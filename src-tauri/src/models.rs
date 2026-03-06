@@ -154,6 +154,8 @@ pub struct LearnedRulePayload {
     #[serde(default)]
     pub observation_count: i64,
     pub file_path: String,
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 fn default_confidence() -> f64 {
@@ -185,6 +187,8 @@ pub struct LearnedRule {
     pub file_path: String,
     pub created_at: String,
     pub updated_at: String,
+    pub state: String,
+    pub project: Option<String>,
 }
 
 // Tool frequency count for status strip
@@ -237,4 +241,26 @@ pub struct AnalysisRule {
     pub domain: String,
     pub confidence: f64,
     pub content: String,
+}
+
+// Verdict on an existing rule from LLM analysis
+#[derive(Deserialize, Clone, Debug)]
+pub struct RuleVerdict {
+    pub name: String,
+    pub verdict: String,
+    #[serde(default = "default_verdict_strength")]
+    pub strength: f64,
+}
+
+fn default_verdict_strength() -> f64 {
+    0.5
+}
+
+// Top-level LLM analysis output (two-phase)
+#[derive(Deserialize, Clone, Debug)]
+pub struct AnalysisOutput {
+    #[serde(default)]
+    pub new_rules: Vec<AnalysisRule>,
+    #[serde(default)]
+    pub verdicts: Vec<RuleVerdict>,
 }

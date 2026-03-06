@@ -21,6 +21,10 @@ function main() {
     const hookPhase = phaseMap[input.hook_event_name];
     if (!hookPhase) return;
 
+    // Skip low-signal PreToolUse hooks (post-phase captures errors/results)
+    const LOW_SIGNAL_PRE = ["Read", "Glob", "Grep", "Bash", "LS", "WebSearch", "WebFetch", "Agent"];
+    if (hookPhase === "pre" && LOW_SIGNAL_PRE.includes(input.tool_name)) return;
+
     const configPath = path.join(
       process.env.HOME || process.env.USERPROFILE,
       ".config",

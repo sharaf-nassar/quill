@@ -124,6 +124,8 @@ export interface LearnedRule {
   file_path: string;
   created_at: string;
   updated_at: string;
+  state: string;
+  project: string | null;
 }
 
 export interface LearningRun {

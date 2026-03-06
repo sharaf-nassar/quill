@@ -52,9 +52,7 @@ async fn check_for_update(app: &tauri::AppHandle) {
                     |chunk_length, _content_length| {
                         downloaded += chunk_length as u64;
                     },
-                    || {
-                        log::info!("Download finished");
-                    },
+                    || {},
                 )
                 .await
             {
@@ -67,9 +65,8 @@ async fn check_for_update(app: &tauri::AppHandle) {
                 }
             }
         }
-        Ok(None) => {
-            log::info!("No update available");
-        }
+        Ok(None) => {}
+
         Err(e) => {
             log::error!("Update check failed: {e}");
         }
@@ -362,6 +359,7 @@ pub fn run() {
                     Target::new(TargetKind::Stdout),
                     Target::new(TargetKind::LogDir { file_name: None }),
                 ])
+                .level(log::LevelFilter::Info)
                 .max_file_size(5_000_000) // 5 MB rotation
                 .build(),
         )

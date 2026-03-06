@@ -19,8 +19,11 @@ function RuleCard({ rule, onDelete }: RuleCardProps) {
   const [loading, setLoading] = useState(false);
   const color = confidenceColor(rule.confidence);
   const pct = Math.round(rule.confidence * 100);
+  const isCandidate = rule.state === "candidate";
+  const hasFile = rule.file_path.length > 0;
 
   const toggleExpand = async () => {
+    if (!hasFile) return;
     if (expanded) {
       setExpanded(false);
       return;
@@ -42,12 +45,23 @@ function RuleCard({ rule, onDelete }: RuleCardProps) {
   };
 
   return (
-    <div className="learning-rule-card">
-      <div className="learning-rule-header" onClick={toggleExpand}>
-        <span className="learning-rule-expand">{expanded ? "▾" : "▸"}</span>
+    <div className={`learning-rule-card${isCandidate ? " learning-rule-card--candidate" : ""}`}>
+      <div
+        className="learning-rule-header"
+        onClick={toggleExpand}
+        style={hasFile ? undefined : { cursor: "default" }}
+      >
+        {hasFile ? (
+          <span className="learning-rule-expand">{expanded ? "\u25BE" : "\u25B8"}</span>
+        ) : (
+          <span className="learning-rule-expand">&nbsp;</span>
+        )}
         <span className="learning-rule-name">{rule.name}</span>
         <span className="learning-rule-confidence" style={{ color }}>
           {rule.confidence.toFixed(2)}
+        </span>
+        <span className={`learning-rule-state learning-rule-state--${rule.state}`}>
+          {rule.state}
         </span>
         <button
           className="learning-rule-delete"
@@ -69,9 +83,12 @@ function RuleCard({ rule, onDelete }: RuleCardProps) {
       {rule.domain && (
         <span className="learning-rule-domain">{rule.domain}</span>
       )}
+      {rule.project && (
+        <span className="learning-rule-project">{rule.project}</span>
+      )}
       {expanded && (
         <pre className="learning-rule-content">
-          {loading ? "Loading…" : content}
+          {loading ? "Loading\u2026" : content}
         </pre>
       )}
     </div>

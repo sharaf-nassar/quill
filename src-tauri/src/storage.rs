@@ -10,6 +10,42 @@ use crate::models::{
     TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
+fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
+    let n = alpha + beta;
+    if n < 0.01 {
+        return 0.5;
+    }
+    let p = alpha / n;
+    let z = 1.96_f64;
+    let denominator = 1.0 + z * z / n;
+    let center = p + z * z / (2.0 * n);
+    let spread = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt();
+    ((center - spread) / denominator).clamp(0.0, 0.95)
+}
+
+fn compute_state(confidence: f64, _alpha: f64, _beta: f64, freshness: f64) -> &'static str {
+    if freshness < 0.3 {
+        "stale"
+    } else if confidence < 0.4 {
+        "invalidated"
+    } else if confidence >= 0.6 {
+        "confirmed"
+    } else {
+        "emerging"
+    }
+}
+
+fn freshness_factor(last_evidence_at: Option<&str>) -> f64 {
+    let Some(ts) = last_evidence_at else {
+        return 1.0;
+    };
+    let Ok(last) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        return 1.0;
+    };
+    let days = (Utc::now() - last.with_timezone(&Utc)).num_seconds().max(0) as f64 / 86400.0;
+    0.5_f64.powf(days / 90.0)
+}
+
 fn db_path() -> Result<PathBuf, String> {
     let data_dir = dirs::data_local_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
@@ -186,6 +222,30 @@ impl Storage {
             }
             conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])
                 .map_err(|e| format!("Failed to record migration 2: {e}"))?;
+        }
+
+        // Migration 3: add Beta-Binomial columns to learned_rules
+        if current_version < 3 {
+            let cols = [
+                ("alpha", "REAL NOT NULL DEFAULT 1.0"),
+                ("beta_param", "REAL NOT NULL DEFAULT 1.0"),
+                ("last_evidence_at", "TEXT DEFAULT NULL"),
+                ("state", "TEXT NOT NULL DEFAULT 'emerging'"),
+                ("project", "TEXT DEFAULT NULL"),
+            ];
+            for (col, typ) in &cols {
+                let has_col: bool = conn
+                    .prepare(&format!("SELECT {col} FROM learned_rules LIMIT 0"))
+                    .is_ok();
+                if !has_col {
+                    conn.execute_batch(&format!(
+                        "ALTER TABLE learned_rules ADD COLUMN {col} {typ};"
+                    ))
+                    .map_err(|e| format!("Migration 3 (add {col}) error: {e}"))?;
+                }
+            }
+            conn.execute("INSERT INTO schema_version (version) VALUES (3)", [])
+                .map_err(|e| format!("Failed to record migration 3: {e}"))?;
         }
 
         let storage = Self {
@@ -1189,14 +1249,16 @@ impl Storage {
 
     pub fn store_learned_rule(&self, payload: &LearnedRulePayload) -> Result<(), String> {
         let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, last_evidence_at, state, project)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, ?7, 'emerging', ?8)
              ON CONFLICT(name) DO UPDATE SET
                  domain = excluded.domain,
-                 confidence = MIN(0.95, learned_rules.confidence * 0.6 + excluded.confidence * 0.4),
+                 alpha = learned_rules.alpha + excluded.alpha,
                  observation_count = learned_rules.observation_count + excluded.observation_count,
                  file_path = excluded.file_path,
+                 last_evidence_at = excluded.last_evidence_at,
                  updated_at = datetime('now')",
             params![
                 payload.name,
@@ -1204,19 +1266,43 @@ impl Storage {
                 payload.confidence,
                 payload.observation_count,
                 payload.file_path,
+                payload.confidence,
+                now,
+                payload.project,
             ],
         )
         .map_err(|e| format!("Insert learned rule error: {e}"))?;
         Ok(())
     }
 
+    pub fn reinforce_rule(&self, name: &str, strength: f64) -> Result<(), String> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE learned_rules SET alpha = alpha + ?1, last_evidence_at = ?2, updated_at = datetime('now') WHERE name = ?3",
+            params![strength, now, name],
+        )
+        .map_err(|e| format!("Reinforce rule error: {e}"))?;
+        Ok(())
+    }
+
+    pub fn contradict_rule(&self, name: &str, strength: f64) -> Result<(), String> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE learned_rules SET beta_param = beta_param + ?1, last_evidence_at = ?2, updated_at = datetime('now') WHERE name = ?3",
+            params![strength, now, name],
+        )
+        .map_err(|e| format!("Contradict rule error: {e}"))?;
+        Ok(())
+    }
+
     pub fn get_learned_rules(&self) -> Result<Vec<LearnedRule>, String> {
-        // Fetch all metadata from DB in one query
         let mut meta_map = {
             let conn = self.conn.lock();
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT name, domain, confidence, observation_count, created_at, updated_at
+                    "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at
                      FROM learned_rules",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
@@ -1226,23 +1312,41 @@ impl Storage {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, f64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
                     ))
                 })
                 .map_err(|e| format!("Query error: {e}"))?;
 
             let mut map = std::collections::HashMap::new();
             for row in rows {
-                let (name, domain, confidence, obs_count, created, updated) =
-                    row.map_err(|e| format!("Row error: {e}"))?;
-                map.insert(name, (domain, confidence, obs_count, created, updated));
+                let (
+                    name,
+                    domain,
+                    alpha,
+                    beta,
+                    obs_count,
+                    last_ev,
+                    state,
+                    project,
+                    created,
+                    updated,
+                ) = row.map_err(|e| format!("Row error: {e}"))?;
+                map.insert(
+                    name,
+                    (
+                        domain, alpha, beta, obs_count, last_ev, state, project, created, updated,
+                    ),
+                );
             }
             map
         };
 
-        // Scan filesystem as authoritative list, join with pre-fetched metadata
         let rules_dir = dirs::home_dir()
             .ok_or("Cannot determine home directory")?
             .join(".claude")
@@ -1250,40 +1354,109 @@ impl Storage {
             .join("learned");
 
         let mut rules = Vec::new();
-        if rules_dir.exists() {
-            let entries =
-                std::fs::read_dir(&rules_dir).map_err(|e| format!("Read dir error: {e}"))?;
 
-            for entry in entries {
-                let entry = entry.map_err(|e| format!("Dir entry error: {e}"))?;
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "md") {
-                    let name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let file_path = path.to_string_lossy().to_string();
-
-                    let now = Utc::now().to_rfc3339();
-                    let (domain, confidence, observation_count, created_at, updated_at) = meta_map
-                        .remove(&name)
-                        .unwrap_or((None, 0.5, 0, now.clone(), now));
-
-                    rules.push(LearnedRule {
-                        name,
-                        domain,
-                        confidence,
-                        observation_count,
-                        file_path,
-                        created_at,
-                        updated_at,
-                    });
+        fn collect_rule_files(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        collect_rule_files(&path, out);
+                    } else if path.extension().is_some_and(|ext| ext == "md") {
+                        let name = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let file_path = path.to_string_lossy().to_string();
+                        out.push((name, file_path));
+                    }
                 }
             }
         }
 
-        // Sort by confidence descending
+        if rules_dir.exists() {
+            let mut files = Vec::new();
+            collect_rule_files(&rules_dir, &mut files);
+
+            for (name, file_path) in files {
+                let now = Utc::now().to_rfc3339();
+                let (
+                    domain,
+                    alpha,
+                    beta,
+                    observation_count,
+                    last_ev,
+                    _db_state,
+                    project,
+                    created_at,
+                    updated_at,
+                ) = meta_map.remove(&name).unwrap_or((
+                    None,
+                    1.0,
+                    1.0,
+                    0,
+                    None,
+                    "emerging".to_string(),
+                    None,
+                    now.clone(),
+                    now,
+                ));
+
+                let fresh = freshness_factor(last_ev.as_deref());
+                let eff_alpha = alpha * fresh;
+                let eff_beta = beta * fresh;
+                let confidence = wilson_lower_bound(eff_alpha, eff_beta);
+                let state = compute_state(confidence, alpha, beta, fresh).to_string();
+
+                rules.push(LearnedRule {
+                    name,
+                    domain,
+                    confidence,
+                    observation_count,
+                    file_path,
+                    created_at,
+                    updated_at,
+                    state,
+                    project,
+                });
+            }
+        }
+
+        // Include DB-only rules (candidates that haven't met the confidence threshold yet)
+        for (
+            name,
+            (
+                domain,
+                alpha,
+                beta,
+                observation_count,
+                last_ev,
+                _db_state,
+                project,
+                created_at,
+                updated_at,
+            ),
+        ) in meta_map
+        {
+            let fresh = freshness_factor(last_ev.as_deref());
+            let eff_alpha = alpha * fresh;
+            let eff_beta = beta * fresh;
+            let confidence = wilson_lower_bound(eff_alpha, eff_beta);
+            let state = "candidate".to_string();
+
+            rules.push(LearnedRule {
+                name,
+                domain,
+                confidence,
+                observation_count,
+                file_path: String::new(),
+                created_at,
+                updated_at,
+                state,
+                project,
+            });
+        }
+
         rules.sort_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
@@ -1300,20 +1473,55 @@ impl Storage {
             ));
         }
 
+        // Get file_path from DB before deleting the record
+        let file_path: Option<String> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT file_path FROM learned_rules WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .ok()
+        };
+
         // Delete from table
         let conn = self.conn.lock();
         conn.execute("DELETE FROM learned_rules WHERE name = ?1", params![name])
             .map_err(|e| format!("Delete rule error: {e}"))?;
+        drop(conn);
 
-        // Delete file
-        let rules_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("rules")
-            .join("learned");
-        let file_path = rules_dir.join(format!("{name}.md"));
-        if file_path.exists() {
-            std::fs::remove_file(&file_path).map_err(|e| format!("Delete file error: {e}"))?;
+        // Delete file using stored path, or fall back to searching subdirectories
+        if let Some(fp) = file_path {
+            let path = std::path::Path::new(&fp);
+            if path.exists() {
+                std::fs::remove_file(path).map_err(|e| format!("Delete file error: {e}"))?;
+            }
+        } else {
+            // Fallback: search recursively
+            let rules_dir = dirs::home_dir()
+                .ok_or("Cannot determine home directory")?
+                .join(".claude")
+                .join("rules")
+                .join("learned");
+            fn find_and_delete(dir: &std::path::Path, name: &str) -> bool {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if find_and_delete(&path, name) {
+                                return true;
+                            }
+                        } else if path.file_stem().is_some_and(|s| s == name)
+                            && path.extension().is_some_and(|e| e == "md")
+                        {
+                            let _ = std::fs::remove_file(&path);
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            find_and_delete(&rules_dir, name);
         }
         Ok(())
     }
@@ -1335,7 +1543,10 @@ impl Storage {
     pub fn cleanup_old_observations(&self) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "DELETE FROM observations WHERE created_at < datetime('now', '-30 days')",
+            "DELETE FROM observations WHERE created_at < (
+                SELECT COALESCE(MAX(created_at), datetime('now', '-30 days'))
+                FROM learning_runs WHERE status = 'completed'
+            ) AND created_at < datetime('now', '-7 days')",
             [],
         )
         .map_err(|e| format!("Observation cleanup error: {e}"))?;

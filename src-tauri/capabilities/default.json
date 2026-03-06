@@ -1,10 +1,11 @@
 {
   "identifier": "default",
   "description": "Default capabilities for Claude Usage widget",
-  "windows": ["main"],
+  "windows": ["main", "runs"],
   "permissions": [
     "core:default",
     "core:window:default",
+    "core:window:allow-create",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
     "core:window:allow-set-always-on-top",
@@ -16,6 +17,9 @@
     "core:window:allow-set-position",
     "core:window:allow-outer-position",
     "core:window:allow-outer-size",
+    "core:window:allow-destroy",
+    "core:webview:default",
+    "core:webview:allow-create-webview-window",
     "core:tray:default",
     "window-state:default",
     "updater:default",

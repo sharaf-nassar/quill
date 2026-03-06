@@ -1,13 +1,11 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { useLearningData } from "../hooks/useLearningData";
 import StatusStrip from "../components/learning/StatusStrip";
 import RuleCard from "../components/learning/RuleCard";
 import DomainBreakdown from "../components/learning/DomainBreakdown";
-import RunHistory from "../components/learning/RunHistory";
+import FloatingRunsWindow from "../components/learning/FloatingRunsWindow";
 import type { LearningSettings } from "../types";
-
-type LearningTab = "summary" | "rules" | "runs";
 
 const TRIGGER_OPTIONS = [
   { value: "on-demand", label: "On-demand" },
@@ -118,14 +116,14 @@ function LearningPanel() {
     topTools,
     sparkline,
     analyzing,
-    liveLogs,
     loading,
     updateSettings,
     triggerAnalysis,
     deleteRule,
   } = useLearningData();
 
-  const [activeTab, setActiveTab] = useState<LearningTab>("summary");
+  const [showRuns, setShowRuns] = useState(false);
+  const handleCloseRuns = useCallback(() => setShowRuns(false), []);
   const contentRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -162,11 +160,7 @@ function LearningPanel() {
     return (
       <div className="learning-app">
         <div className="learning-toolbar">
-          <div className="learning-tabs">
-            <button className="learning-tab active">Summary</button>
-            <button className="learning-tab">Rules</button>
-            <button className="learning-tab">Runs</button>
-          </div>
+          <span className="learning-toolbar-label">Learning</span>
         </div>
         <div className="learning-loading">Loading...</div>
       </div>
@@ -176,21 +170,7 @@ function LearningPanel() {
   return (
     <div className="learning-app">
       <div className="learning-toolbar">
-        <div className="learning-tabs">
-          {(["summary", "rules", "runs"] as const).map((tab) => (
-            <button
-              key={tab}
-              className={`learning-tab${activeTab === tab ? " active" : ""}`}
-              onClick={() => setActiveTab(tab)}
-            >
-              {tab === "summary"
-                ? "Summary"
-                : tab === "rules"
-                  ? `Rules (${rules.length})`
-                  : `Runs (${runs.length})`}
-            </button>
-          ))}
-        </div>
+        <span className="learning-toolbar-label">Learning</span>
         <div className="learning-toolbar-right">
           {settings.trigger_mode !== "on-demand" && (
             <button
@@ -204,6 +184,20 @@ function LearningPanel() {
               {settings.enabled ? "ON" : "OFF"}
             </button>
           )}
+          <button
+            className={`learning-runs-btn${showRuns ? " learning-runs-btn--active" : ""}`}
+            onClick={() => setShowRuns((v) => !v)}
+            aria-label="Toggle run history"
+            title="Run history"
+          >
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+              <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5" />
+              <path d="M8 4.5V8.5L10.5 10" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            {runs.length > 0 && (
+              <span className="learning-runs-badge">{runs.length}</span>
+            )}
+          </button>
           <LearningSettingsInline
             settings={settings}
             onUpdateSettings={updateSettings}
@@ -211,37 +205,37 @@ function LearningPanel() {
         </div>
       </div>
       <div className="learning-content" ref={contentRef}>
-        {activeTab === "summary" && (
-          <StatusStrip
-            observationCount={observationCount}
-            unanalyzedCount={unanalyzedCount}
-            topTools={topTools}
-            sparkline={sparkline}
-            lastRun={runs[0]}
-            analyzing={analyzing}
-            onAnalyze={triggerAnalysis}
-          />
-        )}
-        {activeTab === "rules" && (
-          <div className="learning-section">
-            {rules.length === 0 ? (
-              <div className="learning-empty">
-                No rules learned yet. Run an analysis to get started.
-              </div>
-            ) : (
-              <>
-                {rules.map((rule) => (
-                  <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} />
-                ))}
-                <DomainBreakdown rules={rules} />
-              </>
-            )}
+        <StatusStrip
+          observationCount={observationCount}
+          unanalyzedCount={unanalyzedCount}
+          topTools={topTools}
+          sparkline={sparkline}
+          lastRun={runs[0]}
+          analyzing={analyzing}
+          onAnalyze={triggerAnalysis}
+        />
+        <div className="learning-section">
+          <div className="learning-section-header">
+            RULES
+            <span className="learning-section-count">{rules.length}</span>
           </div>
-        )}
-        {activeTab === "runs" && (
-          <RunHistory runs={runs} analyzing={analyzing} liveLogs={liveLogs} />
-        )}
+          {rules.length === 0 ? (
+            <div className="learning-empty">
+              No rules learned yet. Run an analysis to get started.
+            </div>
+          ) : (
+            <>
+              {rules.map((rule) => (
+                <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} />
+              ))}
+              <DomainBreakdown rules={rules} />
+            </>
+          )}
+        </div>
       </div>
+      {showRuns && (
+        <FloatingRunsWindow onClose={handleCloseRuns} />
+      )}
     </div>
   );
 }
