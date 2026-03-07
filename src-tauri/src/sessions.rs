@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use tantivy::collector::{FacetCollector, TopDocs};
+use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::*;
+use tantivy::snippet::SnippetGenerator;
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 // ---------------------------------------------------------------------------
@@ -313,6 +317,339 @@ impl SessionIndex {
 
         Ok(total_indexed)
     }
+
+    // -------------------------------------------------------------------
+    // Search
+    // -------------------------------------------------------------------
+
+    /// Search the index with a query string and optional filters.
+    pub fn search(&self, filters: &SearchFilters) -> Result<SearchResults, String> {
+        let searcher = self.searcher();
+        let f = &self.fields;
+
+        // Build query parser targeting content, tools_used, files_modified
+        let mut parser =
+            QueryParser::for_index(&self.index, vec![f.content, f.tools_used, f.files_modified]);
+        parser.set_conjunction_by_default();
+
+        let (text_query, _errors) = parser.parse_query_lenient(&filters.query);
+
+        // Combine with filter clauses via BooleanQuery
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
+            vec![(Occur::Must, text_query)];
+
+        // Project facet filter
+        if let Some(ref proj) = filters.project {
+            let facet = Facet::from(&format!("/{proj}"));
+            let term = Term::from_facet(f.project, &facet);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        }
+
+        // Host facet filter
+        if let Some(ref host) = filters.host {
+            let facet = Facet::from(&format!("/{host}"));
+            let term = Term::from_facet(f.host, &facet);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        }
+
+        // Role filter
+        if let Some(ref role) = filters.role {
+            let term = Term::from_field_text(f.role, role);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        }
+
+        // Git branch filter
+        if let Some(ref branch) = filters.git_branch {
+            let term = Term::from_field_text(f.git_branch, branch);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        }
+
+        // Date range filter
+        if filters.date_from.is_some() || filters.date_to.is_some() {
+            let lower = match &filters.date_from {
+                Some(from_str) => {
+                    let dt = chrono::DateTime::parse_from_rfc3339(from_str)
+                        .map(|dt| DateTime::from_timestamp_secs(dt.timestamp()))
+                        .unwrap_or(DateTime::MIN);
+                    Bound::Included(Term::from_field_date(f.timestamp, dt))
+                }
+                None => Bound::Unbounded,
+            };
+            let upper = match &filters.date_to {
+                Some(to_str) => {
+                    let dt = chrono::DateTime::parse_from_rfc3339(to_str)
+                        .map(|dt| DateTime::from_timestamp_secs(dt.timestamp()))
+                        .unwrap_or(DateTime::MAX);
+                    Bound::Included(Term::from_field_date(f.timestamp, dt))
+                }
+                None => Bound::Unbounded,
+            };
+            clauses.push((Occur::Must, Box::new(RangeQuery::new(lower, upper))));
+        }
+
+        let combined = BooleanQuery::new(clauses);
+        let limit = filters.limit.unwrap_or(20) as usize;
+        let offset = filters.offset.unwrap_or(0) as usize;
+
+        let top_docs = searcher
+            .search(&combined, &TopDocs::with_limit(limit).and_offset(offset))
+            .map_err(|e| format!("Search error: {e}"))?;
+
+        // Snippet generator for content field
+        let snippet_gen = SnippetGenerator::create(&searcher, &combined, f.content)
+            .map_err(|e| format!("Snippet generator error: {e}"))?;
+
+        let mut hits = Vec::with_capacity(top_docs.len());
+        for (score, doc_addr) in &top_docs {
+            let doc: TantivyDocument = searcher
+                .doc(*doc_addr)
+                .map_err(|e| format!("Doc retrieval: {e}"))?;
+
+            let snippet = snippet_gen.snippet_from_doc(&doc);
+            // Convert <b>...</b> to <mark>...</mark>
+            let snippet_html = snippet
+                .to_html()
+                .replace("<b>", "<mark>")
+                .replace("</b>", "</mark>");
+
+            let get_text = |field: Field| -> String {
+                doc.get_first(field)
+                    .and_then(|v| v.as_value().as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            };
+
+            let get_facet_str = |field: Field| -> String {
+                doc.get_first(field)
+                    .and_then(|v| {
+                        v.as_value().as_facet().map(|f| {
+                            // Strip leading "/"
+                            f.strip_prefix('/').unwrap_or(f).to_string()
+                        })
+                    })
+                    .unwrap_or_default()
+            };
+
+            let timestamp = doc
+                .get_first(f.timestamp)
+                .and_then(|v| v.as_value().as_datetime())
+                .map(|dt| {
+                    chrono::DateTime::from_timestamp(dt.into_timestamp_secs(), 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
+            hits.push(SearchHit {
+                message_id: get_text(f.message_id),
+                session_id: get_text(f.session_id),
+                content: get_text(f.content),
+                snippet: snippet_html,
+                role: get_text(f.role),
+                project: get_facet_str(f.project),
+                host: get_facet_str(f.host),
+                timestamp,
+                git_branch: get_text(f.git_branch),
+                tools_used: get_text(f.tools_used),
+                files_modified: get_text(f.files_modified),
+                score: *score,
+            });
+        }
+
+        Ok(SearchResults {
+            hits,
+            total: top_docs.len() as u64,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // Facets
+    // -------------------------------------------------------------------
+
+    /// Collect distinct project and host facets from the index.
+    pub fn get_facets(&self) -> Result<SearchFacets, String> {
+        let searcher = self.searcher();
+
+        let mut project_collector = FacetCollector::for_field("project");
+        project_collector.add_facet(Facet::root());
+
+        let mut host_collector = FacetCollector::for_field("host");
+        host_collector.add_facet(Facet::root());
+
+        let (project_counts, host_counts) = searcher
+            .search(
+                &tantivy::query::AllQuery,
+                &(project_collector, host_collector),
+            )
+            .map_err(|e| format!("Facet collection error: {e}"))?;
+
+        let projects = project_counts
+            .get("/")
+            .map(|(facet, count)| FacetCount {
+                label: facet
+                    .to_string()
+                    .strip_prefix('/')
+                    .unwrap_or(&facet.to_string())
+                    .to_string(),
+                count,
+            })
+            .collect();
+
+        let hosts = host_counts
+            .get("/")
+            .map(|(facet, count)| FacetCount {
+                label: facet
+                    .to_string()
+                    .strip_prefix('/')
+                    .unwrap_or(&facet.to_string())
+                    .to_string(),
+                count,
+            })
+            .collect();
+
+        Ok(SearchFacets { projects, hosts })
+    }
+
+    // -------------------------------------------------------------------
+    // Context -- surrounding messages for a search hit
+    // -------------------------------------------------------------------
+
+    /// Find the JSONL file for a session and return a window of messages
+    /// around the target message.
+    pub fn get_context(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        window: usize,
+    ) -> Result<SessionContext, String> {
+        let projects_dir = dirs::home_dir()
+            .ok_or("Cannot determine home directory")?
+            .join(".claude")
+            .join("projects");
+
+        // Find the JSONL file matching this session_id
+        let mut jsonl_path: Option<PathBuf> = None;
+        if projects_dir.exists() {
+            for project_entry in std::fs::read_dir(&projects_dir)
+                .map_err(|e| format!("Read projects: {e}"))?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+            {
+                let candidate = project_entry.path().join(format!("{session_id}.jsonl"));
+                if candidate.exists() {
+                    jsonl_path = Some(candidate);
+                    break;
+                }
+            }
+        }
+
+        let path =
+            jsonl_path.ok_or_else(|| format!("JSONL file not found for session {session_id}"))?;
+
+        let messages = extract_messages_from_jsonl(&path);
+
+        // Find the index of the target message
+        let target_idx = messages
+            .iter()
+            .position(|m| m.uuid == message_id)
+            .unwrap_or(0);
+
+        let start = target_idx.saturating_sub(window);
+        let end = (target_idx + window + 1).min(messages.len());
+
+        let context_messages: Vec<ContextMessage> = messages[start..end]
+            .iter()
+            .map(|m| ContextMessage {
+                uuid: m.uuid.clone(),
+                role: m.role.clone(),
+                content: m.content.clone(),
+                timestamp: m.timestamp.clone(),
+                is_target: m.uuid == message_id,
+            })
+            .collect();
+
+        Ok(SessionContext {
+            session_id: session_id.to_string(),
+            messages: context_messages,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Search result types (serializable for frontend)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SearchHit {
+    pub message_id: String,
+    pub session_id: String,
+    pub content: String,
+    pub snippet: String,
+    pub role: String,
+    pub project: String,
+    pub host: String,
+    pub timestamp: String,
+    pub git_branch: String,
+    pub tools_used: String,
+    pub files_modified: String,
+    pub score: f32,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SearchResults {
+    pub hits: Vec<SearchHit>,
+    pub total: u64,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct SearchFilters {
+    pub query: String,
+    pub project: Option<String>,
+    pub host: Option<String>,
+    pub role: Option<String>,
+    pub git_branch: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct FacetCount {
+    pub label: String,
+    pub count: u64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SearchFacets {
+    pub projects: Vec<FacetCount>,
+    pub hosts: Vec<FacetCount>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ContextMessage {
+    pub uuid: String,
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+    pub is_target: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SessionContext {
+    pub session_id: String,
+    pub messages: Vec<ContextMessage>,
 }
 
 // ---------------------------------------------------------------------------
