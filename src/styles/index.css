@@ -616,6 +616,15 @@ body {
   color: rgba(34, 197, 94, 0.9);
 }
 
+.view-tab--search {
+  color: rgba(96, 165, 250, 0.5);
+  font-size: 13px;
+}
+
+.view-tab--search:hover {
+  color: rgba(96, 165, 250, 0.8);
+}
+
 /* ─── Draggable divider between live and analytics ─── */
 .panel-divider {
   flex-shrink: 0;

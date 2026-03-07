@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { PendingUpdate } from "../types";
 
 interface TitleBarProps {
@@ -35,6 +36,26 @@ function TitleBar({
       .catch(() => {});
   }, []);
 
+  const handleOpenSessions = useCallback(async () => {
+    const existing = await WebviewWindow.getByLabel("sessions");
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    new WebviewWindow("sessions", {
+      url: "/?view=sessions",
+      title: "Session Search",
+      width: 700,
+      height: 600,
+      minWidth: 500,
+      minHeight: 400,
+      decorations: false,
+      transparent: true,
+      resizable: true,
+    });
+  }, []);
+
   return (
     <div className="titlebar" data-tauri-drag-region>
       <div className="titlebar-left">
@@ -56,6 +77,14 @@ function TitleBar({
             onClick={onToggleLearning}
           >
             &#10022;
+          </button>
+          <button
+            className="view-tab view-tab--search"
+            onClick={handleOpenSessions}
+            aria-label="Search sessions"
+            title="Search sessions"
+          >
+            &#8981;
           </button>
         </div>
       </div>
