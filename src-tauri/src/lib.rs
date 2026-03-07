@@ -4,7 +4,6 @@ mod fetcher;
 mod learning;
 mod models;
 mod server;
-#[allow(dead_code)]
 mod sessions;
 mod storage;
 
@@ -14,7 +13,7 @@ use models::{
 };
 use parking_lot::Mutex;
 use rand::RngCore;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use storage::Storage;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -472,6 +471,38 @@ pub fn run() {
                 });
             }
 
+            // Initialize session search index
+            {
+                let index_dir = dirs::data_local_dir()
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("claude-usage")
+                    .join("session-index");
+
+                match sessions::SessionIndex::open_or_create(&index_dir) {
+                    Ok(idx) => {
+                        let idx = Arc::new(idx);
+                        app.manage(sessions::SessionIndexState(idx.clone()));
+
+                        // Spawn background startup scan
+                        let scan_handle = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            match tokio::task::block_in_place(|| idx.startup_scan(&scan_handle)) {
+                                Ok(count) => {
+                                    log::info!("Session index startup scan: {count} messages");
+                                }
+                                Err(e) => {
+                                    log::error!("Session index startup scan failed: {e}");
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialize session index: {e}");
+                    }
+                }
+            }
+
             // Restore always-on-top preference (default: off)
             let on_top_enabled = STORAGE
                 .get()
@@ -567,6 +598,10 @@ pub fn run() {
             get_top_tools,
             get_observation_sparkline,
             read_rule_content,
+            sessions::search_sessions,
+            sessions::get_session_context,
+            sessions::get_search_facets,
+            sessions::rebuild_search_index,
             hide_window,
             quit_app,
         ])

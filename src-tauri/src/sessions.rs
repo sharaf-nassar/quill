@@ -27,6 +27,7 @@ pub struct SessionSchema {
     pub git_branch: Field,
     pub tools_used: Field,
     pub files_modified: Field,
+    #[allow(dead_code)]
     pub schema: Schema,
 }
 
@@ -800,4 +801,49 @@ pub fn extract_messages_from_jsonl(path: &Path) -> Vec<ExtractedMessage> {
     }
 
     messages
+}
+
+// ---------------------------------------------------------------------------
+// Tauri state wrapper and commands
+// ---------------------------------------------------------------------------
+
+/// Wrapper for managed Tauri state.
+pub struct SessionIndexState(pub Arc<SessionIndex>);
+
+#[tauri::command]
+pub async fn search_sessions(
+    filters: SearchFilters,
+    state: tauri::State<'_, SessionIndexState>,
+) -> Result<SearchResults, String> {
+    let idx = state.0.clone();
+    crate::run_blocking(move || idx.search(&filters))
+}
+
+#[tauri::command]
+pub async fn get_session_context(
+    session_id: String,
+    message_id: String,
+    window: Option<u32>,
+    state: tauri::State<'_, SessionIndexState>,
+) -> Result<SessionContext, String> {
+    let idx = state.0.clone();
+    let w = window.unwrap_or(5) as usize;
+    crate::run_blocking(move || idx.get_context(&session_id, &message_id, w))
+}
+
+#[tauri::command]
+pub async fn get_search_facets(
+    state: tauri::State<'_, SessionIndexState>,
+) -> Result<SearchFacets, String> {
+    let idx = state.0.clone();
+    crate::run_blocking(move || idx.get_facets())
+}
+
+#[tauri::command]
+pub async fn rebuild_search_index(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SessionIndexState>,
+) -> Result<usize, String> {
+    let idx = state.0.clone();
+    crate::run_blocking(move || idx.startup_scan(&app))
 }
