@@ -17,8 +17,9 @@ use tauri::Emitter;
 
 use crate::models::{
     LearnedRulePayload, LearningRunPayload, ObservationPayload, SessionEndPayload,
-    TokenReportPayload,
+    SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
 };
+use crate::sessions;
 use crate::storage::Storage;
 
 const DEFAULT_PORT: u16 = 19876;
@@ -30,13 +31,20 @@ const MAX_TOKEN_VALUE: i64 = 100_000_000;
 const MAX_TOOL_DATA_LEN: usize = 2048;
 
 const MAX_OBS_REQUESTS: usize = 500;
+const MAX_SESSION_NOTIFY_REQUESTS: usize = 500;
+const MAX_SESSION_MSG_REQUESTS: usize = 100;
+const MAX_PATH_LEN: usize = 4096;
+const MAX_CONTENT_LEN: usize = 1_000_000;
+const MAX_MESSAGES_PER_BATCH: usize = 500;
 
 struct ServerState {
     storage: &'static Storage,
     secret: String,
     rate_limiter: Mutex<VecDeque<Instant>>,
     obs_rate_limiter: Mutex<VecDeque<Instant>>,
+    session_rate_limiter: Mutex<VecDeque<Instant>>,
     app_handle: tauri::AppHandle,
+    session_index: Arc<sessions::SessionIndex>,
 }
 
 fn check_auth(headers: &HeaderMap, secret: &str) -> bool {
@@ -71,7 +79,12 @@ fn check_rate_limit(rate_limiter: &Mutex<VecDeque<Instant>>) -> bool {
     true
 }
 
-pub async fn start_server(storage: &'static Storage, secret: String, app_handle: tauri::AppHandle) {
+pub async fn start_server(
+    storage: &'static Storage,
+    secret: String,
+    app_handle: tauri::AppHandle,
+    session_index: Arc<sessions::SessionIndex>,
+) {
     let port: u16 = std::env::var("CLAUDE_USAGE_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -82,7 +95,9 @@ pub async fn start_server(storage: &'static Storage, secret: String, app_handle:
         secret,
         rate_limiter: Mutex::new(VecDeque::new()),
         obs_rate_limiter: Mutex::new(VecDeque::new()),
+        session_rate_limiter: Mutex::new(VecDeque::new()),
         app_handle,
+        session_index,
     });
 
     let app = Router::new()
@@ -95,6 +110,8 @@ pub async fn start_server(storage: &'static Storage, secret: String, app_handle:
         .route("/api/v1/learning/runs", post(post_learning_run))
         .route("/api/v1/learning/runs", get(get_learning_runs))
         .route("/api/v1/learning/rules", post(post_learned_rule))
+        .route("/api/v1/sessions/notify", post(post_session_notify))
+        .route("/api/v1/sessions/messages", post(post_session_messages))
         .with_state(state);
 
     // Bind to 0.0.0.0 intentionally — remote hosts need to reach this server
@@ -446,6 +463,178 @@ async fn post_learned_rule(
         }
         Err(e) => {
             log::error!("Failed to store learned rule: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
+    }
+}
+
+// --- Session indexing endpoints ---
+
+async fn post_session_notify(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<SessionNotifyPayload>,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.secret) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
+    }
+    if !check_rate_limit_with_max(&state.session_rate_limiter, MAX_SESSION_NOTIFY_REQUESTS) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded".to_string(),
+        );
+    }
+    if payload.session_id.is_empty() || payload.session_id.len() > MAX_STRING_LEN {
+        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
+    }
+    if payload.jsonl_path.is_empty() || payload.jsonl_path.len() > MAX_PATH_LEN {
+        return (StatusCode::BAD_REQUEST, "Invalid jsonl_path".to_string());
+    }
+
+    let path = std::path::Path::new(&payload.jsonl_path);
+    if !path.exists() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "jsonl_path does not exist".to_string(),
+        );
+    }
+
+    // Extract messages from the JSONL file
+    let messages = sessions::extract_messages_from_jsonl(path);
+    if messages.is_empty() {
+        return (StatusCode::OK, "ok (no messages)".to_string());
+    }
+
+    // Derive project name from parent directory
+    let project_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(sessions::SessionIndex::project_display_name)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let idx = state.session_index.clone();
+    let result = tokio::task::block_in_place(|| -> Result<usize, String> {
+        // Delete existing docs for this session before re-indexing
+        {
+            let writer = idx.writer.lock();
+            let term = tantivy::Term::from_field_text(idx.fields.session_id, &payload.session_id);
+            writer.delete_term(term);
+        }
+
+        let mut count = 0usize;
+        for msg in &messages {
+            idx.index_message(msg, &project_name, "local")?;
+            count += 1;
+        }
+
+        let mut writer = idx.writer.lock();
+        writer.commit().map_err(|e| format!("Commit index: {e}"))?;
+        Ok(count)
+    });
+
+    match result {
+        Ok(count) => {
+            let _ = state.app_handle.emit("sessions-index-updated", count);
+            (StatusCode::OK, format!("ok ({count} messages indexed)"))
+        }
+        Err(e) => {
+            log::error!("Failed to index session notify: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error".to_string(),
+            )
+        }
+    }
+}
+
+async fn post_session_messages(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<SessionMessagesPayload>,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.secret) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
+    }
+    if !check_rate_limit_with_max(&state.session_rate_limiter, MAX_SESSION_MSG_REQUESTS) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded".to_string(),
+        );
+    }
+    if payload.session_id.is_empty() || payload.session_id.len() > MAX_STRING_LEN {
+        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
+    }
+    if payload.host.is_empty() || payload.host.len() > MAX_STRING_LEN {
+        return (StatusCode::BAD_REQUEST, "Invalid host".to_string());
+    }
+    if payload.project.is_empty() || payload.project.len() > MAX_STRING_LEN {
+        return (StatusCode::BAD_REQUEST, "Invalid project".to_string());
+    }
+    if payload.messages.is_empty() {
+        return (StatusCode::BAD_REQUEST, "No messages provided".to_string());
+    }
+    if payload.messages.len() > MAX_MESSAGES_PER_BATCH {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Too many messages (max {MAX_MESSAGES_PER_BATCH})"),
+        );
+    }
+
+    // Validate individual messages
+    for msg in &payload.messages {
+        if msg.uuid.is_empty() || msg.uuid.len() > MAX_STRING_LEN {
+            return (StatusCode::BAD_REQUEST, "Invalid message uuid".to_string());
+        }
+        if msg.content.len() > MAX_CONTENT_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Message content too long".to_string(),
+            );
+        }
+    }
+
+    // Convert SessionMessagePayload items to ExtractedMessage structs
+    let extracted: Vec<sessions::ExtractedMessage> = payload
+        .messages
+        .iter()
+        .map(|m| sessions::ExtractedMessage {
+            uuid: m.uuid.clone(),
+            session_id: payload.session_id.clone(),
+            role: m.role.clone(),
+            content: m.content.clone(),
+            timestamp: m.timestamp.clone(),
+            git_branch: payload.git_branch.clone(),
+            tools_used: m.tools_used.clone(),
+            files_modified: m.files_modified.clone(),
+        })
+        .collect();
+
+    let idx = state.session_index.clone();
+    let host = payload.host.clone();
+    let project = payload.project.clone();
+    let result = tokio::task::block_in_place(|| -> Result<usize, String> {
+        let mut count = 0usize;
+        for msg in &extracted {
+            idx.index_message(msg, &project, &host)?;
+            count += 1;
+        }
+
+        let mut writer = idx.writer.lock();
+        writer.commit().map_err(|e| format!("Commit index: {e}"))?;
+        Ok(count)
+    });
+
+    match result {
+        Ok(count) => {
+            let _ = state.app_handle.emit("sessions-index-updated", count);
+            (StatusCode::OK, format!("ok ({count} messages indexed)"))
+        }
+        Err(e) => {
+            log::error!("Failed to index session messages: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),

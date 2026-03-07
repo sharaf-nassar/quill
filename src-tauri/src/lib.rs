@@ -368,15 +368,57 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .setup(move |app| {
+            // Initialize session search index first (shared with HTTP server)
+            let session_index: Option<Arc<sessions::SessionIndex>> = {
+                let index_dir = dirs::data_local_dir()
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("claude-usage")
+                    .join("session-index");
+
+                match sessions::SessionIndex::open_or_create(&index_dir) {
+                    Ok(idx) => {
+                        let idx = Arc::new(idx);
+                        app.manage(sessions::SessionIndexState(idx.clone()));
+
+                        // Spawn background startup scan
+                        let scan_idx = idx.clone();
+                        let scan_handle = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            match tokio::task::block_in_place(|| {
+                                scan_idx.startup_scan(&scan_handle)
+                            }) {
+                                Ok(count) => {
+                                    log::info!("Session index startup scan: {count} messages");
+                                }
+                                Err(e) => {
+                                    log::error!("Session index startup scan failed: {e}");
+                                }
+                            }
+                        });
+
+                        Some(idx)
+                    }
+                    Err(e) => {
+                        log::error!("Failed to initialize session index: {e}");
+                        None
+                    }
+                }
+            };
+
             // Spawn the HTTP token reporting server (needs AppHandle for events)
             if let Some(storage) = STORAGE.get() {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(server::start_server(storage, secret, handle));
+                if let Some(idx) = session_index {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(server::start_server(storage, secret, handle, idx));
+                } else {
+                    log::error!("Session index not available; HTTP server not started");
+                }
 
                 // Periodic aggregation/cleanup every hour
                 tauri::async_runtime::spawn(async move {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-                    interval.tick().await; // skip the immediate first tick (cleanup already ran at startup)
+                    interval.tick().await; // skip the immediate first tick
                     loop {
                         interval.tick().await;
                         if let Err(e) =
@@ -428,7 +470,7 @@ pub fn run() {
                     });
                 }
 
-                // Learning periodic analysis timer — polls every minute, runs when interval elapsed
+                // Learning periodic analysis timer -- polls every minute, runs when interval elapsed
                 let periodic_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let mut last_run = std::time::Instant::now();
@@ -469,38 +511,6 @@ pub fn run() {
                         }
                     }
                 });
-            }
-
-            // Initialize session search index
-            {
-                let index_dir = dirs::data_local_dir()
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("claude-usage")
-                    .join("session-index");
-
-                match sessions::SessionIndex::open_or_create(&index_dir) {
-                    Ok(idx) => {
-                        let idx = Arc::new(idx);
-                        app.manage(sessions::SessionIndexState(idx.clone()));
-
-                        // Spawn background startup scan
-                        let scan_handle = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            match tokio::task::block_in_place(|| idx.startup_scan(&scan_handle)) {
-                                Ok(count) => {
-                                    log::info!("Session index startup scan: {count} messages");
-                                }
-                                Err(e) => {
-                                    log::error!("Session index startup scan failed: {e}");
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        log::error!("Failed to initialize session index: {e}");
-                    }
-                }
             }
 
             // Restore always-on-top preference (default: off)

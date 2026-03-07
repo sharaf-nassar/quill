@@ -234,6 +234,42 @@ pub struct LearningStatus {
     pub last_run: Option<LearningRun>,
 }
 
+// --- Session indexing HTTP payloads ---
+
+/// Notify that a session JSONL file has been created/updated
+#[derive(Deserialize)]
+pub struct SessionNotifyPayload {
+    pub session_id: String,
+    pub jsonl_path: String,
+}
+
+/// A single message pushed via the HTTP API
+#[derive(Deserialize)]
+pub struct SessionMessagePayload {
+    pub uuid: String,
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub msg_type: String,
+    pub timestamp: String,
+    pub content: String,
+    pub role: String,
+    #[serde(default)]
+    pub tools_used: Vec<String>,
+    #[serde(default)]
+    pub files_modified: Vec<String>,
+}
+
+/// Batch of messages pushed via the HTTP API
+#[derive(Deserialize)]
+pub struct SessionMessagesPayload {
+    pub host: String,
+    pub session_id: String,
+    pub project: String,
+    #[serde(default)]
+    pub git_branch: String,
+    pub messages: Vec<SessionMessagePayload>,
+}
+
 // Haiku analysis output item (parsed from JSON)
 #[derive(Deserialize, Clone, Debug)]
 pub struct AnalysisRule {
