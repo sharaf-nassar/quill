@@ -274,7 +274,7 @@ pub struct SessionMessagesPayload {
 }
 
 // Haiku analysis output item (parsed from JSON)
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 pub struct AnalysisRule {
     pub name: String,
     pub domain: String,
@@ -285,7 +285,7 @@ pub struct AnalysisRule {
 }
 
 // Verdict on an existing rule from LLM analysis
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 pub struct RuleVerdict {
     pub name: String,
     pub verdict: String,
@@ -298,7 +298,7 @@ fn default_verdict_strength() -> f64 {
 }
 
 // Top-level LLM analysis output (two-phase)
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 pub struct AnalysisOutput {
     #[serde(default)]
     pub new_rules: Vec<AnalysisRule>,
