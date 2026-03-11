@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use crate::models::{AnalysisOutput, LearningRunPayload};
+use crate::models::LearningRunPayload;
 use crate::storage::Storage;
 use tauri::Emitter;
 
@@ -764,15 +764,6 @@ pub async fn spawn_insights_analysis(
          EXISTING RULES (do NOT duplicate these):\n\
          {existing_list}\n\
          \n\
-         Output ONLY valid JSON (no markdown fences):\n\
-         {{\n\
-           \"new_rules\": [\n\
-             {{\"name\": \"kebab-case-name\", \"domain\": \"workflow\", \"confidence\": 0.0-1.0, \
-               \"content\": \"markdown rule text\", \"is_anti_pattern\": false}}\n\
-           ],\n\
-           \"verdicts\": []\n\
-         }}\n\
-         \n\
          Rules for the name field: lowercase letters, digits, and hyphens only.\n\
          Use today's date {today} in the Learned field of new rule content.\n\
          Domain MUST be \"workflow\" for all rules.\n\
@@ -789,86 +780,27 @@ pub async fn spawn_insights_analysis(
         facets.len()
     );
 
-    // 5. Invoke Haiku
-    run_log!("Invoking claude CLI (model=claude-haiku-4-5-20251001, max-turns=1)");
+    // 5. Invoke Haiku via Anthropic API
+    run_log!("Invoking Anthropic API (model=claude-haiku-4-5-20251001)");
 
-    let shell_path2 = crate::config::shell_path().to_string();
-    let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("claude")
-            .args([
-                "--model",
-                "claude-haiku-4-5-20251001",
-                "--max-turns",
-                "1",
-                "--print",
-            ])
-            .arg(&prompt)
-            .env("PATH", &shell_path2)
-            .output()
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))?
-    .map_err(|e| format!("Failed to spawn claude CLI: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr2 = String::from_utf8_lossy(&output.stderr).to_string();
-
-    run_log!(
-        "CLI finished: exit={:?}, stdout={} bytes",
-        output.status.code(),
-        stdout.len()
-    );
-
-    if !output.status.success() {
-        let error_msg = format!(
-            "claude CLI exit code: {:?}, stderr: {}",
-            output.status.code(),
-            &stderr2[..stderr2.len().min(200)]
-        );
-        run_log!("FAILED: {error_msg}");
-        let duration_ms = start.elapsed().as_millis() as i64;
-        let _ = storage.store_learning_run(&LearningRunPayload {
-            trigger_mode: "insights".to_string(),
-            observations_analyzed: facets.len() as i64,
-            rules_created: 0,
-            rules_updated: 0,
-            duration_ms: Some(duration_ms),
-            status: "failed".to_string(),
-            error: Some(error_msg.clone()),
-            logs: Some(logs.join("\n")),
-        });
-        return Err(error_msg);
-    }
-
-    if !stdout.is_empty() {
-        run_log!("LLM response:\n{}", &stdout[..stdout.len().min(2000)]);
-    }
-
-    // 6. Parse JSON output
-    let json_str = extract_json_block(&stdout).unwrap_or(&stdout);
-    let analysis: AnalysisOutput = match serde_json::from_str(json_str) {
-        Ok(a) => a,
-        Err(initial_err) => {
-            let partial = try_partial_parse(json_str, &stdout);
-            if partial.new_rules.is_empty() {
-                let error_msg = format!("JSON parse error: {initial_err}");
-                run_log!("FAILED: {error_msg}");
-                let duration_ms = start.elapsed().as_millis() as i64;
-                let _ = storage.store_learning_run(&LearningRunPayload {
-                    trigger_mode: "insights".to_string(),
-                    observations_analyzed: facets.len() as i64,
-                    rules_created: 0,
-                    rules_updated: 0,
-                    duration_ms: Some(duration_ms),
-                    status: "failed".to_string(),
-                    error: Some(error_msg.clone()),
-                    logs: Some(logs.join("\n")),
-                });
-                return Err(error_msg);
-            }
-            partial
-        }
-    };
+    let analysis = crate::ai_client::analyze_observations(&prompt)
+        .await
+        .map_err(|e| {
+            let error_msg = format!("Anthropic API failed: {e}");
+            run_log!("FAILED: {error_msg}");
+            let duration_ms = start.elapsed().as_millis() as i64;
+            let _ = storage.store_learning_run(&LearningRunPayload {
+                trigger_mode: "insights".to_string(),
+                observations_analyzed: facets.len() as i64,
+                rules_created: 0,
+                rules_updated: 0,
+                duration_ms: Some(duration_ms),
+                status: "failed".to_string(),
+                error: Some(error_msg.clone()),
+                logs: Some(logs.join("\n")),
+            });
+            error_msg
+        })?;
 
     run_log!("Parsed {} candidate rules", analysis.new_rules.len());
 
@@ -1072,70 +1004,4 @@ fn sanitize_rule_content(content: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Try to extract a JSON object from potentially noisy output
-fn extract_json_block(s: &str) -> Option<&str> {
-    let trimmed = s.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        return Some(trimmed);
-    }
-    let start = trimmed.find('{')?;
-    let end = trimmed.rfind('}')?;
-    if start < end {
-        Some(&trimmed[start..=end])
-    } else {
-        None
-    }
-}
-
-/// Try to extract a JSON array from potentially noisy output (fallback)
-#[allow(dead_code)]
-fn extract_json_array(s: &str) -> Option<&str> {
-    let trimmed = s.trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        return Some(trimmed);
-    }
-    let start = trimmed.find('[')?;
-    let end = trimmed.rfind(']')?;
-    if start < end {
-        Some(&trimmed[start..=end])
-    } else {
-        None
-    }
-}
-
-/// Attempt partial JSON parsing: extract new_rules and verdicts independently.
-/// If the full JSON fails to parse, this tries to recover each field separately
-/// so a malformed verdict array doesn't lose good rule extractions.
-fn try_partial_parse(json_str: &str, raw: &str) -> AnalysisOutput {
-    let mut result = AnalysisOutput {
-        new_rules: Vec::new(),
-        verdicts: Vec::new(),
-    };
-
-    // Try to parse as a generic JSON value first
-    let obj: serde_json::Value =
-        match serde_json::from_str(extract_json_block(raw).unwrap_or(json_str)) {
-            Ok(v) => v,
-            Err(_) => return result,
-        };
-
-    // Extract new_rules independently
-    if let Some(rules_val) = obj.get("new_rules")
-        && let Ok(rules) =
-            serde_json::from_value::<Vec<crate::models::AnalysisRule>>(rules_val.clone())
-    {
-        result.new_rules = rules;
-    }
-
-    // Extract verdicts independently
-    if let Some(verdicts_val) = obj.get("verdicts")
-        && let Ok(verdicts) =
-            serde_json::from_value::<Vec<crate::models::RuleVerdict>>(verdicts_val.clone())
-    {
-        result.verdicts = verdicts;
-    }
-
-    result
 }
