@@ -310,6 +310,10 @@ body {
   min-height: 0;
 }
 
+.learning-content-wrap:first-child {
+  border-top: none;
+}
+
 .learning-content-wrap .learning-app {
   flex: 1;
   min-height: 0;

@@ -18,12 +18,12 @@ const BASE_HEIGHTS: Record<TimeMode, number> = {
   dual: 250,
   background: 200,
 };
-const TIME_MODE_KEY = "claude-usage-time-mode";
-const SHOW_LIVE_KEY = "claude-usage-show-live";
-const SHOW_ANALYTICS_KEY = "claude-usage-show-analytics";
-const SHOW_LEARNING_KEY = "claude-usage-show-learning";
-const SIZE_PREFIX = "claude-usage-size-";
-const SPLIT_RATIO_KEY = "claude-usage-split-ratio";
+const TIME_MODE_KEY = "quill-time-mode";
+const SHOW_LIVE_KEY = "quill-show-live";
+const SHOW_ANALYTICS_KEY = "quill-show-analytics";
+const SHOW_LEARNING_KEY = "quill-show-learning";
+const SIZE_PREFIX = "quill-size-";
+const SPLIT_RATIO_KEY = "quill-split-ratio";
 const DEFAULT_SPLIT_RATIO = 0.4;
 const MIN_SPLIT = 0.15;
 const MAX_SPLIT = 0.85;
@@ -542,33 +542,35 @@ function App() {
         className={`panels${isSplit ? " panels--split" : ""}${showLearning ? " panels--learning" : ""}${showLive && showAnalytics && showLearning ? " panels--triple" : ""}`}
         ref={panelsRef}
       >
-        <div className="upper-panels" ref={upperRef}>
-          {showLive && (
-            <div className="content live-content" ref={liveRef} style={liveStyle}>
-              <UsageDisplay
-                data={usageData}
-                timeMode={timeMode}
-                onTimeModeChange={handleTimeModeChange}
+        {(showLive || showAnalytics) && (
+          <div className="upper-panels" ref={upperRef}>
+            {showLive && (
+              <div className="content live-content" ref={liveRef} style={liveStyle}>
+                <UsageDisplay
+                  data={usageData}
+                  timeMode={timeMode}
+                  onTimeModeChange={handleTimeModeChange}
+                />
+              </div>
+            )}
+            {isSplit && (
+              <div
+                className="panel-divider"
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="Resize panels"
+                tabIndex={0}
+                onMouseDown={handleDividerMouseDown}
+                onKeyDown={handleDividerKeyDown}
               />
-            </div>
-          )}
-          {isSplit && (
-            <div
-              className="panel-divider"
-              role="separator"
-              aria-orientation="horizontal"
-              aria-label="Resize panels"
-              tabIndex={0}
-              onMouseDown={handleDividerMouseDown}
-              onKeyDown={handleDividerKeyDown}
-            />
-          )}
-          {showAnalytics && (
-            <div className="content analytics-content">
-              <AnalyticsView currentBuckets={usageData?.buckets ?? []} />
-            </div>
-          )}
-        </div>
+            )}
+            {showAnalytics && (
+              <div className="content analytics-content">
+                <AnalyticsView currentBuckets={usageData?.buckets ?? []} />
+              </div>
+            )}
+          </div>
+        )}
         {showLearning && (showLive || showAnalytics) && (
           <div
             className="panel-divider"

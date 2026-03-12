@@ -85,7 +85,7 @@ pub async fn start_server(
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
 ) {
-    let port: u16 = std::env::var("CLAUDE_USAGE_PORT")
+    let port: u16 = std::env::var("QUILL_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PORT);

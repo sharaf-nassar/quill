@@ -16,7 +16,7 @@ async function main() {
     const configPath = path.join(
       process.env.HOME || process.env.USERPROFILE,
       ".config",
-      "claude-usage",
+      "quill",
       "config.json"
     );
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
@@ -40,12 +40,12 @@ async function main() {
     });
 
     req.on("error", (err) => {
-      if (process.env.CLAUDE_USAGE_DEBUG) console.error("session-end-learn: request error:", err.message);
+      if (process.env.QUILL_DEBUG) console.error("session-end-learn: request error:", err.message);
     });
     req.write(payload);
     req.end();
   } catch (err) {
-    if (process.env.CLAUDE_USAGE_DEBUG) console.error("session-end-learn: error:", err.message);
+    if (process.env.QUILL_DEBUG) console.error("session-end-learn: error:", err.message);
   }
 }
 

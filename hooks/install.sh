@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# Install the Claude Usage widget hook into Claude Code.
+# Install the Quill widget hook into Claude Code.
 #
 # Preferred: Use the plugin instead:
-#   /plugin marketplace add sharaf-nassar/claude-usage
-#   /plugin install claude-usage-hook@sharaf-nassar/claude-usage
-#   /claude-usage-hook:setup
+#   /plugin marketplace add sharaf-nassar/quill
+#   /plugin install quill-hook@sharaf-nassar/quill
+#   /quill-hook:setup
 #
 # Manual install (this script):
-#   curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/hooks/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/main/hooks/install.sh | bash
 #
 # With options:
 #   ... | bash -s -- --url http://<widget-ip>:19876 --hostname my-server --secret <bearer-secret>
 
 set -euo pipefail
 
-HOOK_URL="https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/hooks/claude-usage-hook.sh"
+HOOK_URL="https://raw.githubusercontent.com/sharaf-nassar/quill/main/hooks/quill-hook.sh"
 INSTALL_DIR="${HOME}/.claude/hooks"
-HOOK_PATH="${INSTALL_DIR}/claude-usage-hook.sh"
+HOOK_PATH="${INSTALL_DIR}/quill-hook.sh"
 SETTINGS_FILE="${HOME}/.claude/settings.json"
-CONFIG_DIR="${HOME}/.config/claude-usage"
+CONFIG_DIR="${HOME}/.config/quill"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 USAGE_URL=""
 HOSTNAME_LABEL=""
 SECRET=""
-SECRET_FILE="${HOME}/.local/share/com.claude.usage-widget/auth_secret"
+SECRET_FILE="${HOME}/.local/share/io.quill.toolkit/auth_secret"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -47,7 +47,7 @@ if [ -z "$SECRET" ]; then
     fi
 fi
 
-echo "Installing Claude Usage hook..."
+echo "Installing Quill hook..."
 
 # Detect if running from the repo (local install) vs piped from GitHub
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
@@ -56,8 +56,8 @@ REPO_ROOT="${SCRIPT_DIR:+$(dirname "$SCRIPT_DIR")}"
 mkdir -p "$INSTALL_DIR"
 
 # Copy or download hook script
-if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/hooks/claude-usage-hook.sh" ]; then
-    cp "$REPO_ROOT/hooks/claude-usage-hook.sh" "$HOOK_PATH"
+if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/hooks/quill-hook.sh" ]; then
+    cp "$REPO_ROOT/hooks/quill-hook.sh" "$HOOK_PATH"
     echo "  Copied hook from local repo to $HOOK_PATH"
 else
     curl -fsSL "$HOOK_URL" -o "$HOOK_PATH"
@@ -95,8 +95,8 @@ else:
 PYEOF
 
 # Copy or download observe and session-end-learn scripts
-OBSERVE_PATH="${INSTALL_DIR}/claude-usage-observe.js"
-SESSION_END_PATH="${INSTALL_DIR}/claude-usage-session-end-learn.js"
+OBSERVE_PATH="${INSTALL_DIR}/quill-observe.js"
+SESSION_END_PATH="${INSTALL_DIR}/quill-session-end-learn.js"
 
 if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/plugin/scripts/observe.js" ]; then
     cp "$REPO_ROOT/plugin/scripts/observe.js" "$OBSERVE_PATH"
@@ -104,8 +104,8 @@ if [ -n "$REPO_ROOT" ] && [ -f "$REPO_ROOT/plugin/scripts/observe.js" ]; then
     cp "$REPO_ROOT/plugin/scripts/session-end-learn.js" "$SESSION_END_PATH"
     echo "  Copied session-end-learn hook from local repo"
 else
-    OBSERVE_URL="https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/plugin/scripts/observe.js"
-    SESSION_END_URL="https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/plugin/scripts/session-end-learn.js"
+    OBSERVE_URL="https://raw.githubusercontent.com/sharaf-nassar/quill/main/plugin/scripts/observe.js"
+    SESSION_END_URL="https://raw.githubusercontent.com/sharaf-nassar/quill/main/plugin/scripts/session-end-learn.js"
     curl -fsSL "$OBSERVE_URL" -o "$OBSERVE_PATH"
     echo "  Downloaded observe hook to $OBSERVE_PATH"
     curl -fsSL "$SESSION_END_URL" -o "$SESSION_END_PATH"
@@ -136,7 +136,7 @@ token_found = False
 session_end_found = False
 for entry in stop_hooks:
     for h in entry.get("hooks", []):
-        if "claude-usage-hook" in h.get("command", ""):
+        if "quill-hook" in h.get("command", ""):
             h["command"] = token_hook_cmd
             token_found = True
         if "session-end-learn" in h.get("command", ""):
@@ -149,7 +149,7 @@ if not session_end_found:
     added = False
     for entry in stop_hooks:
         for h in entry.get("hooks", []):
-            if "claude-usage" in h.get("command", ""):
+            if "quill" in h.get("command", ""):
                 entry["hooks"].append({"type": "command", "command": session_end_cmd, "timeout": 5})
                 added = True
                 break
@@ -166,7 +166,7 @@ for event in ["PreToolUse", "PostToolUse"]:
     found = False
     for entry in event_hooks:
         for h in entry.get("hooks", []):
-            if "claude-usage" in h.get("command", ""):
+            if "quill" in h.get("command", ""):
                 h["command"] = observe_cmd
                 h.pop("async", None)
                 h["timeout"] = 3

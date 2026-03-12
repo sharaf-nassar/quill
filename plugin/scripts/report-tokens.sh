@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Reports token usage from the last assistant turn to the Claude Usage widget.
-# Runs as a Claude Code Stop hook via the claude-usage-hook plugin.
+# Reports token usage from the last assistant turn to the Quill widget.
+# Runs as a Claude Code Stop hook via the quill-hook plugin.
 
 set -euo pipefail
 
-CONFIG_FILE="${HOME}/.config/claude-usage/config.json"
+CONFIG_FILE="${HOME}/.config/quill/config.json"
 
 # No config file = not configured yet, skip silently
 if [ ! -f "$CONFIG_FILE" ]; then

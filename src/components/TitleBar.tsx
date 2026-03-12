@@ -99,7 +99,7 @@ function TitleBar({
         </button>
       ) : (
         <span className="titlebar-text" data-tauri-drag-region>
-          CLAUDE USAGE
+          QUILL
         </span>
       )}
       {version && <span className="titlebar-version">v{version}</span>}

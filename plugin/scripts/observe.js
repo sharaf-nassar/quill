@@ -28,7 +28,7 @@ function main() {
     const configPath = path.join(
       process.env.HOME || process.env.USERPROFILE,
       ".config",
-      "claude-usage",
+      "quill",
       "config.json"
     );
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
@@ -53,18 +53,18 @@ function main() {
         "Content-Length": Buffer.byteLength(payload),
       },
     }, (res) => {
-      if (res.statusCode >= 400 && process.env.CLAUDE_USAGE_DEBUG) {
+      if (res.statusCode >= 400 && process.env.QUILL_DEBUG) {
         console.error(`observe: server returned ${res.statusCode}`);
       }
       res.resume();
     });
 
     req.on("error", (err) => {
-      if (process.env.CLAUDE_USAGE_DEBUG) console.error("observe: request error:", err.message);
+      if (process.env.QUILL_DEBUG) console.error("observe: request error:", err.message);
     });
     req.end(payload);
   } catch (err) {
-    if (process.env.CLAUDE_USAGE_DEBUG) console.error("observe: error:", err.message);
+    if (process.env.QUILL_DEBUG) console.error("observe: error:", err.message);
   }
 }
 

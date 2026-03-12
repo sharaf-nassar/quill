@@ -1,12 +1,12 @@
 {
-  "name": "claude-usage-hook",
-  "description": "Reports per-turn token usage to the Claude Usage desktop widget. After installing, run /claude-usage-hook:setup to configure the widget address.",
-  "version": "1.6.0",
+  "name": "quill-hook",
+  "description": "Reports per-turn token usage to the Quill desktop widget. After installing, run /quill-hook:setup to configure the widget address.",
+  "version": "1.7.0",
   "author": {
     "name": "Sharaf Nassar",
     "url": "https://github.com/sharaf-nassar"
   },
-  "repository": "https://github.com/sharaf-nassar/claude-usage",
+  "repository": "https://github.com/sharaf-nassar/quill",
   "license": "MIT",
   "keywords": ["usage", "tokens", "analytics", "widget"],
   "skills": ["./skills/", "./commands/"]

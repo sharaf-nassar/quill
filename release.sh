@@ -62,8 +62,8 @@ cmd_bump() {
   echo "New version:     ${new_version}"
   echo ""
 
-  read -rp "Create and push tag v${new_version}? [y/N] " confirm
-  if [[ "$confirm" != [yY] ]]; then
+  read -rp "Create and push tag v${new_version}? [Y/n] " confirm
+  if [[ "$confirm" == [nN] ]]; then
     echo "Aborted."
     exit 0
   fi
@@ -98,8 +98,8 @@ cmd_retag() {
   echo "WARNING: This deletes the tag on the remote and re-pushes it."
   echo ""
 
-  read -rp "Continue? [y/N] " confirm
-  if [[ "$confirm" != [yY] ]]; then
+  read -rp "Continue? [Y/n] " confirm
+  if [[ "$confirm" == [nN] ]]; then
     echo "Aborted."
     exit 0
   fi

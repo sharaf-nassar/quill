@@ -139,7 +139,7 @@ interface AnalyticsViewProps {
   currentBuckets: UsageBucket[];
 }
 
-const BREAKDOWN_COLLAPSED_KEY = "claude-usage-breakdown-collapsed";
+const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 
 function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
   const [range, setRange] = useState<RangeType>("24h");

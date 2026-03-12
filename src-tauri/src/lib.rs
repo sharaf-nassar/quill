@@ -386,7 +386,7 @@ pub fn run() {
                 let index_dir = dirs::data_local_dir()
                     .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
                     .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("claude-usage")
+                    .join("io.quill.toolkit")
                     .join("session-index");
 
                 match sessions::SessionIndex::open_or_create(&index_dir) {
@@ -557,6 +557,15 @@ pub fn run() {
 
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_always_on_top(on_top_enabled);
+                // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
+                let taskbar_icon_bytes = include_bytes!("../icons/taskbar-icon.png");
+                match tauri::image::Image::from_bytes(taskbar_icon_bytes as &[u8]) {
+                    Ok(img) => match w.set_icon(img) {
+                        Ok(_) => log::info!("Window icon set successfully"),
+                        Err(e) => log::error!("Failed to set window icon: {e}"),
+                    },
+                    Err(e) => log::error!("Failed to load taskbar icon: {e}"),
+                }
             }
 
             let show = MenuItem::with_id(app, "show", "Show Widget", true, None::<&str>)?;
@@ -576,7 +585,7 @@ pub fn run() {
 
             TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
-                .tooltip("Claude Usage")
+                .tooltip("Quill")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id().as_ref() {

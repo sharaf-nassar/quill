@@ -5,7 +5,7 @@ description: Analyze session observations and extract learned patterns into rule
 
 # Learn — Extract Patterns from Observations
 
-You are analyzing tool-use observations collected by the Claude Usage widget to identify behavioral patterns that should become persistent rules.
+You are analyzing tool-use observations collected by the Quill widget to identify behavioral patterns that should become persistent rules.
 
 ## Step 1: Load Configuration
 
@@ -14,7 +14,7 @@ Run this to get the widget URL and auth secret:
 ```bash
 python3 -c "
 import json, os
-config_path = os.path.expanduser('~/.config/claude-usage/config.json')
+config_path = os.path.expanduser('~/.config/quill/config.json')
 with open(config_path) as f:
     c = json.load(f)
 print(c.get('url', ''))

@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for Claude Usage widget",
+  "description": "Default capabilities for Quill widget",
   "windows": ["main", "runs", "sessions"],
   "permissions": [
     "core:default",

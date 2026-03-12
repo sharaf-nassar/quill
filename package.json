@@ -1,5 +1,5 @@
 {
-  "name": "claude-usage",
+  "name": "quill",
   "version": "0.0.0-injected-by-ci",
   "private": true,
   "type": "module",

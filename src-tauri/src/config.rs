@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -101,6 +100,7 @@ fn write_credentials_file(data: &serde_json::Value) -> Result<(), String> {
         let _ = tmp.set_permissions(fs::Permissions::from_mode(0o600));
     }
 
+    use std::io::Write;
     tmp.write_all(json.as_bytes())
         .map_err(|e| format!("Failed to write temp file: {e}"))?;
     tmp.sync_all()

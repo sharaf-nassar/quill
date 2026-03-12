@@ -1,17 +1,17 @@
 [package]
-name = "claude-usage"
+name = "quill"
 version = "0.0.0-injected-by-ci"
 edition = "2024"
 
 [lib]
-name = "claude_usage_lib"
+name = "quill_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-window-state = "2"
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }

@@ -50,7 +50,7 @@ fn db_path() -> Result<PathBuf, String> {
     let data_dir = dirs::data_local_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
         .ok_or("Cannot determine data directory")?;
-    let app_dir = data_dir.join("com.claude.usage-widget");
+    let app_dir = data_dir.join("io.quill.toolkit");
     std::fs::create_dir_all(&app_dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
 
     #[cfg(unix)]

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # Claude Code Stop hook — extracts token usage from the last assistant turn
-# and reports it to the Claude Usage widget HTTP server.
+# and reports it to the Quill widget HTTP server.
 #
-# Configuration is read from ~/.config/claude-usage/config.json (written by
+# Configuration is read from ~/.config/quill/config.json (written by
 # the plugin setup skill). Falls back to env vars, then defaults.
 #
 # Install via plugin:
-#   /plugin marketplace add sharaf-nassar/claude-usage
-#   /plugin install claude-usage-hook@sharaf-nassar/claude-usage
-#   /claude-usage-hook:setup
+#   /plugin marketplace add sharaf-nassar/quill
+#   /plugin install quill-hook@sharaf-nassar/quill
+#   /quill-hook:setup
 
 set -euo pipefail
 
-CONFIG_FILE="${HOME}/.config/claude-usage/config.json"
+CONFIG_FILE="${HOME}/.config/quill/config.json"
 
 # No config file = not configured yet, skip silently
 if [ ! -f "$CONFIG_FILE" ]; then

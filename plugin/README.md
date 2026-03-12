@@ -1,20 +1,20 @@
-# claude-usage-hook
+# quill-hook
 
-Claude Code plugin that reports per-turn token usage (input, output, cache creation, cache read) to the [Claude Usage](https://github.com/sharaf-nassar/claude-usage) desktop widget.
+Claude Code plugin that reports per-turn token usage (input, output, cache creation, cache read) to the [Quill](https://github.com/sharaf-nassar/quill) desktop widget.
 
 ## Install
 
 ```
-/plugin marketplace add sharaf-nassar/claude-usage
-/plugin install claude-usage-hook@sharaf-nassar/claude-usage
-/claude-usage-hook:setup
+/plugin marketplace add sharaf-nassar/quill
+/plugin install quill-hook@sharaf-nassar/quill
+/quill-hook:setup
 ```
 
 The setup skill will ask:
 1. Whether the widget is on this machine or a remote IP
 2. What hostname label this machine should report as
 
-Configuration is saved to `~/.config/claude-usage/config.json`.
+Configuration is saved to `~/.config/quill/config.json`.
 
 ## Remote setup
 
@@ -30,7 +30,7 @@ When the widget runs on a different machine, the setup skill will prompt for the
 ## Requirements
 
 - `python3` and `curl` available on PATH
-- The Claude Usage widget running (provides the HTTP server on port 19876)
+- The Quill widget running (provides the HTTP server on port 19876)
 
 ## How it works
 
@@ -39,4 +39,4 @@ The plugin registers a Stop hook that fires after every Claude Code turn. It:
 2. Extracts input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
 3. POSTs the data to the widget's HTTP server (2s timeout, fails silently)
 
-No data is sent until you run `/claude-usage-hook:setup`.
+No data is sent until you run `/quill-hook:setup`.

@@ -164,7 +164,7 @@ impl SessionIndex {
     }
 
     /// Extract a human-readable project name from a directory-encoded path.
-    /// e.g. "-home-mamba-work-claude-usage" -> "claude-usage"
+    /// e.g. "-home-mamba-work-quill" -> "quill"
     pub fn project_display_name(dir_name: &str) -> String {
         dir_name
             .rsplit('-')

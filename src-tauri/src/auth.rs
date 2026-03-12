@@ -6,7 +6,7 @@ use std::path::PathBuf;
 fn secret_path() -> Result<PathBuf, String> {
     let data_dir = dirs::data_local_dir()
         .ok_or_else(|| "cannot determine local data directory".to_string())?;
-    Ok(data_dir.join("com.claude.usage-widget").join("auth_secret"))
+    Ok(data_dir.join("io.quill.toolkit").join("auth_secret"))
 }
 
 fn create_secret_file(path: &std::path::Path) -> std::io::Result<fs::File> {

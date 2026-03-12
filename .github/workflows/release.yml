@@ -93,42 +93,18 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
-          # Notarization is handled separately below with a 5-minute timeout
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         with:
           tagName: v__VERSION__
-          releaseName: 'Claude Usage v__VERSION__'
+          releaseName: 'Quill v__VERSION__'
           releaseBody: 'Download the installer for your platform from the assets below.'
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
-
-      - name: Notarize macOS DMG
-        if: matrix.platform == 'macos-latest'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TARGET=$(echo "${{ matrix.args }}" | sed 's/--target //')
-          DMG=$(find "src-tauri/target/${TARGET}/release/bundle/dmg" -name "*.dmg" 2>/dev/null | head -1)
-          if [ -z "$DMG" ]; then
-            echo "::error::No DMG found for target ${TARGET}"
-            exit 1
-          fi
-
-          echo "Notarizing $(basename "$DMG") with 5-minute timeout..."
-          xcrun notarytool submit "$DMG" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 5m
-
-          echo "Stapling notarization ticket..."
-          xcrun stapler staple "$DMG"
-
-          echo "Re-uploading notarized DMG to release..."
-          gh release upload "${{ github.ref_name }}" "$DMG" --clobber
 
   publish:
     needs: build
@@ -158,11 +134,16 @@ jobs:
           fi
           echo "Found release ID: ${RELEASE_ID}"
 
-          # Rename assets: insert platform between version and arch
+          # Rename assets: insert platform between version and arch (skip already-renamed)
           gh api "repos/${GH_REPO}/releases/${RELEASE_ID}/assets" --jq '.[] | "\(.id)\t\(.name)"' | while IFS=$'\t' read -r id name; do
+            # Skip files that already have a platform label
+            if [[ "$name" =~ _(linux|macOS|windows)_ ]]; then
+              continue
+            fi
+
             new_name="$name"
 
-            if [[ "$name" == *".AppImage"* ]]; then
+            if [[ "$name" == *".AppImage"* ]] || [[ "$name" == *".deb"* ]]; then
               new_name=$(echo "$name" | sed -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_/\1_linux_/')
             elif [[ "$name" == *".app.tar.gz"* ]] || [[ "$name" == *".dmg"* ]]; then
               new_name=$(echo "$name" | sed -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_/\1_macOS_/')
@@ -183,6 +164,7 @@ jobs:
               -H "Accept: application/octet-stream" > latest.json
 
             sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.AppImage)/\1_linux_\2/g' latest.json
+            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.deb)/\1_linux_\2/g' latest.json
             sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.app\.tar\.gz)/\1_macOS_\2/g' latest.json
             sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.dmg)/\1_macOS_\2/g' latest.json
             sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.exe)/\1_windows_\2/g' latest.json

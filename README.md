@@ -1,24 +1,73 @@
-# Claude Usage Widget
+# Quill
+
+<p align="center">
+  <img src="src-tauri/icons/quill-original.png" width="128" alt="Quill icon" />
+</p>
 
 A cross-platform desktop widget that displays your Claude AI plan usage in a compact, always-on-top floating window. Built with Tauri + React.
 
 ## Features
 
-- Displays per-5-hour and per-7-day usage with progress bars
+### Live usage
+- Per-5-hour and per-7-day usage with progress bars
 - Per-model breakdown (Sonnet, Opus, Code, OAuth)
 - Color-coded percentages that transition green → yellow → red as usage increases
 - Countdown timers showing time until usage resets
 - Three time display modes (pace marker, dual bars, background fill)
-- Analytics view with historical charts and per-bucket stats
-- **Token tracking** — per-turn input/output/cache token counts via Claude Code hook
+- Token sparkline showing per-turn token counts over time
+
+### Analytics
+- Historical usage charts with dual-axis visualization (utilization + tokens)
+- Per-bucket statistics with min/max/average, trend indicators, and sparklines
+- **Breakdown panels** — token usage grouped by host, project, or session with per-item data deletion
+- Time range selection (1h, 24h, 7d, 30d)
+
+### Session search
+- Full-text search across all Claude Code sessions (powered by Tantivy)
+- Filter by project, host, role, date range, and git branch
+- Snippet highlighting with expandable message context
+- Opens in a dedicated search window from the titlebar
+
+### Token tracking
+- Per-turn input/output/cache token counts via Claude Code hook
 - **Multi-host support** — remote Claude Code instances can report usage over the network
 - Token sparkline in the live view and dual-axis chart overlay in analytics
-- **Learning panel** — integrated side panel that shows learned usage rules, observation stats, and analysis history (toggle from the titlebar)
-- Always-on-top floating window with semi-transparent dark theme
-- Custom titlebar with drag-to-move
+
+### Learning
+- Integrated side panel that shows learned usage rules, observation stats, and analysis history
+- Configurable triggers: on-demand, session-end, periodic, or combined
+- Rule state tracking (emerging → confirmed → stale → invalidated)
+- Domain-grouped rules with confidence scores
+- Run history with real-time analysis logs
+
+### Desktop integration
+- **System tray** with Show / Always on Top / Check for Update / Quit
+- **In-app updater** — checks on startup and every 4 hours; yellow "Update" button appears in the titlebar
+- Always-on-top mode (toggleable from tray menu)
+- Semi-transparent dark theme with custom drag-to-move titlebar
 - Remembers window position and size across restarts
-- Auto-refreshes every 60 seconds
+- Auto-refreshes usage every 60 seconds
 - Automatically refreshes expired OAuth tokens
+
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><strong>Live usage</strong></td>
+    <td align="center"><strong>Analytics</strong></td>
+    <td align="center"><strong>Learning</strong></td>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/live-view.png" width="280" alt="Live usage view with progress bars and token sparkline" /></td>
+    <td><img src="docs/screenshots/analytics-view.png" width="320" alt="Analytics view with usage chart and host breakdown" /></td>
+    <td><img src="docs/screenshots/learning-panel.png" width="280" alt="Learning panel with rules, confidence scores, and domains" /></td>
+  </tr>
+</table>
+
+<p align="center">
+  <strong>Session search</strong><br/>
+  <img src="docs/screenshots/session-search.png" width="300" alt="Session search with filters and highlighted results" />
+</p>
 
 ## Architecture
 
@@ -88,48 +137,48 @@ graph LR
 ### From releases
 
 Download the latest release for your platform from the [Releases](../../releases) page:
-- **Linux**: `.AppImage`
+- **Linux**: `.deb` (recommended) or `.AppImage`
 - **Windows**: `.exe`
 - **macOS**: `.dmg`
 
 #### Linux setup
 
-The AppImage is a portable executable — no installation or sudo required:
+**Debian/Ubuntu (recommended)** — installs the binary, desktop entry, and icons system-wide:
 
 ```bash
-chmod +x Claude.Usage_*_linux_amd64.AppImage
-./Claude.Usage_*_linux_amd64.AppImage
+sudo dpkg -i Quill_*_linux_amd64.deb
 ```
 
-To integrate it as a desktop app (shows up in your app launcher):
+**AppImage** — portable executable, no installation required:
 
 ```bash
-mkdir -p ~/Applications
-mv Claude.Usage_*_linux_amd64.AppImage ~/Applications/
-chmod +x ~/Applications/Claude.Usage_*_linux_amd64.AppImage
+chmod +x Quill_*_linux_amd64.AppImage
+./Quill_*_linux_amd64.AppImage
+```
 
-# Download the app icon
-mkdir -p ~/.local/share/icons
-curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/src-tauri/icons/icon.png \
-  -o ~/.local/share/icons/claude-usage.png
+#### Linux uninstall
 
-# Create the desktop entry
-mkdir -p ~/.local/share/applications
-cat > ~/.local/share/applications/claude-usage.desktop << EOF
-[Desktop Entry]
-Name=Claude Usage
-Exec=$HOME/Applications/Claude.Usage_0.1.0_linux_amd64.AppImage
-Icon=$HOME/.local/share/icons/claude-usage.png
-Type=Application
-Categories=Utility;
-EOF
+To fully remove Quill and its data:
+
+```bash
+# If installed via .deb:
+sudo dpkg -r quill
+
+# If using AppImage:
+rm -f ~/Applications/Quill_*_linux_amd64.AppImage
+
+# Remove app data (usage database, auth secret, logs, etc.)
+rm -rf ~/.local/share/io.quill.toolkit
+
+# Remove hook config
+rm -rf ~/.config/quill
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/sharaf-nassar/claude-usage.git
-cd claude-usage
+git clone https://github.com/sharaf-nassar/quill.git
+cd quill
 npm install
 cargo tauri build
 ```
@@ -146,31 +195,34 @@ claude /login
 
 No additional configuration is needed — the widget starts tracking utilization immediately.
 
-## Token Tracking & Learning (Optional)
+## Token Tracking, Learning & Session Search (Optional)
 
-The widget includes an HTTP server (port `19876`) that receives data from Claude Code via hooks. The plugin enables two features:
+The widget includes an HTTP server (port `19876`, configurable via `QUILL_PORT`) that receives data from Claude Code via hooks. The plugin enables three features:
 
 - **Token tracking** — per-turn input/output/cache token counts, powering the sparkline in the live view and the token overlay on the analytics chart
 - **Learning** — observes tool usage patterns across sessions and can analyze them to extract reusable rules (stored in `~/.claude/rules/learned/`)
+- **Session search** — indexes Claude Code session transcripts for full-text search with filters
+
+The HTTP server uses bearer-token authentication and rate limiting to secure incoming data.
 
 ### Install the hook (Claude Code plugin)
 
 1. Add the marketplace:
 
 ```
-/plugin marketplace add sharaf-nassar/claude-usage
+/plugin marketplace add sharaf-nassar/quill
 ```
 
 2. Install the plugin:
 
 ```
-/plugin install claude-usage-hook@sharaf-nassar/claude-usage
+/plugin install quill-hook@sharaf-nassar/quill
 ```
 
 3. **Restart** Claude Code, then run the setup skill:
 
 ```
-/claude-usage-hook:setup
+/quill-hook:setup
 ```
 
 The setup skill will ask where the widget is running (this machine or a remote IP) and save the config. After setup, every Claude Code turn will report token counts and tool observations to the widget.
@@ -185,19 +237,26 @@ Once the plugin is installed and observations are being collected:
    - **On-demand** — click "Analyze" in the panel to run analysis manually
    - **Session-end** — automatically analyzes after each Claude Code session ends
    - **Periodic** — runs analysis on a configurable interval
+   - **Combined** — both session-end and periodic enabled together
 4. Analysis extracts patterns from observations and creates rule files in `~/.claude/rules/learned/`
 5. Learned rules appear as cards in the panel with confidence scores and domain tags
+
+You can also trigger analysis from Claude Code by running the learn skill:
+
+```
+/quill-hook:learn
+```
 
 ### Manual install (alternative)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/hooks/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/main/hooks/install.sh | bash
 ```
 
 With a remote widget host:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/claude-usage/main/hooks/install.sh | bash -s -- --url http://<widget-ip>:19876 --hostname my-server
+curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/main/hooks/install.sh | bash -s -- --url http://<widget-ip>:19876 --hostname my-server
 ```
 
 ### Multi-host setup
@@ -227,9 +286,11 @@ cargo tauri dev
 
 - **Drag the title bar** to move the window
 - **Drag any edge or corner** to resize
-- **Right-click** for a context menu (Refresh / Quit)
 - **Gear icon** to switch between time display modes
+- **Chart icon** to toggle the analytics view
 - **Star button (✦)** to toggle the learning panel — the window expands rightward to show it and shrinks back when closed
+- **Search icon** to open the session search window
+- **System tray icon** — left-click to show the widget; menu has Always on Top, Check for Update, and Quit
 
 ## Project structure
 
@@ -237,56 +298,78 @@ cargo tauri dev
 src/                          # React frontend
   main.tsx                    # Entry point
   App.tsx                     # Main app component with learning sidebar
+  types.ts                    # Shared TypeScript interfaces
   components/
-    TitleBar.tsx              # Custom minimal titlebar (drag + close + learning toggle)
+    TitleBar.tsx              # Custom titlebar (drag, view toggles, search, update)
+    SectionHeader.tsx         # Reusable collapsible section header
     UsageRow.tsx              # Usage row with progress bar + token sparkline
-    UsageDisplay.tsx          # Container for all rows
+    UsageDisplay.tsx          # Container for all usage rows
     analytics/
-      AnalyticsView.tsx       # Analytics tab with charts and stats
+      AnalyticsView.tsx       # Analytics tab with charts, stats, and breakdowns
+      BreakdownPanel.tsx      # Host/project/session breakdown with deletion
       UsageChart.tsx          # Dual-axis chart (utilization + tokens)
-      StatsPanel.tsx          # Bucket statistics cards
-      BucketOverview.tsx      # All-buckets summary with sparklines
+      shared.tsx              # Shared analytics utilities
     learning/
-      LearningTitleBar.tsx    # Learning panel header with ON/OFF toggle
       StatusStrip.tsx         # Observation stats and sparkline
-      TriggerSettings.tsx     # Analysis trigger configuration
       RuleCard.tsx            # Individual learned rule display
       DomainBreakdown.tsx     # Rules grouped by domain
       RunHistory.tsx          # Past analysis run log
+      FloatingRunsWindow.tsx  # Floating window for run history with live logs
+    sessions/
+      SearchBar.tsx           # Full-text search input with debounce
+      FilterBar.tsx           # Collapsible filters (project, host, role, date)
+      ResultCard.tsx          # Search result with expandable context
   windows/
     LearningWindow.tsx        # Learning panel (integrated sidebar)
+    RunsWindowView.tsx        # Standalone run history window
+    SessionsWindowView.tsx    # Session search window
   hooks/
     useAnalyticsData.ts       # Fetches utilization history and stats
+    useBreakdownData.ts       # Fetches host/project/session breakdowns
     useTokenData.ts           # Fetches token history, stats, hostnames
     useLearningData.ts        # Fetches learning rules, runs, observations
+    useToast.tsx              # Toast notification system
   utils/
+    time.ts                   # Relative time formatting
     tokens.ts                 # Token count formatting (1.2k, 1.5M)
   styles/
     index.css                 # Global styles + dark theme
     learning.css              # Learning panel styles
+    sessions.css              # Session search styles
 src-tauri/                    # Rust backend
   src/
     main.rs                   # Tauri entry point
-    lib.rs                    # IPC commands and server startup
+    lib.rs                    # IPC commands, tray icon, updater, server startup
+    ai_client.rs              # Rig Anthropic integration for learning analysis
+    auth.rs                   # OAuth token management
     config.rs                 # Credential loading and token refresh
     fetcher.rs                # Usage API calls with retry logic
     learning.rs               # Learning analysis spawner
     models.rs                 # Data models (usage buckets + token + learning types)
+    sessions.rs               # Tantivy full-text session search and indexing
     storage.rs                # SQLite storage with aggregation
     server.rs                 # axum HTTP server for token reporting
   tauri.conf.json             # Tauri window and build configuration
-plugin/                       # Claude Code plugin (hook + setup skill)
+plugin/                       # Claude Code plugin (hook + setup/learn skills)
   .claude-plugin/
     plugin.json               # Plugin manifest
   hooks/
-    hooks.json                # Stop hook configuration
+    hooks.json                # PreToolUse, PostToolUse, and Stop hook config
   scripts/
+    observe.js                # Captures tool observations (pre/post tool use)
     report-tokens.sh          # Extracts tokens from transcript, POSTs to widget
+    session-sync.js           # Syncs session metadata and messages to widget
+    session-end-learn.js      # Triggers learning analysis on session end
   skills/
     setup/
       SKILL.md                # Interactive setup wizard
+    learn/
+      SKILL.md                # Manual learning analysis trigger
+  commands/
+    setup.md                  # Setup command documentation
+    learn.md                  # Learn command documentation
 hooks/                        # Standalone hook scripts (non-plugin)
-  claude-usage-hook.sh        # Standalone Stop hook
+  quill-hook.sh               # Standalone Stop hook
   install.sh                  # curl-pipe installer
 ```
 
@@ -302,7 +385,7 @@ Releases are driven by git tags. The CI workflow (`.github/workflows/release.yml
 
 2. The `tauri-action` patches the version in `tauri.conf.json` at build time using the tag, so the built binary always matches the tag version. You do not need to update `tauri.conf.json`, `package.json`, or `Cargo.toml` manually — the git tag is the single source of truth for the release version.
 
-3. The workflow creates a draft GitHub release, builds for all platforms (Linux AppImage, macOS dmg, Windows nsis), then publishes the release.
+3. The workflow creates a draft GitHub release, builds for all platforms (Linux AppImage + .deb, macOS dmg for Intel + ARM, Windows nsis), then publishes the release.
 
 4. The in-app updater checks the `latest.json` endpoint on GitHub Releases on startup and every 4 hours. When an update is found, a yellow "Update" button appears in the titlebar. Linux uses AppImage so updates install without sudo.
 
