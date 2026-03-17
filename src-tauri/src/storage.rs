@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 
-use chrono::{TimeDelta, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 
 use crate::models::{
-    BucketStats, DataPoint, HostBreakdown, LearnedRule, LearnedRulePayload, LearningRun,
-    LearningRunPayload, LearningStatus, ObservationPayload, ProjectBreakdown, SessionBreakdown,
-    TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LanguageBreakdown,
+    LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload, LearningStatus,
+    ObservationPayload, ProjectBreakdown, SessionBreakdown, SessionCodeStats, TokenDataPoint,
+    TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
@@ -60,6 +61,66 @@ fn db_path() -> Result<PathBuf, String> {
     }
 
     Ok(app_dir.join("usage.db"))
+}
+
+fn ext_to_language(file_path: &str) -> &'static str {
+    let ext = file_path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "ts" | "tsx" => "TypeScript",
+        "js" | "jsx" => "JavaScript",
+        "rs" => "Rust",
+        "py" => "Python",
+        "css" | "scss" => "CSS",
+        "html" => "HTML",
+        "json" => "JSON",
+        "toml" => "TOML",
+        "yaml" | "yml" => "YAML",
+        "md" => "Markdown",
+        "sql" => "SQL",
+        "go" => "Go",
+        "sh" => "Shell",
+        _ => "Other",
+    }
+}
+
+fn parse_code_change(tool_name: &str, full_input: &str) -> Option<(i64, i64, String)> {
+    let parsed: serde_json::Value = serde_json::from_str(full_input).ok()?;
+
+    let file_path = parsed
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    match tool_name {
+        "Edit" => {
+            let old = parsed.get("old_string").and_then(|v| v.as_str())?;
+            let new = parsed.get("new_string").and_then(|v| v.as_str())?;
+            let removed = old.lines().count() as i64;
+            let added = new.lines().count() as i64;
+            Some((added, removed, file_path))
+        }
+        "Write" => {
+            let content = parsed.get("content").and_then(|v| v.as_str())?;
+            let added = content.lines().count() as i64;
+            Some((added, 0, file_path))
+        }
+        _ => None,
+    }
+}
+
+fn range_to_duration(range: &str) -> TimeDelta {
+    match range {
+        "1h" => TimeDelta::hours(1),
+        "24h" => TimeDelta::hours(24),
+        "7d" => TimeDelta::days(7),
+        "30d" => TimeDelta::days(30),
+        _ => TimeDelta::hours(24),
+    }
 }
 
 pub struct Storage {
@@ -2400,6 +2461,239 @@ impl Storage {
             .map_err(|e| format!("Failed to check duplicate pending: {e}"))?
         };
         Ok(count > 0)
+    }
+
+    pub fn get_code_stats(&self, range: &str) -> Result<CodeStats, String> {
+        let conn = self.conn.lock();
+        let from = (Utc::now() - range_to_duration(range)).to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT tool_name, file_path, full_input, session_id
+				 FROM tool_actions
+				 WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL",
+            )
+            .map_err(|e| format!("Prepare error: {e}"))?;
+
+        let mut total_added: i64 = 0;
+        let mut total_removed: i64 = 0;
+        let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut lang_lines: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+
+        let rows = stmt
+            .query_map([&from], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        for row in rows {
+            let (tool_name, file_path, full_input, session_id) =
+                row.map_err(|e| format!("Row error: {e}"))?;
+
+            if let Some((added, removed, parsed_path)) = parse_code_change(&tool_name, &full_input)
+            {
+                total_added += added;
+                total_removed += removed;
+                sessions.insert(session_id);
+
+                let path = if parsed_path.is_empty() {
+                    file_path.unwrap_or_default()
+                } else {
+                    parsed_path
+                };
+                let lang = ext_to_language(&path);
+                *lang_lines.entry(lang).or_insert(0) += added + removed;
+            }
+        }
+
+        let session_count = sessions.len() as i64;
+        let total_changed = total_added + total_removed;
+        let avg_per_session = if session_count > 0 {
+            total_changed as f64 / session_count as f64
+        } else {
+            0.0
+        };
+
+        let mut by_language: Vec<LanguageBreakdown> = lang_lines
+            .into_iter()
+            .map(|(language, lines)| {
+                let percentage = if total_changed > 0 {
+                    (lines as f64 / total_changed as f64) * 100.0
+                } else {
+                    0.0
+                };
+                LanguageBreakdown {
+                    language: language.to_string(),
+                    lines,
+                    percentage,
+                }
+            })
+            .collect();
+        by_language.sort_by(|a, b| b.lines.cmp(&a.lines));
+
+        Ok(CodeStats {
+            lines_added: total_added,
+            lines_removed: total_removed,
+            net_change: total_added - total_removed,
+            session_count,
+            avg_per_session,
+            by_language,
+        })
+    }
+
+    pub fn get_code_stats_history(
+        &self,
+        range: &str,
+    ) -> Result<Vec<CodeStatsHistoryPoint>, String> {
+        let conn = self.conn.lock();
+        let now = Utc::now();
+        let from = now - range_to_duration(range);
+        let from_str = from.to_rfc3339();
+
+        let bucket_secs: i64 = match range {
+            "1h" => 60,
+            "24h" => 15 * 60,
+            "7d" => 3600,
+            "30d" => 86400,
+            _ => 15 * 60,
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT tool_name, full_input, timestamp
+				 FROM tool_actions
+				 WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL
+				 ORDER BY timestamp ASC",
+            )
+            .map_err(|e| format!("Prepare error: {e}"))?;
+
+        struct RawChange {
+            added: i64,
+            removed: i64,
+            ts: DateTime<Utc>,
+        }
+        let mut changes: Vec<RawChange> = Vec::new();
+
+        let rows = stmt
+            .query_map([&from_str], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        for row in rows {
+            let (tool_name, full_input, timestamp) = row.map_err(|e| format!("Row error: {e}"))?;
+
+            if let Some((added, removed, _)) = parse_code_change(&tool_name, &full_input)
+                && let Ok(ts) = timestamp.parse::<DateTime<Utc>>()
+            {
+                changes.push(RawChange { added, removed, ts });
+            }
+        }
+
+        let from_ts = from.timestamp();
+        let now_ts = now.timestamp();
+        let mut points: Vec<CodeStatsHistoryPoint> = Vec::new();
+        let mut bucket_start = from_ts;
+
+        while bucket_start < now_ts {
+            let bucket_end = bucket_start + bucket_secs;
+            let mut added = 0i64;
+            let mut removed = 0i64;
+
+            for c in &changes {
+                let ct = c.ts.timestamp();
+                if ct >= bucket_start && ct < bucket_end {
+                    added += c.added;
+                    removed += c.removed;
+                }
+            }
+
+            let ts = DateTime::from_timestamp(bucket_start, 0)
+                .unwrap_or(from)
+                .to_rfc3339();
+
+            points.push(CodeStatsHistoryPoint {
+                timestamp: ts,
+                lines_added: added,
+                lines_removed: removed,
+                total_changed: added + removed,
+            });
+
+            bucket_start = bucket_end;
+        }
+
+        Ok(points)
+    }
+
+    pub fn get_batch_session_code_stats(
+        &self,
+        session_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, SessionCodeStats>, String> {
+        if session_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let conn = self.conn.lock();
+
+        let placeholders: Vec<String> = (1..=session_ids.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT session_id, tool_name, full_input
+			 FROM tool_actions
+			 WHERE category = 'code_change'
+			   AND full_input IS NOT NULL
+			   AND session_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Prepare error: {e}"))?;
+
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = session_ids
+            .iter()
+            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+
+        let rows = stmt
+            .query_map(param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        let mut result: std::collections::HashMap<String, SessionCodeStats> =
+            std::collections::HashMap::new();
+
+        for row in rows {
+            let (session_id, tool_name, full_input) = row.map_err(|e| format!("Row error: {e}"))?;
+
+            if let Some((added, removed, _)) = parse_code_change(&tool_name, &full_input) {
+                let entry = result.entry(session_id).or_insert(SessionCodeStats {
+                    lines_added: 0,
+                    lines_removed: 0,
+                    net_change: 0,
+                });
+                entry.lines_added += added;
+                entry.lines_removed += removed;
+                entry.net_change = entry.lines_added - entry.lines_removed;
+            }
+        }
+
+        Ok(result)
     }
 }
 

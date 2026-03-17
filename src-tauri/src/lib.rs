@@ -12,8 +12,9 @@ pub(crate) mod sessions;
 mod storage;
 
 use models::{
-    BucketStats, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
-    ProjectBreakdown, SessionBreakdown, TokenDataPoint, TokenStats, ToolCount, UsageData,
+    BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
+    LearningRun, LearningSettings, ProjectBreakdown, SessionBreakdown, SessionCodeStats,
+    TokenDataPoint, TokenStats, ToolCount, UsageData,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -314,6 +315,28 @@ async fn get_top_tools(limit: i32, days: i32) -> Result<Vec<ToolCount>, String> 
 async fn get_observation_sparkline() -> Result<Vec<i64>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_observation_sparkline())
+}
+
+// --- Code change stats commands ---
+
+#[tauri::command]
+async fn get_code_stats(range: String) -> Result<CodeStats, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_code_stats(&range))
+}
+
+#[tauri::command]
+async fn get_code_stats_history(range: String) -> Result<Vec<CodeStatsHistoryPoint>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_code_stats_history(&range))
+}
+
+#[tauri::command]
+async fn get_batch_session_code_stats(
+    session_ids: Vec<String>,
+) -> Result<std::collections::HashMap<String, SessionCodeStats>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_batch_session_code_stats(&session_ids))
 }
 
 #[tauri::command]
@@ -828,6 +851,9 @@ pub fn run() {
             remove_custom_project,
             delete_memory_file,
             delete_project_memories,
+            get_code_stats,
+            get_code_stats_history,
+            get_batch_session_code_stats,
             sessions::search_sessions,
             sessions::get_session_context,
             sessions::get_search_facets,

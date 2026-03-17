@@ -443,3 +443,41 @@ pub struct MemoryOptimizerUpdatedEvent {
 pub struct MemoryFilesUpdatedEvent {
     pub project_path: String,
 }
+
+// --- Code change stats models ---
+
+/// Aggregate code change stats for a time range
+#[derive(Serialize, Clone, Debug)]
+pub struct CodeStats {
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub net_change: i64,
+    pub session_count: i64,
+    pub avg_per_session: f64,
+    pub by_language: Vec<LanguageBreakdown>,
+}
+
+/// Per-language breakdown of code changes
+#[derive(Serialize, Clone, Debug)]
+pub struct LanguageBreakdown {
+    pub language: String,
+    pub lines: i64,
+    pub percentage: f64,
+}
+
+/// Time-bucketed code change data point for charts
+#[derive(Serialize, Clone, Debug)]
+pub struct CodeStatsHistoryPoint {
+    pub timestamp: String,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub total_changed: i64,
+}
+
+/// Per-session code change stats
+#[derive(Serialize, Clone, Debug)]
+pub struct SessionCodeStats {
+    pub lines_added: i64,
+    pub lines_removed: i64,
+    pub net_change: i64,
+}
