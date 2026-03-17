@@ -101,9 +101,46 @@ export interface PendingUpdate {
 }
 
 export interface MergedDataPoint {
-  timestamp: string;
-  utilization: number | null;
-  total_tokens: number | null;
+	timestamp: string;
+	utilization: number | null;
+	total_tokens: number | null;
+	total_lines_changed: number | null;
+}
+
+// Code change stats types
+
+export interface LanguageBreakdown {
+	language: string;
+	lines: number;
+	percentage: number;
+}
+
+export interface CodeStats {
+	lines_added: number;
+	lines_removed: number;
+	net_change: number;
+	session_count: number;
+	avg_per_session: number;
+	by_language: LanguageBreakdown[];
+}
+
+export interface CodeStatsHistoryPoint {
+	timestamp: string;
+	lines_added: number;
+	lines_removed: number;
+	total_changed: number;
+}
+
+export interface SessionCodeStats {
+	lines_added: number;
+	lines_removed: number;
+	net_change: number;
+}
+
+export interface ChartSeriesVisibility {
+	utilization: boolean;
+	tokens: boolean;
+	loc: boolean;
 }
 
 // Learning system types

@@ -168,7 +168,7 @@ function UsageChart({ data, range, bucket, tokenData }: UsageChartProps) {
   // Merge usage and token data by timestamp for the composed chart
   const mergedData: MergedDataPoint[] = hasTokenData
     ? mergeDataSeries(anchoredData, anchoredTokenData)
-    : anchoredData.map((d) => ({ ...d, total_tokens: null }));
+    : anchoredData.map((d) => ({ ...d, total_tokens: null, total_lines_changed: null }));
 
   const formatter = (v: string) => formatTime(v, range);
   const allowedTicks = dedupeTickLabels(mergedData, formatter);
@@ -363,14 +363,14 @@ function mergeDataSeries(
   // Build merged array from usage data, matching closest token via binary search
   const merged: MergedDataPoint[] = usageData.map((u, i) => {
     if (tokenTimestamps.length === 0) {
-      return { ...u, total_tokens: null };
+      return { ...u, total_tokens: null, total_lines_changed: null };
     }
     const closest = findClosestIndex(tokenTimestamps, usageTimestamps[i]);
     const dist = Math.abs(tokenTimestamps[closest] - usageTimestamps[i]);
     if (dist < MATCH_WINDOW_MS) {
-      return { ...u, total_tokens: tokenData[closest].total_tokens };
+      return { ...u, total_tokens: tokenData[closest].total_tokens, total_lines_changed: null };
     }
-    return { ...u, total_tokens: null };
+    return { ...u, total_tokens: null, total_lines_changed: null };
   });
 
   // Add token data points without nearby usage points
@@ -380,6 +380,7 @@ function mergeDataSeries(
         timestamp: tokenData[i].timestamp,
         utilization: null,
         total_tokens: tokenData[i].total_tokens,
+        total_lines_changed: null,
       });
       continue;
     }
@@ -390,13 +391,21 @@ function mergeDataSeries(
         timestamp: tokenData[i].timestamp,
         utilization: null,
         total_tokens: tokenData[i].total_tokens,
+        total_lines_changed: null,
       });
     }
   }
 
-  merged.sort(
-    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
-  );
+  const tsCache = new Map<string, number>();
+  const getTs = (ts: string) => {
+    let v = tsCache.get(ts);
+    if (v === undefined) {
+      v = new Date(ts).getTime();
+      tsCache.set(ts, v);
+    }
+    return v;
+  };
+  merged.sort((a, b) => getTs(a.timestamp) - getTs(b.timestamp));
 
   return merged;
 }
