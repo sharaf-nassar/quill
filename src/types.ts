@@ -140,7 +140,6 @@ export interface SessionCodeStats {
 export interface ChartSeriesVisibility {
 	utilization: boolean;
 	tokens: boolean;
-	loc: boolean;
 }
 
 // Learning system types
@@ -243,4 +242,61 @@ export interface SessionContext {
   messages: ContextMessage[];
   session_id: string;
   project: string;
+}
+
+// Analytics redesign types
+
+export type AnalyticsTab = "now" | "trends" | "charts";
+
+export interface InsightTrend {
+	direction: "up" | "down" | "flat";
+	percentage: number;
+	/** Whether "up" is good (true) or bad (false). Null = neutral. */
+	upIsGood: boolean | null;
+}
+
+export interface SparklinePoint {
+	value: number;
+}
+
+export interface SessionHealthStats {
+	avgDurationSeconds: number;
+	avgTokens: number;
+	sessionsPerDay: number;
+	sessionCount: number;
+	prev: {
+		avgDurationSeconds: number;
+		avgTokens: number;
+		sessionsPerDay: number;
+		sessionCount: number;
+	};
+}
+
+export interface ActivityPatternData {
+	/** 24 values, index 0 = midnight, index 23 = 11pm */
+	hourlyTokens: number[];
+	peakStart: number;
+	peakEnd: number;
+}
+
+export interface LearningStatsData {
+	total: number;
+	emerging: number;
+	confirmed: number;
+	/** 5 buckets: [0-20%, 20-40%, 40-60%, 60-80%, 80-100%] */
+	confidenceBuckets: number[];
+	newThisWeek: number;
+}
+
+export interface ProjectTokensRaw {
+	project: string;
+	total_tokens: number;
+	session_count: number;
+}
+
+export interface SessionStatsRaw {
+	avg_duration_seconds: number;
+	avg_tokens: number;
+	session_count: number;
+	total_tokens: number;
 }

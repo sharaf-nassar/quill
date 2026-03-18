@@ -65,6 +65,23 @@ pub struct HostBreakdown {
     pub last_active: String,
 }
 
+// Per-project token totals (grouped by session cwd)
+#[derive(Serialize, Clone, Debug)]
+pub struct ProjectTokens {
+    pub project: String,
+    pub total_tokens: i64,
+    pub session_count: i64,
+}
+
+// Aggregate session stats (unlimited, for analytics)
+#[derive(Serialize, Clone, Debug)]
+pub struct SessionStats {
+    pub avg_duration_seconds: f64,
+    pub avg_tokens: f64,
+    pub session_count: i64,
+    pub total_tokens: i64,
+}
+
 // Session-level token breakdown
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionBreakdown {

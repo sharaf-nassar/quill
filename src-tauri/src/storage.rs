@@ -7,8 +7,8 @@ use rusqlite::{Connection, params};
 use crate::models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LanguageBreakdown,
     LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload, LearningStatus,
-    ObservationPayload, ProjectBreakdown, SessionBreakdown, SessionCodeStats, TokenDataPoint,
-    TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    ObservationPayload, ProjectBreakdown, ProjectTokens, SessionBreakdown, SessionCodeStats,
+    SessionStats, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
@@ -1163,6 +1163,91 @@ impl Storage {
             results.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
         Ok(results)
+    }
+
+    pub fn get_project_tokens(&self, days: i32) -> Result<Vec<ProjectTokens>, String> {
+        let days = days.clamp(1, 365);
+        let conn = self.conn.lock();
+        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    project,
+                    SUM(total_tokens) as total_tokens,
+                    COUNT(*) as session_count
+                FROM (
+                    SELECT
+                        s.session_id,
+                        (SELECT t.cwd FROM token_snapshots t
+                         WHERE t.session_id = s.session_id AND t.cwd IS NOT NULL
+                         ORDER BY t.timestamp DESC LIMIT 1) as project,
+                        SUM(s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens) as total_tokens
+                    FROM token_snapshots s
+                    WHERE s.timestamp >= ?1
+                    GROUP BY s.session_id
+                )
+                WHERE project IS NOT NULL
+                GROUP BY project
+                ORDER BY total_tokens DESC
+                LIMIT 20",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![from], |row| {
+                Ok(ProjectTokens {
+                    project: row.get(0)?,
+                    total_tokens: row.get(1)?,
+                    session_count: row.get(2)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| format!("Row error: {e}"))?);
+        }
+        Ok(results)
+    }
+
+    pub fn get_session_stats(&self, days: i32) -> Result<SessionStats, String> {
+        let conn = self.conn.lock();
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT
+                    AVG(duration_seconds) as avg_duration_seconds,
+                    AVG(total_tokens) as avg_tokens,
+                    COUNT(*) as session_count,
+                    SUM(total_tokens) as total_tokens
+                FROM (
+                    SELECT
+                        session_id,
+                        (strftime('%s', MAX(timestamp)) - strftime('%s', MIN(timestamp))) as duration_seconds,
+                        SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) as total_tokens
+                    FROM token_snapshots
+                    WHERE timestamp >= ?1
+                    GROUP BY session_id
+                    HAVING COUNT(*) > 1
+                )",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let result = stmt
+            .query_row(rusqlite::params![cutoff_str], |row| {
+                Ok(SessionStats {
+                    avg_duration_seconds: row.get::<_, Option<f64>>(0)?.unwrap_or(0.0),
+                    avg_tokens: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                    session_count: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    total_tokens: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        Ok(result)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {

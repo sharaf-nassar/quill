@@ -13,8 +13,8 @@ mod storage;
 
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
-    LearningRun, LearningSettings, ProjectBreakdown, SessionBreakdown, SessionCodeStats,
-    TokenDataPoint, TokenStats, ToolCount, UsageData,
+    LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, SessionBreakdown,
+    SessionCodeStats, SessionStats, TokenDataPoint, TokenStats, ToolCount, UsageData,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -183,6 +183,18 @@ async fn get_session_breakdown(
 ) -> Result<Vec<SessionBreakdown>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_session_breakdown(days, hostname.as_deref()))
+}
+
+#[tauri::command]
+async fn get_project_tokens(days: i32) -> Result<Vec<ProjectTokens>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_project_tokens(days))
+}
+
+#[tauri::command]
+async fn get_session_stats(days: i32) -> Result<SessionStats, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_session_stats(days))
 }
 
 #[tauri::command]
@@ -823,6 +835,8 @@ pub fn run() {
             get_host_breakdown,
             get_project_breakdown,
             get_session_breakdown,
+            get_session_stats,
+            get_project_tokens,
             delete_host_data,
             delete_project_data,
             delete_session_data,

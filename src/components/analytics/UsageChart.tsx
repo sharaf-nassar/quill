@@ -213,7 +213,7 @@ function UsageChart({ data, range, bucket, tokenData, locData, visibility }: Usa
 	);
 
 	const showLeftAxis = visibility.utilization;
-	const showRightAxis = (visibility.tokens && hasTokenData) || (visibility.loc && hasLocData);
+	const showRightAxis = visibility.tokens && hasTokenData;
 
 	if (!hasTokenData && !hasLocData) {
 		return (
@@ -371,19 +371,7 @@ function UsageChart({ data, range, bucket, tokenData, locData, visibility }: Usa
 							connectNulls
 						/>
 					)}
-					{visibility.loc && (
-						<Line
-							yAxisId="right"
-							type="monotone"
-							dataKey="total_lines_changed"
-							stroke="#a78bfa"
-							strokeWidth={1.5}
-							dot={false}
-							animationDuration={300}
-							connectNulls
-						/>
-					)}
-				</ComposedChart>
+					</ComposedChart>
 			</ResponsiveContainer>
 		</div>
 	);

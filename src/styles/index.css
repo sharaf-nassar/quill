@@ -1242,6 +1242,349 @@ body {
   padding: 20px 12px;
 }
 
+/* ─── Analytics tabs ─── */
+.analytics-tab-bar {
+	display: flex;
+	gap: 0;
+	flex-shrink: 0;
+}
+
+.analytics-tab {
+	background: none;
+	border: none;
+	border-bottom: 2px solid transparent;
+	color: #484f58;
+	font-size: 11px;
+	font-weight: 600;
+	padding: 5px 14px;
+	cursor: pointer;
+	transition: color 0.15s ease;
+}
+
+.analytics-tab:hover {
+	color: rgba(255, 255, 255, 0.7);
+}
+
+.analytics-tab.active {
+	color: #e6edf3;
+}
+
+/* ─── Insight cards ─── */
+.insight-cards-row {
+	display: grid;
+	grid-template-columns: 1fr 1fr 1fr;
+	gap: 8px;
+}
+
+@container (max-width: 500px) {
+	.insight-cards-row {
+		grid-template-columns: 1fr;
+	}
+}
+
+.insight-card {
+	background: #161b22;
+	border-radius: 8px;
+	padding: 10px;
+	border: 1px solid #21262d;
+}
+
+.insight-card-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 4px;
+}
+
+.insight-card-label {
+	font-size: 9px;
+	color: #8b949e;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+}
+
+.insight-card-trend {
+	font-size: 8px;
+	padding: 1px 6px;
+	border-radius: 8px;
+}
+
+.insight-card-value {
+	font-size: 20px;
+	font-weight: 700;
+	line-height: 1;
+}
+
+.insight-card-subtitle {
+	font-size: 9px;
+	color: #484f58;
+	margin-top: 2px;
+}
+
+.insight-card-sparkline {
+	margin-top: 6px;
+	display: flex;
+	align-items: flex-end;
+	gap: 2px;
+	height: 20px;
+}
+
+.insight-card-sparkline-bar {
+	flex: 1;
+	border-radius: 1px;
+	min-height: 1px;
+	transition: height 0.3s ease;
+}
+
+/* ─── Chart section header ─── */
+.chart-section-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+
+.chart-section-header .section-title {
+	margin-bottom: 0;
+}
+
+/* ─── Compact stats row ─── */
+.compact-stats-row {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px;
+}
+
+.compact-stats-card {
+	background: #161b22;
+	border-radius: 8px;
+	padding: 8px 10px;
+	border: 1px solid #21262d;
+	display: flex;
+	gap: 16px;
+	align-items: center;
+}
+
+.compact-stat-label {
+	font-size: 8px;
+	color: #8b949e;
+	display: block;
+}
+
+.compact-stat-value {
+	font-size: 12px;
+	color: #e6edf3;
+	font-weight: 600;
+}
+
+/* ─── Trends tab cards ─── */
+.trends-card {
+	background: #161b22;
+	border-radius: 8px;
+	padding: 10px;
+	border: 1px solid #21262d;
+}
+
+.trends-card-empty {
+	color: #484f58;
+	font-size: 11px;
+	text-align: center;
+	padding: 20px;
+}
+
+.trends-card-skeleton {
+	background: #161b22;
+	border-radius: 8px;
+	border: 1px solid #21262d;
+	height: 80px;
+	animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+	0%, 100% { opacity: 0.4; }
+	50% { opacity: 0.7; }
+}
+
+.trends-card-header {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	margin-bottom: 8px;
+}
+
+.trends-card-title {
+	font-size: 10px;
+	color: #e6edf3;
+	font-weight: 600;
+	display: block;
+	margin-bottom: 8px;
+}
+
+.trends-card-header .trends-card-title {
+	margin-bottom: 0;
+}
+
+.trends-card-badge {
+	font-size: 8px;
+	padding: 1px 6px;
+	border-radius: 8px;
+}
+
+.trends-card-subtitle {
+	font-size: 9px;
+	color: #8b949e;
+}
+
+.trends-bottom-row {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 8px;
+}
+
+@container (max-width: 500px) {
+	.trends-bottom-row {
+		grid-template-columns: 1fr;
+	}
+}
+
+/* ─── Session health ─── */
+.session-health-metrics {
+	display: flex;
+	gap: 20px;
+}
+
+.session-health-label {
+	font-size: 8px;
+	color: #8b949e;
+}
+
+.session-health-value {
+	font-size: 16px;
+	color: #e6edf3;
+	font-weight: 700;
+}
+
+.session-health-comparison {
+	font-size: 8px;
+	color: #8b949e;
+	margin-top: 2px;
+}
+
+/* ─── Activity heatmap ─── */
+.activity-heatmap {
+	display: flex;
+	gap: 1px;
+	margin-bottom: 4px;
+}
+
+.activity-heatmap-slot {
+	flex: 1;
+	text-align: center;
+}
+
+.activity-heatmap-label {
+	font-size: 6px;
+	color: #484f58;
+	margin-bottom: 2px;
+	height: 10px;
+}
+
+.activity-heatmap-cell {
+	height: 18px;
+	border-radius: 2px;
+}
+
+/* ─── Project focus ─── */
+.project-focus-bars {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.project-focus-row {
+	display: flex;
+	justify-content: space-between;
+	font-size: 8px;
+	margin-bottom: 2px;
+}
+
+.project-focus-name {
+	color: #e6edf3;
+}
+
+.project-focus-stats {
+	color: #8b949e;
+}
+
+.project-focus-sessions {
+	color: #484f58;
+	font-size: 7px;
+	margin-left: 4px;
+}
+
+.project-focus-bar-bg {
+	height: 6px;
+	background: #21262d;
+	border-radius: 3px;
+	overflow: hidden;
+}
+
+.project-focus-bar-fill {
+	height: 100%;
+	border-radius: 3px;
+	transition: width 0.3s ease;
+}
+
+/* ─── Learning progress ─── */
+.learning-stats-row {
+	display: flex;
+	gap: 12px;
+	margin-bottom: 8px;
+}
+
+.learning-stat-value {
+	font-size: 18px;
+	font-weight: 700;
+}
+
+.learning-stat-label {
+	font-size: 8px;
+	color: #8b949e;
+}
+
+.learning-confidence-label {
+	font-size: 8px;
+	color: #8b949e;
+	margin-bottom: 4px;
+}
+
+.learning-confidence-chart {
+	display: flex;
+	gap: 1px;
+	height: 20px;
+	align-items: flex-end;
+}
+
+.learning-confidence-bar {
+	flex: 1;
+	border-radius: 1px;
+	min-height: 1px;
+	transition: height 0.3s ease;
+}
+
+.learning-confidence-axis {
+	display: flex;
+	justify-content: space-between;
+	font-size: 6px;
+	color: #484f58;
+	margin-top: 2px;
+}
+
+.learning-growth {
+	font-size: 8px;
+	margin-top: 6px;
+}
+
 /* ─── Status label (colorblind accessibility) ─── */
 .status-label {
   font-size: calc(7px * var(--s));
