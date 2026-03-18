@@ -7,7 +7,7 @@ interface InstalledTabProps {
 		inProgress: Set<string>;
 		enablePlugin: (name: string) => Promise<void>;
 		disablePlugin: (name: string) => Promise<void>;
-		removePlugin: (name: string) => Promise<void>;
+		removePlugin: (name: string, marketplace: string) => Promise<void>;
 	};
 	onChanged: () => void;
 }
@@ -42,7 +42,7 @@ function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
 
 	const handleRemove = useCallback(
 		async (plugin: InstalledPlugin) => {
-			await operations.removePlugin(plugin.name);
+			await operations.removePlugin(plugin.name, plugin.marketplace);
 			onChanged();
 		},
 		[operations, onChanged],

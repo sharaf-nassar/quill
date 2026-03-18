@@ -14,6 +14,7 @@ export function useInstalledPlugins() {
 	const [error, setError] = useState<string | null>(null);
 
 	const refresh = useCallback(async () => {
+		setLoading(true);
 		try {
 			const data = await invoke<InstalledPlugin[]>("get_installed_plugins");
 			setPlugins(data);
@@ -47,6 +48,7 @@ export function useMarketplaces() {
 	const [error, setError] = useState<string | null>(null);
 
 	const refresh = useCallback(async () => {
+		setLoading(true);
 		try {
 			const data = await invoke<Marketplace[]>("get_marketplaces");
 			setMarketplaces(data);
@@ -84,6 +86,7 @@ export function useAvailableUpdates() {
 	const [error, setError] = useState<string | null>(null);
 
 	const refresh = useCallback(async () => {
+		setLoading(true);
 		try {
 			const data = await invoke<UpdateCheckResult>("get_available_updates");
 			setResult(data);
@@ -162,9 +165,9 @@ export function usePluginOperations() {
 	);
 
 	const removePlugin = useCallback(
-		async (name: string) => {
+		async (name: string, marketplace: string) => {
 			await withOperation(name, async () => {
-				await invoke("remove_plugin", { name });
+				await invoke("remove_plugin", { name, marketplace });
 			});
 		},
 		[withOperation],

@@ -578,28 +578,50 @@ async fn check_updates_now(app: tauri::AppHandle) -> Result<plugins::UpdateCheck
 }
 
 #[tauri::command]
-async fn install_plugin(name: String, marketplace: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::install_plugin(&name, &marketplace))
+async fn install_plugin(
+    name: String,
+    marketplace: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::install_plugin(&name, &marketplace))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn remove_plugin(name: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::remove_plugin(&name))
+async fn remove_plugin(
+    name: String,
+    marketplace: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::remove_plugin(&name, &marketplace))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn enable_plugin(name: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::enable_plugin(&name))
+async fn enable_plugin(name: String, app: tauri::AppHandle) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::enable_plugin(&name))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn disable_plugin(name: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::disable_plugin(&name))
+async fn disable_plugin(name: String, app: tauri::AppHandle) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::disable_plugin(&name))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn update_plugin(name: String, marketplace: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace))
+async fn update_plugin(
+    name: String,
+    marketplace: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -611,23 +633,33 @@ async fn update_all_plugins(app: tauri::AppHandle) -> Result<plugins::BulkUpdate
 }
 
 #[tauri::command]
-async fn add_marketplace(repo: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::add_marketplace(&repo))
+async fn add_marketplace(repo: String, app: tauri::AppHandle) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::add_marketplace(&repo))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn remove_marketplace(name: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::remove_marketplace(&name))
+async fn remove_marketplace(name: String, app: tauri::AppHandle) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::remove_marketplace(&name))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn refresh_marketplace(name: String) -> Result<String, String> {
-    tokio::task::block_in_place(|| plugins::refresh_marketplace(&name))
+async fn refresh_marketplace(name: String, app: tauri::AppHandle) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::refresh_marketplace(&name))?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]
-async fn refresh_all_marketplaces() -> Result<plugins::MarketplaceRefreshResults, String> {
-    tokio::task::block_in_place(plugins::refresh_all_marketplaces)
+async fn refresh_all_marketplaces(
+    app: tauri::AppHandle,
+) -> Result<plugins::MarketplaceRefreshResults, String> {
+    let result = tokio::task::block_in_place(plugins::refresh_all_marketplaces)?;
+    let _ = app.emit("plugin-changed", ());
+    Ok(result)
 }
 
 #[tauri::command]

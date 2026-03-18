@@ -284,6 +284,24 @@ pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
     Ok(marketplaces)
 }
 
+/// Returns true if `available` is a newer version than `current`.
+/// Falls back to string inequality if either fails to parse as semver.
+fn is_newer_version(current: &str, available: &str) -> bool {
+    // Try lenient semver parse (handles versions like "1.0" by treating as "1.0.0")
+    let parse = |v: &str| -> Option<(u64, u64, u64)> {
+        let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
+        let major = parts.first()?.parse().ok()?;
+        let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let patch = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        Some((major, minor, patch))
+    };
+
+    match (parse(current), parse(available)) {
+        (Some(cur), Some(avail)) => avail > cur,
+        _ => available != current,
+    }
+}
+
 pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
     let installed = get_installed_plugins()?;
     let marketplaces = get_marketplaces()?;
@@ -295,7 +313,7 @@ pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
                 continue;
             }
             for mp in &marketplace.plugins {
-                if mp.name == plugin.name && mp.version != plugin.version {
+                if mp.name == plugin.name && is_newer_version(&plugin.version, &mp.version) {
                     updates.push(PluginUpdate {
                         name: plugin.name.clone(),
                         marketplace: plugin.marketplace.clone(),
@@ -310,59 +328,106 @@ pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
     Ok(updates)
 }
 
+// ── Input Validation ──
+
+fn is_valid_plugin_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+fn validate_plugin_name(name: &str) -> Result<(), String> {
+    if is_valid_plugin_name(name) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid plugin name '{name}': only alphanumeric, hyphens, underscores, and dots allowed"
+        ))
+    }
+}
+
+fn validate_repo(repo: &str) -> Result<(), String> {
+    if repo.is_empty() || repo.len() > 256 {
+        return Err("Repository path must be 1-256 characters".to_string());
+    }
+    if repo.starts_with('-') {
+        return Err("Repository path must not start with a hyphen".to_string());
+    }
+    // Allow "org/repo" format or https URLs
+    let is_github_shorthand = repo
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/');
+    let is_url = repo.starts_with("https://");
+    if !is_github_shorthand && !is_url {
+        return Err("Repository must be 'org/repo' format or an https:// URL".to_string());
+    }
+    Ok(())
+}
+
 // ── Mutation Functions (CLI subprocess) ──
 
 fn run_claude_command(args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("claude")
         .args(args)
         .output()
-        .map_err(|e| format!("Failed to run `claude {}`: {e}", args.join(" ")))?;
+        .map_err(|e| format!("Plugin command failed: {e}"))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Err(format!(
-            "Command `claude {}` failed: {}{}",
+        log::error!(
+            "claude {} failed: stderr={} stdout={}",
             args.join(" "),
             stderr.trim(),
-            if !stdout.trim().is_empty() {
-                format!("\n{}", stdout.trim())
-            } else {
-                String::new()
-            }
-        ))
+            stdout.trim()
+        );
+        Err("Plugin command failed. Check application logs for details.".to_string())
     }
 }
 
 pub fn install_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
+    validate_plugin_name(marketplace)?;
     let qualified = format!("{name}@{marketplace}");
     run_claude_command(&["plugin", "install", &qualified])
 }
 
-pub fn remove_plugin(name: &str) -> Result<String, String> {
-    run_claude_command(&["plugin", "uninstall", name])
+pub fn remove_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
+    validate_plugin_name(marketplace)?;
+    let qualified = format!("{name}@{marketplace}");
+    run_claude_command(&["plugin", "uninstall", &qualified])
 }
 
 pub fn enable_plugin(name: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
     run_claude_command(&["plugin", "enable", name])
 }
 
 pub fn disable_plugin(name: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
     run_claude_command(&["plugin", "disable", name])
 }
 
 pub fn update_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
+    validate_plugin_name(marketplace)?;
     let qualified = format!("{name}@{marketplace}");
     run_claude_command(&["plugin", "update", &qualified])
 }
 
 pub fn add_marketplace(repo: &str) -> Result<String, String> {
+    validate_repo(repo)?;
     run_claude_command(&["plugin", "marketplace", "add", repo])
 }
 
 pub fn remove_marketplace(name: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
     run_claude_command(&["plugin", "marketplace", "remove", name])
 }
 
@@ -461,6 +526,9 @@ pub fn spawn_update_checker(state: Arc<UpdateCheckerState>, app: tauri::AppHandl
     let interval_secs: u64 = 4 * 60 * 60; // 4 hours
 
     tauri::async_runtime::spawn(async move {
+        // Delay first check to avoid contending with app startup I/O
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
         let mut last_count: usize = 0;
         loop {
             // Check for updates

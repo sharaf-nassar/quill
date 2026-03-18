@@ -95,7 +95,7 @@ function UpdatesTab({
 						<div
 							className="plugins-progress-bar__fill"
 							style={{
-								width: `${(progress.completed / progress.total) * 100}%`,
+								width: `${progress.total > 0 ? (progress.completed / progress.total) * 100 : 0}%`,
 							}}
 						/>
 					</div>

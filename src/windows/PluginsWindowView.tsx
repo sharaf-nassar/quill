@@ -67,28 +67,6 @@ function PluginsWindowView() {
 		handlePluginChanged();
 	}, [handlePluginChanged]);
 
-	if (installed.loading && marketplaces.loading) {
-		return (
-			<div className="plugins-window">
-				<div className="plugins-window-titlebar" data-tauri-drag-region>
-					<span className="plugins-window-title" data-tauri-drag-region>
-						Plugin Manager
-					</span>
-					<button
-						className="plugins-window-close"
-						onClick={handleClose}
-						aria-label="Close"
-					>
-						&times;
-					</button>
-				</div>
-				<div className="plugins-body">
-					<div className="plugins-loading">Loading...</div>
-				</div>
-			</div>
-		);
-	}
-
 	return (
 		<div className="plugins-window">
 			<div className="plugins-window-titlebar" data-tauri-drag-region>
@@ -104,41 +82,47 @@ function PluginsWindowView() {
 				</button>
 			</div>
 			<div className="plugins-body">
-				<PluginsTabs
-					activeTab={activeTab}
-					onTabChange={setActiveTab}
-					updateCount={updates.result.plugin_updates.length}
-				/>
-				{activeTab === "installed" && (
-					<InstalledTab
-						plugins={installed.plugins}
-						operations={operations}
-						onChanged={handlePluginChanged}
-					/>
-				)}
-				{activeTab === "browse" && (
-					<BrowseTab
-						marketplaces={marketplaces.marketplaces}
-						operations={operations}
-						onChanged={handlePluginChanged}
-					/>
-				)}
-				{activeTab === "marketplaces" && (
-					<MarketplacesTab
-						marketplaces={marketplaces.marketplaces}
-						onAdd={handleAddMarketplace}
-						onRemove={handleRemoveMarketplace}
-						onRefresh={handleRefreshMarketplace}
-						onRefreshAll={handleRefreshAllMarketplaces}
-					/>
-				)}
-				{activeTab === "updates" && (
-					<UpdatesTab
-						updates={updates}
-						operations={operations}
-						bulkUpdate={bulkUpdate}
-						onChanged={handlePluginChanged}
-					/>
+				{installed.loading && marketplaces.loading ? (
+					<div className="plugins-loading">Loading...</div>
+				) : (
+					<>
+						<PluginsTabs
+							activeTab={activeTab}
+							onTabChange={setActiveTab}
+							updateCount={updates.result.plugin_updates.length}
+						/>
+						{activeTab === "installed" && (
+							<InstalledTab
+								plugins={installed.plugins}
+								operations={operations}
+								onChanged={handlePluginChanged}
+							/>
+						)}
+						{activeTab === "browse" && (
+							<BrowseTab
+								marketplaces={marketplaces.marketplaces}
+								operations={operations}
+								onChanged={handlePluginChanged}
+							/>
+						)}
+						{activeTab === "marketplaces" && (
+							<MarketplacesTab
+								marketplaces={marketplaces.marketplaces}
+								onAdd={handleAddMarketplace}
+								onRemove={handleRemoveMarketplace}
+								onRefresh={handleRefreshMarketplace}
+								onRefreshAll={handleRefreshAllMarketplaces}
+							/>
+						)}
+						{activeTab === "updates" && (
+							<UpdatesTab
+								updates={updates}
+								operations={operations}
+								bulkUpdate={bulkUpdate}
+								onChanged={handlePluginChanged}
+							/>
+						)}
+					</>
 				)}
 			</div>
 		</div>
