@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { listen } from "@tauri-apps/api/event";
 import type { PendingUpdate, SectionId } from "../types";
 import type { LayoutNode } from "./tiling/types";
 import PresetsMenu from "./tiling/PresetsMenu";
@@ -31,11 +32,21 @@ function TitleBar({
 	onApplyPreset,
 }: TitleBarProps) {
 	const [version, setVersion] = useState("");
+	const [pluginUpdateCount, setPluginUpdateCount] = useState(0);
 
 	useEffect(() => {
 		getVersion()
 			.then(setVersion)
 			.catch(() => {});
+	}, []);
+
+	useEffect(() => {
+		const unlisten = listen<number>("plugin-updates-available", (event) => {
+			setPluginUpdateCount(event.payload);
+		});
+		return () => {
+			unlisten.then((fn) => fn());
+		};
 	}, []);
 
 	const handleOpenSessions = useCallback(async () => {
@@ -78,6 +89,26 @@ function TitleBar({
 		});
 	}, []);
 
+	const handleOpenPlugins = useCallback(async () => {
+		const existing = await WebviewWindow.getByLabel("plugins");
+		if (existing) {
+			await existing.show();
+			await existing.setFocus();
+			return;
+		}
+		new WebviewWindow("plugins", {
+			url: "/?view=plugins",
+			title: "Plugin Manager",
+			width: 700,
+			height: 550,
+			minWidth: 500,
+			minHeight: 400,
+			decorations: false,
+			transparent: true,
+			resizable: true,
+		});
+	}, []);
+
 	return (
 		<div className="titlebar" data-tauri-drag-region>
 			<div className="titlebar-left">
@@ -109,6 +140,17 @@ function TitleBar({
 						title="Search sessions"
 					>
 						&#8981;
+					</button>
+					<button
+						className="view-tab view-tab--plugins"
+						onClick={handleOpenPlugins}
+						aria-label="Plugin Manager"
+						title="Plugin Manager"
+					>
+						&#9881;
+						{pluginUpdateCount > 0 && (
+							<span className="plugins-update-badge">{pluginUpdateCount}</span>
+						)}
 					</button>
 				</div>
 				{layout && (

@@ -508,6 +508,16 @@ body {
   color: rgba(96, 165, 250, 0.8);
 }
 
+.view-tab--plugins {
+  color: rgba(122, 162, 247, 0.45);
+  font-size: 12px;
+  position: relative;
+}
+
+.view-tab--plugins:hover {
+  color: rgba(122, 162, 247, 0.75);
+}
+
 /* ─── Analytics view ─── */
 .analytics-view {
   width: 100%;
@@ -1233,6 +1243,86 @@ body {
 
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+.breakdown-rename-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 10px;
+  cursor: pointer;
+  padding: 3px 7px;
+  min-width: 24px;
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  line-height: 1;
+  transition: color 0.15s, background 0.15s;
+}
+
+.breakdown-rename-btn:hover {
+  color: #60a5fa;
+  background: rgba(96, 165, 250, 0.08);
+}
+
+.breakdown-rename-btn:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.breakdown-rename-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.breakdown-rename-input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  color: #fff;
+  font-size: 11px;
+  font-family: inherit;
+  padding: 2px 6px;
+  outline: none;
+}
+
+.breakdown-rename-input:focus {
+  border-color: rgba(96, 165, 250, 0.5);
+}
+
+.breakdown-rename-confirm,
+.breakdown-rename-cancel {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 4px;
+  line-height: 1;
+  border-radius: 3px;
+}
+
+.breakdown-rename-confirm:hover {
+  color: #4ade80;
+}
+
+.breakdown-rename-cancel:hover {
+  color: #f87171;
+}
+
+.breakdown-rename-hint {
+  width: 100%;
+  font-size: 9px;
+  color: #fbbf24;
+  margin-top: 2px;
 }
 
 .breakdown-empty {
