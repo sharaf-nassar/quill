@@ -8,7 +8,6 @@ import PresetsMenu from "./tiling/PresetsMenu";
 interface TitleBarProps {
 	showLive: boolean;
 	showAnalytics: boolean;
-	showLearning: boolean;
 	onToggleSection: (sectionId: SectionId) => void;
 	onClose: () => void;
 	pendingUpdate: PendingUpdate | null;
@@ -22,7 +21,6 @@ interface TitleBarProps {
 function TitleBar({
 	showLive,
 	showAnalytics,
-	showLearning,
 	onToggleSection,
 	onClose,
 	pendingUpdate,
@@ -60,6 +58,26 @@ function TitleBar({
 		});
 	}, []);
 
+	const handleOpenLearning = useCallback(async () => {
+		const existing = await WebviewWindow.getByLabel("learning");
+		if (existing) {
+			await existing.show();
+			await existing.setFocus();
+			return;
+		}
+		new WebviewWindow("learning", {
+			url: "/?view=learning",
+			title: "Learning",
+			width: 500,
+			height: 600,
+			minWidth: 400,
+			minHeight: 400,
+			decorations: false,
+			transparent: true,
+			resizable: true,
+		});
+	}, []);
+
 	return (
 		<div className="titlebar" data-tauri-drag-region>
 			<div className="titlebar-left">
@@ -77,8 +95,10 @@ function TitleBar({
 						Analytics
 					</button>
 					<button
-						className={`view-tab view-tab--learning${showLearning ? " active" : ""}`}
-						onClick={() => onToggleSection("learning")}
+						className="view-tab view-tab--learning"
+						onClick={handleOpenLearning}
+						aria-label="Open learning"
+						title="Learning"
 					>
 						&#10022;
 					</button>

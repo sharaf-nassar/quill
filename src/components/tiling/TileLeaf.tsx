@@ -11,7 +11,6 @@ const BASE_HEIGHTS: Record<string, number> = {
 const PANEL_LABELS: Record<SectionId, string> = {
 	live: "Live",
 	analytics: "Analytics",
-	learning: "Learning",
 };
 
 interface TileLeafProps {

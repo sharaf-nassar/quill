@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useLearningData } from "../hooks/useLearningData";
 import StatusStrip from "../components/learning/StatusStrip";
 import RuleCard from "../components/learning/RuleCard";
@@ -7,6 +7,7 @@ import DomainBreakdown from "../components/learning/DomainBreakdown";
 import FloatingRunsWindow from "../components/learning/FloatingRunsWindow";
 import { MemoriesPanel } from "../components/learning/MemoriesPanel";
 import type { LearningSettings } from "../types";
+import "../styles/learning.css";
 
 const TRIGGER_OPTIONS = [
   { value: "on-demand", label: "On-demand" },
@@ -128,49 +129,35 @@ function LearningPanel() {
   const handleCloseRuns = useCallback(() => setShowRuns(false), []);
   const contentRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const el = contentRef.current;
-    if (!el) return;
-
-    const grow = async () => {
-      const overflow = el.scrollHeight - el.clientHeight;
-      if (overflow <= 0) return;
-
-      const win = getCurrentWindow();
-      const size = await win.innerSize();
-      const maxH = window.screen.availHeight * 0.85;
-      const newH = Math.min(size.height + overflow, maxH);
-      if (newH > size.height) {
-        await win.setSize(new LogicalSize(size.width, Math.round(newH)));
-      }
-    };
-
-    const observer = new ResizeObserver(() => {
-      grow();
-    });
-    observer.observe(el);
-    grow();
-
-    return () => observer.disconnect();
-  });
-
   const handleToggleEnabled = (on: boolean) => {
     updateSettings({ ...settings, enabled: on });
   };
 
+  const handleClose = async () => {
+    await getCurrentWindow().close();
+  };
+
   if (loading) {
     return (
-      <div className="learning-app">
-        <div className="learning-toolbar">
-          <span className="learning-toolbar-label">Learning</span>
+      <div className="learning-window">
+        <div className="learning-window-titlebar" data-tauri-drag-region>
+          <span className="learning-window-title" data-tauri-drag-region>Learning</span>
+          <button className="learning-window-close" onClick={handleClose} aria-label="Close">&times;</button>
         </div>
-        <div className="learning-loading">Loading...</div>
+        <div className="learning-app">
+          <div className="learning-loading">Loading...</div>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="learning-app">
+    <div className="learning-window">
+      <div className="learning-window-titlebar" data-tauri-drag-region>
+        <span className="learning-window-title" data-tauri-drag-region>Learning</span>
+        <button className="learning-window-close" onClick={handleClose} aria-label="Close">&times;</button>
+      </div>
+      <div className="learning-app">
       <div className="learning-toolbar">
         <span className="learning-toolbar-label">Learning</span>
         <div style={{ display: "flex", gap: 2, marginLeft: 8 }}>
@@ -260,6 +247,7 @@ function LearningPanel() {
       {showRuns && (
         <FloatingRunsWindow onClose={handleCloseRuns} />
       )}
+      </div>
     </div>
   );
 }

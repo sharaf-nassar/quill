@@ -6,7 +6,6 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import TitleBar from "./components/TitleBar";
 import UsageDisplay from "./components/UsageDisplay";
 import AnalyticsView from "./components/analytics/AnalyticsView";
-import LearningPanel from "./windows/LearningWindow";
 import TilingContainer from "./components/tiling/TilingContainer";
 import {
 	collectPanels,
@@ -24,14 +23,11 @@ import {
 import type { LayoutNode, SectionId } from "./components/tiling/types";
 import { useToast } from "./hooks/useToast";
 import type { UsageData, TimeMode, PendingUpdate } from "./types";
-import "./styles/learning.css";
 
 const TIME_MODE_KEY = "quill-time-mode";
 const SHOW_LIVE_KEY = "quill-show-live";
 const SHOW_ANALYTICS_KEY = "quill-show-analytics";
-const SHOW_LEARNING_KEY = "quill-show-learning";
-
-const KNOWN_PANELS = new Set<SectionId>(["live", "analytics", "learning"]);
+const KNOWN_PANELS = new Set<SectionId>(["live", "analytics"]);
 
 function loadBool(key: string, fallback: boolean): boolean {
 	try {
@@ -60,7 +56,6 @@ function buildInitialLayout(): LayoutNode | null {
 	const panels: SectionId[] = [];
 	if (loadBool(SHOW_LIVE_KEY, true)) panels.push("live");
 	if (loadBool(SHOW_ANALYTICS_KEY, false)) panels.push("analytics");
-	if (loadBool(SHOW_LEARNING_KEY, false)) panels.push("learning");
 
 	if (panels.length === 0) return null;
 	if (panels.length === 1) return { type: "leaf", panelId: panels[0] };
@@ -92,7 +87,6 @@ function App() {
 
 	const showLive = visiblePanels.includes("live");
 	const showAnalytics = visiblePanels.includes("analytics");
-	const showLearning = visiblePanels.includes("learning");
 
 	useEffect(() => {
 		removeLegacyKeys();
@@ -105,9 +99,8 @@ function App() {
 		try {
 			localStorage.setItem(SHOW_LIVE_KEY, String(showLive));
 			localStorage.setItem(SHOW_ANALYTICS_KEY, String(showAnalytics));
-			localStorage.setItem(SHOW_LEARNING_KEY, String(showLearning));
 		} catch { /* ignore */ }
-	}, [layoutTree, visiblePanels, showLive, showAnalytics, showLearning]);
+	}, [layoutTree, visiblePanels, showLive, showAnalytics]);
 
 	const updateLayout = useCallback((newTree: LayoutNode) => {
 		setLayoutTree(newTree);
@@ -151,10 +144,10 @@ function App() {
 		[],
 	);
 
-	const handleTimeModeChange = (mode: TimeMode) => {
+	const handleTimeModeChange = useCallback((mode: TimeMode) => {
 		setTimeMode(mode);
 		try { localStorage.setItem(TIME_MODE_KEY, mode); } catch { /* ignore */ }
-	};
+	}, []);
 
 	const handleClose = useCallback(async () => {
 		await invoke("hide_window");
@@ -247,21 +240,28 @@ function App() {
 		refresh();
 	};
 
+	const livePanel = useMemo(
+		() => (
+			<UsageDisplay
+				data={usageData}
+				timeMode={timeMode}
+				onTimeModeChange={handleTimeModeChange}
+			/>
+		),
+		[usageData, timeMode, handleTimeModeChange],
+	);
+
+	const analyticsPanel = useMemo(
+		() => <AnalyticsView currentBuckets={usageData?.buckets ?? []} />,
+		[usageData],
+	);
+
 	const panelMap = useMemo(
 		() => ({
-			live: (
-				<UsageDisplay
-					data={usageData}
-					timeMode={timeMode}
-					onTimeModeChange={handleTimeModeChange}
-				/>
-			),
-			analytics: (
-				<AnalyticsView currentBuckets={usageData?.buckets ?? []} />
-			),
-			learning: <LearningPanel />,
+			live: livePanel,
+			analytics: analyticsPanel,
 		}),
-		[usageData, timeMode],
+		[livePanel, analyticsPanel],
 	);
 
 	return (
@@ -269,7 +269,6 @@ function App() {
 			<TitleBar
 				showLive={showLive}
 				showAnalytics={showAnalytics}
-				showLearning={showLearning}
 				onToggleSection={handleToggleSection}
 				onClose={handleClose}
 				pendingUpdate={pendingUpdate}

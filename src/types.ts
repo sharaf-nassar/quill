@@ -88,7 +88,7 @@ export interface BreakdownSelection {
   lastActive: string;
 }
 
-export type SectionId = "live" | "analytics" | "learning";
+export type SectionId = "live" | "analytics";
 
 export interface SectionConfig {
   id: SectionId;

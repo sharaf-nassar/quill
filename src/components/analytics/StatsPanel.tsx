@@ -8,23 +8,6 @@ interface StatsPanelProps {
 	codeStats: CodeStats | null;
 }
 
-const LANG_COLORS: Record<string, string> = {
-	TypeScript: "#3178c6",
-	JavaScript: "#f7df1e",
-	Rust: "#dea584",
-	Python: "#3776ab",
-	CSS: "#563d7c",
-	HTML: "#e34c26",
-	Go: "#00add8",
-	JSON: "#8b8b8b",
-	Shell: "#89e051",
-	Markdown: "#083fa1",
-	SQL: "#e38c00",
-	TOML: "#9c4221",
-	YAML: "#cb171e",
-	Other: "#8b949e",
-};
-
 function formatNumber(n: number): string {
 	if (Math.abs(n) >= 1000) {
 		return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
@@ -151,27 +134,6 @@ function StatsPanel({ bucketStats, tokenStats, codeStats }: StatsPanelProps) {
 							</span>
 						</div>
 					</div>
-					{codeStats.by_language.length > 0 && (
-						<div className="stats-card-languages">
-							<span className="stats-card-label">By Language</span>
-							<div className="stats-card-lang-list">
-								{codeStats.by_language.slice(0, 5).map((lang) => (
-									<div key={lang.language} className="stats-card-lang-row">
-										<span
-											className="stats-card-lang-dot"
-											style={{
-												background: LANG_COLORS[lang.language] ?? LANG_COLORS.Other,
-											}}
-										/>
-										<span className="stats-card-lang-name">{lang.language}</span>
-										<span className="stats-card-lang-pct">
-											{Math.round(lang.percentage)}%
-										</span>
-									</div>
-								))}
-							</div>
-						</div>
-					)}
 				</div>
 			)}
 		</div>
