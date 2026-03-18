@@ -11,6 +11,9 @@ const SessionsWindowView = React.lazy(
 const LearningWindowView = React.lazy(
   () => import("./windows/LearningWindow"),
 );
+const PluginsWindowView = React.lazy(
+  () => import("./windows/PluginsWindowView"),
+);
 
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view");
@@ -25,6 +28,8 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
           <SessionsWindowView />
         ) : view === "learning" ? (
           <LearningWindowView />
+        ) : view === "plugins" ? (
+          <PluginsWindowView />
         ) : (
           <App />
         )}
