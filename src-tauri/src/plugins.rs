@@ -1,0 +1,493 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+// ── Data Structures ──
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InstalledPlugin {
+    pub name: String,
+    pub marketplace: String,
+    pub version: String,
+    pub scope: String,
+    pub enabled: bool,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub installed_at: String,
+    pub last_updated: String,
+    pub git_commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MarketplacePlugin {
+    pub name: String,
+    pub description: Option<String>,
+    pub version: String,
+    pub author: Option<String>,
+    pub category: Option<String>,
+    pub source_path: String,
+    pub installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Marketplace {
+    pub name: String,
+    pub source_type: String,
+    pub repo: String,
+    pub install_location: String,
+    pub last_updated: Option<String>,
+    pub plugins: Vec<MarketplacePlugin>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginUpdate {
+    pub name: String,
+    pub marketplace: String,
+    pub current_version: String,
+    pub available_version: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateCheckResult {
+    pub plugin_updates: Vec<PluginUpdate>,
+    pub last_checked: Option<String>,
+    pub next_check: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkUpdateProgress {
+    pub total: u32,
+    pub completed: u32,
+    pub current_plugin: Option<String>,
+    pub results: Vec<BulkUpdateItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkUpdateItem {
+    pub name: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+// ── Internal JSON deserialization shapes ──
+
+#[derive(Deserialize)]
+struct InstalledPluginsFile {
+    #[allow(dead_code)]
+    version: u32,
+    plugins: std::collections::HashMap<String, Vec<InstallationRecord>>,
+}
+
+#[derive(Deserialize)]
+struct InstallationRecord {
+    scope: String,
+    #[serde(rename = "installPath")]
+    install_path: String,
+    version: String,
+    #[serde(rename = "installedAt")]
+    installed_at: String,
+    #[serde(rename = "lastUpdated")]
+    last_updated: String,
+    #[serde(rename = "gitCommitSha")]
+    git_commit_sha: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MarketplaceSource {
+    source: SourceInfo,
+    #[serde(rename = "installLocation")]
+    install_location: String,
+    #[serde(rename = "lastUpdated")]
+    last_updated: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SourceInfo {
+    source: String,
+    repo: String,
+}
+
+#[derive(Deserialize)]
+struct PluginJson {
+    #[allow(dead_code)]
+    name: Option<String>,
+    description: Option<String>,
+    #[allow(dead_code)]
+    version: Option<String>,
+    author: Option<AuthorField>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AuthorField {
+    Str(String),
+    Obj { name: String },
+}
+
+impl AuthorField {
+    fn name(&self) -> &str {
+        match self {
+            AuthorField::Str(s) => s,
+            AuthorField::Obj { name } => name,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct MarketplaceManifest {
+    plugins: Option<Vec<MarketplacePluginEntry>>,
+}
+
+#[derive(Deserialize)]
+struct MarketplacePluginEntry {
+    name: String,
+    description: Option<String>,
+    version: Option<String>,
+    author: Option<AuthorField>,
+    source: Option<String>,
+    category: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BlocklistEntry {
+    plugin: String,
+}
+
+// ── Helpers ──
+
+fn plugins_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".claude")
+        .join("plugins")
+}
+
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+}
+
+fn read_blocklist() -> std::collections::HashSet<String> {
+    let path = plugins_dir().join("blocklist.json");
+    if !path.exists() {
+        return std::collections::HashSet::new();
+    }
+    let entries: Vec<BlocklistEntry> = match read_json_file(&path) {
+        Ok(e) => e,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    entries.into_iter().map(|e| e.plugin).collect()
+}
+
+fn read_plugin_json(install_path: &str) -> Option<PluginJson> {
+    let path = PathBuf::from(install_path)
+        .join(".claude-plugin")
+        .join("plugin.json");
+    read_json_file(&path).ok()
+}
+
+// ── Read Functions ──
+
+pub fn get_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
+    let path = plugins_dir().join("installed_plugins.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let file: InstalledPluginsFile = read_json_file(&path)?;
+    let blocklist = read_blocklist();
+    let mut plugins = Vec::new();
+
+    for (key, records) in &file.plugins {
+        // Key format: "pluginName@marketplace"
+        let parts: Vec<&str> = key.splitn(2, '@').collect();
+        let (plugin_name, marketplace_name) = if parts.len() == 2 {
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (key.clone(), "unknown".to_string())
+        };
+
+        for record in records {
+            let meta = read_plugin_json(&record.install_path);
+            let enabled = !blocklist.contains(key);
+
+            plugins.push(InstalledPlugin {
+                name: plugin_name.clone(),
+                marketplace: marketplace_name.clone(),
+                version: record.version.clone(),
+                scope: record.scope.clone(),
+                enabled,
+                description: meta.as_ref().and_then(|m| m.description.clone()),
+                author: meta
+                    .as_ref()
+                    .and_then(|m| m.author.as_ref().map(|a| a.name().to_string())),
+                installed_at: record.installed_at.clone(),
+                last_updated: record.last_updated.clone(),
+                git_commit_sha: record.git_commit_sha.clone(),
+            });
+        }
+    }
+
+    plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(plugins)
+}
+
+pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
+    let path = plugins_dir().join("known_marketplaces.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let sources: std::collections::HashMap<String, MarketplaceSource> = read_json_file(&path)?;
+    let installed = get_installed_plugins().unwrap_or_default();
+    let installed_set: std::collections::HashSet<String> = installed
+        .iter()
+        .map(|p| format!("{}@{}", p.name, p.marketplace))
+        .collect();
+
+    let mut marketplaces = Vec::new();
+
+    for (name, src) in &sources {
+        let marketplace_json_path = PathBuf::from(&src.install_location)
+            .join(".claude-plugin")
+            .join("marketplace.json");
+
+        let mut plugins = Vec::new();
+        if let Ok(manifest) = read_json_file::<MarketplaceManifest>(&marketplace_json_path)
+            && let Some(entries) = manifest.plugins
+        {
+            for entry in entries {
+                let key = format!("{}@{}", entry.name, name);
+                plugins.push(MarketplacePlugin {
+                    name: entry.name,
+                    description: entry.description,
+                    version: entry.version.unwrap_or_else(|| "0.0.0".to_string()),
+                    author: entry.author.map(|a| a.name().to_string()),
+                    category: entry.category,
+                    source_path: entry.source.unwrap_or_default(),
+                    installed: installed_set.contains(&key),
+                });
+            }
+        }
+
+        marketplaces.push(Marketplace {
+            name: name.clone(),
+            source_type: src.source.source.clone(),
+            repo: src.source.repo.clone(),
+            install_location: src.install_location.clone(),
+            last_updated: src.last_updated.clone(),
+            plugins,
+        });
+    }
+
+    marketplaces.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(marketplaces)
+}
+
+pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
+    let installed = get_installed_plugins()?;
+    let marketplaces = get_marketplaces()?;
+    let mut updates = Vec::new();
+
+    for plugin in &installed {
+        for marketplace in &marketplaces {
+            if marketplace.name != plugin.marketplace {
+                continue;
+            }
+            for mp in &marketplace.plugins {
+                if mp.name == plugin.name && mp.version != plugin.version {
+                    updates.push(PluginUpdate {
+                        name: plugin.name.clone(),
+                        marketplace: plugin.marketplace.clone(),
+                        current_version: plugin.version.clone(),
+                        available_version: mp.version.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(updates)
+}
+
+// ── Mutation Functions (CLI subprocess) ──
+
+fn run_claude_command(args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new("claude")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run `claude {}`: {e}", args.join(" ")))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(format!(
+            "Command `claude {}` failed: {}{}",
+            args.join(" "),
+            stderr.trim(),
+            if !stdout.trim().is_empty() {
+                format!("\n{}", stdout.trim())
+            } else {
+                String::new()
+            }
+        ))
+    }
+}
+
+pub fn install_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+    let qualified = format!("{name}@{marketplace}");
+    run_claude_command(&["plugin", "install", &qualified])
+}
+
+pub fn remove_plugin(name: &str) -> Result<String, String> {
+    run_claude_command(&["plugin", "uninstall", name])
+}
+
+pub fn enable_plugin(name: &str) -> Result<String, String> {
+    run_claude_command(&["plugin", "enable", name])
+}
+
+pub fn disable_plugin(name: &str) -> Result<String, String> {
+    run_claude_command(&["plugin", "disable", name])
+}
+
+pub fn update_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+    let qualified = format!("{name}@{marketplace}");
+    run_claude_command(&["plugin", "update", &qualified])
+}
+
+pub fn add_marketplace(repo: &str) -> Result<String, String> {
+    run_claude_command(&["plugin", "marketplace", "add", repo])
+}
+
+pub fn remove_marketplace(name: &str) -> Result<String, String> {
+    run_claude_command(&["plugin", "marketplace", "remove", name])
+}
+
+pub fn refresh_marketplace(name: &str) -> Result<String, String> {
+    let marketplaces = get_marketplaces()?;
+    let marketplace = marketplaces
+        .iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| format!("Marketplace '{name}' not found"))?;
+
+    let location = &marketplace.install_location;
+    let output = std::process::Command::new("git")
+        .args(["pull", "--ff-only"])
+        .current_dir(location)
+        .output()
+        .map_err(|e| format!("Failed to git pull {name}: {e}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!(
+            "git pull failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+pub type MarketplaceRefreshResults = Vec<(String, Result<String, String>)>;
+
+pub fn refresh_all_marketplaces() -> Result<MarketplaceRefreshResults, String> {
+    let marketplaces = get_marketplaces()?;
+    let results: Vec<_> = marketplaces
+        .iter()
+        .map(|m| (m.name.clone(), refresh_marketplace(&m.name)))
+        .collect();
+    Ok(results)
+}
+
+pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> BulkUpdateProgress {
+    use tauri::Emitter;
+
+    let total = updates.len() as u32;
+    let mut progress = BulkUpdateProgress {
+        total,
+        completed: 0,
+        current_plugin: None,
+        results: Vec::new(),
+    };
+
+    for update in updates {
+        progress.current_plugin = Some(update.name.clone());
+        let _ = app.emit("plugin-bulk-progress", &progress);
+
+        let result = update_plugin(&update.name, &update.marketplace);
+        progress.results.push(BulkUpdateItem {
+            name: update.name.clone(),
+            status: if result.is_ok() {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            },
+            error: result.err(),
+        });
+        progress.completed += 1;
+    }
+
+    progress.current_plugin = None;
+    let _ = app.emit("plugin-bulk-progress", &progress);
+    progress
+}
+
+// ── Background Update Checker ──
+
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+pub struct UpdateCheckerState {
+    pub last_result: Mutex<UpdateCheckResult>,
+}
+
+impl UpdateCheckerState {
+    pub fn new() -> Self {
+        Self {
+            last_result: Mutex::new(UpdateCheckResult {
+                plugin_updates: Vec::new(),
+                last_checked: None,
+                next_check: None,
+            }),
+        }
+    }
+}
+
+pub fn spawn_update_checker(state: Arc<UpdateCheckerState>, app: tauri::AppHandle) {
+    use tauri::Emitter;
+
+    let interval_secs: u64 = 4 * 60 * 60; // 4 hours
+
+    tauri::async_runtime::spawn(async move {
+        let mut last_count: usize = 0;
+        loop {
+            // Check for updates
+            let result = tokio::task::block_in_place(get_available_updates);
+
+            if let Ok(updates) = result {
+                let count = updates.len();
+                let now = chrono::Utc::now().to_rfc3339();
+                let next = (chrono::Utc::now() + chrono::Duration::seconds(interval_secs as i64))
+                    .to_rfc3339();
+
+                let check_result = UpdateCheckResult {
+                    plugin_updates: updates,
+                    last_checked: Some(now),
+                    next_check: Some(next),
+                };
+
+                *state.last_result.lock() = check_result;
+
+                // Only emit event when count changes
+                if count != last_count {
+                    let _ = app.emit("plugin-updates-available", count);
+                    last_count = count;
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        }
+    });
+}

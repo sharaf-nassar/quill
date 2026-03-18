@@ -288,3 +288,65 @@ export interface SessionStatsRaw {
 	session_count: number;
 	total_tokens: number;
 }
+
+// Plugin manager types
+
+export type PluginsTab = "installed" | "browse" | "marketplaces" | "updates";
+
+export interface InstalledPlugin {
+	name: string;
+	marketplace: string;
+	version: string;
+	scope: string;
+	enabled: boolean;
+	description: string | null;
+	author: string | null;
+	installed_at: string;
+	last_updated: string;
+	git_commit_sha: string | null;
+}
+
+export interface MarketplacePlugin {
+	name: string;
+	description: string | null;
+	version: string;
+	author: string | null;
+	category: string | null;
+	source_path: string;
+	installed: boolean;
+}
+
+export interface Marketplace {
+	name: string;
+	source_type: string;
+	repo: string;
+	install_location: string;
+	last_updated: string | null;
+	plugins: MarketplacePlugin[];
+}
+
+export interface PluginUpdate {
+	name: string;
+	marketplace: string;
+	current_version: string;
+	available_version: string;
+}
+
+export interface UpdateCheckResult {
+	plugin_updates: PluginUpdate[];
+	last_checked: string | null;
+	next_check: string | null;
+}
+
+export interface BulkUpdateProgress {
+	total: number;
+	completed: number;
+	current_plugin: string | null;
+	results: BulkUpdateItem[];
+}
+
+export interface BulkUpdateItem {
+	name: string;
+	status: string;
+	error: string | null;
+}

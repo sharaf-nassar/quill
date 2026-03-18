@@ -6,6 +6,7 @@ mod fetcher;
 mod learning;
 mod memory_optimizer;
 mod models;
+mod plugins;
 mod prompt_utils;
 mod server;
 pub(crate) mod sessions;
@@ -207,6 +208,12 @@ async fn get_project_breakdown(days: i32) -> Result<Vec<ProjectBreakdown>, Strin
 async fn delete_project_data(cwd: String) -> Result<u64, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.delete_project_data(&cwd))
+}
+
+#[tauri::command]
+async fn rename_project(old_cwd: String, new_cwd: String) -> Result<u64, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.rename_project(&old_cwd, &new_cwd))
 }
 
 #[tauri::command]
@@ -515,6 +522,114 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
     })
 }
 
+// --- Plugin IPC commands ---
+
+#[tauri::command]
+async fn get_installed_plugins() -> Result<Vec<plugins::InstalledPlugin>, String> {
+    tokio::task::block_in_place(plugins::get_installed_plugins)
+}
+
+#[tauri::command]
+async fn get_marketplaces() -> Result<Vec<plugins::Marketplace>, String> {
+    tokio::task::block_in_place(plugins::get_marketplaces)
+}
+
+#[tauri::command]
+async fn get_available_updates(
+    app: tauri::AppHandle,
+) -> Result<plugins::UpdateCheckResult, String> {
+    let state = app
+        .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
+        .map(|s| s.inner().clone());
+
+    if let Some(state) = state {
+        Ok(state.last_result.lock().clone())
+    } else {
+        // Fallback: compute directly
+        let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
+        Ok(plugins::UpdateCheckResult {
+            plugin_updates: updates,
+            last_checked: None,
+            next_check: None,
+        })
+    }
+}
+
+#[tauri::command]
+async fn check_updates_now(app: tauri::AppHandle) -> Result<plugins::UpdateCheckResult, String> {
+    let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let result = plugins::UpdateCheckResult {
+        plugin_updates: updates,
+        last_checked: Some(now),
+        next_check: None,
+    };
+
+    if let Some(state) = app
+        .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
+        .map(|s| s.inner().clone())
+    {
+        *state.last_result.lock() = result.clone();
+        let _ = app.emit("plugin-updates-available", result.plugin_updates.len());
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn install_plugin(name: String, marketplace: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::install_plugin(&name, &marketplace))
+}
+
+#[tauri::command]
+async fn remove_plugin(name: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::remove_plugin(&name))
+}
+
+#[tauri::command]
+async fn enable_plugin(name: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::enable_plugin(&name))
+}
+
+#[tauri::command]
+async fn disable_plugin(name: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::disable_plugin(&name))
+}
+
+#[tauri::command]
+async fn update_plugin(name: String, marketplace: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace))
+}
+
+#[tauri::command]
+async fn update_all_plugins(app: tauri::AppHandle) -> Result<plugins::BulkUpdateProgress, String> {
+    let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
+    let progress = tokio::task::block_in_place(|| plugins::bulk_update_plugins(&updates, &app));
+    let _ = app.emit("plugin-changed", ());
+    Ok(progress)
+}
+
+#[tauri::command]
+async fn add_marketplace(repo: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::add_marketplace(&repo))
+}
+
+#[tauri::command]
+async fn remove_marketplace(name: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::remove_marketplace(&name))
+}
+
+#[tauri::command]
+async fn refresh_marketplace(name: String) -> Result<String, String> {
+    tokio::task::block_in_place(|| plugins::refresh_marketplace(&name))
+}
+
+#[tauri::command]
+async fn refresh_all_marketplaces() -> Result<plugins::MarketplaceRefreshResults, String> {
+    tokio::task::block_in_place(plugins::refresh_all_marketplaces)
+}
+
 #[tauri::command]
 async fn hide_window(window: tauri::WebviewWindow) {
     if let Ok(pos) = window.outer_position() {
@@ -745,6 +860,14 @@ pub fn run() {
                 });
             }
 
+            // Plugin update checker (every 4 hours)
+            {
+                let update_state = std::sync::Arc::new(plugins::UpdateCheckerState::new());
+                app.manage(update_state.clone());
+                let update_handle = app.handle().clone();
+                plugins::spawn_update_checker(update_state, update_handle);
+            }
+
             // Restore always-on-top preference (default: off)
             let on_top_enabled = STORAGE
                 .get()
@@ -839,6 +962,7 @@ pub fn run() {
             get_project_tokens,
             delete_host_data,
             delete_project_data,
+            rename_project,
             delete_session_data,
             get_learning_settings,
             set_learning_settings,
@@ -868,6 +992,20 @@ pub fn run() {
             get_code_stats,
             get_code_stats_history,
             get_batch_session_code_stats,
+            get_installed_plugins,
+            get_marketplaces,
+            get_available_updates,
+            check_updates_now,
+            install_plugin,
+            remove_plugin,
+            enable_plugin,
+            disable_plugin,
+            update_plugin,
+            update_all_plugins,
+            add_marketplace,
+            remove_marketplace,
+            refresh_marketplace,
+            refresh_all_marketplaces,
             sessions::search_sessions,
             sessions::get_session_context,
             sessions::get_search_facets,

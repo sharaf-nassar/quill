@@ -1318,6 +1318,38 @@ impl Storage {
         Ok(count as u64)
     }
 
+    pub fn rename_project(&self, old_cwd: &str, new_cwd: &str) -> Result<u64, String> {
+        let new_cwd = new_cwd.trim();
+        if new_cwd.is_empty() {
+            return Err("New project path cannot be empty".to_string());
+        }
+        if new_cwd == old_cwd {
+            return Err("New path is the same as the current path".to_string());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Transaction error: {e}"))?;
+
+        let snap_count = tx
+            .execute(
+                "UPDATE token_snapshots SET cwd = ?2 WHERE cwd = ?1",
+                params![old_cwd, new_cwd],
+            )
+            .map_err(|e| format!("Update token_snapshots error: {e}"))?;
+
+        tx.execute(
+            "UPDATE observations SET cwd = ?2 WHERE cwd = ?1",
+            params![old_cwd, new_cwd],
+        )
+        .map_err(|e| format!("Update observations error: {e}"))?;
+
+        tx.commit().map_err(|e| format!("Commit error: {e}"))?;
+
+        Ok(snap_count as u64)
+    }
+
     // --- Learning system methods ---
 
     pub fn store_observation(&self, payload: &ObservationPayload) -> Result<(), String> {
@@ -2801,6 +2833,10 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
         p
     };
 
+    // Home directories are too generic to act as merge parents.
+    // A session run from ~ should stay its own row, not absorb every project.
+    let home_dir = dirs::home_dir().map(|h| h.to_string_lossy().to_string());
+
     // Build a mapping: child path → parent root
     let mut parent_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -2811,13 +2847,18 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
             if candidate == path {
                 continue;
             }
+            // Skip home directory — it's not a real project root
+            if home_dir.as_deref() == Some(candidate.as_str()) {
+                continue;
+            }
             // candidate must be a proper prefix with a '/' boundary
             if path.starts_with(candidate.as_str())
                 && path.as_bytes().get(candidate.len()) == Some(&b'/')
             {
-                // Pick the shortest (most ancestral) parent
+                // Pick the longest (most specific) parent so subdirs merge
+                // into their closest project root, not a distant ancestor.
                 match best_parent {
-                    Some(bp) if candidate.len() < bp.len() => {
+                    Some(bp) if candidate.len() > bp.len() => {
                         best_parent = Some(candidate);
                     }
                     None => {
