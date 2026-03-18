@@ -289,6 +289,20 @@ export interface SessionStatsRaw {
 	total_tokens: number;
 }
 
+// Charts types
+
+export interface MergedDataPoint {
+	timestamp: string;
+	utilization: number | null;
+	total_tokens: number | null;
+	total_lines_changed: number | null;
+}
+
+export interface ChartSeriesVisibility {
+	utilization: boolean;
+	tokens: boolean;
+}
+
 // Plugin manager types
 
 export type PluginsTab = "installed" | "browse" | "marketplaces" | "updates";
