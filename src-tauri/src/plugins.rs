@@ -111,7 +111,6 @@ struct PluginJson {
     #[allow(dead_code)]
     name: Option<String>,
     description: Option<String>,
-    #[allow(dead_code)]
     version: Option<String>,
     author: Option<AuthorField>,
 }
@@ -253,18 +252,32 @@ pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
             .join("marketplace.json");
 
         let mut plugins = Vec::new();
+        let marketplace_root = PathBuf::from(&src.install_location);
         if let Ok(manifest) = read_json_file::<MarketplaceManifest>(&marketplace_json_path)
             && let Some(entries) = manifest.plugins
         {
             for entry in entries {
                 let key = format!("{}@{}", entry.name, name);
+                let source_path = entry.source.unwrap_or_default();
+
+                // Read actual version from the plugin's plugin.json in the
+                // marketplace repo, not from the marketplace manifest which
+                // can drift out of sync.
+                let actual_version = {
+                    let plugin_dir = marketplace_root.join(&source_path);
+                    read_plugin_json(plugin_dir.to_str().unwrap_or_default())
+                        .and_then(|p| p.version)
+                        .or(entry.version)
+                        .unwrap_or_else(|| "0.0.0".to_string())
+                };
+
                 plugins.push(MarketplacePlugin {
                     name: entry.name,
                     description: entry.description,
-                    version: entry.version.unwrap_or_else(|| "0.0.0".to_string()),
+                    version: actual_version,
                     author: entry.author.map(|a| a.name().to_string()),
                     category: entry.category,
-                    source_path: entry.source.unwrap_or_default(),
+                    source_path,
                     installed: installed_set.contains(&key),
                 });
             }

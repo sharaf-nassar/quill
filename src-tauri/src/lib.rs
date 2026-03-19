@@ -622,16 +622,12 @@ async fn update_plugin(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let result = tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace))?;
-    // Refresh marketplace so version data is current and stale updates clear
-    let _ = tokio::task::block_in_place(|| plugins::refresh_marketplace(&marketplace));
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
 async fn update_all_plugins(app: tauri::AppHandle) -> Result<plugins::BulkUpdateProgress, String> {
-    // Refresh all marketplaces first so we have current version data
-    let _ = tokio::task::block_in_place(plugins::refresh_all_marketplaces);
     let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
     let progress = tokio::task::block_in_place(|| plugins::bulk_update_plugins(&updates, &app));
     let _ = app.emit("plugin-changed", ());
