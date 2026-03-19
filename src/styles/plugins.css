@@ -50,6 +50,50 @@
   color: rgba(255, 255, 255, 0.7);
 }
 
+/* ─── Result banner ─── */
+.plugins-result-banner {
+  display: flex;
+  align-items: center;
+  padding: 6px 12px;
+  font-size: 12px;
+  flex-shrink: 0;
+  gap: 8px;
+}
+
+.plugins-result-banner--success {
+  background: rgba(158, 206, 106, 0.15);
+  color: #9ece6a;
+  border-bottom: 1px solid rgba(158, 206, 106, 0.2);
+}
+
+.plugins-result-banner--error {
+  background: rgba(247, 118, 142, 0.15);
+  color: #f7768e;
+  border-bottom: 1px solid rgba(247, 118, 142, 0.2);
+}
+
+.plugins-result-banner__message {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugins-result-banner__dismiss {
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.6;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.plugins-result-banner__dismiss:hover {
+  opacity: 1;
+}
+
 .plugins-body {
   flex: 1;
   display: flex;

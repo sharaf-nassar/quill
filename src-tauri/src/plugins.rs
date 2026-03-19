@@ -373,21 +373,39 @@ fn run_claude_command(args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("claude")
         .args(args)
         .output()
-        .map_err(|e| format!("Plugin command failed: {e}"))?;
+        .map_err(|e| format!("Failed to run claude CLI: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(stdout)
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
         log::error!(
-            "claude {} failed: stderr={} stdout={}",
-            args.join(" "),
-            stderr.trim(),
-            stdout.trim()
+            "claude {} failed: stderr={stderr} stdout={stdout}",
+            args.join(" ")
         );
-        Err("Plugin command failed. Check application logs for details.".to_string())
+        // Return stderr if available, otherwise stdout — but strip ANSI codes for the UI
+        let msg = if !stderr.is_empty() { &stderr } else { &stdout };
+        Err(strip_ansi(msg))
     }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 pub fn install_plugin(name: &str, marketplace: &str) -> Result<String, String> {

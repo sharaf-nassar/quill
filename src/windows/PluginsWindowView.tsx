@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -67,6 +67,15 @@ function PluginsWindowView() {
 		handlePluginChanged();
 	}, [handlePluginChanged]);
 
+	// Auto-dismiss operation result after 5 seconds
+	const lastResult = operations.lastResult;
+	const clearResult = operations.clearResult;
+	useEffect(() => {
+		if (!lastResult) return;
+		const timer = setTimeout(() => clearResult(), 5000);
+		return () => clearTimeout(timer);
+	}, [lastResult, clearResult]);
+
 	return (
 		<div className="plugins-window">
 			<div className="plugins-window-titlebar" data-tauri-drag-region>
@@ -81,6 +90,21 @@ function PluginsWindowView() {
 					&times;
 				</button>
 			</div>
+			{operations.lastResult && (
+				<div
+					className={`plugins-result-banner${operations.lastResult.success ? " plugins-result-banner--success" : " plugins-result-banner--error"}`}
+				>
+					<span className="plugins-result-banner__message">
+						{operations.lastResult.message}
+					</span>
+					<button
+						className="plugins-result-banner__dismiss"
+						onClick={operations.clearResult}
+					>
+						&times;
+					</button>
+				</div>
+			)}
 			<div className="plugins-body">
 				{installed.loading && marketplaces.loading ? (
 					<div className="plugins-loading">Loading...</div>

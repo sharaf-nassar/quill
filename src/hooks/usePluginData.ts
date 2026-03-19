@@ -136,14 +136,36 @@ export function useAvailableUpdates() {
 	return { result, loading, error, refresh, checkNow };
 }
 
+export interface OperationResult {
+	pluginName: string;
+	action: string;
+	success: boolean;
+	message: string;
+}
+
 export function usePluginOperations() {
 	const [inProgress, setInProgress] = useState<Set<string>>(new Set());
+	const [lastResult, setLastResult] = useState<OperationResult | null>(null);
 
 	const withOperation = useCallback(
-		async (pluginName: string, operation: () => Promise<unknown>) => {
+		async (pluginName: string, action: string, operation: () => Promise<unknown>) => {
 			setInProgress((prev) => new Set(prev).add(pluginName));
+			setLastResult(null);
 			try {
-				await operation();
+				const result = await operation();
+				setLastResult({
+					pluginName,
+					action,
+					success: true,
+					message: typeof result === "string" && result.trim() ? result.trim() : `${action} completed`,
+				});
+			} catch (e) {
+				setLastResult({
+					pluginName,
+					action,
+					success: false,
+					message: String(e),
+				});
 			} finally {
 				setInProgress((prev) => {
 					const next = new Set(prev);
@@ -157,8 +179,8 @@ export function usePluginOperations() {
 
 	const installPlugin = useCallback(
 		async (name: string, marketplace: string) => {
-			await withOperation(name, async () => {
-				await invoke("install_plugin", { name, marketplace });
+			await withOperation(name, "Install", async () => {
+				return await invoke("install_plugin", { name, marketplace });
 			});
 		},
 		[withOperation],
@@ -166,8 +188,8 @@ export function usePluginOperations() {
 
 	const removePlugin = useCallback(
 		async (name: string, marketplace: string) => {
-			await withOperation(name, async () => {
-				await invoke("remove_plugin", { name, marketplace });
+			await withOperation(name, "Remove", async () => {
+				return await invoke("remove_plugin", { name, marketplace });
 			});
 		},
 		[withOperation],
@@ -175,8 +197,8 @@ export function usePluginOperations() {
 
 	const enablePlugin = useCallback(
 		async (name: string) => {
-			await withOperation(name, async () => {
-				await invoke("enable_plugin", { name });
+			await withOperation(name, "Enable", async () => {
+				return await invoke("enable_plugin", { name });
 			});
 		},
 		[withOperation],
@@ -184,8 +206,8 @@ export function usePluginOperations() {
 
 	const disablePlugin = useCallback(
 		async (name: string) => {
-			await withOperation(name, async () => {
-				await invoke("disable_plugin", { name });
+			await withOperation(name, "Disable", async () => {
+				return await invoke("disable_plugin", { name });
 			});
 		},
 		[withOperation],
@@ -193,15 +215,21 @@ export function usePluginOperations() {
 
 	const updatePlugin = useCallback(
 		async (name: string, marketplace: string) => {
-			await withOperation(name, async () => {
-				await invoke("update_plugin", { name, marketplace });
+			await withOperation(name, "Update", async () => {
+				return await invoke("update_plugin", { name, marketplace });
 			});
 		},
 		[withOperation],
 	);
 
+	const clearResult = useCallback(() => {
+		setLastResult(null);
+	}, []);
+
 	return {
 		inProgress,
+		lastResult,
+		clearResult,
 		installPlugin,
 		removePlugin,
 		enablePlugin,
