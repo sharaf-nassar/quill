@@ -497,6 +497,26 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 8: {e}"))?;
         }
 
+        // Migration 9: suggestion conflict groups
+        if current_version < 9 {
+            let has_group_id: bool = conn
+                .prepare("SELECT group_id FROM optimization_suggestions LIMIT 0")
+                .is_ok();
+            if !has_group_id {
+                conn.execute_batch(
+                    "ALTER TABLE optimization_suggestions ADD COLUMN group_id TEXT;",
+                )
+                .map_err(|e| format!("Migration 9 (group_id): {e}"))?;
+            }
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_optsug_group ON optimization_suggestions(group_id);",
+            )
+            .map_err(|e| format!("Migration 9 (group_id index): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (9)", [])
+                .map_err(|e| format!("Failed to record migration 9: {e}"))?;
+        }
+
         let storage = Self {
             conn: Mutex::new(conn),
         };
@@ -2347,7 +2367,7 @@ impl Storage {
                 (
                     "SELECT id, run_id, project_path, action_type, target_file, reasoning,
                             proposed_content, merge_sources, status, error, resolved_at, created_at,
-                            original_content, diff_summary, backup_data
+                            original_content, diff_summary, backup_data, group_id
                      FROM optimization_suggestions WHERE project_path = ?1 AND status = ?2
                      ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
                         .to_string(),
@@ -2362,7 +2382,7 @@ impl Storage {
                 (
                     "SELECT id, run_id, project_path, action_type, target_file, reasoning,
                             proposed_content, merge_sources, status, error, resolved_at, created_at,
-                            original_content, diff_summary, backup_data
+                            original_content, diff_summary, backup_data, group_id
                      FROM optimization_suggestions WHERE project_path = ?1
                      ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
                         .to_string(),
@@ -2399,6 +2419,7 @@ impl Storage {
                     original_content: row.get(12)?,
                     diff_summary: row.get(13)?,
                     backup_data: row.get(14)?,
+                    group_id: row.get(15)?,
                 })
             })
             .map_err(|e| format!("Failed to query suggestions: {e}"))?;
@@ -2418,7 +2439,7 @@ impl Storage {
             .prepare_cached(
                 "SELECT id, run_id, project_path, action_type, target_file, reasoning,
                         proposed_content, merge_sources, status, error, resolved_at, created_at,
-                        original_content, diff_summary, backup_data
+                        original_content, diff_summary, backup_data, group_id
                  FROM optimization_suggestions
                  WHERE project_path = ?1 AND status = 'denied'
                  ORDER BY resolved_at DESC LIMIT ?2",
@@ -2445,6 +2466,7 @@ impl Storage {
                     original_content: row.get(12)?,
                     diff_summary: row.get(13)?,
                     backup_data: row.get(14)?,
+                    group_id: row.get(15)?,
                 })
             })
             .map_err(|e| format!("Failed to query denied suggestions: {e}"))?;
@@ -2480,7 +2502,7 @@ impl Storage {
         conn.query_row(
             "SELECT id, run_id, project_path, action_type, target_file, reasoning,
                     proposed_content, merge_sources, status, error, resolved_at, created_at,
-                    original_content, diff_summary, backup_data
+                    original_content, diff_summary, backup_data, group_id
              FROM optimization_suggestions WHERE id = ?1",
             rusqlite::params![suggestion_id],
             |row| {
@@ -2503,6 +2525,7 @@ impl Storage {
                     original_content: row.get(12)?,
                     diff_summary: row.get(13)?,
                     backup_data: row.get(14)?,
+                    group_id: row.get(15)?,
                 })
             },
         )
@@ -2573,7 +2596,7 @@ impl Storage {
             .prepare_cached(
                 "SELECT id, run_id, project_path, action_type, target_file, reasoning,
                         proposed_content, merge_sources, status, error, resolved_at, created_at,
-                        original_content, diff_summary, backup_data
+                        original_content, diff_summary, backup_data, group_id
                  FROM optimization_suggestions WHERE run_id = ?1
                  ORDER BY created_at ASC",
             )
@@ -2599,6 +2622,7 @@ impl Storage {
                     original_content: row.get(12)?,
                     diff_summary: row.get(13)?,
                     backup_data: row.get(14)?,
+                    group_id: row.get(15)?,
                 })
             })
             .map_err(|e| format!("Failed to query suggestions for run: {e}"))?;
@@ -2673,6 +2697,67 @@ impl Storage {
             .map_err(|e| format!("Failed to check duplicate pending: {e}"))?
         };
         Ok(count > 0)
+    }
+
+    /// Set group_id for a suggestion.
+    #[allow(dead_code)]
+    pub fn set_suggestion_group_id(
+        &self,
+        suggestion_id: i64,
+        group_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE optimization_suggestions SET group_id = ?1 WHERE id = ?2",
+            rusqlite::params![group_id, suggestion_id],
+        )
+        .map_err(|e| format!("Failed to set suggestion group_id: {e}"))?;
+        Ok(())
+    }
+
+    /// Get all pending suggestions in a group.
+    #[allow(dead_code)]
+    pub fn get_suggestions_by_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, run_id, project_path, action_type, target_file, reasoning,
+                        proposed_content, merge_sources, status, error, resolved_at, created_at,
+                        original_content, diff_summary, backup_data, group_id
+                 FROM optimization_suggestions WHERE group_id = ?1
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|e| format!("Failed to prepare group suggestions query: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                let merge_sources_json: Option<String> = row.get(7)?;
+                let merge_sources: Option<Vec<String>> =
+                    merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
+                Ok(crate::models::OptimizationSuggestion {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    project_path: row.get(2)?,
+                    action_type: row.get(3)?,
+                    target_file: row.get(4)?,
+                    reasoning: row.get(5)?,
+                    proposed_content: row.get(6)?,
+                    merge_sources,
+                    status: row.get(8)?,
+                    error: row.get(9)?,
+                    resolved_at: row.get(10)?,
+                    created_at: row.get(11)?,
+                    original_content: row.get(12)?,
+                    diff_summary: row.get(13)?,
+                    backup_data: row.get(14)?,
+                    group_id: row.get(15)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query group suggestions: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect group suggestions: {e}"))
     }
 
     pub fn get_code_stats(&self, range: &str) -> Result<CodeStats, String> {

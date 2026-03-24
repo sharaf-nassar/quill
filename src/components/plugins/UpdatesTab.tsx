@@ -1,6 +1,12 @@
 import { useCallback } from "react";
 import type { UpdateCheckResult, BulkUpdateProgress } from "../../types";
 
+function projectName(path: string | null): string {
+	if (!path) return "";
+	const name = path.split("/").filter(Boolean).pop();
+	return name === "~" ? "~" : name ?? path;
+}
+
 function formatTime(ts: string | null): string {
 	if (!ts) return "Never";
 	const date = new Date(ts);
@@ -20,7 +26,7 @@ interface UpdatesTabProps {
 	};
 	operations: {
 		inProgress: Set<string>;
-		updatePlugin: (name: string, marketplace: string) => Promise<void>;
+		updatePlugin: (name: string, marketplace: string, scope: string, projectPath: string | null) => Promise<void>;
 	};
 	bulkUpdate: {
 		progress: BulkUpdateProgress | null;
@@ -41,8 +47,8 @@ function UpdatesTab({
 	const { progress, running } = bulkUpdate;
 
 	const handleUpdate = useCallback(
-		async (name: string, marketplace: string) => {
-			await operations.updatePlugin(name, marketplace);
+		async (name: string, marketplace: string, scope: string, projectPath: string | null) => {
+			await operations.updatePlugin(name, marketplace, scope, projectPath);
 			onChanged();
 		},
 		[operations, onChanged],
@@ -126,7 +132,11 @@ function UpdatesTab({
 
 			<div className="plugins-list">
 				{result.plugin_updates.length === 0 && !running && (
-					<div className="plugins-empty">All plugins are up to date &#10003;</div>
+					<div className="plugins-empty">
+						{result.last_checked
+							? "All plugins are up to date \u2713"
+							: "Click Check Now for updates\u2026"}
+					</div>
 				)}
 				{result.plugin_updates.map((update) => {
 					const busy =
@@ -145,7 +155,13 @@ function UpdatesTab({
 									</span>
 								</div>
 								<div className="plugins-row__meta">
-									{update.marketplace}
+									<span>{update.marketplace}</span>
+									<span className="plugins-scope-badge" title={update.project_path ?? undefined}>
+										{update.scope}
+										{update.scope === "project" && update.project_path && (
+											<> &middot; {projectName(update.project_path)}</>
+										)}
+									</span>
 								</div>
 							</div>
 							<div className="plugins-row__actions">
@@ -160,7 +176,7 @@ function UpdatesTab({
 									<button
 										className="plugins-btn plugins-btn--install"
 										onClick={() =>
-											handleUpdate(update.name, update.marketplace)
+											handleUpdate(update.name, update.marketplace, update.scope, update.project_path)
 										}
 									>
 										Update

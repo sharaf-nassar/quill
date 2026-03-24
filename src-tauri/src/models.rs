@@ -479,6 +479,7 @@ pub struct OptimizationSuggestion {
     pub original_content: Option<String>,
     pub diff_summary: Option<String>,
     pub backup_data: Option<String>,
+    pub group_id: Option<String>,
 }
 
 /// An optimization run record returned to frontend

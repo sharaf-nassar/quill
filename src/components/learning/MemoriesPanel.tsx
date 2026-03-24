@@ -236,6 +236,8 @@ export function MemoriesPanel() {
     denySuggestion,
     undenySuggestion,
     undoSuggestion,
+    approveGroup,
+    denyGroup,
     addCustomProject,
     removeCustomProject,
     deleteMemoryFile,
@@ -258,9 +260,13 @@ export function MemoriesPanel() {
     ? projects
     : projects.filter((p) => p.memory_count > 0 || p.is_custom);
 
+  const isAllView = selectedProject === "__all__";
+  const totalMemoryCount = projects.reduce((sum, p) => sum + p.memory_count, 0);
+
   // If selected project is no longer in the visible list, auto-select first visible
   useEffect(() => {
     if (
+      selectedProject !== "__all__" &&
       visibleProjects.length > 0 &&
       !visibleProjects.some((p) => p.path === selectedProject)
     ) {
@@ -297,6 +303,7 @@ export function MemoriesPanel() {
           onChange={(e) => setSelectedProject(e.target.value)}
           style={STYLES.select}
         >
+          <option value="__all__">All Projects ({totalMemoryCount})</option>
           {visibleProjects.map((p) => (
             <option key={p.path} value={p.path}>
               {p.name} ({p.memory_count})
@@ -321,8 +328,8 @@ export function MemoriesPanel() {
         </button>
       </div>
 
-      {/* Manage panel */}
-      {showManage && (
+      {/* Manage panel (hidden in all-projects view) */}
+      {showManage && !isAllView && (
         <div style={STYLES.managePanel}>
           {/* Show empty toggle */}
           <label style={STYLES.showEmptyLabel}>
@@ -419,6 +426,55 @@ export function MemoriesPanel() {
 
       {loading ? (
         <div className="learning-empty">Loading...</div>
+      ) : isAllView ? (
+        /* ─── All Projects grouped view ─── */
+        <>
+          {actualMemoryFiles.length === 0 ? (
+            <div className="learning-empty">
+              No memory files across any project.
+            </div>
+          ) : (
+            (() => {
+              // Group by project_path, preserve project order
+              const byProject = new Map<string, typeof actualMemoryFiles>();
+              for (const mf of actualMemoryFiles) {
+                const list = byProject.get(mf.project_path) || [];
+                list.push(mf);
+                byProject.set(mf.project_path, list);
+              }
+              // Resolve display name from projects list
+              const nameFor = (path: string) =>
+                projects.find((p) => p.path === path)?.name || path.split("/").pop() || path;
+
+              return [...byProject.entries()].map(([projectPath, files]) => (
+                <div key={projectPath} className="learning-section">
+                  <div
+                    className="learning-section-header"
+                    style={{ cursor: "pointer" }}
+                    onClick={() => setSelectedProject(projectPath)}
+                    title={`Switch to ${nameFor(projectPath)}`}
+                  >
+                    {nameFor(projectPath)}
+                    <span className="learning-section-count">
+                      {files.length}
+                    </span>
+                  </div>
+                  {files.map((mf) => (
+                    <MemoryFileCard
+                      key={mf.file_path}
+                      file={mf}
+                      expanded={expandedFiles.has(mf.file_path)}
+                      onToggle={toggleFile}
+                      onDelete={(path, name) =>
+                        setConfirmDelete({ type: "file", path, name })
+                      }
+                    />
+                  ))}
+                </div>
+              ));
+            })()
+          )}
+        </>
       ) : (
         <>
           {/* Memory files */}
@@ -528,15 +584,106 @@ export function MemoriesPanel() {
                   {actionableSuggestions.length}
                 </span>
               </div>
-              {actionableSuggestions.map((s) => (
-                <SuggestionCard
-                  key={s.id}
-                  suggestion={s}
-                  onApprove={approveSuggestion}
-                  onDeny={denySuggestion}
-                  onUndo={undoSuggestion}
-                />
-              ))}
+              {(() => {
+                // Partition into grouped and ungrouped
+                const grouped = new Map<string, typeof actionableSuggestions>();
+                const ungrouped: typeof actionableSuggestions = [];
+                for (const s of actionableSuggestions) {
+                  if (s.group_id) {
+                    const list = grouped.get(s.group_id) || [];
+                    list.push(s);
+                    grouped.set(s.group_id, list);
+                  } else {
+                    ungrouped.push(s);
+                  }
+                }
+                return (
+                  <>
+                    {/* Grouped suggestions */}
+                    {[...grouped.entries()].map(([gid, items]) => (
+                      <div
+                        key={gid}
+                        style={{
+                          border: "1px solid rgba(139,92,246,0.3)",
+                          borderRadius: 6,
+                          padding: 6,
+                          marginBottom: 4,
+                          background: "rgba(139,92,246,0.04)",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                            marginBottom: 4,
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: 9,
+                              fontWeight: 700,
+                              color: "#8B5CF6",
+                              textTransform: "uppercase",
+                              letterSpacing: 0.5,
+                            }}
+                          >
+                            Linked ({items.length})
+                          </span>
+                          <span
+                            style={{
+                              fontSize: 9,
+                              color: "rgba(255,255,255,0.4)",
+                              flex: 1,
+                            }}
+                          >
+                            These share files — approve or deny together
+                          </span>
+                          <button
+                            className="learning-analyze-btn"
+                            style={{
+                              borderColor: "#8B5CF6",
+                              color: "#8B5CF6",
+                              fontSize: 9,
+                              padding: "2px 8px",
+                            }}
+                            onClick={() => approveGroup(gid)}
+                          >
+                            Approve All
+                          </button>
+                          <button
+                            className="learning-rule-delete"
+                            style={{ fontSize: 11, color: "#EF4444" }}
+                            onClick={() => denyGroup(gid)}
+                          >
+                            Deny All
+                          </button>
+                        </div>
+                        {items.map((s) => (
+                          <SuggestionCard
+                            key={s.id}
+                            suggestion={s}
+                            onApprove={approveSuggestion}
+                            onDeny={denySuggestion}
+                            onUndo={undoSuggestion}
+                            inGroup
+                          />
+                        ))}
+                      </div>
+                    ))}
+                    {/* Ungrouped suggestions */}
+                    {ungrouped.map((s) => (
+                      <SuggestionCard
+                        key={s.id}
+                        suggestion={s}
+                        onApprove={approveSuggestion}
+                        onDeny={denySuggestion}
+                        onUndo={undoSuggestion}
+                      />
+                    ))}
+                  </>
+                );
+              })()}
             </div>
           )}
 

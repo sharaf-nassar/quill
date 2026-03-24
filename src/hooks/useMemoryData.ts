@@ -32,6 +32,7 @@ export interface OptimizationSuggestion {
   original_content: string | null;
   diff_summary: string | null;
   backup_data: string | null;
+  group_id: string | null;
 }
 
 export interface OptimizationRun {
@@ -108,11 +109,36 @@ export function useMemoryData() {
     }
   }, [toast]);
 
+  const projectsRef = useRef(projects);
+  projectsRef.current = projects;
+
+  const loadAllProjectData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const withMemories = projectsRef.current.filter((p) => p.memory_count > 0);
+      const allFiles = await Promise.all(
+        withMemories.map((p) =>
+          invoke<MemoryFile[]>("get_memory_files", { projectPath: p.path }),
+        ),
+      );
+      setMemoryFiles(allFiles.flat());
+      setSuggestions([]);
+      setRuns([]);
+      setOptimizing(false);
+    } catch (e) {
+      toast("error", `Failed to load all project data: ${e}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [toast]);
+
   const refresh = useCallback(() => {
-    if (selectedProject) {
+    if (selectedProject === "__all__") {
+      loadAllProjectData();
+    } else if (selectedProject) {
       loadProjectData(selectedProject);
     }
-  }, [selectedProject, loadProjectData]);
+  }, [selectedProject, loadProjectData, loadAllProjectData]);
 
   // Load projects on mount
   useEffect(() => {
@@ -121,10 +147,12 @@ export function useMemoryData() {
 
   // Load project data when selection changes
   useEffect(() => {
-    if (selectedProject) {
+    if (selectedProject === "__all__") {
+      loadAllProjectData();
+    } else if (selectedProject) {
       loadProjectData(selectedProject);
     }
-  }, [selectedProject, loadProjectData]);
+  }, [selectedProject, loadProjectData, loadAllProjectData]);
 
   // Listen for events
   useEffect(() => {
@@ -218,6 +246,30 @@ export function useMemoryData() {
         refresh();
       } catch (e) {
         toast("error", `Failed to undo: ${e}`);
+      }
+    },
+    [refresh, toast],
+  );
+
+  const approveGroup = useCallback(
+    async (groupId: string) => {
+      try {
+        await invoke("approve_suggestion_group", { groupId });
+        refresh();
+      } catch (e) {
+        toast("error", `Failed to approve group: ${e}`);
+      }
+    },
+    [refresh, toast],
+  );
+
+  const denyGroup = useCallback(
+    async (groupId: string) => {
+      try {
+        await invoke("deny_suggestion_group", { groupId });
+        refresh();
+      } catch (e) {
+        toast("error", `Failed to deny group: ${e}`);
       }
     },
     [refresh, toast],
@@ -323,6 +375,8 @@ export function useMemoryData() {
     denySuggestion,
     undenySuggestion,
     undoSuggestion,
+    approveGroup,
+    denyGroup,
     addCustomProject,
     removeCustomProject,
     deleteMemoryFile,

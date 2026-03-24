@@ -491,17 +491,15 @@ body {
 }
 
 .view-tab--learning {
-  color: rgba(34, 197, 94, 0.5);
-  font-size: 15px;
+  font-size: 14px;
 }
 
 .view-tab--learning:hover {
-  color: rgba(34, 197, 94, 0.8);
+  opacity: 0.9;
 }
 
 .view-tab--learning.active {
   background: rgba(34, 197, 94, 0.12);
-  color: rgba(34, 197, 94, 0.9);
 }
 
 .view-tab--search {

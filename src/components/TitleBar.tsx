@@ -145,7 +145,7 @@ function TitleBar({
 						aria-label="Open learning"
 						title="Learning"
 					>
-						&#10022;
+						&#x1F9E0;
 					</button>
 					<button
 						className="view-tab view-tab--search"

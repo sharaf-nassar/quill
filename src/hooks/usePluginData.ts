@@ -214,9 +214,9 @@ export function usePluginOperations() {
 	);
 
 	const updatePlugin = useCallback(
-		async (name: string, marketplace: string) => {
+		async (name: string, marketplace: string, scope: string, projectPath: string | null) => {
 			await withOperation(name, "Update", async () => {
-				return await invoke("update_plugin", { name, marketplace });
+				return await invoke("update_plugin", { name, marketplace, scope, projectPath });
 			});
 		},
 		[withOperation],

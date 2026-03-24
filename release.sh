@@ -158,13 +158,38 @@ cmd_retag() {
   echo "WARNING: This deletes the tag on the remote and re-pushes it."
   echo ""
 
-  echo "Generating release notes..."
+  # Extract previous release notes from the existing tag annotation
+  local prev_notes
+  prev_notes=$(git tag -l --format='%(contents:body)' "$tag" | sed '/^$/d')
+
   local notes
-  notes=$(generate_notes "$prev_tag" "$tag")
-  echo ""
-  echo "--- Release Notes ---"
-  echo "$notes"
-  echo "---------------------"
+  if [[ -n "$prev_notes" ]]; then
+    echo "--- Previous Release Notes ---"
+    echo "$prev_notes"
+    echo "------------------------------"
+    echo ""
+    read -rp "Use previous release notes? [Y/n] " use_prev
+    if [[ "$use_prev" == [nN] ]]; then
+      echo ""
+      echo "Generating new release notes..."
+      notes=$(generate_notes "$prev_tag" "$tag")
+      echo ""
+      echo "--- New Release Notes ---"
+      echo "$notes"
+      echo "-------------------------"
+    else
+      notes="$prev_notes"
+    fi
+  else
+    echo "No previous release notes found on $tag."
+    echo ""
+    echo "Generating release notes..."
+    notes=$(generate_notes "$prev_tag" "$tag")
+    echo ""
+    echo "--- Release Notes ---"
+    echo "$notes"
+    echo "---------------------"
+  fi
   echo ""
 
   read -rp "Continue? [Y/n] " confirm

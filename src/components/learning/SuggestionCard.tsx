@@ -7,6 +7,7 @@ interface SuggestionCardProps {
   onDeny: (id: number) => void;
   onUndeny?: (id: number) => void;
   onUndo?: (id: number) => void;
+  inGroup?: boolean;
 }
 
 const ACTION_COLORS: Record<string, string> = {
@@ -48,6 +49,7 @@ export function SuggestionCard({
   onDeny,
   onUndeny,
   onUndo,
+  inGroup,
 }: SuggestionCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [showFull, setShowFull] = useState(false);
@@ -104,7 +106,7 @@ export function SuggestionCard({
             {suggestion.status}
           </span>
         )}
-        {isPending && (
+        {isPending && !inGroup && (
           <span style={{ display: "flex", gap: 4, marginLeft: "auto" }}>
             <button
               className="learning-analyze-btn"

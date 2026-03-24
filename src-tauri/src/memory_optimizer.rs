@@ -621,6 +621,7 @@ pub async fn run_optimization_with_run(
 
     // Store suggestions (with CLAUDE.md action type validation)
     let mem_dir = memory_dir(project_path);
+    let mut stored_suggestions: Vec<(i64, Option<String>, Option<Vec<String>>)> = Vec::new();
     for suggestion in &result.suggestions {
         let targets_claude_md = suggestion
             .target_file
@@ -721,7 +722,7 @@ pub async fn run_optimization_with_run(
             ActionType::Create | ActionType::Flag => (None, None, None),
         };
 
-        storage.store_optimization_suggestion(
+        let sug_id = storage.store_optimization_suggestion(
             run_id,
             project_path,
             &suggestion.action_type.to_string(),
@@ -733,7 +734,15 @@ pub async fn run_optimization_with_run(
             diff_summary.as_deref(),
             backup_data.as_deref(),
         )?;
+        stored_suggestions.push((
+            sug_id,
+            target_file.clone(),
+            suggestion.merge_sources.clone(),
+        ));
     }
+
+    // Detect file-level conflicts and assign group IDs
+    assign_conflict_groups(storage, &stored_suggestions)?;
 
     storage.update_optimization_run(
         run_id,
@@ -797,6 +806,393 @@ fn read_target_file(
     let target = target?;
     let path = resolve_target_path(target, project_path, mem_dir).ok()?;
     std::fs::read_to_string(path).ok()
+}
+
+/// Detect file-level conflicts between suggestions and assign group IDs.
+/// Two suggestions conflict if they reference any of the same files
+/// (via target_file or merge_sources). Connected components become groups.
+fn assign_conflict_groups(
+    storage: &Storage,
+    suggestions: &[(i64, Option<String>, Option<Vec<String>>)],
+) -> Result<(), String> {
+    if suggestions.len() < 2 {
+        return Ok(());
+    }
+
+    // Collect all file references per suggestion
+    let mut file_to_indices: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, (_id, target, sources)) in suggestions.iter().enumerate() {
+        if let Some(t) = target {
+            file_to_indices.entry(t.clone()).or_default().push(i);
+        }
+        if let Some(srcs) = sources {
+            for s in srcs {
+                file_to_indices.entry(s.clone()).or_default().push(i);
+            }
+        }
+    }
+
+    // Union-find to identify connected components
+    let n = suggestions.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], i: usize) -> usize {
+        let mut root = i;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        // Path compression
+        let mut cur = i;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+
+    for indices in file_to_indices.values() {
+        for window in indices.windows(2) {
+            let ra = find(&mut parent, window[0]);
+            let rb = find(&mut parent, window[1]);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+    }
+
+    // Find groups with >1 member and assign group IDs
+    let mut components: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        components.entry(root).or_default().push(i);
+    }
+
+    let mut group_counter = 0u32;
+    for members in components.values() {
+        if members.len() > 1 {
+            let run_id = suggestions[members[0]].0;
+            let group_id = format!("{run_id}-g{group_counter}");
+            group_counter += 1;
+            for &idx in members {
+                storage.set_suggestion_group_id(suggestions[idx].0, &group_id)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute all suggestions in a group atomically.
+/// Validates staleness for all before executing any, then executes in order:
+/// flag → update → create → merge → delete.
+pub fn execute_suggestion_group(
+    storage: &Storage,
+    group_id: &str,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    let suggestions = storage.get_suggestions_by_group(group_id)?;
+    let pending: Vec<_> = suggestions
+        .iter()
+        .filter(|s| s.status == "pending" || s.status == "undone")
+        .cloned()
+        .collect();
+
+    if pending.is_empty() {
+        return Err("No pending suggestions in this group".to_string());
+    }
+
+    let project_path = pending[0].project_path.clone();
+    let mem_dir = memory_dir(&project_path);
+
+    // Phase 1: Validate staleness for ALL suggestions before executing any
+    for s in &pending {
+        if let Some(ref original) = s.original_content
+            && let Some(ref target) = s.target_file
+            && let Ok(path) = resolve_target_path(target, &project_path, &mem_dir)
+            && path.exists()
+        {
+            let current = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+            let orig_hash = format!("{:x}", Sha256::digest(original.as_bytes()));
+            let curr_hash = format!("{:x}", Sha256::digest(current.as_bytes()));
+            if orig_hash != curr_hash {
+                return Err(format!(
+                    "File '{}' has changed since suggestions were generated — re-run optimization",
+                    target
+                ));
+            }
+        }
+    }
+
+    // Phase 2: Sort by execution order and execute
+    fn action_order(action_type: &str) -> u8 {
+        match action_type {
+            "flag" => 0,
+            "update" => 1,
+            "create" => 2,
+            "merge" => 3,
+            "delete" => 4,
+            _ => 5,
+        }
+    }
+
+    let mut ordered = pending;
+    ordered.sort_by_key(|s| action_order(&s.action_type));
+
+    for s in &ordered {
+        // Execute each suggestion's filesystem operation directly
+        // (skip per-item staleness check since we validated the group above)
+        execute_single_suggestion_unchecked(storage, s, &project_path, &mem_dir)?;
+        storage.update_suggestion_status(s.id, "approved", None)?;
+    }
+
+    let _ = app.emit(
+        "memory-files-updated",
+        MemoryFilesUpdatedEvent {
+            project_path: project_path.clone(),
+        },
+    );
+
+    // Generate combined MEMORY.md follow-up for the group
+    generate_group_memory_md_followup(storage, &ordered, &project_path, &mem_dir)?;
+
+    Ok(())
+}
+
+/// Execute a single suggestion's filesystem operation without staleness check.
+/// Used by group execution where staleness was already validated.
+fn execute_single_suggestion_unchecked(
+    _storage: &Storage,
+    suggestion: &crate::models::OptimizationSuggestion,
+    project_path: &str,
+    mem_dir: &Path,
+) -> Result<(), String> {
+    let is_claude_md = suggestion
+        .target_file
+        .as_ref()
+        .map(|f| f.ends_with("CLAUDE.md"))
+        .unwrap_or(false);
+
+    match suggestion.action_type.as_str() {
+        "delete" => {
+            if is_claude_md {
+                return Err("Cannot delete CLAUDE.md files".to_string());
+            }
+            let target = suggestion
+                .target_file
+                .as_ref()
+                .ok_or("Delete suggestion missing target_file")?;
+            let path = resolve_target_path(target, project_path, mem_dir)?;
+            if path.exists() {
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("Failed to delete {}: {e}", path.display()))?;
+            }
+        }
+        "update" => {
+            let target = suggestion
+                .target_file
+                .as_ref()
+                .ok_or("Update suggestion missing target_file")?;
+            let content = suggestion
+                .proposed_content
+                .as_ref()
+                .ok_or("Update suggestion missing proposed_content")?;
+            let path = resolve_target_path(target, project_path, mem_dir)?;
+            std::fs::write(&path, content)
+                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        }
+        "create" => {
+            if is_claude_md {
+                return Err("Cannot create CLAUDE.md files".to_string());
+            }
+            let content = suggestion
+                .proposed_content
+                .as_ref()
+                .ok_or("Create suggestion missing proposed_content")?;
+            let raw_filename = suggestion
+                .target_file
+                .as_ref()
+                .ok_or("Create suggestion missing target filename")?;
+            let filename = if raw_filename.ends_with(".md") {
+                raw_filename.clone()
+            } else {
+                format!("{raw_filename}.md")
+            };
+            if !crate::prompt_utils::is_safe_memory_name(
+                filename.strip_suffix(".md").unwrap_or(&filename),
+            ) {
+                return Err(format!("Unsafe memory filename: {filename}"));
+            }
+            let path = mem_dir.join(&filename);
+            if !mem_dir.exists() {
+                std::fs::create_dir_all(mem_dir)
+                    .map_err(|e| format!("Failed to create memory dir: {e}"))?;
+            }
+            std::fs::write(&path, content)
+                .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
+        }
+        "merge" => {
+            if is_claude_md {
+                return Err("Cannot merge CLAUDE.md files".to_string());
+            }
+            let sources: Vec<String> = suggestion.merge_sources.clone().unwrap_or_default();
+            let content = suggestion
+                .proposed_content
+                .as_ref()
+                .ok_or("Merge suggestion missing proposed_content")?;
+            let target = suggestion
+                .target_file
+                .as_ref()
+                .ok_or("Merge suggestion missing target_file")?;
+
+            // Note: skip source existence check for group execution since
+            // a prior step in the group may have already removed a source
+            let target_path = resolve_target_path(target, project_path, mem_dir)?;
+            std::fs::write(&target_path, content)
+                .map_err(|e| format!("Failed to write merged file: {e}"))?;
+
+            for source in &sources {
+                if source != target {
+                    let source_path = resolve_target_path(source, project_path, mem_dir)?;
+                    if source_path.exists() {
+                        std::fs::remove_file(&source_path).map_err(|e| {
+                            format!("Failed to delete merge source {source}: {e}")
+                        })?;
+                    }
+                }
+            }
+        }
+        "flag" => {}
+        other => {
+            return Err(format!("Unknown action type: {other}"));
+        }
+    }
+    Ok(())
+}
+
+/// Generate a single MEMORY.md follow-up suggestion for an entire approved group.
+fn generate_group_memory_md_followup(
+    storage: &Storage,
+    suggestions: &[crate::models::OptimizationSuggestion],
+    project_path: &str,
+    mem_dir: &Path,
+) -> Result<(), String> {
+    let memory_md_path = mem_dir.join("MEMORY.md");
+    let memory_md_exists = memory_md_path.exists();
+    let current_memory_md = if memory_md_exists {
+        std::fs::read_to_string(&memory_md_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut updated = current_memory_md.clone();
+
+    for s in suggestions {
+        if s.action_type == "flag" {
+            continue;
+        }
+        let is_claude_md = s
+            .target_file
+            .as_ref()
+            .map(|f| f.ends_with("CLAUDE.md"))
+            .unwrap_or(false);
+        if is_claude_md {
+            continue;
+        }
+
+        match s.action_type.as_str() {
+            "delete" => {
+                if let Some(target) = &s.target_file {
+                    let link_pattern =
+                        regex::Regex::new(&format!(r"\[.*?\]\({}\)", regex::escape(target)))
+                            .unwrap();
+                    updated = updated
+                        .lines()
+                        .filter(|line| !link_pattern.is_match(line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+            }
+            "create" => {
+                let target = s.target_file.as_deref().unwrap_or("new_memory.md");
+                let desc = s
+                    .proposed_content
+                    .as_deref()
+                    .and_then(|c| {
+                        c.strip_prefix("---").and_then(|rest| {
+                            rest.find("---").and_then(|end| {
+                                rest[..end]
+                                    .lines()
+                                    .find(|l| l.trim().starts_with("description:"))
+                                    .map(|l| {
+                                        l.trim()
+                                            .strip_prefix("description:")
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string()
+                                    })
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| "New memory".to_string());
+                let link = format!("- [{}]({}) — {}", target, target, desc);
+                updated = format!("{}\n{}", updated.trim_end(), link);
+            }
+            "merge" => {
+                let sources = s.merge_sources.clone().unwrap_or_default();
+                for source in &sources {
+                    let link_pattern =
+                        regex::Regex::new(&format!(r"\[.*?\]\({}\)", regex::escape(source)))
+                            .unwrap();
+                    updated = updated
+                        .lines()
+                        .filter(|line| !link_pattern.is_match(line))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                }
+                let target = s.target_file.as_deref().unwrap_or("merged.md");
+                let desc = s.reasoning.chars().take(80).collect::<String>();
+                let link = format!("- [{}]({}) — {}", target, target, desc);
+                if !updated.contains(&format!("]({target})")) {
+                    updated = format!("{}\n{}", updated.trim_end(), link);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if updated != current_memory_md {
+        let run_id = suggestions[0].run_id;
+        let diff = generate_diff(&current_memory_md, &updated, "MEMORY.md");
+        storage.store_optimization_suggestion(
+            run_id,
+            project_path,
+            "update",
+            Some("MEMORY.md"),
+            "Update MEMORY.md index to reflect grouped changes",
+            Some(&updated),
+            None,
+            Some(&current_memory_md),
+            Some(&diff),
+            None,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Deny all pending suggestions in a group.
+pub fn deny_suggestion_group(storage: &Storage, group_id: &str) -> Result<(), String> {
+    let suggestions = storage.get_suggestions_by_group(group_id)?;
+    for s in &suggestions {
+        if s.status == "pending" || s.status == "undone" {
+            storage.update_suggestion_status(s.id, "denied", None)?;
+        }
+    }
+    Ok(())
 }
 
 /// Execute an approved suggestion — performs the filesystem operation.

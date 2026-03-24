@@ -1,6 +1,12 @@
 import { useState, useMemo, useCallback } from "react";
 import type { InstalledPlugin } from "../../types";
 
+function projectName(path: string | null): string {
+	if (!path) return "";
+	const name = path.split("/").filter(Boolean).pop();
+	return name === "~" ? "~" : name ?? path;
+}
+
 interface InstalledTabProps {
 	plugins: InstalledPlugin[];
 	operations: {
@@ -83,7 +89,13 @@ function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
 									</div>
 								)}
 								<div className="plugins-row__meta">
-									{plugin.marketplace} &middot; {plugin.scope} scope
+									<span>{plugin.marketplace}</span>
+									<span className="plugins-scope-badge" title={plugin.project_path ?? undefined}>
+										{plugin.scope}
+										{plugin.scope === "project" && plugin.project_path && (
+											<> &middot; {projectName(plugin.project_path)}</>
+										)}
+									</span>
 								</div>
 							</div>
 							<div className="plugins-row__actions">

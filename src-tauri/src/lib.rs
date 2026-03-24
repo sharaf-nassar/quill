@@ -431,6 +431,18 @@ async fn undo_suggestion(suggestion_id: i64, app: tauri::AppHandle) -> Result<()
 }
 
 #[tauri::command]
+async fn approve_suggestion_group(group_id: String, app: tauri::AppHandle) -> Result<(), String> {
+    let storage = get_storage()?;
+    run_blocking(move || memory_optimizer::execute_suggestion_group(storage, &group_id, &app))
+}
+
+#[tauri::command]
+async fn deny_suggestion_group(group_id: String) -> Result<(), String> {
+    let storage = get_storage()?;
+    run_blocking(move || memory_optimizer::deny_suggestion_group(storage, &group_id))
+}
+
+#[tauri::command]
 async fn get_suggestions_for_run(
     run_id: i64,
 ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
@@ -621,9 +633,12 @@ async fn disable_plugin(name: String, app: tauri::AppHandle) -> Result<String, S
 async fn update_plugin(
     name: String,
     marketplace: String,
+    scope: String,
+    project_path: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace))?;
+    let result = tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace, &scope, project_path.as_deref()))?;
+    refresh_update_cache(&app);
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
@@ -632,8 +647,22 @@ async fn update_plugin(
 async fn update_all_plugins(app: tauri::AppHandle) -> Result<plugins::BulkUpdateProgress, String> {
     let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
     let progress = tokio::task::block_in_place(|| plugins::bulk_update_plugins(&updates, &app));
+    refresh_update_cache(&app);
     let _ = app.emit("plugin-changed", ());
     Ok(progress)
+}
+
+/// Re-compute the cached update list from disk after a plugin mutation.
+fn refresh_update_cache(app: &tauri::AppHandle) {
+    if let Some(state) = app
+        .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
+        .map(|s| s.inner().clone())
+    {
+        if let Ok(updates) = plugins::get_available_updates() {
+            let mut cached = state.last_result.lock();
+            cached.plugin_updates = updates;
+        }
+    }
 }
 
 #[tauri::command]
@@ -1026,6 +1055,8 @@ pub fn run() {
             deny_suggestion,
             undeny_suggestion,
             undo_suggestion,
+            approve_suggestion_group,
+            deny_suggestion_group,
             get_suggestions_for_run,
             get_optimization_runs,
             get_known_projects,

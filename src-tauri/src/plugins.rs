@@ -9,6 +9,7 @@ pub struct InstalledPlugin {
     pub marketplace: String,
     pub version: String,
     pub scope: String,
+    pub project_path: Option<String>,
     pub enabled: bool,
     pub description: Option<String>,
     pub author: Option<String>,
@@ -42,6 +43,8 @@ pub struct Marketplace {
 pub struct PluginUpdate {
     pub name: String,
     pub marketplace: String,
+    pub scope: String,
+    pub project_path: Option<String>,
     pub current_version: String,
     pub available_version: String,
 }
@@ -80,6 +83,8 @@ struct InstalledPluginsFile {
 #[derive(Deserialize)]
 struct InstallationRecord {
     scope: String,
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
     #[serde(rename = "installPath")]
     install_path: String,
     version: String,
@@ -215,6 +220,7 @@ pub fn get_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
                 marketplace: marketplace_name.clone(),
                 version: record.version.clone(),
                 scope: record.scope.clone(),
+                project_path: record.project_path.clone(),
                 enabled,
                 description: meta.as_ref().and_then(|m| m.description.clone()),
                 author: meta
@@ -330,6 +336,8 @@ pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
                     updates.push(PluginUpdate {
                         name: plugin.name.clone(),
                         marketplace: plugin.marketplace.clone(),
+                        scope: plugin.scope.clone(),
+                        project_path: plugin.project_path.clone(),
                         current_version: plugin.version.clone(),
                         available_version: mp.version.clone(),
                     });
@@ -383,8 +391,16 @@ fn validate_repo(repo: &str) -> Result<(), String> {
 // ── Mutation Functions (CLI subprocess) ──
 
 fn run_claude_command(args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new("claude")
-        .args(args)
+    run_claude_command_in(args, None)
+}
+
+fn run_claude_command_in(args: &[&str], cwd: Option<&str>) -> Result<String, String> {
+    let mut cmd = std::process::Command::new("claude");
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run claude CLI: {e}"))?;
 
@@ -445,11 +461,14 @@ pub fn disable_plugin(name: &str) -> Result<String, String> {
     run_claude_command(&["plugin", "disable", name])
 }
 
-pub fn update_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+pub fn update_plugin(name: &str, marketplace: &str, scope: &str, project_path: Option<&str>) -> Result<String, String> {
     validate_plugin_name(name)?;
     validate_plugin_name(marketplace)?;
     let qualified = format!("{name}@{marketplace}");
-    run_claude_command(&["plugin", "update", &qualified])
+    run_claude_command_in(
+        &["plugin", "update", &qualified, "--scope", scope],
+        project_path,
+    )
 }
 
 pub fn add_marketplace(repo: &str) -> Result<String, String> {
@@ -512,7 +531,7 @@ pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> 
         progress.current_plugin = Some(update.name.clone());
         let _ = app.emit("plugin-bulk-progress", &progress);
 
-        let result = update_plugin(&update.name, &update.marketplace);
+        let result = update_plugin(&update.name, &update.marketplace, &update.scope, update.project_path.as_deref());
         progress.results.push(BulkUpdateItem {
             name: update.name.clone(),
             status: if result.is_ok() {

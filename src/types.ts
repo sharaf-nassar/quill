@@ -328,6 +328,7 @@ export interface InstalledPlugin {
 	marketplace: string;
 	version: string;
 	scope: string;
+	project_path: string | null;
 	enabled: boolean;
 	description: string | null;
 	author: string | null;
@@ -358,6 +359,8 @@ export interface Marketplace {
 export interface PluginUpdate {
 	name: string;
 	marketplace: string;
+	scope: string;
+	project_path: string | null;
 	current_version: string;
 	available_version: string;
 }
