@@ -343,7 +343,21 @@ impl SessionIndex {
         // Detect hostname from system
         let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
-            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+            .or_else(|_| {
+                // /etc/hostname exists on Linux; on macOS use `hostname` command
+                std::fs::read_to_string("/etc/hostname")
+                    .map(|s| s.trim().to_string())
+                    .or_else(|_| {
+                        std::process::Command::new("hostname")
+                            .output()
+                            .map_err(|e| e.to_string())
+                            .and_then(|o| {
+                                String::from_utf8(o.stdout)
+                                    .map(|s| s.trim().to_string())
+                                    .map_err(|e| e.to_string())
+                            })
+                    })
+            })
             .unwrap_or_else(|_| "unknown".to_string());
 
         for project_entry in &project_entries {

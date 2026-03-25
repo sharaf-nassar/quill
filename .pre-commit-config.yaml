@@ -42,3 +42,11 @@ repos:
         entry: npx eslint --max-warnings=0
         types_or: [ts, tsx]
         files: ^src/
+
+      - id: typecheck
+        name: typecheck
+        language: system
+        entry: npx tsc --noEmit
+        pass_filenames: false
+        types_or: [ts, tsx]
+        files: ^src/

@@ -461,7 +461,12 @@ pub fn disable_plugin(name: &str) -> Result<String, String> {
     run_claude_command(&["plugin", "disable", name])
 }
 
-pub fn update_plugin(name: &str, marketplace: &str, scope: &str, project_path: Option<&str>) -> Result<String, String> {
+pub fn update_plugin(
+    name: &str,
+    marketplace: &str,
+    scope: &str,
+    project_path: Option<&str>,
+) -> Result<String, String> {
     validate_plugin_name(name)?;
     validate_plugin_name(marketplace)?;
     let qualified = format!("{name}@{marketplace}");
@@ -531,7 +536,12 @@ pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> 
         progress.current_plugin = Some(update.name.clone());
         let _ = app.emit("plugin-bulk-progress", &progress);
 
-        let result = update_plugin(&update.name, &update.marketplace, &update.scope, update.project_path.as_deref());
+        let result = update_plugin(
+            &update.name,
+            &update.marketplace,
+            &update.scope,
+            update.project_path.as_deref(),
+        );
         progress.results.push(BulkUpdateItem {
             name: update.name.clone(),
             status: if result.is_ok() {

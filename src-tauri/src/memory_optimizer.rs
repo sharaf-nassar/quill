@@ -8,6 +8,8 @@ use crate::models::{
     MemoryOptimizerUpdatedEvent, OptimizationOutput,
 };
 use crate::prompt_utils::{escape_for_prompt, safe_truncate};
+
+type SuggestionRow = (i64, Option<String>, Option<Vec<String>>);
 use crate::storage::Storage;
 
 const MAX_DENIED: usize = 50;
@@ -103,9 +105,8 @@ fn slug_to_path(slug: &str) -> String {
 /// Resolve the memory directory for a project.
 pub fn memory_dir(project_path: &str) -> PathBuf {
     let slug = project_path_to_slug(project_path);
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
-        .join(".claude")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join(".claude")
         .join("projects")
         .join(slug)
         .join("memory")
@@ -215,8 +216,8 @@ pub fn scan_memory_files(storage: &Storage, project_path: &str) -> Result<Vec<Me
             changed_since_last_run: changed,
         });
     }
-    let home_str = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let global_claude_md = PathBuf::from(&home_str).join(".claude").join("CLAUDE.md");
+    let home_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let global_claude_md = home_path.join(".claude").join("CLAUDE.md");
     if global_claude_md.exists()
         && let Ok(content) = std::fs::read_to_string(&global_claude_md)
     {
@@ -256,8 +257,7 @@ struct GatheredContext {
 }
 
 fn gather_context(project_path: &str) -> GatheredContext {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let home = PathBuf::from(home);
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
 
     let global_claude_md = read_file_optional(&home.join(".claude").join("CLAUDE.md"));
     let project_claude_md = read_file_optional(&PathBuf::from(project_path).join("CLAUDE.md"));
@@ -621,7 +621,7 @@ pub async fn run_optimization_with_run(
 
     // Store suggestions (with CLAUDE.md action type validation)
     let mem_dir = memory_dir(project_path);
-    let mut stored_suggestions: Vec<(i64, Option<String>, Option<Vec<String>>)> = Vec::new();
+    let mut stored_suggestions: Vec<SuggestionRow> = Vec::new();
     for suggestion in &result.suggestions {
         let targets_claude_md = suggestion
             .target_file
@@ -776,8 +776,8 @@ fn resolve_target_path(
     if target == "CLAUDE.md" {
         Ok(PathBuf::from(project_path).join("CLAUDE.md"))
     } else if target.contains("/.claude/CLAUDE.md") || target == "~/.claude/CLAUDE.md" {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        Ok(PathBuf::from(home).join(".claude").join("CLAUDE.md"))
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        Ok(home.join(".claude").join("CLAUDE.md"))
     } else {
         let resolved = mem_dir.join(target);
         for component in resolved.components() {
@@ -811,10 +811,7 @@ fn read_target_file(
 /// Detect file-level conflicts between suggestions and assign group IDs.
 /// Two suggestions conflict if they reference any of the same files
 /// (via target_file or merge_sources). Connected components become groups.
-fn assign_conflict_groups(
-    storage: &Storage,
-    suggestions: &[(i64, Option<String>, Option<Vec<String>>)],
-) -> Result<(), String> {
+fn assign_conflict_groups(storage: &Storage, suggestions: &[SuggestionRow]) -> Result<(), String> {
     if suggestions.len() < 2 {
         return Ok(());
     }
@@ -1058,9 +1055,8 @@ fn execute_single_suggestion_unchecked(
                 if source != target {
                     let source_path = resolve_target_path(source, project_path, mem_dir)?;
                     if source_path.exists() {
-                        std::fs::remove_file(&source_path).map_err(|e| {
-                            format!("Failed to delete merge source {source}: {e}")
-                        })?;
+                        std::fs::remove_file(&source_path)
+                            .map_err(|e| format!("Failed to delete merge source {source}: {e}"))?;
                     }
                 }
             }
@@ -1568,8 +1564,8 @@ pub fn undo_suggestion(
 
 /// Get list of known projects (from analytics + custom).
 pub fn get_known_projects(storage: &Storage) -> Result<Vec<crate::models::KnownProject>, String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let projects_dir = home.join(".claude").join("projects");
 
     let mut projects: Vec<crate::models::KnownProject> = Vec::new();
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
