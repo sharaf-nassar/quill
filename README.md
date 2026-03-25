@@ -207,6 +207,9 @@ sudo dpkg -r quill
 rm -f ~/Applications/Quill_*_linux_amd64.AppImage
 
 # Remove app data (usage database, auth secret, logs, etc.)
+# macOS:
+rm -rf ~/Library/Application\ Support/com.quilltoolkit.app
+# Linux:
 rm -rf ~/.local/share/com.quilltoolkit.app
 
 # Remove hook config

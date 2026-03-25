@@ -1,6 +1,7 @@
 #[allow(dead_code)] // Used by learning.rs in upcoming tasks
 mod ai_client;
 mod auth;
+mod claude_setup;
 mod config;
 mod fetcher;
 mod git_analysis;
@@ -637,7 +638,9 @@ async fn update_plugin(
     project_path: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::update_plugin(&name, &marketplace, &scope, project_path.as_deref()))?;
+    let result = tokio::task::block_in_place(|| {
+        plugins::update_plugin(&name, &marketplace, &scope, project_path.as_deref())
+    })?;
     refresh_update_cache(&app);
     let _ = app.emit("plugin-changed", ());
     Ok(result)
@@ -657,11 +660,13 @@ fn refresh_update_cache(app: &tauri::AppHandle) {
     if let Some(state) = app
         .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
         .map(|s| s.inner().clone())
+        && let Ok(updates) = plugins::get_available_updates()
     {
-        if let Ok(updates) = plugins::get_available_updates() {
-            let mut cached = state.last_result.lock();
-            cached.plugin_updates = updates;
-        }
+        let count = updates.len();
+        let mut cached = state.last_result.lock();
+        cached.plugin_updates = updates;
+        drop(cached);
+        let _ = app.emit("plugin-updates-available", count);
     }
 }
 
@@ -761,7 +766,15 @@ pub fn run() {
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
                 let index_dir = dirs::data_local_dir()
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+                    .or_else(|| {
+                        dirs::home_dir().map(|h| {
+                            if cfg!(target_os = "macos") {
+                                h.join("Library").join("Application Support")
+                            } else {
+                                h.join(".local").join("share")
+                            }
+                        })
+                    })
                     .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                     .join("com.quilltoolkit.app")
                     .join("session-index");
@@ -939,6 +952,18 @@ pub fn run() {
                 let restart_state = std::sync::Arc::new(restart::RestartState::new());
                 app.manage(restart_state);
                 restart::startup_cleanup();
+            }
+
+            // Set up Claude Code integration (deploy scripts, register MCP/hooks, config)
+            {
+                let setup_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) =
+                        tokio::task::block_in_place(|| claude_setup::setup_local(&setup_handle))
+                    {
+                        log::error!("Claude Code local setup failed: {e}");
+                    }
+                });
             }
 
             // Restore always-on-top preference (default: off)

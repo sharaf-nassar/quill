@@ -8,7 +8,7 @@ You are configuring the Quill plugin. This plugin has two components:
 1. **Usage hook** — reports per-turn token usage to the Quill desktop widget over HTTP
 2. **MCP server** — lets you query session history, search past conversations, and analyze usage patterns
 
-The widget server requires a bearer secret for authentication. The secret is stored at `~/.local/share/com.quilltoolkit.app/auth_secret` on the machine running the widget.
+The widget server requires a bearer secret for authentication. The secret is stored at `~/Library/Application Support/com.quilltoolkit.app/auth_secret` on macOS or `~/.local/share/com.quilltoolkit.app/auth_secret` on Linux.
 
 Follow these steps exactly:
 
@@ -22,7 +22,7 @@ Follow these steps exactly:
 
 2. If they choose "This machine":
    - Set the URL to `http://localhost:19876`.
-   - Read the secret from `~/.local/share/com.quilltoolkit.app/auth_secret` using the Read tool.
+   - Read the secret from `~/Library/Application Support/com.quilltoolkit.app/auth_secret` (macOS) or `~/.local/share/com.quilltoolkit.app/auth_secret` (Linux) using the Read tool.
    - If the secret file exists, display it to the user and tell them:
      "Save this secret — you'll need it when running `/quill-hook:setup` on any other machine that should report to this widget."
    - If the secret file doesn't exist, warn the user that the widget doesn't appear to have been launched yet. The config will be saved and will work once the widget creates the secret on first launch. They can re-run `/quill-hook:setup` afterward.
@@ -33,7 +33,7 @@ Follow these steps exactly:
      Provide reasonable example options like "192.168.1.100" with descriptions, but they'll likely type their own.
    - Construct the URL as `http://<their-input>:19876`
    - Use AskUserQuestion to ask:
-     "What is the bearer secret from the widget machine? (Run `cat ~/.local/share/com.quilltoolkit.app/auth_secret` on that machine to get it)"
+     "What is the bearer secret from the widget machine? (On macOS run `cat ~/Library/Application\\ Support/com.quilltoolkit.app/auth_secret`, on Linux run `cat ~/.local/share/com.quilltoolkit.app/auth_secret`)"
      Provide a single option "I don't have it yet" with description "Skip for now — the hook will fail until a valid secret is configured. Re-run /quill-hook:setup when you have it."
    - If they provide a secret, use it. If they choose "I don't have it yet", set secret to empty string and warn them.
 

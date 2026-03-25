@@ -61,13 +61,10 @@ if [ -z "$SESSION_ID" ] || [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH
 fi
 
 # Find the last assistant message with usage data in the JSONL transcript
-USAGE_JSON=$(python3 -c "
+USAGE_JSON=$(tac "$TRANSCRIPT_PATH" | python3 -c "
 import sys, json
 
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
-
-for line in reversed(lines):
+for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
@@ -91,7 +88,7 @@ for line in reversed(lines):
     }
     print(json.dumps(result))
     break
-" "$TRANSCRIPT_PATH" 2>/dev/null || true)
+" 2>/dev/null || true)
 
 if [ -z "$USAGE_JSON" ]; then
     exit 0

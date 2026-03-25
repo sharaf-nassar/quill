@@ -23,7 +23,11 @@ CONFIG_FILE="${CONFIG_DIR}/config.json"
 USAGE_URL=""
 HOSTNAME_LABEL=""
 SECRET=""
-SECRET_FILE="${HOME}/.local/share/com.quilltoolkit.app/auth_secret"
+if [ "$(uname)" = "Darwin" ]; then
+    SECRET_FILE="${HOME}/Library/Application Support/com.quilltoolkit.app/auth_secret"
+else
+    SECRET_FILE="${HOME}/.local/share/com.quilltoolkit.app/auth_secret"
+fi
 
 while [[ $# -gt 0 ]]; do
     case $1 in

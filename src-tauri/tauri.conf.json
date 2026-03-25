@@ -10,7 +10,8 @@
   "bundle": {
     "active": true,
     "targets": ["dmg", "nsis", "appimage", "deb"],
-    "createUpdaterArtifacts": true,
+    "resources": ["claude-integration/**/*"],
+    "createUpdaterArtifacts": "v1Compatible",
     "macOS": {
       "entitlements": "./Entitlements.plist"
     },

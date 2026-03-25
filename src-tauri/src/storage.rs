@@ -50,7 +50,15 @@ fn freshness_factor(last_evidence_at: Option<&str>) -> f64 {
 
 fn db_path() -> Result<PathBuf, String> {
     let data_dir = dirs::data_local_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
+        .or_else(|| {
+            dirs::home_dir().map(|h| {
+                if cfg!(target_os = "macos") {
+                    h.join("Library").join("Application Support")
+                } else {
+                    h.join(".local").join("share")
+                }
+            })
+        })
         .ok_or("Cannot determine data directory")?;
     let app_dir = data_dir.join("com.quilltoolkit.app");
     std::fs::create_dir_all(&app_dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;

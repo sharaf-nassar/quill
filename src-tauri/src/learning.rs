@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use crate::models::{AnalysisOutput, LearningLogEvent, LearningRunPayload, RunPhase, StreamFindings};
+use crate::models::{
+    AnalysisOutput, LearningLogEvent, LearningRunPayload, RunPhase, StreamFindings,
+};
 use crate::prompt_utils::{compress_observation, sanitize_for_prompt};
 use crate::storage::Storage;
 use tauri::Emitter;
@@ -19,17 +21,17 @@ pub fn is_safe_rule_name(name: &str) -> bool {
 /// Stream A: extract behavioral patterns from unanalyzed tool-use observations.
 /// Returns owned logs alongside findings so it can run inside `tokio::join!`.
 async fn analyze_observations_stream(
-	storage: &'static Storage,
-	min_obs: i64,
-	max_rules: usize,
-	existing_rules_summary: String,
-	existing_list: String,
-	app: tauri::AppHandle,
-	run_id: i64,
+    storage: &'static Storage,
+    min_obs: i64,
+    max_rules: usize,
+    existing_rules_summary: String,
+    existing_list: String,
+    app: tauri::AppHandle,
+    run_id: i64,
 ) -> (Option<(StreamFindings, i64)>, Vec<String>) {
-	let mut logs: Vec<String> = Vec::new();
+    let mut logs: Vec<String> = Vec::new();
 
-	macro_rules! stream_log {
+    macro_rules! stream_log {
 		($($arg:tt)*) => {{
 			let msg = format!($($arg)*);
 			log::debug!("{msg}");
@@ -41,93 +43,93 @@ async fn analyze_observations_stream(
 		}};
 	}
 
-	let unanalyzed = match storage.get_unanalyzed_observation_count() {
-		Ok(count) => count,
-		Err(e) => {
-			stream_log!("Stream A: failed to get observation count: {e}");
-			return (None, logs);
-		}
-	};
+    let unanalyzed = match storage.get_unanalyzed_observation_count() {
+        Ok(count) => count,
+        Err(e) => {
+            stream_log!("Stream A: failed to get observation count: {e}");
+            return (None, logs);
+        }
+    };
 
-	if unanalyzed < min_obs {
-		stream_log!(
-			"Stream A: only {unanalyzed} unanalyzed observations (need {min_obs}), skipping"
-		);
-		return (None, logs);
-	}
+    if unanalyzed < min_obs {
+        stream_log!(
+            "Stream A: only {unanalyzed} unanalyzed observations (need {min_obs}), skipping"
+        );
+        return (None, logs);
+    }
 
-	stream_log!("Stream A: found {unanalyzed} unanalyzed observations");
+    stream_log!("Stream A: found {unanalyzed} unanalyzed observations");
 
-	let observations = match storage.get_unanalyzed_observations(100) {
-		Ok(obs) => obs,
-		Err(e) => {
-			stream_log!("Stream A: failed to get observations: {e}");
-			return (None, logs);
-		}
-	};
+    let observations = match storage.get_unanalyzed_observations(100) {
+        Ok(obs) => obs,
+        Err(e) => {
+            stream_log!("Stream A: failed to get observations: {e}");
+            return (None, logs);
+        }
+    };
 
-	let obs_count = observations.len() as i64;
+    let obs_count = observations.len() as i64;
 
-	// Build compact observation summary (pair pre/post, group by project)
-	let mut project_obs: std::collections::HashMap<String, Vec<String>> =
-		std::collections::HashMap::new();
-	let mut i = 0;
-	while i < observations.len() {
-		let obs = &observations[i];
-		let tool = obs.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
-		let phase = obs
-			.get("hook_phase")
-			.and_then(|v| v.as_str())
-			.unwrap_or("?");
-		let project = obs
-			.get("cwd")
-			.and_then(|v| v.as_str())
-			.unwrap_or("global")
-			.to_string();
-		let input_preview = obs
-			.get("tool_input")
-			.and_then(|v| v.as_str())
-			.map(|s| compress_observation(s, 500))
-			.unwrap_or_default();
+    // Build compact observation summary (pair pre/post, group by project)
+    let mut project_obs: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut i = 0;
+    while i < observations.len() {
+        let obs = &observations[i];
+        let tool = obs.get("tool_name").and_then(|v| v.as_str()).unwrap_or("?");
+        let phase = obs
+            .get("hook_phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let project = obs
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("global")
+            .to_string();
+        let input_preview = obs
+            .get("tool_input")
+            .and_then(|v| v.as_str())
+            .map(|s| compress_observation(s, 500))
+            .unwrap_or_default();
 
-		let line = if phase == "pre" && i + 1 < observations.len() {
-			let next = &observations[i + 1];
-			let next_phase = next
-				.get("hook_phase")
-				.and_then(|v| v.as_str())
-				.unwrap_or("");
-			let next_tool = next.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
-			let same_session = obs.get("session_id") == next.get("session_id");
-			if next_phase == "post" && next_tool == tool && same_session {
-				let output_preview = next
-					.get("tool_output")
-					.and_then(|v| v.as_str())
-					.map(|s| compress_observation(s, 500))
-					.unwrap_or_default();
-				i += 2;
-				format!("- {tool}: {input_preview} -> {output_preview}")
-			} else {
-				i += 1;
-				format!("- {phase} {tool}: {input_preview}")
-			}
-		} else {
-			i += 1;
-			format!("- {phase} {tool}: {input_preview}")
-		};
+        let line = if phase == "pre" && i + 1 < observations.len() {
+            let next = &observations[i + 1];
+            let next_phase = next
+                .get("hook_phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let next_tool = next.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+            let same_session = obs.get("session_id") == next.get("session_id");
+            if next_phase == "post" && next_tool == tool && same_session {
+                let output_preview = next
+                    .get("tool_output")
+                    .and_then(|v| v.as_str())
+                    .map(|s| compress_observation(s, 500))
+                    .unwrap_or_default();
+                i += 2;
+                format!("- {tool}: {input_preview} -> {output_preview}")
+            } else {
+                i += 1;
+                format!("- {phase} {tool}: {input_preview}")
+            }
+        } else {
+            i += 1;
+            format!("- {phase} {tool}: {input_preview}")
+        };
 
-		project_obs.entry(project).or_default().push(line);
-	}
+        project_obs.entry(project).or_default().push(line);
+    }
 
-	let obs_summary = project_obs
-		.iter()
-		.map(|(proj, lines)| format!("[Project: {proj}]\n{}", lines.join("\n")))
-		.collect::<Vec<_>>()
-		.join("\n\n");
+    let obs_summary = project_obs
+        .iter()
+        .map(|(proj, lines)| format!("[Project: {proj}]\n{}", lines.join("\n")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
-	let today = chrono::Utc::now().format("%Y-%m-%d");
+    let today = chrono::Utc::now().format("%Y-%m-%d");
 
-	let prompt = format!(
-		"Analyze these Claude Code tool-use observations and extract 0-{max_rules} behavioral \
+    let prompt = format!(
+        "Analyze these Claude Code tool-use observations and extract 0-{max_rules} behavioral \
 		 patterns that should become persistent rules.\n\
 		 Focus on repeated corrections, error sequences, consistent preferences, and workflow friction.\n\
 		 For each pattern, determine if it is a positive pattern (\"do this\") or an \
@@ -147,48 +149,51 @@ async fn analyze_observations_stream(
 		 Rules for the name field: lowercase letters, digits, and hyphens only.\n\
 		 Use today's date {today} in the Learned field of new pattern content.\n\
 		 If no patterns found, output: {{\"patterns\": [], \"verdicts\": []}}"
-	);
+    );
 
-	stream_log!("Stream A: prompt size {} chars, calling Haiku", prompt.len());
+    stream_log!(
+        "Stream A: prompt size {} chars, calling Haiku",
+        prompt.len()
+    );
 
-	let preamble = "You are a behavioral pattern analyzer for Claude Code tool-use observations. \
+    let preamble = "You are a behavioral pattern analyzer for Claude Code tool-use observations. \
 	                Respond with structured JSON matching the provided schema.";
 
-	match crate::ai_client::analyze_typed::<StreamFindings>(
-		&prompt,
-		preamble,
-		crate::ai_client::MODEL_HAIKU,
-		4096,
-	)
-	.await
-	{
-		Ok(findings) => {
-			stream_log!(
-				"Stream A: extracted {} patterns, {} verdicts",
-				findings.patterns.len(),
-				findings.verdicts.len()
-			);
-			(Some((findings, obs_count)), logs)
-		}
-		Err(e) => {
-			stream_log!("Stream A: API call failed: {e}");
-			(None, logs)
-		}
-	}
+    match crate::ai_client::analyze_typed::<StreamFindings>(
+        &prompt,
+        preamble,
+        crate::ai_client::MODEL_HAIKU,
+        4096,
+    )
+    .await
+    {
+        Ok(findings) => {
+            stream_log!(
+                "Stream A: extracted {} patterns, {} verdicts",
+                findings.patterns.len(),
+                findings.verdicts.len()
+            );
+            (Some((findings, obs_count)), logs)
+        }
+        Err(e) => {
+            stream_log!("Stream A: API call failed: {e}");
+            (None, logs)
+        }
+    }
 }
 
 /// Stream B: extract patterns from git history for a project.
 /// Returns owned logs alongside findings so it can run inside `tokio::join!`.
 async fn analyze_git_stream(
-	storage: &'static Storage,
-	project_path: String,
-	existing_rules_summary: String,
-	app: tauri::AppHandle,
-	run_id: i64,
+    storage: &'static Storage,
+    project_path: String,
+    existing_rules_summary: String,
+    app: tauri::AppHandle,
+    run_id: i64,
 ) -> (Option<StreamFindings>, Vec<String>) {
-	let mut logs: Vec<String> = Vec::new();
+    let mut logs: Vec<String> = Vec::new();
 
-	macro_rules! stream_log {
+    macro_rules! stream_log {
 		($($arg:tt)*) => {{
 			let msg = format!($($arg)*);
 			log::debug!("{msg}");
@@ -200,26 +205,25 @@ async fn analyze_git_stream(
 		}};
 	}
 
-	stream_log!("Stream B: collecting git data for {project_path}");
+    stream_log!("Stream B: collecting git data for {project_path}");
 
-	let git_data =
-		match crate::git_analysis::collect_git_data(storage, &project_path, 200).await {
-			Ok(data) => data,
-			Err(e) => {
-				stream_log!("Stream B: git data collection failed: {e}");
-				return (None, logs);
-			}
-		};
+    let git_data = match crate::git_analysis::collect_git_data(storage, &project_path, 200).await {
+        Ok(data) => data,
+        Err(e) => {
+            stream_log!("Stream B: git data collection failed: {e}");
+            return (None, logs);
+        }
+    };
 
-	if git_data.is_empty() {
-		stream_log!("Stream B: no git data available, skipping");
-		return (None, logs);
-	}
+    if git_data.is_empty() {
+        stream_log!("Stream B: no git data available, skipping");
+        return (None, logs);
+    }
 
-	stream_log!("Stream B: collected {} chars of git data", git_data.len());
+    stream_log!("Stream B: collected {} chars of git data", git_data.len());
 
-	let prompt = format!(
-		"Analyze this git history data and extract 0-3 behavioral patterns related to:\n\
+    let prompt = format!(
+        "Analyze this git history data and extract 0-3 behavioral patterns related to:\n\
 		 - Commit message conventions and style\n\
 		 - Workflow sequences (branching, PR, review patterns)\n\
 		 - Architectural decisions visible in the history\n\
@@ -236,51 +240,55 @@ async fn analyze_git_stream(
 		 \n\
 		 Rules for the name field: lowercase letters, digits, and hyphens only.\n\
 		 If no patterns found, output: {{\"patterns\": [], \"verdicts\": []}}"
-	);
+    );
 
-	stream_log!("Stream B: prompt size {} chars, calling Haiku", prompt.len());
+    stream_log!(
+        "Stream B: prompt size {} chars, calling Haiku",
+        prompt.len()
+    );
 
-	let preamble = "You are a git history pattern analyzer. \
+    let preamble = "You are a git history pattern analyzer. \
 	                Respond with structured JSON matching the provided schema.";
 
-	match crate::ai_client::analyze_typed::<StreamFindings>(
-		&prompt,
-		preamble,
-		crate::ai_client::MODEL_HAIKU,
-		4096,
-	)
-	.await
-	{
-		Ok(findings) => {
-			stream_log!(
-				"Stream B: extracted {} patterns, {} verdicts",
-				findings.patterns.len(),
-				findings.verdicts.len()
-			);
-			(Some(findings), logs)
-		}
-		Err(e) => {
-			stream_log!("Stream B: API call failed: {e}");
-			(None, logs)
-		}
-	}
+    match crate::ai_client::analyze_typed::<StreamFindings>(
+        &prompt,
+        preamble,
+        crate::ai_client::MODEL_HAIKU,
+        4096,
+    )
+    .await
+    {
+        Ok(findings) => {
+            stream_log!(
+                "Stream B: extracted {} patterns, {} verdicts",
+                findings.patterns.len(),
+                findings.verdicts.len()
+            );
+            (Some(findings), logs)
+        }
+        Err(e) => {
+            stream_log!("Stream B: API call failed: {e}");
+            (None, logs)
+        }
+    }
 }
 
 /// Synthesis phase: combine findings from Stream A and Stream B into a final AnalysisOutput.
 /// Uses Sonnet to cross-reference patterns, resolve contradictions, and deduplicate.
+#[allow(clippy::too_many_arguments)]
 async fn synthesize_findings(
-	obs_findings: Option<&StreamFindings>,
-	git_findings: Option<&StreamFindings>,
-	insights: Option<&InsightsData>,
-	existing_rules_summary: &str,
-	memory_context: &str,
-	claude_md_context: &str,
-	max_rules: usize,
-	logs: &mut Vec<String>,
-	app: &tauri::AppHandle,
-	run_id: i64,
+    obs_findings: Option<&StreamFindings>,
+    git_findings: Option<&StreamFindings>,
+    insights: Option<&InsightsData>,
+    existing_rules_summary: &str,
+    memory_context: &str,
+    claude_md_context: &str,
+    max_rules: usize,
+    logs: &mut Vec<String>,
+    app: &tauri::AppHandle,
+    run_id: i64,
 ) -> Result<AnalysisOutput, String> {
-	macro_rules! synth_log {
+    macro_rules! synth_log {
 		($($arg:tt)*) => {{
 			let msg = format!($($arg)*);
 			log::debug!("{msg}");
@@ -292,31 +300,31 @@ async fn synthesize_findings(
 		}};
 	}
 
-	let obs_json = obs_findings
-		.map(|f| serde_json::to_string_pretty(f).unwrap_or_else(|_| "{}".to_string()))
-		.unwrap_or_else(|| "No data available".to_string());
+    let obs_json = obs_findings
+        .map(|f| serde_json::to_string_pretty(f).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "No data available".to_string());
 
-	let git_json = git_findings
-		.map(|f| serde_json::to_string_pretty(f).unwrap_or_else(|_| "{}".to_string()))
-		.unwrap_or_else(|| "No data available".to_string());
+    let git_json = git_findings
+        .map(|f| serde_json::to_string_pretty(f).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "No data available".to_string());
 
-	let insights_text = if let Some(data) = insights {
-		format!(
-			"Friction types (across {} sessions):\n{}\n\nSession outcomes:\n{}\n\nFriction details (sample):\n{}\n\nSession summaries (sample):\n{}",
-			data.facet_count,
-			data.friction_summary,
-			data.outcome_summary,
-			data.friction_details.join("\n"),
-			data.session_summaries.join("\n"),
-		)
-	} else {
-		"No insights data available".to_string()
-	};
+    let insights_text = if let Some(data) = insights {
+        format!(
+            "Friction types (across {} sessions):\n{}\n\nSession outcomes:\n{}\n\nFriction details (sample):\n{}\n\nSession summaries (sample):\n{}",
+            data.facet_count,
+            data.friction_summary,
+            data.outcome_summary,
+            data.friction_details.join("\n"),
+            data.session_summaries.join("\n"),
+        )
+    } else {
+        "No insights data available".to_string()
+    };
 
-	let today = chrono::Utc::now().format("%Y-%m-%d");
+    let today = chrono::Utc::now().format("%Y-%m-%d");
 
-	let mut prompt = format!(
-		"You are synthesizing findings from two analysis streams into a final set of rules.\n\
+    let mut prompt = format!(
+        "You are synthesizing findings from two analysis streams into a final set of rules.\n\
 		 \n\
 		 Your job:\n\
 		 1. CONFIRM patterns that appear in multiple sources (stronger signal)\n\
@@ -347,54 +355,54 @@ async fn synthesize_findings(
 		 Use today's date {today} in the Learned field of new rule content.\n\
 		 For anti-patterns, prefix content with \"ANTI-PATTERN: Avoid this.\" and explain what to do instead.\n\
 		 If no new patterns, output: {{\"new_rules\": [], \"verdicts\": []}}"
-	);
+    );
 
-	if !memory_context.is_empty() {
-		prompt.push_str(
-			"\n## Existing Project Memories (DO NOT create rules that duplicate these)\n\n",
-		);
-		prompt.push_str("The following project memories already exist. Do not create rules that duplicate this knowledge. ");
-		prompt.push_str("If you notice a pattern that's already covered by a memory, skip it.\n\n");
-		prompt.push_str(memory_context);
-		prompt.push('\n');
-	}
+    if !memory_context.is_empty() {
+        prompt.push_str(
+            "\n## Existing Project Memories (DO NOT create rules that duplicate these)\n\n",
+        );
+        prompt.push_str("The following project memories already exist. Do not create rules that duplicate this knowledge. ");
+        prompt.push_str("If you notice a pattern that's already covered by a memory, skip it.\n\n");
+        prompt.push_str(memory_context);
+        prompt.push('\n');
+    }
 
-	if !claude_md_context.is_empty() {
-		prompt.push_str(
-			"\n## Existing CLAUDE.md Instructions (DO NOT create rules that duplicate these)\n\n",
-		);
-		prompt.push_str("The following CLAUDE.md instructions already exist. Do not create rules that duplicate these directives. ");
-		prompt.push_str(
-			"If you notice a pattern that's already covered by a CLAUDE.md directive, skip it.\n\n",
-		);
-		prompt.push_str(claude_md_context);
-		prompt.push('\n');
-	}
+    if !claude_md_context.is_empty() {
+        prompt.push_str(
+            "\n## Existing CLAUDE.md Instructions (DO NOT create rules that duplicate these)\n\n",
+        );
+        prompt.push_str("The following CLAUDE.md instructions already exist. Do not create rules that duplicate these directives. ");
+        prompt.push_str(
+            "If you notice a pattern that's already covered by a CLAUDE.md directive, skip it.\n\n",
+        );
+        prompt.push_str(claude_md_context);
+        prompt.push('\n');
+    }
 
-	synth_log!(
-		"Synthesis: prompt size {} chars, calling Sonnet",
-		prompt.len()
-	);
+    synth_log!(
+        "Synthesis: prompt size {} chars, calling Sonnet",
+        prompt.len()
+    );
 
-	let preamble = "You are a synthesis agent combining multi-source analysis into actionable rules. \
+    let preamble = "You are a synthesis agent combining multi-source analysis into actionable rules. \
 	                Respond with structured JSON matching the provided schema.";
 
-	let result = crate::ai_client::analyze_typed::<AnalysisOutput>(
-		&prompt,
-		preamble,
-		crate::ai_client::MODEL_SONNET,
-		8192,
-	)
-	.await
-	.map_err(|e| format!("Synthesis API call failed: {e}"))?;
+    let result = crate::ai_client::analyze_typed::<AnalysisOutput>(
+        &prompt,
+        preamble,
+        crate::ai_client::MODEL_SONNET,
+        8192,
+    )
+    .await
+    .map_err(|e| format!("Synthesis API call failed: {e}"))?;
 
-	synth_log!(
-		"Synthesis: produced {} rules, {} verdicts",
-		result.new_rules.len(),
-		result.verdicts.len()
-	);
+    synth_log!(
+        "Synthesis: produced {} rules, {} verdicts",
+        result.new_rules.len(),
+        result.verdicts.len()
+    );
 
-	Ok(result)
+    Ok(result)
 }
 
 /// Spawns a background analysis using the multi-stream pipeline.
@@ -534,24 +542,24 @@ pub async fn spawn_analysis(
     let memory_context = {
         let mut ctx = String::new();
         let mem_dir = crate::memory_optimizer::memory_dir(&project_path);
-        if mem_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&mem_dir) {
-                let mut budget = 40_000usize;
-                for entry in entries.flatten() {
-                    if budget == 0 {
-                        break;
-                    }
-                    let path = entry.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                        continue;
-                    }
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                        let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
-                        let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
-                        ctx.push_str(&format!("- {name}: {truncated}\n"));
-                        budget = budget.saturating_sub(truncated.len() + name.len() + 4);
-                    }
+        if mem_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&mem_dir)
+        {
+            let mut budget = 40_000usize;
+            for entry in entries.flatten() {
+                if budget == 0 {
+                    break;
+                }
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
+                    let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
+                    ctx.push_str(&format!("- {name}: {truncated}\n"));
+                    budget = budget.saturating_sub(truncated.len() + name.len() + 4);
                 }
             }
         }
@@ -563,24 +571,23 @@ pub async fn spawn_analysis(
         let mut ctx = String::new();
         let mut budget = 40_000usize;
         let project_claude_md = std::path::PathBuf::from(&project_path).join("CLAUDE.md");
-        if project_claude_md.exists() {
-            if let Ok(content) = std::fs::read_to_string(&project_claude_md) {
-                let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
-                let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
-                ctx.push_str(&format!("- Project CLAUDE.md: {truncated}\n"));
-                budget = budget.saturating_sub(truncated.len() + 20);
-            }
+        if project_claude_md.exists()
+            && let Ok(content) = std::fs::read_to_string(&project_claude_md)
+        {
+            let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
+            let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
+            ctx.push_str(&format!("- Project CLAUDE.md: {truncated}\n"));
+            budget = budget.saturating_sub(truncated.len() + 20);
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let global_claude_md = std::path::PathBuf::from(&home)
-            .join(".claude")
-            .join("CLAUDE.md");
-        if global_claude_md.exists() && budget > 100 {
-            if let Ok(content) = std::fs::read_to_string(&global_claude_md) {
-                let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
-                let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
-                ctx.push_str(&format!("- Global CLAUDE.md: {truncated}\n"));
-            }
+        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        let global_claude_md = home.join(".claude").join("CLAUDE.md");
+        if global_claude_md.exists()
+            && budget > 100
+            && let Ok(content) = std::fs::read_to_string(&global_claude_md)
+        {
+            let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
+            let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
+            ctx.push_str(&format!("- Global CLAUDE.md: {truncated}\n"));
         }
         ctx
     };
@@ -616,12 +623,18 @@ pub async fn spawn_analysis(
             name: "streams".to_string(),
             status: "completed".to_string(),
             duration_ms: Some(phase1_start.elapsed().as_millis() as i64),
-            findings_count: obs_result.as_ref().map(|(f, _)| f.patterns.len() as i64).unwrap_or(0),
+            findings_count: obs_result
+                .as_ref()
+                .map(|(f, _)| f.patterns.len() as i64)
+                .unwrap_or(0),
         });
 
         match obs_result {
             Some((findings, count)) => {
-                run_log!("Micro mode: Stream A produced {} patterns", findings.patterns.len());
+                run_log!(
+                    "Micro mode: Stream A produced {} patterns",
+                    findings.patterns.len()
+                );
                 (findings.to_analysis_output(), count, "observations")
             }
             None => {
@@ -677,8 +690,14 @@ pub async fn spawn_analysis(
         logs.extend(git_logs);
         logs.extend(insights_logs);
 
-        let obs_findings_count = obs_result.as_ref().map(|(f, _)| f.patterns.len() as i64).unwrap_or(0);
-        let git_findings_count = git_result.as_ref().map(|f| f.patterns.len() as i64).unwrap_or(0);
+        let obs_findings_count = obs_result
+            .as_ref()
+            .map(|(f, _)| f.patterns.len() as i64)
+            .unwrap_or(0);
+        let git_findings_count = git_result
+            .as_ref()
+            .map(|f| f.patterns.len() as i64)
+            .unwrap_or(0);
 
         phases.push(RunPhase {
             name: "streams".to_string(),
@@ -700,7 +719,9 @@ pub async fn spawn_analysis(
         // ── Phase 2: Synthesis ──────────────────────────────────────────
         let phase2_start = Instant::now();
 
-        let has_obs = obs_findings.as_ref().is_some_and(|f| !f.patterns.is_empty());
+        let has_obs = obs_findings
+            .as_ref()
+            .is_some_and(|f| !f.patterns.is_empty());
         let has_git = git_result.as_ref().is_some_and(|f| !f.patterns.is_empty());
 
         let (output, source) = if has_obs && has_git {
@@ -719,7 +740,7 @@ pub async fn spawn_analysis(
                 run_id,
             )
             .await
-            .map_err(|e| {
+            .inspect_err(|e| {
                 let duration_ms = start.elapsed().as_millis() as i64;
                 let _ = storage.update_learning_run(
                     run_id,
@@ -735,7 +756,6 @@ pub async fn spawn_analysis(
                         phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
                     },
                 );
-                e
             })?;
             (result, "synthesis")
         } else if has_obs {
@@ -1092,13 +1112,16 @@ async fn gather_insights(
     friction_details.truncate(30);
     summaries.truncate(20);
 
-    (Some(InsightsData {
-        facet_count: facets.len(),
-        friction_summary,
-        outcome_summary,
-        friction_details,
-        session_summaries: summaries,
-    }), logs)
+    (
+        Some(InsightsData {
+            facet_count: facets.len(),
+            friction_summary,
+            outcome_summary,
+            friction_details,
+            session_summaries: summaries,
+        }),
+        logs,
+    )
 }
 
 /// Parameters for the shared rule-writing helper.
