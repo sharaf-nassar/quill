@@ -8,7 +8,7 @@
     {
       "name": "quill-hook",
       "description": "Reports per-turn token usage to the Quill desktop widget. After installing, run /quill-hook:setup to configure.",
-      "version": "1.10.0",
+      "version": "2.0.0",
       "source": "./plugin"
     }
   ]

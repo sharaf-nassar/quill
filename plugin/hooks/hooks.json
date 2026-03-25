@@ -4,7 +4,7 @@
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.js",
+        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs",
         "timeout": 3
       }]
     }],
@@ -12,12 +12,12 @@
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.js",
+        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs",
         "timeout": 3
       },
       {
         "type": "command",
-        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.js",
+        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.cjs",
         "timeout": 3
       }]
     }],
@@ -31,12 +31,12 @@
           },
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.js",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.cjs",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-end-learn.js",
+            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-end-learn.cjs",
             "timeout": 5
           }
         ]

@@ -5,7 +5,6 @@ use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,6 +128,30 @@ pub fn hook_script_path() -> PathBuf {
 		})
 		.join("quill")
 		.join("claude-restart-hook.sh")
+}
+
+/// Returns the resume file directory: $XDG_CACHE_HOME/quill/claude-resume/
+pub fn resume_dir() -> PathBuf {
+	dirs::cache_dir()
+		.unwrap_or_else(|| {
+			dirs::home_dir()
+				.map(|h| h.join(".cache"))
+				.unwrap_or_else(|| PathBuf::from("/tmp"))
+		})
+		.join("quill")
+		.join("claude-resume")
+}
+
+/// Returns the shell integration script path
+pub fn shell_integration_path() -> PathBuf {
+	dirs::cache_dir()
+		.unwrap_or_else(|| {
+			dirs::home_dir()
+				.map(|h| h.join(".cache"))
+				.unwrap_or_else(|| PathBuf::from("/tmp"))
+		})
+		.join("quill")
+		.join("quill-shell-integration.sh")
 }
 
 fn map_status(s: &str) -> InstanceStatus {
@@ -501,9 +524,153 @@ pub fn hooks_installed() -> bool {
 	})
 }
 
+// ── Shell integration for plain-terminal restart ──
+
+const SHELL_INTEGRATION_MARKER: &str = "quill-shell-integration";
+
+const SHELL_INTEGRATION_SCRIPT: &str = r##"# Quill shell integration — checks for pending claude resume commands
+# Installed by the Quill restart orchestrator. Safe to remove if unwanted.
+__quill_resume() {
+	local tty_id
+	tty_id=$(tty 2>/dev/null | tr '/' '_') || return
+	local f="${XDG_CACHE_HOME:-$HOME/.cache}/quill/claude-resume/$tty_id"
+	if [ -f "$f" ]; then
+		local cmd
+		cmd=$(cat "$f")
+		rm -f "$f"
+		# Only execute if it matches the expected resume command format
+		case "$cmd" in
+			claude\ --resume\ *)
+				printf '\033[90m[quill] resuming session...\033[0m\n'
+				eval "$cmd"
+				;;
+		esac
+	fi
+}
+if [ -n "$BASH_VERSION" ]; then
+	PROMPT_COMMAND="__quill_resume${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+elif [ -n "$ZSH_VERSION" ]; then
+	autoload -Uz add-zsh-hook 2>/dev/null
+	add-zsh-hook precmd __quill_resume 2>/dev/null
+fi
+"##;
+
+/// Install the shell integration script and source line in shell RC files.
+#[cfg(unix)]
+pub fn install_shell_integration() -> Result<(), String> {
+	let script_path = shell_integration_path();
+	if let Some(parent) = script_path.parent() {
+		fs::create_dir_all(parent)
+			.map_err(|e| format!("Failed to create shell integration dir: {e}"))?;
+	}
+	fs::write(&script_path, SHELL_INTEGRATION_SCRIPT)
+		.map_err(|e| format!("Failed to write shell integration script: {e}"))?;
+
+	// Also ensure the resume directory exists
+	let rdir = resume_dir();
+	fs::create_dir_all(&rdir)
+		.map_err(|e| format!("Failed to create resume dir: {e}"))?;
+
+	// Set strict permissions on resume directory
+	{
+		use std::os::unix::fs::PermissionsExt;
+		let perms = fs::Permissions::from_mode(0o700);
+		let _ = fs::set_permissions(&rdir, perms);
+	}
+
+	let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+	let source_line = format!(
+		"[ -f \"{}\" ] && source \"{}\"",
+		script_path.to_string_lossy(),
+		script_path.to_string_lossy()
+	);
+
+	for rc_name in &[".bashrc", ".zshrc"] {
+		let rc_path = home.join(rc_name);
+		if !rc_path.exists() {
+			// Only modify RC files that already exist
+			continue;
+		}
+
+		let content = fs::read_to_string(&rc_path)
+			.map_err(|e| format!("Failed to read {rc_name}: {e}"))?;
+
+		if content.contains(SHELL_INTEGRATION_MARKER) {
+			continue; // Already installed
+		}
+
+		let addition = format!(
+			"\n# {SHELL_INTEGRATION_MARKER}\n{source_line}\n"
+		);
+
+		let updated = format!("{content}{addition}");
+		fs::write(&rc_path, updated)
+			.map_err(|e| format!("Failed to update {rc_name}: {e}"))?;
+
+		log::info!("Added Quill shell integration to {rc_name}");
+	}
+
+	Ok(())
+}
+
+/// Check if the shell integration source line is present in at least one RC file.
+#[cfg(unix)]
+pub fn shell_integration_installed() -> bool {
+	let home = match dirs::home_dir() {
+		Some(h) => h,
+		None => return false,
+	};
+
+	[".bashrc", ".zshrc"].iter().any(|rc_name| {
+		let rc_path = home.join(rc_name);
+		fs::read_to_string(&rc_path)
+			.is_ok_and(|content| content.contains(SHELL_INTEGRATION_MARKER))
+	})
+}
+
+/// Write a resume command file for a given TTY, to be picked up by the shell hook.
+#[cfg(unix)]
+fn write_resume_file(tty_path: &str, session_id: &str) -> Result<(), String> {
+	let rdir = resume_dir();
+	fs::create_dir_all(&rdir)
+		.map_err(|e| format!("Failed to create resume dir: {e}"))?;
+
+	let tty_id = tty_path.replace('/', "_");
+	let file_path = rdir.join(&tty_id);
+	let cmd = format!("claude --resume \"{session_id}\"");
+	fs::write(&file_path, &cmd)
+		.map_err(|e| format!("Failed to write resume file: {e}"))?;
+
+	log::info!("Wrote resume file for {tty_path}: {file_path:?}");
+	Ok(())
+}
+
+/// Clean up stale resume files (older than 5 minutes).
+#[cfg(unix)]
+fn cleanup_stale_resume_files() {
+	let rdir = resume_dir();
+	let entries = match fs::read_dir(&rdir) {
+		Ok(e) => e,
+		Err(_) => return,
+	};
+
+	let cutoff = std::time::SystemTime::now() - Duration::from_secs(300);
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if let Ok(meta) = fs::metadata(&path) {
+			if let Ok(modified) = meta.modified() {
+				if modified < cutoff {
+					log::info!("Removing stale resume file: {path:?}");
+					let _ = fs::remove_file(&path);
+				}
+			}
+		}
+	}
+}
+
 // ── Orchestration ──
 
-/// Clean up stale restart flag and orphaned state files on Quill startup.
+/// Clean up stale restart flag, orphaned state files, and stale resume files on Quill startup.
 #[cfg(unix)]
 pub fn startup_cleanup() {
 	// Remove stale restart flag
@@ -532,6 +699,9 @@ pub fn startup_cleanup() {
 			}
 		}
 	}
+
+	// Remove stale resume files from previous sessions
+	cleanup_stale_resume_files();
 }
 
 /// Inject restart command into a tmux pane via send-keys.
@@ -550,20 +720,12 @@ fn restart_via_tmux(target: &str, session_id: &str) -> Result<(), String> {
 	Ok(())
 }
 
-/// Inject restart command into a plain terminal via PTY device write.
-#[cfg(unix)]
-fn restart_via_pty(tty_path: &str, session_id: &str) -> Result<(), String> {
-	let cmd = format!("claude --resume \"{session_id}\"\r");
-	let mut file = fs::OpenOptions::new()
-		.write(true)
-		.open(tty_path)
-		.map_err(|e| format!("Failed to open PTY {tty_path}: {e}"))?;
-
-	file.write_all(cmd.as_bytes())
-		.map_err(|e| format!("Failed to write to PTY {tty_path}: {e}"))?;
-
-	Ok(())
-}
+// Plain terminal restart works via resume files + shell PROMPT_COMMAND hook.
+// Writing to the PTY slave only displays text on screen — it does NOT inject
+// input for the shell (that requires the PTY master, held by the terminal
+// emulator). On modern Linux (6.2+) TIOCSTI is also blocked. Resume files
+// are written before SIGTERM in spawn_orchestrator(); the shell's __quill_resume
+// hook picks them up on the next prompt.
 
 #[cfg(unix)]
 const TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -621,6 +783,23 @@ pub fn spawn_orchestrator(
 		*state.phase.lock() = RestartPhase::Restarting;
 		let instances = discover_instances();
 
+		// Pre-write resume files for plain terminals BEFORE killing, so the
+		// shell's PROMPT_COMMAND hook finds them as soon as it regains control.
+		for instance in &instances {
+			if instance.status == InstanceStatus::Exited {
+				continue;
+			}
+			if let TerminalType::Plain = &instance.terminal_type {
+				if let Some(sid) = &instance.session_id {
+					if !sid.is_empty() {
+						if let Err(e) = write_resume_file(&instance.tty, sid) {
+							log::error!("Failed to write resume file for {}: {e}", instance.tty);
+						}
+					}
+				}
+			}
+		}
+
 		let mut restart_targets: Vec<(ClaudeInstance, bool)> = Vec::new();
 
 		for instance in &instances {
@@ -655,7 +834,8 @@ pub fn spawn_orchestrator(
 		// Brief delay for shell to re-render prompt
 		tokio::time::sleep(Duration::from_millis(500)).await;
 
-		// Phase 3: Inject restart commands
+		// Phase 3: Inject restart commands (tmux uses send-keys; plain terminals
+		// already have resume files written above — mark them as Restarting).
 		let mut final_instances: Vec<ClaudeInstance> = Vec::new();
 
 		for (mut instance, kill_ok) in restart_targets {
@@ -680,7 +860,10 @@ pub fn spawn_orchestrator(
 
 			let result = match &instance.terminal_type {
 				TerminalType::Tmux { target } => restart_via_tmux(target, &session_id),
-				TerminalType::Plain => restart_via_pty(&instance.tty, &session_id),
+				TerminalType::Plain => {
+					// Resume file was already written before kill; just mark success.
+					Ok(())
+				}
 			};
 
 			match result {
@@ -824,7 +1007,8 @@ pub async fn install_restart_hooks() -> Result<(), String> {
 	#[cfg(unix)]
 	{
 		install_hook_script()?;
-		merge_hooks_into_settings()
+		merge_hooks_into_settings()?;
+		install_shell_integration()
 	}
 	#[cfg(not(unix))]
 	{
@@ -836,7 +1020,7 @@ pub async fn install_restart_hooks() -> Result<(), String> {
 pub async fn check_restart_hooks_installed() -> bool {
 	#[cfg(unix)]
 	{
-		hooks_installed()
+		hooks_installed() && shell_integration_installed()
 	}
 	#[cfg(not(unix))]
 	{
