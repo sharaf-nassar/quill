@@ -384,6 +384,16 @@ export interface BulkUpdateItem {
 	error: string | null;
 }
 
+// Response time types
+
+export interface ResponseTimeStats {
+	avg_response_secs: number;
+	peak_response_secs: number;
+	avg_idle_secs: number;
+	sample_count: number;
+	sparkline: number[];
+}
+
 // Restart feature types
 
 export interface ClaudeInstance {

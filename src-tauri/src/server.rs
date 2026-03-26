@@ -564,6 +564,23 @@ async fn post_session_notify(
 
     match result {
         Ok(count) => {
+            // Re-index re-processes the whole session, so delete and re-populate response_times
+            if let Err(e) = state
+                .storage
+                .delete_response_times_for_session(&payload.session_id)
+            {
+                log::warn!("Failed to delete old response_times: {e}");
+            }
+            let rt_pairs: Vec<(&str, &str)> = messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+                .collect();
+            if let Err(e) = state
+                .storage
+                .ingest_response_times(&payload.session_id, &rt_pairs)
+            {
+                log::warn!("Failed to store response times: {e}");
+            }
             let _ = state.app_handle.emit("sessions-index-updated", count);
             (StatusCode::OK, format!("ok ({count} messages indexed)"))
         }
@@ -668,6 +685,17 @@ async fn post_session_messages(
 
     match result {
         Ok(count) => {
+            let rt_pairs: Vec<(&str, &str)> = payload
+                .messages
+                .iter()
+                .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+                .collect();
+            if let Err(e) = state
+                .storage
+                .ingest_response_times(&payload.session_id, &rt_pairs)
+            {
+                log::warn!("Failed to store response times: {e}");
+            }
             let _ = state.app_handle.emit("sessions-index-updated", count);
             (StatusCode::OK, format!("ok ({count} messages indexed)"))
         }

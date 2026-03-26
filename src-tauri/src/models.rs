@@ -567,3 +567,13 @@ pub struct SessionCodeStats {
     pub lines_removed: i64,
     pub net_change: i64,
 }
+
+/// Aggregate response time stats for a time range
+#[derive(Serialize, Clone, Debug)]
+pub struct ResponseTimeStats {
+    pub avg_response_secs: f64,
+    pub peak_response_secs: f64,
+    pub avg_idle_secs: f64,
+    pub sample_count: i64,
+    pub sparkline: Vec<f64>,
+}

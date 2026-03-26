@@ -7,9 +7,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, GitSnapshot, HostBreakdown,
     LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
-    LearningStatus, ObservationPayload, ProjectBreakdown, ProjectTokens, SessionBreakdown,
-    SessionCodeStats, SessionStats, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount,
-    UsageBucket,
+    LearningStatus, ObservationPayload, ProjectBreakdown, ProjectTokens, ResponseTimeStats,
+    SessionBreakdown, SessionCodeStats, SessionStats, TokenDataPoint, TokenReportPayload,
+    TokenStats, ToolCount, UsageBucket,
 };
 
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
@@ -523,6 +523,27 @@ impl Storage {
 
             conn.execute("INSERT INTO schema_version (version) VALUES (9)", [])
                 .map_err(|e| format!("Failed to record migration 9: {e}"))?;
+        }
+
+        // Migration 10: response_times table for response/idle latency tracking
+        if current_version < 10 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS response_times (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id   TEXT NOT NULL,
+                    timestamp    TEXT NOT NULL,
+                    response_secs REAL,
+                    idle_secs    REAL,
+                    created_at   TEXT DEFAULT (datetime('now')),
+                    UNIQUE(session_id, timestamp)
+                );
+                CREATE INDEX IF NOT EXISTS idx_rt_session ON response_times(session_id);
+                CREATE INDEX IF NOT EXISTS idx_rt_timestamp ON response_times(timestamp);",
+            )
+            .map_err(|e| format!("Migration 10 (response_times table): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (10)", [])
+                .map_err(|e| format!("Failed to record migration 10: {e}"))?;
         }
 
         let storage = Self {
@@ -3000,6 +3021,204 @@ impl Storage {
 
         Ok(result)
     }
+
+    pub fn delete_response_times_for_session(&self, session_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM response_times WHERE session_id = ?1",
+            params![session_id],
+        )
+        .map_err(|e| format!("Failed to delete response_times for session: {e}"))?;
+        Ok(())
+    }
+
+    pub fn ingest_response_times(
+        &self,
+        session_id: &str,
+        messages: &[(&str, &str)],
+    ) -> Result<(), String> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by timestamp
+        let mut sorted: Vec<(&str, &str)> = messages.to_vec();
+        sorted.sort_by(|a, b| a.1.cmp(b.1));
+
+        // Query last assistant timestamp for this session (for cross-batch continuity)
+        let last_assistant_ts: Option<String> = {
+            let conn = self.conn.lock();
+            conn.query_row(
+                "SELECT timestamp FROM response_times
+                 WHERE session_id = ?1 AND response_secs IS NOT NULL
+                 ORDER BY timestamp DESC LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Failed to query last assistant ts: {e}"))?
+        };
+
+        // Build (user_ts, Option<prev_assistant_ts>) pairs
+        // We walk the sorted messages and track state
+        struct Turn {
+            user_ts: String,
+            assistant_ts: String,
+            prev_assistant_ts: Option<String>,
+        }
+
+        let mut turns: Vec<Turn> = Vec::new();
+        let mut prev_assistant: Option<String> = last_assistant_ts;
+        let mut pending_user: Option<String> = None;
+
+        for (role, timestamp) in &sorted {
+            match *role {
+                "user" => {
+                    pending_user = Some((*timestamp).to_string());
+                }
+                "assistant" => {
+                    if let Some(user_ts) = pending_user.take() {
+                        turns.push(Turn {
+                            user_ts,
+                            assistant_ts: (*timestamp).to_string(),
+                            prev_assistant_ts: prev_assistant.clone(),
+                        });
+                    }
+                    prev_assistant = Some((*timestamp).to_string());
+                }
+                _ => {}
+            }
+        }
+
+        if turns.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Transaction error: {e}"))?;
+
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO response_times (session_id, timestamp, response_secs, idle_secs)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|e| format!("Prepare error: {e}"))?;
+
+            for turn in &turns {
+                let response_secs = parse_ts_diff(&turn.assistant_ts, &turn.user_ts);
+                let idle_secs = turn
+                    .prev_assistant_ts
+                    .as_deref()
+                    .and_then(|prev| parse_ts_diff(&turn.user_ts, prev));
+
+                let response_val = response_secs.filter(|&s| s > 0.0 && s <= 600.0);
+                let idle_val = idle_secs.filter(|&s| s > 0.0 && s <= 600.0);
+
+                if response_val.is_none() && idle_val.is_none() {
+                    continue;
+                }
+
+                stmt.execute(params![
+                    session_id,
+                    turn.assistant_ts,
+                    response_val,
+                    idle_val
+                ])
+                .map_err(|e| format!("Insert error: {e}"))?;
+            }
+        }
+
+        tx.commit().map_err(|e| format!("Commit error: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_response_time_stats(&self, range: &str) -> Result<ResponseTimeStats, String> {
+        let conn = self.conn.lock();
+        let now = Utc::now();
+        let from = now - range_to_duration(range);
+        let from_str = from.to_rfc3339();
+
+        // Overall aggregates
+        let (avg_response_secs, peak_response_secs, avg_idle_secs, sample_count) = conn
+            .query_row(
+                "SELECT
+                     COALESCE(AVG(response_secs), 0.0),
+                     COALESCE(MAX(response_secs), 0.0),
+                     COALESCE(AVG(idle_secs), 0.0),
+                     COUNT(response_secs)
+                 FROM response_times
+                 WHERE timestamp >= ?1",
+                params![from_str],
+                |row| {
+                    Ok((
+                        row.get::<_, f64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        // 7-bucket sparkline — single query + in-memory bucketing
+        let range_secs = range_to_duration(range).num_seconds() as f64;
+        let bucket_secs = range_secs / 7.0;
+        let from_epoch = from.timestamp_millis() as f64;
+
+        // bucket_sums[i] = (sum_of_response_secs, count)
+        let mut bucket_sums: [(f64, u64); 7] = [(0.0, 0); 7];
+
+        {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT timestamp, response_secs FROM response_times
+                     WHERE timestamp >= ?1 AND response_secs IS NOT NULL",
+                )
+                .map_err(|e| format!("Prepare sparkline query: {e}"))?;
+
+            let rows = stmt
+                .query_map(params![from_str], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .map_err(|e| format!("Sparkline query error: {e}"))?;
+
+            for row in rows.flatten() {
+                let (ts_str, secs) = row;
+                if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_str) {
+                    let offset_ms = (ts.timestamp_millis() as f64) - from_epoch;
+                    let bucket = ((offset_ms / 1000.0) / bucket_secs) as usize;
+                    let bucket = bucket.min(6);
+                    bucket_sums[bucket].0 += secs;
+                    bucket_sums[bucket].1 += 1;
+                }
+            }
+        }
+
+        let sparkline: Vec<f64> = bucket_sums
+            .iter()
+            .map(|&(sum, count)| if count > 0 { sum / count as f64 } else { 0.0 })
+            .collect();
+
+        Ok(ResponseTimeStats {
+            avg_response_secs,
+            peak_response_secs,
+            avg_idle_secs,
+            sample_count,
+            sparkline,
+        })
+    }
+}
+
+/// Parse the difference in seconds between two ISO 8601 timestamps (end - start).
+/// Returns None if either timestamp fails to parse.
+fn parse_ts_diff(end_ts: &str, start_ts: &str) -> Option<f64> {
+    let end = DateTime::parse_from_rfc3339(end_ts).ok()?;
+    let start = DateTime::parse_from_rfc3339(start_ts).ok()?;
+    let diff = (end - start).num_milliseconds() as f64 / 1000.0;
+    if diff < 0.0 { None } else { Some(diff) }
 }
 
 /// Merge project breakdown entries where one cwd is a subdirectory of another.

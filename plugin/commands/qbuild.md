@@ -40,6 +40,12 @@ Launch 2-4 explorer agents **in parallel** using `subagent_type: Explore`, `mode
 
 After agents return, **read the 5-8 most important files they identified**.
 
+### UI Change Detection
+
+After explorers return: if Agent 3 (UI patterns) was launched and returned results, set **HAS_UI_CHANGES=true**. Otherwise `HAS_UI_CHANGES=false`.
+
+If `HAS_UI_CHANGES=true`, read the visual companion guide: `skills/qbuild/visual-companion.md`
+
 ---
 
 ## Phase 2: Clarify Requirements
@@ -90,6 +96,27 @@ After architects return:
 1. Compare the approaches — identify where they agree (high confidence) and where they differ (genuine trade-offs)
 2. Form your recommendation with reasoning
 3. Include the comparison in the plan presentation (Phase 4) so the user sees alternatives
+
+### Step 2b: Visual Design Preview (HAS_UI_CHANGES only)
+
+If `HAS_UI_CHANGES=true`:
+
+1. Start the visual companion server:
+   `bash "${CLAUDE_PLUGIN_ROOT}/scripts/visual/start-server.sh" --project-dir "<PROJECT_DIR>"`
+   Save **VISUAL_SESSION_DIR**, **VISUAL_SCREEN_DIR**, **VISUAL_STATE_DIR**, **VISUAL_URL** from the JSON response.
+   If server fails to start, set `HAS_UI_CHANGES=false` and continue text-only.
+2. For each architect approach that proposes meaningfully different UI, write an HTML content fragment to `VISUAL_SCREEN_DIR` showing a wireframe comparison. Use the `.options` CSS class with one `.option` per approach. Follow the visual companion guide for content fragment format.
+3. Include the URL in Phase 4's plan presentation so the user can see the visual options.
+4. After user responds, read `VISUAL_STATE_DIR/events` to capture browser selections. Merge with terminal response.
+5. Push a waiting screen after design is confirmed:
+   ```html
+   <!-- waiting.html -->
+   <div style="display:flex;align-items:center;justify-content:center;min-height:60vh">
+     <p class="subtitle">Approach confirmed — executing implementation plan...</p>
+   </div>
+   ```
+
+Skip entirely if `HAS_UI_CHANGES=false`.
 
 ### Step 3: Create the Wave Plan
 
@@ -165,7 +192,7 @@ If changes requested, update and re-present. If the user prefers a different arc
 
 1. **Uncommitted changes**: Run `git status --porcelain`. If output, **STOP** — present the dirty files to the user and ask how they want to handle them. **NEVER run `git stash` automatically.** Do not proceed until the working tree is clean.
 2. **Stale qbuild artifacts**: Run `git worktree list` and `git branch --list 'qbuild/*'`. If any exist, present to user — clean up or use different slug.
-3. **Stale lock files**: Run `ls .qbuild-lock.* 2>/dev/null`. If any exist, present to user — they may be leftover from a crashed session. Offer to remove them.
+3. **Existing lock files**: Run `ls .qbuild-lock.* 2>/dev/null`. If any exist, **assume they belong to active Claude Code sessions**. Do NOT offer to remove them. Do NOT delete them. Report their existence to the user and proceed — multiple qbuild sessions can coexist because each uses a unique worktree and lock ID.
 
 ### Create Worktree
 
@@ -201,6 +228,16 @@ For **Wave 2+**, include a `## Prior Wave Summary` section in each prompt from t
 | NEEDS_CONTEXT | Provide context via **SendMessage**, let agent continue |
 
 After all agents complete, **record a wave summary**: 2-3 sentences of what changed, files modified, key decisions. Include in Wave 2+ agent prompts.
+
+**Step 2b — Visual Preview (HAS_UI_CHANGES only, UI waves only)**
+
+After collecting results from a wave that included UI Implementor agents, if `HAS_UI_CHANGES=true`:
+1. Check server alive: verify `VISUAL_STATE_DIR/server-info` exists. If not, restart server.
+2. Write a preview screen to `VISUAL_SCREEN_DIR/wave-N-preview.html` showing the implemented UI changes as a wireframe mockup.
+3. Tell the user: "Wave N UI changes are previewed at **{VISUAL_URL}**. Take a look and let me know if anything needs adjustment before I continue."
+4. Read events after user responds. This is informational — proceed to Step 3 (Build Gate) after user confirms.
+
+Skip if `HAS_UI_CHANGES=false` or if the wave had no UI tasks.
 
 **Step 3 — Build Gate**: Run `cd "<WORKTREE_PATH>" && <build_command>`. If fails, dispatch Fix Agent. Max 2 fix rounds — if still broken, check Fix Agent's report: if it signals a potential architectural issue (fixes revealing problems in different places, each fix creating new symptoms), escalate to user before continuing. Otherwise report and stop. If the project has no build command (e.g. pure scripting language), skip this step.
 
@@ -309,6 +346,8 @@ Present options:
 
 If `--ff-only` fails (source branch moved during execution), fall back to `git merge` and inform the user a merge commit was created.
 
+If `HAS_UI_CHANGES=true`, stop the visual server after merge/squash/skip: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/visual/stop-server.sh" "$VISUAL_SESSION_DIR"`
+
 **See also**: `superpowers:finishing-a-development-branch` for alternative branch completion workflows.
 
 ---
@@ -318,6 +357,7 @@ If `--ff-only` fails (source branch moved during execution), fall back to `git m
 On user cancel or fatal error:
 
 1. Stop — no new agents.
+1b. **Stop visual companion** (if HAS_UI_CHANGES=true): `bash "${CLAUDE_PLUGIN_ROOT}/scripts/visual/stop-server.sh" "$VISUAL_SESSION_DIR"`
 2. **Remove lock file**: `rm -f "<ORIGINAL_DIR>/.qbuild-lock.$LOCK_ID"` (always, regardless of keep/remove choice).
 3. Report: "Build aborted. Changes on branch `{WORKTREE_BRANCH}` in `{WORKTREE_PATH}`. Keep or remove?"
 4. **Remove**: `cd "<ORIGINAL_DIR>" && git worktree remove "<WORKTREE_PATH>" --force && git branch -D "qbuild/<slug>"`
@@ -622,5 +662,7 @@ Used in Phase 7 for multi-focus quality review. Launch 3 instances with differen
 22. **Escalate architectural failures** — when Fix Agent reports that fixes reveal problems in different places or create new symptoms, present the investigation report to the user with redesign/continue/abort options. Do not silently continue.
 23. ⛔ **Never stash (NON-NEGOTIABLE)** — NEVER run `git stash` automatically. If the working tree is dirty, STOP and present the dirty files to the user. Ask them how to proceed. Do not offer to stash on their behalf.
 24. **Stop on dirty git errors** — if any git operation fails due to uncommitted changes, unstaged files, or other dirty-state issues, STOP immediately and ask the user. Do not attempt to resolve dirty-git errors automatically.
+25. **Visual companion lifecycle** — start server in Phase 3 only when `HAS_UI_CHANGES=true`. Push waiting screens between visual questions. Stop server in Phase 9 and Abort. If server fails at any point, set `HAS_UI_CHANGES=false` and continue text-only.
+26. ⛔ **Lock file ownership (NON-NEGOTIABLE)** — ONLY delete the lock file matching the current session's `LOCK_ID` (`.qbuild-lock.$LOCK_ID`). NEVER delete, modify, or offer to remove lock files created by other sessions. Existing lock files always belong to active sessions until proven otherwise — and proving otherwise is NOT your job.
 
 ARGUMENTS: $ARGUMENTS

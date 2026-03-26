@@ -4,7 +4,8 @@ import { useTokenData } from "../../hooks/useTokenData";
 import { useCodeStats } from "../../hooks/useCodeStats";
 import { useEfficiencyStats } from "../../hooks/useEfficiencyStats";
 import { useVelocityStats } from "../../hooks/useVelocityStats";
-import { formatNumber } from "../../utils/format";
+import { useResponseTimeStats } from "../../hooks/useResponseTimeStats";
+import { formatNumber, formatDurationSecs } from "../../utils/format";
 import InsightCard from "./InsightCard";
 import CompactStatsRow from "./CompactStatsRow";
 import BreakdownPanel from "./BreakdownPanel";
@@ -37,18 +38,6 @@ const DAYS_TO_RANGE: Record<number, RangeType> = {
 
 const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 
-/** Parse a bucket label like "5 hours" or "7 days" into hours for weighting */
-function parseBucketHours(label: string): number {
-	const match = label.match(/(\d+)\s*(hour|day|week|month)/i);
-	if (!match) return 1;
-	const num = parseInt(match[1], 10);
-	const unit = match[2].toLowerCase();
-	if (unit.startsWith("hour")) return num;
-	if (unit.startsWith("day")) return num * 24;
-	if (unit.startsWith("week")) return num * 168;
-	if (unit.startsWith("month")) return num * 720;
-	return 1;
-}
 
 interface NowTabProps {
 	range: RangeType;
@@ -79,28 +68,13 @@ function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
 	// eslint-disable-next-line react-hooks/exhaustive-deps -- bucketsKey is an intentional stabilizer
 	const stableBuckets = useMemo(() => currentBuckets, [bucketsKey]);
 
-	const { stats, loading, error } = useAnalyticsData(
+	const { loading, error } = useAnalyticsData(
 		defaultBucket,
 		range,
 		stableBuckets,
 	);
 
-	// Weighted average utilization across all buckets (weighted by window duration)
-	const weightedUtil = useMemo(() => {
-		if (!currentBuckets || currentBuckets.length === 0) return null;
-		let totalWeight = 0;
-		let weightedSum = 0;
-		for (const b of currentBuckets) {
-			const hours = parseBucketHours(b.label);
-			weightedSum += b.utilization * hours;
-			totalWeight += hours;
-		}
-		return totalWeight > 0 ? weightedSum / totalWeight : null;
-	}, [currentBuckets]);
-
-	const peakUtil = currentBuckets?.length > 0
-		? Math.max(...currentBuckets.map((b) => b.utilization))
-		: 0;
+	const responseTimeStats = useResponseTimeStats(range);
 
 	const tokenHostname =
 		breakdownSelection?.type === "host" ? breakdownSelection.key : null;
@@ -184,35 +158,20 @@ function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
 							accentColor="#a78bfa"
 						/>
 						<InsightCard
-							label="Rate Limit"
+							label="Response Time"
 							value={
-								weightedUtil !== null
-									? `${weightedUtil.toFixed(0)}%`
+								responseTimeStats.avgResponseSecs !== null
+									? formatDurationSecs(responseTimeStats.avgResponseSecs)
 									: null
 							}
 							subtitle={
-								weightedUtil !== null
-									? `peak ${peakUtil.toFixed(0)}%${stats ? ` \u00b7 ${Math.round(stats.time_above_80)}m above 80%` : ""}`
+								responseTimeStats.avgResponseSecs !== null
+									? `peak ${formatDurationSecs(responseTimeStats.peakResponseSecs)} \u00b7 avg idle ${formatDurationSecs(responseTimeStats.avgIdleSecs)}`
 									: "no data"
 							}
-							trend={
-								stats
-									? {
-											direction: stats.trend === "up" ? "up" : stats.trend === "down" ? "down" : "flat",
-											percentage: 0,
-											upIsGood: false,
-										}
-									: null
-							}
-							accentColor={
-								weightedUtil !== null
-									? weightedUtil >= 80
-										? "#f87171"
-										: weightedUtil >= 50
-											? "#fbbf24"
-											: "#34d399"
-									: "#8b949e"
-							}
+							trend={null}
+							sparkline={responseTimeStats.sparkline}
+							accentColor={responseTimeStats.accentColor}
 						/>
 					</div>
 

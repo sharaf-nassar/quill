@@ -17,8 +17,9 @@ mod storage;
 
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
-    LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, SessionBreakdown,
-    SessionCodeStats, SessionStats, TokenDataPoint, TokenStats, ToolCount, UsageData,
+    LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, ResponseTimeStats,
+    SessionBreakdown, SessionCodeStats, SessionStats, TokenDataPoint, TokenStats, ToolCount,
+    UsageData,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -359,6 +360,12 @@ async fn get_batch_session_code_stats(
 ) -> Result<std::collections::HashMap<String, SessionCodeStats>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_batch_session_code_stats(&session_ids))
+}
+
+#[tauri::command]
+async fn get_response_time_stats(range: String) -> Result<ResponseTimeStats, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_response_time_stats(&range))
 }
 
 #[tauri::command]
@@ -1092,6 +1099,7 @@ pub fn run() {
             get_code_stats,
             get_code_stats_history,
             get_batch_session_code_stats,
+            get_response_time_stats,
             get_installed_plugins,
             get_marketplaces,
             get_available_updates,
