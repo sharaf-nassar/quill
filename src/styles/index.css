@@ -407,6 +407,26 @@ body {
   min-width: 0;
 }
 
+.code-sparkline-row {
+  display: flex;
+  align-items: center;
+  gap: calc(6px * var(--s));
+  margin-top: calc(2px * var(--s));
+}
+
+.code-sparkline-label {
+  font-size: calc(8px * var(--s));
+  color: rgba(167, 139, 250, 0.6);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.code-sparkline-chart {
+  flex: 1;
+  height: 16px;
+  min-width: 0;
+}
+
 /* Error / loading */
 .error-label {
   color: #ef4444;

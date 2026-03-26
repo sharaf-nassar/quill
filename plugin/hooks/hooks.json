@@ -7,6 +7,14 @@
         "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs",
         "timeout": 3
       }]
+    },
+    {
+      "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+      "hooks": [{
+        "type": "command",
+        "command": "${CLAUDE_PLUGIN_ROOT}/scripts/qbuild-guard.sh",
+        "timeout": 5
+      }]
     }],
     "PostToolUse": [{
       "matcher": "*",

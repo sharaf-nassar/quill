@@ -1,0 +1,1 @@
+../../../plugin/scripts/qbuild-guard.sh

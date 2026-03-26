@@ -19,6 +19,9 @@ Thumbs.db
 # Milvus data (unrelated)
 volumes/
 
+# qbuild lock files
+.qbuild-lock.*
+
 # Python
 __pycache__/
 *.pyc
