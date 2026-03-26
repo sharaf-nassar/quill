@@ -9,6 +9,7 @@ import InsightCard from "./InsightCard";
 import CompactStatsRow from "./CompactStatsRow";
 import BreakdownPanel from "./BreakdownPanel";
 import TokenSparkline from "./TokenSparkline";
+import CodeSparkline from "./CodeSparkline";
 import type {
 	RangeType,
 	UsageBucket,
@@ -114,7 +115,7 @@ function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
 		tokenCwd,
 	);
 
-	const { stats: codeStats } = useCodeStats(range);
+	const { stats: codeStats, history: codeHistory } = useCodeStats(range);
 
 	const efficiencyStats = useEfficiencyStats(range);
 	const velocityStats = useVelocityStats(range);
@@ -137,6 +138,7 @@ function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
 			</div>
 
 			<TokenSparkline data={tokenHistory} range={tokenRange} />
+			<CodeSparkline data={codeHistory} range={range} />
 
 			{error && (
 				<div className="analytics-error" role="alert">

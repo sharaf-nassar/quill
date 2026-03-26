@@ -162,7 +162,11 @@ fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
     clean_owned_dir(&scripts_dir())?;
     clean_owned_dir(&mcp_dir())?;
     clean_owned_dir(&templates_dir())?;
-    clean_owned_dir(&skills_dir())?;
+
+    // Clean stale skills dir from older versions (skills now live in the Claude Code plugin)
+    if skills_dir().exists() {
+        let _ = fs::remove_dir_all(skills_dir());
+    }
 
     // Clean only our commands from the shared ~/.claude/commands/ directory
     clean_quill_commands()?;
@@ -171,18 +175,19 @@ fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
     copy_dir_recursive(&source.join("scripts"), &scripts_dir())?;
     copy_dir_recursive(&source.join("mcp"), &mcp_dir())?;
     copy_dir_recursive(&source.join("templates"), &templates_dir())?;
-    copy_dir_recursive(&source.join("skills"), &skills_dir())?;
     copy_dir_recursive(&source.join("commands"), &commands_dir())?;
 
-    // Make report-tokens.sh executable on Unix
-    let report_tokens = scripts_dir().join("report-tokens.sh");
-    if report_tokens.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(&report_tokens, perms)
-                .map_err(|e| format!("Failed to set permissions on report-tokens.sh: {e}"))?;
+    // Make shell scripts executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        for script in &["report-tokens.sh", "qbuild-guard.sh"] {
+            let path = scripts_dir().join(script);
+            if path.exists() {
+                fs::set_permissions(&path, perms.clone())
+                    .map_err(|e| format!("Failed to set permissions on {script}: {e}"))?;
+            }
         }
     }
 
@@ -426,6 +431,20 @@ fn register_hooks() -> Result<(), String> {
                         "type": "command",
                         "command": format!("node {}/observe.cjs", sd_str),
                         "timeout": 3
+                    }
+                ]
+            }),
+        ),
+        (
+            "PreToolUse",
+            "Edit|Write|MultiEdit|NotebookEdit",
+            serde_json::json!({
+                "_source": HOOK_MARKER,
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": format!("{}/qbuild-guard.sh", sd_str),
+                        "timeout": 5
                     }
                 ]
             }),
