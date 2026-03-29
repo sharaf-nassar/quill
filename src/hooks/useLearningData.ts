@@ -127,6 +127,18 @@ export function useLearningData() {
     [refresh, toast],
   );
 
+  const promoteRule = useCallback(
+	async (name: string) => {
+		try {
+			await invoke("promote_learned_rule", { name });
+			await refresh();
+		} catch (e) {
+			toast("error", `Failed to promote rule: ${e}`);
+		}
+	},
+	[refresh, toast],
+);
+
   // Derive analyzing state from runs data
   const analyzing = runs.some((r) => r.status === "running");
 
@@ -144,6 +156,7 @@ export function useLearningData() {
     updateSettings,
     triggerAnalysis,
     deleteRule,
+    promoteRule,
     refresh,
   };
 }

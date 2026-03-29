@@ -30,6 +30,13 @@ const RestartWindowView = React.lazy(
 
   document.addEventListener("keydown", (e) => {
     if (!e.ctrlKey && !e.metaKey) return;
+
+    // Block webview find-in-page (no search UI exists)
+    if (e.key === "f") {
+      e.preventDefault();
+      return;
+    }
+
     const current = parseFloat(document.documentElement.style.zoom || "1");
     let next: number | null = null;
 

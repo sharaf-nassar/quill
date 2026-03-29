@@ -546,6 +546,20 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 10: {e}"))?;
         }
 
+        if current_version < 11 {
+            let has_content: bool = conn
+                .prepare("SELECT content FROM learned_rules LIMIT 0")
+                .is_ok();
+            if !has_content {
+                conn.execute_batch(
+                    "ALTER TABLE learned_rules ADD COLUMN content TEXT DEFAULT NULL;",
+                )
+                .map_err(|e| format!("Migration 11 (content column): {e}"))?;
+            }
+            conn.execute("INSERT INTO schema_version (version) VALUES (11)", [])
+                .map_err(|e| format!("Failed to record migration 11: {e}"))?;
+        }
+
         let storage = Self {
             conn: Mutex::new(conn),
         };
@@ -1721,8 +1735,8 @@ impl Storage {
         let beta = (1.0 - payload.confidence) * evidence_scale;
         let is_anti = payload.is_anti_pattern as i32;
         conn.execute(
-            "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, last_evidence_at, state, project, is_anti_pattern, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'emerging', ?9, ?10, ?11)
+            "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, last_evidence_at, state, project, is_anti_pattern, source, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'emerging', ?9, ?10, ?11, ?12)
              ON CONFLICT(name) DO UPDATE SET
                  domain = excluded.domain,
                  alpha = learned_rules.alpha + excluded.alpha,
@@ -1732,6 +1746,7 @@ impl Storage {
                  last_evidence_at = excluded.last_evidence_at,
                  is_anti_pattern = excluded.is_anti_pattern,
                  source = CASE WHEN excluded.source IS NOT NULL THEN excluded.source ELSE learned_rules.source END,
+                 content = CASE WHEN excluded.content IS NOT NULL THEN excluded.content ELSE learned_rules.content END,
                  updated_at = datetime('now')",
             params![
                 payload.name,
@@ -1745,6 +1760,7 @@ impl Storage {
                 payload.project,
                 is_anti,
                 payload.source,
+                payload.content,
             ],
         )
         .map_err(|e| format!("Insert learned rule error: {e}"))?;
@@ -1778,7 +1794,7 @@ impl Storage {
             let conn = self.conn.lock();
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at, is_anti_pattern, source
+                    "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at, is_anti_pattern, source, content
                      FROM learned_rules
                      WHERE state != 'suppressed'",
                 )
@@ -1798,6 +1814,7 @@ impl Storage {
                         row.get::<_, String>(9)?,
                         row.get::<_, i32>(10).unwrap_or(0),
                         row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
                     ))
                 })
                 .map_err(|e| format!("Query error: {e}"))?;
@@ -1817,12 +1834,13 @@ impl Storage {
                     updated,
                     is_anti,
                     source,
+                    content,
                 ) = row.map_err(|e| format!("Row error: {e}"))?;
                 map.insert(
                     name,
                     (
                         domain, alpha, beta, obs_count, last_ev, state, project, created, updated,
-                        is_anti, source,
+                        is_anti, source, content,
                     ),
                 );
             }
@@ -1874,6 +1892,7 @@ impl Storage {
                     updated_at,
                     is_anti,
                     source,
+                    _content,
                 ) = meta_map.remove(&name).unwrap_or((
                     None,
                     1.0,
@@ -1885,6 +1904,7 @@ impl Storage {
                     now.clone(),
                     now,
                     0,
+                    None,
                     None,
                 ));
 
@@ -1906,6 +1926,7 @@ impl Storage {
                     project,
                     is_anti_pattern: is_anti != 0,
                     source,
+                    content: None,
                 });
             }
         }
@@ -1925,6 +1946,7 @@ impl Storage {
                 updated_at,
                 is_anti,
                 source,
+                content_val,
             ),
         ) in meta_map
         {
@@ -1946,6 +1968,7 @@ impl Storage {
                 project,
                 is_anti_pattern: is_anti != 0,
                 source,
+                content: content_val,
             });
         }
 
@@ -2071,6 +2094,62 @@ impl Storage {
             false
         }
         find_and_delete(&rules_dir, name);
+        Ok(())
+    }
+
+    pub fn promote_learned_rule(&self, name: &str) -> Result<(), String> {
+        if !crate::learning::is_safe_rule_name(name) {
+            return Err(format!(
+                "Invalid rule name: {}",
+                &name[..name.len().min(50)]
+            ));
+        }
+
+        let content: String = {
+            let conn = self.conn.lock();
+            let content_opt: Option<String> = conn
+                .query_row(
+                    "SELECT content FROM learned_rules WHERE name = ?1 AND state != 'suppressed'",
+                    params![name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Rule not found: {e}"))?;
+            content_opt.ok_or_else(|| {
+                "No stored content for this rule — re-run analysis to capture content".to_string()
+            })?
+        };
+
+        let rules_dir = dirs::home_dir()
+            .ok_or("Cannot determine home directory")?
+            .join(".claude")
+            .join("rules")
+            .join("learned");
+        std::fs::create_dir_all(&rules_dir).map_err(|e| format!("Cannot create rules dir: {e}"))?;
+
+        let file_path = rules_dir.join(format!("{name}.md"));
+        let canonical_dir = rules_dir
+            .canonicalize()
+            .map_err(|e| format!("Canonicalize error: {e}"))?;
+        let canonical_parent = file_path
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .unwrap_or_default();
+        if !canonical_parent.starts_with(&canonical_dir) {
+            return Err(format!("Path traversal detected for rule: {name}"));
+        }
+
+        let sanitized = crate::learning::sanitize_rule_content(&content);
+        std::fs::write(&file_path, &sanitized)
+            .map_err(|e| format!("Failed to write rule file: {e}"))?;
+
+        // Update DB to record file_path
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE learned_rules SET file_path = ?1, updated_at = datetime('now') WHERE name = ?2",
+            params![file_path.to_string_lossy().as_ref(), name],
+        )
+        .map_err(|e| format!("Update file_path error: {e}"))?;
+
         Ok(())
     }
 

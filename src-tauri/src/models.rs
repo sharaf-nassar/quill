@@ -179,6 +179,8 @@ pub struct LearnedRulePayload {
     pub is_anti_pattern: bool,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 fn default_confidence() -> f64 {
@@ -215,6 +217,7 @@ pub struct LearnedRule {
     pub project: Option<String>,
     pub is_anti_pattern: bool,
     pub source: Option<String>,
+    pub content: Option<String>,
 }
 
 // Tool frequency count for status strip

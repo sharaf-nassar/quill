@@ -154,6 +154,7 @@ export interface LearnedRule {
   project: string | null;
   is_anti_pattern: boolean;
   source: string | null;
+	content: string | null;
 }
 
 export interface RunPhase {

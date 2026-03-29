@@ -301,6 +301,14 @@ async fn delete_learned_rule(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn promote_learned_rule(name: String, app: tauri::AppHandle) -> Result<(), String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.promote_learned_rule(&name))?;
+    let _ = app.emit("learning-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_learning_runs(limit: i32) -> Result<Vec<LearningRun>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_learning_runs(limit as i64))
@@ -1073,6 +1081,7 @@ pub fn run() {
             set_learning_settings,
             get_learned_rules,
             delete_learned_rule,
+            promote_learned_rule,
             get_learning_runs,
             trigger_analysis,
             get_observation_count,

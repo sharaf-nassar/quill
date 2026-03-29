@@ -86,7 +86,7 @@ Tables for the behavioral learning pipeline: observations, summaries, analysis r
 - **observations** — Tool-use observations (session_id, hook_phase, tool_name, tool_input/output, cwd). Indexed on session_id, timestamp, created_at.
 - **observation_summaries** — Per-period/project summaries (tool_counts JSON, error_count, total). Unique on (period, project).
 - **learning_runs** — Analysis run records (trigger_mode, observations_analyzed, rules created/updated, duration, status, error).
-- **learned_rules** — Discovered patterns (name unique, domain, confidence, observation_count, file_path, state, is_anti_pattern, source).
+- **learned_rules** — Discovered patterns (name unique, domain, confidence, observation_count, file_path, content, state, is_anti_pattern, source). The `content` column (migration 11) stores sanitized rule text for manual promotion.
 
 #### Session Indexing
 
@@ -128,11 +128,11 @@ Key-value configuration and schema migration version tracking.
 
 `get_project_tokens`, `get_session_stats`, `get_project_breakdown`, `delete_project_data`, `rename_project`, `delete_host_data`, `delete_session_data`.
 
-### Learning Commands (11)
+### Learning Commands (12)
 
 Commands for managing the behavioral learning pipeline settings, rules, and observations.
 
-`get_learning_settings`, `set_learning_settings`, `get_learned_rules`, `delete_learned_rule`, `get_learning_runs`, `trigger_analysis`, `get_observation_count`, `get_unanalyzed_observation_count`, `get_top_tools`, `get_observation_sparkline`, `read_rule_content`.
+`get_learning_settings`, `set_learning_settings`, `get_learned_rules`, `delete_learned_rule`, `promote_learned_rule`, `get_learning_runs`, `trigger_analysis`, `get_observation_count`, `get_unanalyzed_observation_count`, `get_top_tools`, `get_observation_sparkline`, `read_rule_content`.
 
 ### Code and Response Stats (4)
 

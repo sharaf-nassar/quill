@@ -1200,6 +1200,10 @@ fn write_rule_files(
             String::new()
         };
 
+        // Sanitize LLM-generated content before writing to disk to prevent
+        // prompt-injection persistence (content is read back into future prompts)
+        let sanitized_content = sanitize_rule_content(&rule.content);
+
         let _ = storage.store_learned_rule(&crate::models::LearnedRulePayload {
             name: rule.name.clone(),
             domain: Some(rule.domain.clone()),
@@ -1209,6 +1213,7 @@ fn write_rule_files(
             project: project.clone(),
             is_anti_pattern: rule.is_anti_pattern,
             source: source.clone(),
+            content: Some(sanitized_content.clone()),
         });
 
         let anti_label = if rule.is_anti_pattern {
@@ -1216,10 +1221,6 @@ fn write_rule_files(
         } else {
             ""
         };
-
-        // Sanitize LLM-generated content before writing to disk to prevent
-        // prompt-injection persistence (content is read back into future prompts)
-        let sanitized_content = sanitize_rule_content(&rule.content);
 
         // Only write the .md file if confidence meets threshold and not micro mode
         if above_threshold {
@@ -1259,7 +1260,7 @@ fn write_rule_files(
 /// Basic sanitization of LLM-generated rule content before writing to disk.
 /// Removes markdown code fences and system-level prompt markers that could
 /// be used for prompt injection when the content is read back into future prompts.
-fn sanitize_rule_content(content: &str) -> String {
+pub fn sanitize_rule_content(content: &str) -> String {
     content
         .lines()
         .filter(|line| {

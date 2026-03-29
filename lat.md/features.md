@@ -52,11 +52,19 @@ Analysis can run: **on-demand** (manual), **session-end** (on close), **periodic
 
 The Learning window has two tabs: **Rules** and **Memories** (memory optimization).
 
-The Rules tab shows learned patterns with confidence, domain, state badges, and delete action. A `StatusStrip` shows observation counts and a "Run Analysis" button. A floating `RunHistory` panel shows past runs with per-phase timing and real-time logs during active runs.
+The Rules tab splits rules into two sections: **Active Rules** (have `.md` files on disk) and **Discovered** (DB-only candidates). Active rules show only name, confidence, domain, and delete action — no state badge. Discovered rules show state badge and a promote button with inline two-step confirmation. A `StatusStrip` shows observation counts and a "Run Analysis" button. A floating `RunHistory` panel shows past runs with per-phase timing and real-time logs during active runs.
 
 ### Rule Storage
 
-Discovered rules are written as markdown files to `~/.claude/rules/learned/` and tracked in the `learned_rules` database table. Rules include name, domain, confidence, observation count, and state.
+Rules are tracked in the `learned_rules` database table and optionally written as `.md` files to `~/.claude/rules/learned/`.
+
+Rules above the confidence threshold are automatically written to disk. Users can manually promote any discovered rule via the UI, writing stored content to disk regardless of confidence.
+
+### Rule Promotion
+
+Users can promote discovered rules to active rules via [[src-tauri/src/storage.rs#Storage#promote_learned_rule]].
+
+The promote flow reads stored content from the DB, sanitizes it, writes the `.md` file, and updates `file_path` in the database. The rule then moves from the Discovered section to Active Rules on the next UI refresh.
 
 ## Session Search
 

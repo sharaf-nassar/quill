@@ -6,7 +6,7 @@ The React 19 frontend is a multi-window Tauri application with custom hooks for 
 
 [[src/main.tsx]] routes to window-specific components based on the `?view=` URL parameter.
 
-Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range. A `ToastProvider` context wraps all views for notifications.
+Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications.
 
 ### Window Routes
 
@@ -61,7 +61,7 @@ Recharts-based analytics in `src/components/analytics/` with three tabs: Now, Tr
 Rule management and memory optimization UI in `src/components/learning/`.
 
 - **MemoriesPanel** (807 lines) — Memory optimization UI with project selector, file browser with content preview, suggestion approval/denial, and custom project management. The largest frontend component.
-- **RuleCard** (113 lines) — Displays a learned rule with name, domain, confidence %, observation count, and state badge (emerging/confirmed/anti-pattern).
+- **RuleCard** — Displays a learned rule with name, confidence %, and a metadata row (domain, source, project) in muted text. For active rules (on disk): no state badge, delete only. For discovered rules (DB-only): state badge, promote button with inline two-step confirmation, and expandable DB-stored content preview.
 - **SuggestionCard** (258 lines) — Memory optimization suggestion with approve/deny/undo actions and diff summaries.
 - **StatusStrip** (79 lines) — Observation count, unanalyzed count, last run time, and "Run Analysis" button.
 - **DomainBreakdown** (38 lines) — Rules-by-domain pie chart.

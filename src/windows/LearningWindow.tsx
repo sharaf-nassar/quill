@@ -122,6 +122,7 @@ function LearningPanel() {
     updateSettings,
     triggerAnalysis,
     deleteRule,
+    promoteRule,
   } = useLearningData();
 
   const [activeTab, setActiveTab] = useState<"rules" | "memories">("rules");
@@ -221,24 +222,41 @@ function LearningPanel() {
               analyzing={analyzing}
               onAnalyze={triggerAnalysis}
             />
-            <div className="learning-section">
-              <div className="learning-section-header">
-                RULES
-                <span className="learning-section-count">{rules.length}</span>
-              </div>
-              {rules.length === 0 ? (
-                <div className="learning-empty">
-                  No rules learned yet. Run an analysis to get started.
-                </div>
-              ) : (
+            {(() => {
+              const activeRules = rules.filter((r) => r.file_path.length > 0);
+              const discoveredRules = rules.filter((r) => r.file_path.length === 0);
+              return (
                 <>
-                  {rules.map((rule) => (
-                    <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} />
-                  ))}
+                  <div className="learning-section">
+                    <div className="learning-section-header">
+                      ACTIVE RULES
+                      <span className="learning-section-count">{activeRules.length}</span>
+                    </div>
+                    {activeRules.length === 0 ? (
+                      <div className="learning-empty">
+                        No active rules yet. Promote discovered rules or run an analysis.
+                      </div>
+                    ) : (
+                      activeRules.map((rule) => (
+                        <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} />
+                      ))
+                    )}
+                  </div>
+                  {discoveredRules.length > 0 && (
+                    <div className="learning-section">
+                      <div className="learning-section-header">
+                        DISCOVERED
+                        <span className="learning-section-count">{discoveredRules.length}</span>
+                      </div>
+                      {discoveredRules.map((rule) => (
+                        <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} onPromote={promoteRule} />
+                      ))}
+                    </div>
+                  )}
                   <DomainBreakdown rules={rules} />
                 </>
-              )}
-            </div>
+              );
+            })()}
           </>
         ) : (
           <MemoriesPanel />
