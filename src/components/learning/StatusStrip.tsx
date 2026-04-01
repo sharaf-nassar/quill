@@ -1,7 +1,9 @@
-import type { LearningRun, ToolCount } from "../../types";
+import type { LearningRun, ProviderFilter, ToolCount } from "../../types";
+import { providerFilterLabel } from "../../utils/providers";
 import { timeAgo } from "../../utils/time";
 
 interface StatusStripProps {
+  providerFilter: ProviderFilter;
   observationCount: number;
   unanalyzedCount: number;
   topTools: ToolCount[];
@@ -12,6 +14,7 @@ interface StatusStripProps {
 }
 
 function StatusStrip({
+  providerFilter,
   observationCount,
   unanalyzedCount,
   topTools,
@@ -25,6 +28,9 @@ function StatusStrip({
   return (
     <div className="learning-status">
       <div className="learning-status-row">
+        <span className="learning-context-chip">
+          {providerFilterLabel(providerFilter)}
+        </span>
         <span className="learning-stat">
           {observationCount} obs
         </span>

@@ -1,10 +1,20 @@
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use crate::integrations::IntegrationProvider;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::json;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 // ── Data Structures ──
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InstalledPlugin {
+    pub provider: IntegrationProvider,
+    pub plugin_id: String,
+    pub marketplace_path: Option<String>,
     pub name: String,
     pub marketplace: String,
     pub version: String,
@@ -20,6 +30,9 @@ pub struct InstalledPlugin {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MarketplacePlugin {
+    pub provider: IntegrationProvider,
+    pub plugin_id: String,
+    pub marketplace_path: Option<String>,
     pub name: String,
     pub description: Option<String>,
     pub version: String,
@@ -27,10 +40,13 @@ pub struct MarketplacePlugin {
     pub category: Option<String>,
     pub source_path: String,
     pub installed: bool,
+    pub enabled: bool,
+    pub install_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Marketplace {
+    pub provider: IntegrationProvider,
     pub name: String,
     pub source_type: String,
     pub repo: String,
@@ -41,6 +57,7 @@ pub struct Marketplace {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginUpdate {
+    pub provider: IntegrationProvider,
     pub name: String,
     pub marketplace: String,
     pub scope: String,
@@ -66,6 +83,7 @@ pub struct BulkUpdateProgress {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BulkUpdateItem {
+    pub plugin_key: String,
     pub name: String,
     pub status: String,
     pub error: Option<String>,
@@ -77,7 +95,7 @@ pub struct BulkUpdateItem {
 struct InstalledPluginsFile {
     #[allow(dead_code)]
     version: u32,
-    plugins: std::collections::HashMap<String, Vec<InstallationRecord>>,
+    plugins: HashMap<String, Vec<InstallationRecord>>,
 }
 
 #[derive(Deserialize)]
@@ -156,29 +174,100 @@ struct BlocklistEntry {
     plugin: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AppServerEnvelope<T> {
+    id: Option<u64>,
+    result: Option<T>,
+    error: Option<AppServerError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppServerError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexPluginListResponse {
+    marketplaces: Vec<CodexMarketplace>,
+    #[serde(default)]
+    marketplace_load_errors: Vec<CodexMarketplaceLoadError>,
+    remote_sync_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexMarketplaceLoadError {
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexMarketplace {
+    name: String,
+    path: String,
+    interface: Option<CodexMarketplaceInterface>,
+    plugins: Vec<CodexPluginSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexMarketplaceInterface {
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexPluginSummary {
+    id: String,
+    name: String,
+    installed: bool,
+    enabled: bool,
+    interface: Option<CodexPluginInterface>,
+    source: Option<CodexPluginSource>,
+    install_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexPluginSource {
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    source_type: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexPluginInterface {
+    display_name: Option<String>,
+    short_description: Option<String>,
+    long_description: Option<String>,
+    developer_name: Option<String>,
+    category: Option<String>,
+}
+
 // ── Helpers ──
 
-fn plugins_dir() -> PathBuf {
+fn claude_plugins_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".claude")
         .join("plugins")
 }
 
-fn read_json_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T, String> {
+fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
     serde_json::from_str(&content).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
 }
 
-fn read_blocklist() -> std::collections::HashSet<String> {
-    let path = plugins_dir().join("blocklist.json");
+fn read_blocklist() -> HashSet<String> {
+    let path = claude_plugins_dir().join("blocklist.json");
     if !path.exists() {
-        return std::collections::HashSet::new();
+        return HashSet::new();
     }
     let entries: Vec<BlocklistEntry> = match read_json_file(&path) {
         Ok(e) => e,
-        Err(_) => return std::collections::HashSet::new(),
+        Err(_) => return HashSet::new(),
     };
     entries.into_iter().map(|e| e.plugin).collect()
 }
@@ -190,10 +279,140 @@ fn read_plugin_json(install_path: &str) -> Option<PluginJson> {
     read_json_file(&path).ok()
 }
 
-// ── Read Functions ──
+fn run_codex_app_server_request<T: DeserializeOwned>(
+    request_id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, String> {
+    let mut child = Command::new("codex")
+        .args(["app-server", "--enable", "apps", "--listen", "stdio://"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start codex app-server: {e}"))?;
 
-pub fn get_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
-    let path = plugins_dir().join("installed_plugins.json");
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open codex app-server stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open codex app-server stdout".to_string())?;
+
+    let messages = [
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "quill_plugin_manager",
+                    "title": "Quill Plugin Manager",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            },
+        }),
+        json!({
+            "method": "initialized",
+            "params": {},
+        }),
+        json!({
+            "method": method,
+            "id": request_id,
+            "params": params,
+        }),
+    ];
+
+    for message in messages {
+        stdin
+            .write_all(message.to_string().as_bytes())
+            .map_err(|e| format!("Failed to write to codex app-server: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("Failed to write newline to codex app-server: {e}"))?;
+    }
+    drop(stdin);
+
+    let mut stderr = child.stderr.take();
+    let reader = BufReader::new(stdout);
+    let mut response = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read codex app-server output: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let envelope: AppServerEnvelope<T> = serde_json::from_str(&line)
+            .map_err(|e| format!("Failed to parse codex app-server message: {e}"))?;
+        if envelope.id != Some(request_id) {
+            continue;
+        }
+
+        if let Some(error) = envelope.error {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Codex app-server {method} failed (code {}): {}",
+                error.code, error.message
+            ));
+        }
+
+        if let Some(result) = envelope.result {
+            response = Some(result);
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Some(result) = response {
+        return Ok(result);
+    }
+
+    let mut stderr_text = String::new();
+    if let Some(mut handle) = stderr.take() {
+        let _ = handle.read_to_string(&mut stderr_text);
+    }
+
+    if stderr_text.trim().is_empty() {
+        Err(format!("Codex app-server {method} returned no response"))
+    } else {
+        Err(format!(
+            "Codex app-server {method} returned no response: {}",
+            stderr_text.trim()
+        ))
+    }
+}
+
+fn get_codex_plugin_list(force_remote_sync: bool) -> Result<CodexPluginListResponse, String> {
+    let response: CodexPluginListResponse = run_codex_app_server_request(
+        2,
+        "plugin/list",
+        json!({
+            "forceRemoteSync": force_remote_sync,
+        }),
+    )?;
+
+    if let Some(error) = &response.remote_sync_error {
+        log::warn!("Codex plugin remote sync error: {error}");
+    }
+    for error in &response.marketplace_load_errors {
+        log::warn!("Codex plugin marketplace load error: {}", error.message);
+    }
+
+    Ok(response)
+}
+
+// ── Claude Read Functions ──
+
+fn get_claude_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
+    let path = claude_plugins_dir().join("installed_plugins.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -203,7 +422,6 @@ pub fn get_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
     let mut plugins = Vec::new();
 
     for (key, records) in &file.plugins {
-        // Key format: "pluginName@marketplace"
         let parts: Vec<&str> = key.splitn(2, '@').collect();
         let (plugin_name, marketplace_name) = if parts.len() == 2 {
             (parts[0].to_string(), parts[1].to_string())
@@ -216,6 +434,9 @@ pub fn get_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
             let enabled = !blocklist.contains(key);
 
             plugins.push(InstalledPlugin {
+                provider: IntegrationProvider::Claude,
+                plugin_id: key.clone(),
+                marketplace_path: None,
                 name: plugin_name.clone(),
                 marketplace: marketplace_name.clone(),
                 version: record.version.clone(),
@@ -237,15 +458,15 @@ pub fn get_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
     Ok(plugins)
 }
 
-pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
-    let path = plugins_dir().join("known_marketplaces.json");
+fn get_claude_marketplaces() -> Result<Vec<Marketplace>, String> {
+    let path = claude_plugins_dir().join("known_marketplaces.json");
     if !path.exists() {
         return Ok(Vec::new());
     }
 
-    let sources: std::collections::HashMap<String, MarketplaceSource> = read_json_file(&path)?;
-    let installed = get_installed_plugins().unwrap_or_default();
-    let installed_set: std::collections::HashSet<String> = installed
+    let sources: HashMap<String, MarketplaceSource> = read_json_file(&path)?;
+    let installed = get_claude_installed_plugins().unwrap_or_default();
+    let installed_set: HashSet<String> = installed
         .iter()
         .map(|p| format!("{}@{}", p.name, p.marketplace))
         .collect();
@@ -265,10 +486,6 @@ pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
             for entry in entries {
                 let key = format!("{}@{}", entry.name, name);
                 let source_path = entry.source.unwrap_or_default();
-
-                // Read actual version from the plugin's plugin.json in the
-                // marketplace repo, not from the marketplace manifest which
-                // can drift out of sync.
                 let actual_version = {
                     let plugin_dir = marketplace_root.join(&source_path);
                     read_plugin_json(plugin_dir.to_str().unwrap_or_default())
@@ -278,6 +495,9 @@ pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
                 };
 
                 plugins.push(MarketplacePlugin {
+                    provider: IntegrationProvider::Claude,
+                    plugin_id: key.clone(),
+                    marketplace_path: None,
                     name: entry.name,
                     description: entry.description,
                     version: actual_version,
@@ -285,11 +505,14 @@ pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
                     category: entry.category,
                     source_path,
                     installed: installed_set.contains(&key),
+                    enabled: installed_set.contains(&key),
+                    install_url: None,
                 });
             }
         }
 
         marketplaces.push(Marketplace {
+            provider: IntegrationProvider::Claude,
             name: name.clone(),
             source_type: src.source.source.clone(),
             repo: src.source.repo.clone(),
@@ -303,10 +526,139 @@ pub fn get_marketplaces() -> Result<Vec<Marketplace>, String> {
     Ok(marketplaces)
 }
 
-/// Returns true if `available` is a newer version than `current`.
-/// Falls back to string inequality if either fails to parse as semver.
+// ── Codex Read Functions ──
+
+fn get_codex_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
+    let response = get_codex_plugin_list(false)?;
+    let mut installed = Vec::new();
+
+    for marketplace in response.marketplaces {
+        let marketplace_name = marketplace
+            .interface
+            .as_ref()
+            .and_then(|iface| iface.display_name.clone())
+            .unwrap_or_else(|| marketplace.name.clone());
+
+        for plugin in marketplace.plugins {
+            if !plugin.installed {
+                continue;
+            }
+
+            let description = plugin.interface.as_ref().and_then(|iface| {
+                iface
+                    .short_description
+                    .clone()
+                    .or_else(|| iface.long_description.clone())
+            });
+            let author = plugin
+                .interface
+                .as_ref()
+                .and_then(|iface| iface.developer_name.clone());
+
+            installed.push(InstalledPlugin {
+                provider: IntegrationProvider::Codex,
+                plugin_id: plugin.id,
+                marketplace_path: Some(marketplace.path.clone()),
+                name: plugin
+                    .interface
+                    .as_ref()
+                    .and_then(|iface| iface.display_name.clone())
+                    .unwrap_or(plugin.name),
+                marketplace: marketplace_name.clone(),
+                version: String::new(),
+                scope: "global".to_string(),
+                project_path: None,
+                enabled: plugin.enabled,
+                description,
+                author,
+                installed_at: String::new(),
+                last_updated: String::new(),
+                git_commit_sha: None,
+            });
+        }
+    }
+
+    installed.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(installed)
+}
+
+fn get_codex_marketplaces() -> Result<Vec<Marketplace>, String> {
+    let response = get_codex_plugin_list(false)?;
+    let mut marketplaces = Vec::new();
+
+    for marketplace in response.marketplaces {
+        let display_name = marketplace
+            .interface
+            .as_ref()
+            .and_then(|iface| iface.display_name.clone())
+            .unwrap_or_else(|| marketplace.name.clone());
+
+        let plugins = marketplace
+            .plugins
+            .into_iter()
+            .map(|plugin| {
+                let interface = plugin.interface.as_ref();
+                MarketplacePlugin {
+                    provider: IntegrationProvider::Codex,
+                    plugin_id: plugin.id,
+                    marketplace_path: Some(marketplace.path.clone()),
+                    name: interface
+                        .and_then(|iface| iface.display_name.clone())
+                        .unwrap_or(plugin.name),
+                    description: interface.and_then(|iface| {
+                        iface
+                            .short_description
+                            .clone()
+                            .or_else(|| iface.long_description.clone())
+                    }),
+                    version: String::new(),
+                    author: interface.and_then(|iface| iface.developer_name.clone()),
+                    category: interface.and_then(|iface| iface.category.clone()),
+                    source_path: plugin
+                        .source
+                        .and_then(|source| source.path)
+                        .unwrap_or_default(),
+                    installed: plugin.installed,
+                    enabled: plugin.enabled,
+                    install_url: plugin.install_url,
+                }
+            })
+            .collect();
+
+        marketplaces.push(Marketplace {
+            provider: IntegrationProvider::Codex,
+            name: display_name,
+            source_type: "codex".to_string(),
+            repo: marketplace.path.clone(),
+            install_location: marketplace.path,
+            last_updated: None,
+            plugins,
+        });
+    }
+
+    marketplaces.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(marketplaces)
+}
+
+// ── Shared Read Functions ──
+
+pub fn get_installed_plugins(
+    provider: IntegrationProvider,
+) -> Result<Vec<InstalledPlugin>, String> {
+    match provider {
+        IntegrationProvider::Claude => get_claude_installed_plugins(),
+        IntegrationProvider::Codex => get_codex_installed_plugins(),
+    }
+}
+
+pub fn get_marketplaces(provider: IntegrationProvider) -> Result<Vec<Marketplace>, String> {
+    match provider {
+        IntegrationProvider::Claude => get_claude_marketplaces(),
+        IntegrationProvider::Codex => get_codex_marketplaces(),
+    }
+}
+
 fn is_newer_version(current: &str, available: &str) -> bool {
-    // Try lenient semver parse (handles versions like "1.0" by treating as "1.0.0")
     let parse = |v: &str| -> Option<(u64, u64, u64)> {
         let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
         let major = parts.first()?.parse().ok()?;
@@ -321,9 +673,9 @@ fn is_newer_version(current: &str, available: &str) -> bool {
     }
 }
 
-pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
-    let installed = get_installed_plugins()?;
-    let marketplaces = get_marketplaces()?;
+fn get_claude_available_updates() -> Result<Vec<PluginUpdate>, String> {
+    let installed = get_claude_installed_plugins()?;
+    let marketplaces = get_claude_marketplaces()?;
     let mut updates = Vec::new();
 
     for plugin in &installed {
@@ -331,15 +683,18 @@ pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
             if marketplace.name != plugin.marketplace {
                 continue;
             }
-            for mp in &marketplace.plugins {
-                if mp.name == plugin.name && is_newer_version(&plugin.version, &mp.version) {
+            for marketplace_plugin in &marketplace.plugins {
+                if marketplace_plugin.name == plugin.name
+                    && is_newer_version(&plugin.version, &marketplace_plugin.version)
+                {
                     updates.push(PluginUpdate {
+                        provider: IntegrationProvider::Claude,
                         name: plugin.name.clone(),
                         marketplace: plugin.marketplace.clone(),
                         scope: plugin.scope.clone(),
                         project_path: plugin.project_path.clone(),
                         current_version: plugin.version.clone(),
-                        available_version: mp.version.clone(),
+                        available_version: marketplace_plugin.version.clone(),
                     });
                 }
             }
@@ -347,6 +702,13 @@ pub fn get_available_updates() -> Result<Vec<PluginUpdate>, String> {
     }
 
     Ok(updates)
+}
+
+pub fn get_available_updates(provider: IntegrationProvider) -> Result<Vec<PluginUpdate>, String> {
+    match provider {
+        IntegrationProvider::Claude => get_claude_available_updates(),
+        IntegrationProvider::Codex => Ok(Vec::new()),
+    }
 }
 
 // ── Input Validation ──
@@ -377,7 +739,6 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     if repo.starts_with('-') {
         return Err("Repository path must not start with a hyphen".to_string());
     }
-    // Allow "org/repo" format or https URLs
     let is_github_shorthand = repo
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/');
@@ -388,14 +749,32 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ── Mutation Functions (CLI subprocess) ──
+fn validate_plugin_id(plugin_id: &str) -> Result<(), String> {
+    if plugin_id.trim().is_empty() {
+        return Err("Plugin ID must not be empty".to_string());
+    }
+    if plugin_id.len() > 256 {
+        return Err("Plugin ID must be 256 characters or fewer".to_string());
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(path: &str) -> Result<(), String> {
+    let parsed = Path::new(path);
+    if !parsed.is_absolute() {
+        return Err(format!("Expected absolute path, got '{path}'"));
+    }
+    Ok(())
+}
+
+// ── Claude Mutation Functions ──
 
 fn run_claude_command(args: &[&str]) -> Result<String, String> {
     run_claude_command_in(args, None)
 }
 
 fn run_claude_command_in(args: &[&str], cwd: Option<&str>) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("claude");
+    let mut cmd = Command::new("claude");
     cmd.args(args);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -414,7 +793,6 @@ fn run_claude_command_in(args: &[&str], cwd: Option<&str>) -> Result<String, Str
             "claude {} failed: stderr={stderr} stdout={stdout}",
             args.join(" ")
         );
-        // Return stderr if available, otherwise stdout — but strip ANSI codes for the UI
         let msg = if !stderr.is_empty() { &stderr } else { &stdout };
         Err(strip_ansi(msg))
     }
@@ -437,31 +815,31 @@ fn strip_ansi(s: &str) -> String {
     result
 }
 
-pub fn install_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+fn install_claude_plugin(name: &str, marketplace: &str) -> Result<String, String> {
     validate_plugin_name(name)?;
     validate_plugin_name(marketplace)?;
     let qualified = format!("{name}@{marketplace}");
     run_claude_command(&["plugin", "install", &qualified])
 }
 
-pub fn remove_plugin(name: &str, marketplace: &str) -> Result<String, String> {
+fn remove_claude_plugin(name: &str, marketplace: &str) -> Result<String, String> {
     validate_plugin_name(name)?;
     validate_plugin_name(marketplace)?;
     let qualified = format!("{name}@{marketplace}");
     run_claude_command(&["plugin", "uninstall", &qualified])
 }
 
-pub fn enable_plugin(name: &str) -> Result<String, String> {
+fn enable_claude_plugin(name: &str) -> Result<String, String> {
     validate_plugin_name(name)?;
     run_claude_command(&["plugin", "enable", name])
 }
 
-pub fn disable_plugin(name: &str) -> Result<String, String> {
+fn disable_claude_plugin(name: &str) -> Result<String, String> {
     validate_plugin_name(name)?;
     run_claude_command(&["plugin", "disable", name])
 }
 
-pub fn update_plugin(
+fn update_claude_plugin(
     name: &str,
     marketplace: &str,
     scope: &str,
@@ -476,27 +854,26 @@ pub fn update_plugin(
     )
 }
 
-pub fn add_marketplace(repo: &str) -> Result<String, String> {
+fn add_claude_marketplace(repo: &str) -> Result<String, String> {
     validate_repo(repo)?;
     run_claude_command(&["plugin", "marketplace", "add", repo])
 }
 
-pub fn remove_marketplace(name: &str) -> Result<String, String> {
+fn remove_claude_marketplace(name: &str) -> Result<String, String> {
     validate_plugin_name(name)?;
     run_claude_command(&["plugin", "marketplace", "remove", name])
 }
 
-pub fn refresh_marketplace(name: &str) -> Result<String, String> {
-    let marketplaces = get_marketplaces()?;
+fn refresh_claude_marketplace(name: &str) -> Result<String, String> {
+    let marketplaces = get_claude_marketplaces()?;
     let marketplace = marketplaces
         .iter()
-        .find(|m| m.name == name)
+        .find(|marketplace| marketplace.name == name)
         .ok_or_else(|| format!("Marketplace '{name}' not found"))?;
 
-    let location = &marketplace.install_location;
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .args(["pull", "--ff-only"])
-        .current_dir(location)
+        .current_dir(&marketplace.install_location)
         .output()
         .map_err(|e| format!("Failed to git pull {name}: {e}"))?;
 
@@ -510,19 +887,202 @@ pub fn refresh_marketplace(name: &str) -> Result<String, String> {
     }
 }
 
+// ── Codex Mutation Functions ──
+
+fn install_codex_plugin(name: &str, marketplace_path: &str) -> Result<String, String> {
+    validate_plugin_name(name)?;
+    validate_absolute_path(marketplace_path)?;
+    let _: serde_json::Value = run_codex_app_server_request(
+        3,
+        "plugin/install",
+        json!({
+            "pluginName": name,
+            "marketplacePath": marketplace_path,
+        }),
+    )?;
+    Ok(format!("Installed Codex plugin '{name}'"))
+}
+
+fn remove_codex_plugin(plugin_id: &str) -> Result<String, String> {
+    validate_plugin_id(plugin_id)?;
+    let _: serde_json::Value = run_codex_app_server_request(
+        4,
+        "plugin/uninstall",
+        json!({
+            "pluginId": plugin_id,
+        }),
+    )?;
+    Ok(format!("Removed Codex plugin '{plugin_id}'"))
+}
+
+fn refresh_codex_marketplaces() -> Result<String, String> {
+    let _ = get_codex_plugin_list(true)?;
+    Ok("Refreshed Codex plugin catalog".to_string())
+}
+
+// ── Shared Mutation Functions ──
+
+pub fn install_plugin(
+    provider: IntegrationProvider,
+    name: &str,
+    marketplace: &str,
+    marketplace_path: Option<&str>,
+) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => install_claude_plugin(name, marketplace),
+        IntegrationProvider::Codex => {
+            let path = marketplace_path
+                .ok_or_else(|| "Codex plugin installs require a marketplace path".to_string())?;
+            install_codex_plugin(name, path)
+        }
+    }
+}
+
+pub fn remove_plugin(
+    provider: IntegrationProvider,
+    name: &str,
+    marketplace: &str,
+    plugin_id: &str,
+) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => remove_claude_plugin(name, marketplace),
+        IntegrationProvider::Codex => remove_codex_plugin(plugin_id),
+    }
+}
+
+pub fn enable_plugin(provider: IntegrationProvider, name: &str) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => enable_claude_plugin(name),
+        IntegrationProvider::Codex => Err(
+            "Codex plugins do not expose a separate enable action through app-server".to_string(),
+        ),
+    }
+}
+
+pub fn disable_plugin(provider: IntegrationProvider, name: &str) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => disable_claude_plugin(name),
+        IntegrationProvider::Codex => Err(
+            "Codex plugins do not expose a separate disable action through app-server".to_string(),
+        ),
+    }
+}
+
+pub fn update_plugin(
+    provider: IntegrationProvider,
+    name: &str,
+    marketplace: &str,
+    scope: &str,
+    project_path: Option<&str>,
+) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => update_claude_plugin(name, marketplace, scope, project_path),
+        IntegrationProvider::Codex => Err(
+            "Codex plugins do not expose versioned update metadata through app-server".to_string(),
+        ),
+    }
+}
+
+pub fn add_marketplace(provider: IntegrationProvider, repo: &str) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => add_claude_marketplace(repo),
+        IntegrationProvider::Codex => {
+            Err("Codex plugin marketplaces are discovered automatically by app-server".to_string())
+        }
+    }
+}
+
+pub fn remove_marketplace(provider: IntegrationProvider, name: &str) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => remove_claude_marketplace(name),
+        IntegrationProvider::Codex => {
+            Err("Codex plugin marketplaces are discovered automatically by app-server".to_string())
+        }
+    }
+}
+
+pub fn refresh_marketplace(provider: IntegrationProvider, name: &str) -> Result<String, String> {
+    match provider {
+        IntegrationProvider::Claude => refresh_claude_marketplace(name),
+        IntegrationProvider::Codex => {
+            let _ = name;
+            refresh_codex_marketplaces()
+        }
+    }
+}
+
 pub type MarketplaceRefreshResults = Vec<(String, Result<String, String>)>;
 
-pub fn refresh_all_marketplaces() -> Result<MarketplaceRefreshResults, String> {
-    let marketplaces = get_marketplaces()?;
-    let results: Vec<_> = marketplaces
-        .iter()
-        .map(|m| (m.name.clone(), refresh_marketplace(&m.name)))
-        .collect();
-    Ok(results)
+pub fn refresh_all_marketplaces(
+    provider: IntegrationProvider,
+) -> Result<MarketplaceRefreshResults, String> {
+    match provider {
+        IntegrationProvider::Claude => {
+            let marketplaces = get_claude_marketplaces()?;
+            let results: Vec<_> = marketplaces
+                .iter()
+                .map(|marketplace| {
+                    (
+                        marketplace.name.clone(),
+                        refresh_claude_marketplace(&marketplace.name),
+                    )
+                })
+                .collect();
+            Ok(results)
+        }
+        IntegrationProvider::Codex => {
+            let marketplaces = get_codex_marketplaces()?;
+            let refresh_result = refresh_codex_marketplaces();
+            let results = marketplaces
+                .into_iter()
+                .map(|marketplace| {
+                    (
+                        marketplace.name,
+                        refresh_result
+                            .clone()
+                            .map(|_| "Refreshed via codex app-server".to_string()),
+                    )
+                })
+                .collect();
+            Ok(results)
+        }
+    }
 }
 
 pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> BulkUpdateProgress {
     use tauri::Emitter;
+
+    fn progress_key(update: &PluginUpdate) -> String {
+        format!(
+            "{:?}:{}@{}:{}:{}",
+            update.provider,
+            update.name,
+            update.marketplace,
+            update.scope,
+            update.project_path.clone().unwrap_or_default()
+        )
+    }
+
+    fn progress_label(update: &PluginUpdate) -> String {
+        let provider = match update.provider {
+            IntegrationProvider::Claude => "Claude",
+            IntegrationProvider::Codex => "Codex",
+        };
+
+        match update.project_path.as_deref() {
+            Some(project_path) if update.scope == "project" => {
+                let project_name = Path::new(project_path)
+                    .file_name()
+                    .and_then(|segment| segment.to_str())
+                    .unwrap_or(project_path);
+                format!(
+                    "{} ({provider}, {}, project:{project_name})",
+                    update.name, update.marketplace
+                )
+            }
+            _ => format!("{} ({provider}, {})", update.name, update.marketplace),
+        }
+    }
 
     let total = updates.len() as u32;
     let mut progress = BulkUpdateProgress {
@@ -533,17 +1093,21 @@ pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> 
     };
 
     for update in updates {
-        progress.current_plugin = Some(update.name.clone());
+        let plugin_key = progress_key(update);
+        let plugin_label = progress_label(update);
+        progress.current_plugin = Some(plugin_label.clone());
         let _ = app.emit("plugin-bulk-progress", &progress);
 
         let result = update_plugin(
+            update.provider,
             &update.name,
             &update.marketplace,
             &update.scope,
             update.project_path.as_deref(),
         );
         progress.results.push(BulkUpdateItem {
-            name: update.name.clone(),
+            plugin_key,
+            name: plugin_label,
             status: if result.is_ok() {
                 "success".to_string()
             } else {
@@ -560,9 +1124,6 @@ pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> 
 }
 
 // ── Background Update Checker ──
-
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 pub struct UpdateCheckerState {
     pub last_result: Mutex<UpdateCheckResult>,
@@ -583,16 +1144,15 @@ impl UpdateCheckerState {
 pub fn spawn_update_checker(state: Arc<UpdateCheckerState>, app: tauri::AppHandle) {
     use tauri::Emitter;
 
-    let interval_secs: u64 = 4 * 60 * 60; // 4 hours
+    let interval_secs: u64 = 4 * 60 * 60;
 
     tauri::async_runtime::spawn(async move {
-        // Delay first check to avoid contending with app startup I/O
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
         let mut last_count: usize = 0;
         loop {
-            // Check for updates
-            let result = tokio::task::block_in_place(get_available_updates);
+            let result =
+                tokio::task::block_in_place(|| get_available_updates(IntegrationProvider::Claude));
 
             if let Ok(updates) = result {
                 let count = updates.len();
@@ -608,7 +1168,6 @@ pub fn spawn_update_checker(state: Arc<UpdateCheckerState>, app: tauri::AppHandl
 
                 *state.last_result.lock() = check_result;
 
-                // Only emit event when count changes
                 if count != last_count {
                     let _ = app.emit("plugin-updates-available", count);
                     last_count = count;

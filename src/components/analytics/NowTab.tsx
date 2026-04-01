@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import { useTokenData } from "../../hooks/useTokenData";
 import { useCodeStats } from "../../hooks/useCodeStats";
@@ -42,11 +42,10 @@ const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 interface NowTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
-	currentBuckets: UsageBucket[];
+	currentBucket: UsageBucket | null;
 }
 
-function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
-	const defaultBucket = currentBuckets?.[0]?.label ?? "7 days";
+function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {
 	const [breakdownSelection, setBreakdownSelection] =
 		useState<BreakdownSelection | null>(null);
 	const [breakdownCollapsed, setBreakdownCollapsed] = useState(() => {
@@ -62,16 +61,9 @@ function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
 		? (DAYS_TO_RANGE[breakdownDays] ?? "24h")
 		: range;
 
-	const bucketsKey = (currentBuckets ?? [])
-		.map((b) => `${b.label}:${b.utilization}:${b.resets_at ?? ""}`)
-		.join(",");
-	// eslint-disable-next-line react-hooks/exhaustive-deps -- bucketsKey is an intentional stabilizer
-	const stableBuckets = useMemo(() => currentBuckets, [bucketsKey]);
-
 	const { loading, error } = useAnalyticsData(
-		defaultBucket,
+		currentBucket,
 		range,
-		stableBuckets,
 	);
 
 	const responseTimeStats = useResponseTimeStats(range);
@@ -79,11 +71,18 @@ function NowTab({ range, onRangeChange, currentBuckets }: NowTabProps) {
 	const tokenHostname =
 		breakdownSelection?.type === "host" ? breakdownSelection.key : null;
 	const tokenSessionId =
-		breakdownSelection?.type === "session" ? breakdownSelection.key : null;
+		breakdownSelection?.type === "session"
+			? breakdownSelection.sessionId ?? null
+			: null;
+	const tokenProvider =
+		breakdownSelection?.type === "session"
+			? breakdownSelection.provider ?? null
+			: null;
 	const tokenCwd =
 		breakdownSelection?.type === "project" ? breakdownSelection.key : null;
 	const { history: tokenHistory, stats: tokenStats } = useTokenData(
 		tokenRange,
+		tokenProvider,
 		tokenHostname,
 		tokenSessionId,
 		tokenCwd,

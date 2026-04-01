@@ -4,13 +4,16 @@ use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::integrations::IntegrationProvider;
 use crate::models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, GitSnapshot, HostBreakdown,
     LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
     LearningStatus, ObservationPayload, ProjectBreakdown, ProjectTokens, ResponseTimeStats,
-    SessionBreakdown, SessionCodeStats, SessionStats, TokenDataPoint, TokenReportPayload,
-    TokenStats, ToolCount, UsageBucket,
+    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, TokenDataPoint,
+    TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
+
+const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
     let n = alpha + beta;
@@ -97,6 +100,10 @@ fn ext_to_language(file_path: &str) -> &'static str {
 }
 
 fn parse_code_change(tool_name: &str, full_input: &str) -> Option<(i64, i64, String)> {
+    if tool_name == "apply_patch" {
+        return parse_apply_patch_change(full_input);
+    }
+
     let parsed: serde_json::Value = serde_json::from_str(full_input).ok()?;
 
     let file_path = parsed
@@ -122,6 +129,156 @@ fn parse_code_change(tool_name: &str, full_input: &str) -> Option<(i64, i64, Str
     }
 }
 
+fn parse_apply_patch_change(patch: &str) -> Option<(i64, i64, String)> {
+    let mut added = 0i64;
+    let mut removed = 0i64;
+    let mut file_path = String::new();
+    let mut mode = "";
+
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            if file_path.is_empty() {
+                file_path = path.to_string();
+            }
+            mode = "add";
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            if file_path.is_empty() {
+                file_path = path.to_string();
+            }
+            mode = "update";
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            if file_path.is_empty() {
+                file_path = path.to_string();
+            }
+            mode = "delete";
+            continue;
+        }
+
+        if line.starts_with("*** ") {
+            mode = "";
+            continue;
+        }
+
+        match mode {
+            "add" => {
+                if line.starts_with('+') {
+                    added += 1;
+                }
+            }
+            "update" => {
+                if line.starts_with('+') {
+                    added += 1;
+                } else if line.starts_with('-') {
+                    removed += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if added == 0 && removed == 0 && file_path.is_empty() {
+        return None;
+    }
+
+    Some((added, removed, file_path))
+}
+
+fn session_key(provider: IntegrationProvider, session_id: &str) -> String {
+    format!("{provider}:{session_id}")
+}
+
+fn normalized_provider_scope(provider_scope: &[IntegrationProvider]) -> Vec<IntegrationProvider> {
+    let mut scope = provider_scope.to_vec();
+    scope.sort_by_key(|provider| provider.as_str());
+    scope.dedup();
+    if scope.is_empty() {
+        scope.push(IntegrationProvider::Claude);
+    }
+    scope
+}
+
+fn provider_scope_json(provider_scope: &[IntegrationProvider]) -> String {
+    serde_json::to_string(&normalized_provider_scope(provider_scope))
+        .unwrap_or_else(|_| "[\"claude\"]".to_string())
+}
+
+fn parse_provider_scope(value: Option<String>) -> Vec<IntegrationProvider> {
+    let raw = value.unwrap_or_else(|| "[\"claude\"]".to_string());
+    let parsed = serde_json::from_str::<Vec<IntegrationProvider>>(&raw)
+        .unwrap_or_else(|_| vec![IntegrationProvider::Claude]);
+    normalized_provider_scope(&parsed)
+}
+
+fn provider_scope_contains_json(provider: IntegrationProvider) -> String {
+    format!("\"{}\"", provider.as_str())
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if !dirs.contains(&path) {
+        dirs.push(path);
+    }
+}
+
+fn learned_rule_dirs(provider: Option<IntegrationProvider>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let claude_dir = crate::learning::learned_rules_dir_for_scope(&[IntegrationProvider::Claude]);
+    let codex_dir = crate::learning::learned_rules_dir_for_scope(&[IntegrationProvider::Codex]);
+    let shared_dir = crate::learning::learned_rules_dir_for_scope(&[
+        IntegrationProvider::Claude,
+        IntegrationProvider::Codex,
+    ]);
+
+    match provider {
+        Some(IntegrationProvider::Claude) => {
+            push_unique_dir(&mut dirs, claude_dir);
+            push_unique_dir(&mut dirs, shared_dir);
+        }
+        Some(IntegrationProvider::Codex) => {
+            push_unique_dir(&mut dirs, codex_dir);
+            push_unique_dir(&mut dirs, shared_dir);
+        }
+        None => {
+            push_unique_dir(&mut dirs, claude_dir);
+            push_unique_dir(&mut dirs, codex_dir);
+            push_unique_dir(&mut dirs, shared_dir);
+        }
+    }
+
+    dirs
+}
+
+fn learned_rule_dirs_for_scope(provider_scope: &[IntegrationProvider]) -> Vec<PathBuf> {
+    let scope = normalized_provider_scope(provider_scope);
+    match scope.as_slice() {
+        [IntegrationProvider::Claude] => learned_rule_dirs(Some(IntegrationProvider::Claude)),
+        [IntegrationProvider::Codex] => learned_rule_dirs(Some(IntegrationProvider::Codex)),
+        _ => learned_rule_dirs(None),
+    }
+}
+
+fn inferred_rule_provider_scope(path: &std::path::Path) -> Vec<IntegrationProvider> {
+    let shared_dir = crate::learning::learned_rules_dir_for_scope(&[
+        IntegrationProvider::Claude,
+        IntegrationProvider::Codex,
+    ]);
+    if path.starts_with(&shared_dir) {
+        return vec![IntegrationProvider::Claude, IntegrationProvider::Codex];
+    }
+
+    let codex_dir = crate::learning::learned_rules_dir_for_scope(&[IntegrationProvider::Codex]);
+    if path.starts_with(&codex_dir) {
+        return vec![IntegrationProvider::Codex];
+    }
+
+    vec![IntegrationProvider::Claude]
+}
+
 fn range_to_duration(range: &str) -> TimeDelta {
     match range {
         "1h" => TimeDelta::hours(1),
@@ -130,6 +287,55 @@ fn range_to_duration(range: &str) -> TimeDelta {
         "30d" => TimeDelta::days(30),
         _ => TimeDelta::hours(24),
     }
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
+        .is_ok()
+}
+
+fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
+    let conditional_indexes = [
+        (
+            table_has_column(conn, "usage_snapshots", "provider")
+                && table_has_column(conn, "usage_snapshots", "bucket_key"),
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_provider_bucket ON usage_snapshots(provider, bucket_key);
+             CREATE INDEX IF NOT EXISTS idx_snapshots_ts_provider_bucket ON usage_snapshots(timestamp, provider, bucket_key);",
+            "usage snapshot provider indexes",
+        ),
+        (
+            table_has_column(conn, "usage_hourly", "provider")
+                && table_has_column(conn, "usage_hourly", "bucket_key"),
+            "CREATE INDEX IF NOT EXISTS idx_hourly_provider_bucket ON usage_hourly(provider, bucket_key);",
+            "usage hourly provider indexes",
+        ),
+        (
+            table_has_column(conn, "token_snapshots", "provider"),
+            "CREATE INDEX IF NOT EXISTS idx_token_snap_provider_ts ON token_snapshots(provider, timestamp);
+             CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_ts ON token_snapshots(provider, session_id, timestamp DESC);
+             CREATE INDEX IF NOT EXISTS idx_token_snap_provider_cwd ON token_snapshots(provider, cwd, timestamp);",
+            "token snapshot provider indexes",
+        ),
+        (
+            table_has_column(conn, "token_hourly", "provider"),
+            "CREATE INDEX IF NOT EXISTS idx_token_hourly_provider_hour ON token_hourly(provider, hour);",
+            "token hourly provider indexes",
+        ),
+        (
+            table_has_column(conn, "observations", "provider"),
+            "CREATE INDEX IF NOT EXISTS idx_obs_provider_created ON observations(provider, created_at);",
+            "observation provider indexes",
+        ),
+    ];
+
+    for (enabled, sql, label) in conditional_indexes {
+        if enabled {
+            conn.execute_batch(sql)
+                .map_err(|e| format!("Failed to create {label}: {e}"))?;
+        }
+    }
+
+    Ok(())
 }
 
 pub struct Storage {
@@ -151,33 +357,35 @@ impl Storage {
             .map_err(|e| format!("Failed to set pragmas: {e}"))?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS usage_snapshots (
+            r#"CREATE TABLE IF NOT EXISTS usage_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'claude',
+                bucket_key TEXT NOT NULL,
                 bucket_label TEXT NOT NULL,
                 utilization REAL NOT NULL,
                 resets_at TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON usage_snapshots(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_snapshots_bucket ON usage_snapshots(bucket_label);
-            CREATE INDEX IF NOT EXISTS idx_snapshots_ts_bucket ON usage_snapshots(timestamp, bucket_label);
 
             CREATE TABLE IF NOT EXISTS usage_hourly (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hour TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'claude',
+                bucket_key TEXT NOT NULL,
                 bucket_label TEXT NOT NULL,
                 avg_utilization REAL NOT NULL,
                 max_utilization REAL NOT NULL,
                 min_utilization REAL NOT NULL,
                 sample_count INTEGER NOT NULL,
-                UNIQUE(hour, bucket_label)
+                UNIQUE(hour, provider, bucket_key)
             );
             CREATE INDEX IF NOT EXISTS idx_hourly_hour ON usage_hourly(hour);
-            CREATE INDEX IF NOT EXISTS idx_hourly_bucket ON usage_hourly(bucket_label);
 
             CREATE TABLE IF NOT EXISTS token_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL DEFAULT 'claude',
                 session_id TEXT NOT NULL,
                 hostname TEXT NOT NULL DEFAULT 'local',
                 timestamp TEXT NOT NULL,
@@ -196,13 +404,14 @@ impl Storage {
             CREATE TABLE IF NOT EXISTS token_hourly (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hour TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT 'claude',
                 hostname TEXT NOT NULL DEFAULT 'local',
                 total_input INTEGER NOT NULL,
                 total_output INTEGER NOT NULL,
                 total_cache_creation INTEGER NOT NULL DEFAULT 0,
                 total_cache_read INTEGER NOT NULL DEFAULT 0,
                 turn_count INTEGER NOT NULL,
-                UNIQUE(hour, hostname)
+                UNIQUE(hour, hostname, provider)
             );
             CREATE INDEX IF NOT EXISTS idx_token_hourly_hour ON token_hourly(hour);
 
@@ -214,6 +423,7 @@ impl Storage {
             -- Learning system tables
             CREATE TABLE IF NOT EXISTS observations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL DEFAULT 'claude',
                 session_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 hook_phase TEXT NOT NULL,
@@ -236,6 +446,7 @@ impl Storage {
                 duration_ms INTEGER,
                 status TEXT NOT NULL DEFAULT 'running',
                 error TEXT,
+                provider_scope TEXT NOT NULL DEFAULT '["claude"]',
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
@@ -246,9 +457,10 @@ impl Storage {
                 confidence REAL NOT NULL DEFAULT 0.5,
                 observation_count INTEGER NOT NULL DEFAULT 0,
                 file_path TEXT NOT NULL,
+                provider_scope TEXT NOT NULL DEFAULT '["claude"]',
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
-            );",
+            );"#,
         )
         .map_err(|e| format!("Failed to create tables: {e}"))?;
 
@@ -340,14 +552,16 @@ impl Storage {
                 "CREATE TABLE IF NOT EXISTS observation_summaries (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     period TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT 'claude',
                     project TEXT,
                     tool_counts TEXT NOT NULL,
                     error_count INTEGER NOT NULL DEFAULT 0,
                     total_observations INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT DEFAULT (datetime('now')),
-                    UNIQUE(period, project)
+                    UNIQUE(period, provider, project)
                 );
-                CREATE INDEX IF NOT EXISTS idx_obs_summaries_period ON observation_summaries(period);",
+                CREATE INDEX IF NOT EXISTS idx_obs_summaries_period ON observation_summaries(period);
+                CREATE INDEX IF NOT EXISTS idx_obs_summaries_provider_period ON observation_summaries(provider, period);",
             )
             .map_err(|e| format!("Migration 4 (observation_summaries) error: {e}"))?;
 
@@ -360,6 +574,7 @@ impl Storage {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS tool_actions (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider      TEXT NOT NULL DEFAULT 'claude',
                     message_id    TEXT NOT NULL,
                     session_id    TEXT NOT NULL,
                     tool_name     TEXT NOT NULL,
@@ -370,6 +585,7 @@ impl Storage {
                     full_output   TEXT,
                     timestamp     TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session ON tool_actions(provider, session_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_actions_session  ON tool_actions(session_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_actions_message  ON tool_actions(message_id);
                 CREATE INDEX IF NOT EXISTS idx_tool_actions_file     ON tool_actions(file_path);
@@ -397,6 +613,7 @@ impl Storage {
                 CREATE TABLE IF NOT EXISTS optimization_runs (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_path        TEXT NOT NULL,
+                    provider_scope      TEXT NOT NULL DEFAULT '[\"claude\"]',
                     trigger             TEXT NOT NULL,
                     memories_scanned    INTEGER NOT NULL DEFAULT 0,
                     suggestions_created INTEGER NOT NULL DEFAULT 0,
@@ -412,6 +629,7 @@ impl Storage {
                     id               INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_id           INTEGER NOT NULL REFERENCES optimization_runs(id),
                     project_path     TEXT NOT NULL,
+                    provider_scope   TEXT NOT NULL DEFAULT '[\"claude\"]',
                     action_type      TEXT NOT NULL,
                     target_file      TEXT,
                     reasoning        TEXT NOT NULL,
@@ -530,13 +748,15 @@ impl Storage {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS response_times (
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider     TEXT NOT NULL DEFAULT 'claude',
                     session_id   TEXT NOT NULL,
                     timestamp    TEXT NOT NULL,
                     response_secs REAL,
                     idle_secs    REAL,
                     created_at   TEXT DEFAULT (datetime('now')),
-                    UNIQUE(session_id, timestamp)
+                    UNIQUE(provider, session_id, timestamp)
                 );
+                CREATE INDEX IF NOT EXISTS idx_rt_provider_session ON response_times(provider, session_id);
                 CREATE INDEX IF NOT EXISTS idx_rt_session ON response_times(session_id);
                 CREATE INDEX IF NOT EXISTS idx_rt_timestamp ON response_times(timestamp);",
             )
@@ -559,6 +779,264 @@ impl Storage {
             conn.execute("INSERT INTO schema_version (version) VALUES (11)", [])
                 .map_err(|e| format!("Failed to record migration 11: {e}"))?;
         }
+
+        if current_version < 12 {
+            let has_token_provider: bool = conn
+                .prepare("SELECT provider FROM token_snapshots LIMIT 0")
+                .is_ok();
+            if !has_token_provider {
+                conn.execute_batch(
+                    "ALTER TABLE token_snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude';
+                     CREATE INDEX IF NOT EXISTS idx_token_snap_provider_ts ON token_snapshots(provider, timestamp);
+                     CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_ts ON token_snapshots(provider, session_id, timestamp DESC);
+                     CREATE INDEX IF NOT EXISTS idx_token_snap_provider_cwd ON token_snapshots(provider, cwd, timestamp);",
+                )
+                .map_err(|e| format!("Migration 12 (token_snapshots provider): {e}"))?;
+            }
+
+            let has_token_hourly_provider: bool = conn
+                .prepare("SELECT provider FROM token_hourly LIMIT 0")
+                .is_ok();
+            if !has_token_hourly_provider {
+                conn.execute_batch(
+                    "ALTER TABLE token_hourly RENAME TO token_hourly_legacy;
+                     CREATE TABLE token_hourly (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         hour TEXT NOT NULL,
+                         provider TEXT NOT NULL DEFAULT 'claude',
+                         hostname TEXT NOT NULL DEFAULT 'local',
+                         total_input INTEGER NOT NULL,
+                         total_output INTEGER NOT NULL,
+                         total_cache_creation INTEGER NOT NULL DEFAULT 0,
+                         total_cache_read INTEGER NOT NULL DEFAULT 0,
+                         turn_count INTEGER NOT NULL,
+                         UNIQUE(hour, hostname, provider)
+                     );
+                     INSERT INTO token_hourly (hour, provider, hostname, total_input, total_output, total_cache_creation, total_cache_read, turn_count)
+                     SELECT hour, 'claude', hostname, total_input, total_output, total_cache_creation, total_cache_read, turn_count
+                     FROM token_hourly_legacy;
+                     DROP TABLE token_hourly_legacy;
+                     CREATE INDEX IF NOT EXISTS idx_token_hourly_hour ON token_hourly(hour);
+                     CREATE INDEX IF NOT EXISTS idx_token_hourly_provider_hour ON token_hourly(provider, hour);",
+                )
+                .map_err(|e| format!("Migration 12 (token_hourly provider): {e}"))?;
+            }
+
+            let has_obs_provider: bool = conn
+                .prepare("SELECT provider FROM observations LIMIT 0")
+                .is_ok();
+            if !has_obs_provider {
+                conn.execute_batch(
+                    "ALTER TABLE observations ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude';
+                     CREATE INDEX IF NOT EXISTS idx_obs_provider_created ON observations(provider, created_at);",
+                )
+                .map_err(|e| format!("Migration 12 (observations provider): {e}"))?;
+            }
+
+            let has_obs_summaries_table: bool = conn
+                .prepare("SELECT 1 FROM observation_summaries LIMIT 0")
+                .is_ok();
+            let has_obs_summary_provider = has_obs_summaries_table
+                && conn
+                    .prepare("SELECT provider FROM observation_summaries LIMIT 0")
+                    .is_ok();
+            if has_obs_summaries_table && !has_obs_summary_provider {
+                conn.execute_batch(
+                    "ALTER TABLE observation_summaries RENAME TO observation_summaries_legacy;
+                     CREATE TABLE observation_summaries (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         period TEXT NOT NULL,
+                         provider TEXT NOT NULL DEFAULT 'claude',
+                         project TEXT,
+                         tool_counts TEXT NOT NULL,
+                         error_count INTEGER NOT NULL DEFAULT 0,
+                         total_observations INTEGER NOT NULL DEFAULT 0,
+                         created_at TEXT DEFAULT (datetime('now')),
+                         UNIQUE(period, provider, project)
+                     );
+                     INSERT INTO observation_summaries (period, provider, project, tool_counts, error_count, total_observations, created_at)
+                     SELECT period, 'claude', project, tool_counts, error_count, total_observations, created_at
+                     FROM observation_summaries_legacy;
+                     DROP TABLE observation_summaries_legacy;
+                     CREATE INDEX IF NOT EXISTS idx_obs_summaries_period ON observation_summaries(period);
+                     CREATE INDEX IF NOT EXISTS idx_obs_summaries_provider_period ON observation_summaries(provider, period);",
+                )
+                .map_err(|e| format!("Migration 12 (observation_summaries provider): {e}"))?;
+            }
+
+            let has_tool_provider: bool = conn
+                .prepare("SELECT provider FROM tool_actions LIMIT 0")
+                .is_ok();
+            if !has_tool_provider {
+                conn.execute_batch(
+                    "ALTER TABLE tool_actions ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude';
+                     CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session ON tool_actions(provider, session_id);",
+                )
+                .map_err(|e| format!("Migration 12 (tool_actions provider): {e}"))?;
+            }
+
+            let has_response_provider: bool = conn
+                .prepare("SELECT provider FROM response_times LIMIT 0")
+                .is_ok();
+            if !has_response_provider {
+                conn.execute_batch(
+                    "ALTER TABLE response_times RENAME TO response_times_legacy;
+                     CREATE TABLE response_times (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         provider TEXT NOT NULL DEFAULT 'claude',
+                         session_id TEXT NOT NULL,
+                         timestamp TEXT NOT NULL,
+                         response_secs REAL,
+                         idle_secs REAL,
+                         created_at TEXT DEFAULT (datetime('now')),
+                         UNIQUE(provider, session_id, timestamp)
+                     );
+                     INSERT INTO response_times (provider, session_id, timestamp, response_secs, idle_secs, created_at)
+                     SELECT 'claude', session_id, timestamp, response_secs, idle_secs, created_at
+                     FROM response_times_legacy;
+                     DROP TABLE response_times_legacy;
+                     CREATE INDEX IF NOT EXISTS idx_rt_provider_session ON response_times(provider, session_id);
+                     CREATE INDEX IF NOT EXISTS idx_rt_session ON response_times(session_id);
+                     CREATE INDEX IF NOT EXISTS idx_rt_timestamp ON response_times(timestamp);",
+                )
+                .map_err(|e| format!("Migration 12 (response_times provider): {e}"))?;
+            }
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (12)", [])
+                .map_err(|e| format!("Failed to record migration 12: {e}"))?;
+        }
+
+        if current_version < 13 {
+            let migration_checks = [
+                (
+                    "SELECT provider_scope FROM learning_runs LIMIT 0",
+                    "ALTER TABLE learning_runs ADD COLUMN provider_scope TEXT NOT NULL DEFAULT '[\"claude\"]';",
+                    "learning_runs provider_scope",
+                ),
+                (
+                    "SELECT provider_scope FROM learned_rules LIMIT 0",
+                    "ALTER TABLE learned_rules ADD COLUMN provider_scope TEXT NOT NULL DEFAULT '[\"claude\"]';",
+                    "learned_rules provider_scope",
+                ),
+                (
+                    "SELECT provider_scope FROM optimization_runs LIMIT 0",
+                    "ALTER TABLE optimization_runs ADD COLUMN provider_scope TEXT NOT NULL DEFAULT '[\"claude\"]';",
+                    "optimization_runs provider_scope",
+                ),
+                (
+                    "SELECT provider_scope FROM optimization_suggestions LIMIT 0",
+                    "ALTER TABLE optimization_suggestions ADD COLUMN provider_scope TEXT NOT NULL DEFAULT '[\"claude\"]';",
+                    "optimization_suggestions provider_scope",
+                ),
+            ];
+
+            for (check_sql, migrate_sql, label) in migration_checks {
+                let has_column = conn.prepare(check_sql).is_ok();
+                if !has_column {
+                    conn.execute_batch(migrate_sql)
+                        .map_err(|e| format!("Migration 13 ({label}): {e}"))?;
+                }
+            }
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (13)", [])
+                .map_err(|e| format!("Failed to record migration 13: {e}"))?;
+        }
+
+        if current_version < 14 {
+            let bucket_key_case = "CASE bucket_label
+                WHEN '5 hours' THEN 'five_hour'
+                WHEN '7 days' THEN 'seven_day'
+                WHEN 'Sonnet' THEN 'seven_day_sonnet'
+                WHEN 'Opus' THEN 'seven_day_opus'
+                WHEN 'Code' THEN 'seven_day_cowork'
+                WHEN 'OAuth' THEN 'seven_day_oauth_apps'
+                WHEN 'Extra' THEN 'extra_usage'
+                ELSE lower(replace(bucket_label, ' ', '_'))
+            END";
+
+            let usage_snapshots_has_provider = conn
+                .prepare("SELECT provider FROM usage_snapshots LIMIT 0")
+                .is_ok();
+            let usage_snapshots_has_bucket_key = conn
+                .prepare("SELECT bucket_key FROM usage_snapshots LIMIT 0")
+                .is_ok();
+            if !usage_snapshots_has_provider || !usage_snapshots_has_bucket_key {
+                let migrate_sql = format!(
+                    "ALTER TABLE usage_snapshots RENAME TO usage_snapshots_legacy;
+                     CREATE TABLE usage_snapshots (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         timestamp TEXT NOT NULL,
+                         provider TEXT NOT NULL DEFAULT 'claude',
+                         bucket_key TEXT NOT NULL,
+                         bucket_label TEXT NOT NULL,
+                         utilization REAL NOT NULL,
+                         resets_at TEXT,
+                         created_at TEXT DEFAULT (datetime('now'))
+                     );
+                     INSERT INTO usage_snapshots (timestamp, provider, bucket_key, bucket_label, utilization, resets_at, created_at)
+                     SELECT
+                         timestamp,
+                         'claude',
+                         {bucket_key_case},
+                         bucket_label,
+                         utilization,
+                         resets_at,
+                         created_at
+                     FROM usage_snapshots_legacy;
+                     DROP TABLE usage_snapshots_legacy;
+                     CREATE INDEX IF NOT EXISTS idx_snapshots_timestamp ON usage_snapshots(timestamp);
+                     CREATE INDEX IF NOT EXISTS idx_snapshots_provider_bucket ON usage_snapshots(provider, bucket_key);
+                     CREATE INDEX IF NOT EXISTS idx_snapshots_ts_provider_bucket ON usage_snapshots(timestamp, provider, bucket_key);"
+                );
+                conn.execute_batch(&migrate_sql)
+                    .map_err(|e| format!("Migration 14 (usage_snapshots): {e}"))?;
+            }
+
+            let usage_hourly_has_provider = conn
+                .prepare("SELECT provider FROM usage_hourly LIMIT 0")
+                .is_ok();
+            let usage_hourly_has_bucket_key = conn
+                .prepare("SELECT bucket_key FROM usage_hourly LIMIT 0")
+                .is_ok();
+            if !usage_hourly_has_provider || !usage_hourly_has_bucket_key {
+                let migrate_sql = format!(
+                    "ALTER TABLE usage_hourly RENAME TO usage_hourly_legacy;
+                     CREATE TABLE usage_hourly (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         hour TEXT NOT NULL,
+                         provider TEXT NOT NULL DEFAULT 'claude',
+                         bucket_key TEXT NOT NULL,
+                         bucket_label TEXT NOT NULL,
+                         avg_utilization REAL NOT NULL,
+                         max_utilization REAL NOT NULL,
+                         min_utilization REAL NOT NULL,
+                         sample_count INTEGER NOT NULL,
+                         UNIQUE(hour, provider, bucket_key)
+                     );
+                     INSERT INTO usage_hourly (hour, provider, bucket_key, bucket_label, avg_utilization, max_utilization, min_utilization, sample_count)
+                     SELECT
+                         hour,
+                         'claude',
+                         {bucket_key_case},
+                         bucket_label,
+                         avg_utilization,
+                         max_utilization,
+                         min_utilization,
+                         sample_count
+                     FROM usage_hourly_legacy;
+                     DROP TABLE usage_hourly_legacy;
+                     CREATE INDEX IF NOT EXISTS idx_hourly_hour ON usage_hourly(hour);
+                     CREATE INDEX IF NOT EXISTS idx_hourly_provider_bucket ON usage_hourly(provider, bucket_key);"
+                );
+                conn.execute_batch(&migrate_sql)
+                    .map_err(|e| format!("Migration 14 (usage_hourly): {e}"))?;
+            }
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (14)", [])
+                .map_err(|e| format!("Failed to record migration 14: {e}"))?;
+        }
+
+        ensure_startup_indexes(&conn)?;
 
         let storage = Self {
             conn: Mutex::new(conn),
@@ -589,13 +1067,16 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO usage_snapshots (timestamp, bucket_label, utilization, resets_at) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO usage_snapshots (timestamp, provider, bucket_key, bucket_label, utilization, resets_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
             for bucket in buckets {
                 stmt.execute(params![
                     now,
+                    bucket.provider.as_str(),
+                    bucket.key,
                     bucket.label,
                     bucket.utilization,
                     bucket.resets_at
@@ -617,9 +1098,11 @@ impl Storage {
             .map_err(|e| format!("Transaction error: {e}"))?;
 
         tx.execute(
-            "INSERT INTO usage_hourly (hour, bucket_label, avg_utilization, max_utilization, min_utilization, sample_count)
+            "INSERT INTO usage_hourly (hour, provider, bucket_key, bucket_label, avg_utilization, max_utilization, min_utilization, sample_count)
              SELECT
                  strftime('%Y-%m-%dT%H:00:00Z', timestamp) as hour,
+                 provider,
+                 bucket_key,
                  bucket_label,
                  AVG(utilization),
                  MAX(utilization),
@@ -627,8 +1110,8 @@ impl Storage {
                  COUNT(*)
              FROM usage_snapshots
              WHERE timestamp < ?1
-             GROUP BY hour, bucket_label
-             ON CONFLICT(hour, bucket_label) DO UPDATE SET
+             GROUP BY hour, provider, bucket_key, bucket_label
+             ON CONFLICT(hour, provider, bucket_key) DO UPDATE SET
                  avg_utilization = (usage_hourly.avg_utilization * usage_hourly.sample_count + excluded.avg_utilization * excluded.sample_count)
                      / (usage_hourly.sample_count + excluded.sample_count),
                  max_utilization = MAX(usage_hourly.max_utilization, excluded.max_utilization),
@@ -649,7 +1132,12 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_usage_history(&self, bucket: &str, range: &str) -> Result<Vec<DataPoint>, String> {
+    pub fn get_usage_history(
+        &self,
+        provider: IntegrationProvider,
+        bucket_key: &str,
+        range: &str,
+    ) -> Result<Vec<DataPoint>, String> {
         let conn = self.conn.lock();
         let now = Utc::now();
 
@@ -672,13 +1160,13 @@ impl Storage {
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT hour, avg_utilization FROM usage_hourly
-                     WHERE bucket_label = ?1 AND hour >= ?2
+                     WHERE provider = ?1 AND bucket_key = ?2 AND hour >= ?3
                      ORDER BY hour ASC",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
             let hourly_rows = stmt
-                .query_map(params![bucket, from_hour], |row| {
+                .query_map(params![provider.as_str(), bucket_key, from_hour], |row| {
                     Ok(DataPoint {
                         timestamp: row.get(0)?,
                         utilization: row.get(1)?,
@@ -694,13 +1182,13 @@ impl Storage {
             let mut stmt2 = conn
                 .prepare_cached(
                     "SELECT timestamp, utilization FROM usage_snapshots
-                     WHERE bucket_label = ?1 AND timestamp >= ?2
+                     WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3
                      ORDER BY timestamp ASC",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
             let snap_rows = stmt2
-                .query_map(params![bucket, from_str], |row| {
+                .query_map(params![provider.as_str(), bucket_key, from_str], |row| {
                     Ok(DataPoint {
                         timestamp: row.get(0)?,
                         utilization: row.get(1)?,
@@ -718,13 +1206,13 @@ impl Storage {
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT timestamp, utilization FROM usage_snapshots
-                     WHERE bucket_label = ?1 AND timestamp >= ?2
+                     WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3
                      ORDER BY timestamp ASC",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
             let rows = stmt
-                .query_map(params![bucket, from_str], |row| {
+                .query_map(params![provider.as_str(), bucket_key, from_str], |row| {
                     Ok(DataPoint {
                         timestamp: row.get(0)?,
                         utilization: row.get(1)?,
@@ -747,14 +1235,20 @@ impl Storage {
         }
     }
 
-    pub fn get_usage_stats(&self, bucket: &str, days: i32) -> Result<BucketStats, String> {
+    pub fn get_usage_stats(
+        &self,
+        provider: IntegrationProvider,
+        bucket_key: &str,
+        days: i32,
+    ) -> Result<BucketStats, String> {
         let conn = self.conn.lock();
-        Self::get_usage_stats_with_conn(&conn, bucket, days)
+        Self::get_usage_stats_with_conn(&conn, provider, bucket_key, days)
     }
 
     fn get_usage_stats_with_conn(
         conn: &Connection,
-        bucket: &str,
+        provider: IntegrationProvider,
+        bucket_key: &str,
         days: i32,
     ) -> Result<BucketStats, String> {
         let days = days.clamp(1, 365);
@@ -763,32 +1257,38 @@ impl Storage {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT
+                     MIN(bucket_label),
                      AVG(utilization),
                      MAX(utilization),
                      MIN(utilization),
                      COUNT(*),
                      (SELECT COUNT(*) FROM usage_snapshots
-                      WHERE bucket_label = ?1 AND timestamp >= ?2 AND utilization >= 80.0)
+                      WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3 AND utilization >= 80.0)
                  FROM usage_snapshots
-                 WHERE bucket_label = ?1 AND timestamp >= ?2",
+                 WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3",
             )
             .map_err(|e| format!("Prepare error: {e}"))?;
 
         let stats = stmt
-            .query_row(params![bucket, from], |row| {
-                let total: i64 = row.get(3)?;
-                let above_80: i64 = row.get(4)?;
+            .query_row(params![provider.as_str(), bucket_key, from], |row| {
+                let label = row
+                    .get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| bucket_key.to_string());
+                let total: i64 = row.get(4)?;
+                let above_80: i64 = row.get(5)?;
                 let pct_above_80 = if total > 0 {
                     (above_80 as f64 / total as f64) * 100.0
                 } else {
                     0.0
                 };
                 Ok(BucketStats {
-                    label: bucket.to_string(),
+                    provider,
+                    key: bucket_key.to_string(),
+                    label,
                     current: 0.0, // filled in by caller
-                    avg: row.get::<_, Option<f64>>(0)?.unwrap_or(0.0),
-                    max: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                    min: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    avg: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                    max: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                    min: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
                     time_above_80: pct_above_80,
                     trend: String::new(), // filled in below
                     sample_count: total,
@@ -796,7 +1296,7 @@ impl Storage {
             })
             .map_err(|e| format!("Query error: {e}"))?;
 
-        let trend = calc_trend(conn, bucket)?;
+        let trend = calc_trend(conn, provider, bucket_key)?;
 
         Ok(BucketStats { trend, ..stats })
     }
@@ -809,11 +1309,53 @@ impl Storage {
         let conn = self.conn.lock();
         let mut results = Vec::new();
         for bucket in current_buckets {
-            let mut stats = Self::get_usage_stats_with_conn(&conn, &bucket.label, days)?;
+            let mut stats =
+                Self::get_usage_stats_with_conn(&conn, bucket.provider, &bucket.key, days)?;
             stats.current = bucket.utilization;
             results.push(stats);
         }
         Ok(results)
+    }
+
+    pub fn get_latest_usage_buckets(
+        &self,
+        provider: IntegrationProvider,
+    ) -> Result<Vec<UsageBucket>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT bucket_key, bucket_label, utilization, resets_at
+                 FROM usage_snapshots snapshot
+                 WHERE snapshot.provider = ?1
+                   AND snapshot.timestamp = (
+                       SELECT MAX(inner_snapshot.timestamp)
+                       FROM usage_snapshots inner_snapshot
+                       WHERE inner_snapshot.provider = snapshot.provider
+                         AND inner_snapshot.bucket_key = snapshot.bucket_key
+                   )
+                 ORDER BY
+                     CASE snapshot.provider WHEN 'claude' THEN 0 ELSE 1 END,
+                     snapshot.bucket_label ASC",
+            )
+            .map_err(|e| format!("Prepare error: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![provider.as_str()], |row| {
+                Ok(UsageBucket {
+                    provider,
+                    key: row.get(0)?,
+                    label: row.get(1)?,
+                    utilization: row.get(2)?,
+                    resets_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        let mut buckets = Vec::new();
+        for row in rows {
+            buckets.push(row.map_err(|e| format!("Row error: {e}"))?);
+        }
+        Ok(buckets)
     }
 
     pub fn get_snapshot_count(&self) -> Result<i64, String> {
@@ -827,9 +1369,10 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT INTO token_snapshots (session_id, hostname, timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cwd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
+                payload.provider.as_str(),
                 payload.session_id,
                 payload.hostname,
                 now,
@@ -848,6 +1391,7 @@ impl Storage {
     pub fn get_token_history(
         &self,
         range: &str,
+        provider: Option<IntegrationProvider>,
         hostname: Option<&str>,
         session_id: Option<&str>,
         cwd: Option<&str>,
@@ -874,23 +1418,46 @@ impl Storage {
             let from_hour = from.format("%Y-%m-%dT%H:00:00Z").to_string();
 
             let (hourly_sql, hourly_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-                if let Some(host) = hostname {
-                    (
-                        "SELECT hour, total_input, total_output, total_cache_creation, total_cache_read
+                match (provider, hostname) {
+                    (Some(provider), Some(host)) => (
+                        "SELECT hour, SUM(total_input), SUM(total_output), SUM(total_cache_creation), SUM(total_cache_read)
+                         FROM token_hourly
+                         WHERE hour >= ?1 AND provider = ?2 AND hostname = ?3
+                         GROUP BY hour
+                         ORDER BY hour ASC".to_string(),
+                        vec![
+                            Box::new(from_hour.clone()),
+                            Box::new(provider.as_str().to_string()),
+                            Box::new(host.to_string()),
+                        ],
+                    ),
+                    (Some(provider), None) => (
+                        "SELECT hour, SUM(total_input), SUM(total_output), SUM(total_cache_creation), SUM(total_cache_read)
+                         FROM token_hourly
+                         WHERE hour >= ?1 AND provider = ?2
+                         GROUP BY hour
+                         ORDER BY hour ASC".to_string(),
+                        vec![
+                            Box::new(from_hour.clone()),
+                            Box::new(provider.as_str().to_string()),
+                        ],
+                    ),
+                    (None, Some(host)) => (
+                        "SELECT hour, SUM(total_input), SUM(total_output), SUM(total_cache_creation), SUM(total_cache_read)
                          FROM token_hourly
                          WHERE hour >= ?1 AND hostname = ?2
+                         GROUP BY hour
                          ORDER BY hour ASC".to_string(),
                         vec![Box::new(from_hour.clone()), Box::new(host.to_string())],
-                    )
-                } else {
-                    (
+                    ),
+                    (None, None) => (
                         "SELECT hour, SUM(total_input), SUM(total_output), SUM(total_cache_creation), SUM(total_cache_read)
                          FROM token_hourly
                          WHERE hour >= ?1
                          GROUP BY hour
                          ORDER BY hour ASC".to_string(),
                         vec![Box::new(from_hour.clone())],
-                    )
+                    ),
                 };
 
             let mut stmt = conn
@@ -923,43 +1490,32 @@ impl Storage {
         }
 
         // Append granular snapshots
-        let (snap_sql, snap_params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(
-            sid,
-        ) =
-            session_id
-        {
-            (
-                    "SELECT timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1 AND session_id = ?2
-                     ORDER BY timestamp ASC".to_string(),
-                    vec![Box::new(from_str.clone()), Box::new(sid.to_string())],
-                )
+        let mut snap_sql = String::from(
+            "SELECT timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
+             FROM token_snapshots
+             WHERE timestamp >= ?1",
+        );
+        let mut snap_params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(from_str.clone())];
+        let mut next_param = 2;
+
+        if let Some(provider) = provider {
+            snap_sql.push_str(&format!(" AND provider = ?{next_param}"));
+            snap_params.push(Box::new(provider.as_str().to_string()));
+            next_param += 1;
+        }
+
+        if let Some(sid) = session_id {
+            snap_sql.push_str(&format!(" AND session_id = ?{next_param}"));
+            snap_params.push(Box::new(sid.to_string()));
         } else if let Some(project) = cwd {
-            (
-                    "SELECT timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1 AND cwd = ?2
-                     ORDER BY timestamp ASC".to_string(),
-                    vec![Box::new(from_str.clone()), Box::new(project.to_string())],
-                )
+            snap_sql.push_str(&format!(" AND cwd = ?{next_param}"));
+            snap_params.push(Box::new(project.to_string()));
         } else if let Some(host) = hostname {
-            (
-                    "SELECT timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1 AND hostname = ?2
-                     ORDER BY timestamp ASC".to_string(),
-                    vec![Box::new(from_str.clone()), Box::new(host.to_string())],
-                )
-        } else {
-            (
-                    "SELECT timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1
-                     ORDER BY timestamp ASC".to_string(),
-                    vec![Box::new(from_str.clone())],
-                )
-        };
+            snap_sql.push_str(&format!(" AND hostname = ?{next_param}"));
+            snap_params.push(Box::new(host.to_string()));
+        }
+        snap_sql.push_str(" ORDER BY timestamp ASC");
 
         let mut stmt2 = conn
             .prepare(&snap_sql)
@@ -1002,54 +1558,44 @@ impl Storage {
     pub fn get_token_stats(
         &self,
         days: i32,
+        provider: Option<IntegrationProvider>,
         hostname: Option<&str>,
+        session_id: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<TokenStats, String> {
         let days = days.clamp(1, 365);
         let conn = self.conn.lock();
         let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
 
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(project) = cwd {
-                (
-                    "SELECT
-                         COALESCE(SUM(input_tokens), 0),
-                         COALESCE(SUM(output_tokens), 0),
-                         COALESCE(SUM(cache_creation_input_tokens), 0),
-                         COALESCE(SUM(cache_read_input_tokens), 0),
-                         COUNT(*)
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1 AND cwd = ?2"
-                        .to_string(),
-                    vec![Box::new(from), Box::new(project.to_string())],
-                )
-            } else if let Some(host) = hostname {
-                (
-                    "SELECT
-                         COALESCE(SUM(input_tokens), 0),
-                         COALESCE(SUM(output_tokens), 0),
-                         COALESCE(SUM(cache_creation_input_tokens), 0),
-                         COALESCE(SUM(cache_read_input_tokens), 0),
-                         COUNT(*)
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1 AND hostname = ?2"
-                        .to_string(),
-                    vec![Box::new(from), Box::new(host.to_string())],
-                )
-            } else {
-                (
-                    "SELECT
-                         COALESCE(SUM(input_tokens), 0),
-                         COALESCE(SUM(output_tokens), 0),
-                         COALESCE(SUM(cache_creation_input_tokens), 0),
-                         COALESCE(SUM(cache_read_input_tokens), 0),
-                         COUNT(*)
-                     FROM token_snapshots
-                     WHERE timestamp >= ?1"
-                        .to_string(),
-                    vec![Box::new(from)],
-                )
-            };
+        let mut sql = String::from(
+            "SELECT
+                 COALESCE(SUM(input_tokens), 0),
+                 COALESCE(SUM(output_tokens), 0),
+                 COALESCE(SUM(cache_creation_input_tokens), 0),
+                 COALESCE(SUM(cache_read_input_tokens), 0),
+                 COUNT(*)
+             FROM token_snapshots
+             WHERE timestamp >= ?1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from)];
+        let mut next_param = 2;
+
+        if let Some(provider) = provider {
+            sql.push_str(&format!(" AND provider = ?{next_param}"));
+            params_vec.push(Box::new(provider.as_str().to_string()));
+            next_param += 1;
+        }
+
+        if let Some(session_id) = session_id {
+            sql.push_str(&format!(" AND session_id = ?{next_param}"));
+            params_vec.push(Box::new(session_id.to_string()));
+        } else if let Some(project) = cwd {
+            sql.push_str(&format!(" AND cwd = ?{next_param}"));
+            params_vec.push(Box::new(project.to_string()));
+        } else if let Some(host) = hostname {
+            sql.push_str(&format!(" AND hostname = ?{next_param}"));
+            params_vec.push(Box::new(host.to_string()));
+        }
 
         let mut stmt = conn
             .prepare(&sql)
@@ -1155,7 +1701,7 @@ impl Storage {
                      hostname,
                      SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) as total_tokens,
                      COUNT(*) as turn_count,
-                     COUNT(DISTINCT session_id) as session_count,
+                     COUNT(DISTINCT provider || ':' || session_id) as session_count,
                      MAX(timestamp) as last_active
                  FROM token_snapshots
                  WHERE timestamp >= ?1 AND cwd IS NOT NULL
@@ -1192,52 +1738,47 @@ impl Storage {
         &self,
         days: i32,
         hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+        limit: Option<i32>,
     ) -> Result<Vec<SessionBreakdown>, String> {
         let days = days.clamp(1, 365);
+        let limit = limit.unwrap_or(10).clamp(1, 500);
         let conn = self.conn.lock();
         let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
 
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(host) =
-            hostname
-        {
-            (
-                    "SELECT
-                         s.session_id,
-                         s.hostname,
-                         SUM(s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens) as total_tokens,
-                         COUNT(*) as turn_count,
-                         MIN(s.timestamp) as first_seen,
-                         MAX(s.timestamp) as last_active,
-                         (SELECT t.cwd FROM token_snapshots t
-                          WHERE t.session_id = s.session_id AND t.cwd IS NOT NULL
-                          ORDER BY t.timestamp DESC LIMIT 1) as project
-                     FROM token_snapshots s
-                     WHERE s.timestamp >= ?1 AND s.hostname = ?2
-                     GROUP BY s.session_id
-                     ORDER BY last_active DESC
-                     LIMIT 10".to_string(),
-                    vec![Box::new(from), Box::new(host.to_string())],
-                )
-        } else {
-            (
-                    "SELECT
-                         s.session_id,
-                         s.hostname,
-                         SUM(s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens) as total_tokens,
-                         COUNT(*) as turn_count,
-                         MIN(s.timestamp) as first_seen,
-                         MAX(s.timestamp) as last_active,
-                         (SELECT t.cwd FROM token_snapshots t
-                          WHERE t.session_id = s.session_id AND t.cwd IS NOT NULL
-                          ORDER BY t.timestamp DESC LIMIT 1) as project
-                     FROM token_snapshots s
-                     WHERE s.timestamp >= ?1
-                     GROUP BY s.session_id
-                     ORDER BY last_active DESC
-                     LIMIT 10".to_string(),
-                    vec![Box::new(from)],
-                )
-        };
+        let mut sql = String::from(
+            "SELECT
+                 s.provider,
+                 s.session_id,
+                 s.hostname,
+                 SUM(s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens) as total_tokens,
+                 COUNT(*) as turn_count,
+                 MIN(s.timestamp) as first_seen,
+                 MAX(s.timestamp) as last_active,
+                 (SELECT t.cwd FROM token_snapshots t
+                  WHERE t.provider = s.provider AND t.session_id = s.session_id AND t.cwd IS NOT NULL
+                  ORDER BY t.timestamp DESC LIMIT 1) as project
+             FROM token_snapshots s
+             WHERE s.timestamp >= ?1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from)];
+        let hostname_param = if provider.is_some() { 3 } else { 2 };
+
+        if let Some(provider) = provider {
+            sql.push_str(" AND s.provider = ?2");
+            params_vec.push(Box::new(provider.as_str().to_string()));
+        }
+
+        if let Some(host) = hostname {
+            sql.push_str(&format!(" AND s.hostname = ?{hostname_param}"));
+            params_vec.push(Box::new(host.to_string()));
+        }
+
+        sql.push_str(
+            " GROUP BY s.provider, s.session_id, s.hostname
+              ORDER BY last_active DESC",
+        );
+        sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = conn
             .prepare(&sql)
@@ -1249,13 +1790,14 @@ impl Storage {
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
                 Ok(SessionBreakdown {
-                    session_id: row.get(0)?,
-                    hostname: row.get(1)?,
-                    total_tokens: row.get(2)?,
-                    turn_count: row.get(3)?,
-                    first_seen: row.get(4)?,
-                    last_active: row.get(5)?,
-                    project: row.get(6)?,
+                    provider: row.get(0)?,
+                    session_id: row.get(1)?,
+                    hostname: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                    turn_count: row.get(4)?,
+                    first_seen: row.get(5)?,
+                    last_active: row.get(6)?,
+                    project: row.get(7)?,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -1280,14 +1822,15 @@ impl Storage {
                     COUNT(*) as session_count
                 FROM (
                     SELECT
+                        s.provider,
                         s.session_id,
                         (SELECT t.cwd FROM token_snapshots t
-                         WHERE t.session_id = s.session_id AND t.cwd IS NOT NULL
+                         WHERE t.provider = s.provider AND t.session_id = s.session_id AND t.cwd IS NOT NULL
                          ORDER BY t.timestamp DESC LIMIT 1) as project,
                         SUM(s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens) as total_tokens
                     FROM token_snapshots s
                     WHERE s.timestamp >= ?1
-                    GROUP BY s.session_id
+                    GROUP BY s.provider, s.session_id
                 )
                 WHERE project IS NOT NULL
                 GROUP BY project
@@ -1327,12 +1870,13 @@ impl Storage {
                     SUM(total_tokens) as total_tokens
                 FROM (
                     SELECT
+                        provider,
                         session_id,
                         (strftime('%s', MAX(timestamp)) - strftime('%s', MIN(timestamp))) as duration_seconds,
                         SUM(input_tokens + output_tokens + cache_creation_input_tokens + cache_read_input_tokens) as total_tokens
                     FROM token_snapshots
                     WHERE timestamp >= ?1
-                    GROUP BY session_id
+                    GROUP BY provider, session_id
                     HAVING COUNT(*) > 1
                 )",
             )
@@ -1371,6 +1915,14 @@ impl Storage {
         Ok(())
     }
 
+    pub fn get_provider_settings_json(&self) -> Result<Option<String>, String> {
+        self.get_setting(PROVIDER_SETTINGS_KEY)
+    }
+
+    pub fn set_provider_settings_json(&self, value: &str) -> Result<(), String> {
+        self.set_setting(PROVIDER_SETTINGS_KEY, value)
+    }
+
     pub fn delete_host_data(&self, hostname: &str) -> Result<u64, String> {
         let mut conn = self.conn.lock();
 
@@ -1397,13 +1949,17 @@ impl Storage {
         Ok((snap_count + hourly_count) as u64)
     }
 
-    pub fn delete_session_data(&self, session_id: &str) -> Result<u64, String> {
+    pub fn delete_session_data(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<u64, String> {
         let conn = self.conn.lock();
 
         let count = conn
             .execute(
-                "DELETE FROM token_snapshots WHERE session_id = ?1",
-                params![session_id],
+                "DELETE FROM token_snapshots WHERE provider = ?1 AND session_id = ?2",
+                params![provider.as_str(), session_id],
             )
             .map_err(|e| format!("Delete error: {e}"))?;
 
@@ -1452,15 +2008,65 @@ impl Storage {
         Ok(snap_count as u64)
     }
 
+    pub fn get_project_provider_map(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<std::collections::HashMap<String, Vec<IntegrationProvider>>, String> {
+        let conn = self.conn.lock();
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+            Some(provider) => (
+                "SELECT provider, cwd FROM token_snapshots
+                 WHERE cwd IS NOT NULL AND provider = ?1
+                 UNION
+                 SELECT provider, cwd FROM observations
+                 WHERE cwd IS NOT NULL AND provider = ?1",
+                vec![Box::new(provider.as_str().to_string()) as Box<dyn rusqlite::types::ToSql>],
+            ),
+            None => (
+                "SELECT provider, cwd FROM token_snapshots
+                 WHERE cwd IS NOT NULL
+                 UNION
+                 SELECT provider, cwd FROM observations
+                 WHERE cwd IS NOT NULL",
+                Vec::new(),
+            ),
+        };
+        let mut stmt = conn
+            .prepare_cached(sql)
+            .map_err(|e| format!("Prepare project providers error: {e}"))?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|param| param.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Query project providers error: {e}"))?;
+
+        let mut project_providers: std::collections::HashMap<String, Vec<IntegrationProvider>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (provider_name, cwd) = row.map_err(|e| format!("Project provider row: {e}"))?;
+            let parsed_provider: IntegrationProvider = provider_name.parse()?;
+            let entry = project_providers.entry(cwd).or_default();
+            if !entry.contains(&parsed_provider) {
+                entry.push(parsed_provider);
+                entry.sort_by_key(|provider| provider.as_str());
+            }
+        }
+
+        Ok(project_providers)
+    }
+
     // --- Learning system methods ---
 
     pub fn store_observation(&self, payload: &ObservationPayload) -> Result<(), String> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO observations (session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO observations (provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
+                payload.provider.as_str(),
                 payload.session_id,
                 now,
                 payload.hook_phase,
@@ -1474,43 +2080,93 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_recent_observations(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
-        self.get_observations_since(None, limit)
+    pub fn get_recent_observations(
+        &self,
+        limit: i64,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.get_observations_since(None, limit, provider)
     }
 
     pub fn get_unanalyzed_observations(
         &self,
         limit: i64,
+        provider: Option<IntegrationProvider>,
     ) -> Result<Vec<serde_json::Value>, String> {
+        let since = self.latest_completed_learning_run_created_at(provider)?;
+        self.get_observations_since(Some(&since), limit, provider)
+    }
+
+    fn latest_completed_learning_run_created_at(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<String, String> {
         let conn = self.conn.lock();
-        let since: String = conn
-            .query_row(
-                "SELECT COALESCE(MAX(created_at), '1970-01-01') FROM learning_runs WHERE status = 'completed'",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Query last run error: {e}"))?;
-        drop(conn);
-        self.get_observations_since(Some(&since), limit)
+        match provider {
+            Some(provider) => conn
+                .query_row(
+                    "SELECT COALESCE(MAX(created_at), '1970-01-01')
+                     FROM learning_runs
+                     WHERE status = 'completed'
+                       AND instr(provider_scope, ?1) > 0",
+                    params![provider_scope_contains_json(provider)],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Query last run error: {e}")),
+            None => conn
+                .query_row(
+                    "SELECT COALESCE(MAX(created_at), '1970-01-01')
+                     FROM learning_runs
+                     WHERE status = 'completed'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Query last run error: {e}")),
+        }
     }
 
     fn get_observations_since(
         &self,
         since: Option<&str>,
         limit: i64,
+        provider: Option<IntegrationProvider>,
     ) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.conn.lock();
         let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match since {
+            Some(s) if provider.is_some() => (
+                "SELECT id, provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
+                 FROM observations
+                 WHERE created_at > ?1 AND provider = ?2
+                 ORDER BY created_at DESC
+                 LIMIT ?3",
+                vec![
+                    Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(provider.expect("provider checked above").as_str().to_string()),
+                    Box::new(limit),
+                ],
+            ),
             Some(s) => (
-                "SELECT id, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
+                "SELECT id, provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
                  FROM observations
                  WHERE created_at > ?1
                  ORDER BY created_at DESC
                  LIMIT ?2",
                 vec![Box::new(s.to_string()) as Box<dyn rusqlite::types::ToSql>, Box::new(limit)],
             ),
+            None if provider.is_some() => (
+                "SELECT id, provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
+                 FROM observations
+                 WHERE provider = ?1
+                 ORDER BY created_at DESC
+                 LIMIT ?2",
+                vec![
+                    Box::new(provider.expect("provider checked above").as_str().to_string())
+                        as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
             None => (
-                "SELECT id, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
+                "SELECT id, provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
                  FROM observations
                  ORDER BY created_at DESC
                  LIMIT ?1",
@@ -1527,14 +2183,15 @@ impl Storage {
             .query_map(param_refs.as_slice(), |row| {
                 Ok(serde_json::json!({
                     "id": row.get::<_, i64>(0)?,
-                    "session_id": row.get::<_, String>(1)?,
-                    "timestamp": row.get::<_, String>(2)?,
-                    "hook_phase": row.get::<_, String>(3)?,
-                    "tool_name": row.get::<_, String>(4)?,
-                    "tool_input": row.get::<_, Option<String>>(5)?,
-                    "tool_output": row.get::<_, Option<String>>(6)?,
-                    "cwd": row.get::<_, Option<String>>(7)?,
-                    "created_at": row.get::<_, String>(8)?,
+                    "provider": row.get::<_, String>(1)?,
+                    "session_id": row.get::<_, String>(2)?,
+                    "timestamp": row.get::<_, String>(3)?,
+                    "hook_phase": row.get::<_, String>(4)?,
+                    "tool_name": row.get::<_, String>(5)?,
+                    "tool_input": row.get::<_, Option<String>>(6)?,
+                    "tool_output": row.get::<_, Option<String>>(7)?,
+                    "cwd": row.get::<_, Option<String>>(8)?,
+                    "created_at": row.get::<_, String>(9)?,
                 }))
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -1546,36 +2203,87 @@ impl Storage {
         Ok(results)
     }
 
-    pub fn get_observation_count(&self) -> Result<i64, String> {
+    pub fn get_observation_count(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<i64, String> {
         let conn = self.conn.lock();
-        conn.query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
-            .map_err(|e| format!("Count error: {e}"))
+        match provider {
+            Some(provider) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM observations WHERE provider = ?1",
+                    params![provider.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Count error: {e}")),
+            None => conn
+                .query_row("SELECT COUNT(*) FROM observations", [], |row| row.get(0))
+                .map_err(|e| format!("Count error: {e}")),
+        }
     }
 
-    pub fn get_unanalyzed_observation_count(&self) -> Result<i64, String> {
+    pub fn get_unanalyzed_observation_count(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<i64, String> {
+        let since = self.latest_completed_learning_run_created_at(provider)?;
         let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT COUNT(*) FROM observations WHERE created_at > (
-                SELECT COALESCE(MAX(created_at), '1970-01-01') FROM learning_runs WHERE status = 'completed'
-            )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Count error: {e}"))
+        match provider {
+            Some(provider) => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM observations
+                     WHERE created_at > ?1 AND provider = ?2",
+                    params![since, provider.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Count error: {e}")),
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*) FROM observations WHERE created_at > ?1",
+                    params![since],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Count error: {e}")),
+        }
     }
 
-    pub fn get_top_tools(&self, limit: i64, days: i64) -> Result<Vec<ToolCount>, String> {
+    pub fn get_top_tools(
+        &self,
+        limit: i64,
+        days: i64,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<Vec<ToolCount>, String> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached(
+        let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+            Some(provider) => (
+                "SELECT tool_name, COUNT(*) as count FROM observations
+                 WHERE created_at >= datetime('now', '-' || ?1 || ' days')
+                   AND provider = ?2
+                 GROUP BY tool_name ORDER BY count DESC LIMIT ?3",
+                vec![
+                    Box::new(days) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(provider.as_str().to_string()),
+                    Box::new(limit),
+                ],
+            ),
+            None => (
                 "SELECT tool_name, COUNT(*) as count FROM observations
                  WHERE created_at >= datetime('now', '-' || ?1 || ' days')
                  GROUP BY tool_name ORDER BY count DESC LIMIT ?2",
-            )
+                vec![
+                    Box::new(days) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
+        };
+        let mut stmt = conn
+            .prepare_cached(sql)
             .map_err(|e| format!("Prepare error: {e}"))?;
 
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
         let rows = stmt
-            .query_map(params![days, limit], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok(ToolCount {
                     tool_name: row.get(0)?,
                     count: row.get(1)?,
@@ -1590,19 +2298,36 @@ impl Storage {
         Ok(results)
     }
 
-    pub fn get_observation_sparkline(&self) -> Result<Vec<i64>, String> {
+    pub fn get_observation_sparkline(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<Vec<i64>, String> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached(
+        let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+            Some(provider) => (
+                "SELECT DATE(created_at) as day, COUNT(*) as count
+                 FROM observations
+                 WHERE created_at >= DATE('now', '-6 days')
+                   AND provider = ?1
+                 GROUP BY day ORDER BY day ASC",
+                vec![Box::new(provider.as_str().to_string()) as Box<dyn rusqlite::types::ToSql>],
+            ),
+            None => (
                 "SELECT DATE(created_at) as day, COUNT(*) as count
                  FROM observations
                  WHERE created_at >= DATE('now', '-6 days')
                  GROUP BY day ORDER BY day ASC",
-            )
+                Vec::new(),
+            ),
+        };
+        let mut stmt = conn
+            .prepare_cached(sql)
             .map_err(|e| format!("Prepare error: {e}"))?;
 
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -1629,8 +2354,8 @@ impl Storage {
     pub fn store_learning_run(&self, payload: &LearningRunPayload) -> Result<i64, String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, phases, provider_scope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 payload.trigger_mode,
                 payload.observations_analyzed,
@@ -1640,18 +2365,24 @@ impl Storage {
                 payload.status,
                 payload.error,
                 payload.logs,
+                payload.phases,
+                provider_scope_json(&payload.provider_scope),
             ],
         )
         .map_err(|e| format!("Insert learning run error: {e}"))?;
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn create_learning_run(&self, trigger_mode: &str) -> Result<i64, String> {
+    pub fn create_learning_run(
+        &self,
+        trigger_mode: &str,
+        provider_scope: &[IntegrationProvider],
+    ) -> Result<i64, String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO learning_runs (trigger_mode, status, observations_analyzed, rules_created, rules_updated)
-             VALUES (?1, 'running', 0, 0, 0)",
-            params![trigger_mode],
+            "INSERT INTO learning_runs (trigger_mode, status, observations_analyzed, rules_created, rules_updated, provider_scope)
+             VALUES (?1, 'running', 0, 0, 0, ?2)",
+            params![trigger_mode, provider_scope_json(provider_scope)],
         )
         .map_err(|e| format!("Create learning run error: {e}"))?;
         Ok(conn.last_insert_rowid())
@@ -1661,7 +2392,7 @@ impl Storage {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE learning_runs SET observations_analyzed=?2, rules_created=?3, rules_updated=?4,
-             duration_ms=?5, status=?6, error=?7, logs=?8, phases=?9
+             duration_ms=?5, status=?6, error=?7, logs=?8, phases=?9, provider_scope=?10
              WHERE id=?1",
             params![
                 id,
@@ -1673,6 +2404,7 @@ impl Storage {
                 payload.error,
                 payload.logs,
                 payload.phases,
+                provider_scope_json(&payload.provider_scope),
             ],
         )
         .map_err(|e| format!("Update learning run error: {e}"))?;
@@ -1690,17 +2422,39 @@ impl Storage {
         Ok(count as u64)
     }
 
-    pub fn get_learning_runs(&self, limit: i64) -> Result<Vec<LearningRun>, String> {
+    pub fn get_learning_runs(
+        &self,
+        limit: i64,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<Vec<LearningRun>, String> {
         let conn = self.conn.lock();
+        let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+            Some(provider) => (
+                "SELECT id, trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, created_at, phases, provider_scope
+                 FROM learning_runs
+                 WHERE instr(provider_scope, ?1) > 0
+                 ORDER BY created_at DESC LIMIT ?2",
+                vec![
+                    Box::new(provider_scope_contains_json(provider))
+                        as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
+            None => (
+                "SELECT id, trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, created_at, phases, provider_scope
+                 FROM learning_runs
+                 ORDER BY created_at DESC LIMIT ?1",
+                vec![Box::new(limit) as Box<dyn rusqlite::types::ToSql>],
+            ),
+        };
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, created_at, phases
-                 FROM learning_runs ORDER BY created_at DESC LIMIT ?1",
-            )
+            .prepare_cached(sql)
             .map_err(|e| format!("Prepare error: {e}"))?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|param| param.as_ref()).collect();
 
         let rows = stmt
-            .query_map(params![limit], |row| {
+            .query_map(params_refs.as_slice(), |row| {
                 Ok(LearningRun {
                     id: row.get(0)?,
                     trigger_mode: row.get(1)?,
@@ -1713,6 +2467,7 @@ impl Storage {
                     logs: row.get(8)?,
                     created_at: row.get(9)?,
                     phases: row.get(10)?,
+                    provider_scope: parse_provider_scope(row.get(11)?),
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -1734,9 +2489,20 @@ impl Storage {
         let alpha = payload.confidence * evidence_scale;
         let beta = (1.0 - payload.confidence) * evidence_scale;
         let is_anti = payload.is_anti_pattern as i32;
+        let existing_scope: Option<String> = conn
+            .query_row(
+                "SELECT provider_scope FROM learned_rules WHERE name = ?1",
+                params![payload.name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("Read learned rule scope error: {e}"))?;
+        let mut merged_scope = parse_provider_scope(existing_scope);
+        merged_scope.extend(payload.provider_scope.iter().copied());
+        let merged_scope = normalized_provider_scope(&merged_scope);
         conn.execute(
-            "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, last_evidence_at, state, project, is_anti_pattern, source, content)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'emerging', ?9, ?10, ?11, ?12)
+            "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, last_evidence_at, state, project, is_anti_pattern, source, content, provider_scope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'emerging', ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(name) DO UPDATE SET
                  domain = excluded.domain,
                  alpha = learned_rules.alpha + excluded.alpha,
@@ -1747,6 +2513,7 @@ impl Storage {
                  is_anti_pattern = excluded.is_anti_pattern,
                  source = CASE WHEN excluded.source IS NOT NULL THEN excluded.source ELSE learned_rules.source END,
                  content = CASE WHEN excluded.content IS NOT NULL THEN excluded.content ELSE learned_rules.content END,
+                 provider_scope = excluded.provider_scope,
                  updated_at = datetime('now')",
             params![
                 payload.name,
@@ -1761,6 +2528,7 @@ impl Storage {
                 is_anti,
                 payload.source,
                 payload.content,
+                provider_scope_json(&merged_scope),
             ],
         )
         .map_err(|e| format!("Insert learned rule error: {e}"))?;
@@ -1789,18 +2557,36 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_learned_rules(&self) -> Result<Vec<LearnedRule>, String> {
+    pub fn get_learned_rules(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<Vec<LearnedRule>, String> {
         let mut meta_map = {
             let conn = self.conn.lock();
-            let mut stmt = conn
-                .prepare_cached(
-                    "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at, is_anti_pattern, source, content
+            let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+                Some(provider) => (
+                    "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at, is_anti_pattern, source, content, provider_scope
+                     FROM learned_rules
+                     WHERE state != 'suppressed' AND instr(provider_scope, ?1) > 0",
+                    vec![
+                        Box::new(provider_scope_contains_json(provider))
+                            as Box<dyn rusqlite::types::ToSql>,
+                    ],
+                ),
+                None => (
+                    "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at, is_anti_pattern, source, content, provider_scope
                      FROM learned_rules
                      WHERE state != 'suppressed'",
-                )
+                    Vec::new(),
+                ),
+            };
+            let mut stmt = conn
+                .prepare_cached(sql)
                 .map_err(|e| format!("Prepare error: {e}"))?;
+            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params_vec.iter().map(|param| param.as_ref()).collect();
             let rows = stmt
-                .query_map([], |row| {
+                .query_map(params_refs.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
@@ -1815,6 +2601,7 @@ impl Storage {
                         row.get::<_, i32>(10).unwrap_or(0),
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 })
                 .map_err(|e| format!("Query error: {e}"))?;
@@ -1835,25 +2622,32 @@ impl Storage {
                     is_anti,
                     source,
                     content,
+                    provider_scope,
                 ) = row.map_err(|e| format!("Row error: {e}"))?;
                 map.insert(
                     name,
                     (
-                        domain, alpha, beta, obs_count, last_ev, state, project, created, updated,
-                        is_anti, source, content,
+                        domain,
+                        alpha,
+                        beta,
+                        obs_count,
+                        last_ev,
+                        state,
+                        project,
+                        created,
+                        updated,
+                        is_anti,
+                        source,
+                        content,
+                        parse_provider_scope(provider_scope),
                     ),
                 );
             }
             map
         };
 
-        let rules_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("rules")
-            .join("learned");
-
         let mut rules = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
 
         fn collect_rule_files(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
             if let Ok(entries) = std::fs::read_dir(dir) {
@@ -1874,11 +2668,20 @@ impl Storage {
             }
         }
 
-        if rules_dir.exists() {
+        for rules_dir in learned_rule_dirs(provider) {
+            if !rules_dir.exists() {
+                continue;
+            }
+
             let mut files = Vec::new();
             collect_rule_files(&rules_dir, &mut files);
 
             for (name, file_path) in files {
+                if !seen_names.insert(name.clone()) {
+                    continue;
+                }
+
+                let inferred_scope = inferred_rule_provider_scope(std::path::Path::new(&file_path));
                 let now = Utc::now().to_rfc3339();
                 let (
                     domain,
@@ -1893,6 +2696,7 @@ impl Storage {
                     is_anti,
                     source,
                     _content,
+                    provider_scope,
                 ) = meta_map.remove(&name).unwrap_or((
                     None,
                     1.0,
@@ -1906,6 +2710,7 @@ impl Storage {
                     0,
                     None,
                     None,
+                    inferred_scope,
                 ));
 
                 let fresh = freshness_factor(last_ev.as_deref());
@@ -1927,6 +2732,7 @@ impl Storage {
                     is_anti_pattern: is_anti != 0,
                     source,
                     content: None,
+                    provider_scope,
                 });
             }
         }
@@ -1947,6 +2753,7 @@ impl Storage {
                 is_anti,
                 source,
                 content_val,
+                provider_scope,
             ),
         ) in meta_map
         {
@@ -1969,6 +2776,7 @@ impl Storage {
                 is_anti_pattern: is_anti != 0,
                 source,
                 content: content_val,
+                provider_scope,
             });
         }
 
@@ -2041,22 +2849,24 @@ impl Storage {
         // LLM can't trivially re-promote the same pattern. Boost beta by 5.0,
         // clear the file_path, and set state to 'suppressed' so the rule is
         // hidden from the UI but still tracked to prevent re-creation.
-        let file_path: Option<String> = {
+        let (file_path, provider_scope) = {
             let conn = self.conn.lock();
-            let fp: Option<String> = conn
+            let record: Option<(Option<String>, Option<String>)> = conn
                 .query_row(
-                    "SELECT file_path FROM learned_rules WHERE name = ?1",
+                    "SELECT file_path, provider_scope FROM learned_rules WHERE name = ?1",
                     params![name],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .ok();
+                .optional()
+                .map_err(|e| format!("Read learned rule metadata error: {e}"))?;
 
             conn.execute(
                 "UPDATE learned_rules SET beta_param = beta_param + 5.0, file_path = '', state = 'suppressed', updated_at = datetime('now') WHERE name = ?1",
                 params![name],
             )
             .ok();
-            fp
+            let (file_path, provider_scope) = record.unwrap_or((None, None));
+            (file_path, parse_provider_scope(provider_scope))
         };
 
         // Delete the .md file from disk
@@ -2070,11 +2880,6 @@ impl Storage {
         }
 
         // Also search recursively as fallback
-        let rules_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("rules")
-            .join("learned");
         fn find_and_delete(dir: &std::path::Path, name: &str) -> bool {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
@@ -2093,7 +2898,11 @@ impl Storage {
             }
             false
         }
-        find_and_delete(&rules_dir, name);
+        for rules_dir in learned_rule_dirs_for_scope(&provider_scope) {
+            if find_and_delete(&rules_dir, name) {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -2105,25 +2914,26 @@ impl Storage {
             ));
         }
 
-        let content: String = {
+        let (content, provider_scope): (String, Vec<IntegrationProvider>) = {
             let conn = self.conn.lock();
-            let content_opt: Option<String> = conn
+            let row: (Option<String>, Option<String>) = conn
                 .query_row(
-                    "SELECT content FROM learned_rules WHERE name = ?1 AND state != 'suppressed'",
+                    "SELECT content, provider_scope FROM learned_rules WHERE name = ?1 AND state != 'suppressed'",
                     params![name],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .map_err(|e| format!("Rule not found: {e}"))?;
-            content_opt.ok_or_else(|| {
-                "No stored content for this rule — re-run analysis to capture content".to_string()
-            })?
+            let (content_opt, provider_scope) = row;
+            (
+                content_opt.ok_or_else(|| {
+                    "No stored content for this rule — re-run analysis to capture content"
+                        .to_string()
+                })?,
+                parse_provider_scope(provider_scope),
+            )
         };
 
-        let rules_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("rules")
-            .join("learned");
+        let rules_dir = crate::learning::learned_rules_dir_for_scope(&provider_scope);
         std::fs::create_dir_all(&rules_dir).map_err(|e| format!("Cannot create rules dir: {e}"))?;
 
         let file_path = rules_dir.join(format!("{name}.md"));
@@ -2154,10 +2964,10 @@ impl Storage {
     }
 
     pub fn get_learning_status(&self) -> Result<LearningStatus, String> {
-        let observation_count = self.get_observation_count()?;
-        let unanalyzed_count = self.get_unanalyzed_observation_count()?;
-        let rules = self.get_learned_rules()?;
-        let runs = self.get_learning_runs(1)?;
+        let observation_count = self.get_observation_count(None)?;
+        let unanalyzed_count = self.get_unanalyzed_observation_count(None)?;
+        let rules = self.get_learned_rules(None)?;
+        let runs = self.get_learning_runs(1, None)?;
 
         Ok(LearningStatus {
             observation_count,
@@ -2186,34 +2996,39 @@ impl Storage {
         // Aggregate tool counts and error counts by project for the period being cleaned
         let mut summary_stmt = conn
             .prepare_cached(
-                "SELECT cwd, tool_name, COUNT(*) as cnt,
+                "SELECT provider, cwd, tool_name, COUNT(*) as cnt,
                         SUM(CASE WHEN tool_output LIKE '%error%' OR tool_output LIKE '%Error%' THEN 1 ELSE 0 END) as err_cnt
                  FROM observations
                  WHERE created_at < ?1
-                 GROUP BY cwd, tool_name",
+                 GROUP BY provider, cwd, tool_name",
             )
             .map_err(|e| format!("Summary prepare error: {e}"))?;
 
         let summary_rows = summary_stmt
             .query_map(params![cutoff_ts], |row| {
                 Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(|e| format!("Summary query error: {e}"))?;
 
-        // Group by project
+        // Group by provider and project
+        type ObservationSummaryKey = (String, Option<String>);
+        type ObservationSummaryValue = (serde_json::Map<String, serde_json::Value>, i64, i64);
+
         let mut project_summaries: std::collections::HashMap<
-            Option<String>,
-            (serde_json::Map<String, serde_json::Value>, i64, i64),
+            ObservationSummaryKey,
+            ObservationSummaryValue,
         > = std::collections::HashMap::new();
         for row in summary_rows {
-            let (project, tool, count, errors) = row.map_err(|e| format!("Summary row: {e}"))?;
+            let (provider, project, tool, count, errors) =
+                row.map_err(|e| format!("Summary row: {e}"))?;
             let entry = project_summaries
-                .entry(project)
+                .entry((provider, project))
                 .or_insert_with(|| (serde_json::Map::new(), 0, 0));
             entry.0.insert(tool, serde_json::Value::from(count));
             entry.1 += errors;
@@ -2222,15 +3037,15 @@ impl Storage {
         drop(summary_stmt);
 
         let period = Utc::now().format("%Y-%m-%d").to_string();
-        for (project, (tool_counts, error_count, total)) in &project_summaries {
+        for ((provider, project), (tool_counts, error_count, total)) in &project_summaries {
             if *total == 0 {
                 continue;
             }
             let tc_json = serde_json::Value::Object(tool_counts.clone()).to_string();
             conn.execute(
-                "INSERT OR REPLACE INTO observation_summaries (period, project, tool_counts, error_count, total_observations)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![period, project, tc_json, error_count, total],
+                "INSERT OR REPLACE INTO observation_summaries (period, provider, project, tool_counts, error_count, total_observations)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![period, provider, project, tc_json, error_count, total],
             )
             .ok(); // Best-effort: don't fail cleanup if summary write fails
         }
@@ -2252,9 +3067,10 @@ impl Storage {
             .map_err(|e| format!("Transaction error: {e}"))?;
 
         tx.execute(
-            "INSERT INTO token_hourly (hour, hostname, total_input, total_output, total_cache_creation, total_cache_read, turn_count)
+            "INSERT INTO token_hourly (hour, provider, hostname, total_input, total_output, total_cache_creation, total_cache_read, turn_count)
              SELECT
                  strftime('%Y-%m-%dT%H:00:00Z', timestamp) as hour,
+                 provider,
                  hostname,
                  SUM(input_tokens),
                  SUM(output_tokens),
@@ -2263,8 +3079,8 @@ impl Storage {
                  COUNT(*)
              FROM token_snapshots
              WHERE timestamp < ?1
-             GROUP BY hour, hostname
-             ON CONFLICT(hour, hostname) DO UPDATE SET
+             GROUP BY hour, provider, hostname
+             ON CONFLICT(hour, hostname, provider) DO UPDATE SET
                  total_input = token_hourly.total_input + excluded.total_input,
                  total_output = token_hourly.total_output + excluded.total_output,
                  total_cache_creation = token_hourly.total_cache_creation + excluded.total_cache_creation,
@@ -2286,11 +3102,15 @@ impl Storage {
     }
 
     /// Delete all tool_actions for a session (used before re-indexing to prevent duplicates).
-    pub fn delete_tool_actions_for_session(&self, session_id: &str) -> Result<(), String> {
+    pub fn delete_tool_actions_for_session(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "DELETE FROM tool_actions WHERE session_id = ?1",
-            rusqlite::params![session_id],
+            "DELETE FROM tool_actions WHERE provider = ?1 AND session_id = ?2",
+            rusqlite::params![provider.as_str(), session_id],
         )
         .map_err(|e| format!("Delete tool_actions for session: {e}"))?;
         Ok(())
@@ -2298,6 +3118,7 @@ impl Storage {
 
     pub fn store_tool_actions(
         &self,
+        provider: IntegrationProvider,
         actions: &[crate::sessions::ToolAction],
         message_id: &str,
         session_id: &str,
@@ -2310,13 +3131,14 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO tool_actions (message_id, session_id, tool_name, category, file_path, summary, full_input, full_output, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category, file_path, summary, full_input, full_output, timestamp)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
                 .map_err(|e| format!("Prepare store_tool_actions: {e}"))?;
 
             for action in actions {
                 stmt.execute(rusqlite::params![
+                    provider.as_str(),
                     message_id,
                     session_id,
                     action.tool_name,
@@ -2345,17 +3167,18 @@ impl Storage {
         &self,
         project_path: &str,
         trigger: &str,
+        provider_scope: &[IntegrationProvider],
     ) -> Result<i64, String> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         // Atomic: insert only if no running run exists for this project
         conn.execute(
-            "INSERT INTO optimization_runs (project_path, trigger, memories_scanned, suggestions_created, context_sources, status, started_at)
-             SELECT ?1, ?2, 0, 0, '{}', 'running', ?3
+            "INSERT INTO optimization_runs (project_path, provider_scope, trigger, memories_scanned, suggestions_created, context_sources, status, started_at)
+             SELECT ?1, ?2, ?3, 0, 0, '{}', 'running', ?4
              WHERE NOT EXISTS (
                  SELECT 1 FROM optimization_runs WHERE project_path = ?1 AND status = 'running'
              )",
-            rusqlite::params![project_path, trigger, now],
+            rusqlite::params![project_path, provider_scope_json(provider_scope), trigger, now],
         )
         .map_err(|e| format!("Failed to create optimization run: {e}"))?;
 
@@ -2402,29 +3225,53 @@ impl Storage {
     pub fn get_optimization_runs(
         &self,
         project_path: &str,
+        provider: Option<IntegrationProvider>,
         limit: i64,
     ) -> Result<Vec<crate::models::OptimizationRun>, String> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, project_path, trigger, memories_scanned, suggestions_created,
+        let (query, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+            Some(provider) => (
+                "SELECT id, project_path, provider_scope, trigger, memories_scanned, suggestions_created,
                         status, error, started_at, completed_at
-                 FROM optimization_runs WHERE project_path = ?1
-                 ORDER BY started_at DESC LIMIT ?2",
-            )
+                 FROM optimization_runs
+                 WHERE project_path = ?1 AND instr(provider_scope, ?2) > 0
+                 ORDER BY started_at DESC LIMIT ?3"
+                    .to_string(),
+                vec![
+                    Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(provider_scope_contains_json(provider)),
+                    Box::new(limit),
+                ],
+            ),
+            None => (
+                "SELECT id, project_path, provider_scope, trigger, memories_scanned, suggestions_created,
+                        status, error, started_at, completed_at
+                 FROM optimization_runs
+                 WHERE project_path = ?1
+                 ORDER BY started_at DESC LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
+        };
+        let mut stmt = conn
+            .prepare_cached(&query)
             .map_err(|e| format!("Failed to prepare optimization runs query: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params![project_path, limit], |row| {
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
                 Ok(crate::models::OptimizationRun {
                     id: row.get(0)?,
                     project_path: row.get(1)?,
-                    trigger: row.get(2)?,
-                    memories_scanned: row.get(3)?,
-                    suggestions_created: row.get(4)?,
-                    status: row.get(5)?,
-                    error: row.get(6)?,
-                    started_at: row.get(7)?,
-                    completed_at: row.get(8)?,
+                    provider_scope: parse_provider_scope(row.get(2)?),
+                    trigger: row.get(3)?,
+                    memories_scanned: row.get(4)?,
+                    suggestions_created: row.get(5)?,
+                    status: row.get(6)?,
+                    error: row.get(7)?,
+                    started_at: row.get(8)?,
+                    completed_at: row.get(9)?,
                 })
             })
             .map_err(|e| format!("Failed to query optimization runs: {e}"))?;
@@ -2449,11 +3296,18 @@ impl Storage {
     ) -> Result<i64, String> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
+        let provider_scope: String = conn
+            .query_row(
+                "SELECT provider_scope FROM optimization_runs WHERE id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to read optimization run scope: {e}"))?;
         conn.execute(
             "INSERT INTO optimization_suggestions
-             (run_id, project_path, action_type, target_file, reasoning, proposed_content, merge_sources, status, created_at, original_content, diff_summary, backup_data)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11)",
-            rusqlite::params![run_id, project_path, action_type, target_file, reasoning, proposed_content, merge_sources, now, original_content, diff_summary, backup_data],
+             (run_id, project_path, provider_scope, action_type, target_file, reasoning, proposed_content, merge_sources, status, created_at, original_content, diff_summary, backup_data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9, ?10, ?11, ?12)",
+            rusqlite::params![run_id, project_path, provider_scope, action_type, target_file, reasoning, proposed_content, merge_sources, now, original_content, diff_summary, backup_data],
         )
         .map_err(|e| format!("Failed to store optimization suggestion: {e}"))?;
         Ok(conn.last_insert_rowid())
@@ -2464,43 +3318,37 @@ impl Storage {
     pub fn get_optimization_suggestions(
         &self,
         project_path: &str,
+        provider: Option<IntegrationProvider>,
         status_filter: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
         let conn = self.conn.lock();
 
-        let (query, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(status) = status_filter {
-                (
-                    "SELECT id, run_id, project_path, action_type, target_file, reasoning,
-                            proposed_content, merge_sources, status, error, resolved_at, created_at,
-                            original_content, diff_summary, backup_data, group_id
-                     FROM optimization_suggestions WHERE project_path = ?1 AND status = ?2
-                     ORDER BY created_at DESC LIMIT ?3 OFFSET ?4"
-                        .to_string(),
-                    vec![
-                        Box::new(project_path.to_string()),
-                        Box::new(status.to_string()),
-                        Box::new(limit),
-                        Box::new(offset),
-                    ],
-                )
-            } else {
-                (
-                    "SELECT id, run_id, project_path, action_type, target_file, reasoning,
-                            proposed_content, merge_sources, status, error, resolved_at, created_at,
-                            original_content, diff_summary, backup_data, group_id
-                     FROM optimization_suggestions WHERE project_path = ?1
-                     ORDER BY created_at DESC LIMIT ?2 OFFSET ?3"
-                        .to_string(),
-                    vec![
-                        Box::new(project_path.to_string()),
-                        Box::new(limit),
-                        Box::new(offset),
-                    ],
-                )
-            };
+        let mut query = "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
+                                proposed_content, merge_sources, status, error, resolved_at, created_at,
+                                original_content, diff_summary, backup_data, group_id
+                         FROM optimization_suggestions WHERE project_path = ?1"
+            .to_string();
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>];
+        let mut next_param = 2;
+        if let Some(provider) = provider {
+            query.push_str(&format!(" AND instr(provider_scope, ?{next_param}) > 0"));
+            params.push(Box::new(provider_scope_contains_json(provider)));
+            next_param += 1;
+        }
+        if let Some(status) = status_filter {
+            query.push_str(&format!(" AND status = ?{next_param}"));
+            params.push(Box::new(status.to_string()));
+            next_param += 1;
+        }
+        query.push_str(&format!(
+            " ORDER BY created_at DESC LIMIT ?{next_param} OFFSET ?{}",
+            next_param + 1
+        ));
+        params.push(Box::new(limit));
+        params.push(Box::new(offset));
 
         let mut stmt = conn
             .prepare_cached(&query)
@@ -2508,26 +3356,27 @@ impl Storage {
 
         let rows = stmt
             .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let merge_sources_json: Option<String> = row.get(7)?;
+                let merge_sources_json: Option<String> = row.get(8)?;
                 let merge_sources: Option<Vec<String>> =
                     merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(crate::models::OptimizationSuggestion {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     project_path: row.get(2)?,
-                    action_type: row.get(3)?,
-                    target_file: row.get(4)?,
-                    reasoning: row.get(5)?,
-                    proposed_content: row.get(6)?,
+                    provider_scope: parse_provider_scope(row.get(3)?),
+                    action_type: row.get(4)?,
+                    target_file: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    proposed_content: row.get(7)?,
                     merge_sources,
-                    status: row.get(8)?,
-                    error: row.get(9)?,
-                    resolved_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    original_content: row.get(12)?,
-                    diff_summary: row.get(13)?,
-                    backup_data: row.get(14)?,
-                    group_id: row.get(15)?,
+                    status: row.get(9)?,
+                    error: row.get(10)?,
+                    resolved_at: row.get(11)?,
+                    created_at: row.get(12)?,
+                    original_content: row.get(13)?,
+                    diff_summary: row.get(14)?,
+                    backup_data: row.get(15)?,
+                    group_id: row.get(16)?,
                 })
             })
             .map_err(|e| format!("Failed to query suggestions: {e}"))?;
@@ -2540,41 +3389,65 @@ impl Storage {
     pub fn get_denied_suggestions(
         &self,
         project_path: &str,
+        provider: Option<IntegrationProvider>,
         limit: i64,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, run_id, project_path, action_type, target_file, reasoning,
+        let (query, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+            Some(provider) => (
+                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
+                        proposed_content, merge_sources, status, error, resolved_at, created_at,
+                        original_content, diff_summary, backup_data, group_id
+                 FROM optimization_suggestions
+                 WHERE project_path = ?1 AND status = 'denied' AND instr(provider_scope, ?2) > 0
+                 ORDER BY resolved_at DESC LIMIT ?3"
+                    .to_string(),
+                vec![
+                    Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(provider_scope_contains_json(provider)),
+                    Box::new(limit),
+                ],
+            ),
+            None => (
+                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
                         proposed_content, merge_sources, status, error, resolved_at, created_at,
                         original_content, diff_summary, backup_data, group_id
                  FROM optimization_suggestions
                  WHERE project_path = ?1 AND status = 'denied'
-                 ORDER BY resolved_at DESC LIMIT ?2",
-            )
+                 ORDER BY resolved_at DESC LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit),
+                ],
+            ),
+        };
+        let mut stmt = conn
+            .prepare_cached(&query)
             .map_err(|e| format!("Failed to prepare denied suggestions query: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params![project_path, limit], |row| {
-                let merge_sources_json: Option<String> = row.get(7)?;
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let merge_sources_json: Option<String> = row.get(8)?;
                 let merge_sources: Option<Vec<String>> =
                     merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(crate::models::OptimizationSuggestion {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     project_path: row.get(2)?,
-                    action_type: row.get(3)?,
-                    target_file: row.get(4)?,
-                    reasoning: row.get(5)?,
-                    proposed_content: row.get(6)?,
+                    provider_scope: parse_provider_scope(row.get(3)?),
+                    action_type: row.get(4)?,
+                    target_file: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    proposed_content: row.get(7)?,
                     merge_sources,
-                    status: row.get(8)?,
-                    error: row.get(9)?,
-                    resolved_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    original_content: row.get(12)?,
-                    diff_summary: row.get(13)?,
-                    backup_data: row.get(14)?,
-                    group_id: row.get(15)?,
+                    status: row.get(9)?,
+                    error: row.get(10)?,
+                    resolved_at: row.get(11)?,
+                    created_at: row.get(12)?,
+                    original_content: row.get(13)?,
+                    diff_summary: row.get(14)?,
+                    backup_data: row.get(15)?,
+                    group_id: row.get(16)?,
                 })
             })
             .map_err(|e| format!("Failed to query denied suggestions: {e}"))?;
@@ -2608,32 +3481,33 @@ impl Storage {
     ) -> Result<crate::models::OptimizationSuggestion, String> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT id, run_id, project_path, action_type, target_file, reasoning,
+            "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
                     proposed_content, merge_sources, status, error, resolved_at, created_at,
                     original_content, diff_summary, backup_data, group_id
              FROM optimization_suggestions WHERE id = ?1",
             rusqlite::params![suggestion_id],
             |row| {
-                let merge_sources_json: Option<String> = row.get(7)?;
+                let merge_sources_json: Option<String> = row.get(8)?;
                 let merge_sources: Option<Vec<String>> =
                     merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(crate::models::OptimizationSuggestion {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     project_path: row.get(2)?,
-                    action_type: row.get(3)?,
-                    target_file: row.get(4)?,
-                    reasoning: row.get(5)?,
-                    proposed_content: row.get(6)?,
+                    provider_scope: parse_provider_scope(row.get(3)?),
+                    action_type: row.get(4)?,
+                    target_file: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    proposed_content: row.get(7)?,
                     merge_sources,
-                    status: row.get(8)?,
-                    error: row.get(9)?,
-                    resolved_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    original_content: row.get(12)?,
-                    diff_summary: row.get(13)?,
-                    backup_data: row.get(14)?,
-                    group_id: row.get(15)?,
+                    status: row.get(9)?,
+                    error: row.get(10)?,
+                    resolved_at: row.get(11)?,
+                    created_at: row.get(12)?,
+                    original_content: row.get(13)?,
+                    diff_summary: row.get(14)?,
+                    backup_data: row.get(15)?,
+                    group_id: row.get(16)?,
                 })
             },
         )
@@ -2702,7 +3576,7 @@ impl Storage {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, run_id, project_path, action_type, target_file, reasoning,
+                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
                         proposed_content, merge_sources, status, error, resolved_at, created_at,
                         original_content, diff_summary, backup_data, group_id
                  FROM optimization_suggestions WHERE run_id = ?1
@@ -2711,26 +3585,27 @@ impl Storage {
             .map_err(|e| format!("Failed to prepare suggestions-for-run query: {e}"))?;
         let rows = stmt
             .query_map(rusqlite::params![run_id], |row| {
-                let merge_sources_json: Option<String> = row.get(7)?;
+                let merge_sources_json: Option<String> = row.get(8)?;
                 let merge_sources: Option<Vec<String>> =
                     merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(crate::models::OptimizationSuggestion {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     project_path: row.get(2)?,
-                    action_type: row.get(3)?,
-                    target_file: row.get(4)?,
-                    reasoning: row.get(5)?,
-                    proposed_content: row.get(6)?,
+                    provider_scope: parse_provider_scope(row.get(3)?),
+                    action_type: row.get(4)?,
+                    target_file: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    proposed_content: row.get(7)?,
                     merge_sources,
-                    status: row.get(8)?,
-                    error: row.get(9)?,
-                    resolved_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    original_content: row.get(12)?,
-                    diff_summary: row.get(13)?,
-                    backup_data: row.get(14)?,
-                    group_id: row.get(15)?,
+                    status: row.get(9)?,
+                    error: row.get(10)?,
+                    resolved_at: row.get(11)?,
+                    created_at: row.get(12)?,
+                    original_content: row.get(13)?,
+                    diff_summary: row.get(14)?,
+                    backup_data: row.get(15)?,
+                    group_id: row.get(16)?,
                 })
             })
             .map_err(|e| format!("Failed to query suggestions for run: {e}"))?;
@@ -2832,7 +3707,7 @@ impl Storage {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT id, run_id, project_path, action_type, target_file, reasoning,
+                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
                         proposed_content, merge_sources, status, error, resolved_at, created_at,
                         original_content, diff_summary, backup_data, group_id
                  FROM optimization_suggestions WHERE group_id = ?1
@@ -2841,26 +3716,27 @@ impl Storage {
             .map_err(|e| format!("Failed to prepare group suggestions query: {e}"))?;
         let rows = stmt
             .query_map(rusqlite::params![group_id], |row| {
-                let merge_sources_json: Option<String> = row.get(7)?;
+                let merge_sources_json: Option<String> = row.get(8)?;
                 let merge_sources: Option<Vec<String>> =
                     merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
                 Ok(crate::models::OptimizationSuggestion {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
                     project_path: row.get(2)?,
-                    action_type: row.get(3)?,
-                    target_file: row.get(4)?,
-                    reasoning: row.get(5)?,
-                    proposed_content: row.get(6)?,
+                    provider_scope: parse_provider_scope(row.get(3)?),
+                    action_type: row.get(4)?,
+                    target_file: row.get(5)?,
+                    reasoning: row.get(6)?,
+                    proposed_content: row.get(7)?,
                     merge_sources,
-                    status: row.get(8)?,
-                    error: row.get(9)?,
-                    resolved_at: row.get(10)?,
-                    created_at: row.get(11)?,
-                    original_content: row.get(12)?,
-                    diff_summary: row.get(13)?,
-                    backup_data: row.get(14)?,
-                    group_id: row.get(15)?,
+                    status: row.get(9)?,
+                    error: row.get(10)?,
+                    resolved_at: row.get(11)?,
+                    created_at: row.get(12)?,
+                    original_content: row.get(13)?,
+                    diff_summary: row.get(14)?,
+                    backup_data: row.get(15)?,
+                    group_id: row.get(16)?,
                 })
             })
             .map_err(|e| format!("Failed to query group suggestions: {e}"))?;
@@ -3041,31 +3917,44 @@ impl Storage {
 
     pub fn get_batch_session_code_stats(
         &self,
-        session_ids: &[String],
+        session_refs: &[SessionRef],
     ) -> Result<std::collections::HashMap<String, SessionCodeStats>, String> {
-        if session_ids.is_empty() {
+        if session_refs.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
         let conn = self.conn.lock();
 
-        let placeholders: Vec<String> = (1..=session_ids.len()).map(|i| format!("?{i}")).collect();
+        let predicates: Vec<String> = session_refs
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let provider_pos = idx * 2 + 1;
+                let session_pos = provider_pos + 1;
+                format!("(provider = ?{provider_pos} AND session_id = ?{session_pos})")
+            })
+            .collect();
         let sql = format!(
-            "SELECT session_id, tool_name, full_input
+            "SELECT provider, session_id, tool_name, full_input
 			 FROM tool_actions
 			 WHERE category = 'code_change'
 			   AND full_input IS NOT NULL
-			   AND session_id IN ({})",
-            placeholders.join(", ")
+			   AND ({})",
+            predicates.join(" OR ")
         );
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("Prepare error: {e}"))?;
 
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = session_ids
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = session_refs
             .iter()
-            .map(|s| Box::new(s.clone()) as Box<dyn rusqlite::types::ToSql>)
+            .flat_map(|session_ref| {
+                [
+                    Box::new(session_ref.provider.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(session_ref.session_id.clone()) as Box<dyn rusqlite::types::ToSql>,
+                ]
+            })
             .collect();
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -3076,6 +3965,7 @@ impl Storage {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -3084,14 +3974,19 @@ impl Storage {
             std::collections::HashMap::new();
 
         for row in rows {
-            let (session_id, tool_name, full_input) = row.map_err(|e| format!("Row error: {e}"))?;
+            let (provider, session_id, tool_name, full_input) =
+                row.map_err(|e| format!("Row error: {e}"))?;
+            let provider: IntegrationProvider = provider.parse()?;
 
             if let Some((added, removed, _)) = parse_code_change(&tool_name, &full_input) {
-                let entry = result.entry(session_id).or_insert(SessionCodeStats {
-                    lines_added: 0,
-                    lines_removed: 0,
-                    net_change: 0,
-                });
+                let entry =
+                    result
+                        .entry(session_key(provider, &session_id))
+                        .or_insert(SessionCodeStats {
+                            lines_added: 0,
+                            lines_removed: 0,
+                            net_change: 0,
+                        });
                 entry.lines_added += added;
                 entry.lines_removed += removed;
                 entry.net_change = entry.lines_added - entry.lines_removed;
@@ -3101,11 +3996,15 @@ impl Storage {
         Ok(result)
     }
 
-    pub fn delete_response_times_for_session(&self, session_id: &str) -> Result<(), String> {
+    pub fn delete_response_times_for_session(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute(
-            "DELETE FROM response_times WHERE session_id = ?1",
-            params![session_id],
+            "DELETE FROM response_times WHERE provider = ?1 AND session_id = ?2",
+            params![provider.as_str(), session_id],
         )
         .map_err(|e| format!("Failed to delete response_times for session: {e}"))?;
         Ok(())
@@ -3113,6 +4012,7 @@ impl Storage {
 
     pub fn ingest_response_times(
         &self,
+        provider: IntegrationProvider,
         session_id: &str,
         messages: &[(&str, &str)],
     ) -> Result<(), String> {
@@ -3129,9 +4029,9 @@ impl Storage {
             let conn = self.conn.lock();
             conn.query_row(
                 "SELECT timestamp FROM response_times
-                 WHERE session_id = ?1 AND response_secs IS NOT NULL
+                 WHERE provider = ?1 AND session_id = ?2 AND response_secs IS NOT NULL
                  ORDER BY timestamp DESC LIMIT 1",
-                params![session_id],
+                params![provider.as_str(), session_id],
                 |row| row.get(0),
             )
             .optional()
@@ -3181,8 +4081,8 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT OR IGNORE INTO response_times (session_id, timestamp, response_secs, idle_secs)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO response_times (provider, session_id, timestamp, response_secs, idle_secs)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
@@ -3201,6 +4101,7 @@ impl Storage {
                 }
 
                 stmt.execute(params![
+                    provider.as_str(),
                     session_id,
                     turn.assistant_ts,
                     response_val,
@@ -3397,7 +4298,11 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
     results
 }
 
-fn calc_trend(conn: &Connection, bucket: &str) -> Result<String, String> {
+fn calc_trend(
+    conn: &Connection,
+    provider: IntegrationProvider,
+    bucket_key: &str,
+) -> Result<String, String> {
     let now = Utc::now();
     let one_hour_ago = (now - TimeDelta::hours(1)).to_rfc3339();
     let two_hours_ago = (now - TimeDelta::hours(2)).to_rfc3339();
@@ -3405,8 +4310,8 @@ fn calc_trend(conn: &Connection, bucket: &str) -> Result<String, String> {
     let recent_avg: Option<f64> = conn
         .query_row(
             "SELECT AVG(utilization) FROM usage_snapshots
-             WHERE bucket_label = ?1 AND timestamp >= ?2",
-            params![bucket, one_hour_ago],
+             WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3",
+            params![provider.as_str(), bucket_key, one_hour_ago],
             |row| row.get(0),
         )
         .map_err(|e| format!("Trend query error: {e}"))?;
@@ -3414,8 +4319,8 @@ fn calc_trend(conn: &Connection, bucket: &str) -> Result<String, String> {
     let prev_avg: Option<f64> = conn
         .query_row(
             "SELECT AVG(utilization) FROM usage_snapshots
-             WHERE bucket_label = ?1 AND timestamp >= ?2 AND timestamp < ?3",
-            params![bucket, two_hours_ago, one_hour_ago],
+             WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3 AND timestamp < ?4",
+            params![provider.as_str(), bucket_key, two_hours_ago, one_hour_ago],
             |row| row.get(0),
         )
         .map_err(|e| format!("Trend query error: {e}"))?;

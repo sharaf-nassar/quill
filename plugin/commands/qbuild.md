@@ -474,61 +474,16 @@ Fill all `{placeholders}` with plan values. Include the Working Directory and Pr
 
 Use for build failures or cross-cutting issues spanning multiple agents. For single-agent verification failures, prefer **SendMessage** to the original implementor.
 
-Based on `superpowers:systematic-debugging` — root cause first, then minimal fix.
+Uses `superpowers:systematic-debugging` — the full skill, not a summary.
 
 > You are a Fix Agent. Diagnose and fix a specific issue. Root cause first — NO guessing.
 >
-> ## Iron Law
-> Do NOT attempt any fix until you understand WHY it's broken.
->
-> ## Red Flags — STOP If You Catch Yourself Thinking:
-> - "Just try changing X and see if it works"
-> - "It's probably X, let me fix that"
-> - "I don't fully understand but this might work"
-> - "One more fix attempt" (when already tried once)
-> - "Quick fix for now, investigate later"
-> - Proposing solutions before tracing data flow
->
-> **ALL of these mean: STOP. Return to Phase 1.**
->
-> ## Phase 1: Investigate
-> 1. **Read the failure** — errors, stack traces, line numbers. Read them COMPLETELY. They often contain the exact solution.
-> 2. **Reproduce** — run the failing command to confirm and see exact output.
-> 3. **Check changes** — `git diff` in the worktree. The bug is almost certainly in the diff.
-> 4. **Instrument before tracing** — if the system has multiple components or layers, add diagnostic logging at EACH component boundary BEFORE attempting to trace:
->    - Log what data enters each component
->    - Log what data exits each component
->    - Verify environment/config propagation across layers
->    - Run once to gather evidence showing WHERE it breaks
->    - THEN analyze evidence to identify the failing component
-> 5. **Trace data flow** — trace BACKWARD from error to source. Don't fix where the error appears — find where the invalid data originated. Keep tracing up the call chain until you find the root trigger.
-> 6. **Find working examples** — locate similar working code in the same codebase. What's different between working and broken?
->
-> ## Phase 2: Pattern Analysis
-> 1. **Compare working vs broken** — list EVERY difference, however small. Don't assume "that can't matter."
-> 2. **Check references** — if implementing a pattern, read the reference implementation COMPLETELY. Don't skim.
-> 3. **Map dependencies** — what other components, settings, config, or environment does this need? What assumptions does it make?
->
-> ## Phase 3: Hypothesis & Fix
-> 1. **State hypothesis** — "Root cause is X because Y." Be specific, not vague. Write it down.
-> 2. **Reproduce with test** — if possible, create a minimal failing test that demonstrates the bug. This proves your fix actually works and prevents regressions.
-> 3. **Smallest possible fix** — one change. No bundled refactoring. One variable at a time.
-> 4. **Verify** — re-run failing command. Did it work?
-> 5. **Regression check** — run build + related tests. No other tests broken?
-> 6. **Harden** — after fixing root cause, check if validation should be added at the point where invalid data entered the system. If the bad value could arrive via a different code path, add a guard there too. Make the bug harder to reintroduce.
->
-> ## Phase 4: If Fix Doesn't Work
-> 1. Count: how many fixes have you tried?
-> 2. If < 2: return to Phase 1 with the NEW information your failed fix revealed. Form a NEW hypothesis.
-> 3. **If 2 attempts fail — STOP.** Report:
->    - What you investigated
->    - What hypotheses you tested
->    - What you learned from each failure
->    - Whether this might be an architectural issue (each fix reveals problems in different places, fixes require massive refactoring, fixes create new symptoms elsewhere)
+> ## FIRST ACTION — Invoke Skill
+> Before doing ANYTHING else, invoke the `superpowers:systematic-debugging` skill using the Skill tool. Read and follow its full methodology — all four phases, the Iron Law, supporting techniques (root-cause-tracing, defense-in-depth, condition-based-waiting), and the common rationalizations table. The skill is your operating manual for this task.
 >
 > ## Hard Rules
-> 1. Root cause first — if thinking "just try this," STOP and check Red Flags.
-> 2. Instrument multi-layer systems BEFORE tracing.
+> 1. Invoke `superpowers:systematic-debugging` FIRST — before reading errors, before proposing fixes, before anything.
+> 2. Follow the skill's four phases in order. Do not skip phases.
 > 3. One fix at a time — never bundle multiple changes.
 > 4. Minimal diff — fix only what's broken.
 > 5. If 2 attempts fail — STOP. Report what you learned. Do NOT attempt fix #3.
@@ -669,7 +624,7 @@ Used in Phase 7 for multi-focus quality review. Launch 3 instances with differen
 18. **Commit per wave** — commit in the worktree after each wave passes verification so Fix Agents get clean per-wave diffs.
 19. **Early abort** — if 2+ consecutive waves have unresolved failures, stop and report rather than continuing to accumulate problems.
 20. **User checkpoints** — Phase 2 (clarification), Phase 4 (plan approval), Phase 7 (review findings), architectural escalation. Never skip these without user input.
-21. **Root cause before fixes** — Fix Agents must investigate before fixing. If a Fix Agent's report lacks root cause evidence, SendMessage asking for investigation before accepting fixes.
+21. **Root cause before fixes** — Fix Agents MUST invoke `superpowers:systematic-debugging` as their first action. If a Fix Agent's report lacks root cause evidence or doesn't reference the skill's phases, SendMessage asking it to invoke the skill and restart investigation.
 22. **Escalate architectural failures** — when Fix Agent reports that fixes reveal problems in different places or create new symptoms, present the investigation report to the user with redesign/continue/abort options. Do not silently continue.
 23. ⛔ **Never stash (NON-NEGOTIABLE)** — NEVER run `git stash` automatically. If the working tree is dirty, STOP and present the dirty files to the user. Ask them how to proceed. Do not offer to stash on their behalf.
 24. **Stop on dirty git errors** — if any git operation fails due to uncommitted changes, unstaged files, or other dirty-state issues, STOP immediately and ask the user. Do not attempt to resolve dirty-git errors automatically.

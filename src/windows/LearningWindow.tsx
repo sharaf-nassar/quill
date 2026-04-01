@@ -6,7 +6,7 @@ import RuleCard from "../components/learning/RuleCard";
 import DomainBreakdown from "../components/learning/DomainBreakdown";
 import FloatingRunsWindow from "../components/learning/FloatingRunsWindow";
 import { MemoriesPanel } from "../components/learning/MemoriesPanel";
-import type { LearningSettings } from "../types";
+import type { LearningSettings, ProviderFilter } from "../types";
 import "../styles/learning.css";
 
 const TRIGGER_OPTIONS = [
@@ -109,6 +109,7 @@ function LearningSettingsInline({
 }
 
 function LearningPanel() {
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>("all");
   const {
     settings,
     rules,
@@ -123,7 +124,7 @@ function LearningPanel() {
     triggerAnalysis,
     deleteRule,
     promoteRule,
-  } = useLearningData();
+  } = useLearningData(providerFilter);
 
   const [activeTab, setActiveTab] = useState<"rules" | "memories">("rules");
   const [showRuns, setShowRuns] = useState(false);
@@ -177,6 +178,16 @@ function LearningPanel() {
             Memories
           </button>
         </div>
+        <select
+          className="learning-provider-filter"
+          value={providerFilter}
+          onChange={(event) => setProviderFilter(event.target.value as ProviderFilter)}
+          aria-label="Provider filter"
+        >
+          <option value="all">All Providers</option>
+          <option value="claude">Claude</option>
+          <option value="codex">Codex</option>
+        </select>
         <div className="learning-toolbar-right">
           {settings.trigger_mode !== "on-demand" && (
             <button
@@ -214,6 +225,7 @@ function LearningPanel() {
         {activeTab === "rules" ? (
           <>
             <StatusStrip
+              providerFilter={providerFilter}
               observationCount={observationCount}
               unanalyzedCount={unanalyzedCount}
               topTools={topTools}
@@ -259,7 +271,7 @@ function LearningPanel() {
             })()}
           </>
         ) : (
-          <MemoriesPanel />
+          <MemoriesPanel providerFilter={providerFilter} />
         )}
       </div>
       {showRuns && (

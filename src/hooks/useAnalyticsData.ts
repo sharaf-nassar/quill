@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { RangeType, DataPoint, BucketStats, UsageBucket } from "../types";
+import { usageBucketRefKey } from "../types";
 
 const REFRESH_INTERVAL_MS = 60_000; // Re-fetch every 60s to keep chart current
 
@@ -12,9 +13,8 @@ const RANGES: Record<RangeType, { label: string; days: number }> = {
 };
 
 export function useAnalyticsData(
-  bucket: string,
+  bucket: UsageBucket | null,
   range: RangeType,
-  currentBuckets: UsageBucket[] | undefined,
 ) {
   const [history, setHistory] = useState<DataPoint[]>([]);
   const [stats, setStats] = useState<BucketStats | null>(null);
@@ -22,13 +22,16 @@ export function useAnalyticsData(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const bucketsRef = useRef(currentBuckets);
-  bucketsRef.current = currentBuckets;
-  const hasBuckets = !!(currentBuckets && currentBuckets.length > 0);
+  const bucketRef = useRef(bucket);
+  bucketRef.current = bucket;
+  const bucketIdentity = bucket ? usageBucketRefKey(bucket) : "none";
 
   const initialLoadDone = useRef(false);
+  const requestIdRef = useRef(0);
 
   const fetchData = useCallback(async () => {
+    const requestId = requestIdRef.current + 1;
+    requestIdRef.current = requestId;
     // Only show loading skeleton on initial fetch, not periodic refreshes
     if (!initialLoadDone.current) {
       setLoading(true);
@@ -37,38 +40,52 @@ export function useAnalyticsData(
 
     try {
       const days = RANGES[range]?.days ?? 1;
-      const buckets = bucketsRef.current;
-
-      const hasBucketsNow = buckets && buckets.length > 0;
+      const currentBucket = bucketRef.current;
+      const hasBucket = bucketIdentity !== "none" && currentBucket !== null;
 
       const [historyData, countData, statsData] = await Promise.all([
-        invoke<DataPoint[]>("get_usage_history", { bucket, range }),
+        hasBucket
+          ? invoke<DataPoint[]>("get_usage_history", {
+              provider: currentBucket.provider,
+              bucketKey: currentBucket.key,
+              range,
+            })
+          : Promise.resolve([]),
         invoke<number>("get_snapshot_count"),
-        hasBucketsNow
-          ? invoke<BucketStats>("get_usage_stats", { bucket, days })
+        hasBucket
+          ? invoke<BucketStats>("get_usage_stats", {
+              provider: currentBucket.provider,
+              bucketKey: currentBucket.key,
+              days,
+            })
           : Promise.resolve(null),
       ]);
+
+      if (requestId !== requestIdRef.current) {
+        return;
+      }
 
       setHistory(historyData);
       setSnapshotCount(countData);
 
-      if (hasBucketsNow && statsData) {
-        const currentBucket = buckets.find((b) => b.label === bucket);
-        if (currentBucket) {
-          setStats({ ...statsData, current: currentBucket.utilization });
-        } else {
-          setStats(statsData);
-        }
+      if (hasBucket && currentBucket && statsData) {
+        setStats({ ...statsData, current: currentBucket.utilization });
+      } else {
+        setStats(null);
       }
     } catch (e) {
+      if (requestId !== requestIdRef.current) {
+        return;
+      }
       console.error("Analytics fetch error:", e);
       setError(String(e));
     } finally {
-      setLoading(false);
-      initialLoadDone.current = true;
+      if (requestId === requestIdRef.current) {
+        setLoading(false);
+        initialLoadDone.current = true;
+      }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- hasBuckets triggers re-fetch when buckets arrive (data read from ref)
-  }, [bucket, range, hasBuckets]);
+  }, [bucketIdentity, range]);
 
   useEffect(() => {
     fetchData();

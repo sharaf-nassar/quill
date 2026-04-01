@@ -7,10 +7,12 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import TitleBar from "./components/TitleBar";
 import UsageDisplay from "./components/UsageDisplay";
 import AnalyticsView from "./components/analytics/AnalyticsView";
+import type { UseIntegrationsResult } from "./hooks/useIntegrations";
 import { useToast } from "./hooks/useToast";
 import type { UsageData, TimeMode, PendingUpdate } from "./types";
 
 const BASE_WIDTH = 260;
+const MIN_LIVE_SCALE = 0.35;
 const BASE_HEIGHTS: Record<TimeMode, number> = {
 	marker: 200,
 	dual: 250,
@@ -85,7 +87,11 @@ function loadTimeMode(): TimeMode {
 	return "marker";
 }
 
-function App() {
+interface AppProps {
+	integrations: UseIntegrationsResult;
+}
+
+function App({ integrations }: AppProps) {
 	const { toast } = useToast();
 	const [usageData, setUsageData] = useState<UsageData | null>(null);
 	const [showMenu, setShowMenu] = useState(false);
@@ -103,6 +109,18 @@ function App() {
 	const currentLayoutRef = useRef<LayoutKey | null>(
 		layoutKey(loadBool(SHOW_LIVE_KEY, true), loadBool(SHOW_ANALYTICS_KEY, false)),
 	);
+	const {
+		statuses,
+		loading: providersLoading,
+		error: providersError,
+		hasEnabledProvider,
+		refresh: refreshIntegrations,
+	} = integrations;
+	const hasDetectedProvider = statuses.some((status) => status.detectedCli);
+	const liveProviderKey = statuses
+		.filter((status) => status.enabled)
+		.map((status) => status.provider)
+		.join(",");
 
 	const saveCurrentSize = useCallback(async () => {
 		const key = currentLayoutRef.current;
@@ -172,12 +190,26 @@ function App() {
 
 	const isSplit = showLive && showAnalytics;
 
+	const observeLiveTargets = useCallback((observer: ResizeObserver) => {
+		const liveEl = liveRef.current;
+		if (!liveEl) return;
+
+		observer.observe(liveEl);
+
+		const usageDisplay = liveEl.querySelector(".usage-display");
+		if (usageDisplay instanceof HTMLElement) {
+			observer.observe(usageDisplay);
+		}
+	}, []);
+
 	const handleDividerMouseDown = useCallback(
 		(e: React.MouseEvent<HTMLDivElement>) => {
 			e.preventDefault();
 			const liveEl = liveRef.current;
 			const containerEl = upperRef.current;
 			if (!liveEl || !containerEl) return;
+			const dividerRect = e.currentTarget.getBoundingClientRect();
+			const dragOffset = e.clientY - dividerRect.top;
 
 			const liveInner = liveEl.querySelector(".usage-display") as HTMLElement | null;
 			const analyticsInner = containerEl.querySelector(".analytics-view") as HTMLElement | null;
@@ -204,7 +236,11 @@ function App() {
 				const clientY = ev.clientY;
 				rafId = requestAnimationFrame(() => {
 					const rect = containerEl.getBoundingClientRect();
-					const ratio = Math.max(MIN_SPLIT, Math.min(MAX_SPLIT, (clientY - rect.top) / rect.height));
+					const dividerTop = clientY - dragOffset;
+					const ratio = Math.max(
+						MIN_SPLIT,
+						Math.min(MAX_SPLIT, (dividerTop - rect.top) / rect.height),
+					);
 					splitRatioRef.current = ratio;
 					liveEl.style.flex = `0 0 ${ratio * 100}%`;
 				});
@@ -227,8 +263,8 @@ function App() {
 					analyticsInner.style.flex = "";
 				}
 
-				if (observerRef.current && liveRef.current) {
-					observerRef.current.observe(liveRef.current);
+				if (observerRef.current) {
+					observeLiveTargets(observerRef.current);
 				}
 
 				setSplitRatio(splitRatioRef.current);
@@ -238,7 +274,7 @@ function App() {
 			document.addEventListener("mousemove", onMouseMove);
 			document.addEventListener("mouseup", onMouseUp);
 		},
-		[],
+		[observeLiveTargets],
 	);
 
 	const handleDividerKeyDown = useCallback(
@@ -267,15 +303,22 @@ function App() {
 			setUsageData(data);
 		} catch (e) {
 			toast("error", `Usage data fetch failed: ${e}`);
-			setUsageData({ buckets: [], error: String(e) });
+			setUsageData({ buckets: [], provider_errors: [], error: String(e) });
 		}
 	}, [toast]);
 
 	useEffect(() => {
+		if (providersLoading) {
+			return;
+		}
+		if (!hasEnabledProvider) {
+			setUsageData(null);
+			return;
+		}
 		refresh();
 		const interval = setInterval(refresh, 3 * 60_000);
 		return () => clearInterval(interval);
-	}, [refresh]);
+	}, [hasEnabledProvider, providersLoading, refresh]);
 
 	const [pendingUpdate, setPendingUpdate] = useState<PendingUpdate | null>(null);
 	const [updating, setUpdating] = useState(false);
@@ -333,9 +376,8 @@ function App() {
 		const el = liveRef.current;
 		if (!el) return;
 
-		const baseH = BASE_HEIGHTS[timeMode] ?? 200;
+		const fallbackHeight = BASE_HEIGHTS[timeMode] ?? 200;
 		let rafId = 0;
-		let lastScale = -1;
 
 		const updateScale = () => {
 			cancelAnimationFrame(rafId);
@@ -343,26 +385,34 @@ function App() {
 				const w = el.clientWidth;
 				const h = el.clientHeight;
 				if (w <= 0 || h <= 0) return;
+
+				el.style.setProperty("--s", "1");
+				const usageDisplay = el.querySelector(".usage-display");
+				const contentHeight =
+					usageDisplay instanceof HTMLElement
+						? Math.max(usageDisplay.scrollHeight, fallbackHeight)
+						: fallbackHeight;
 				const wScale = w / BASE_WIDTH;
-				const hScale = h / baseH;
-				const scale = Math.round(Math.max(0.6, Math.min(wScale, hScale, 2.5)) * 100) / 100;
-				if (scale !== lastScale) {
-					lastScale = scale;
-					el.style.setProperty("--s", String(scale));
-				}
+				const hScale = h / contentHeight;
+				const maxLiveScale = isSplit ? 1 : 2.5;
+				const scale =
+					Math.round(
+						Math.max(MIN_LIVE_SCALE, Math.min(wScale, hScale, maxLiveScale)) * 100,
+					) / 100;
+				el.style.setProperty("--s", String(scale));
 			});
 		};
 
 		const observer = new ResizeObserver(updateScale);
 		observerRef.current = observer;
-		observer.observe(el);
+		observeLiveTargets(observer);
 		updateScale();
 		return () => {
 			observer.disconnect();
 			observerRef.current = null;
 			cancelAnimationFrame(rafId);
 		};
-	}, [timeMode, showLive]);
+	}, [isSplit, timeMode, showLive, usageData, liveProviderKey, observeLiveTargets]);
 
 	const handleContextMenu = (e: React.MouseEvent) => {
 		e.preventDefault();
@@ -382,12 +432,36 @@ function App() {
 		await invoke("quit_app");
 	};
 
-	const handleRefresh = () => {
+	const handleRefresh = async () => {
 		closeMenu();
-		refresh();
+		await refreshIntegrations();
+		if (hasEnabledProvider && !providersLoading) {
+			await refresh();
+		}
 	};
 
 	const liveStyle = isSplit ? { flex: `0 0 ${splitRatio * 100}%` } : undefined;
+	const emptyState = (() => {
+		if (providersError) {
+			return {
+				title: "Provider status unavailable",
+				description:
+					"Quill could not load integration status. Restart the app, then enable Claude Code or Codex from the QUILL menu.",
+			};
+		}
+		if (hasDetectedProvider) {
+			return {
+				title: "No provider is enabled",
+				description:
+					"Enable Claude Code or Codex from the QUILL menu to restore Quill features.",
+			};
+		}
+		return {
+			title: "Install Claude Code or Codex",
+			description:
+				"Quill needs at least one supported provider installed and enabled before its features can run.",
+		};
+	})();
 
 	return (
 		<div className="app" onContextMenu={handleContextMenu} onClick={closeMenu}>
@@ -400,21 +474,49 @@ function App() {
 				pendingUpdate={pendingUpdate}
 				updating={updating}
 				onUpdate={handleUpdate}
+				providersLoading={providersLoading}
+				hasEnabledProvider={hasEnabledProvider}
 			/>
 			<div
 				className={`panels${isSplit ? " panels--split" : ""}`}
 				ref={upperRef}
 			>
-				{showLive && (
+				{providersLoading ? (
+					<div className="content">
+						<div className="loading">Checking integrations...</div>
+					</div>
+				) : !hasEnabledProvider ? (
+					<div className="content">
+						<div className="integration-empty-state">
+							<p className="integration-empty-state__eyebrow">Providers</p>
+							<h2 className="integration-empty-state__title">
+								{emptyState.title}
+							</h2>
+							<p className="integration-empty-state__description">
+								{emptyState.description}
+							</p>
+							<button
+								className="integration-empty-state__action"
+								onClick={() => void refreshIntegrations()}
+								disabled={providersLoading}
+							>
+								Rescan Providers
+							</button>
+						</div>
+					</div>
+				) : (
+					<>
+						{showLive && (
 					<div className="content live-content" ref={liveRef} style={liveStyle}>
 						<UsageDisplay
 							data={usageData}
 							timeMode={timeMode}
+							enabledProviders={statuses.filter((status) => status.enabled).map((status) => status.provider)}
 							onTimeModeChange={handleTimeModeChange}
 						/>
 					</div>
-				)}
-				{isSplit && (
+						)}
+						{isSplit && (
 					<div
 						className="panel-divider"
 						role="separator"
@@ -424,16 +526,18 @@ function App() {
 						onMouseDown={handleDividerMouseDown}
 						onKeyDown={handleDividerKeyDown}
 					/>
-				)}
-				{showAnalytics && (
+						)}
+						{showAnalytics && (
 					<div className="content analytics-content">
 						<AnalyticsView currentBuckets={usageData?.buckets ?? []} />
 					</div>
-				)}
-				{!showLive && !showAnalytics && (
+						)}
+						{!showLive && !showAnalytics && (
 					<div className="content">
 						<div className="loading">Toggle a view from the titlebar</div>
 					</div>
+						)}
+					</>
 				)}
 			</div>
 			{showMenu && (
@@ -442,7 +546,7 @@ function App() {
 					style={{ left: menuPos.x, top: menuPos.y }}
 					onClick={(e) => e.stopPropagation()}
 				>
-					<button className="context-menu-item" onClick={handleRefresh}>
+					<button className="context-menu-item" onClick={() => void handleRefresh()}>
 						Refresh
 					</button>
 					<button className="context-menu-item" onClick={handleQuit}>

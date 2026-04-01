@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import { useIntegrations } from "../hooks/useIntegrations";
 import {
 	useInstalledPlugins,
 	useMarketplaces,
@@ -13,16 +14,34 @@ import InstalledTab from "../components/plugins/InstalledTab";
 import BrowseTab from "../components/plugins/BrowseTab";
 import MarketplacesTab from "../components/plugins/MarketplacesTab";
 import UpdatesTab from "../components/plugins/UpdatesTab";
-import type { PluginsTab } from "../types";
+import type { IntegrationProvider, PluginsTab } from "../types";
 import "../styles/plugins.css";
+
+function providerLabel(provider: IntegrationProvider): string {
+	return provider === "claude" ? "Claude Code" : "Codex";
+}
 
 function PluginsWindowView() {
 	const [activeTab, setActiveTab] = useState<PluginsTab>("installed");
-	const installed = useInstalledPlugins();
-	const marketplaces = useMarketplaces();
-	const updates = useAvailableUpdates();
+	const integrations = useIntegrations();
+	const enabledProviders = integrations.statuses
+		.filter((status) => status.enabled)
+		.map((status) => status.provider);
+	const fallbackProvider = enabledProviders[0] ?? null;
+	const [selectedProvider, setSelectedProvider] =
+		useState<IntegrationProvider | null>(fallbackProvider);
+	const installed = useInstalledPlugins(selectedProvider);
+	const marketplaces = useMarketplaces(selectedProvider);
+	const updates = useAvailableUpdates(selectedProvider);
 	const operations = usePluginOperations();
-	const bulkUpdate = useBulkUpdate();
+	const bulkUpdate = useBulkUpdate(selectedProvider);
+
+	useEffect(() => {
+		if (selectedProvider && enabledProviders.includes(selectedProvider)) {
+			return;
+		}
+		setSelectedProvider(fallbackProvider);
+	}, [enabledProviders, fallbackProvider, selectedProvider]);
 
 	const refreshInstalled = installed.refresh;
 	const refreshMarketplaces = marketplaces.refresh;
@@ -40,32 +59,44 @@ function PluginsWindowView() {
 
 	const handleAddMarketplace = useCallback(
 		async (repo: string) => {
-			await invoke("add_marketplace", { repo });
+			if (!selectedProvider) {
+				return;
+			}
+			await invoke("add_marketplace", { provider: selectedProvider, repo });
 			handlePluginChanged();
 		},
-		[handlePluginChanged],
+		[handlePluginChanged, selectedProvider],
 	);
 
 	const handleRemoveMarketplace = useCallback(
 		async (name: string) => {
-			await invoke("remove_marketplace", { name });
+			if (!selectedProvider) {
+				return;
+			}
+			await invoke("remove_marketplace", { provider: selectedProvider, name });
 			handlePluginChanged();
 		},
-		[handlePluginChanged],
+		[handlePluginChanged, selectedProvider],
 	);
 
 	const handleRefreshMarketplace = useCallback(
 		async (name: string) => {
-			await invoke("refresh_marketplace", { name });
+			if (!selectedProvider) {
+				return;
+			}
+			await invoke("refresh_marketplace", { provider: selectedProvider, name });
 			handlePluginChanged();
 		},
-		[handlePluginChanged],
+		[handlePluginChanged, selectedProvider],
 	);
 
 	const handleRefreshAllMarketplaces = useCallback(async () => {
-		await invoke("refresh_all_marketplaces");
+		if (!selectedProvider) {
+			return;
+		}
+		await invoke("refresh_all_marketplaces", { provider: selectedProvider });
 		handlePluginChanged();
-	}, [handlePluginChanged]);
+	}, [handlePluginChanged, selectedProvider]);
 
 	// Auto-dismiss operation result after 5 seconds
 	const lastResult = operations.lastResult;
@@ -106,10 +137,29 @@ function PluginsWindowView() {
 				</div>
 			)}
 			<div className="plugins-body">
-				{installed.loading && marketplaces.loading ? (
+				{!selectedProvider ? (
+					<div className="plugins-loading">
+						Enable Claude Code or Codex from the QUILL menu to manage plugins.
+					</div>
+				) : installed.loading && marketplaces.loading ? (
 					<div className="plugins-loading">Loading...</div>
 				) : (
 					<>
+						<div className="plugins-provider-switcher">
+							{enabledProviders.map((provider) => (
+								<button
+									key={provider}
+									className={`plugins-provider-switcher__button${
+										selectedProvider === provider
+											? " plugins-provider-switcher__button--active"
+											: ""
+									}`}
+									onClick={() => setSelectedProvider(provider)}
+								>
+									{providerLabel(provider)}
+								</button>
+							))}
+						</div>
 						<PluginsTabs
 							activeTab={activeTab}
 							onTabChange={setActiveTab}
@@ -132,6 +182,7 @@ function PluginsWindowView() {
 						{activeTab === "marketplaces" && (
 							<MarketplacesTab
 								marketplaces={marketplaces.marketplaces}
+								allowEditing={selectedProvider === "claude"}
 								onAdd={handleAddMarketplace}
 								onRemove={handleRemoveMarketplace}
 								onRefresh={handleRefreshMarketplace}
@@ -140,6 +191,7 @@ function PluginsWindowView() {
 						)}
 						{activeTab === "updates" && (
 							<UpdatesTab
+								provider={selectedProvider}
 								updates={updates}
 								operations={operations}
 								bulkUpdate={bulkUpdate}

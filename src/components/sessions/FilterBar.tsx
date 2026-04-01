@@ -1,5 +1,10 @@
 import { useState } from "react";
-import type { SearchFilters, SearchFacets, SortMode } from "../../types";
+import type {
+	IntegrationProvider,
+	SearchFilters,
+	SearchFacets,
+	SortMode,
+} from "../../types";
 
 interface FilterBarProps {
 	facets: SearchFacets;
@@ -15,6 +20,9 @@ function FilterBar({ facets, filters, onChange, sortBy, onSortChange }: FilterBa
 	const update = (patch: Partial<SearchFilters>) => {
 		onChange({ ...filters, ...patch });
 	};
+
+	const providerLabel = (provider: IntegrationProvider) =>
+		provider === "claude" ? "Claude Code" : "Codex";
 
 	return (
 		<div className="sessions-filter-bar">
@@ -42,6 +50,25 @@ function FilterBar({ facets, filters, onChange, sortBy, onSortChange }: FilterBa
 			</div>
 			{expanded && (
 				<div className="sessions-filter-controls">
+					<select
+						className="sessions-filter-select"
+						value={filters.provider ?? ""}
+						onChange={(e) =>
+							update({
+								provider:
+									e.target.value === "claude" || e.target.value === "codex"
+										? e.target.value
+										: undefined,
+							})
+						}
+					>
+						<option value="">All providers</option>
+						{facets.providers.map((provider) => (
+							<option key={provider.name} value={provider.name}>
+								{providerLabel(provider.name as IntegrationProvider)} ({provider.count})
+							</option>
+						))}
+					</select>
 					<select
 						className="sessions-filter-select"
 						value={filters.project ?? ""}

@@ -1,5 +1,7 @@
+use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::integrations::IntegrationProvider;
 use crate::models::{
     AnalysisOutput, LearningLogEvent, LearningRunPayload, RunPhase, StreamFindings,
 };
@@ -18,12 +20,83 @@ pub fn is_safe_rule_name(name: &str) -> bool {
         && !name.starts_with('-')
 }
 
+fn requested_provider_scope(provider: Option<IntegrationProvider>) -> Vec<IntegrationProvider> {
+    match provider {
+        Some(provider) => vec![provider],
+        None => vec![IntegrationProvider::Claude, IntegrationProvider::Codex],
+    }
+}
+
+fn provider_scope_label(provider_scope: &[IntegrationProvider]) -> String {
+    let labels: Vec<&str> = provider_scope
+        .iter()
+        .map(|provider| match provider {
+            IntegrationProvider::Claude => "Claude Code",
+            IntegrationProvider::Codex => "Codex",
+        })
+        .collect();
+    match labels.as_slice() {
+        [] => "agent".to_string(),
+        [single] => (*single).to_string(),
+        _ => labels.join(" + "),
+    }
+}
+
+fn quill_rules_root() -> PathBuf {
+    dirs::config_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("quill")
+        .join("learned-rules")
+}
+
+pub fn learned_rules_dir_for_scope(provider_scope: &[IntegrationProvider]) -> PathBuf {
+    let only_claude = provider_scope == [IntegrationProvider::Claude];
+    if only_claude {
+        return dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".claude")
+            .join("rules")
+            .join("learned");
+    }
+
+    let suffix = if provider_scope == [IntegrationProvider::Codex] {
+        "codex"
+    } else {
+        "shared"
+    };
+    quill_rules_root().join(suffix)
+}
+
+fn rule_directories_for_scope(provider_scope: &[IntegrationProvider]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if provider_scope.contains(&IntegrationProvider::Claude) {
+        dirs.push(
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".claude")
+                .join("rules"),
+        );
+    }
+    if provider_scope.contains(&IntegrationProvider::Codex) {
+        dirs.push(quill_rules_root().join("codex"));
+    }
+    if provider_scope.contains(&IntegrationProvider::Claude)
+        || provider_scope.contains(&IntegrationProvider::Codex)
+    {
+        dirs.push(quill_rules_root().join("shared"));
+    }
+    dirs
+}
+
 /// Stream A: extract behavioral patterns from unanalyzed tool-use observations.
 /// Returns owned logs alongside findings so it can run inside `tokio::join!`.
+#[allow(clippy::too_many_arguments)]
 async fn analyze_observations_stream(
     storage: &'static Storage,
     min_obs: i64,
     max_rules: usize,
+    provider: Option<IntegrationProvider>,
     existing_rules_summary: String,
     existing_list: String,
     app: tauri::AppHandle,
@@ -43,7 +116,10 @@ async fn analyze_observations_stream(
 		}};
 	}
 
-    let unanalyzed = match storage.get_unanalyzed_observation_count() {
+    let provider_scope = requested_provider_scope(provider);
+    let provider_label = provider_scope_label(&provider_scope);
+
+    let unanalyzed = match storage.get_unanalyzed_observation_count(provider) {
         Ok(count) => count,
         Err(e) => {
             stream_log!("Stream A: failed to get observation count: {e}");
@@ -60,7 +136,7 @@ async fn analyze_observations_stream(
 
     stream_log!("Stream A: found {unanalyzed} unanalyzed observations");
 
-    let observations = match storage.get_unanalyzed_observations(100) {
+    let observations = match storage.get_unanalyzed_observations(100, provider) {
         Ok(obs) => obs,
         Err(e) => {
             stream_log!("Stream A: failed to get observations: {e}");
@@ -86,6 +162,10 @@ async fn analyze_observations_stream(
             .and_then(|v| v.as_str())
             .unwrap_or("global")
             .to_string();
+        let provider_name = obs
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let input_preview = obs
             .get("tool_input")
             .and_then(|v| v.as_str())
@@ -117,19 +197,22 @@ async fn analyze_observations_stream(
             format!("- {phase} {tool}: {input_preview}")
         };
 
-        project_obs.entry(project).or_default().push(line);
+        project_obs
+            .entry(format!("{provider_name}:{project}"))
+            .or_default()
+            .push(line);
     }
 
     let obs_summary = project_obs
         .iter()
-        .map(|(proj, lines)| format!("[Project: {proj}]\n{}", lines.join("\n")))
+        .map(|(project_key, lines)| format!("[Scope: {project_key}]\n{}", lines.join("\n")))
         .collect::<Vec<_>>()
         .join("\n\n");
 
     let today = chrono::Utc::now().format("%Y-%m-%d");
 
     let prompt = format!(
-        "Analyze these Claude Code tool-use observations and extract 0-{max_rules} behavioral \
+        "Analyze these {provider_label} tool-use observations and extract 0-{max_rules} behavioral \
 		 patterns that should become persistent rules.\n\
 		 Focus on repeated corrections, error sequences, consistent preferences, and workflow friction.\n\
 		 For each pattern, determine if it is a positive pattern (\"do this\") or an \
@@ -156,7 +239,7 @@ async fn analyze_observations_stream(
         prompt.len()
     );
 
-    let preamble = "You are a behavioral pattern analyzer for Claude Code tool-use observations. \
+    let preamble = "You are a behavioral pattern analyzer for agent tool-use observations. \
 	                Respond with structured JSON matching the provided schema.";
 
     match crate::ai_client::analyze_typed::<StreamFindings>(
@@ -282,7 +365,7 @@ async fn synthesize_findings(
     insights: Option<&InsightsData>,
     existing_rules_summary: &str,
     memory_context: &str,
-    claude_md_context: &str,
+    instruction_context: &str,
     max_rules: usize,
     logs: &mut Vec<String>,
     app: &tauri::AppHandle,
@@ -367,15 +450,14 @@ async fn synthesize_findings(
         prompt.push('\n');
     }
 
-    if !claude_md_context.is_empty() {
+    if !instruction_context.is_empty() {
+        prompt
+            .push_str("\n## Existing Instructions (DO NOT create rules that duplicate these)\n\n");
+        prompt.push_str("The following instruction files already exist. Do not create rules that duplicate these directives. ");
         prompt.push_str(
-            "\n## Existing CLAUDE.md Instructions (DO NOT create rules that duplicate these)\n\n",
+            "If you notice a pattern that's already covered by an instruction directive, skip it.\n\n",
         );
-        prompt.push_str("The following CLAUDE.md instructions already exist. Do not create rules that duplicate these directives. ");
-        prompt.push_str(
-            "If you notice a pattern that's already covered by a CLAUDE.md directive, skip it.\n\n",
-        );
-        prompt.push_str(claude_md_context);
+        prompt.push_str(instruction_context);
         prompt.push('\n');
     }
 
@@ -413,14 +495,17 @@ async fn synthesize_findings(
 pub async fn spawn_analysis(
     storage: &'static Storage,
     trigger: &str,
+    provider: Option<IntegrationProvider>,
     app: &tauri::AppHandle,
     micro: bool,
 ) -> Result<(), String> {
     // ── Phase 0: Setup ──────────────────────────────────────────────────
     let phase0_start = Instant::now();
+    let provider_scope = requested_provider_scope(provider);
+    let provider_label = provider_scope_label(&provider_scope);
 
     let run_id = storage
-        .create_learning_run(trigger)
+        .create_learning_run(trigger, &provider_scope)
         .map_err(|e| format!("Failed to create learning run: {e}"))?;
     let _ = app.emit("learning-updated", ());
 
@@ -467,35 +552,34 @@ pub async fn spawn_analysis(
     let mode_label = if micro { "micro" } else { "full" };
     log::info!("Learning analysis started (trigger={trigger}, mode={mode_label})");
     run_log!(
-        "Starting {mode_label} analysis (trigger={trigger}, min_obs={min_obs}, min_confidence={min_confidence:.2})"
+        "Starting {mode_label} analysis for {provider_label} (trigger={trigger}, min_obs={min_obs}, min_confidence={min_confidence:.2})"
     );
 
     // Read existing rules and build summaries
-    let existing_rules = storage.get_learned_rules().unwrap_or_default();
+    let existing_rules = storage.get_learned_rules(provider).unwrap_or_default();
     let existing_filenames: Vec<String> = existing_rules
         .iter()
         .map(|r| format!("{}.md", r.name))
         .collect();
 
     let mut all_rule_files = existing_filenames;
-    if let Some(home) = dirs::home_dir() {
-        let rules_dir = home.join(".claude").join("rules");
-        if rules_dir.exists() {
-            fn collect_md_files(dir: &std::path::Path, out: &mut Vec<String>) {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            collect_md_files(&path, out);
-                        } else if path.is_file()
-                            && path.extension().is_some_and(|e| e == "md")
-                            && let Some(name) = path.file_name().and_then(|n| n.to_str())
-                        {
-                            out.push(name.to_string());
-                        }
-                    }
+    fn collect_md_files(dir: &std::path::Path, out: &mut Vec<String>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_md_files(&path, out);
+                } else if path.is_file()
+                    && path.extension().is_some_and(|e| e == "md")
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    out.push(name.to_string());
                 }
             }
+        }
+    }
+    for rules_dir in rule_directories_for_scope(&provider_scope) {
+        if rules_dir.exists() {
             collect_md_files(&rules_dir, &mut all_rule_files);
         }
     }
@@ -528,7 +612,7 @@ pub async fn spawn_analysis(
     // Determine project path from observations for Stream B and memory/CLAUDE.md context
     let obs_limit = if micro { 30 } else { 100 };
     let observations = storage
-        .get_unanalyzed_observations(obs_limit)
+        .get_unanalyzed_observations(obs_limit, provider)
         .map_err(|e| format!("Failed to get observations: {e}"))?;
 
     let project_path = observations
@@ -538,59 +622,41 @@ pub async fn spawn_analysis(
         .unwrap_or("global")
         .to_string();
 
-    // Gather memory files context
-    let memory_context = {
-        let mut ctx = String::new();
-        let mem_dir = crate::memory_optimizer::memory_dir(&project_path);
-        if mem_dir.exists()
-            && let Ok(entries) = std::fs::read_dir(&mem_dir)
-        {
-            let mut budget = 40_000usize;
-            for entry in entries.flatten() {
-                if budget == 0 {
-                    break;
-                }
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
-                    let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
-                    ctx.push_str(&format!("- {name}: {truncated}\n"));
-                    budget = budget.saturating_sub(truncated.len() + name.len() + 4);
-                }
-            }
-        }
-        ctx
-    };
-
-    // Gather CLAUDE.md context
-    let claude_md_context = {
-        let mut ctx = String::new();
-        let mut budget = 40_000usize;
-        let project_claude_md = std::path::PathBuf::from(&project_path).join("CLAUDE.md");
-        if project_claude_md.exists()
-            && let Ok(content) = std::fs::read_to_string(&project_claude_md)
-        {
-            let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
-            let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
-            ctx.push_str(&format!("- Project CLAUDE.md: {truncated}\n"));
-            budget = budget.saturating_sub(truncated.len() + 20);
-        }
-        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
-        let global_claude_md = home.join(".claude").join("CLAUDE.md");
-        if global_claude_md.exists()
-            && budget > 100
-            && let Ok(content) = std::fs::read_to_string(&global_claude_md)
-        {
-            let sanitized = crate::prompt_utils::sanitize_for_prompt(&content);
-            let truncated = crate::prompt_utils::safe_truncate(&sanitized, budget);
-            ctx.push_str(&format!("- Global CLAUDE.md: {truncated}\n"));
-        }
-        ctx
-    };
+    let scanned_context =
+        crate::memory_optimizer::scan_memory_files(storage, &project_path, provider)
+            .unwrap_or_default();
+    let memory_context = scanned_context
+        .iter()
+        .filter(|file| !matches!(file.memory_type.as_deref(), Some("claude-md" | "agents-md")))
+        .map(|file| {
+            format!(
+                "- [{}] {}: {}",
+                file.provider.as_str(),
+                file.file_name,
+                crate::prompt_utils::safe_truncate(
+                    &crate::prompt_utils::sanitize_for_prompt(&file.content),
+                    4_000,
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instruction_context = scanned_context
+        .iter()
+        .filter(|file| matches!(file.memory_type.as_deref(), Some("claude-md" | "agents-md")))
+        .map(|file| {
+            format!(
+                "- [{}] {}: {}",
+                file.provider.as_str(),
+                file.file_name,
+                crate::prompt_utils::safe_truncate(
+                    &crate::prompt_utils::sanitize_for_prompt(&file.content),
+                    4_000,
+                )
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
 
     phases.push(RunPhase {
         name: "setup".to_string(),
@@ -611,6 +677,7 @@ pub async fn spawn_analysis(
             storage,
             min_obs,
             max_rules,
+            provider,
             existing_rules_summary.clone(),
             existing_list.clone(),
             app.clone(),
@@ -653,6 +720,7 @@ pub async fn spawn_analysis(
                         error: Some(msg.clone()),
                         logs: Some(logs.join("\n")),
                         phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
+                        provider_scope: provider_scope.clone(),
                     },
                 );
                 return Err(msg);
@@ -667,6 +735,7 @@ pub async fn spawn_analysis(
                 storage,
                 min_obs,
                 max_rules,
+                provider,
                 existing_rules_summary.clone(),
                 existing_list.clone(),
                 app.clone(),
@@ -679,7 +748,7 @@ pub async fn spawn_analysis(
                 app.clone(),
                 run_id,
             ),
-            gather_insights(app.clone(), run_id),
+            gather_insights(provider, app.clone(), run_id),
         );
 
         // Destructure and merge logs
@@ -733,7 +802,7 @@ pub async fn spawn_analysis(
                 insights_result.as_ref(),
                 &existing_rules_summary,
                 &memory_context,
-                &claude_md_context,
+                &instruction_context,
                 max_rules,
                 &mut logs,
                 app,
@@ -754,6 +823,7 @@ pub async fn spawn_analysis(
                         error: Some(e.clone()),
                         logs: Some(logs.join("\n")),
                         phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
+                        provider_scope: provider_scope.clone(),
                     },
                 );
             })?;
@@ -791,6 +861,7 @@ pub async fn spawn_analysis(
                     error: Some(msg.clone()),
                     logs: Some(logs.join("\n")),
                     phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
+                    provider_scope: provider_scope.clone(),
                 },
             );
             return Err(msg);
@@ -817,11 +888,7 @@ pub async fn spawn_analysis(
     );
 
     // Write rule files and insert into DB
-    let base_rules_dir = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude")
-        .join("rules")
-        .join("learned");
+    let base_rules_dir = learned_rules_dir_for_scope(&provider_scope);
 
     let rules_dir = base_rules_dir.clone();
     std::fs::create_dir_all(&rules_dir).map_err(|e| format!("Failed to create rules dir: {e}"))?;
@@ -840,6 +907,7 @@ pub async fn spawn_analysis(
             observation_count: obs_count,
             project: None,
             source: Some(source_label.to_string()),
+            provider_scope: &provider_scope,
         },
         &mut logs,
         app,
@@ -879,7 +947,7 @@ pub async fn spawn_analysis(
 
     // Consolidation check: detect rules with overlapping names/domains
     if !micro {
-        let fresh_rules = storage.get_learned_rules().unwrap_or_default();
+        let fresh_rules = storage.get_learned_rules(provider).unwrap_or_default();
         let mut domain_groups: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for r in &fresh_rules {
@@ -942,6 +1010,7 @@ pub async fn spawn_analysis(
             error: None,
             logs: Some(logs.join("\n")),
             phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
+            provider_scope: provider_scope.clone(),
         },
     );
 
@@ -981,6 +1050,7 @@ struct InsightsData {
 /// Returns `None` on any failure (CLI error, no facets, parse errors).
 /// Returns owned logs alongside the result so it can run inside `tokio::join!`.
 async fn gather_insights(
+    provider: Option<IntegrationProvider>,
     app: tauri::AppHandle,
     run_id: i64,
 ) -> (Option<InsightsData>, Vec<String>) {
@@ -996,6 +1066,11 @@ async fn gather_insights(
             });
             logs.push(msg);
         }};
+	}
+
+    if provider == Some(IntegrationProvider::Codex) {
+        insight_log!("Skipping Claude insights for Codex-only analysis");
+        return (None, logs);
     }
 
     insight_log!("Running claude /insights to generate session analysis...");
@@ -1135,6 +1210,7 @@ struct WriteRuleParams<'a> {
     observation_count: i64,
     project: Option<String>,
     source: Option<String>,
+    provider_scope: &'a [IntegrationProvider],
 }
 
 /// Shared rule-writing logic used by `spawn_analysis`.
@@ -1156,6 +1232,7 @@ fn write_rule_files(
         observation_count,
         ref project,
         ref source,
+        provider_scope,
     } = *params;
     let mut rules_created = 0i64;
     let mut rules_updated = 0i64;
@@ -1214,6 +1291,7 @@ fn write_rule_files(
             is_anti_pattern: rule.is_anti_pattern,
             source: source.clone(),
             content: Some(sanitized_content.clone()),
+            provider_scope: provider_scope.to_vec(),
         });
 
         let anti_label = if rule.is_anti_pattern {

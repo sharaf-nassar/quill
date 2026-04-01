@@ -1,7 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { RangeType, TokenDataPoint, TokenStats } from "../types";
+import type {
+  IntegrationProvider,
+  RangeType,
+  TokenDataPoint,
+  TokenStats,
+} from "../types";
 
 const RANGE_DAYS: Record<RangeType, number> = {
   "1h": 1,
@@ -14,6 +19,7 @@ const REFRESH_DEBOUNCE_MS = 1000;
 
 export function useTokenData(
   range: RangeType,
+  provider: IntegrationProvider | null,
   hostname: string | null,
   sessionId: string | null,
   cwd: string | null,
@@ -34,6 +40,7 @@ export function useTokenData(
 
     try {
       const days = RANGE_DAYS[range] ?? 1;
+      const providerArg = provider || null;
       const hostnameArg = hostname || null;
       const sessionIdArg = sessionId || null;
       const cwdArg = cwd || null;
@@ -41,13 +48,16 @@ export function useTokenData(
       const [historyData, statsData, hostnameData] = await Promise.all([
         invoke<TokenDataPoint[]>("get_token_history", {
           range,
+          provider: providerArg,
           hostname: hostnameArg,
           sessionId: sessionIdArg,
           cwd: cwdArg,
         }),
         invoke<TokenStats>("get_token_stats", {
           days,
+          provider: providerArg,
           hostname: hostnameArg,
+          sessionId: sessionIdArg,
           cwd: cwdArg,
         }),
         invoke<string[]>("get_token_hostnames"),
@@ -63,7 +73,7 @@ export function useTokenData(
       setLoading(false);
       initialLoadDone.current = true;
     }
-  }, [range, hostname, sessionId, cwd]);
+  }, [range, provider, hostname, sessionId, cwd]);
 
   useEffect(() => {
     fetchData();

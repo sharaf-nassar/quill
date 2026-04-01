@@ -1,9 +1,10 @@
+use crate::integrations::IntegrationProvider;
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -27,7 +28,8 @@ pub struct StateFileEntry {
 // ── Types sent to frontend via Tauri commands ──
 
 #[derive(Serialize, Clone, Debug)]
-pub struct ClaudeInstance {
+pub struct RestartInstance {
+    pub provider: IntegrationProvider,
     pub pid: u32,
     pub session_id: Option<String>,
     pub cwd: String,
@@ -57,7 +59,7 @@ pub enum InstanceStatus {
 #[derive(Serialize, Clone, Debug)]
 pub struct RestartStatus {
     pub phase: RestartPhase,
-    pub instances: Vec<ClaudeInstance>,
+    pub instances: Vec<RestartInstance>,
     pub waiting_on: usize,
     pub elapsed_seconds: u64,
 }
@@ -77,7 +79,7 @@ pub enum RestartPhase {
 pub struct RestartState {
     pub running: AtomicBool,
     pub phase: parking_lot::Mutex<RestartPhase>,
-    pub instances: parking_lot::Mutex<Vec<ClaudeInstance>>,
+    pub instances: parking_lot::Mutex<Vec<RestartInstance>>,
     pub started_at: parking_lot::Mutex<Option<std::time::Instant>>,
 }
 
@@ -106,6 +108,14 @@ pub fn state_dir() -> PathBuf {
         .join("claude-state")
 }
 
+/// Returns Codex session transcript root: ~/.codex/sessions/
+pub fn codex_sessions_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".codex")
+        .join("sessions")
+}
+
 /// Returns the restart flag file path
 pub fn restart_flag_path() -> PathBuf {
     dirs::cache_dir()
@@ -130,8 +140,13 @@ pub fn hook_script_path() -> PathBuf {
         .join("claude-restart-hook.sh")
 }
 
-/// Returns the resume file directory: $XDG_CACHE_HOME/quill/claude-resume/
-pub fn resume_dir() -> PathBuf {
+/// Returns the provider-specific resume file directory under cache.
+pub fn resume_dir_for_provider(provider: IntegrationProvider) -> PathBuf {
+    let suffix = match provider {
+        IntegrationProvider::Claude => "claude-resume",
+        IntegrationProvider::Codex => "codex-resume",
+    };
+
     dirs::cache_dir()
         .unwrap_or_else(|| {
             dirs::home_dir()
@@ -139,7 +154,7 @@ pub fn resume_dir() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
         })
         .join("quill")
-        .join("claude-resume")
+        .join(suffix)
 }
 
 /// Returns the shell integration script path
@@ -226,13 +241,31 @@ pub fn read_state_files() -> Vec<(StateFileEntry, PathBuf)> {
     results
 }
 
-/// Scan for Claude Code processes not already tracked by state files.
+fn cmdline_matches_provider(cmdline: &str, provider: IntegrationProvider) -> bool {
+    let token_match = |name: &str| {
+        cmdline
+            .split('\0')
+            .chain(cmdline.split_whitespace())
+            .any(|arg| arg.ends_with(&format!("/{name}")) || arg == name)
+    };
+    match provider {
+        IntegrationProvider::Claude => {
+            token_match("claude") || cmdline.contains("@anthropic-ai/claude-code")
+        }
+        IntegrationProvider::Codex => token_match("codex"),
+    }
+}
+
+/// Scan for running provider processes not already tracked by state files.
 /// Returns (pid, cwd, tty) tuples.
 ///
 /// On Linux, reads /proc directly. On macOS, uses ps + lsof since /proc
 /// does not exist.
 #[cfg(target_os = "linux")]
-pub fn scan_proc_for_claude(known_pids: &[u32]) -> Vec<(u32, String, String)> {
+pub fn scan_proc_for_provider(
+    provider: IntegrationProvider,
+    known_pids: &[u32],
+) -> Vec<(u32, String, String)> {
     let mut found = Vec::new();
     let proc_dir = match fs::read_dir("/proc") {
         Ok(d) => d,
@@ -249,19 +282,14 @@ pub fn scan_proc_for_claude(known_pids: &[u32]) -> Vec<(u32, String, String)> {
             continue;
         }
 
-        // Read cmdline to check if this is a Claude process
+        // Read cmdline to check if this is a provider process
         let cmdline_path = format!("/proc/{pid}/cmdline");
         let cmdline = match fs::read_to_string(&cmdline_path) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        let is_claude = cmdline
-            .split('\0')
-            .any(|arg| arg.ends_with("/claude") || arg == "claude")
-            || cmdline.contains("@anthropic-ai/claude-code");
-
-        if !is_claude {
+        if !cmdline_matches_provider(&cmdline, provider) {
             continue;
         }
 
@@ -280,7 +308,10 @@ pub fn scan_proc_for_claude(known_pids: &[u32]) -> Vec<(u32, String, String)> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn scan_proc_for_claude(known_pids: &[u32]) -> Vec<(u32, String, String)> {
+pub fn scan_proc_for_provider(
+    provider: IntegrationProvider,
+    known_pids: &[u32],
+) -> Vec<(u32, String, String)> {
     let mut found = Vec::new();
     let output = match Command::new("ps").args(["-eo", "pid,tty,args"]).output() {
         Ok(o) if o.status.success() => o,
@@ -308,12 +339,7 @@ pub fn scan_proc_for_claude(known_pids: &[u32]) -> Vec<(u32, String, String)> {
             None => continue,
         };
 
-        let is_claude = args
-            .split_whitespace()
-            .any(|arg| arg.ends_with("/claude") || arg == "claude")
-            || args.contains("@anthropic-ai/claude-code");
-
-        if !is_claude {
+        if !cmdline_matches_provider(args, provider) {
             continue;
         }
 
@@ -371,55 +397,184 @@ pub fn detect_tmux_panes() -> HashMap<String, String> {
     map
 }
 
-/// Discover all running Claude Code instances from state files and /proc scan.
+#[derive(Clone, Debug)]
+struct CodexSessionMeta {
+    session_id: String,
+    last_seen: String,
+}
+
 #[cfg(unix)]
-pub fn discover_instances() -> Vec<ClaudeInstance> {
-    let state_entries = read_state_files();
-    let known_pids: Vec<u32> = state_entries.iter().map(|(s, _)| s.pid).collect();
-    let extra_procs = scan_proc_for_claude(&known_pids);
-    let tmux_panes = detect_tmux_panes();
+fn terminal_type_from_tty(tty: &str, tmux_panes: &HashMap<String, String>) -> TerminalType {
+    match tmux_panes.get(tty) {
+        Some(target) => TerminalType::Tmux {
+            target: target.clone(),
+        },
+        None => TerminalType::Plain,
+    }
+}
 
-    let mut instances: Vec<ClaudeInstance> = state_entries
+#[cfg(unix)]
+fn discover_codex_session_metadata() -> HashMap<String, Vec<CodexSessionMeta>> {
+    let sessions_dir = codex_sessions_dir();
+    if !sessions_dir.exists() {
+        return HashMap::new();
+    }
+
+    let mut by_cwd: HashMap<String, Vec<(CodexSessionMeta, std::time::SystemTime)>> =
+        HashMap::new();
+    for entry in walkdir::WalkDir::new(&sessions_dir)
         .into_iter()
-        .map(|(entry, _path)| {
-            let terminal_type = match tmux_panes.get(&entry.tty) {
-                Some(target) => TerminalType::Tmux {
-                    target: target.clone(),
-                },
-                None => TerminalType::Plain,
-            };
-            ClaudeInstance {
-                pid: entry.pid,
-                session_id: if entry.session_id.is_empty() {
-                    None
-                } else {
-                    Some(entry.session_id)
-                },
-                cwd: entry.cwd,
-                tty: entry.tty,
-                terminal_type,
-                status: map_status(&entry.status),
-                last_seen: entry.timestamp,
-            }
-        })
-        .collect();
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+    {
+        let path = entry.path();
+        let file_mtime = fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let last_seen = chrono::DateTime::<chrono::Utc>::from(file_mtime).to_rfc3339();
 
-    // Add instances found via /proc scan that don't have state files
-    for (pid, cwd, tty) in extra_procs {
-        let terminal_type = match tmux_panes.get(&tty) {
-            Some(target) => TerminalType::Tmux {
-                target: target.clone(),
-            },
-            None => TerminalType::Plain,
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
         };
-        instances.push(ClaudeInstance {
+
+        let mut found_sid: Option<String> = None;
+        let mut found_cwd: Option<String> = None;
+        for line in content.lines().take(200) {
+            let obj: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if obj
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                != "session_meta"
+            {
+                continue;
+            }
+
+            let payload = match obj.get("payload") {
+                Some(p) => p,
+                None => continue,
+            };
+            found_sid = payload
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            found_cwd = payload
+                .get("cwd")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string);
+            if found_sid.is_some() && found_cwd.is_some() {
+                break;
+            }
+        }
+
+        let (session_id, cwd) = match (found_sid, found_cwd) {
+            (Some(sid), Some(cwd)) if !sid.is_empty() && !cwd.is_empty() => (sid, cwd),
+            _ => continue,
+        };
+
+        by_cwd.entry(cwd).or_default().push((
+            CodexSessionMeta {
+                session_id,
+                last_seen: last_seen.clone(),
+            },
+            file_mtime,
+        ));
+    }
+
+    by_cwd
+        .into_iter()
+        .map(|(cwd, mut entries)| {
+            entries.sort_by(|left, right| right.1.cmp(&left.1));
+
+            let mut seen_session_ids = HashSet::new();
+            let metas = entries
+                .into_iter()
+                .filter_map(|(meta, _mtime)| {
+                    if seen_session_ids.insert(meta.session_id.clone()) {
+                        Some(meta)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            (cwd, metas)
+        })
+        .collect()
+}
+
+/// Discover all running restartable instances for enabled providers.
+#[cfg(unix)]
+pub fn discover_instances() -> Vec<RestartInstance> {
+    let tmux_panes = detect_tmux_panes();
+    let mut instances: Vec<RestartInstance> = Vec::new();
+    let mut known_pids: HashSet<u32> = HashSet::new();
+
+    let state_entries = read_state_files();
+    for (entry, _path) in state_entries {
+        known_pids.insert(entry.pid);
+        instances.push(RestartInstance {
+            provider: IntegrationProvider::Claude,
+            pid: entry.pid,
+            session_id: if entry.session_id.is_empty() {
+                None
+            } else {
+                Some(entry.session_id)
+            },
+            cwd: entry.cwd.clone(),
+            tty: entry.tty.clone(),
+            terminal_type: terminal_type_from_tty(&entry.tty, &tmux_panes),
+            status: map_status(&entry.status),
+            last_seen: entry.timestamp,
+        });
+    }
+
+    let known_claude_pids: Vec<u32> = known_pids.iter().copied().collect();
+    for (pid, cwd, tty) in scan_proc_for_provider(IntegrationProvider::Claude, &known_claude_pids) {
+        known_pids.insert(pid);
+        instances.push(RestartInstance {
+            provider: IntegrationProvider::Claude,
             pid,
             session_id: None,
             cwd,
-            tty,
-            terminal_type,
+            tty: tty.clone(),
+            terminal_type: terminal_type_from_tty(&tty, &tmux_panes),
             status: InstanceStatus::Unknown,
             last_seen: String::new(),
+        });
+    }
+
+    let codex_meta_by_cwd = discover_codex_session_metadata();
+    let mut codex_meta_offsets: HashMap<String, usize> = HashMap::new();
+    let known_all_pids: Vec<u32> = known_pids.iter().copied().collect();
+    let mut codex_processes = scan_proc_for_provider(IntegrationProvider::Codex, &known_all_pids);
+    codex_processes.sort_by(|left, right| right.0.cmp(&left.0));
+
+    for (pid, cwd, tty) in codex_processes {
+        known_pids.insert(pid);
+        let meta = codex_meta_by_cwd.get(&cwd).and_then(|metas| {
+            let offset = codex_meta_offsets.entry(cwd.clone()).or_insert(0);
+            let meta = metas.get(*offset).cloned();
+            if meta.is_some() {
+                *offset += 1;
+            }
+            meta
+        });
+        instances.push(RestartInstance {
+            provider: IntegrationProvider::Codex,
+            pid,
+            session_id: meta.as_ref().map(|m| m.session_id.clone()),
+            cwd: cwd.clone(),
+            tty: tty.clone(),
+            terminal_type: terminal_type_from_tty(&tty, &tmux_panes),
+            status: InstanceStatus::Unknown,
+            last_seen: meta.map(|m| m.last_seen).unwrap_or_default(),
         });
     }
 
@@ -638,7 +793,7 @@ pub fn hooks_installed() -> bool {
 
 const SHELL_INTEGRATION_MARKER: &str = "quill-shell-integration";
 
-const SHELL_INTEGRATION_SCRIPT: &str = r##"# Quill shell integration — checks for pending claude resume commands
+const SHELL_INTEGRATION_SCRIPT: &str = r##"# Quill shell integration — checks for pending resume commands
 # Installed by the Quill restart orchestrator. Safe to remove if unwanted.
 __quill_resume() {
 	local tty_id
@@ -647,14 +802,25 @@ __quill_resume() {
 	if [ -z "$cache_dir" ]; then
 		case "$(uname)" in Darwin) cache_dir="$HOME/Library/Caches";; *) cache_dir="$HOME/.cache";; esac
 	fi
-	local f="$cache_dir/quill/claude-resume/$tty_id"
-	if [ -f "$f" ]; then
+	local claude_f="$cache_dir/quill/claude-resume/$tty_id"
+	local codex_f="$cache_dir/quill/codex-resume/$tty_id"
+	local f=""
+	if [ -f "$claude_f" ]; then
+		f="$claude_f"
+	elif [ -f "$codex_f" ]; then
+		f="$codex_f"
+	fi
+	if [ -n "$f" ] && [ -f "$f" ]; then
 		local cmd
 		cmd=$(cat "$f")
 		rm -f "$f"
 		# Only execute if it matches the expected resume command format
 		case "$cmd" in
 			claude\ --resume\ *)
+				printf '\033[90m[quill] resuming session...\033[0m\n'
+				eval "$cmd"
+				;;
+			codex\ resume\ *)
 				printf '\033[90m[quill] resuming session...\033[0m\n'
 				eval "$cmd"
 				;;
@@ -680,15 +846,17 @@ pub fn install_shell_integration() -> Result<(), String> {
     fs::write(&script_path, SHELL_INTEGRATION_SCRIPT)
         .map_err(|e| format!("Failed to write shell integration script: {e}"))?;
 
-    // Also ensure the resume directory exists
-    let rdir = resume_dir();
-    fs::create_dir_all(&rdir).map_err(|e| format!("Failed to create resume dir: {e}"))?;
+    // Ensure provider resume directories exist
+    for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
+        let rdir = resume_dir_for_provider(provider);
+        fs::create_dir_all(&rdir).map_err(|e| format!("Failed to create resume dir: {e}"))?;
 
-    // Set strict permissions on resume directory
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o700);
-        let _ = fs::set_permissions(&rdir, perms);
+        // Set strict permissions on resume directory
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o700);
+            let _ = fs::set_permissions(&rdir, perms);
+        }
     }
 
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
@@ -742,15 +910,153 @@ pub fn shell_integration_installed() -> bool {
         })
 }
 
+#[cfg(unix)]
+fn cleanup_restart_hook_entries() -> Result<(), String> {
+    let settings_path = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".claude")
+        .join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&settings_path)
+        .map_err(|e| format!("Failed to read settings.json: {e}"))?;
+    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let mut modified = false;
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_event, entries) in hooks.iter_mut() {
+            if let Some(arr) = entries.as_array_mut() {
+                let before_len = arr.len();
+                arr.retain(|entry| !entry.to_string().contains(HOOK_MARKER));
+                modified |= arr.len() != before_len;
+            }
+        }
+    }
+
+    if modified {
+        let output = serde_json::to_string_pretty(&settings)
+            .map_err(|e| format!("Failed to serialize settings.json: {e}"))?;
+        fs::write(&settings_path, output)
+            .map_err(|e| format!("Failed to write settings.json: {e}"))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_shell_integration_lines() -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let script_path = shell_integration_path().to_string_lossy().to_string();
+
+    for rc_name in [".bashrc", ".bash_profile", ".zshrc"] {
+        let rc_path = home.join(rc_name);
+        if !rc_path.exists() {
+            continue;
+        }
+
+        let content =
+            fs::read_to_string(&rc_path).map_err(|e| format!("Failed to read {rc_name}: {e}"))?;
+        let lines: Vec<&str> = content.lines().collect();
+        let filtered: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| !line.contains(SHELL_INTEGRATION_MARKER) && !line.contains(&script_path))
+            .collect();
+
+        if filtered.len() == lines.len() {
+            continue;
+        }
+
+        let mut updated = filtered.join("\n");
+        if !updated.is_empty() {
+            updated.push('\n');
+        }
+        fs::write(&rc_path, updated).map_err(|e| format!("Failed to update {rc_name}: {e}"))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_path_if_exists(path: &PathBuf) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| format!("Failed to remove {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn remove_dir_if_exists(path: &PathBuf) -> Result<(), String> {
+    if path.exists() {
+        fs::remove_dir_all(path)
+            .map_err(|e| format!("Failed to remove {}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn uninstall_claude_restart_assets(
+    remove_shared_shell_integration: bool,
+) -> Result<(), String> {
+    cleanup_restart_hook_entries()?;
+    if remove_shared_shell_integration {
+        remove_shell_integration_lines()?;
+        remove_path_if_exists(&shell_integration_path())?;
+    }
+    remove_path_if_exists(&hook_script_path())?;
+    remove_path_if_exists(&restart_flag_path())?;
+    remove_dir_if_exists(&resume_dir_for_provider(IntegrationProvider::Claude))?;
+    remove_dir_if_exists(&state_dir())?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn uninstall_claude_restart_assets(
+    _remove_shared_shell_integration: bool,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub fn uninstall_codex_restart_assets(remove_shared_shell_integration: bool) -> Result<(), String> {
+    if remove_shared_shell_integration {
+        remove_shell_integration_lines()?;
+        remove_path_if_exists(&shell_integration_path())?;
+    }
+    remove_path_if_exists(&restart_flag_path())?;
+    remove_dir_if_exists(&resume_dir_for_provider(IntegrationProvider::Codex))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn uninstall_codex_restart_assets(
+    _remove_shared_shell_integration: bool,
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// Write a resume command file for a given TTY, to be picked up by the shell hook.
 #[cfg(unix)]
-fn write_resume_file(tty_path: &str, session_id: &str) -> Result<(), String> {
-    let rdir = resume_dir();
+fn write_resume_file(
+    provider: IntegrationProvider,
+    tty_path: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let rdir = resume_dir_for_provider(provider);
     fs::create_dir_all(&rdir).map_err(|e| format!("Failed to create resume dir: {e}"))?;
 
     let tty_id = tty_path.replace('/', "_");
     let file_path = rdir.join(&tty_id);
-    let cmd = format!("claude --resume \"{session_id}\"");
+    let cmd = match provider {
+        IntegrationProvider::Claude => format!("claude --resume \"{session_id}\""),
+        IntegrationProvider::Codex => format!("codex resume \"{session_id}\""),
+    };
     fs::write(&file_path, &cmd).map_err(|e| format!("Failed to write resume file: {e}"))?;
 
     log::info!("Wrote resume file for {tty_path}: {file_path:?}");
@@ -760,21 +1066,23 @@ fn write_resume_file(tty_path: &str, session_id: &str) -> Result<(), String> {
 /// Clean up stale resume files (older than 5 minutes).
 #[cfg(unix)]
 fn cleanup_stale_resume_files() {
-    let rdir = resume_dir();
-    let entries = match fs::read_dir(&rdir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
     let cutoff = std::time::SystemTime::now() - Duration::from_secs(300);
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Ok(meta) = fs::metadata(&path)
-            && let Ok(modified) = meta.modified()
-            && modified < cutoff
-        {
-            log::info!("Removing stale resume file: {path:?}");
-            let _ = fs::remove_file(&path);
+    for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
+        let rdir = resume_dir_for_provider(provider);
+        let entries = match fs::read_dir(&rdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(meta) = fs::metadata(&path)
+                && let Ok(modified) = meta.modified()
+                && modified < cutoff
+            {
+                log::info!("Removing stale resume file: {path:?}");
+                let _ = fs::remove_file(&path);
+            }
         }
     }
 }
@@ -814,8 +1122,15 @@ pub fn startup_cleanup() {
 
 /// Inject restart command into a tmux pane via send-keys.
 #[cfg(unix)]
-fn restart_via_tmux(target: &str, session_id: &str) -> Result<(), String> {
-    let cmd = format!("claude --resume \"{session_id}\"");
+fn restart_via_tmux(
+    provider: IntegrationProvider,
+    target: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let cmd = match provider {
+        IntegrationProvider::Claude => format!("claude --resume \"{session_id}\""),
+        IntegrationProvider::Codex => format!("codex resume \"{session_id}\""),
+    };
     let output = Command::new("tmux")
         .args(["send-keys", "-t", target, &cmd, "Enter"])
         .output()
@@ -837,6 +1152,17 @@ fn restart_via_tmux(target: &str, session_id: &str) -> Result<(), String> {
 
 #[cfg(unix)]
 const TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+#[cfg(unix)]
+fn should_wait_for_idle(instance: &RestartInstance) -> bool {
+    match instance.provider {
+        IntegrationProvider::Claude => {
+            instance.status == InstanceStatus::Processing
+                || instance.status == InstanceStatus::Unknown
+        }
+        IntegrationProvider::Codex => false,
+    }
+}
 
 /// Spawn the background orchestrator task.
 /// `force`: if true, skip waiting for idle and SIGTERM immediately.
@@ -867,13 +1193,7 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
                 }
 
                 let instances = discover_instances();
-                let waiting = instances
-                    .iter()
-                    .filter(|i| {
-                        i.status == InstanceStatus::Processing
-                            || i.status == InstanceStatus::Unknown
-                    })
-                    .count();
+                let waiting = instances.iter().filter(|i| should_wait_for_idle(i)).count();
 
                 *state.instances.lock() = instances;
 
@@ -899,13 +1219,13 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
             if let TerminalType::Plain = &instance.terminal_type
                 && let Some(sid) = &instance.session_id
                 && !sid.is_empty()
-                && let Err(e) = write_resume_file(&instance.tty, sid)
+                && let Err(e) = write_resume_file(instance.provider, &instance.tty, sid)
             {
                 log::error!("Failed to write resume file for {}: {e}", instance.tty);
             }
         }
 
-        let mut restart_targets: Vec<(ClaudeInstance, bool)> = Vec::new();
+        let mut restart_targets: Vec<(RestartInstance, bool)> = Vec::new();
 
         for instance in &instances {
             if instance.status == InstanceStatus::Exited {
@@ -915,7 +1235,11 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
             let pid = Pid::from_raw(instance.pid as i32);
             match kill(pid, Signal::SIGTERM) {
                 Ok(()) => {
-                    log::info!("Sent SIGTERM to Claude PID {}", instance.pid);
+                    log::info!(
+                        "Sent SIGTERM to {:?} PID {}",
+                        instance.provider,
+                        instance.pid
+                    );
                     restart_targets.push((instance.clone(), true));
                 }
                 Err(e) => {
@@ -941,7 +1265,7 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
 
         // Phase 3: Inject restart commands (tmux uses send-keys; plain terminals
         // already have resume files written above — mark them as Restarting).
-        let mut final_instances: Vec<ClaudeInstance> = Vec::new();
+        let mut final_instances: Vec<RestartInstance> = Vec::new();
 
         for (mut instance, kill_ok) in restart_targets {
             if !kill_ok {
@@ -964,7 +1288,9 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
             };
 
             let result = match &instance.terminal_type {
-                TerminalType::Tmux { target } => restart_via_tmux(target, &session_id),
+                TerminalType::Tmux { target } => {
+                    restart_via_tmux(instance.provider, target, &session_id)
+                }
                 TerminalType::Plain => {
                     // Resume file was already written before kill; just mark success.
                     Ok(())
@@ -1002,7 +1328,7 @@ pub fn startup_cleanup() {}
 // ── Tauri Commands ──
 
 #[tauri::command]
-pub async fn discover_claude_instances() -> Vec<ClaudeInstance> {
+pub async fn discover_restart_instances() -> Vec<RestartInstance> {
     #[cfg(unix)]
     {
         tokio::task::block_in_place(discover_instances)
@@ -1011,6 +1337,11 @@ pub async fn discover_claude_instances() -> Vec<ClaudeInstance> {
     {
         Vec::new()
     }
+}
+
+#[tauri::command]
+pub async fn discover_claude_instances() -> Vec<RestartInstance> {
+    discover_restart_instances().await
 }
 
 #[tauri::command]
@@ -1075,12 +1406,7 @@ pub async fn get_restart_status(
             tokio::task::block_in_place(discover_instances)
         };
 
-        let waiting_on = instances
-            .iter()
-            .filter(|i| {
-                i.status == InstanceStatus::Processing || i.status == InstanceStatus::Unknown
-            })
-            .count();
+        let waiting_on = instances.iter().filter(|i| should_wait_for_idle(i)).count();
 
         let elapsed_seconds = state
             .started_at
@@ -1108,27 +1434,37 @@ pub async fn get_restart_status(
 }
 
 #[tauri::command]
-pub async fn install_restart_hooks() -> Result<(), String> {
+pub async fn install_restart_hooks(provider: Option<IntegrationProvider>) -> Result<(), String> {
     #[cfg(unix)]
     {
-        install_hook_script()?;
-        merge_hooks_into_settings()?;
-        install_shell_integration()
+        match provider.unwrap_or(IntegrationProvider::Claude) {
+            IntegrationProvider::Claude => {
+                install_hook_script()?;
+                merge_hooks_into_settings()?;
+                install_shell_integration()
+            }
+            IntegrationProvider::Codex => install_shell_integration(),
+        }
     }
     #[cfg(not(unix))]
     {
+        let _ = provider;
         Err("Restart hooks are not supported on Windows".to_string())
     }
 }
 
 #[tauri::command]
-pub async fn check_restart_hooks_installed() -> bool {
+pub async fn check_restart_hooks_installed(provider: Option<IntegrationProvider>) -> bool {
     #[cfg(unix)]
     {
-        hooks_installed() && shell_integration_installed()
+        match provider.unwrap_or(IntegrationProvider::Claude) {
+            IntegrationProvider::Claude => hooks_installed() && shell_integration_installed(),
+            IntegrationProvider::Codex => shell_integration_installed(),
+        }
     }
     #[cfg(not(unix))]
     {
+        let _ = provider;
         false
     }
 }

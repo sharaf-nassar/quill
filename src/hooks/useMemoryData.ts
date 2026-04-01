@@ -2,10 +2,12 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useToast } from "./useToast";
+import type { IntegrationProvider, ProviderFilter } from "../types";
 
 export interface MemoryFile {
   id: number;
   project_path: string;
+  provider: IntegrationProvider;
   file_path: string;
   file_name: string;
   content_hash: string;
@@ -33,6 +35,7 @@ export interface OptimizationSuggestion {
   diff_summary: string | null;
   backup_data: string | null;
   group_id: string | null;
+  provider_scope: IntegrationProvider[];
 }
 
 export interface OptimizationRun {
@@ -45,6 +48,7 @@ export interface OptimizationRun {
   error: string | null;
   started_at: string;
   completed_at: string | null;
+  provider_scope: IntegrationProvider[];
 }
 
 export interface KnownProject {
@@ -53,9 +57,16 @@ export interface KnownProject {
   has_memories: boolean;
   memory_count: number;
   is_custom: boolean;
+  providers: IntegrationProvider[];
 }
 
-export function useMemoryData() {
+function filterToProvider(
+  providerFilter: ProviderFilter,
+): IntegrationProvider | null {
+  return providerFilter === "all" ? null : providerFilter;
+}
+
+export function useMemoryData(providerFilter: ProviderFilter = "all") {
   const { toast } = useToast();
   const [projects, setProjects] = useState<KnownProject[]>([]);
   const [selectedProject, setSelectedProject] = useState<string>("");
@@ -70,7 +81,9 @@ export function useMemoryData() {
 
   const loadProjects = useCallback(async () => {
     try {
-      const p = await invoke<KnownProject[]>("get_known_projects");
+      const p = await invoke<KnownProject[]>("get_known_projects", {
+        provider: filterToProvider(providerFilter),
+      });
       setProjects(p);
       if (!selectedProjectRef.current && p.length > 0) {
         setSelectedProject(p[0].path);
@@ -78,22 +91,25 @@ export function useMemoryData() {
     } catch (e) {
       toast("error", `Failed to load projects: ${e}`);
     }
-  }, [toast]);
+  }, [providerFilter, toast]);
 
   const loadProjectData = useCallback(async (projectPath: string) => {
     if (!projectPath) return;
     setLoading(true);
     try {
+      const provider = filterToProvider(providerFilter);
       const [files, sugs, r] = await Promise.all([
-        invoke<MemoryFile[]>("get_memory_files", { projectPath }),
+        invoke<MemoryFile[]>("get_memory_files", { projectPath, provider }),
         invoke<OptimizationSuggestion[]>("get_optimization_suggestions", {
           projectPath,
+          provider,
           statusFilter: null,
           limit: 200,
           offset: 0,
         }),
         invoke<OptimizationRun[]>("get_optimization_runs", {
           projectPath,
+          provider,
           limit: 10,
         }),
       ]);
@@ -107,7 +123,7 @@ export function useMemoryData() {
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [providerFilter, toast]);
 
   const projectsRef = useRef(projects);
   projectsRef.current = projects;
@@ -115,10 +131,11 @@ export function useMemoryData() {
   const loadAllProjectData = useCallback(async () => {
     setLoading(true);
     try {
+      const provider = filterToProvider(providerFilter);
       const withMemories = projectsRef.current.filter((p) => p.memory_count > 0);
       const allFiles = await Promise.all(
         withMemories.map((p) =>
-          invoke<MemoryFile[]>("get_memory_files", { projectPath: p.path }),
+          invoke<MemoryFile[]>("get_memory_files", { projectPath: p.path, provider }),
         ),
       );
       setMemoryFiles(allFiles.flat());
@@ -130,7 +147,7 @@ export function useMemoryData() {
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [providerFilter, toast]);
 
   const refresh = useCallback(() => {
     if (selectedProject === "__all__") {
@@ -196,12 +213,13 @@ export function useMemoryData() {
     try {
       await invoke("trigger_memory_optimization", {
         projectPath: selectedProject,
+        provider: filterToProvider(providerFilter),
       });
     } catch (e) {
       toast("warning", String(e));
       setOptimizing(false);
     }
-  }, [selectedProject, optimizing, toast]);
+  }, [providerFilter, selectedProject, optimizing, toast]);
 
   const approveSuggestion = useCallback(
     async (id: number) => {
@@ -347,7 +365,10 @@ export function useMemoryData() {
           const batch = withMemories.slice(i, i + BATCH_SIZE);
           await Promise.allSettled(
             batch.map((p) =>
-              invoke("trigger_memory_optimization", { projectPath: p.path }),
+              invoke("trigger_memory_optimization", {
+                projectPath: p.path,
+                provider: filterToProvider(providerFilter),
+              }),
             ),
           );
         }
@@ -357,7 +378,7 @@ export function useMemoryData() {
         setOptimizing(false);
       }
     },
-    [projects, optimizing, toast],
+    [projects, providerFilter, optimizing, toast],
   );
 
   return {

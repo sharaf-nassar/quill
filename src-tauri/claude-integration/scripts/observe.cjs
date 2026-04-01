@@ -34,6 +34,7 @@ function main() {
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
     const payload = JSON.stringify({
+      provider: "claude",
       session_id: input.session_id,
       hook_phase: hookPhase,
       tool_name: input.tool_name,

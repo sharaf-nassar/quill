@@ -1,9 +1,11 @@
-import React, { useState, useMemo, Suspense } from "react";
+import React, { useState, useMemo, Suspense, useEffect, useRef } from "react";
 import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import TabBar from "./TabBar";
 import NowTab from "./NowTab";
 import TrendsTab from "./TrendsTab";
+import { providerLabel } from "../../utils/providers";
 import type { RangeType, UsageBucket, AnalyticsTab } from "../../types";
+import { usageBucketRefKey } from "../../types";
 
 const ChartsTab = React.lazy(() => import("./ChartsTab"));
 
@@ -30,6 +32,9 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		} catch { /* ignore */ }
 		return "24h";
 	});
+	const [selectedBucketKey, setSelectedBucketKey] = useState<string | null>(null);
+	const [bucketMenuOpen, setBucketMenuOpen] = useState(false);
+	const bucketMenuRef = useRef<HTMLDivElement>(null);
 
 	const handleChartsRangeChange = (r: RangeType) => {
 		setChartsRange(r);
@@ -46,16 +51,48 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 	};
 
 	const bucketsKey = (currentBuckets ?? [])
-		.map((b) => `${b.label}:${b.utilization}:${b.resets_at ?? ""}`)
+		.map((bucket) =>
+			`${bucket.provider}:${bucket.key}:${bucket.label}:${bucket.utilization}:${bucket.resets_at ?? ""}`,
+		)
 		.join(",");
 	// eslint-disable-next-line react-hooks/exhaustive-deps -- bucketsKey is an intentional stabilizer
 	const stableBuckets = useMemo(() => currentBuckets, [bucketsKey]);
 
-	const { snapshotCount, loading } = useAnalyticsData(
-		currentBuckets?.[0]?.label ?? "7 days",
-		"24h",
-		stableBuckets,
-	);
+	useEffect(() => {
+		if (stableBuckets.length === 0) {
+			setSelectedBucketKey(null);
+			return;
+		}
+
+		if (
+			selectedBucketKey &&
+			stableBuckets.some((bucket) => usageBucketRefKey(bucket) === selectedBucketKey)
+		) {
+			return;
+		}
+
+		setSelectedBucketKey(usageBucketRefKey(stableBuckets[0]));
+	}, [selectedBucketKey, stableBuckets]);
+
+	useEffect(() => {
+		if (!bucketMenuOpen) return;
+		const handler = (event: MouseEvent) => {
+			if (
+				bucketMenuRef.current &&
+				!bucketMenuRef.current.contains(event.target as Node)
+			) {
+				setBucketMenuOpen(false);
+			}
+		};
+		document.addEventListener("mousedown", handler);
+		return () => document.removeEventListener("mousedown", handler);
+	}, [bucketMenuOpen]);
+
+	const selectedBucket = stableBuckets.find(
+		(bucket) => usageBucketRefKey(bucket) === selectedBucketKey,
+	) ?? null;
+
+	const { snapshotCount, loading } = useAnalyticsData(selectedBucket, "24h");
 
 	if (snapshotCount === 0 && !loading) {
 		return (
@@ -88,14 +125,56 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		);
 	}
 
+	const selectedBucketLabel = selectedBucket
+		? `${providerLabel(selectedBucket.provider)} · ${selectedBucket.label}`
+		: "No live metric";
+
 	return (
 		<div className="analytics-view">
 			<TabBar activeTab={activeTab} onTabChange={handleTabChange} />
+			{stableBuckets.length > 0 && (
+				<div className="analytics-controls analytics-controls--metric">
+					<div className="bucket-dropdown-wrap" ref={bucketMenuRef}>
+						<button
+							className="bucket-dropdown-trigger"
+							onClick={() => setBucketMenuOpen((open) => !open)}
+							aria-haspopup="true"
+							aria-expanded={bucketMenuOpen}
+						>
+							<span>{selectedBucketLabel}</span>
+							<span className="bucket-dropdown-arrow">
+								{bucketMenuOpen ? "\u25B4" : "\u25BE"}
+							</span>
+						</button>
+						{bucketMenuOpen && (
+							<div className="bucket-dropdown-menu" role="menu">
+								{stableBuckets.map((bucket) => {
+									const bucketKey = usageBucketRefKey(bucket);
+									return (
+										<button
+											key={bucketKey}
+											className={`bucket-dropdown-item${bucketKey === selectedBucketKey ? " active" : ""}`}
+											role="menuitemradio"
+											aria-checked={bucketKey === selectedBucketKey}
+											onClick={() => {
+												setSelectedBucketKey(bucketKey);
+												setBucketMenuOpen(false);
+											}}
+										>
+											{providerLabel(bucket.provider)} · {bucket.label}
+										</button>
+									);
+								})}
+							</div>
+						)}
+					</div>
+				</div>
+			)}
 			{activeTab === "now" && (
 				<NowTab
 					range={nowRange}
 					onRangeChange={setNowRange}
-					currentBuckets={currentBuckets}
+					currentBucket={selectedBucket}
 				/>
 			)}
 			{activeTab === "trends" && (
@@ -109,7 +188,7 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 					<ChartsTab
 						range={chartsRange}
 						onRangeChange={handleChartsRangeChange}
-						currentBuckets={currentBuckets}
+						currentBucket={selectedBucket}
 					/>
 				</Suspense>
 			)}

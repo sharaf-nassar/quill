@@ -3,14 +3,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useToast } from "./useToast";
 import type {
+  IntegrationProvider,
   LearningSettings,
   LearnedRule,
   LearningRun,
   LearningLogEvent,
+  ProviderFilter,
   ToolCount,
 } from "../types";
 
-export function useLearningData() {
+function filterToProvider(
+  providerFilter: ProviderFilter,
+): IntegrationProvider | null {
+  return providerFilter === "all" ? null : providerFilter;
+}
+
+export function useLearningData(providerFilter: ProviderFilter = "all") {
   const { toast } = useToast();
   const [settings, setSettings] = useState<LearningSettings>({
     enabled: false,
@@ -29,15 +37,17 @@ export function useLearningData() {
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
+    setLoading(true);
     try {
+      const provider = filterToProvider(providerFilter);
       const [s, r, ru, oc, uc, tt, sp] = await Promise.all([
         invoke<LearningSettings>("get_learning_settings"),
-        invoke<LearnedRule[]>("get_learned_rules"),
-        invoke<LearningRun[]>("get_learning_runs", { limit: 10 }),
-        invoke<number>("get_observation_count"),
-        invoke<number>("get_unanalyzed_observation_count"),
-        invoke<ToolCount[]>("get_top_tools", { limit: 5, days: 30 }),
-        invoke<number[]>("get_observation_sparkline"),
+        invoke<LearnedRule[]>("get_learned_rules", { provider }),
+        invoke<LearningRun[]>("get_learning_runs", { limit: 10, provider }),
+        invoke<number>("get_observation_count", { provider }),
+        invoke<number>("get_unanalyzed_observation_count", { provider }),
+        invoke<ToolCount[]>("get_top_tools", { limit: 5, days: 30, provider }),
+        invoke<number[]>("get_observation_sparkline", { provider }),
       ]);
       setSettings(s);
       setRules(r);
@@ -63,7 +73,7 @@ export function useLearningData() {
     } finally {
       setLoading(false);
     }
-  }, [toast]);
+  }, [providerFilter, toast]);
 
   useEffect(() => {
     refresh();
@@ -108,12 +118,14 @@ export function useLearningData() {
 
   const triggerAnalysis = useCallback(async () => {
     try {
-      await invoke("trigger_analysis");
+      await invoke("trigger_analysis", {
+        provider: filterToProvider(providerFilter),
+      });
       await refresh();
     } catch (e) {
       toast("warning", String(e));
     }
-  }, [refresh, toast]);
+  }, [providerFilter, refresh, toast]);
 
   const deleteRule = useCallback(
     async (name: string) => {

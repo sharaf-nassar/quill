@@ -12,22 +12,33 @@ import type {
 	SearchHit,
 	SearchFacets,
 	SessionContext,
+	SessionRef,
 	SortMode,
 } from "../types";
+import { sessionRefKey } from "../types";
 import "../styles/sessions.css";
 
 const PAGE_SIZE = 20;
 
 function SessionsWindowView() {
 	const [results, setResults] = useState<SearchHit[]>([]);
-	const sessionIds = useMemo(
-		() => [...new Set(results.map((r) => r.session_id))],
-		[results],
-	);
-	const locStatsMap = useSessionCodeStats(sessionIds);
+	const sessionRefs = useMemo(() => {
+		const seen = new Set<string>();
+		return results.reduce<SessionRef[]>((refs, hit) => {
+			const ref = { provider: hit.provider, session_id: hit.session_id };
+			const key = sessionRefKey(ref);
+			if (!seen.has(key)) {
+				seen.add(key);
+				refs.push(ref);
+			}
+			return refs;
+		}, []);
+	}, [results]);
+	const locStatsMap = useSessionCodeStats(sessionRefs);
 	const [totalHits, setTotalHits] = useState(0);
 	const [queryTimeMs, setQueryTimeMs] = useState(0);
 	const [facets, setFacets] = useState<SearchFacets>({
+		providers: [],
 		projects: [],
 		hosts: [],
 	});
@@ -38,6 +49,11 @@ function SessionsWindowView() {
 	const [loading, setLoading] = useState(false);
 	const [page, setPage] = useState(0);
 	const [query, setQuery] = useState("");
+	const hitKey = useCallback(
+		(hit: Pick<SearchHit, "provider" | "message_id">) =>
+			`${hit.provider}:${hit.message_id}`,
+		[],
+	);
 
 	useEffect(() => {
 		invoke<SearchFacets>("get_search_facets").then(setFacets).catch(() => {});
@@ -99,20 +115,22 @@ function SessionsWindowView() {
 	const handleSelect = useCallback(
 		async (hit: SearchHit) => {
 			setSelectedHit(hit);
-			if (!context[hit.message_id]) {
+			const key = hitKey(hit);
+			if (!context[key]) {
 				try {
 					const ctx = await invoke<SessionContext>("get_session_context", {
+						provider: hit.provider,
 						sessionId: hit.session_id,
 						aroundMessageId: hit.message_id,
 						window: 5,
 					});
-					setContext((prev) => ({ ...prev, [hit.message_id]: ctx }));
+					setContext((prev) => ({ ...prev, [key]: ctx }));
 				} catch {
 					/* no-op */
 				}
 			}
 		},
-		[context],
+		[context, hitKey],
 	);
 
 	const handleFiltersChange = useCallback(
@@ -212,10 +230,17 @@ function SessionsWindowView() {
 						)}
 						{results.map((hit) => (
 							<ResultCard
-								key={hit.message_id}
+								key={hitKey(hit)}
 								hit={hit}
-								selected={selectedHit?.message_id === hit.message_id}
-								locStats={locStatsMap[hit.session_id] ?? null}
+								selected={
+									selectedHit ? hitKey(selectedHit) === hitKey(hit) : false
+								}
+								locStats={
+									locStatsMap[sessionRefKey({
+										provider: hit.provider,
+										session_id: hit.session_id,
+									})] ?? null
+								}
 								onSelect={() => handleSelect(hit)}
 							/>
 						))}
@@ -235,8 +260,13 @@ function SessionsWindowView() {
 					{selectedHit ? (
 						<DetailPanel
 							hit={selectedHit}
-							context={context[selectedHit.message_id] ?? null}
-							locStats={locStatsMap[selectedHit.session_id] ?? null}
+							context={context[hitKey(selectedHit)] ?? null}
+							locStats={
+								locStatsMap[sessionRefKey({
+									provider: selectedHit.provider,
+									session_id: selectedHit.session_id,
+								})] ?? null
+							}
 						/>
 					) : (
 						<div className="sessions-detail-empty">

@@ -4,33 +4,37 @@ The system has five primary data pipelines connecting hook scripts, the HTTP ser
 
 ## Token Reporting Pipeline
 
-Hook scripts capture token usage from Claude Code sessions and report it to the widget for real-time tracking.
+Hook scripts capture token usage from Claude Code and Codex sessions and report it to the widget for real-time tracking.
 
-1. Claude Code session produces a transcript with token counts
-2. Hook script (`report-tokens.sh`) extracts tokens and POSTs to `POST /api/v1/tokens` with Bearer auth
+1. Claude Code or Codex session produces transcript/state with token counts
+2. Provider hook script (`report-tokens.sh`) extracts tokens and POSTs to `POST /api/v1/tokens` with Bearer auth
 3. [[src-tauri/src/server.rs]] validates, rate-limits, and inserts into `token_snapshots` table
 4. Server emits `tokens-updated` Tauri event
 5. Frontend hooks (`useTokenData`, `useAnalyticsData`) receive event and refresh via IPC
-6. Hourly cleanup task aggregates snapshots into `token_hourly` for historical queries
+6. Hourly cleanup task aggregates snapshots into `token_hourly` by provider/host for historical queries
 
 ### Data Shape
 
-The `TokenReportPayload` carries: session_id, hostname, timestamp, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, and cwd (project path). This enables per-host, per-project, and per-session breakdowns.
+`TokenReportPayload` carries provider, session id, hostname, timestamp, token counts, and cwd.
+
+That keeps combined analytics provider-safe while still sharing one token pipeline.
+
+Analytics session drill-down uses the same provider plus session id pair when requesting token history, compact token stats, or session deletion, so identical ids from different providers stay isolated.
 
 ## Learning Analysis Pipeline
 
 Tool-use observations and git history are analyzed by LLMs to discover reusable behavioral patterns.
 
-1. Hook script (`observe.cjs`) captures PreToolUse/PostToolUse events
+1. Provider hook script (`observe.cjs`) captures PreToolUse/PostToolUse events
 2. POSTs observation to `POST /api/v1/learning/observations`
-3. Observations stored in `observations` table, marked unanalyzed
-4. Trigger fires (on-demand, session-end, or periodic timer)
-5. [[src-tauri/src/learning.rs]] spawns async analysis task
+3. Observations stored in `observations` with provider provenance, marked unanalyzed
+4. Trigger fires (on-demand, session-end, or periodic timer) with optional provider scope from the UI or session-end payload
+5. [[src-tauri/src/learning.rs]] spawns async analysis task scoped to Claude, Codex, or both providers
 6. **Stream A**: Fetch up to 100 unanalyzed observations, compress for LLM context
 7. **Stream B**: Fetch git history for project via [[src-tauri/src/git_analysis.rs]] (cached by HEAD hash)
 8. Haiku extracts patterns from each stream independently
 9. Sonnet synthesizes combined findings and applies verdicts on existing rules
-10. New rules stored in `learned_rules` table and written to `~/.claude/rules/learned/`
+10. New rules stored in `learned_rules` with `provider_scope` and written to Claude, Codex, or shared learned-rule directories
 11. Existing rule confidence updated using Wilson lower-bound scoring with freshness decay
 12. `learning-updated` event emitted; real-time `learning-log` events stream progress to UI
 
@@ -40,37 +44,37 @@ Observations are compressed for LLM context using [[src-tauri/src/prompt_utils.r
 
 ## Session Indexing Pipeline
 
-Session transcripts are indexed for full-text search with enriched metadata.
+Session transcripts are indexed for full-text search with enriched metadata, while provider-aware side tables keep tool and latency data distinct.
 
-1. Claude Code writes session JSONL files to `~/.claude/projects/`
-2. On app startup, [[src-tauri/src/sessions.rs]] scans for new files (incremental by mtime)
-3. Alternatively, hook script posts `POST /api/v1/sessions/notify` with JSONL path
+1. Claude Code writes session JSONL files to `~/.claude/projects/`, and Codex writes rollout transcripts to `~/.codex/sessions/`
+2. On app startup, [[src-tauri/src/sessions.rs]] scans both provider transcript roots incrementally by mtime
+3. Provider hook scripts can also post `POST /api/v1/sessions/notify` with JSONL path plus provider metadata
 4. Or direct message ingestion via `POST /api/v1/sessions/messages`
-5. Messages parsed and enriched: extract tools_used, files_modified, code_changes, commands_run
-6. Indexed into Tantivy with fields: message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
-7. Tool action details stored in `tool_actions` SQLite table for deep inspection via MCP
+5. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details
+6. Indexed into Tantivy with fields: provider, message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
+7. Tool action details and response-time metrics are stored in provider-aware SQLite tables for deep inspection via MCP and analytics
 8. Frontend search queries use TF-IDF weighted scoring with snippet generation
-9. Faceted search pre-aggregates project, host, and branch counts
+9. Faceted search pre-aggregates provider, project, and host counts
 
 ### Enrichment
 
 Each message is enriched during indexing by parsing tool call inputs and outputs.
 
-Edit/Write tool calls become `code_changes` (file path + change summary). Bash calls become `commands_run`. Read/Grep/Glob calls become `tool_details` with paths and queries. All enriched fields are full-text searchable.
+Claude Edit/Write tool calls become `code_changes`, Bash becomes `commands_run`, and Read/Grep/Glob become `tool_details`. Codex `apply_patch` calls become `code_changes`, `exec_command` and `write_stdin` become `commands_run`, and MCP or auxiliary tool calls become searchable `tool_details`.
 
 ## Memory Optimization Pipeline
 
 LLM analyzes project memory files to suggest consolidation, cleanup, and improvements.
 
-1. Frontend triggers optimization for a specific project path
-2. [[src-tauri/src/memory_optimizer.rs]] scans project directory recursively for memory files
+1. Frontend triggers optimization for a specific project path plus optional provider scope
+2. [[src-tauri/src/memory_optimizer.rs]] scans project memory files plus provider instruction files
 3. Filters: exclude denylisted directories, minified/compiled files, oversized content
 4. Compute dynamic budget allocation based on available section types
-5. Assemble LLM prompt: memory file contents + project CLAUDE.md + learned rules + instinct sections
+5. Assemble LLM prompt: memory file contents + scoped `CLAUDE.md` or `AGENTS.md` instruction files + learned rules + instinct sections
 6. Call Haiku to generate structured optimization suggestions
-7. Suggestions stored in `optimization_suggestions` with status=pending
+7. Suggestions stored in `optimization_suggestions` with `provider_scope` and status=pending
 8. `memory-optimizer-updated` event notifies frontend
-9. User reviews suggestions in the Memories panel
+9. User reviews suggestions in the Memories panel with provider badges and a shared provider filter
 10. On approve: execute action (write/delete/merge file), store backup in `backup_data` column, set status=executed
 11. On deny: set status=denied (can be un-denied later)
 12. On undo: restore from backup_data, set status=reverted
@@ -102,11 +106,12 @@ Plugin lifecycle operations through marketplace git repositories and the Claude 
 
 ## Usage Bucket Fetching
 
-The main window polls Claude API usage limits to display real-time rate limit status.
+The main window polls enabled providers for live rate limit status and stores the results in shared provider-aware usage tables.
 
-1. [[src-tauri/src/fetcher.rs]] calls the Anthropic API with OAuth Bearer token
-2. Parses response into usage buckets: 5-hour, 7-day, model-specific, extra usage, OAuth apps
-3. Validates: finite utilization values, valid RFC3339 timestamps
-4. Returns `UsageData` to frontend via `fetch_usage_data()` IPC command
-5. Raw snapshots stored in `usage_snapshots` table
-6. Hourly cleanup aggregates into `usage_hourly` for trend analysis
+1. `fetch_usage_data()` resolves the enabled provider list from the integration manager
+2. Claude polling in [[src-tauri/src/fetcher.rs]] calls the Anthropic API with an OAuth Bearer token and parses Claude bucket keys
+3. Codex polling in [[src-tauri/src/fetcher.rs]] scans recent `~/.codex/sessions/**/*.jsonl` files, finds the newest `token_count` event, and derives provider buckets from its `rate_limits`
+4. Each bucket is normalized to `{ provider, key, label, utilization, resets_at }` and validated for finite utilization plus RFC3339 reset timestamps
+5. Successful live buckets are inserted into `usage_snapshots`, keyed by provider plus bucket key, and hourly cleanup aggregates them into `usage_hourly`
+6. If a provider poll fails, the command loads the last stored buckets for that provider and returns a provider-scoped error alongside the cached rows
+7. Frontend live usage groups rows by provider, while analytics selects one concrete provider bucket for utilization history and stats

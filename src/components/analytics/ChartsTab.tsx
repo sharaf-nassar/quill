@@ -107,20 +107,18 @@ function UnifiedTooltip({ utilData, tokenData, codeData, cacheData }: UnifiedToo
 interface ChartsTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
-	currentBuckets: UsageBucket[];
+	currentBucket: UsageBucket | null;
 }
 
-function ChartsTab({ range, onRangeChange, currentBuckets }: ChartsTabProps) {
-	const defaultBucket = currentBuckets?.[0]?.label ?? "7 days";
-
+function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 	const { history: utilHistory, loading: utilLoading, error: utilError } = useAnalyticsData(
-		defaultBucket,
+		currentBucket,
 		range,
-		currentBuckets,
 	);
 
 	const { history: tokenHistory, loading: tokenLoading, error: tokenError } = useTokenData(
 		range,
+		null,
 		null,
 		null,
 		null,

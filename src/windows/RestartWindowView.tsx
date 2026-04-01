@@ -12,7 +12,7 @@ function RestartWindowView() {
 		<div className="restart-window">
 			<div className="restart-window-titlebar" data-tauri-drag-region>
 				<span className="restart-window-title" data-tauri-drag-region>
-					Restart Claude Code
+					Restart Agent Sessions
 				</span>
 				<button
 					className="restart-window-close"

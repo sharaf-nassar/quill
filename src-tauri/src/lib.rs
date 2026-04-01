@@ -5,6 +5,7 @@ mod claude_setup;
 mod config;
 mod fetcher;
 mod git_analysis;
+mod integrations;
 mod learning;
 mod memory_optimizer;
 mod models;
@@ -17,9 +18,9 @@ mod storage;
 
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
-    LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, ResponseTimeStats,
-    SessionBreakdown, SessionCodeStats, SessionStats, TokenDataPoint, TokenStats, ToolCount,
-    UsageData,
+    LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, ProviderStatus,
+    ResponseTimeStats, SessionBreakdown, SessionCodeStats, SessionEndPayload, SessionRef,
+    SessionStats, TokenDataPoint, TokenStats, ToolCount, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -100,31 +101,109 @@ where
 
 #[tauri::command]
 async fn fetch_usage_data() -> Result<UsageData, String> {
-    let data = fetcher::fetch_usage().await;
+    let statuses = run_blocking(integrations::detect_all)?;
+    let enabled_providers = statuses
+        .into_iter()
+        .filter(|status| status.enabled)
+        .map(|status| status.provider)
+        .collect::<Vec<_>>();
 
-    if data.error.is_none()
-        && !data.buckets.is_empty()
+    if enabled_providers.is_empty() {
+        return Ok(UsageData {
+            buckets: Vec::new(),
+            provider_errors: Vec::new(),
+            error: Some("No providers are enabled.".to_string()),
+        });
+    }
+
+    let mut live_buckets = Vec::new();
+    let mut display_buckets = Vec::new();
+    let mut provider_errors = Vec::new();
+
+    for provider in enabled_providers {
+        let fetch_result = match provider {
+            integrations::IntegrationProvider::Claude => fetcher::fetch_claude_usage().await,
+            integrations::IntegrationProvider::Codex => run_blocking(fetcher::fetch_codex_usage),
+        };
+
+        match fetch_result {
+            Ok(mut buckets) => {
+                display_buckets.extend(buckets.clone());
+                live_buckets.append(&mut buckets);
+            }
+            Err(message) => {
+                provider_errors.push(UsageProviderError { provider, message });
+
+                if let Ok(storage) = get_storage() {
+                    match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
+                        Ok(mut buckets) => display_buckets.append(&mut buckets),
+                        Err(err) => log::warn!(
+                            "Failed to load cached usage buckets for {}: {}",
+                            provider.as_str(),
+                            err
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    if !live_buckets.is_empty()
         && let Ok(storage) = get_storage()
     {
-        let buckets = data.buckets.clone();
+        let buckets = live_buckets.clone();
         if let Err(e) = run_blocking(move || storage.store_snapshot(&buckets)) {
             log::warn!("Failed to store snapshot: {e}");
         }
     }
 
-    Ok(data)
+    display_buckets.sort_by(|left, right| {
+        left.provider
+            .as_str()
+            .cmp(right.provider.as_str())
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    display_buckets.dedup_by(|left, right| {
+        left.provider == right.provider
+            && left.key == right.key
+            && left.utilization == right.utilization
+            && left.resets_at == right.resets_at
+    });
+
+    let error = if display_buckets.is_empty() {
+        provider_errors
+            .first()
+            .map(|provider_error| provider_error.message.clone())
+            .or_else(|| Some("No live usage data available.".to_string()))
+    } else {
+        None
+    };
+
+    Ok(UsageData {
+        buckets: display_buckets,
+        provider_errors,
+        error,
+    })
 }
 
 #[tauri::command]
-async fn get_usage_history(bucket: String, range: String) -> Result<Vec<DataPoint>, String> {
+async fn get_usage_history(
+    provider: integrations::IntegrationProvider,
+    bucket_key: String,
+    range: String,
+) -> Result<Vec<DataPoint>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_usage_history(&bucket, &range))
+    run_blocking(move || storage.get_usage_history(provider, &bucket_key, &range))
 }
 
 #[tauri::command]
-async fn get_usage_stats(bucket: String, days: i32) -> Result<BucketStats, String> {
+async fn get_usage_stats(
+    provider: integrations::IntegrationProvider,
+    bucket_key: String,
+    days: i32,
+) -> Result<BucketStats, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_usage_stats(&bucket, days))
+    run_blocking(move || storage.get_usage_stats(provider, &bucket_key, days))
 }
 
 #[tauri::command]
@@ -144,6 +223,7 @@ async fn get_snapshot_count() -> Result<i64, String> {
 #[tauri::command]
 async fn get_token_history(
     range: String,
+    provider: Option<integrations::IntegrationProvider>,
     hostname: Option<String>,
     session_id: Option<String>,
     cwd: Option<String>,
@@ -152,6 +232,7 @@ async fn get_token_history(
     run_blocking(move || {
         storage.get_token_history(
             &range,
+            provider,
             hostname.as_deref(),
             session_id.as_deref(),
             cwd.as_deref(),
@@ -162,11 +243,21 @@ async fn get_token_history(
 #[tauri::command]
 async fn get_token_stats(
     days: i32,
+    provider: Option<integrations::IntegrationProvider>,
     hostname: Option<String>,
+    session_id: Option<String>,
     cwd: Option<String>,
 ) -> Result<TokenStats, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_token_stats(days, hostname.as_deref(), cwd.as_deref()))
+    run_blocking(move || {
+        storage.get_token_stats(
+            days,
+            provider,
+            hostname.as_deref(),
+            session_id.as_deref(),
+            cwd.as_deref(),
+        )
+    })
 }
 
 #[tauri::command]
@@ -185,9 +276,11 @@ async fn get_host_breakdown(days: i32) -> Result<Vec<HostBreakdown>, String> {
 async fn get_session_breakdown(
     days: i32,
     hostname: Option<String>,
+    provider: Option<integrations::IntegrationProvider>,
+    limit: Option<i32>,
 ) -> Result<Vec<SessionBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_session_breakdown(days, hostname.as_deref()))
+    run_blocking(move || storage.get_session_breakdown(days, hostname.as_deref(), provider, limit))
 }
 
 #[tauri::command]
@@ -227,9 +320,33 @@ async fn delete_host_data(hostname: String) -> Result<u64, String> {
 }
 
 #[tauri::command]
-async fn delete_session_data(session_id: String) -> Result<u64, String> {
+async fn delete_session_data(
+    provider: integrations::IntegrationProvider,
+    session_id: String,
+) -> Result<u64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.delete_session_data(&session_id))
+    run_blocking(move || storage.delete_session_data(provider, &session_id))
+}
+
+#[tauri::command]
+async fn get_provider_statuses() -> Result<Vec<ProviderStatus>, String> {
+    run_blocking(integrations::detect_all)
+}
+
+#[tauri::command]
+async fn confirm_enable_provider(
+    provider: integrations::IntegrationProvider,
+    app: tauri::AppHandle,
+) -> Result<ProviderStatus, String> {
+    run_blocking(move || integrations::confirm_enable(&app, provider))
+}
+
+#[tauri::command]
+async fn confirm_disable_provider(
+    provider: integrations::IntegrationProvider,
+    app: tauri::AppHandle,
+) -> Result<ProviderStatus, String> {
+    run_blocking(move || integrations::confirm_disable(&app, provider))
 }
 
 // --- Learning IPC commands ---
@@ -289,9 +406,11 @@ async fn set_learning_settings(settings: LearningSettings) -> Result<(), String>
 }
 
 #[tauri::command]
-async fn get_learned_rules() -> Result<Vec<LearnedRule>, String> {
+async fn get_learned_rules(
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<Vec<LearnedRule>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_learned_rules())
+    run_blocking(move || storage.get_learned_rules(provider))
 }
 
 #[tauri::command]
@@ -309,43 +428,59 @@ async fn promote_learned_rule(name: String, app: tauri::AppHandle) -> Result<(),
 }
 
 #[tauri::command]
-async fn get_learning_runs(limit: i32) -> Result<Vec<LearningRun>, String> {
+async fn get_learning_runs(
+    limit: i32,
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<Vec<LearningRun>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_learning_runs(limit as i64))
+    run_blocking(move || storage.get_learning_runs(limit as i64, provider))
 }
 
 #[tauri::command]
-async fn trigger_analysis(app: tauri::AppHandle) -> Result<(), String> {
+async fn trigger_analysis(
+    provider: Option<integrations::IntegrationProvider>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let storage = get_storage()?;
     tauri::async_runtime::spawn(async move {
-        let _ = learning::spawn_analysis(storage, "on-demand", &app, false).await;
+        let _ = learning::spawn_analysis(storage, "on-demand", provider, &app, false).await;
         let _ = app.emit("learning-updated", ());
     });
     Ok(())
 }
 
 #[tauri::command]
-async fn get_observation_count() -> Result<i64, String> {
+async fn get_observation_count(
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<i64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_observation_count())
+    run_blocking(move || storage.get_observation_count(provider))
 }
 
 #[tauri::command]
-async fn get_unanalyzed_observation_count() -> Result<i64, String> {
+async fn get_unanalyzed_observation_count(
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<i64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_unanalyzed_observation_count())
+    run_blocking(move || storage.get_unanalyzed_observation_count(provider))
 }
 
 #[tauri::command]
-async fn get_top_tools(limit: i32, days: i32) -> Result<Vec<ToolCount>, String> {
+async fn get_top_tools(
+    limit: i32,
+    days: i32,
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<Vec<ToolCount>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_top_tools(limit as i64, days as i64))
+    run_blocking(move || storage.get_top_tools(limit as i64, days as i64, provider))
 }
 
 #[tauri::command]
-async fn get_observation_sparkline() -> Result<Vec<i64>, String> {
+async fn get_observation_sparkline(
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<Vec<i64>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_observation_sparkline())
+    run_blocking(move || storage.get_observation_sparkline(provider))
 }
 
 // --- Code change stats commands ---
@@ -364,10 +499,10 @@ async fn get_code_stats_history(range: String) -> Result<Vec<CodeStatsHistoryPoi
 
 #[tauri::command]
 async fn get_batch_session_code_stats(
-    session_ids: Vec<String>,
+    session_refs: Vec<SessionRef>,
 ) -> Result<std::collections::HashMap<String, SessionCodeStats>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_batch_session_code_stats(&session_ids))
+    run_blocking(move || storage.get_batch_session_code_stats(&session_refs))
 }
 
 #[tauri::command]
@@ -384,22 +519,35 @@ async fn read_rule_content(file_path: String) -> Result<String, String> {
 // --- Memory optimizer commands ---
 
 #[tauri::command]
-async fn get_memory_files(project_path: String) -> Result<Vec<crate::models::MemoryFile>, String> {
+async fn get_memory_files(
+    project_path: String,
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<Vec<crate::models::MemoryFile>, String> {
     let storage = get_storage()?;
-    run_blocking(move || memory_optimizer::scan_memory_files(storage, &project_path))
+    run_blocking(move || memory_optimizer::scan_memory_files(storage, &project_path, provider))
 }
 
 #[tauri::command]
 async fn trigger_memory_optimization(
     project_path: String,
+    provider: Option<integrations::IntegrationProvider>,
     app: tauri::AppHandle,
 ) -> Result<i64, String> {
     let storage = get_storage()?;
     // Create the run record synchronously so we can return the real run_id
-    let run_id = storage.create_optimization_run(&project_path, "manual")?;
+    let provider_scope = match provider {
+        Some(provider) => vec![provider],
+        None => vec![
+            integrations::IntegrationProvider::Claude,
+            integrations::IntegrationProvider::Codex,
+        ],
+    };
+    let run_id = storage.create_optimization_run(&project_path, "manual", &provider_scope)?;
     let project = project_path.clone();
     tauri::async_runtime::spawn(async move {
-        match memory_optimizer::run_optimization_with_run(storage, &project, run_id, &app).await {
+        match memory_optimizer::run_optimization_with_run(storage, &project, run_id, provider, &app)
+            .await
+        {
             Ok(_) => log::info!("Memory optimization completed: run {run_id}"),
             Err(e) => log::error!("Memory optimization failed: {e}"),
         }
@@ -410,6 +558,7 @@ async fn trigger_memory_optimization(
 #[tauri::command]
 async fn get_optimization_suggestions(
     project_path: String,
+    provider: Option<integrations::IntegrationProvider>,
     status_filter: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -418,7 +567,13 @@ async fn get_optimization_suggestions(
     let limit = limit.unwrap_or(200);
     let offset = offset.unwrap_or(0);
     run_blocking(move || {
-        storage.get_optimization_suggestions(&project_path, status_filter.as_deref(), limit, offset)
+        storage.get_optimization_suggestions(
+            &project_path,
+            provider,
+            status_filter.as_deref(),
+            limit,
+            offset,
+        )
     })
 }
 
@@ -469,16 +624,19 @@ async fn get_suggestions_for_run(
 #[tauri::command]
 async fn get_optimization_runs(
     project_path: String,
+    provider: Option<integrations::IntegrationProvider>,
     limit: i32,
 ) -> Result<Vec<crate::models::OptimizationRun>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_optimization_runs(&project_path, limit as i64))
+    run_blocking(move || storage.get_optimization_runs(&project_path, provider, limit as i64))
 }
 
 #[tauri::command]
-async fn get_known_projects() -> Result<Vec<crate::models::KnownProject>, String> {
+async fn get_known_projects(
+    provider: Option<integrations::IntegrationProvider>,
+) -> Result<Vec<crate::models::KnownProject>, String> {
     let storage = get_storage()?;
-    run_blocking(move || memory_optimizer::get_known_projects(storage))
+    run_blocking(move || memory_optimizer::get_known_projects(storage, provider))
 }
 
 #[tauri::command]
@@ -555,19 +713,34 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
 // --- Plugin IPC commands ---
 
 #[tauri::command]
-async fn get_installed_plugins() -> Result<Vec<plugins::InstalledPlugin>, String> {
-    tokio::task::block_in_place(plugins::get_installed_plugins)
+async fn get_installed_plugins(
+    provider: integrations::IntegrationProvider,
+) -> Result<Vec<plugins::InstalledPlugin>, String> {
+    tokio::task::block_in_place(|| plugins::get_installed_plugins(provider))
 }
 
 #[tauri::command]
-async fn get_marketplaces() -> Result<Vec<plugins::Marketplace>, String> {
-    tokio::task::block_in_place(plugins::get_marketplaces)
+async fn get_marketplaces(
+    provider: integrations::IntegrationProvider,
+) -> Result<Vec<plugins::Marketplace>, String> {
+    tokio::task::block_in_place(|| plugins::get_marketplaces(provider))
 }
 
 #[tauri::command]
 async fn get_available_updates(
+    provider: integrations::IntegrationProvider,
     app: tauri::AppHandle,
 ) -> Result<plugins::UpdateCheckResult, String> {
+    if provider != integrations::IntegrationProvider::Claude {
+        return Ok(plugins::UpdateCheckResult {
+            plugin_updates: tokio::task::block_in_place(|| {
+                plugins::get_available_updates(provider)
+            })?,
+            last_checked: None,
+            next_check: None,
+        });
+    }
+
     let state = app
         .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
         .map(|s| s.inner().clone());
@@ -576,7 +749,7 @@ async fn get_available_updates(
         Ok(state.last_result.lock().clone())
     } else {
         // Fallback: compute directly
-        let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
+        let updates = tokio::task::block_in_place(|| plugins::get_available_updates(provider))?;
         Ok(plugins::UpdateCheckResult {
             plugin_updates: updates,
             last_checked: None,
@@ -586,10 +759,12 @@ async fn get_available_updates(
 }
 
 #[tauri::command]
-async fn check_updates_now(app: tauri::AppHandle) -> Result<plugins::UpdateCheckResult, String> {
-    // Refresh marketplaces first so version data is current
-    let _ = tokio::task::block_in_place(plugins::refresh_all_marketplaces);
-    let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
+async fn check_updates_now(
+    provider: integrations::IntegrationProvider,
+    app: tauri::AppHandle,
+) -> Result<plugins::UpdateCheckResult, String> {
+    let _ = tokio::task::block_in_place(|| plugins::refresh_all_marketplaces(provider));
+    let updates = tokio::task::block_in_place(|| plugins::get_available_updates(provider))?;
     let now = chrono::Utc::now().to_rfc3339();
 
     let result = plugins::UpdateCheckResult {
@@ -598,9 +773,10 @@ async fn check_updates_now(app: tauri::AppHandle) -> Result<plugins::UpdateCheck
         next_check: None,
     };
 
-    if let Some(state) = app
-        .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
-        .map(|s| s.inner().clone())
+    if provider == integrations::IntegrationProvider::Claude
+        && let Some(state) = app
+            .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
+            .map(|s| s.inner().clone())
     {
         *state.last_result.lock() = result.clone();
         let _ = app.emit("plugin-updates-available", result.plugin_updates.len());
@@ -611,42 +787,59 @@ async fn check_updates_now(app: tauri::AppHandle) -> Result<plugins::UpdateCheck
 
 #[tauri::command]
 async fn install_plugin(
+    provider: integrations::IntegrationProvider,
     name: String,
     marketplace: String,
+    marketplace_path: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::install_plugin(&name, &marketplace))?;
+    let result = tokio::task::block_in_place(|| {
+        plugins::install_plugin(provider, &name, &marketplace, marketplace_path.as_deref())
+    })?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
 async fn remove_plugin(
+    provider: integrations::IntegrationProvider,
     name: String,
     marketplace: String,
+    plugin_id: String,
     app: tauri::AppHandle,
 ) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::remove_plugin(&name, &marketplace))?;
+    let result = tokio::task::block_in_place(|| {
+        plugins::remove_plugin(provider, &name, &marketplace, &plugin_id)
+    })?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
-async fn enable_plugin(name: String, app: tauri::AppHandle) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::enable_plugin(&name))?;
+async fn enable_plugin(
+    provider: integrations::IntegrationProvider,
+    name: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::enable_plugin(provider, &name))?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
-async fn disable_plugin(name: String, app: tauri::AppHandle) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::disable_plugin(&name))?;
+async fn disable_plugin(
+    provider: integrations::IntegrationProvider,
+    name: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::disable_plugin(provider, &name))?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
 async fn update_plugin(
+    provider: integrations::IntegrationProvider,
     name: String,
     marketplace: String,
     scope: String,
@@ -654,63 +847,93 @@ async fn update_plugin(
     app: tauri::AppHandle,
 ) -> Result<String, String> {
     let result = tokio::task::block_in_place(|| {
-        plugins::update_plugin(&name, &marketplace, &scope, project_path.as_deref())
+        plugins::update_plugin(
+            provider,
+            &name,
+            &marketplace,
+            &scope,
+            project_path.as_deref(),
+        )
     })?;
-    refresh_update_cache(&app);
+    refresh_update_cache(&app, provider);
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
-async fn update_all_plugins(app: tauri::AppHandle) -> Result<plugins::BulkUpdateProgress, String> {
-    let updates = tokio::task::block_in_place(plugins::get_available_updates)?;
+async fn update_all_plugins(
+    provider: integrations::IntegrationProvider,
+    app: tauri::AppHandle,
+) -> Result<plugins::BulkUpdateProgress, String> {
+    let updates = tokio::task::block_in_place(|| plugins::get_available_updates(provider))?;
     let progress = tokio::task::block_in_place(|| plugins::bulk_update_plugins(&updates, &app));
-    refresh_update_cache(&app);
+    refresh_update_cache(&app, provider);
     let _ = app.emit("plugin-changed", ());
     Ok(progress)
 }
 
 /// Re-compute the cached update list from disk after a plugin mutation.
-fn refresh_update_cache(app: &tauri::AppHandle) {
+fn refresh_update_cache(app: &tauri::AppHandle, provider: integrations::IntegrationProvider) {
+    if provider != integrations::IntegrationProvider::Claude {
+        return;
+    }
+
     if let Some(state) = app
         .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
         .map(|s| s.inner().clone())
-        && let Ok(updates) = plugins::get_available_updates()
+        && let Ok(updates) = plugins::get_available_updates(provider)
     {
         let count = updates.len();
+        let now = chrono::Utc::now().to_rfc3339();
+        let next = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
         let mut cached = state.last_result.lock();
         cached.plugin_updates = updates;
+        cached.last_checked = Some(now);
+        cached.next_check = Some(next);
         drop(cached);
         let _ = app.emit("plugin-updates-available", count);
     }
 }
 
 #[tauri::command]
-async fn add_marketplace(repo: String, app: tauri::AppHandle) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::add_marketplace(&repo))?;
+async fn add_marketplace(
+    provider: integrations::IntegrationProvider,
+    repo: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::add_marketplace(provider, &repo))?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
-async fn remove_marketplace(name: String, app: tauri::AppHandle) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::remove_marketplace(&name))?;
+async fn remove_marketplace(
+    provider: integrations::IntegrationProvider,
+    name: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::remove_marketplace(provider, &name))?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
-async fn refresh_marketplace(name: String, app: tauri::AppHandle) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::refresh_marketplace(&name))?;
+async fn refresh_marketplace(
+    provider: integrations::IntegrationProvider,
+    name: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let result = tokio::task::block_in_place(|| plugins::refresh_marketplace(provider, &name))?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
 
 #[tauri::command]
 async fn refresh_all_marketplaces(
+    provider: integrations::IntegrationProvider,
     app: tauri::AppHandle,
 ) -> Result<plugins::MarketplaceRefreshResults, String> {
-    let result = tokio::task::block_in_place(plugins::refresh_all_marketplaces)?;
+    let result = tokio::task::block_in_place(|| plugins::refresh_all_marketplaces(provider))?;
     let _ = app.emit("plugin-changed", ());
     Ok(result)
 }
@@ -864,7 +1087,7 @@ pub fn run() {
                 // Listen for session-end events to trigger analysis (only if enabled)
                 {
                     let se_handle = app.handle().clone();
-                    app.listen("learning-session-end", move |_event| {
+                    app.listen("learning-session-end", move |event| {
                         let enabled = storage
                             .get_setting("learning.enabled")
                             .ok()
@@ -880,11 +1103,25 @@ pub fn run() {
                             return;
                         }
 
+                        let provider = serde_json::from_str::<SessionEndPayload>(event.payload())
+                            .map(|payload| payload.provider)
+                            .map_err(|error| {
+                                log::warn!("Failed to parse learning-session-end payload: {error}");
+                                error
+                            })
+                            .ok();
+
                         let handle = se_handle.clone();
                         tauri::async_runtime::spawn(async move {
                             // Try full analysis first; if not enough observations, try micro-update
-                            match learning::spawn_analysis(storage, "session-end", &handle, false)
-                                .await
+                            match learning::spawn_analysis(
+                                storage,
+                                "session-end",
+                                provider,
+                                &handle,
+                                false,
+                            )
+                            .await
                             {
                                 Ok(()) => {}
                                 Err(_) => {
@@ -893,6 +1130,7 @@ pub fn run() {
                                     if let Err(e) = learning::spawn_analysis(
                                         storage,
                                         "session-end-micro",
+                                        provider,
                                         &handle,
                                         true,
                                     )
@@ -942,6 +1180,7 @@ pub fn run() {
                             if let Err(e) = learning::spawn_analysis(
                                 storage,
                                 "periodic",
+                                None,
                                 &periodic_handle,
                                 false,
                             )
@@ -969,14 +1208,14 @@ pub fn run() {
                 restart::startup_cleanup();
             }
 
-            // Set up Claude Code integration (deploy scripts, register MCP/hooks, config)
+            // Refresh provider integration state on startup.
             {
                 let setup_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) =
-                        tokio::task::block_in_place(|| claude_setup::setup_local(&setup_handle))
+                        tokio::task::block_in_place(|| integrations::startup_refresh(&setup_handle))
                     {
-                        log::error!("Claude Code local setup failed: {e}");
+                        log::error!("Integration startup refresh failed: {e}");
                     }
                 });
             }
@@ -1077,6 +1316,9 @@ pub fn run() {
             delete_project_data,
             rename_project,
             delete_session_data,
+            get_provider_statuses,
+            confirm_enable_provider,
+            confirm_disable_provider,
             get_learning_settings,
             set_learning_settings,
             get_learned_rules,
@@ -1127,6 +1369,7 @@ pub fn run() {
             sessions::get_session_context,
             sessions::get_search_facets,
             sessions::rebuild_search_index,
+            restart::discover_restart_instances,
             restart::discover_claude_instances,
             restart::request_restart,
             restart::cancel_restart,

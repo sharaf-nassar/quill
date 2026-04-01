@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 
 use tauri::Emitter;
 
+use crate::integrations::IntegrationProvider;
 use crate::models::{
     LearnedRulePayload, LearningRunPayload, ObservationPayload, SessionEndPayload,
     SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
@@ -298,7 +299,20 @@ async fn get_observations(
         .unwrap_or(100)
         .min(500);
 
-    match state.storage.get_recent_observations(limit) {
+    let provider = match params.get("provider") {
+        Some(value) => match value.parse::<IntegrationProvider>() {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid provider"})),
+                );
+            }
+        },
+        None => None,
+    };
+
+    match state.storage.get_recent_observations(limit, provider) {
         Ok(observations) => (StatusCode::OK, Json(serde_json::json!(observations))),
         Err(e) => {
             log::error!("Failed to get observations: {e}");
@@ -350,9 +364,13 @@ async fn post_session_end(
         .unwrap_or_default();
 
     if enabled && (trigger_mode == "session-end" || trigger_mode.contains("session-end")) {
-        let _ = state
-            .app_handle
-            .emit("learning-session-end", &payload.session_id);
+        let _ = state.app_handle.emit(
+            "learning-session-end",
+            serde_json::json!({
+                "provider": payload.provider,
+                "session_id": payload.session_id,
+            }),
+        );
     }
 
     (StatusCode::OK, "ok".to_string())
@@ -432,7 +450,20 @@ async fn get_learning_runs(
         .unwrap_or(20)
         .min(100);
 
-    match state.storage.get_learning_runs(limit) {
+    let provider = match params.get("provider") {
+        Some(value) => match value.parse::<IntegrationProvider>() {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid provider"})),
+                );
+            }
+        },
+        None => None,
+    };
+
+    match state.storage.get_learning_runs(limit, provider) {
         Ok(runs) => (StatusCode::OK, Json(serde_json::json!(runs))),
         Err(e) => {
             log::error!("Failed to get learning runs: {e}");
@@ -506,18 +537,52 @@ async fn post_session_notify(
     }
 
     // Extract messages from the JSONL file
-    let messages = sessions::extract_messages_from_jsonl(path);
-    if messages.is_empty() {
+    let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, path);
+    if let Some(git_branch) = payload
+        .git_branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+    {
+        for msg in &mut extracted.messages {
+            if msg.git_branch.is_empty() {
+                msg.git_branch = git_branch.to_string();
+            }
+        }
+    }
+    if extracted.messages.is_empty() {
         return (StatusCode::OK, "ok (no messages)".to_string());
     }
 
-    // Derive project name from parent directory
-    let project_name = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|n| n.to_str())
-        .map(sessions::SessionIndex::project_display_name)
+    let project_name = payload
+        .project
+        .clone()
+        .filter(|project| !project.is_empty())
+        .or_else(|| extracted.project_name.clone())
+        .or_else(|| {
+            payload.cwd.as_deref().and_then(|cwd| {
+                std::path::Path::new(cwd)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
+            })
+        })
+        .or_else(|| {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(sessions::SessionIndex::project_display_name)
+        })
         .unwrap_or_else(|| "unknown".to_string());
+    let host = payload
+        .host
+        .clone()
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "local".to_string());
+    let session_id = if extracted.session_id.is_empty() {
+        payload.session_id.clone()
+    } else {
+        extracted.session_id.clone()
+    };
 
     let idx = match &state.session_index {
         Some(idx) => idx.clone(),
@@ -530,27 +595,31 @@ async fn post_session_notify(
     };
     let result = tokio::task::block_in_place(|| -> Result<usize, String> {
         // Delete existing docs + tool_actions for this session before re-indexing
-        {
-            let writer = idx.writer.lock();
-            let term = tantivy::Term::from_field_text(idx.fields.session_id, &payload.session_id);
-            writer.delete_term(term);
-        }
+        idx.delete_session_docs(payload.provider, &session_id)?;
         if let Err(e) = state
             .storage
-            .delete_tool_actions_for_session(&payload.session_id)
+            .delete_tool_actions_for_session(payload.provider, &session_id)
         {
             log::warn!("Failed to delete old tool_actions: {e}");
         }
+        if let Err(e) = state
+            .storage
+            .delete_response_times_for_session(payload.provider, &session_id)
+        {
+            log::warn!("Failed to delete old response_times: {e}");
+        }
 
         let mut count = 0usize;
-        for msg in &messages {
-            idx.index_message(msg, &project_name, "local")?;
+        for msg in &extracted.messages {
+            idx.index_message(payload.provider, msg, &project_name, &host)?;
             // Store tool actions in SQLite for this message
             if !msg.tool_actions.is_empty()
-                && let Err(e) =
-                    state
-                        .storage
-                        .store_tool_actions(&msg.tool_actions, &msg.uuid, &msg.session_id)
+                && let Err(e) = state.storage.store_tool_actions(
+                    payload.provider,
+                    &msg.tool_actions,
+                    &msg.uuid,
+                    &msg.session_id,
+                )
             {
                 log::warn!("Failed to store tool actions: {e}");
             }
@@ -565,19 +634,15 @@ async fn post_session_notify(
     match result {
         Ok(count) => {
             // Re-index re-processes the whole session, so delete and re-populate response_times
-            if let Err(e) = state
-                .storage
-                .delete_response_times_for_session(&payload.session_id)
-            {
-                log::warn!("Failed to delete old response_times: {e}");
-            }
-            let rt_pairs: Vec<(&str, &str)> = messages
+            let rt_pairs: Vec<(&str, &str)> = extracted
+                .messages
                 .iter()
                 .map(|m| (m.role.as_str(), m.timestamp.as_str()))
                 .collect();
-            if let Err(e) = state
-                .storage
-                .ingest_response_times(&payload.session_id, &rt_pairs)
+            if let Err(e) =
+                state
+                    .storage
+                    .ingest_response_times(payload.provider, &session_id, &rt_pairs)
             {
                 log::warn!("Failed to store response times: {e}");
             }
@@ -674,7 +739,7 @@ async fn post_session_messages(
     let result = tokio::task::block_in_place(|| -> Result<usize, String> {
         let mut count = 0usize;
         for msg in &extracted {
-            idx.index_message(msg, &project, &host)?;
+            idx.index_message(payload.provider, msg, &project, &host)?;
             count += 1;
         }
 
@@ -690,10 +755,11 @@ async fn post_session_messages(
                 .iter()
                 .map(|m| (m.role.as_str(), m.timestamp.as_str()))
                 .collect();
-            if let Err(e) = state
-                .storage
-                .ingest_response_times(&payload.session_id, &rt_pairs)
-            {
+            if let Err(e) = state.storage.ingest_response_times(
+                payload.provider,
+                &payload.session_id,
+                &rt_pairs,
+            ) {
                 log::warn!("Failed to store response times: {e}");
             }
             let _ = state.app_handle.emit("sessions-index-updated", count);
@@ -741,7 +807,21 @@ async fn get_session_search(
         .unwrap_or(10)
         .min(100);
 
+    let provider = match params.get("provider") {
+        Some(value) => match value.parse::<IntegrationProvider>() {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid provider"})),
+                );
+            }
+        },
+        None => None,
+    };
+
     let filters = sessions::SearchFilters {
+        provider,
         project: params.get("project").cloned(),
         host: params.get("host").cloned(),
         role: params.get("role").cloned(),
@@ -818,7 +898,21 @@ async fn get_session_context_api(
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
 
-    let result = tokio::task::block_in_place(|| idx.get_context(&session_id, &message_id, window));
+    let provider = match params.get("provider") {
+        Some(value) => match value.parse::<IntegrationProvider>() {
+            Ok(provider) => provider,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Invalid provider"})),
+                );
+            }
+        },
+        None => IntegrationProvider::Claude,
+    };
+
+    let result =
+        tokio::task::block_in_place(|| idx.get_context(provider, &session_id, &message_id, window));
 
     match result {
         Ok(context) => (StatusCode::OK, Json(serde_json::json!(context))),

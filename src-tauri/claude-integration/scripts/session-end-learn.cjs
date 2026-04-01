@@ -22,6 +22,7 @@ async function main() {
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
     const payload = JSON.stringify({
+      provider: "claude",
       session_id: input.session_id,
       transcript_path: input.transcript_path,
       cwd: input.cwd,

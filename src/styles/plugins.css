@@ -111,6 +111,39 @@
   font-size: 12px;
 }
 
+/* ─── Provider switcher ─── */
+.plugins-provider-switcher {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px 0;
+  flex-shrink: 0;
+}
+
+.plugins-provider-switcher__button {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  color: rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 5px 10px;
+  text-transform: uppercase;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.plugins-provider-switcher__button:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.plugins-provider-switcher__button--active {
+  background: rgba(122, 162, 247, 0.12);
+  border-color: rgba(122, 162, 247, 0.3);
+  color: #7aa2f7;
+}
+
 /* ─── Tab bar ─── */
 .plugins-tab-bar {
   display: flex;
@@ -406,6 +439,31 @@
   font-family: "SF Mono", "Fira Code", monospace;
 }
 
+.plugins-provider-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.plugins-provider-note {
+  margin: 0 10px 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(122, 162, 247, 0.12);
+  border-radius: 6px;
+  background: rgba(122, 162, 247, 0.06);
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 /* ─── Buttons ─── */
 .plugins-btn {
   background: none;
@@ -551,6 +609,9 @@
 }
 
 .plugins-marketplace-group__name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   font-weight: 700;
   color: #c0caf5;

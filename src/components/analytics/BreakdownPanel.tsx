@@ -9,7 +9,9 @@ import type {
   HostBreakdown,
   ProjectBreakdown,
   SessionBreakdown,
+  SessionRef,
 } from "../../types";
+import { sessionRefKey } from "../../types";
 
 function formatRelativeTime(isoString: string): string {
   const now = Date.now();
@@ -49,6 +51,10 @@ const MODE_LABELS: Record<BreakdownMode, string> = {
 };
 const PAGE_SIZE = 5;
 const CONFIRM_TIMEOUT_MS = 3000;
+
+function providerLabel(provider: SessionRef["provider"]): string {
+  return provider === "claude" ? "Claude" : "Codex";
+}
 
 interface TrashIconProps {
   size?: number;
@@ -142,6 +148,29 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     }
   };
 
+  const handleSessionRowClick = (row: SessionBreakdown) => {
+    const ref: SessionRef = {
+      provider: row.provider,
+      session_id: row.session_id,
+    };
+    const key = sessionRefKey(ref);
+
+    resetConfirm();
+    if (selection?.type === "session" && selection.key === key) {
+      onSelect(null);
+      return;
+    }
+
+    onSelect({
+      type: "session",
+      key,
+      firstSeen: row.first_seen,
+      lastActive: row.last_active,
+      provider: row.provider,
+      sessionId: row.session_id,
+    });
+  };
+
   const isSelected = (type: BreakdownSelection["type"], key: string) =>
     selection?.type === type && selection?.key === key;
 
@@ -168,21 +197,31 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     resetConfirm();
     setDeleting(true);
 
-    const commandMap: Record<BreakdownSelection["type"], string> = {
-      host: "delete_host_data",
-      project: "delete_project_data",
-      session: "delete_session_data",
-    };
-    const argsMap: Record<
-      BreakdownSelection["type"],
-      Record<string, string>
-    > = {
-      host: { hostname: selection.key },
-      project: { cwd: selection.key },
-      session: { sessionId: selection.key },
-    };
-    const command = commandMap[selection.type];
-    const args = argsMap[selection.type];
+    let command: string;
+    let args: Record<string, string>;
+
+    switch (selection.type) {
+      case "host":
+        command = "delete_host_data";
+        args = { hostname: selection.key };
+        break;
+      case "project":
+        command = "delete_project_data";
+        args = { cwd: selection.key };
+        break;
+      case "session":
+        if (!selection.provider || !selection.sessionId) {
+          setDeleting(false);
+          toast("error", "Missing provider data for this session");
+          return;
+        }
+        command = "delete_session_data";
+        args = {
+          provider: selection.provider,
+          sessionId: selection.sessionId,
+        };
+        break;
+    }
 
     try {
       await invoke(command, args);
@@ -452,23 +491,36 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                 })
               : (pageData as SessionBreakdown[]).map((row) => (
                   <div
-                    key={row.session_id}
-                    className={`breakdown-row breakdown-row-session${isSelected("session", row.session_id) ? " selected" : ""}`}
+                    key={sessionRefKey({
+                      provider: row.provider,
+                      session_id: row.session_id,
+                    })}
+                    className={`breakdown-row breakdown-row-session${isSelected(
+                      "session",
+                      sessionRefKey({
+                        provider: row.provider,
+                        session_id: row.session_id,
+                      }),
+                    ) ? " selected" : ""}`}
                     role="listitem"
                     tabIndex={0}
                     aria-label={`Session ${row.session_id.slice(0, 8)}${projectName(row.project) ? ` in ${projectName(row.project)}` : ""} on ${row.hostname}: ${formatTokenCount(row.total_tokens)} tokens, ${row.turn_count} turns`}
-                    onClick={() =>
-                      handleRowClick("session", row.session_id, row)
-                    }
+                    onClick={() => handleSessionRowClick(row)}
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        handleRowClick("session", row.session_id, row);
+                        handleSessionRowClick(row);
                       }
                     }}
                   >
                     <span className="breakdown-name" title={row.session_id}>
                       {row.session_id.slice(0, 8)}
+                      <span
+                        className={`breakdown-provider-tag ${row.provider}`}
+                        title={providerLabel(row.provider)}
+                      >
+                        {providerLabel(row.provider)}
+                      </span>
                       {projectName(row.project) && (
                         <span
                           className="breakdown-project-tag"

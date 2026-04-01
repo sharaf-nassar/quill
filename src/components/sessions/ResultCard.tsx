@@ -24,8 +24,9 @@ function ResultCard({ hit, selected, locStats, onSelect }: ResultCardProps) {
 	const sanitized = DOMPurify.sanitize(hit.snippet, {
 		ALLOWED_TAGS: ["mark"],
 	});
+	const providerLabel = hit.provider === "claude" ? "Claude" : "Codex";
 
-	const meta = [hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
+	const meta = [providerLabel, hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
 		.filter(Boolean)
 		.join(" \u00B7 ");
 
@@ -40,6 +41,9 @@ function ResultCard({ hit, selected, locStats, onSelect }: ResultCardProps) {
 					aria-label={hit.role}
 				>
 					{hit.role === "user" ? "\u2191" : "\u2193"}
+				</span>
+				<span className={`sessions-provider-badge ${hit.provider}`}>
+					{providerLabel}
 				</span>
 				<span
 					className="sessions-result-snippet"

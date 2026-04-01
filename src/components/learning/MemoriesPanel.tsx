@@ -1,6 +1,13 @@
 import { useState, useEffect, type CSSProperties } from "react";
-import { useMemoryData } from "../../hooks/useMemoryData";
+import { useMemoryData, type MemoryFile } from "../../hooks/useMemoryData";
 import { SuggestionCard } from "./SuggestionCard";
+import type { ProviderFilter } from "../../types";
+import {
+  memoryTypeLabel,
+  providerBadgeClass,
+  providerScopeClass,
+  providerScopeLabel,
+} from "../../utils/providers";
 
 const STYLES = {
   selectorRow: {
@@ -115,6 +122,7 @@ const TYPE_COLORS: Record<string, string> = {
   project: "#22C55E",
   reference: "#EAB308",
   "claude-md": "#A855F7",
+  "agents-md": "#F97316",
 };
 
 const CHANGED_STYLE: CSSProperties = {
@@ -136,8 +144,6 @@ function typeBadgeStyle(type: string): CSSProperties {
   };
 }
 
-import type { MemoryFile } from "../../hooks/useMemoryData";
-
 interface MemoryFileCardProps {
   file: MemoryFile;
   expanded: boolean;
@@ -156,9 +162,12 @@ function MemoryFileCard({ file: mf, expanded, onToggle, onDelete }: MemoryFileCa
           {expanded ? "▾" : "▸"}
         </span>
         <span className="learning-rule-name">{mf.file_name}</span>
+        <span className={providerBadgeClass(mf.provider)}>
+          {mf.provider === "claude" ? "Claude" : "Codex"}
+        </span>
         {mf.memory_type && (
           <span style={typeBadgeStyle(mf.memory_type)}>
-            {mf.memory_type}
+            {memoryTypeLabel(mf.memory_type)}
           </span>
         )}
         {mf.changed_since_last_run && (
@@ -185,15 +194,17 @@ function MemoryFileCard({ file: mf, expanded, onToggle, onDelete }: MemoryFileCa
   );
 }
 
-const CLAUDE_MD_BADGE_STYLE = typeBadgeStyle("claude-md");
-
-interface ClaudeMdCardProps {
+interface InstructionFileCardProps {
   file: MemoryFile;
   expanded: boolean;
   onToggle: (fp: string) => void;
 }
 
-function ClaudeMdCard({ file: mf, expanded, onToggle }: ClaudeMdCardProps) {
+function InstructionFileCard({
+  file: mf,
+  expanded,
+  onToggle,
+}: InstructionFileCardProps) {
   return (
     <div className="learning-rule-card">
       <div
@@ -204,7 +215,12 @@ function ClaudeMdCard({ file: mf, expanded, onToggle }: ClaudeMdCardProps) {
           {expanded ? "▾" : "▸"}
         </span>
         <span className="learning-rule-name">{mf.file_name}</span>
-        <span style={CLAUDE_MD_BADGE_STYLE}>CLAUDE.MD</span>
+        <span className={providerBadgeClass(mf.provider)}>
+          {mf.provider === "claude" ? "Claude" : "Codex"}
+        </span>
+        <span style={typeBadgeStyle(mf.memory_type ?? "reference")}>
+          {memoryTypeLabel(mf.memory_type)}
+        </span>
         {mf.changed_since_last_run && (
           <span style={CHANGED_STYLE}>changed</span>
         )}
@@ -219,7 +235,11 @@ function ClaudeMdCard({ file: mf, expanded, onToggle }: ClaudeMdCardProps) {
   );
 }
 
-export function MemoriesPanel() {
+interface MemoriesPanelProps {
+  providerFilter: ProviderFilter;
+}
+
+export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
   const {
     projects,
     selectedProject,
@@ -242,7 +262,7 @@ export function MemoriesPanel() {
     removeCustomProject,
     deleteMemoryFile,
     deleteProjectMemories,
-  } = useMemoryData();
+  } = useMemoryData(providerFilter);
 
   const [showManage, setShowManage] = useState(false);
   const [newPath, setNewPath] = useState("");
@@ -274,9 +294,12 @@ export function MemoriesPanel() {
     }
   }, [visibleProjects, selectedProject, setSelectedProject]);
 
-  // Separate memory files from CLAUDE.md files
-  const actualMemoryFiles = memoryFiles.filter((f) => f.memory_type !== "claude-md");
-  const claudeMdFiles = memoryFiles.filter((f) => f.memory_type === "claude-md");
+  const actualMemoryFiles = memoryFiles.filter(
+    (file) => !["claude-md", "agents-md"].includes(file.memory_type ?? ""),
+  );
+  const instructionFiles = memoryFiles.filter((file) =>
+    ["claude-md", "agents-md"].includes(file.memory_type ?? ""),
+  );
 
   const pendingSuggestions = suggestions.filter((s) => s.status === "pending");
   const deniedSuggestions = suggestions.filter((s) => s.status === "denied");
@@ -448,6 +471,10 @@ export function MemoriesPanel() {
 
               return [...byProject.entries()].map(([projectPath, files]) => (
                 <div key={projectPath} className="learning-section">
+                  {(() => {
+                    const projectProviders =
+                      projects.find((project) => project.path === projectPath)?.providers ?? [];
+                    return (
                   <div
                     className="learning-section-header"
                     style={{ cursor: "pointer" }}
@@ -455,10 +482,17 @@ export function MemoriesPanel() {
                     title={`Switch to ${nameFor(projectPath)}`}
                   >
                     {nameFor(projectPath)}
+                    {projectProviders.map((provider) => (
+                      <span key={`${projectPath}-${provider}`} className={providerBadgeClass(provider)}>
+                        {provider === "claude" ? "Claude" : "Codex"}
+                      </span>
+                    ))}
                     <span className="learning-section-count">
                       {files.length}
                     </span>
                   </div>
+                    );
+                  })()}
                   {files.map((mf) => (
                     <MemoryFileCard
                       key={mf.file_path}
@@ -552,17 +586,17 @@ export function MemoriesPanel() {
             )}
           </div>
 
-          {/* CLAUDE.md files */}
-          {claudeMdFiles.length > 0 && (
+          {/* Instruction files */}
+          {instructionFiles.length > 0 && (
             <div className="learning-section">
               <div className="learning-section-header">
-                CLAUDE.MD FILES
+                INSTRUCTION FILES
                 <span className="learning-section-count">
-                  {claudeMdFiles.length}
+                  {instructionFiles.length}
                 </span>
               </div>
-              {claudeMdFiles.map((mf) => (
-                <ClaudeMdCard
+              {instructionFiles.map((mf) => (
+                <InstructionFileCard
                   key={mf.file_path}
                   file={mf}
                   expanded={expandedFiles.has(mf.file_path)}
@@ -788,6 +822,9 @@ export function MemoriesPanel() {
                           : "●"}
                     </span>
                     <span className="learning-run-trigger">{r.trigger}</span>
+                    <span className={providerScopeClass(r.provider_scope)}>
+                      {providerScopeLabel(r.provider_scope)}
+                    </span>
                     <span className="learning-run-result">
                       {r.memories_scanned} scanned, {r.suggestions_created}{" "}
                       suggestions

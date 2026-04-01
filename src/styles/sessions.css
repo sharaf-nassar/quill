@@ -244,6 +244,29 @@
   gap: 6px;
 }
 
+.sessions-provider-badge {
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  border-radius: 999px;
+  padding: 2px 6px;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+}
+
+.sessions-provider-badge.claude {
+  color: #F9A8D4;
+  background: rgba(244, 114, 182, 0.12);
+  border-color: rgba(244, 114, 182, 0.22);
+}
+
+.sessions-provider-badge.codex {
+  color: #7DD3FC;
+  background: rgba(56, 189, 248, 0.12);
+  border-color: rgba(56, 189, 248, 0.22);
+}
+
 .sessions-result-snippet {
   flex: 1;
   font-size: 11px;

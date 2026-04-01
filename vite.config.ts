@@ -16,6 +16,9 @@ export default defineConfig({
       host: "localhost",
       port: 8181,
     },
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

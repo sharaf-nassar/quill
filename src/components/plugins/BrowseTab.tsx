@@ -1,13 +1,20 @@
 import { useState, useMemo, useCallback } from "react";
-import type { Marketplace } from "../../types";
+import type { Marketplace, MarketplacePlugin } from "../../types";
 
 interface BrowseTabProps {
 	marketplaces: Marketplace[];
 	operations: {
 		inProgress: Set<string>;
-		installPlugin: (name: string, marketplace: string) => Promise<void>;
+		installPlugin: (
+			marketplace: Marketplace,
+			plugin: MarketplacePlugin,
+		) => Promise<void>;
 	};
 	onChanged: () => void;
+}
+
+function providerLabel(provider: Marketplace["provider"]): string {
+	return provider === "claude" ? "Claude" : "Codex";
 }
 
 function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {
@@ -62,8 +69,8 @@ function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {
 	}, []);
 
 	const handleInstall = useCallback(
-		async (pluginName: string, marketplace: string) => {
-			await operations.installPlugin(pluginName, marketplace);
+		async (marketplace: Marketplace, plugin: MarketplacePlugin) => {
+			await operations.installPlugin(marketplace, plugin);
 			onChanged();
 		},
 		[operations, onChanged],
@@ -99,6 +106,9 @@ function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {
 							onClick={() => toggleCollapse(marketplace.name)}
 						>
 							<span className="plugins-marketplace-group__name">
+								<span className="plugins-provider-badge">
+									{providerLabel(marketplace.provider)}
+								</span>
 								{marketplace.name}
 							</span>
 							<span className="plugins-marketplace-group__count">
@@ -111,10 +121,12 @@ function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {
 						</button>
 						{!collapsed.has(marketplace.name) &&
 							marketplace.plugins.map((plugin) => {
-								const busy = operations.inProgress.has(plugin.name);
+								const busy = operations.inProgress.has(
+									`${plugin.provider}:${plugin.plugin_id}`,
+								);
 								return (
 									<div
-										key={plugin.name}
+										key={`${plugin.provider}:${plugin.plugin_id}`}
 										className={`plugins-row${plugin.installed ? " plugins-row--installed" : ""}`}
 									>
 										<div className="plugins-row__info">
@@ -122,9 +134,11 @@ function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {
 												<span className="plugins-row__name">
 													{plugin.name}
 												</span>
-												<span className="plugins-row__version">
-													{plugin.version}
-												</span>
+												{plugin.version && (
+													<span className="plugins-row__version">
+														{plugin.version}
+													</span>
+												)}
 												{plugin.category && (
 													<span className="plugins-row__category">
 														{plugin.category}
@@ -159,15 +173,13 @@ function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {
 														Installing...
 													</span>
 												</div>
-											) : (
-												<button
-													className="plugins-btn plugins-btn--install"
-													onClick={() =>
-														handleInstall(plugin.name, marketplace.name)
-													}
-												>
-													Install
-												</button>
+												) : (
+													<button
+														className="plugins-btn plugins-btn--install"
+														onClick={() => handleInstall(marketplace, plugin)}
+													>
+														Install
+													</button>
 											)}
 										</div>
 									</div>

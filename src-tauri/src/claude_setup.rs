@@ -1,3 +1,5 @@
+use crate::integrations::manifest::OwnedAssetManifest;
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -70,6 +72,47 @@ fn get_hostname() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+const MANAGED_COMMAND_FILES: [&str; 5] = [
+    "qbuild.md",
+    "learn.md",
+    "quill-build.md",
+    "quill-learn.md",
+    "quill-setup.md",
+];
+
+const MANAGED_SCRIPT_FILES: [&str; 5] = [
+    "observe.cjs",
+    "qbuild-guard.sh",
+    "session-sync.cjs",
+    "report-tokens.sh",
+    "session-end-learn.cjs",
+];
+
+const MCP_SERVER_KEY: &str = "mcpServers.quill";
+
+fn build_owned_manifest() -> OwnedAssetManifest {
+    let mut files: Vec<String> = MANAGED_COMMAND_FILES
+        .into_iter()
+        .map(|name| commands_dir().join(name).to_string_lossy().to_string())
+        .collect();
+    files.extend(
+        MANAGED_SCRIPT_FILES
+            .into_iter()
+            .map(|name| scripts_dir().join(name).to_string_lossy().to_string()),
+    );
+
+    OwnedAssetManifest {
+        files,
+        directories: vec![
+            scripts_dir().to_string_lossy().to_string(),
+            mcp_dir().to_string_lossy().to_string(),
+            templates_dir().to_string_lossy().to_string(),
+        ],
+        config_keys: vec![MCP_SERVER_KEY.to_string()],
+        markdown_blocks: vec![SECTION_HEADING.to_string()],
+    }
+}
+
 // ── File deployment ──
 
 /// Recursively copy all files from `src` into `dst`, creating directories as needed.
@@ -124,15 +167,7 @@ fn clean_quill_commands() -> Result<(), String> {
         return Ok(());
     }
     // All command filenames we have ever shipped — keeps old names so updates clean them up
-    let managed_commands = [
-        "qbuild.md",
-        // Legacy/removed names — kept so updates clean them up:
-        "learn.md",
-        "quill-build.md",
-        "quill-learn.md",
-        "quill-setup.md",
-    ];
-    for name in &managed_commands {
+    for name in &MANAGED_COMMAND_FILES {
         let path = dir.join(name);
         if path.exists()
             && let Err(e) = fs::remove_file(&path)
@@ -140,6 +175,248 @@ fn clean_quill_commands() -> Result<(), String> {
             log::warn!("Failed to remove command {}: {e}", name);
         }
     }
+    Ok(())
+}
+
+pub(crate) fn owned_asset_manifest() -> OwnedAssetManifest {
+    build_owned_manifest()
+}
+
+pub fn install_with_manifest(app: &tauri::AppHandle) -> Result<OwnedAssetManifest, String> {
+    deploy_files(app)?;
+
+    if let Err(err) = create_local_config() {
+        log::error!("Failed to create local config: {err}");
+    }
+
+    if let Err(err) = register_mcp_server() {
+        log::error!("Failed to register MCP server: {err}");
+    }
+
+    if let Err(err) = register_hooks() {
+        log::error!("Failed to register hooks: {err}");
+    }
+
+    if let Err(err) = update_claude_md() {
+        log::error!("Failed to update CLAUDE.md: {err}");
+    }
+
+    if let Err(err) = cleanup_legacy_hooks() {
+        log::error!("Failed to clean up legacy hooks: {err}");
+    }
+
+    if let Err(err) = verify_mcp() {
+        log::error!("MCP server verification FAILED: {err}");
+        log::error!("The Quill MCP server may not work correctly until this is resolved");
+    }
+
+    Ok(build_owned_manifest())
+}
+
+pub fn uninstall_with_manifest(manifest: &OwnedAssetManifest) -> Result<(), String> {
+    remove_owned_files(&manifest.files)?;
+    remove_managed_command_files()?;
+    cleanup_quill_hooks()?;
+    remove_quill_mcp_key(manifest)?;
+    remove_claude_md_sections(&manifest.markdown_blocks)?;
+    remove_owned_directories(&manifest.directories)?;
+    Ok(())
+}
+
+fn remove_owned_files(paths: &[String]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for raw_path in paths {
+        if !seen.insert(raw_path.to_owned()) {
+            continue;
+        }
+
+        let path = PathBuf::from(raw_path);
+        if path.exists()
+            && let Err(err) = fs::remove_file(&path)
+        {
+            return Err(format!("Failed to remove file {}: {err}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn remove_managed_command_files() -> Result<(), String> {
+    let mut paths = HashSet::new();
+    for name in &MANAGED_COMMAND_FILES {
+        let path = commands_dir().join(name);
+        paths.insert(path);
+    }
+
+    for path in paths {
+        if path.exists()
+            && let Err(err) = fs::remove_file(&path)
+        {
+            return Err(format!(
+                "Failed to remove command file {}: {err}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_owned_directories(directories: &[String]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for raw_dir in directories {
+        if !seen.insert(raw_dir.to_owned()) {
+            continue;
+        }
+
+        let path = PathBuf::from(raw_dir);
+        if !path.exists() {
+            continue;
+        }
+
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|err| format!("Failed to remove directory {}: {err}", path.display()))?;
+            continue;
+        }
+
+        if let Err(err) = fs::remove_file(&path) {
+            return Err(format!("Failed to remove file {}: {err}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn remove_quill_mcp_key(manifest: &OwnedAssetManifest) -> Result<(), String> {
+    let claude_json_path = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".claude.json");
+
+    if !claude_json_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&claude_json_path)
+        .map_err(|err| format!("Failed to read .claude.json: {err}"))?;
+
+    let mut root: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let mut removed_keys = false;
+    let mut keys: HashSet<&str> = manifest.config_keys.iter().map(String::as_str).collect();
+    keys.insert(MCP_SERVER_KEY);
+
+    for key in keys {
+        let mut parts = key.split('.').collect::<Vec<_>>();
+        if parts.is_empty() {
+            continue;
+        }
+
+        let leaf = parts.pop().unwrap_or_default();
+        let parent = parts
+            .iter()
+            .try_fold(&mut root, |cursor, part| match cursor.get_mut(*part) {
+                Some(next) if next.is_object() => Ok::<_, ()>(next),
+                _ => Err(()),
+            });
+
+        if let Ok(parent_obj) = parent
+            && let Some(parent_map) = parent_obj.as_object_mut()
+            && parent_map.remove(leaf).is_some()
+        {
+            removed_keys = true;
+        }
+    }
+
+    if removed_keys {
+        let content = serde_json::to_string_pretty(&root)
+            .map_err(|err| format!("Failed to serialize .claude.json: {err}"))?;
+        fs::write(&claude_json_path, content)
+            .map_err(|err| format!("Failed to write .claude.json: {err}"))?;
+    }
+
+    Ok(())
+}
+
+fn remove_claude_md_sections(blocks: &[String]) -> Result<(), String> {
+    let claude_md_path = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".claude")
+        .join("CLAUDE.md");
+
+    if !claude_md_path.exists() {
+        return Ok(());
+    }
+
+    let mut changed = false;
+    let mut content = fs::read_to_string(&claude_md_path)
+        .map_err(|err| format!("Failed to read CLAUDE.md: {err}"))?;
+
+    for heading in blocks {
+        if let Some(start) = content.find(heading) {
+            let after_heading = start + heading.len();
+            let end = content[after_heading..]
+                .find("\n### ")
+                .or_else(|| content[after_heading..].find("\n## "))
+                .map(|pos| after_heading + pos)
+                .unwrap_or(content.len());
+
+            let mut stripped = String::with_capacity(content.len());
+            stripped.push_str(&content[..start]);
+            stripped.push_str(&content[end..]);
+            content = stripped;
+            changed = true;
+        }
+    }
+
+    if changed {
+        fs::write(&claude_md_path, content)
+            .map_err(|err| format!("Failed to write CLAUDE.md: {err}"))?;
+    }
+
+    Ok(())
+}
+
+fn cleanup_quill_hooks() -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let settings_path = home.join(".claude").join("settings.json");
+
+    if !settings_path.exists() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&settings_path)
+        .map_err(|err| format!("Failed to read settings.json: {err}"))?;
+
+    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+
+    let mut modified = false;
+    let quill_scripts_path = scripts_dir().to_string_lossy().to_string();
+    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_event, entries) in hooks.iter_mut() {
+            if let Some(arr) = entries.as_array_mut() {
+                let before = arr.len();
+                arr.retain(|entry| {
+                    let raw = entry.to_string();
+                    !raw.contains(HOOK_MARKER) && !raw.contains(&quill_scripts_path)
+                });
+                if arr.len() != before {
+                    modified = true;
+                }
+            }
+        }
+    }
+
+    if modified {
+        let output = serde_json::to_string_pretty(&settings)
+            .map_err(|err| format!("Failed to serialize settings.json: {err}"))?;
+        fs::write(&settings_path, output)
+            .map_err(|err| format!("Failed to write settings.json: {err}"))?;
+    }
+
     Ok(())
 }
 
@@ -648,40 +925,7 @@ fn cleanup_legacy_hooks() -> Result<(), String> {
 
 /// Set up Claude Code integration locally when the Quill widget runs on the same machine.
 /// Called on widget startup.
+#[allow(dead_code)]
 pub fn setup_local(app: &tauri::AppHandle) -> Result<(), String> {
-    // Step 1: Deploy files — fatal if this fails
-    deploy_files(app)?;
-
-    // Step 2: Create local config — log errors but continue
-    if let Err(e) = create_local_config() {
-        log::error!("Failed to create local config: {e}");
-    }
-
-    // Step 3: Register MCP server — log errors but continue
-    if let Err(e) = register_mcp_server() {
-        log::error!("Failed to register MCP server: {e}");
-    }
-
-    // Step 4: Register hooks — log errors but continue
-    if let Err(e) = register_hooks() {
-        log::error!("Failed to register hooks: {e}");
-    }
-
-    // Step 5: Update CLAUDE.md with MCP section — log errors but continue
-    if let Err(e) = update_claude_md() {
-        log::error!("Failed to update CLAUDE.md: {e}");
-    }
-
-    // Step 6: Clean up legacy hooks — log errors but continue
-    if let Err(e) = cleanup_legacy_hooks() {
-        log::error!("Failed to clean up legacy hooks: {e}");
-    }
-
-    // Step 7: Verify MCP — log prominently but don't fail
-    if let Err(e) = verify_mcp() {
-        log::error!("MCP server verification FAILED: {e}");
-        log::error!("The Quill MCP server may not work correctly until this is resolved");
-    }
-
-    Ok(())
+    install_with_manifest(app).map(|_| ())
 }

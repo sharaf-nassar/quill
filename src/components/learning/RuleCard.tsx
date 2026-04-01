@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { LearnedRule } from "../../types";
+import { providerScopeClass, providerScopeLabel } from "../../utils/providers";
 
 interface RuleCardProps {
 	rule: LearnedRule;
@@ -70,6 +71,9 @@ function RuleCard({ rule, onDelete, onPromote }: RuleCardProps) {
 					{rule.is_anti_pattern && <span className="learning-rule-anti" title="Anti-pattern: avoid this">!</span>}
 					{rule.name}
 				</span>
+        <span className={providerScopeClass(rule.provider_scope)}>
+          {providerScopeLabel(rule.provider_scope)}
+        </span>
 				<span className="learning-rule-confidence" style={{ color }}>
 					{rule.confidence.toFixed(2)}
 				</span>

@@ -101,6 +101,7 @@ usage = json.loads(sys.argv[1])
 payload = {
     'session_id': sys.argv[2],
     'hostname': sys.argv[3],
+    'provider': 'claude',
     'input_tokens': usage['input_tokens'],
     'output_tokens': usage['output_tokens'],
     'cache_creation_input_tokens': usage['cache_creation_input_tokens'],

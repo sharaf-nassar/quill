@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
 use crate::ai_client;
+use crate::integrations::IntegrationProvider;
 use crate::models::{
     ActionType, MemoryFile, MemoryFilesUpdatedEvent, MemoryOptimizerLogEvent,
     MemoryOptimizerUpdatedEvent, OptimizationOutput,
@@ -17,14 +18,14 @@ const MAX_DENIED: usize = 50;
 /// Total prompt budget in bytes (~1MB)
 const TOTAL_BUDGET_BYTES: usize = 1_040_000;
 const WEIGHT_MEMORY: f64 = 0.58;
-const WEIGHT_CLAUDEMD: f64 = 0.23;
+const WEIGHT_INSTRUCTIONS: f64 = 0.23;
 const WEIGHT_RULES: f64 = 0.12;
 const WEIGHT_INSTINCTS: f64 = 0.07;
 
 /// Compute dynamic budget allocation based on which sections have content.
 fn allocate_budgets(
     has_memory: bool,
-    has_claude_md: bool,
+    has_instruction_files: bool,
     has_rules: bool,
     has_instincts: bool,
 ) -> (usize, usize, usize, usize) {
@@ -32,8 +33,8 @@ fn allocate_budgets(
     if has_memory {
         weights.push(("memory", WEIGHT_MEMORY));
     }
-    if has_claude_md {
-        weights.push(("claude_md", WEIGHT_CLAUDEMD));
+    if has_instruction_files {
+        weights.push(("instructions", WEIGHT_INSTRUCTIONS));
     }
     if has_rules {
         weights.push(("rules", WEIGHT_RULES));
@@ -57,7 +58,7 @@ fn allocate_budgets(
 
     (
         budget_for("memory"),
-        budget_for("claude_md"),
+        budget_for("instructions"),
         budget_for("rules"),
         budget_for("instincts"),
     )
@@ -112,6 +113,72 @@ pub fn memory_dir(project_path: &str) -> PathBuf {
         .join("memory")
 }
 
+fn included_providers(provider: Option<IntegrationProvider>) -> Vec<IntegrationProvider> {
+    match provider {
+        Some(provider) => vec![provider],
+        None => vec![IntegrationProvider::Claude, IntegrationProvider::Codex],
+    }
+}
+
+fn provider_memory_dir(provider: IntegrationProvider, project_path: &str) -> Option<PathBuf> {
+    match provider {
+        IntegrationProvider::Claude => Some(memory_dir(project_path)),
+        IntegrationProvider::Codex => None,
+    }
+}
+
+fn is_instruction_memory_type(memory_type: Option<&str>) -> bool {
+    matches!(memory_type, Some("claude-md" | "agents-md"))
+}
+
+fn is_instruction_target(target: &str) -> bool {
+    target == "CLAUDE.md"
+        || target == "~/.claude/CLAUDE.md"
+        || target == "AGENTS.md"
+        || target == "~/.codex/AGENTS.md"
+        || target.contains("/.claude/CLAUDE.md")
+        || target.contains("/.codex/AGENTS.md")
+        || target.ends_with("/CLAUDE.md")
+        || target.ends_with("/AGENTS.md")
+}
+
+fn instruction_candidates(
+    provider: IntegrationProvider,
+    project_path: &str,
+) -> Vec<(PathBuf, String, String, String)> {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    match provider {
+        IntegrationProvider::Claude => vec![
+            (
+                PathBuf::from(project_path).join("CLAUDE.md"),
+                "CLAUDE.md".to_string(),
+                "claude-md".to_string(),
+                "Project-local Claude Code instructions".to_string(),
+            ),
+            (
+                home.join(".claude").join("CLAUDE.md"),
+                "~/.claude/CLAUDE.md".to_string(),
+                "claude-md".to_string(),
+                "Global Claude Code instructions".to_string(),
+            ),
+        ],
+        IntegrationProvider::Codex => vec![
+            (
+                PathBuf::from(project_path).join("AGENTS.md"),
+                "AGENTS.md".to_string(),
+                "agents-md".to_string(),
+                "Project-local Codex instructions".to_string(),
+            ),
+            (
+                home.join(".codex").join("AGENTS.md"),
+                "~/.codex/AGENTS.md".to_string(),
+                "agents-md".to_string(),
+                "Global Codex instructions".to_string(),
+            ),
+        ],
+    }
+}
+
 /// Parse frontmatter from a memory file. Returns (type, description) if found.
 fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>) {
     if !content.starts_with("---") {
@@ -135,112 +202,120 @@ fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>) {
     (mem_type, description)
 }
 
-/// Scan memory files for a project from disk.
-pub fn scan_memory_files(storage: &Storage, project_path: &str) -> Result<Vec<MemoryFile>, String> {
-    let dir = memory_dir(project_path);
+#[allow(clippy::too_many_arguments)]
+fn record_scanned_file(
+    storage: &Storage,
+    prev_hashes: &std::collections::HashMap<String, String>,
+    project_path: &str,
+    provider: IntegrationProvider,
+    path: &Path,
+    file_name: String,
+    memory_type: Option<String>,
+    description: Option<String>,
+) -> Result<Option<MemoryFile>, String> {
+    if !path.exists() || !path.is_file() {
+        return Ok(None);
+    }
 
+    let file_path_str = path.to_string_lossy().to_string();
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", file_path_str))?;
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    let changed = prev_hashes
+        .get(&file_path_str)
+        .map(|prev| prev != &hash)
+        .unwrap_or(true);
+
+    storage.upsert_memory_file(project_path, &file_path_str, &hash)?;
+
+    Ok(Some(MemoryFile {
+        id: 0,
+        provider,
+        project_path: project_path.to_string(),
+        file_path: file_path_str,
+        file_name,
+        content_hash: hash,
+        last_scanned_at: chrono::Utc::now().to_rfc3339(),
+        memory_type,
+        description,
+        content,
+        changed_since_last_run: changed,
+    }))
+}
+
+/// Scan memory and instruction files for a project from disk.
+pub fn scan_memory_files(
+    storage: &Storage,
+    project_path: &str,
+    provider: Option<IntegrationProvider>,
+) -> Result<Vec<MemoryFile>, String> {
     let prev_hashes = storage.get_memory_file_hashes(project_path)?;
     let mut files = Vec::new();
 
-    if dir.exists() {
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| format!("Failed to read memory dir: {e}"))?;
+    for current_provider in included_providers(provider) {
+        if let Some(dir) = provider_memory_dir(current_provider, project_path)
+            && dir.exists()
+        {
+            let entries =
+                std::fs::read_dir(&dir).map_err(|e| format!("Failed to read memory dir: {e}"))?;
 
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read dir entry: {e}"))?;
-            let path = entry.path();
-            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
-                continue;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Failed to read dir entry: {e}"))?;
+                let path = entry.path();
+                if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let content = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+                let (memory_type, description) = parse_frontmatter(&content);
+                if let Some(file) = record_scanned_file(
+                    storage,
+                    &prev_hashes,
+                    project_path,
+                    current_provider,
+                    &path,
+                    file_name,
+                    memory_type,
+                    description,
+                )? {
+                    files.push(file);
+                }
             }
+        }
 
-            let file_path_str = path.to_string_lossy().to_string();
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            let content = std::fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read {}: {e}", file_path_str))?;
-
-            let mut hasher = Sha256::new();
-            hasher.update(content.as_bytes());
-            let hash = format!("{:x}", hasher.finalize());
-
-            let changed = prev_hashes
-                .get(&file_path_str)
-                .map(|prev| prev != &hash)
-                .unwrap_or(true);
-
-            let (mem_type, description) = parse_frontmatter(&content);
-
-            storage.upsert_memory_file(project_path, &file_path_str, &hash)?;
-
-            files.push(MemoryFile {
-                id: 0,
-                project_path: project_path.to_string(),
-                file_path: file_path_str,
+        for (path, file_name, memory_type, description) in
+            instruction_candidates(current_provider, project_path)
+        {
+            if let Some(file) = record_scanned_file(
+                storage,
+                &prev_hashes,
+                project_path,
+                current_provider,
+                &path,
                 file_name,
-                content_hash: hash,
-                last_scanned_at: chrono::Utc::now().to_rfc3339(),
-                memory_type: mem_type,
-                description,
-                content,
-                changed_since_last_run: changed,
-            });
+                Some(memory_type),
+                Some(description),
+            )? {
+                files.push(file);
+            }
         }
     }
 
-    // Include CLAUDE.md files as special entries (for frontend display)
-    let project_claude_md = PathBuf::from(project_path).join("CLAUDE.md");
-    if project_claude_md.exists()
-        && let Ok(content) = std::fs::read_to_string(&project_claude_md)
-    {
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
-        let changed = prev_hashes
-            .get(&project_claude_md.to_string_lossy().to_string())
-            .map(|prev| prev != &hash)
-            .unwrap_or(true);
-        files.push(MemoryFile {
-            id: 0,
-            project_path: project_path.to_string(),
-            file_path: project_claude_md.to_string_lossy().to_string(),
-            file_name: "CLAUDE.md".to_string(),
-            content_hash: hash,
-            last_scanned_at: chrono::Utc::now().to_rfc3339(),
-            memory_type: Some("claude-md".to_string()),
-            description: Some("Project-local CLAUDE.md instructions".to_string()),
-            content,
-            changed_since_last_run: changed,
-        });
-    }
-    let home_path = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let global_claude_md = home_path.join(".claude").join("CLAUDE.md");
-    if global_claude_md.exists()
-        && let Ok(content) = std::fs::read_to_string(&global_claude_md)
-    {
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
-        let changed = prev_hashes
-            .get(&global_claude_md.to_string_lossy().to_string())
-            .map(|prev| prev != &hash)
-            .unwrap_or(true);
-        files.push(MemoryFile {
-            id: 0,
-            project_path: project_path.to_string(),
-            file_path: global_claude_md.to_string_lossy().to_string(),
-            file_name: "~/.claude/CLAUDE.md".to_string(),
-            content_hash: hash,
-            last_scanned_at: chrono::Utc::now().to_rfc3339(),
-            memory_type: Some("claude-md".to_string()),
-            description: Some("Global CLAUDE.md instructions".to_string()),
-            content,
-            changed_since_last_run: changed,
-        });
-    }
+    files.sort_by(|a, b| {
+        a.provider
+            .as_str()
+            .cmp(b.provider.as_str())
+            .then(a.file_name.cmp(&b.file_name))
+            .then(a.file_path.cmp(&b.file_path))
+    });
 
     Ok(files)
 }
@@ -249,69 +324,99 @@ fn read_file_optional(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+struct InstructionContextFile {
+    provider: IntegrationProvider,
+    scope: String,
+    display_name: String,
+    content: String,
+}
+
 struct GatheredContext {
-    global_claude_md: String,
-    project_claude_md: String,
+    instruction_files: Vec<InstructionContextFile>,
     rules: String,
     instincts: String,
 }
 
-fn gather_context(project_path: &str) -> GatheredContext {
+fn gather_context(project_path: &str, provider: Option<IntegrationProvider>) -> GatheredContext {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut instruction_files = Vec::new();
+    let providers = included_providers(provider);
 
-    let global_claude_md = read_file_optional(&home.join(".claude").join("CLAUDE.md"));
-    let project_claude_md = read_file_optional(&PathBuf::from(project_path).join("CLAUDE.md"));
+    for current_provider in &providers {
+        for (path, display_name, _memory_type, _description) in
+            instruction_candidates(*current_provider, project_path)
+        {
+            let content = read_file_optional(&path);
+            if content.is_empty() {
+                continue;
+            }
+            let scope = if display_name.starts_with("~/") {
+                "global".to_string()
+            } else {
+                "project".to_string()
+            };
+            instruction_files.push(InstructionContextFile {
+                provider: *current_provider,
+                scope,
+                display_name,
+                content,
+            });
+        }
+    }
 
     let mut rules = String::new();
-    let rules_dir = home.join(".claude").join("rules");
-    if rules_dir.exists() {
-        collect_md_files(&rules_dir, &mut rules);
+    if providers.contains(&IntegrationProvider::Claude) {
+        let rules_dir = home.join(".claude").join("rules");
+        if rules_dir.exists() {
+            collect_md_files(&rules_dir, &mut rules);
+        }
     }
 
     let mut instincts = String::new();
-    let global_instincts_dir = home
-        .join(".claude")
-        .join("homunculus")
-        .join("instincts")
-        .join("personal");
-    if global_instincts_dir.exists() {
-        collect_md_files(&global_instincts_dir, &mut instincts);
-    }
+    if providers.contains(&IntegrationProvider::Claude) {
+        let global_instincts_dir = home
+            .join(".claude")
+            .join("homunculus")
+            .join("instincts")
+            .join("personal");
+        if global_instincts_dir.exists() {
+            collect_md_files(&global_instincts_dir, &mut instincts);
+        }
 
-    let projects_json_path = home
-        .join(".claude")
-        .join("homunculus")
-        .join("projects.json");
-    if projects_json_path.exists()
-        && let Ok(json_str) = std::fs::read_to_string(&projects_json_path)
-        && let Ok(projects) = serde_json::from_str::<serde_json::Value>(&json_str)
-        && let Some(obj) = projects.as_object()
-    {
-        for (hash_key, info) in obj {
-            let matches = info
-                .get("path")
-                .and_then(|p| p.as_str())
-                .map(|p| p == project_path)
-                .unwrap_or(false);
-            if matches {
-                let project_instincts_dir = home
-                    .join(".claude")
-                    .join("homunculus")
-                    .join("projects")
-                    .join(hash_key)
-                    .join("instincts")
-                    .join("personal");
-                if project_instincts_dir.exists() {
-                    collect_md_files(&project_instincts_dir, &mut instincts);
+        let projects_json_path = home
+            .join(".claude")
+            .join("homunculus")
+            .join("projects.json");
+        if projects_json_path.exists()
+            && let Ok(json_str) = std::fs::read_to_string(&projects_json_path)
+            && let Ok(projects) = serde_json::from_str::<serde_json::Value>(&json_str)
+            && let Some(obj) = projects.as_object()
+        {
+            for (hash_key, info) in obj {
+                let matches = info
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p == project_path)
+                    .unwrap_or(false);
+                if matches {
+                    let project_instincts_dir = home
+                        .join(".claude")
+                        .join("homunculus")
+                        .join("projects")
+                        .join(hash_key)
+                        .join("instincts")
+                        .join("personal");
+                    if project_instincts_dir.exists() {
+                        collect_md_files(&project_instincts_dir, &mut instincts);
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
 
     GatheredContext {
-        global_claude_md,
-        project_claude_md,
+        instruction_files,
         rules,
         instincts,
     }
@@ -343,22 +448,21 @@ fn build_prompt(
     denied: &[crate::models::OptimizationSuggestion],
 ) -> String {
     let has_memory = !memory_files.is_empty();
-    let has_claude_md =
-        !context.project_claude_md.is_empty() || !context.global_claude_md.is_empty();
+    let has_instruction_files = !context.instruction_files.is_empty();
     let has_rules = !context.rules.is_empty();
     let has_instincts = !context.instincts.is_empty();
 
-    let (memory_budget, claude_md_budget, rules_budget, instincts_budget) =
-        allocate_budgets(has_memory, has_claude_md, has_rules, has_instincts);
+    let (memory_budget, instruction_budget, rules_budget, instincts_budget) =
+        allocate_budgets(has_memory, has_instruction_files, has_rules, has_instincts);
 
     let mut prompt = String::with_capacity(32_000);
 
     prompt.push_str(
-        "You are a memory and configuration optimization assistant for Claude Code projects.\n\n",
+        "You are a memory and instruction optimization assistant for Quill-managed Claude Code and Codex projects.\n\n",
     );
-    prompt.push_str("Claude Code uses memory files (project-scoped context) and CLAUDE.md files (instruction sets) to guide the AI assistant. ");
+    prompt.push_str("Claude Code can use project memory files plus CLAUDE.md instructions. Codex uses AGENTS.md instruction files. ");
     prompt.push_str(
-        "Your job is to analyze both and suggest improvements. All changes require user approval.\n\n",
+        "Your job is to analyze the available context and suggest improvements. All changes require user approval.\n\n",
     );
 
     prompt.push_str("<context>\n");
@@ -385,37 +489,21 @@ fn build_prompt(
     }
     prompt.push_str("</memory-files>\n");
 
-    // CLAUDE.md files section
-    if has_claude_md {
-        prompt.push_str("<claude-md-files>\n");
-
-        // Count non-empty CLAUDE.md files for budget splitting
-        let claude_md_count = [
-            !context.project_claude_md.is_empty(),
-            !context.global_claude_md.is_empty(),
-        ]
-        .iter()
-        .filter(|&&v| v)
-        .count();
-        let per_claude_budget = claude_md_budget / claude_md_count.max(1);
-
-        if !context.project_claude_md.is_empty() {
-            let escaped = escape_for_prompt(&context.project_claude_md);
-            let content = safe_truncate(&escaped, per_claude_budget);
+    if has_instruction_files {
+        prompt.push_str("<instruction-files>\n");
+        let per_instruction_budget = instruction_budget / context.instruction_files.len().max(1);
+        for instruction in &context.instruction_files {
+            let escaped = escape_for_prompt(&instruction.content);
+            let content = safe_truncate(&escaped, per_instruction_budget);
             prompt.push_str(&format!(
-                "<file name=\"CLAUDE.md\" scope=\"project\">{}</file>\n",
+                "<file provider=\"{}\" scope=\"{}\" name=\"{}\">{}</file>\n",
+                instruction.provider.as_str(),
+                escape_for_prompt(&instruction.scope),
+                escape_for_prompt(&instruction.display_name),
                 content,
             ));
         }
-        if !context.global_claude_md.is_empty() {
-            let escaped = escape_for_prompt(&context.global_claude_md);
-            let content = safe_truncate(&escaped, per_claude_budget);
-            prompt.push_str(&format!(
-                "<file name=\"~/.claude/CLAUDE.md\" scope=\"global\">{}</file>\n",
-                content,
-            ));
-        }
-        prompt.push_str("</claude-md-files>\n");
+        prompt.push_str("</instruction-files>\n");
     }
 
     // Rules section
@@ -452,13 +540,15 @@ fn build_prompt(
     // Task instructions
     prompt.push_str("<task>\n");
     prompt.push_str(
-        "Analyze the memory files and CLAUDE.md files above and suggest optimizations.\n\n",
+        "Analyze the memory files and instruction files above and suggest optimizations.\n\n",
     );
     prompt.push_str("For memory files, you can suggest: delete, update, merge, create, flag.\n");
-    prompt.push_str("For CLAUDE.md files, you can suggest: update, flag (only).\n\n");
+    prompt.push_str(
+        "For instruction files (CLAUDE.md or AGENTS.md), you can suggest: update, flag (only).\n\n",
+    );
     prompt.push_str("For each suggestion, provide:\n");
     prompt.push_str("- action_type: one of 'delete', 'update', 'merge', 'create', 'flag'\n");
-    prompt.push_str("- target_file: the filename being acted on (null for create). For CLAUDE.md, use 'CLAUDE.md' for project-local or '~/.claude/CLAUDE.md' for global\n");
+    prompt.push_str("- target_file: the filename being acted on (null for create). For instruction files, use exactly one of 'CLAUDE.md', '~/.claude/CLAUDE.md', 'AGENTS.md', or '~/.codex/AGENTS.md'\n");
     prompt.push_str(
         "- new_filename: filename for create actions (lowercase, hyphens/underscores, no extension)\n",
     );
@@ -468,13 +558,14 @@ fn build_prompt(
     );
     prompt.push_str("- merge_sources: list of filenames being merged (for merge only)\n\n");
     prompt.push_str("Focus on:\n");
-    prompt
-        .push_str("1. Memories that duplicate content already in CLAUDE.md, rules, or instincts\n");
+    prompt.push_str(
+        "1. Memories that duplicate content already in instruction files, rules, or instincts\n",
+    );
     prompt.push_str("2. Stale memories referencing things that no longer apply\n");
     prompt.push_str("3. Memories that could be more concise\n");
     prompt.push_str("4. Memories that should be merged (overlapping topics)\n");
     prompt.push_str(
-        "5. Gaps where a new memory would help (project-specific context not captured elsewhere)\n\n",
+        "5. Gaps where a new memory or instruction update would help (project-specific context not captured elsewhere)\n\n",
     );
     prompt.push_str(
         "If the memories are already clean and optimal, return an empty suggestions array.\n",
@@ -508,6 +599,7 @@ pub async fn run_optimization_with_run(
     storage: &'static Storage,
     project_path: &str,
     run_id: i64,
+    provider: Option<IntegrationProvider>,
     app: &tauri::AppHandle,
 ) -> Result<i64, String> {
     let _ = app.emit(
@@ -530,7 +622,7 @@ pub async fn run_optimization_with_run(
 
     emit_log("Scanning memory files...");
     let _ = storage.cleanup_stale_suggestions(project_path);
-    let memory_files = match scan_memory_files(storage, project_path) {
+    let memory_files = match scan_memory_files(storage, project_path, provider) {
         Ok(files) => files,
         Err(e) => {
             storage.update_optimization_run(run_id, 0, 0, "{}", "failed", Some(&e))?;
@@ -548,27 +640,30 @@ pub async fn run_optimization_with_run(
     // Separate memory files from CLAUDE.md entries
     let actual_memory_files: Vec<_> = memory_files
         .iter()
-        .filter(|f| f.memory_type.as_deref() != Some("claude-md"))
+        .filter(|f| !is_instruction_memory_type(f.memory_type.as_deref()))
         .collect();
     let actual_count = actual_memory_files.len();
+    let instruction_file_count = memory_files
+        .iter()
+        .filter(|file| is_instruction_memory_type(file.memory_type.as_deref()))
+        .count();
 
-    emit_log(&format!("Found {} memory files", actual_count));
+    emit_log(&format!(
+        "Found {} memory files and {} instruction files",
+        actual_count, instruction_file_count
+    ));
 
     if actual_memory_files.is_empty() {
         emit_log("No memory files to optimize — checking if new memories should be suggested");
     }
 
-    emit_log("Gathering context (CLAUDE.md, rules, instincts)...");
-    let context = gather_context(project_path);
+    emit_log("Gathering context (instruction files, rules, instincts)...");
+    let context = gather_context(project_path, provider);
 
     let mut sources = serde_json::Map::new();
     sources.insert(
-        "project_claude_md".to_string(),
-        serde_json::Value::Bool(!context.project_claude_md.is_empty()),
-    );
-    sources.insert(
-        "global_claude_md".to_string(),
-        serde_json::Value::Bool(!context.global_claude_md.is_empty()),
+        "instruction_files".to_string(),
+        serde_json::Value::from(context.instruction_files.len()),
     );
     sources.insert(
         "rules".to_string(),
@@ -581,7 +676,7 @@ pub async fn run_optimization_with_run(
     let context_sources_json = serde_json::to_string(&sources).unwrap_or_else(|_| "{}".to_string());
 
     emit_log("Loading denied suggestions...");
-    let denied = storage.get_denied_suggestions(project_path, MAX_DENIED as i64)?;
+    let denied = storage.get_denied_suggestions(project_path, provider, MAX_DENIED as i64)?;
 
     emit_log("Building analysis prompt...");
     let mem_refs: Vec<&MemoryFile> = actual_memory_files.into_iter().collect();
@@ -619,21 +714,21 @@ pub async fn run_optimization_with_run(
         result.suggestions.len()
     ));
 
-    // Store suggestions (with CLAUDE.md action type validation)
+    // Store suggestions (with instruction-file action type validation)
     let mem_dir = memory_dir(project_path);
     let mut stored_suggestions: Vec<SuggestionRow> = Vec::new();
     for suggestion in &result.suggestions {
-        let targets_claude_md = suggestion
+        let targets_instruction_file = suggestion
             .target_file
             .as_ref()
-            .map(|f| f.ends_with("CLAUDE.md"))
+            .map(|target| is_instruction_target(target))
             .unwrap_or(false);
-        if targets_claude_md {
+        if targets_instruction_file {
             match suggestion.action_type {
                 ActionType::Update | ActionType::Flag => {}
                 _ => {
                     log::warn!(
-                        "Skipping disallowed {} action on CLAUDE.md target: {}",
+                        "Skipping disallowed {} action on instruction target: {}",
                         suggestion.action_type,
                         suggestion.target_file.as_deref().unwrap_or("?")
                     );
@@ -766,7 +861,7 @@ pub async fn run_optimization_with_run(
 }
 
 /// Resolve a target file path with path traversal protection.
-/// CLAUDE.md targets get special handling; all others are validated
+/// Instruction files get special handling; all other targets are validated
 /// to stay within the memory directory.
 fn resolve_target_path(
     target: &str,
@@ -778,6 +873,11 @@ fn resolve_target_path(
     } else if target.contains("/.claude/CLAUDE.md") || target == "~/.claude/CLAUDE.md" {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         Ok(home.join(".claude").join("CLAUDE.md"))
+    } else if target == "AGENTS.md" {
+        Ok(PathBuf::from(project_path).join("AGENTS.md"))
+    } else if target.contains("/.codex/AGENTS.md") || target == "~/.codex/AGENTS.md" {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+        Ok(home.join(".codex").join("AGENTS.md"))
     } else {
         let resolved = mem_dir.join(target);
         for component in resolved.components() {
@@ -796,7 +896,7 @@ fn resolve_target_path(
     }
 }
 
-/// Read a target file's content, resolving CLAUDE.md paths specially.
+/// Read a target file's content, resolving instruction file paths specially.
 /// Returns None if the file does not exist or is unreadable.
 fn read_target_file(
     project_path: &str,
@@ -967,16 +1067,16 @@ fn execute_single_suggestion_unchecked(
     project_path: &str,
     mem_dir: &Path,
 ) -> Result<(), String> {
-    let is_claude_md = suggestion
+    let is_instruction_file = suggestion
         .target_file
         .as_ref()
-        .map(|f| f.ends_with("CLAUDE.md"))
+        .map(|target| is_instruction_target(target))
         .unwrap_or(false);
 
     match suggestion.action_type.as_str() {
         "delete" => {
-            if is_claude_md {
-                return Err("Cannot delete CLAUDE.md files".to_string());
+            if is_instruction_file {
+                return Err("Cannot delete instruction files".to_string());
             }
             let target = suggestion
                 .target_file
@@ -1002,8 +1102,8 @@ fn execute_single_suggestion_unchecked(
                 .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         }
         "create" => {
-            if is_claude_md {
-                return Err("Cannot create CLAUDE.md files".to_string());
+            if is_instruction_file {
+                return Err("Cannot create instruction files".to_string());
             }
             let content = suggestion
                 .proposed_content
@@ -1032,8 +1132,8 @@ fn execute_single_suggestion_unchecked(
                 .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         }
         "merge" => {
-            if is_claude_md {
-                return Err("Cannot merge CLAUDE.md files".to_string());
+            if is_instruction_file {
+                return Err("Cannot merge instruction files".to_string());
             }
             let sources: Vec<String> = suggestion.merge_sources.clone().unwrap_or_default();
             let content = suggestion
@@ -1090,12 +1190,12 @@ fn generate_group_memory_md_followup(
         if s.action_type == "flag" {
             continue;
         }
-        let is_claude_md = s
+        let is_instruction_file = s
             .target_file
             .as_ref()
-            .map(|f| f.ends_with("CLAUDE.md"))
+            .map(|target| is_instruction_target(target))
             .unwrap_or(false);
-        if is_claude_md {
+        if is_instruction_file {
             continue;
         }
 
@@ -1205,10 +1305,10 @@ pub fn execute_suggestion(
 
     let mem_dir = memory_dir(&suggestion.project_path);
 
-    let is_claude_md = suggestion
+    let is_instruction_file = suggestion
         .target_file
         .as_ref()
-        .map(|f| f.ends_with("CLAUDE.md"))
+        .map(|target| is_instruction_target(target))
         .unwrap_or(false);
 
     // Staleness check: verify file hasn't changed since suggestion was created
@@ -1232,9 +1332,9 @@ pub fn execute_suggestion(
 
     match suggestion.action_type.as_str() {
         "delete" => {
-            if is_claude_md {
+            if is_instruction_file {
                 return Err(
-                    "Cannot delete CLAUDE.md files — use update or flag instead".to_string()
+                    "Cannot delete instruction files — use update or flag instead".to_string(),
                 );
             }
             let target = suggestion
@@ -1261,9 +1361,9 @@ pub fn execute_suggestion(
                 .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         }
         "create" => {
-            if is_claude_md {
+            if is_instruction_file {
                 return Err(
-                    "Cannot create CLAUDE.md files — use update or flag instead".to_string()
+                    "Cannot create instruction files — use update or flag instead".to_string(),
                 );
             }
             let content = suggestion
@@ -1293,8 +1393,10 @@ pub fn execute_suggestion(
                 .map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
         }
         "merge" => {
-            if is_claude_md {
-                return Err("Cannot merge CLAUDE.md files — use update or flag instead".to_string());
+            if is_instruction_file {
+                return Err(
+                    "Cannot merge instruction files — use update or flag instead".to_string(),
+                );
             }
             let sources: Vec<String> = suggestion.merge_sources.clone().unwrap_or_default();
             let content = suggestion
@@ -1345,8 +1447,8 @@ pub fn execute_suggestion(
         },
     );
 
-    // Generate MEMORY.md follow-up suggestion for non-flag, non-CLAUDE.md actions
-    if suggestion.action_type != "flag" && !is_claude_md {
+    // Generate MEMORY.md follow-up suggestion for non-flag, non-instruction actions
+    if suggestion.action_type != "flag" && !is_instruction_file {
         let memory_md_path = mem_dir.join("MEMORY.md");
         let memory_md_exists = memory_md_path.exists();
         let current_memory_md = if memory_md_exists {
@@ -1563,12 +1665,65 @@ pub fn undo_suggestion(
 }
 
 /// Get list of known projects (from analytics + custom).
-pub fn get_known_projects(storage: &Storage) -> Result<Vec<crate::models::KnownProject>, String> {
+fn project_provider_footprint(
+    project_path: &str,
+    provider: Option<IntegrationProvider>,
+) -> Vec<IntegrationProvider> {
+    let mut providers = Vec::new();
+    for current_provider in included_providers(provider) {
+        let has_memory_dir = provider_memory_dir(current_provider, project_path)
+            .map(|dir| dir.exists())
+            .unwrap_or(false);
+        let has_instruction_file = instruction_candidates(current_provider, project_path)
+            .iter()
+            .any(|(path, _, _, _)| path.exists());
+        if has_memory_dir || has_instruction_file {
+            providers.push(current_provider);
+        }
+    }
+    providers.sort_by_key(|current_provider| current_provider.as_str());
+    providers.dedup();
+    providers
+}
+
+fn count_project_context_files(project_path: &str, providers: &[IntegrationProvider]) -> i64 {
+    let mut count = 0i64;
+    for provider in providers {
+        if let Some(dir) = provider_memory_dir(*provider, project_path)
+            && dir.exists()
+        {
+            count += std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.filter(|entry| {
+                        entry
+                            .as_ref()
+                            .ok()
+                            .and_then(|entry| entry.path().extension().map(|ext| ext == "md"))
+                            .unwrap_or(false)
+                    })
+                    .count() as i64
+                })
+                .unwrap_or(0);
+        }
+
+        count += instruction_candidates(*provider, project_path)
+            .iter()
+            .filter(|(path, _, _, _)| path.exists())
+            .count() as i64;
+    }
+    count
+}
+
+pub fn get_known_projects(
+    storage: &Storage,
+    provider: Option<IntegrationProvider>,
+) -> Result<Vec<crate::models::KnownProject>, String> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let projects_dir = home.join(".claude").join("projects");
 
     let mut projects: Vec<crate::models::KnownProject> = Vec::new();
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut project_providers = storage.get_project_provider_map(provider)?;
 
     if projects_dir.exists()
         && let Ok(entries) = std::fs::read_dir(&projects_dir)
@@ -1584,31 +1739,25 @@ pub fn get_known_projects(storage: &Storage) -> Result<Vec<crate::models::KnownP
                 .unwrap_or("")
                 .to_string();
 
-            let display_name = crate::sessions::SessionIndex::project_display_name(&dir_name);
-            let memory_path = path.join("memory");
-            let has_memories = memory_path.exists();
-            let memory_count = if has_memories {
-                std::fs::read_dir(&memory_path)
-                    .map(|rd| {
-                        rd.filter(|e| {
-                            e.as_ref()
-                                .ok()
-                                .and_then(|e| e.path().extension().map(|ext| ext == "md"))
-                                .unwrap_or(false)
-                        })
-                        .count() as i64
-                    })
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-
             let resolved_path = slug_to_path(&dir_name);
+            let provider_entry = project_providers.entry(resolved_path.clone()).or_default();
+            provider_entry.push(IntegrationProvider::Claude);
+            provider_entry.sort_by_key(|current_provider| current_provider.as_str());
+            provider_entry.dedup();
+
+            let display_name = crate::sessions::SessionIndex::project_display_name(&dir_name);
+            let providers = project_providers
+                .get(&resolved_path)
+                .cloned()
+                .unwrap_or_else(|| vec![IntegrationProvider::Claude]);
+            let memory_count = count_project_context_files(&resolved_path, &providers);
+            let has_memories = memory_count > 0;
 
             if seen_paths.insert(resolved_path.clone()) {
                 projects.push(crate::models::KnownProject {
                     path: resolved_path,
                     name: display_name,
+                    providers,
                     has_memories,
                     memory_count,
                     is_custom: false,
@@ -1627,37 +1776,43 @@ pub fn get_known_projects(storage: &Storage) -> Result<Vec<crate::models::KnownP
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let slug = project_path_to_slug(&custom_path);
-                let mem_path = PathBuf::from(&home)
-                    .join(".claude")
-                    .join("projects")
-                    .join(&slug)
-                    .join("memory");
-                let has_memories = mem_path.exists();
-                let memory_count = if has_memories {
-                    std::fs::read_dir(&mem_path)
-                        .map(|rd| {
-                            rd.filter(|e| {
-                                e.as_ref()
-                                    .ok()
-                                    .and_then(|e| e.path().extension().map(|ext| ext == "md"))
-                                    .unwrap_or(false)
-                            })
-                            .count() as i64
-                        })
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
+                let providers = project_providers
+                    .get(&custom_path)
+                    .cloned()
+                    .filter(|providers| !providers.is_empty())
+                    .unwrap_or_else(|| project_provider_footprint(&custom_path, provider));
+                let memory_count = count_project_context_files(&custom_path, &providers);
+                let has_memories = memory_count > 0;
                 projects.push(crate::models::KnownProject {
                     path: custom_path,
                     name,
+                    providers,
                     has_memories,
                     memory_count,
                     is_custom: true,
                 });
             }
         }
+    }
+
+    for (path, providers) in project_providers {
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        let name = PathBuf::from(&path)
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let memory_count = count_project_context_files(&path, &providers);
+        projects.push(crate::models::KnownProject {
+            path,
+            name,
+            providers,
+            has_memories: memory_count > 0,
+            memory_count,
+            is_custom: false,
+        });
     }
 
     projects.sort_by(|a, b| {

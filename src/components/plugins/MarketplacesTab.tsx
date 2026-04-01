@@ -14,14 +14,20 @@ function formatLastUpdated(ts: string | null): string {
 
 interface MarketplacesTabProps {
 	marketplaces: Marketplace[];
+	allowEditing: boolean;
 	onAdd: (repo: string) => Promise<void>;
 	onRemove: (name: string) => Promise<void>;
 	onRefresh: (name: string) => Promise<void>;
 	onRefreshAll: () => Promise<void>;
 }
 
+function providerLabel(provider: Marketplace["provider"]): string {
+	return provider === "claude" ? "Claude" : "Codex";
+}
+
 function MarketplacesTab({
 	marketplaces,
+	allowEditing,
 	onAdd,
 	onRemove,
 	onRefresh,
@@ -81,16 +87,20 @@ function MarketplacesTab({
 				<input
 					type="text"
 					className="plugins-search-input"
-					placeholder="GitHub repo (e.g., org/marketplace-repo)..."
+					placeholder={
+						allowEditing
+							? "GitHub repo (e.g., org/marketplace-repo)..."
+							: "Codex marketplaces are discovered automatically..."
+					}
 					value={addInput}
 					onChange={(e) => setAddInput(e.target.value)}
 					onKeyDown={handleKeyDown}
-					disabled={adding}
+					disabled={adding || !allowEditing}
 				/>
 				<button
 					className="plugins-btn plugins-btn--install"
 					onClick={handleAdd}
-					disabled={adding || !addInput.trim()}
+					disabled={adding || !addInput.trim() || !allowEditing}
 				>
 					{adding ? "Adding..." : "+ Add"}
 				</button>
@@ -116,6 +126,9 @@ function MarketplacesTab({
 							<div className="plugins-marketplace-card__header">
 								<div className="plugins-marketplace-card__info">
 									<div className="plugins-marketplace-card__name-row">
+										<span className="plugins-provider-badge">
+											{providerLabel(marketplace.provider)}
+										</span>
 										<span className="plugins-marketplace-card__name">
 											{marketplace.name}
 										</span>
@@ -146,12 +159,14 @@ function MarketplacesTab({
 											>
 												Refresh
 											</button>
-											<button
-												className="plugins-btn plugins-btn--danger"
-												onClick={() => onRemove(marketplace.name)}
-											>
-												Remove
-											</button>
+											{allowEditing && (
+												<button
+													className="plugins-btn plugins-btn--danger"
+													onClick={() => onRemove(marketplace.name)}
+												>
+													Remove
+												</button>
+											)}
 										</>
 									)}
 								</div>
@@ -164,6 +179,12 @@ function MarketplacesTab({
 					);
 				})}
 			</div>
+			{!allowEditing && (
+				<div className="plugins-provider-note">
+					Codex discovers plugin marketplaces through app-server. Refresh syncs
+					the catalog, but marketplace add/remove is not exposed here.
+				</div>
+			)}
 			<div className="plugins-footer">
 				<span>
 					{marketplaces.length} marketplace

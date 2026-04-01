@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback } from "react";
 import type { InstalledPlugin } from "../../types";
+import { installedPluginInstanceKey } from "../../utils/plugins";
 
 function projectName(path: string | null): string {
 	if (!path) return "";
@@ -11,11 +12,15 @@ interface InstalledTabProps {
 	plugins: InstalledPlugin[];
 	operations: {
 		inProgress: Set<string>;
-		enablePlugin: (name: string) => Promise<void>;
-		disablePlugin: (name: string) => Promise<void>;
-		removePlugin: (name: string, marketplace: string) => Promise<void>;
+		enablePlugin: (plugin: InstalledPlugin) => Promise<void>;
+		disablePlugin: (plugin: InstalledPlugin) => Promise<void>;
+		removePlugin: (plugin: InstalledPlugin) => Promise<void>;
 	};
 	onChanged: () => void;
+}
+
+function providerLabel(provider: InstalledPlugin["provider"]): string {
+	return provider === "claude" ? "Claude" : "Codex";
 }
 
 function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
@@ -37,9 +42,9 @@ function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
 	const handleToggle = useCallback(
 		async (plugin: InstalledPlugin) => {
 			if (plugin.enabled) {
-				await operations.disablePlugin(plugin.name);
+				await operations.disablePlugin(plugin);
 			} else {
-				await operations.enablePlugin(plugin.name);
+				await operations.enablePlugin(plugin);
 			}
 			onChanged();
 		},
@@ -48,7 +53,7 @@ function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
 
 	const handleRemove = useCallback(
 		async (plugin: InstalledPlugin) => {
-			await operations.removePlugin(plugin.name, plugin.marketplace);
+			await operations.removePlugin(plugin);
 			onChanged();
 		},
 		[operations, onChanged],
@@ -67,16 +72,25 @@ function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
 			</div>
 			<div className="plugins-list">
 				{filtered.map((plugin) => {
-					const busy = operations.inProgress.has(plugin.name);
+					const instanceKey = installedPluginInstanceKey(plugin);
+					const busy = operations.inProgress.has(instanceKey);
+					const supportsToggle = plugin.provider === "claude";
 					return (
 						<div
-							key={`${plugin.name}@${plugin.marketplace}`}
+							key={instanceKey}
 							className={`plugins-row${!plugin.enabled ? " plugins-row--disabled" : ""}`}
 						>
 							<div className="plugins-row__info">
 								<div className="plugins-row__header">
+									<span className="plugins-provider-badge">
+										{providerLabel(plugin.provider)}
+									</span>
 									<span className="plugins-row__name">{plugin.name}</span>
-									<span className="plugins-row__version">{plugin.version}</span>
+									{plugin.version && (
+										<span className="plugins-row__version">
+											{plugin.version}
+										</span>
+									)}
 									<span
 										className={`plugins-row__status${plugin.enabled ? " plugins-row__status--enabled" : " plugins-row__status--disabled"}`}
 									>
@@ -106,12 +120,14 @@ function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {
 									</div>
 								) : (
 									<>
-										<button
-											className={`plugins-btn${plugin.enabled ? " plugins-btn--secondary" : " plugins-btn--enable"}`}
-											onClick={() => handleToggle(plugin)}
-										>
-											{plugin.enabled ? "Disable" : "Enable"}
-										</button>
+										{supportsToggle && (
+											<button
+												className={`plugins-btn${plugin.enabled ? " plugins-btn--secondary" : " plugins-btn--enable"}`}
+												onClick={() => handleToggle(plugin)}
+											>
+												{plugin.enabled ? "Disable" : "Enable"}
+											</button>
+										)}
 										<button
 											className="plugins-btn plugins-btn--danger"
 											onClick={() => handleRemove(plugin)}

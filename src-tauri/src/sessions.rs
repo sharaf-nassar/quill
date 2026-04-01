@@ -11,18 +11,22 @@ use tantivy::schema::*;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
+use crate::integrations::IntegrationProvider;
+
 // ---------------------------------------------------------------------------
 // Schema fields wrapper
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct SessionSchema {
+    pub provider: Field,
     pub message_id: Field,
     pub session_id: Field,
     pub content: Field,
     pub role: Field,
     pub project: Field,
     pub host: Field,
+    pub provider_facet: Field,
     pub timestamp: Field,
     pub git_branch: Field,
     pub tools_used: Field,
@@ -59,7 +63,7 @@ pub struct SessionIndex {
 }
 
 impl SessionIndex {
-    const SCHEMA_VERSION: u32 = 4;
+    const SCHEMA_VERSION: u32 = 5;
 
     /// Open an existing index or create a new one at the given directory.
     pub fn open_or_create(index_dir: &Path) -> Result<Self, String> {
@@ -121,6 +125,7 @@ impl SessionIndex {
         let mut builder = Schema::builder();
 
         // STRING | STORED fields (untokenized, exact-match, stored)
+        let provider = builder.add_text_field("provider", STRING | STORED);
         let message_id = builder.add_text_field("message_id", STRING | STORED);
         let session_id = builder.add_text_field("session_id", STRING | STORED);
         let role = builder.add_text_field("role", STRING | STORED);
@@ -138,6 +143,7 @@ impl SessionIndex {
         // Facet fields (hierarchical)
         let project = builder.add_facet_field("project", FacetOptions::default());
         let host = builder.add_facet_field("host", FacetOptions::default());
+        let provider_facet = builder.add_facet_field("provider_facet", FacetOptions::default());
 
         // Date field (indexed, stored, fast)
         let date_opts = DateOptions::from(INDEXED)
@@ -149,12 +155,14 @@ impl SessionIndex {
         let schema = builder.build();
 
         let fields = SessionSchema {
+            provider,
             message_id,
             session_id,
             content,
             role,
             project,
             host,
+            provider_facet,
             timestamp,
             git_branch,
             tools_used,
@@ -253,12 +261,14 @@ impl SessionIndex {
     /// Index a single extracted message into the tantivy index.
     pub fn index_message(
         &self,
+        provider: IntegrationProvider,
         msg: &ExtractedMessage,
         project_facet: &str,
         host_facet: &str,
     ) -> Result<(), String> {
         let mut doc = TantivyDocument::default();
 
+        doc.add_text(self.fields.provider, provider.as_str());
         doc.add_text(self.fields.message_id, &msg.uuid);
         doc.add_text(self.fields.session_id, &msg.session_id);
         doc.add_text(self.fields.content, &msg.content);
@@ -292,6 +302,10 @@ impl SessionIndex {
             Facet::from(&format!("/{project_facet}")),
         );
         doc.add_facet(self.fields.host, Facet::from(&format!("/{host_facet}")));
+        doc.add_facet(
+            self.fields.provider_facet,
+            Facet::from(&format!("/{}", provider.as_str())),
+        );
 
         // Parse timestamp as RFC3339 -> tantivy DateTime
         let ts = if !msg.timestamp.is_empty() {
@@ -311,40 +325,35 @@ impl SessionIndex {
         Ok(())
     }
 
-    /// Scan ~/.claude/projects/*/*.jsonl and index new/modified files.
-    /// Returns the number of newly indexed messages.
-    pub fn startup_scan(
+    pub(crate) fn delete_session_docs(
         &self,
-        app_handle: &tauri::AppHandle,
-        storage: Option<&crate::storage::Storage>,
-    ) -> Result<usize, String> {
-        use tauri::Emitter;
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let provider_term = Term::from_field_text(self.fields.provider, provider.as_str());
+        let session_term = Term::from_field_text(self.fields.session_id, session_id);
+        let delete_query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(provider_term, IndexRecordOption::Basic)),
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(session_term, IndexRecordOption::Basic)),
+            ),
+        ]);
 
-        let projects_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("projects");
+        let writer = self.writer.lock();
+        writer
+            .delete_query(Box::new(delete_query))
+            .map(|_| ())
+            .map_err(|e| format!("Delete session docs: {e}"))
+    }
 
-        if !projects_dir.exists() {
-            log::info!("No ~/.claude/projects directory found, skipping scan");
-            return Ok(0);
-        }
-
-        let mut total_indexed = 0usize;
-        let mut state = self.state.lock();
-
-        // Collect all JSONL files and their mtimes
-        let project_entries: Vec<_> = std::fs::read_dir(&projects_dir)
-            .map_err(|e| format!("Read projects dir: {e}"))?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .collect();
-
-        // Detect hostname from system
-        let hostname = std::env::var("HOSTNAME")
+    fn local_hostname() -> String {
+        std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .or_else(|_| {
-                // /etc/hostname exists on Linux; on macOS use `hostname` command
                 std::fs::read_to_string("/etc/hostname")
                     .map(|s| s.trim().to_string())
                     .or_else(|_| {
@@ -358,9 +367,31 @@ impl SessionIndex {
                             })
                     })
             })
-            .unwrap_or_else(|_| "unknown".to_string());
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
 
-        for project_entry in &project_entries {
+    fn discover_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
+        let mut files = Self::discover_claude_session_files()?;
+        files.extend(Self::discover_codex_session_files()?);
+        Ok(files)
+    }
+
+    fn discover_claude_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
+        let projects_dir = dirs::home_dir()
+            .ok_or("Cannot determine home directory")?
+            .join(".claude")
+            .join("projects");
+
+        if !projects_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut files = Vec::new();
+        for project_entry in std::fs::read_dir(&projects_dir)
+            .map_err(|e| format!("Read projects dir: {e}"))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+        {
             let project_dir = project_entry.path();
             let project_dir_name = project_dir
                 .file_name()
@@ -368,68 +399,144 @@ impl SessionIndex {
                 .unwrap_or("unknown");
             let project_name = Self::project_display_name(project_dir_name);
 
-            let jsonl_files: Vec<_> = std::fs::read_dir(&project_dir)
+            for entry in std::fs::read_dir(&project_dir)
                 .map_err(|e| format!("Read project dir: {e}"))?
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-                .collect();
+            {
+                files.push(DiscoveredSessionFile {
+                    provider: IntegrationProvider::Claude,
+                    path: entry.path(),
+                    default_project: project_name.clone(),
+                });
+            }
+        }
 
-            for entry in &jsonl_files {
-                let file_path = entry.path();
-                let file_key = file_path.to_string_lossy().to_string();
+        Ok(files)
+    }
 
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+    fn discover_codex_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
+        let sessions_dir = dirs::home_dir()
+            .ok_or("Cannot determine home directory")?
+            .join(".codex")
+            .join("sessions");
 
-                let known_mtime = state.file_mtimes.get(&file_key).copied();
+        if !sessions_dir.exists() {
+            return Ok(Vec::new());
+        }
 
-                if known_mtime == Some(mtime) {
-                    // File hasn't changed since last index
-                    continue;
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(&sessions_dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        {
+            files.push(DiscoveredSessionFile {
+                provider: IntegrationProvider::Codex,
+                path: entry.path().to_path_buf(),
+                default_project: "unknown".to_string(),
+            });
+        }
+
+        Ok(files)
+    }
+
+    /// Scan Claude and Codex session JSONL files and index new/modified files.
+    /// Returns the number of newly indexed messages.
+    pub fn startup_scan(
+        &self,
+        app_handle: &tauri::AppHandle,
+        storage: Option<&crate::storage::Storage>,
+    ) -> Result<usize, String> {
+        use tauri::Emitter;
+
+        let mut total_indexed = 0usize;
+        let mut state = self.state.lock();
+        let hostname = Self::local_hostname();
+
+        for discovered in Self::discover_session_files()? {
+            let file_key = discovered.path.to_string_lossy().to_string();
+            let mtime = std::fs::metadata(&discovered.path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let known_mtime = state.file_mtimes.get(&file_key).copied();
+            if known_mtime == Some(mtime) {
+                continue;
+            }
+
+            let extracted = extract_messages_from_jsonl(discovered.provider, &discovered.path);
+            let project_name = extracted
+                .project_name
+                .clone()
+                .filter(|project| !project.is_empty())
+                .unwrap_or_else(|| discovered.default_project.clone());
+
+            if known_mtime.is_some() && !extracted.session_id.is_empty() {
+                if let Err(e) = self.delete_session_docs(discovered.provider, &extracted.session_id)
+                {
+                    log::warn!("Failed to delete old session docs: {e}");
                 }
 
-                // If file was previously indexed but modified, delete old docs + tool_actions
-                if known_mtime.is_some()
-                    && let Some(session_id) = file_path.file_stem().and_then(|s| s.to_str())
-                {
-                    let term = Term::from_field_text(self.fields.session_id, session_id);
-                    let writer = self.writer.lock();
-                    writer.delete_term(term);
-                    // Also clear old tool_actions to prevent duplicates
-                    if let Some(storage) = storage
-                        && let Err(e) = storage.delete_tool_actions_for_session(session_id)
+                if let Some(storage) = storage {
+                    if let Err(e) = storage
+                        .delete_tool_actions_for_session(discovered.provider, &extracted.session_id)
                     {
                         log::warn!("Failed to delete old tool_actions: {e}");
                     }
-                }
-
-                // Index messages from this file
-                let messages = extract_messages_from_jsonl(&file_path);
-                for msg in &messages {
-                    if let Err(e) = self.index_message(msg, &project_name, &hostname) {
-                        log::warn!("Failed to index message: {e}");
-                    }
-                    // Store tool actions in SQLite
-                    if !msg.tool_actions.is_empty()
-                        && let Some(storage) = storage
-                        && let Err(e) = storage.store_tool_actions(
-                            &msg.tool_actions,
-                            &msg.uuid,
-                            &msg.session_id,
-                        )
-                    {
-                        log::warn!("Failed to store tool actions: {e}");
+                    if let Err(e) = storage.delete_response_times_for_session(
+                        discovered.provider,
+                        &extracted.session_id,
+                    ) {
+                        log::warn!("Failed to delete old response_times: {e}");
                     }
                 }
-
-                total_indexed += messages.len();
-                state.file_mtimes.insert(file_key, mtime);
             }
+
+            for msg in &extracted.messages {
+                if let Err(e) =
+                    self.index_message(discovered.provider, msg, &project_name, &hostname)
+                {
+                    log::warn!("Failed to index message: {e}");
+                }
+
+                if !msg.tool_actions.is_empty()
+                    && let Some(storage) = storage
+                    && let Err(e) = storage.store_tool_actions(
+                        discovered.provider,
+                        &msg.tool_actions,
+                        &msg.uuid,
+                        &msg.session_id,
+                    )
+                {
+                    log::warn!("Failed to store tool actions: {e}");
+                }
+            }
+
+            if let Some(storage) = storage
+                && !extracted.session_id.is_empty()
+                && !extracted.messages.is_empty()
+            {
+                let rt_pairs: Vec<(&str, &str)> = extracted
+                    .messages
+                    .iter()
+                    .map(|msg| (msg.role.as_str(), msg.timestamp.as_str()))
+                    .collect();
+                if let Err(e) = storage.ingest_response_times(
+                    discovered.provider,
+                    &extracted.session_id,
+                    &rt_pairs,
+                ) {
+                    log::warn!("Failed to store response times: {e}");
+                }
+            }
+
+            total_indexed += extracted.messages.len();
+            state.file_mtimes.insert(file_key, mtime);
         }
 
         // Commit all changes
@@ -515,6 +622,14 @@ impl SessionIndex {
         // Role filter
         if let Some(ref role) = filters.role {
             let term = Term::from_field_text(f.role, role);
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            ));
+        }
+
+        if let Some(provider) = filters.provider {
+            let term = Term::from_field_text(f.provider, provider.as_str());
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
@@ -651,6 +766,9 @@ impl SessionIndex {
                 .unwrap_or_default();
 
             hits.push(SearchHit {
+                provider: get_text(f.provider)
+                    .parse()
+                    .unwrap_or(IntegrationProvider::Claude),
                 message_id: get_text(f.message_id),
                 session_id: get_text(f.session_id),
                 content: get_text(f.content),
@@ -680,7 +798,7 @@ impl SessionIndex {
     // Facets
     // -------------------------------------------------------------------
 
-    /// Collect distinct project and host facets from the index.
+    /// Collect distinct provider, project, and host facets from the index.
     pub fn get_facets(&self) -> Result<SearchFacets, String> {
         let searcher = self.searcher();
 
@@ -690,10 +808,13 @@ impl SessionIndex {
         let mut host_collector = FacetCollector::for_field("host");
         host_collector.add_facet(Facet::root());
 
-        let (project_counts, host_counts) = searcher
+        let mut provider_collector = FacetCollector::for_field("provider_facet");
+        provider_collector.add_facet(Facet::root());
+
+        let (project_counts, host_counts, provider_counts) = searcher
             .search(
                 &tantivy::query::AllQuery,
-                &(project_collector, host_collector),
+                &(project_collector, host_collector, provider_collector),
             )
             .map_err(|e| format!("Facet collection error: {e}"))?;
 
@@ -721,7 +842,23 @@ impl SessionIndex {
             })
             .collect();
 
-        Ok(SearchFacets { projects, hosts })
+        let providers = provider_counts
+            .get("/")
+            .map(|(facet, count)| FacetCount {
+                name: facet
+                    .to_string()
+                    .strip_prefix('/')
+                    .unwrap_or(&facet.to_string())
+                    .to_string(),
+                count,
+            })
+            .collect();
+
+        Ok(SearchFacets {
+            providers,
+            projects,
+            hosts,
+        })
     }
 
     // -------------------------------------------------------------------
@@ -732,42 +869,16 @@ impl SessionIndex {
     /// around the target message.
     pub fn get_context(
         &self,
+        provider: IntegrationProvider,
         session_id: &str,
         message_id: &str,
         window: usize,
     ) -> Result<SessionContext, String> {
-        let projects_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("projects");
-
-        // Find the JSONL file matching this session_id
-        let mut jsonl_path: Option<PathBuf> = None;
-        let mut project_name = String::new();
-        if projects_dir.exists() {
-            for project_entry in std::fs::read_dir(&projects_dir)
-                .map_err(|e| format!("Read projects: {e}"))?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-            {
-                let candidate = project_entry.path().join(format!("{session_id}.jsonl"));
-                if candidate.exists() {
-                    jsonl_path = Some(candidate);
-                    let dir_name = project_entry
-                        .file_name()
-                        .to_str()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    project_name = Self::project_display_name(&dir_name);
-                    break;
-                }
-            }
-        }
-
-        let path =
-            jsonl_path.ok_or_else(|| format!("JSONL file not found for session {session_id}"))?;
-
-        let messages = extract_messages_from_jsonl(&path);
+        let path = find_session_path(provider, session_id)?
+            .ok_or_else(|| format!("JSONL file not found for session {session_id}"))?;
+        let extracted = extract_messages_from_jsonl(provider, &path);
+        let project_name = extracted.project_name.unwrap_or_default();
+        let messages = extracted.messages;
 
         // Find the index of the target message
         let target_idx = messages
@@ -803,6 +914,7 @@ impl SessionIndex {
             .collect();
 
         Ok(SessionContext {
+            provider,
             session_id: session_id.to_string(),
             project: project_name,
             messages: context_messages,
@@ -816,6 +928,7 @@ impl SessionIndex {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SearchHit {
+    pub provider: IntegrationProvider,
     pub message_id: String,
     pub session_id: String,
     pub content: String,
@@ -842,6 +955,7 @@ pub struct SearchResults {
 
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct SearchFilters {
+    pub provider: Option<IntegrationProvider>,
     pub project: Option<String>,
     pub host: Option<String>,
     pub role: Option<String>,
@@ -859,6 +973,7 @@ pub struct FacetCount {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SearchFacets {
+    pub providers: Vec<FacetCount>,
     pub projects: Vec<FacetCount>,
     pub hosts: Vec<FacetCount>,
 }
@@ -876,9 +991,16 @@ pub struct ContextMessage {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionContext {
+    pub provider: IntegrationProvider,
     pub session_id: String,
     pub project: String,
     pub messages: Vec<ContextMessage>,
+}
+
+struct DiscoveredSessionFile {
+    provider: IntegrationProvider,
+    path: PathBuf,
+    default_project: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +1037,12 @@ pub struct ExtractedMessage {
     pub tool_actions: Vec<ToolAction>,
 }
 
+pub struct ExtractedSession {
+    pub session_id: String,
+    pub project_name: Option<String>,
+    pub messages: Vec<ExtractedMessage>,
+}
+
 // ---------------------------------------------------------------------------
 // JSONL parsing
 // ---------------------------------------------------------------------------
@@ -934,9 +1062,9 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Build a human-readable summary for a tool invocation.
+/// Build a human-readable summary for a Claude tool invocation.
 /// Returns (category, summary, file_path).
-fn build_tool_summary(
+fn build_claude_tool_summary(
     tool_name: &str,
     input: Option<&serde_json::Value>,
 ) -> (String, String, Option<String>) {
@@ -998,6 +1126,149 @@ fn build_tool_summary(
     }
 }
 
+fn build_codex_function_tool_summary(
+    tool_name: &str,
+    arguments: &str,
+) -> (String, String, Option<String>) {
+    let parsed: serde_json::Value =
+        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Null);
+    let input = parsed.as_object();
+
+    let get_str = |key: &str| -> String {
+        input
+            .and_then(|obj| obj.get(key))
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    match tool_name {
+        "exec_command" => {
+            let command = get_str("cmd");
+            ("command".to_string(), format!("$ {command}"), None)
+        }
+        "write_stdin" => {
+            let chars = truncate(&get_str("chars"), 120);
+            ("command".to_string(), format!("stdin {chars}"), None)
+        }
+        _ if tool_name.starts_with("mcp__") => {
+            let detail = ["query", "text", "path", "uri", "url"]
+                .into_iter()
+                .map(&get_str)
+                .find(|value| !value.is_empty())
+                .unwrap_or_default();
+            let summary = if detail.is_empty() {
+                tool_name.to_string()
+            } else {
+                format!("{tool_name}: {}", truncate(&detail, 120))
+            };
+            let file_path = ["file_path", "path"]
+                .into_iter()
+                .map(&get_str)
+                .find(|value| !value.is_empty());
+            ("tool_detail".to_string(), summary, file_path)
+        }
+        _ => {
+            let detail = ["path", "file_path", "workdir", "query", "text"]
+                .into_iter()
+                .map(&get_str)
+                .find(|value| !value.is_empty())
+                .unwrap_or_default();
+            let summary = if detail.is_empty() {
+                tool_name.to_string()
+            } else {
+                format!("{tool_name}: {}", truncate(&detail, 120))
+            };
+            let file_path = ["file_path", "path"]
+                .into_iter()
+                .map(get_str)
+                .find(|value| !value.is_empty());
+            ("tool_detail".to_string(), summary, file_path)
+        }
+    }
+}
+
+fn build_codex_custom_tool_summary(
+    tool_name: &str,
+    input: &str,
+) -> (String, String, Option<String>) {
+    match tool_name {
+        "apply_patch" => {
+            let files = extract_apply_patch_files(input);
+            let file_path = files.first().cloned();
+            let summary = if files.is_empty() {
+                "Patch".to_string()
+            } else {
+                format!("Patch {}", truncate(&files.join(", "), 160))
+            };
+            ("code_change".to_string(), summary, file_path)
+        }
+        _ => (
+            "tool_detail".to_string(),
+            format!("{tool_name}: {}", truncate(input, 120)),
+            None,
+        ),
+    }
+}
+
+fn extract_apply_patch_files(patch: &str) -> Vec<String> {
+    let mut files = Vec::new();
+
+    for line in patch.lines() {
+        for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+            if let Some(path) = line.strip_prefix(prefix) {
+                files.push(path.to_string());
+            }
+        }
+    }
+
+    files
+}
+
+fn project_name_from_cwd(cwd: &str) -> Option<String> {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
+}
+
+fn make_tool_message(
+    uuid: String,
+    session_id: String,
+    git_branch: String,
+    action: ToolAction,
+) -> ExtractedMessage {
+    let mut code_changes = Vec::new();
+    let mut commands_run = Vec::new();
+    let mut tool_details = Vec::new();
+
+    match action.category.as_str() {
+        "code_change" => code_changes.push(action.summary.clone()),
+        "command" => commands_run.push(action.summary.clone()),
+        _ => tool_details.push(action.summary.clone()),
+    }
+
+    let files_modified = action.file_path.clone().into_iter().collect();
+    let timestamp = action.timestamp.clone();
+    let tool_name = action.tool_name.clone();
+
+    ExtractedMessage {
+        uuid,
+        session_id,
+        role: "assistant".to_string(),
+        content: String::new(),
+        timestamp: timestamp.clone(),
+        git_branch,
+        tools_used: vec![tool_name.clone()],
+        files_modified,
+        code_changes,
+        commands_run,
+        tool_details,
+        tool_actions: vec![action],
+    }
+}
+
 #[allow(dead_code)]
 struct ToolUseEntry {
     tool_name: String,
@@ -1010,15 +1281,35 @@ struct ToolUseEntry {
     message_idx: usize,
 }
 
+/// Extract indexable messages from a provider session transcript.
+pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -> ExtractedSession {
+    match provider {
+        IntegrationProvider::Claude => extract_claude_messages_from_jsonl(path),
+        IntegrationProvider::Codex => extract_codex_messages_from_jsonl(path),
+    }
+}
+
 /// Extract indexable messages from a Claude Code JSONL session file.
 /// Only "user" and "assistant" type messages are extracted.
 /// isMeta messages and messages with empty content are skipped.
-pub fn extract_messages_from_jsonl(path: &Path) -> Vec<ExtractedMessage> {
+fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             log::warn!("Failed to read JSONL {}: {e}", path.display());
-            return Vec::new();
+            return ExtractedSession {
+                session_id: path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                project_name: path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|name| name.to_str())
+                    .map(SessionIndex::project_display_name),
+                messages: Vec::new(),
+            };
         }
     };
 
@@ -1130,7 +1421,8 @@ pub fn extract_messages_from_jsonl(path: &Path) -> Vec<ExtractedMessage> {
                             }
 
                             // Build summary and categorize
-                            let (category, summary, file_path) = build_tool_summary(&name, input);
+                            let (category, summary, file_path) =
+                                build_claude_tool_summary(&name, input);
 
                             match category.as_str() {
                                 "code_change" => code_changes.push(summary.clone()),
@@ -1264,7 +1556,350 @@ pub fn extract_messages_from_jsonl(path: &Path) -> Vec<ExtractedMessage> {
         });
     }
 
-    messages
+    ExtractedSession {
+        session_id: messages
+            .first()
+            .map(|message| message.session_id.clone())
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.to_string())
+            })
+            .unwrap_or_default(),
+        project_name: path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .map(SessionIndex::project_display_name),
+        messages,
+    }
+}
+
+fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Failed to read JSONL {}: {e}", path.display());
+            return ExtractedSession {
+                session_id: String::new(),
+                project_name: None,
+                messages: Vec::new(),
+            };
+        }
+    };
+
+    let mut messages: Vec<ExtractedMessage> = Vec::new();
+    let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
+    let mut session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit('-').next())
+        .unwrap_or_default()
+        .to_string();
+    let mut cwd: Option<String> = None;
+    let mut git_branch = String::new();
+
+    for (line_idx, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let obj: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+
+        let timestamp = obj
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match obj
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+        {
+            "session_meta" => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                if let Some(id) = payload.get("id").and_then(|value| value.as_str()) {
+                    session_id = id.to_string();
+                }
+                cwd = payload
+                    .get("cwd")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string());
+                git_branch = payload
+                    .get("git")
+                    .and_then(|value| value.get("branch"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+            "event_msg" => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                let event_type = payload
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                let role = match event_type {
+                    "user_message" => "user",
+                    "agent_message" => "assistant",
+                    _ => continue,
+                };
+                let content = payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if content.trim().is_empty() {
+                    continue;
+                }
+                messages.push(ExtractedMessage {
+                    uuid: format!("{session_id}:event:{line_idx}"),
+                    session_id: session_id.clone(),
+                    role: role.to_string(),
+                    content,
+                    timestamp,
+                    git_branch: git_branch.clone(),
+                    tools_used: Vec::new(),
+                    files_modified: Vec::new(),
+                    code_changes: Vec::new(),
+                    commands_run: Vec::new(),
+                    tool_details: Vec::new(),
+                    tool_actions: Vec::new(),
+                });
+            }
+            "response_item" => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                match payload
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                {
+                    "function_call" => {
+                        let name = payload
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = payload
+                            .get("arguments")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+
+                        let (category, summary, file_path) =
+                            build_codex_function_tool_summary(&name, &arguments);
+                        let tool_use_id = if call_id.is_empty() {
+                            format!("{session_id}:tool:{line_idx}")
+                        } else {
+                            call_id.clone()
+                        };
+                        let action = ToolAction {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: name.clone(),
+                            category: category.clone(),
+                            file_path: file_path.clone(),
+                            summary: summary.clone(),
+                            full_input: Some(truncate(&arguments, 10240)),
+                            full_output: None,
+                            timestamp: timestamp.clone(),
+                        };
+                        let message_idx = messages.len();
+                        messages.push(make_tool_message(
+                            format!("{session_id}:tool:{line_idx}"),
+                            session_id.clone(),
+                            git_branch.clone(),
+                            action,
+                        ));
+                        if !call_id.is_empty() {
+                            tool_use_map.insert(
+                                call_id,
+                                ToolUseEntry {
+                                    tool_name: name,
+                                    category,
+                                    file_path,
+                                    summary,
+                                    full_input: Some(truncate(&arguments, 10240)),
+                                    timestamp,
+                                    message_idx,
+                                },
+                            );
+                        }
+                    }
+                    "custom_tool_call" => {
+                        let name = payload
+                            .get("name")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = payload
+                            .get("input")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+
+                        let (category, summary, file_path) =
+                            build_codex_custom_tool_summary(&name, &input);
+                        let tool_use_id = if call_id.is_empty() {
+                            format!("{session_id}:tool:{line_idx}")
+                        } else {
+                            call_id.clone()
+                        };
+                        let action = ToolAction {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: name.clone(),
+                            category: category.clone(),
+                            file_path: file_path.clone(),
+                            summary: summary.clone(),
+                            full_input: Some(truncate(&input, 10240)),
+                            full_output: None,
+                            timestamp: timestamp.clone(),
+                        };
+                        let message_idx = messages.len();
+                        messages.push(make_tool_message(
+                            format!("{session_id}:tool:{line_idx}"),
+                            session_id.clone(),
+                            git_branch.clone(),
+                            action,
+                        ));
+                        if !call_id.is_empty() {
+                            tool_use_map.insert(
+                                call_id,
+                                ToolUseEntry {
+                                    tool_name: name,
+                                    category,
+                                    file_path,
+                                    summary,
+                                    full_input: Some(truncate(&input, 10240)),
+                                    timestamp,
+                                    message_idx,
+                                },
+                            );
+                        }
+                    }
+                    "function_call_output" | "custom_tool_call_output" => {
+                        let call_id = payload
+                            .get("call_id")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if call_id.is_empty() {
+                            continue;
+                        }
+                        let output = payload.get("output").map(|value| {
+                            value
+                                .as_str()
+                                .map(|text| truncate(text, 10240))
+                                .unwrap_or_else(|| truncate(&value.to_string(), 10240))
+                        });
+                        if let Some(entry) = tool_use_map.get(&call_id)
+                            && let Some(message) = messages.get_mut(entry.message_idx)
+                        {
+                            if let Some(action) = message.tool_actions.first_mut() {
+                                action.full_output = output.clone();
+                            }
+                            if entry.category == "command"
+                                && let Some(ref output_text) = output
+                            {
+                                let preview = truncate(output_text, 300);
+                                if let Some(command) = message.commands_run.first_mut() {
+                                    *command = format!("{command}\n{preview}");
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ExtractedSession {
+        session_id,
+        project_name: cwd.as_deref().and_then(project_name_from_cwd),
+        messages,
+    }
+}
+
+fn find_session_path(
+    provider: IntegrationProvider,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    match provider {
+        IntegrationProvider::Claude => {
+            let projects_dir = dirs::home_dir()
+                .ok_or("Cannot determine home directory")?
+                .join(".claude")
+                .join("projects");
+
+            if !projects_dir.exists() {
+                return Ok(None);
+            }
+
+            for project_entry in std::fs::read_dir(&projects_dir)
+                .map_err(|e| format!("Read projects: {e}"))?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+            {
+                let candidate = project_entry.path().join(format!("{session_id}.jsonl"));
+                if candidate.exists() {
+                    return Ok(Some(candidate));
+                }
+            }
+
+            Ok(None)
+        }
+        IntegrationProvider::Codex => {
+            let sessions_dir = dirs::home_dir()
+                .ok_or("Cannot determine home directory")?
+                .join(".codex")
+                .join("sessions");
+
+            if !sessions_dir.exists() {
+                return Ok(None);
+            }
+
+            let expected_suffix = format!("{session_id}.jsonl");
+            for entry in walkdir::WalkDir::new(&sessions_dir)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_file())
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            {
+                let file_name = entry.file_name().to_string_lossy();
+                if file_name.ends_with(&expected_suffix) {
+                    return Ok(Some(entry.path().to_path_buf()));
+                }
+            }
+
+            Ok(None)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,6 +1925,7 @@ pub async fn search_sessions(
 
 #[tauri::command]
 pub async fn get_session_context(
+    provider: IntegrationProvider,
     session_id: String,
     around_message_id: String,
     window: Option<u32>,
@@ -1297,7 +1933,7 @@ pub async fn get_session_context(
 ) -> Result<SessionContext, String> {
     let idx = state.0.clone();
     let w = window.unwrap_or(5) as usize;
-    crate::run_blocking(move || idx.get_context(&session_id, &around_message_id, w))
+    crate::run_blocking(move || idx.get_context(provider, &session_id, &around_message_id, w))
 }
 
 #[tauri::command]

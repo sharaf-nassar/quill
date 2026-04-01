@@ -1,8 +1,20 @@
+use crate::integrations::IntegrationProvider;
 use serde::{Deserialize, Serialize};
+pub type ProviderStatus = crate::integrations::ProviderStatus;
+
+fn default_provider() -> IntegrationProvider {
+    IntegrationProvider::Claude
+}
+
+pub fn default_provider_scope() -> Vec<IntegrationProvider> {
+    vec![IntegrationProvider::Claude]
+}
 
 // Payload received from hook scripts via HTTP API
 #[derive(Deserialize, Clone, Debug)]
 pub struct TokenReportPayload {
+    #[serde(default = "default_provider")]
+    pub provider: IntegrationProvider,
     pub session_id: String,
     pub hostname: String,
     pub input_tokens: i64,
@@ -39,14 +51,23 @@ pub struct TokenStats {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageBucket {
+    pub provider: IntegrationProvider,
+    pub key: String,
     pub label: String,
     pub utilization: f64,
     pub resets_at: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
+pub struct UsageProviderError {
+    pub provider: IntegrationProvider,
+    pub message: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
 pub struct UsageData {
     pub buckets: Vec<UsageBucket>,
+    pub provider_errors: Vec<UsageProviderError>,
     pub error: Option<String>,
 }
 
@@ -85,6 +106,7 @@ pub struct SessionStats {
 // Session-level token breakdown
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionBreakdown {
+    pub provider: String,
     pub session_id: String,
     pub hostname: String,
     pub total_tokens: i64,
@@ -107,6 +129,8 @@ pub struct ProjectBreakdown {
 
 #[derive(Serialize, Clone, Debug)]
 pub struct BucketStats {
+    pub provider: IntegrationProvider,
+    pub key: String,
     pub label: String,
     pub current: f64,
     pub avg: f64,
@@ -122,6 +146,8 @@ pub struct BucketStats {
 // Payload received from observation hook scripts via HTTP API
 #[derive(Deserialize, Clone, Debug)]
 pub struct ObservationPayload {
+    #[serde(default = "default_provider")]
+    pub provider: IntegrationProvider,
     pub session_id: String,
     pub hook_phase: String,
     pub tool_name: String,
@@ -136,6 +162,8 @@ pub struct ObservationPayload {
 // Payload from session-end hook
 #[derive(Deserialize, Clone, Debug)]
 pub struct SessionEndPayload {
+    #[serde(default = "default_provider")]
+    pub provider: IntegrationProvider,
     pub session_id: String,
     #[serde(default)]
     pub transcript_path: Option<String>,
@@ -160,6 +188,8 @@ pub struct LearningRunPayload {
     pub logs: Option<String>,
     #[serde(default)]
     pub phases: Option<String>,
+    #[serde(default = "default_provider_scope")]
+    pub provider_scope: Vec<IntegrationProvider>,
 }
 
 // Payload to record learned rule metadata from /learn skill
@@ -181,6 +211,8 @@ pub struct LearnedRulePayload {
     pub source: Option<String>,
     #[serde(default)]
     pub content: Option<String>,
+    #[serde(default = "default_provider_scope")]
+    pub provider_scope: Vec<IntegrationProvider>,
 }
 
 fn default_confidence() -> f64 {
@@ -201,6 +233,7 @@ pub struct LearningRun {
     pub logs: Option<String>,
     pub phases: Option<String>,
     pub created_at: String,
+    pub provider_scope: Vec<IntegrationProvider>,
 }
 
 // Learned rule record returned to frontend
@@ -218,6 +251,7 @@ pub struct LearnedRule {
     pub is_anti_pattern: bool,
     pub source: Option<String>,
     pub content: Option<String>,
+    pub provider_scope: Vec<IntegrationProvider>,
 }
 
 // Tool frequency count for status strip
@@ -268,8 +302,14 @@ pub struct LearningStatus {
 /// Notify that a session JSONL file has been created/updated
 #[derive(Deserialize)]
 pub struct SessionNotifyPayload {
+    #[serde(default = "default_provider")]
+    pub provider: IntegrationProvider,
     pub session_id: String,
     pub jsonl_path: String,
+    pub host: Option<String>,
+    pub cwd: Option<String>,
+    pub project: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 /// A single message pushed via the HTTP API
@@ -291,12 +331,20 @@ pub struct SessionMessagePayload {
 /// Batch of messages pushed via the HTTP API
 #[derive(Deserialize)]
 pub struct SessionMessagesPayload {
+    #[serde(default = "default_provider")]
+    pub provider: IntegrationProvider,
     pub host: String,
     pub session_id: String,
     pub project: String,
     #[serde(default)]
     pub git_branch: String,
     pub messages: Vec<SessionMessagePayload>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SessionRef {
+    pub provider: IntegrationProvider,
+    pub session_id: String,
 }
 
 // Haiku analysis output item (parsed from JSON)
@@ -452,6 +500,7 @@ pub struct OptimizationOutput {
 #[derive(Serialize, Clone, Debug)]
 pub struct MemoryFile {
     pub id: i64,
+    pub provider: IntegrationProvider,
     pub project_path: String,
     pub file_path: String,
     pub file_name: String,
@@ -470,6 +519,7 @@ pub struct OptimizationSuggestion {
     pub id: i64,
     pub run_id: i64,
     pub project_path: String,
+    pub provider_scope: Vec<IntegrationProvider>,
     pub action_type: String,
     pub target_file: Option<String>,
     pub reasoning: String,
@@ -491,6 +541,7 @@ pub struct OptimizationSuggestion {
 pub struct OptimizationRun {
     pub id: i64,
     pub project_path: String,
+    pub provider_scope: Vec<IntegrationProvider>,
     pub trigger: String,
     pub memories_scanned: i64,
     pub suggestions_created: i64,
@@ -506,6 +557,7 @@ pub struct OptimizationRun {
 pub struct KnownProject {
     pub path: String,
     pub name: String,
+    pub providers: Vec<IntegrationProvider>,
     pub has_memories: bool,
     pub memory_count: i64,
     pub is_custom: bool,

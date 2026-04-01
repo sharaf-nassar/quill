@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { OptimizationSuggestion } from "../../hooks/useMemoryData";
+import { providerScopeClass, providerScopeLabel } from "../../utils/providers";
 
 interface SuggestionCardProps {
   suggestion: OptimizationSuggestion;
@@ -96,6 +97,9 @@ export function SuggestionCard({
         </span>
         <span className="learning-rule-name">
           {suggestion.target_file || "(new file)"}
+        </span>
+        <span className={providerScopeClass(suggestion.provider_scope)}>
+          {providerScopeLabel(suggestion.provider_scope)}
         </span>
         {suggestion.status !== "pending" && (
           <span

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import type { LearningRun, RunPhase } from "../../types";
+import { providerScopeClass, providerScopeLabel } from "../../utils/providers";
 import { timeAgo } from "../../utils/time";
 
 interface RunHistoryProps {
@@ -96,6 +97,9 @@ function RunHistory({ runs, liveLogs }: RunHistoryProps) {
                 <span className="learning-run-trigger">
                   {run.trigger_mode}
                 </span>
+                <span className={providerScopeClass(run.provider_scope)}>
+                  {providerScopeLabel(run.provider_scope)}
+                </span>
                 <span className="learning-run-result">
                   {run.status === "running"
                     ? "running\u2026"
@@ -127,6 +131,12 @@ function RunHistory({ runs, liveLogs }: RunHistoryProps) {
           <div className="learning-run-detail-row">
             <span className="learning-run-detail-label">Trigger</span>
             <span>{selected.trigger_mode}</span>
+          </div>
+          <div className="learning-run-detail-row">
+            <span className="learning-run-detail-label">Provider</span>
+            <span className={providerScopeClass(selected.provider_scope)}>
+              {providerScopeLabel(selected.provider_scope)}
+            </span>
           </div>
           {selected.status !== "running" && (
             <>

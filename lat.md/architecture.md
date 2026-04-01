@@ -1,6 +1,6 @@
 # Architecture
 
-Quill is a cross-platform desktop companion for Claude Code, built with Tauri (Rust) and React (TypeScript). It tracks token usage, provides analytics, discovers behavioral patterns, manages plugins, and indexes session history.
+Quill is a cross-platform Claude Code and Codex companion built with Tauri (Rust) and React. It tracks usage, analytics, behavioral patterns, plugins, session history, and provider integrations.
 
 ## Tech Stack
 
@@ -15,15 +15,19 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 Each major feature runs in its own Tauri window, routed via URL query parameter in [[src/main.tsx]].
 
-The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], and [[features#Restart Orchestrator]].
+The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], and [[features#Restart Orchestrator]], but [[src/main.tsx]] blocks those windows with an empty state when no provider is enabled.
+
+The QUILL titlebar trigger now opens a dedicated `integrations` popup window, so provider enable and disable actions can render outside the compact 280x340 widget instead of being clipped inside the main webview.
 
 ### Window Configuration
 
-Windows are defined in `src-tauri/tauri.conf.json` with IDs: `main`, `runs`, `sessions`, `learning`, `plugins`, `restart`. The main window defaults to 280x340px (compact widget), borderless and transparent, with a custom titlebar in [[src/components/TitleBar.tsx]].
+The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `runs`, `sessions`, `learning`, `plugins`, `restart`, and `integrations`.
+
+The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls plus the centered QUILL trigger that anchors the integrations popup window.
 
 ## Module Map
 
-The Rust backend in [[src-tauri/src/lib.rs]] registers 64 Tauri commands and starts background tasks on launch.
+The Rust backend in [[src-tauri/src/lib.rs]] registers 68 Tauri commands and starts background tasks on launch.
 
 ### Backend Modules
 
@@ -39,13 +43,14 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Memory optimizer | [[src-tauri/src/memory_optimizer.rs]] | LLM-driven memory file optimization |
 | Plugins | [[src-tauri/src/plugins.rs]] | Plugin and marketplace management |
 | Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
+| Integrations | [[src-tauri/src/integrations/mod.rs]] | Provider detection plus persisted enable and disable lifecycle for Claude and Codex |
 | Models | [[src-tauri/src/models.rs]] | All shared data structures and serde types |
 | AI client | [[src-tauri/src/ai_client.rs]] | Anthropic API integration via rig-core |
 | Git analysis | [[src-tauri/src/git_analysis.rs]] | Commit pattern extraction and hotspot analysis |
 | Fetcher | [[src-tauri/src/fetcher.rs]] | Claude API usage bucket fetching |
 | Auth | [[src-tauri/src/auth.rs]] | Bearer token generation and storage |
 | Config | [[src-tauri/src/config.rs]] | Credential reading and HTTP client setup |
-| Claude setup | [[src-tauri/src/claude_setup.rs]] | Hook and MCP server auto-deployment |
+| Claude setup | [[src-tauri/src/claude_setup.rs]] | Legacy/local Claude deployment helpers retained outside startup |
 | Prompt utils | [[src-tauri/src/prompt_utils.rs]] | LLM input sanitization and compression |
 
 ### Frontend Structure
@@ -68,7 +73,7 @@ Data flows through three communication channels between the system's components.
 
 ### Tauri IPC
 
-The primary frontend-backend channel. React hooks call `invoke()` for request-response and `listen()` for push events. See [[data-flow]] for specific flows.
+The primary frontend-backend channel. React hooks call `invoke()` for request-response and `listen()` for push events, including provider-status refresh via `integrations-updated`. See [[data-flow]] for specific flows.
 
 ### HTTP API
 
@@ -76,7 +81,9 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 ### Tauri Events
 
-Backend pushes real-time updates to the frontend via `emit()`. Events include `tokens-updated`, `learning-updated`, `learning-log`, `plugin-changed`, `restart-status-changed`, `memory-optimizer-updated`, and `memory-files-updated`.
+Backend pushes real-time updates to the frontend via `emit()`.
+
+Current events include `tokens-updated`, `learning-updated`, `learning-log`, `plugin-changed`, `restart-status-changed`, `integrations-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
 
 ## Background Tasks
 
@@ -86,7 +93,7 @@ Several background tasks start on app launch in [[src-tauri/src/lib.rs]].
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
 - **Plugin update checker**: Polls marketplaces every 4 hours for available updates
 - **Session index scan**: Ingests new JSONL session files on startup
-- **Claude setup**: Deploys hooks and MCP server to `~/.config/quill/` on first run
+- **Integration refresh**: Detects Claude and Codex CLI/home state and emits `integrations-updated`
 
 ## Local vs Remote Architecture
 
@@ -94,7 +101,7 @@ Quill supports both local single-machine and distributed multi-host setups.
 
 ### Local Setup
 
-On startup, [[src-tauri/src/claude_setup.rs]] auto-deploys hook scripts and an MCP server. Hooks report token usage, tool observations, and session events to the local HTTP server. No user configuration needed.
+On startup, [[src-tauri/src/integrations/manager.rs]] refreshes Claude and Codex provider state for the UI. Provider installers only run after explicit enable confirmation: Claude via [[src-tauri/src/claude_setup.rs]] and Codex via [[src-tauri/src/integrations/codex.rs]].
 
 ### Remote Setup
 

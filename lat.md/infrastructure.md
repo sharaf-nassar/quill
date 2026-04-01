@@ -8,7 +8,9 @@ The frontend uses Vite with the React plugin; the backend uses Cargo with Tauri.
 
 ### Frontend Build
 
-Vite serves on port 8181 in dev mode. Production builds target ES2020 with esbuild minification and sourcemaps. TypeScript is strict mode with ESNext modules and bundler resolution. See `vite.config.ts` and `tsconfig.json`.
+Vite serves on port 8181 in dev mode and ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
+
+Production builds target ES2020 with esbuild minification and sourcemaps. TypeScript is strict mode with ESNext modules and bundler resolution. See `vite.config.ts` and `tsconfig.json`.
 
 ### Backend Build
 
@@ -110,7 +112,17 @@ Checks that Quill is not running before modifying the DB to prevent WAL corrupti
 
 ## Claude Integration Deployment
 
-[[src-tauri/src/claude_setup.rs]] (687 lines) auto-deploys integration files on first launch.
+Claude integration now has a dedicated adapter shell in
+[[src-tauri/src/integrations/claude.rs]] plus manifest-aware install/uninstall wrappers in
+[[src-tauri/src/claude_setup.rs]], while startup detection remains in
+[[src-tauri/src/integrations/manager.rs]].
+
+`Task 3A` introduces manifest generation during setup so uninstall can remove only owned artifacts:
+hook entries marked with [[src-tauri/src/claude_setup.rs#HOOK_MARKER]],
+`mcpServers.quill` from `~/.claude.json`, and the `[[src-tauri/src/claude_setup.rs#SECTION_HEADING]]` block in `CLAUDE.md`.
+`confirm_enable_provider` now routes Claude through that adapter install path, and
+[[src-tauri/src/restart.rs#uninstall_claude_restart_assets]] removes Quill-owned restart hooks,
+shell integration lines, and cache files when Claude uninstall runs.
 
 ### Deployed Assets
 
@@ -125,6 +137,25 @@ Files and directories created during first-launch auto-deployment.
 | `~/.claude.json` | MCP server registration |
 
 Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching.
+
+## Codex Integration Deployment
+
+Codex integration lives in [[src-tauri/src/integrations/codex.rs]] and deploys provider-specific assets under `~/.config/quill/codex/` plus Quill-managed entries in the user's Codex home.
+
+### Deployed Assets
+
+Files and config entries created when the Codex provider is enabled. Deployment is allowlisted to the observation, token, sync, and learning scripts; the Claude-only `qbuild-guard.sh` is never copied into Codex assets.
+
+| Target | Content |
+|--------|---------|
+| `~/.config/quill/codex/scripts/` | Hook scripts for observations, token reporting, session sync, and session-end learning |
+| `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets |
+| `~/.config/quill/codex/templates/` | Managed AGENTS template block |
+| `~/.codex/hooks.json` | Hook registrations marked with `_source: "quill-codex-setup"` |
+| `~/.codex/config.toml` | `codex_hooks = true` plus a Quill-managed `mcp_servers.quill` block when no manual entry exists |
+| `~/.codex/AGENTS.md` | Managed Quill session-history guidance block |
+
+Codex uninstall removes only Quill-marked hooks, config blocks, AGENTS blocks, and the provider-owned asset directories.
 
 ## Remote Plugin
 

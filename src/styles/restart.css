@@ -1,4 +1,4 @@
-/* ─── Restart Claude Code window ─── */
+/* ─── Restart sessions window ─── */
 .restart-window {
 	display: flex;
 	flex-direction: column;
@@ -90,6 +90,29 @@
 	background: rgba(255, 255, 255, 0.25);
 }
 
+/* ─── Provider groups ─── */
+.restart-group {
+	margin-bottom: 10px;
+}
+
+.restart-group__header {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 2px 6px;
+}
+
+.restart-group__title {
+	font-size: 11px;
+	font-weight: 700;
+	color: #c0caf5;
+}
+
+.restart-group__count {
+	font-size: 10px;
+	color: #565f89;
+}
+
 /* ─── Instance row ─── */
 .restart-row {
 	display: flex;
@@ -100,6 +123,7 @@
 	border: 1px solid #1e1e2a;
 	border-radius: 6px;
 	margin-bottom: 4px;
+	margin-left: 2px;
 	transition: background 0.15s, border-color 0.15s;
 }
 
@@ -111,6 +135,35 @@
 .restart-row__info {
 	flex: 1;
 	min-width: 0;
+}
+
+.restart-row__meta {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.restart-row__provider {
+	font-size: 9px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.4px;
+	border: 1px solid transparent;
+	border-radius: 999px;
+	padding: 1px 6px;
+	flex-shrink: 0;
+}
+
+.restart-row__provider--claude {
+	color: #7aa2f7;
+	background: rgba(122, 162, 247, 0.1);
+	border-color: rgba(122, 162, 247, 0.35);
+}
+
+.restart-row__provider--codex {
+	color: #9ece6a;
+	background: rgba(158, 206, 106, 0.1);
+	border-color: rgba(158, 206, 106, 0.35);
 }
 
 .restart-row__cwd {
@@ -291,4 +344,13 @@
 	font-size: 11px;
 	color: #ff9e64;
 	flex-shrink: 0;
+}
+
+.restart-provider-note {
+	padding: 6px 12px;
+	border-top: 1px solid rgba(122, 162, 247, 0.15);
+	background: rgba(122, 162, 247, 0.06);
+	color: rgba(255, 255, 255, 0.7);
+	font-size: 11px;
+	line-height: 1.45;
 }

@@ -1,5 +1,11 @@
 import { useCallback } from "react";
-import type { UpdateCheckResult, BulkUpdateProgress } from "../../types";
+import type {
+	BulkUpdateProgress,
+	IntegrationProvider,
+	PluginUpdate,
+	UpdateCheckResult,
+} from "../../types";
+import { pluginUpdateInstanceKey } from "../../utils/plugins";
 
 function projectName(path: string | null): string {
 	if (!path) return "";
@@ -19,6 +25,7 @@ function formatTime(ts: string | null): string {
 }
 
 interface UpdatesTabProps {
+	provider: IntegrationProvider;
 	updates: {
 		result: UpdateCheckResult;
 		loading: boolean;
@@ -26,7 +33,7 @@ interface UpdatesTabProps {
 	};
 	operations: {
 		inProgress: Set<string>;
-		updatePlugin: (name: string, marketplace: string, scope: string, projectPath: string | null) => Promise<void>;
+		updatePlugin: (update: PluginUpdate) => Promise<void>;
 	};
 	bulkUpdate: {
 		progress: BulkUpdateProgress | null;
@@ -38,6 +45,7 @@ interface UpdatesTabProps {
 }
 
 function UpdatesTab({
+	provider,
 	updates,
 	operations,
 	bulkUpdate,
@@ -47,8 +55,8 @@ function UpdatesTab({
 	const { progress, running } = bulkUpdate;
 
 	const handleUpdate = useCallback(
-		async (name: string, marketplace: string, scope: string, projectPath: string | null) => {
-			await operations.updatePlugin(name, marketplace, scope, projectPath);
+		async (update: PluginUpdate) => {
+			await operations.updatePlugin(update);
 			onChanged();
 		},
 		[operations, onChanged],
@@ -82,12 +90,23 @@ function UpdatesTab({
 					<button
 						className="plugins-btn plugins-btn--install"
 						onClick={handleUpdateAll}
-						disabled={running || result.plugin_updates.length === 0}
+						disabled={
+							provider !== "claude" ||
+							running ||
+							result.plugin_updates.length === 0
+						}
 					>
 						{running ? "Updating..." : "Update All"}
 					</button>
 				</div>
 			</div>
+			{provider === "codex" && (
+				<div className="plugins-provider-note">
+					Codex exposes plugin install and uninstall through app-server, but it
+					does not expose versioned update metadata. Use refresh to sync the
+					Codex catalog.
+				</div>
+			)}
 
 			{progress && running && (
 				<div className="plugins-bulk-progress">
@@ -108,7 +127,7 @@ function UpdatesTab({
 					<div className="plugins-bulk-progress__items">
 						{progress.results.map((item) => (
 							<div
-								key={item.name}
+								key={item.plugin_key}
 								className={`plugins-bulk-progress__item plugins-bulk-progress__item--${item.status}`}
 							>
 								{item.status === "success" ? "\u2713" : "\u2717"}{" "}
@@ -139,12 +158,15 @@ function UpdatesTab({
 					</div>
 				)}
 				{result.plugin_updates.map((update) => {
-					const busy =
-						running || operations.inProgress.has(update.name);
+					const instanceKey = pluginUpdateInstanceKey(update);
+					const busy = running || operations.inProgress.has(instanceKey);
 					return (
-						<div key={update.name} className="plugins-row">
+						<div key={instanceKey} className="plugins-row">
 							<div className="plugins-row__info">
 								<div className="plugins-row__header">
+									<span className="plugins-provider-badge">
+										{update.provider === "claude" ? "Claude" : "Codex"}
+									</span>
 									<span className="plugins-row__name">{update.name}</span>
 									<span className="plugins-row__version">
 										{update.current_version}
@@ -175,9 +197,7 @@ function UpdatesTab({
 								) : (
 									<button
 										className="plugins-btn plugins-btn--install"
-										onClick={() =>
-											handleUpdate(update.name, update.marketplace, update.scope, update.project_path)
-										}
+										onClick={() => handleUpdate(update)}
 									>
 										Update
 									</button>

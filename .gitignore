@@ -21,6 +21,7 @@ volumes/
 
 # qbuild lock files
 .qbuild-lock.*
+.worktrees/
 
 # Python
 __pycache__/
@@ -32,3 +33,4 @@ __pycache__/
 .mcp.json
 
 lat.md/.cache
+.codex

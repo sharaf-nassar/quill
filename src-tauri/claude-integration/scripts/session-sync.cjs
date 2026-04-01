@@ -115,6 +115,7 @@ function main() {
     if (isLocal(config.url)) {
       // LOCAL: notify the server to read the JSONL itself
       postJSON(config, "/api/v1/sessions/notify", {
+        provider: "claude",
         session_id: sessionId,
         jsonl_path: transcriptPath,
       });
@@ -151,6 +152,7 @@ function main() {
     }
 
     postJSON(config, "/api/v1/sessions/messages", {
+      provider: "claude",
       host: os.hostname(),
       session_id: sessionId,
       project: path.basename(input.cwd || ""),
