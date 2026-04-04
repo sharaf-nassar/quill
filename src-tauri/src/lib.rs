@@ -112,6 +112,7 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
         return Ok(UsageData {
             buckets: Vec::new(),
             provider_errors: Vec::new(),
+            provider_credits: Vec::new(),
             error: Some("No providers are enabled.".to_string()),
         });
     }
@@ -119,29 +120,52 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
     let mut live_buckets = Vec::new();
     let mut display_buckets = Vec::new();
     let mut provider_errors = Vec::new();
+    let mut provider_credits = Vec::new();
 
     for provider in enabled_providers {
-        let fetch_result = match provider {
-            integrations::IntegrationProvider::Claude => fetcher::fetch_claude_usage().await,
-            integrations::IntegrationProvider::Codex => run_blocking(fetcher::fetch_codex_usage),
-        };
-
-        match fetch_result {
-            Ok(mut buckets) => {
-                display_buckets.extend(buckets.clone());
-                live_buckets.append(&mut buckets);
+        match provider {
+            integrations::IntegrationProvider::Claude => {
+                match fetcher::fetch_claude_usage().await {
+                    Ok(mut buckets) => {
+                        display_buckets.extend(buckets.clone());
+                        live_buckets.append(&mut buckets);
+                    }
+                    Err(message) => {
+                        provider_errors.push(UsageProviderError { provider, message });
+                        if let Ok(storage) = get_storage() {
+                            match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
+                                Ok(mut buckets) => display_buckets.append(&mut buckets),
+                                Err(err) => log::warn!(
+                                    "Failed to load cached usage buckets for {}: {}",
+                                    provider.as_str(),
+                                    err
+                                ),
+                            }
+                        }
+                    }
+                }
             }
-            Err(message) => {
-                provider_errors.push(UsageProviderError { provider, message });
-
-                if let Ok(storage) = get_storage() {
-                    match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
-                        Ok(mut buckets) => display_buckets.append(&mut buckets),
-                        Err(err) => log::warn!(
-                            "Failed to load cached usage buckets for {}: {}",
-                            provider.as_str(),
-                            err
-                        ),
+            integrations::IntegrationProvider::Codex => {
+                match run_blocking(fetcher::fetch_codex_usage) {
+                    Ok((mut buckets, credits)) => {
+                        display_buckets.extend(buckets.clone());
+                        live_buckets.append(&mut buckets);
+                        if let Some(c) = credits {
+                            provider_credits.push(c);
+                        }
+                    }
+                    Err(message) => {
+                        provider_errors.push(UsageProviderError { provider, message });
+                        if let Ok(storage) = get_storage() {
+                            match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
+                                Ok(mut buckets) => display_buckets.append(&mut buckets),
+                                Err(err) => log::warn!(
+                                    "Failed to load cached usage buckets for {}: {}",
+                                    provider.as_str(),
+                                    err
+                                ),
+                            }
+                        }
                     }
                 }
             }
@@ -161,6 +185,7 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
         left.provider
             .as_str()
             .cmp(right.provider.as_str())
+            .then_with(|| left.sort_order.cmp(&right.sort_order))
             .then_with(|| left.label.cmp(&right.label))
     });
     display_buckets.dedup_by(|left, right| {
@@ -182,6 +207,7 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
     Ok(UsageData {
         buckets: display_buckets,
         provider_errors,
+        provider_credits,
         error,
     })
 }

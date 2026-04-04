@@ -13,6 +13,7 @@ import type { UsageData, TimeMode, PendingUpdate } from "./types";
 
 const BASE_WIDTH = 260;
 const MIN_LIVE_SCALE = 0.35;
+const LIVE_FIT_GUTTER_PX = 14;
 const BASE_HEIGHTS: Record<TimeMode, number> = {
 	marker: 200,
 	dual: 250,
@@ -303,7 +304,7 @@ function App({ integrations }: AppProps) {
 			setUsageData(data);
 		} catch (e) {
 			toast("error", `Usage data fetch failed: ${e}`);
-			setUsageData({ buckets: [], provider_errors: [], error: String(e) });
+			setUsageData({ buckets: [], provider_errors: [], provider_credits: [], error: String(e) });
 		}
 	}, [toast]);
 
@@ -378,6 +379,7 @@ function App({ integrations }: AppProps) {
 
 		const fallbackHeight = BASE_HEIGHTS[timeMode] ?? 200;
 		let rafId = 0;
+		let mutationObserver: MutationObserver | null = null;
 
 		const updateScale = () => {
 			cancelAnimationFrame(rafId);
@@ -385,6 +387,7 @@ function App({ integrations }: AppProps) {
 				const w = el.clientWidth;
 				const h = el.clientHeight;
 				if (w <= 0 || h <= 0) return;
+				const availableHeight = Math.max(h - LIVE_FIT_GUTTER_PX, 1);
 
 				el.style.setProperty("--s", "1");
 				const usageDisplay = el.querySelector(".usage-display");
@@ -393,12 +396,29 @@ function App({ integrations }: AppProps) {
 						? Math.max(usageDisplay.scrollHeight, fallbackHeight)
 						: fallbackHeight;
 				const wScale = w / BASE_WIDTH;
-				const hScale = h / contentHeight;
+				const hScale = availableHeight / contentHeight;
 				const maxLiveScale = isSplit ? 1 : 2.5;
-				const scale =
+				let scale =
 					Math.round(
 						Math.max(MIN_LIVE_SCALE, Math.min(wScale, hScale, maxLiveScale)) * 100,
 					) / 100;
+
+				el.style.setProperty("--s", String(scale));
+
+				if (usageDisplay instanceof HTMLElement) {
+					const fittedHeight = usageDisplay.scrollHeight;
+					if (fittedHeight > availableHeight) {
+						const correctedScale =
+							Math.round(
+								Math.max(
+									MIN_LIVE_SCALE,
+									Math.min(scale * (availableHeight / fittedHeight), maxLiveScale),
+								) * 100,
+							) / 100;
+						scale = correctedScale;
+					}
+				}
+
 				el.style.setProperty("--s", String(scale));
 			});
 		};
@@ -406,13 +426,25 @@ function App({ integrations }: AppProps) {
 		const observer = new ResizeObserver(updateScale);
 		observerRef.current = observer;
 		observeLiveTargets(observer);
+		const usageDisplay = el.querySelector(".usage-display");
+		if (usageDisplay instanceof HTMLElement) {
+			mutationObserver = new MutationObserver(updateScale);
+			mutationObserver.observe(usageDisplay, {
+				attributes: true,
+				attributeFilter: ["class", "style"],
+				childList: true,
+				subtree: true,
+				characterData: true,
+			});
+		}
 		updateScale();
 		return () => {
 			observer.disconnect();
+			mutationObserver?.disconnect();
 			observerRef.current = null;
 			cancelAnimationFrame(rafId);
 		};
-	}, [isSplit, timeMode, showLive, usageData, liveProviderKey, observeLiveTargets]);
+	}, [isSplit, splitRatio, timeMode, showLive, usageData, liveProviderKey, observeLiveTargets]);
 
 	const handleContextMenu = (e: React.MouseEvent) => {
 		e.preventDefault();
@@ -474,8 +506,7 @@ function App({ integrations }: AppProps) {
 				pendingUpdate={pendingUpdate}
 				updating={updating}
 				onUpdate={handleUpdate}
-				providersLoading={providersLoading}
-				hasEnabledProvider={hasEnabledProvider}
+				integrations={integrations}
 			/>
 			<div
 				className={`panels${isSplit ? " panels--split" : ""}`}

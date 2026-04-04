@@ -23,7 +23,7 @@ import {
 } from "../../utils/chartHelpers";
 import { CrosshairProvider, useCrosshair } from "./ChartCrosshairContext";
 import MiniChart from "./MiniChart";
-import type { RangeType, UsageBucket } from "../../types";
+import type { RangeType, MergedBucket } from "../../types";
 
 const RANGES: RangeType[] = ["1h", "24h", "7d", "30d"];
 const RANGE_LABELS: Record<RangeType, string> = {
@@ -107,7 +107,7 @@ function UnifiedTooltip({ utilData, tokenData, codeData, cacheData }: UnifiedToo
 interface ChartsTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
-	currentBucket: UsageBucket | null;
+	currentBucket: MergedBucket | null;
 }
 
 function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {

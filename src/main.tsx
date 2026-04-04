@@ -1,5 +1,6 @@
 import React, { Suspense, useCallback } from "react";
 import ReactDOM from "react-dom/client";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
@@ -30,8 +31,23 @@ const IntegrationsWindowView = React.lazy(
   const MIN = 0.5;
   const MAX = 2.0;
 
-  const saved = localStorage.getItem(ZOOM_KEY);
-  if (saved) document.documentElement.style.zoom = saved;
+  const clampZoom = (value: number) => Math.max(MIN, Math.min(MAX, value));
+  const parseZoom = (value: string | null) => {
+    const parsed = value ? parseFloat(value) : NaN;
+    return Number.isFinite(parsed) ? clampZoom(parsed) : 1;
+  };
+  const applyZoom = async (zoom: number) => {
+    try {
+      // Native webview zoom keeps pointer coordinates aligned with chart hover math.
+      await getCurrentWebview().setZoom(zoom);
+      document.documentElement.style.zoom = "";
+    } catch {
+      document.documentElement.style.zoom = String(zoom);
+    }
+  };
+
+  let currentZoom = parseZoom(localStorage.getItem(ZOOM_KEY));
+  void applyZoom(currentZoom);
 
   document.addEventListener("keydown", (e) => {
     if (!e.ctrlKey && !e.metaKey) return;
@@ -41,21 +57,21 @@ const IntegrationsWindowView = React.lazy(
       return;
     }
 
-    const current = parseFloat(document.documentElement.style.zoom || "1");
     let next: number | null = null;
 
     if (e.key === "=" || e.key === "+") {
-      next = Math.min(current + STEP, MAX);
+      next = Math.min(currentZoom + STEP, MAX);
     } else if (e.key === "-") {
-      next = Math.max(current - STEP, MIN);
+      next = Math.max(currentZoom - STEP, MIN);
     } else if (e.key === "0") {
       next = 1;
     }
 
     if (next !== null) {
       e.preventDefault();
-      const rounded = Math.round(next * 10) / 10;
-      document.documentElement.style.zoom = String(rounded);
+      const rounded = clampZoom(Math.round(next * 10) / 10);
+      currentZoom = rounded;
+      void applyZoom(rounded);
       localStorage.setItem(ZOOM_KEY, String(rounded));
     }
   });

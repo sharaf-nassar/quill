@@ -1,13 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  type CodexLiveRange,
-  type CodexLiveData,
-  type CodexLiveSessionRow,
-  type SessionBreakdown,
-  type SparklinePoint,
-  type TokenDataPoint,
+import type {
+  IntegrationProvider,
+  SessionBreakdown,
+  SparklinePoint,
+  TokenDataPoint,
 } from "../types";
 
 const REFRESH_INTERVAL_MS = 60_000;
@@ -15,18 +13,49 @@ const REFRESH_DEBOUNCE_MS = 1_000;
 const HOUR_MS = 60 * 60 * 1000;
 const SESSION_BREAKDOWN_LIMIT = 500;
 const TOKEN_SPARKLINE_BUCKETS = 12;
-const LIVE_RANGE_HOURS: Record<CodexLiveRange, number> = {
+const RECENCY_BUCKETS = 6;
+
+export type LiveSummaryRange = "1h" | "6h" | "12h" | "24h";
+
+export interface LiveSummarySeries {
+  value: number;
+  sparkline: SparklinePoint[];
+  lastActivityAt: string | null;
+}
+
+export interface LiveSummaryData {
+  fetchedAt: string;
+  lastActivityAt: string | null;
+  tokens: LiveSummarySeries;
+  activeSessions: LiveSummarySeries;
+  activeProjects: LiveSummarySeries;
+}
+
+const LIVE_RANGE_HOURS: Record<LiveSummaryRange, number> = {
   "1h": 1,
   "6h": 6,
   "12h": 12,
   "24h": 24,
 };
-const RECENCY_BUCKETS = 6;
 
 function toTimestampMs(value: string | null | undefined): number | null {
   if (!value) return null;
   const ms = new Date(value).getTime();
   return Number.isNaN(ms) ? null : ms;
+}
+
+function maxTimestamp(values: Array<string | null | undefined>): string | null {
+  let latestMs = -Infinity;
+  let latestValue: string | null = null;
+
+  for (const value of values) {
+    const timestampMs = toTimestampMs(value);
+    if (timestampMs === null || timestampMs <= latestMs) continue;
+    latestMs = timestampMs;
+    latestValue = value ?? null;
+  }
+
+  return latestValue;
 }
 
 function sumTokenHistory(history: TokenDataPoint[], cutoffMs: number): number {
@@ -76,20 +105,6 @@ function buildRecencySeries(
   );
 }
 
-function maxTimestamp(values: Array<string | null | undefined>): string | null {
-  let latestMs = -Infinity;
-  let latestValue: string | null = null;
-
-  for (const value of values) {
-    const timestampMs = toTimestampMs(value);
-    if (timestampMs === null || timestampMs <= latestMs) continue;
-    latestMs = timestampMs;
-    latestValue = value ?? null;
-  }
-
-  return latestValue;
-}
-
 function buildTokenSparkline(
   history: TokenDataPoint[],
   bucketCount: number,
@@ -107,27 +122,16 @@ function buildTokenSparkline(
   );
 }
 
-function normalizeSessionRow(
-  session: SessionBreakdown,
-  tokenTotal: number,
-): CodexLiveSessionRow {
-  return {
-    provider: "codex",
-    sessionId: session.session_id,
-    hostname: session.hostname,
-    project: session.project,
-    firstSeen: session.first_seen,
-    lastActive: session.last_active,
-    tokenTotal,
-  };
-}
-
-export function useCodexLiveData(range: CodexLiveRange) {
-  const [data, setData] = useState<CodexLiveData | null>(null);
+export function useLiveSummaryData(
+  range: LiveSummaryRange,
+  enabledProviders: IntegrationProvider[],
+) {
+  const [data, setData] = useState<LiveSummaryData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const initialLoadDone = useRef(false);
   const requestIdRef = useRef(0);
+  const providerKey = enabledProviders.join("|");
 
   const fetchData = useCallback(async () => {
     const requestId = ++requestIdRef.current;
@@ -138,21 +142,27 @@ export function useCodexLiveData(range: CodexLiveRange) {
     setError(null);
 
     try {
-      const [sessionBreakdown, tokenHistory] = await Promise.all([
-        invoke<SessionBreakdown[]>("get_session_breakdown", {
-          days: 1,
-          hostname: null,
-          provider: "codex",
-          limit: SESSION_BREAKDOWN_LIMIT,
+      const providerFetches = await Promise.all(
+        enabledProviders.map(async (provider) => {
+          const [sessionBreakdown, tokenHistory] = await Promise.all([
+            invoke<SessionBreakdown[]>("get_session_breakdown", {
+              days: 1,
+              hostname: null,
+              provider,
+              limit: SESSION_BREAKDOWN_LIMIT,
+            }),
+            invoke<TokenDataPoint[]>("get_token_history", {
+              range: "24h",
+              provider,
+              hostname: null,
+              sessionId: null,
+              cwd: null,
+            }),
+          ]);
+
+          return { provider, sessionBreakdown, tokenHistory };
         }),
-        invoke<TokenDataPoint[]>("get_token_history", {
-          range: "24h",
-          provider: "codex",
-          hostname: null,
-          sessionId: null,
-          cwd: null,
-        }),
-      ]);
+      );
 
       if (requestId !== requestIdRef.current) {
         return;
@@ -161,48 +171,16 @@ export function useCodexLiveData(range: CodexLiveRange) {
       const nowMs = Date.now();
       const windowMs = LIVE_RANGE_HOURS[range] * HOUR_MS;
       const cutoffMs = nowMs - windowMs;
-      const selectedTokenHistory = tokenHistory.filter((point) => {
+      const allSessions = providerFetches.flatMap(({ sessionBreakdown }) => sessionBreakdown);
+      const allTokenHistory = providerFetches.flatMap(({ tokenHistory }) => tokenHistory);
+      const selectedTokenHistory = allTokenHistory.filter((point) => {
         const timestampMs = toTimestampMs(point.timestamp);
         return timestampMs !== null && timestampMs >= cutoffMs;
       });
-      const activeSessions = sessionBreakdown.filter((session) => {
-        if (session.provider !== "codex") return false;
+      const activeSessions = allSessions.filter((session) => {
         const lastActiveMs = toTimestampMs(session.last_active);
         return lastActiveMs !== null && lastActiveMs >= cutoffMs;
       });
-
-      const sessionTotals = await Promise.all(
-        activeSessions.map(async (session) => {
-          const history = await invoke<TokenDataPoint[]>("get_token_history", {
-            range: "24h",
-            provider: "codex",
-            hostname: null,
-            sessionId: session.session_id,
-            cwd: null,
-          });
-
-          return {
-            session,
-            tokenTotal: sumTokenHistory(history, cutoffMs),
-          };
-        }),
-      );
-
-      if (requestId !== requestIdRef.current) {
-        return;
-      }
-
-      const normalizedSessions = sessionTotals
-        .sort((a, b) => {
-          if (b.tokenTotal !== a.tokenTotal) {
-            return b.tokenTotal - a.tokenTotal;
-          }
-          return (
-            (toTimestampMs(b.session.last_active) ?? 0) -
-            (toTimestampMs(a.session.last_active) ?? 0)
-          );
-        })
-        .map(({ session, tokenTotal }) => normalizeSessionRow(session, tokenTotal));
 
       const latestProjectActivity = new Map<string, string>();
 
@@ -222,51 +200,45 @@ export function useCodexLiveData(range: CodexLiveRange) {
         ...activeSessions.map((session) => session.last_active),
       ]);
 
-      const tokensValue = sumTokenHistory(tokenHistory, cutoffMs);
-      const tokensSparkline = buildTokenSparkline(
-        selectedTokenHistory,
-        TOKEN_SPARKLINE_BUCKETS,
-        nowMs,
-        windowMs,
-      );
-      const activeSessionSparkline = buildRecencySeries(
-        activeSessions.map((session) => session.last_active),
-        RECENCY_BUCKETS,
-        nowMs,
-        windowMs,
-      );
-      const activeProjectSparkline = buildRecencySeries(
-        [...latestProjectActivity.values()],
-        RECENCY_BUCKETS,
-        nowMs,
-        windowMs,
-      );
-
       setData({
         fetchedAt: new Date(nowMs).toISOString(),
         lastActivityAt: latestActivityAt,
         tokens: {
-          value: tokensValue,
-          sparkline: tokensSparkline,
+          value: sumTokenHistory(allTokenHistory, cutoffMs),
+          sparkline: buildTokenSparkline(
+            selectedTokenHistory,
+            TOKEN_SPARKLINE_BUCKETS,
+            nowMs,
+            windowMs,
+          ),
           lastActivityAt: maxTimestamp(selectedTokenHistory.map((point) => point.timestamp)),
         },
         activeSessions: {
           value: activeSessions.length,
-          sparkline: activeSessionSparkline,
+          sparkline: buildRecencySeries(
+            activeSessions.map((session) => session.last_active),
+            RECENCY_BUCKETS,
+            nowMs,
+            windowMs,
+          ),
           lastActivityAt: maxTimestamp(activeSessions.map((session) => session.last_active)),
         },
         activeProjects: {
           value: latestProjectActivity.size,
-          sparkline: activeProjectSparkline,
+          sparkline: buildRecencySeries(
+            [...latestProjectActivity.values()],
+            RECENCY_BUCKETS,
+            nowMs,
+            windowMs,
+          ),
           lastActivityAt: maxTimestamp([...latestProjectActivity.values()]),
         },
-        sessions: normalizedSessions,
       });
     } catch (e) {
       if (requestId !== requestIdRef.current) {
         return;
       }
-      console.error("Codex live data fetch error:", e);
+      console.error("Live summary data fetch error:", e);
       setError(String(e));
     } finally {
       if (requestId === requestIdRef.current) {
@@ -274,13 +246,21 @@ export function useCodexLiveData(range: CodexLiveRange) {
         initialLoadDone.current = true;
       }
     }
-  }, [range]);
+  }, [enabledProviders, range]);
 
   useEffect(() => {
+    if (enabledProviders.length === 0) {
+      setData(null);
+      setLoading(false);
+      setError(null);
+      return;
+    }
     fetchData();
-  }, [fetchData]);
+  }, [enabledProviders.length, fetchData, providerKey]);
 
   useEffect(() => {
+    if (enabledProviders.length === 0) return;
+
     let mounted = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const unlistenPromise = listen("tokens-updated", () => {
@@ -294,12 +274,13 @@ export function useCodexLiveData(range: CodexLiveRange) {
       if (timer) clearTimeout(timer);
       unlistenPromise.then((fn) => fn());
     };
-  }, [fetchData]);
+  }, [enabledProviders.length, fetchData]);
 
   useEffect(() => {
+    if (enabledProviders.length === 0) return;
     const interval = setInterval(fetchData, REFRESH_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [enabledProviders.length, fetchData]);
 
   return { data, loading, error, refresh: fetchData };
 }

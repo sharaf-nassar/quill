@@ -8,21 +8,21 @@ Real-time provider-aware rate limit visualization in the main window's left pane
 
 Displays one row per live metric bucket (`UsageRow`) with three visualization modes controlled by a time mode selector: **pace marker** (vertical line showing current position), **dual bars** (time elapsed vs utilization), or **background fill** (color gradient). Colors indicate severity: green (<50%), yellow (50-80%), red (>=80%). Reset countdown shows time until each bucket resets. Data refreshes every 3 minutes via `fetch_usage_data()`.
 
-Claude rows come from the Anthropic OAuth usage API, while Codex rows come from the newest `token_count` transcript event in `~/.codex/sessions/`. The live pane groups rows by provider when both are enabled, and it can keep rendering cached rows for a provider if live polling fails so the other provider does not blank the entire view.
+Claude rows come from the Anthropic OAuth usage API, while Codex rows now come from `codex app-server` `account/rateLimits/read`, with transcript `token_count` data only as a compatibility fallback. The live pane groups rows by provider when both are enabled, and it can keep rendering cached rows for a provider if live polling fails so the other provider does not blank the entire view.
 
-When both providers are enabled, the live pane shows provider badges plus source notes so Claude's API-backed limits stay visually distinct from Codex's session activity module, while single-provider mode suppresses the redundant provider title.
+The top of the live pane now starts with a shared workload summary rail that renders once whenever at least one provider is enabled. It preserves the older `Sessions`, `Projects`, and range-scoped `Tokens` cards while aggregating those counts across the enabled providers instead of showing Codex-only activity.
 
-Codex live-pane data is normalized through a reusable hook that derives selected-range session counts, token totals, recency sparklines, and per-session totals from a 24-hour provider fetch.
+That summary rail includes the same 1h/6h/12h/24h window selector and freshness indicator as the old Codex workload module, but its data now comes from provider-filtered token and session history fetched across Claude, Codex, or both.
 
-The Codex workload module now presents those metrics as a flatter summary rail beside a divider-based session ledger and a header-level timeframe selector (`1h`, `6h`, `12h`, `24h`). The selected window re-scopes the visible summary counts, token totals, and active-session ledger, and the older Activity Pulse block is no longer shown. On wider panes the session ledger stays width-bounded so spare horizontal room expands the summary rail and its mini charts instead of stretching the ledger, and the summary rail itself stretches to split its available height evenly across the three stats. When the live pane gets short, that rail collapses into a top summary row so the lower stat cards do not get clipped. The live pane still measures rendered content height before computing `--s` so Codex shrinks with the split divider instead of being clipped, split mode caps that upscale at `1`, and the Codex module switches into a compact-height density based on the actual split-pane height while reducing visible session rows before it would need an internal scrollbar.
+Codex now uses the same quota-style live rows as Claude instead of a separate workload widget. The old active-session ledger is gone, and Codex reset countdowns are derived from the direct app-server rate-limit response, which also adds model-specific rows such as Codex Spark when the account exposes them. When the Codex account has a finite credit balance, it is displayed in the Codex provider header row (right-aligned next to "Usage limits").
 
-Claude's quota-style section lives in [[src/components/live/ClaudeLiveModule.tsx]], Codex's workload section lives in [[src/components/live/CodexLiveModule.tsx]], and [[src/components/UsageDisplay.tsx]] now focuses on provider grouping, provider errors, and the time-mode selector while delegating provider-specific rendering.
+The shared workload rail lives in [[src/components/live/LiveSummaryModule.tsx]], the provider row sections live in [[src/components/live/ProviderUsageModule.tsx]], and [[src/components/UsageDisplay.tsx]] now owns the top summary, provider grouping, provider errors, and the time-mode selector for detailed limit rows. When the container is wide enough (≥500px), provider sections display side by side via a CSS container query on `.usage-display`; below that threshold they stack vertically.
 
 ## Analytics Dashboard
 
 Three-tab analytics view in the main window's right pane, powered by [[frontend#Custom Hooks]] and Recharts.
 
-When multiple live metrics are available, the dashboard uses a shared metric selector so utilization charts and rate-limit stats stay pinned to one concrete provider bucket while token, code, and response metrics remain aggregated across enabled providers.
+The dashboard uses a shared metric selector that groups buckets by label (e.g. "5 hours", "7 days") across all providers via [[src/types.ts#mergeBucketsByLabel]]. When multiple providers share a label, their utilization is averaged. The dropdown shows unified labels without provider prefixes.
 
 ### Now Tab
 
@@ -40,7 +40,7 @@ Week-over-week comparison charts for token usage trends, code velocity, and cach
 
 Composite Recharts visualization with three synchronized axes: utilization, tokens, and LOC.
 
-Crosshair context synchronizes tooltip position across chart components. Lazy-loaded with React Suspense to reduce initial bundle size, and the utilization series follows the currently selected provider bucket from the shared analytics metric selector.
+Crosshair context synchronizes tooltip position across chart components. Lazy-loaded with React Suspense to reduce initial bundle size, and the utilization series follows the currently selected merged bucket from the shared analytics metric selector.
 
 ## Learning System
 

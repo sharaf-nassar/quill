@@ -1,9 +1,14 @@
 use crate::config::{claude_user_agent, http_client, read_access_token};
 use crate::integrations::IntegrationProvider;
-use crate::models::UsageBucket;
+use crate::models::{ProviderCredits, UsageBucket};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::json;
+use std::collections::HashMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
@@ -37,12 +42,18 @@ fn validate_utilization(val: f64) -> Option<f64> {
     }
 }
 
-fn validate_resets_at(val: &str) -> Option<String> {
-    if chrono::DateTime::parse_from_rfc3339(val).is_ok() {
-        Some(val.to_string())
-    } else {
-        None
+fn parse_resets_at(value: &serde_json::Value) -> Option<String> {
+    if let Some(val) = value.as_str()
+        && chrono::DateTime::parse_from_rfc3339(val).is_ok()
+    {
+        return Some(val.to_string());
     }
+
+    if let Some(val) = value.as_i64() {
+        return DateTime::<Utc>::from_timestamp(val, 0).map(|timestamp| timestamp.to_rfc3339());
+    }
+
+    None
 }
 
 fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
@@ -68,6 +79,7 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
                     label: label.into(),
                     utilization: util,
                     resets_at: None,
+                    sort_order: 0,
                 });
             }
             continue;
@@ -81,10 +93,7 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
             continue;
         };
 
-        let resets_at = entry
-            .get("resets_at")
-            .and_then(|v| v.as_str())
-            .and_then(validate_resets_at);
+        let resets_at = entry.get("resets_at").and_then(parse_resets_at);
 
         buckets.push(UsageBucket {
             provider: IntegrationProvider::Claude,
@@ -92,10 +101,16 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
             label: label.into(),
             utilization: util,
             resets_at,
+            sort_order: 0,
         });
     }
 
     buckets
+}
+
+fn abbreviate_codex_model(name: &str) -> String {
+    let name = name.strip_prefix("GPT-").unwrap_or(name);
+    name.replace("-Codex-", "-").replace("-Codex", "")
 }
 
 fn codex_window_label(window_minutes: i64) -> String {
@@ -116,6 +131,290 @@ fn codex_window_label(window_minutes: i64) -> String {
     } else {
         format!("{window_minutes} min")
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct AppServerEnvelope {
+    id: Option<u64>,
+    result: Option<serde_json::Value>,
+    error: Option<AppServerError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AppServerError {
+    code: i64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRateLimitsResponse {
+    rate_limits: CodexRateLimitSnapshot,
+    rate_limits_by_limit_id: Option<HashMap<String, CodexRateLimitSnapshot>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexCreditsSnapshot {
+    balance: Option<String>,
+    has_credits: bool,
+    unlimited: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRateLimitSnapshot {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    primary: Option<CodexRateLimitWindow>,
+    secondary: Option<CodexRateLimitWindow>,
+    credits: Option<CodexCreditsSnapshot>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexRateLimitWindow {
+    used_percent: f64,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+fn codex_window_resets_at(resets_at: Option<i64>) -> Option<String> {
+    resets_at
+        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+        .map(|timestamp| timestamp.to_rfc3339())
+}
+
+fn run_codex_app_server_request<T: DeserializeOwned>(
+    request_id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, String> {
+    let mut child = Command::new("codex")
+        .args(["app-server", "--enable", "apps", "--listen", "stdio://"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start codex app-server: {e}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to open codex app-server stdin".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to open codex app-server stdout".to_string())?;
+
+    let messages = [
+        json!({
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "quill_usage",
+                    "title": "Quill Usage",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            },
+        }),
+        json!({
+            "method": "initialized",
+            "params": {},
+        }),
+        json!({
+            "method": method,
+            "id": request_id,
+            "params": params,
+        }),
+    ];
+
+    for message in messages {
+        stdin
+            .write_all(message.to_string().as_bytes())
+            .map_err(|e| format!("Failed to write to codex app-server: {e}"))?;
+        stdin
+            .write_all(b"\n")
+            .map_err(|e| format!("Failed to write newline to codex app-server: {e}"))?;
+    }
+    stdin
+        .flush()
+        .map_err(|e| format!("Failed to flush codex app-server stdin: {e}"))?;
+
+    let mut stderr = child.stderr.take();
+    let reader = BufReader::new(stdout);
+    let mut response = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read codex app-server output: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let envelope: AppServerEnvelope = serde_json::from_str(&line)
+            .map_err(|e| format!("Failed to parse codex app-server message: {e}"))?;
+        if envelope.id != Some(request_id) {
+            continue;
+        }
+
+        if let Some(error) = envelope.error {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "Codex app-server {method} failed (code {}): {}",
+                error.code, error.message
+            ));
+        }
+
+        if let Some(result) = envelope.result {
+            let parsed = serde_json::from_value::<T>(result)
+                .map_err(|e| format!("Failed to parse codex app-server {method} response: {e}"))?;
+            response = Some(parsed);
+            break;
+        }
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if let Some(result) = response {
+        return Ok(result);
+    }
+
+    let mut stderr_text = String::new();
+    if let Some(mut handle) = stderr.take() {
+        let _ = handle.read_to_string(&mut stderr_text);
+    }
+
+    if stderr_text.trim().is_empty() {
+        Err(format!("Codex app-server {method} returned no response"))
+    } else {
+        Err(format!(
+            "Codex app-server {method} returned no response: {}",
+            stderr_text.trim()
+        ))
+    }
+}
+
+fn parse_codex_rate_limit_snapshot(
+    limit_key: &str,
+    snapshot: &CodexRateLimitSnapshot,
+) -> Vec<UsageBucket> {
+    let mut buckets = Vec::new();
+    let limit_name = snapshot
+        .limit_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let is_base_limit = limit_key == "codex";
+
+    for (scope, entry, default_window_minutes) in [
+        ("primary", snapshot.primary.as_ref(), 300_i64),
+        ("secondary", snapshot.secondary.as_ref(), 10080_i64),
+    ] {
+        let Some(entry) = entry else {
+            continue;
+        };
+
+        let Some(utilization) = validate_utilization(entry.used_percent) else {
+            continue;
+        };
+
+        let window_minutes = entry.window_duration_mins.unwrap_or(default_window_minutes);
+        let window_label = codex_window_label(window_minutes);
+        let label = limit_name
+            .map(|name| {
+                let short = abbreviate_codex_model(name);
+                format!("{short} {window_label}")
+            })
+            .unwrap_or(window_label);
+        let key = if is_base_limit {
+            format!("{scope}_{window_minutes}m")
+        } else {
+            format!("{limit_key}_{scope}_{window_minutes}m")
+        };
+
+        buckets.push(UsageBucket {
+            provider: IntegrationProvider::Codex,
+            key,
+            label,
+            utilization,
+            resets_at: codex_window_resets_at(entry.resets_at),
+            sort_order: u32::from(!is_base_limit),
+        });
+    }
+
+    buckets
+}
+
+fn extract_codex_credits(snapshot: &CodexCreditsSnapshot) -> Option<ProviderCredits> {
+    if snapshot.has_credits && !snapshot.unlimited && snapshot.balance.is_some() {
+        Some(ProviderCredits {
+            provider: IntegrationProvider::Codex,
+            balance: snapshot.balance.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_codex_app_server_rate_limits(
+    response: CodexRateLimitsResponse,
+) -> (Vec<UsageBucket>, Option<ProviderCredits>) {
+    // Extract credits from the top-level snapshot before it is potentially
+    // consumed by the unwrap_or_else fallback path below.
+    let top_level_credits = response
+        .rate_limits
+        .credits
+        .as_ref()
+        .and_then(extract_codex_credits);
+
+    let mut snapshots = response
+        .rate_limits_by_limit_id
+        .unwrap_or_else(|| {
+            let key = response
+                .rate_limits
+                .limit_id
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
+            HashMap::from([(key, response.rate_limits)])
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    snapshots.sort_by(|(left_key, left_snapshot), (right_key, right_snapshot)| {
+        let left_rank = usize::from(left_key != "codex");
+        let right_rank = usize::from(right_key != "codex");
+        left_rank.cmp(&right_rank).then_with(|| {
+            left_snapshot
+                .limit_name
+                .as_deref()
+                .unwrap_or(left_key.as_str())
+                .cmp(
+                    right_snapshot
+                        .limit_name
+                        .as_deref()
+                        .unwrap_or(right_key.as_str()),
+                )
+        })
+    });
+
+    let credits = top_level_credits.or_else(|| {
+        snapshots
+            .iter()
+            .find_map(|(_, snapshot)| snapshot.credits.as_ref().and_then(extract_codex_credits))
+    });
+
+    let mut buckets = Vec::new();
+    for (limit_key, snapshot) in snapshots {
+        buckets.extend(parse_codex_rate_limit_snapshot(&limit_key, &snapshot));
+    }
+
+    (buckets, credits)
 }
 
 fn parse_codex_rate_limits(rate_limits: &serde_json::Value) -> Vec<UsageBucket> {
@@ -140,10 +439,7 @@ fn parse_codex_rate_limits(rate_limits: &serde_json::Value) -> Vec<UsageBucket> 
             .unwrap_or_else(|| if scope == "primary" { 300 } else { 10080 });
         let label = codex_window_label(window_minutes);
         let key = format!("{scope}_{window_minutes}m");
-        let resets_at = entry
-            .get("resets_at")
-            .and_then(|value| value.as_str())
-            .and_then(validate_resets_at);
+        let resets_at = entry.get("resets_at").and_then(parse_resets_at);
 
         buckets.push(UsageBucket {
             provider: IntegrationProvider::Codex,
@@ -151,6 +447,7 @@ fn parse_codex_rate_limits(rate_limits: &serde_json::Value) -> Vec<UsageBucket> 
             label,
             utilization,
             resets_at,
+            sort_order: 0,
         });
     }
 
@@ -194,34 +491,18 @@ fn latest_codex_usage_in_file(path: &Path) -> Option<(DateTime<Utc>, Vec<UsageBu
     None
 }
 
-pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, String> {
-    let token = match read_access_token() {
-        Ok(t) => t,
-        Err(e) => {
-            return Err(e);
-        }
-    };
-
-    let resp = match do_fetch(&token).await {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(format!("Request failed: {e}"));
-        }
-    };
-
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        Err("Token expired or revoked. Please run: claude /login".into())
-    } else if !resp.status().is_success() {
-        Err(format!("API error: {}", resp.status()))
+fn fetch_codex_usage_direct() -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
+    let response: CodexRateLimitsResponse =
+        run_codex_app_server_request(2, "account/rateLimits/read", json!({}))?;
+    let (buckets, credits) = parse_codex_app_server_rate_limits(response);
+    if buckets.is_empty() {
+        Err("Codex app-server returned no usage buckets.".to_string())
     } else {
-        match resp.json::<serde_json::Value>().await {
-            Ok(data) => Ok(parse_buckets(&data)),
-            Err(e) => Err(format!("Parse error: {e}")),
-        }
+        Ok((buckets, credits))
     }
 }
 
-pub fn fetch_codex_usage() -> Result<Vec<UsageBucket>, String> {
+fn fetch_codex_usage_from_sessions() -> Result<Vec<UsageBucket>, String> {
     let sessions_dir = crate::restart::codex_sessions_dir();
     if !sessions_dir.exists() {
         return Err("Codex session history not found. Start a Codex session first.".to_string());
@@ -261,4 +542,47 @@ pub fn fetch_codex_usage() -> Result<Vec<UsageBucket>, String> {
             "No Codex live usage data yet. Start a Codex session to populate local metrics."
                 .to_string()
         })
+}
+
+pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, String> {
+    let token = match read_access_token() {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+
+    let resp = match do_fetch(&token).await {
+        Ok(r) => r,
+        Err(e) => {
+            return Err(format!("Request failed: {e}"));
+        }
+    };
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        Err("Token expired or revoked. Please run: claude /login".into())
+    } else if !resp.status().is_success() {
+        Err(format!("API error: {}", resp.status()))
+    } else {
+        match resp.json::<serde_json::Value>().await {
+            Ok(data) => Ok(parse_buckets(&data)),
+            Err(e) => Err(format!("Parse error: {e}")),
+        }
+    }
+}
+
+pub fn fetch_codex_usage() -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
+    match fetch_codex_usage_direct() {
+        Ok(result) => Ok(result),
+        Err(direct_error) => {
+            log::warn!("Codex app-server usage fetch failed: {direct_error}");
+            fetch_codex_usage_from_sessions()
+                .map(|buckets| (buckets, None))
+                .map_err(|fallback_error| {
+                    format!(
+                        "Codex usage fetch failed via app-server ({direct_error}) and transcript fallback ({fallback_error})."
+                    )
+                })
+        }
+    }
 }

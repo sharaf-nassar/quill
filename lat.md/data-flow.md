@@ -110,8 +110,11 @@ The main window polls enabled providers for live rate limit status and stores th
 
 1. `fetch_usage_data()` resolves the enabled provider list from the integration manager
 2. Claude polling in [[src-tauri/src/fetcher.rs]] calls the Anthropic API with an OAuth Bearer token and parses Claude bucket keys
-3. Codex polling in [[src-tauri/src/fetcher.rs]] scans recent `~/.codex/sessions/**/*.jsonl` files, finds the newest `token_count` event, and derives provider buckets from its `rate_limits`
-4. Each bucket is normalized to `{ provider, key, label, utilization, resets_at }` and validated for finite utilization plus RFC3339 reset timestamps
-5. Successful live buckets are inserted into `usage_snapshots`, keyed by provider plus bucket key, and hourly cleanup aggregates them into `usage_hourly`
-6. If a provider poll fails, the command loads the last stored buckets for that provider and returns a provider-scoped error alongside the cached rows
-7. Frontend live usage groups rows by provider, while analytics selects one concrete provider bucket for utilization history and stats
+3. Codex polling in [[src-tauri/src/fetcher.rs]] first calls `codex app-server` over stdio and requests `account/rateLimits/read`, which returns a multi-bucket `rateLimitsByLimitId` view that includes the base Codex limits plus model-specific limits such as Codex Spark
+4. The fetcher skips unrelated stdio frames like the `initialize` response and only parses the app-server message whose request id matches the rate-limit call
+5. Each bucket is normalized to `{ provider, key, label, utilization, resets_at }` and validated for finite utilization plus RFC3339 reset timestamps
+5a. Each Codex rate-limit snapshot may also carry a `credits` object (`balance`, `hasCredits`, `unlimited`). The fetcher extracts the first non-null, non-unlimited credit balance and returns it as a `ProviderCredits` entry alongside the buckets
+6. If the direct Codex app-server request fails, [[src-tauri/src/fetcher.rs]] falls back to the newest `token_count` transcript event in `~/.codex/sessions/**/*.jsonl` so older Codex installs can still populate base usage rows
+7. Successful live buckets are inserted into `usage_snapshots`, keyed by provider plus bucket key, and hourly cleanup aggregates them into `usage_hourly`
+8. If a provider poll fails, the command loads the last stored buckets for that provider and returns a provider-scoped error alongside the cached rows
+9. Frontend live usage groups rows by provider, while analytics selects one concrete provider bucket for utilization history and stats

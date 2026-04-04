@@ -20,6 +20,7 @@
     "core:window:allow-destroy",
     "core:webview:default",
     "core:webview:allow-create-webview-window",
+    "core:webview:allow-set-webview-zoom",
     "core:tray:default",
     "window-state:default",
     "updater:default",

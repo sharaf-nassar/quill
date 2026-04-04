@@ -1347,6 +1347,7 @@ impl Storage {
                     label: row.get(1)?,
                     utilization: row.get(2)?,
                     resets_at: row.get(3)?,
+                    sort_order: 0,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;

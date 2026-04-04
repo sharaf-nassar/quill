@@ -1,54 +1,41 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
-import {
-  currentMonitor,
-  getCurrentWindow,
-} from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import type { PendingUpdate } from "../types";
+import ConfirmDialog from "./ConfirmDialog";
+import ProviderMenu from "./integrations/ProviderMenu";
+import type { UseIntegrationsResult } from "../hooks/useIntegrations";
+import { useToast } from "../hooks/useToast";
+import type { IntegrationProvider, PendingUpdate } from "../types";
 
-const INTEGRATIONS_WINDOW_LABEL = "integrations";
-const INTEGRATIONS_WINDOW_WIDTH = 360;
-const INTEGRATIONS_WINDOW_HEIGHT = 228;
-const INTEGRATIONS_WINDOW_MARGIN = 8;
-const INTEGRATIONS_WINDOW_OFFSET_Y = 30;
+interface PendingProviderAction {
+  provider: IntegrationProvider;
+  nextEnabled: boolean;
+}
 
-async function calcIntegrationsWindowPosition(): Promise<{ x: number; y: number }> {
-  const parent = getCurrentWindow();
-  const scale = await parent.scaleFactor();
-  const physPos = await parent.outerPosition();
-  const physSize = await parent.outerSize();
-  const monitor = await currentMonitor();
+function providerLabel(provider: IntegrationProvider): string {
+  return provider === "claude" ? "Claude Code" : "Codex";
+}
 
-  const pos = physPos.toLogical(scale);
-  const width = physSize.width / scale;
-
-  let x = pos.x + (width - INTEGRATIONS_WINDOW_WIDTH) / 2;
-  let y = pos.y + INTEGRATIONS_WINDOW_OFFSET_Y;
-
-  if (monitor) {
-    const monitorScale = monitor.scaleFactor;
-    const monitorX = monitor.position.x / monitorScale;
-    const monitorY = monitor.position.y / monitorScale;
-    const monitorWidth = monitor.size.width / monitorScale;
-    const monitorHeight = monitor.size.height / monitorScale;
-    const maxX =
-      monitorX + monitorWidth - INTEGRATIONS_WINDOW_WIDTH - INTEGRATIONS_WINDOW_MARGIN;
-    const maxY =
-      monitorY + monitorHeight - INTEGRATIONS_WINDOW_HEIGHT - INTEGRATIONS_WINDOW_MARGIN;
-
-    x = Math.min(
-      Math.max(x, monitorX + INTEGRATIONS_WINDOW_MARGIN),
-      Math.max(maxX, monitorX + INTEGRATIONS_WINDOW_MARGIN),
-    );
-    y = Math.min(
-      Math.max(y, monitorY + INTEGRATIONS_WINDOW_MARGIN),
-      Math.max(maxY, monitorY + INTEGRATIONS_WINDOW_MARGIN),
-    );
+function providerActionCopy(action: PendingProviderAction) {
+  const label = providerLabel(action.provider);
+  if (action.nextEnabled) {
+    return {
+      title: `Enable ${label}?`,
+      description:
+        `Quill will install its ${label} integration assets, including hooks, commands, MCP configuration, and managed instruction blocks.`,
+      confirmLabel: `Enable ${label}`,
+      destructive: false,
+    };
   }
 
-  return { x, y };
+  return {
+    title: `Disable ${label}?`,
+    description:
+      `Quill will remove every ${label} integration asset it installed, including hooks, commands, MCP entries, and managed instruction blocks. Historical Quill data stays in the app.`,
+    confirmLabel: `Disable ${label}`,
+    destructive: true,
+  };
 }
 
 interface TitleBarProps {
@@ -60,8 +47,7 @@ interface TitleBarProps {
   pendingUpdate: PendingUpdate | null;
   updating: boolean;
   onUpdate: () => void;
-  providersLoading: boolean;
-  hasEnabledProvider: boolean;
+  integrations: UseIntegrationsResult;
 }
 
 function TitleBar({
@@ -73,12 +59,24 @@ function TitleBar({
   pendingUpdate,
   updating,
   onUpdate,
-  providersLoading,
-  hasEnabledProvider,
+  integrations,
 }: TitleBarProps) {
+  const { toast } = useToast();
   const [version, setVersion] = useState("");
   const [pluginUpdateCount, setPluginUpdateCount] = useState(0);
-  const [providerWindowOpen, setProviderWindowOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [pendingProviderAction, setPendingProviderAction] =
+    useState<PendingProviderAction | null>(null);
+
+  const {
+    statuses,
+    loading: providersLoading,
+    error: providerError,
+    hasEnabledProvider,
+    inFlightProviders,
+    enableProvider,
+    disableProvider,
+  } = integrations;
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
@@ -92,6 +90,17 @@ function TitleBar({
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !pendingProviderAction) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [menuOpen, pendingProviderAction]);
 
   const featuresDisabled = providersLoading || !hasEnabledProvider;
 
@@ -175,46 +184,56 @@ function TitleBar({
     });
   }, []);
 
-  const handleToggleProviderWindow = useCallback(async () => {
-    const existing = await WebviewWindow.getByLabel(INTEGRATIONS_WINDOW_LABEL);
-    if (existing) {
-      await existing.close();
-      return;
-    }
-
-    const { x, y } = await calcIntegrationsWindowPosition();
-    const win = new WebviewWindow(INTEGRATIONS_WINDOW_LABEL, {
-      url: "/?view=integrations",
-      title: "Integrations",
-      width: INTEGRATIONS_WINDOW_WIDTH,
-      height: INTEGRATIONS_WINDOW_HEIGHT,
-      minWidth: INTEGRATIONS_WINDOW_WIDTH,
-      minHeight: INTEGRATIONS_WINDOW_HEIGHT,
-      maxWidth: INTEGRATIONS_WINDOW_WIDTH,
-      maxHeight: INTEGRATIONS_WINDOW_HEIGHT,
-      x,
-      y,
-      decorations: false,
-      transparent: true,
-      resizable: false,
-      alwaysOnTop: true,
-      focus: true,
-      skipTaskbar: true,
-      shadow: true,
+  const handleToggleMenu = useCallback(() => {
+    setMenuOpen((prev) => {
+      if (prev) {
+        setPendingProviderAction(null);
+      }
+      return !prev;
     });
-
-    setProviderWindowOpen(true);
-    void win.once("tauri://destroyed", () => setProviderWindowOpen(false));
-    void win.once("tauri://error", () => setProviderWindowOpen(false));
   }, []);
 
-  const handleCloseWindow = useCallback(async () => {
-    const integrationsWindow = await WebviewWindow.getByLabel(
-      INTEGRATIONS_WINDOW_LABEL,
-    );
-    if (integrationsWindow) {
-      await integrationsWindow.close();
+  const handleRequestToggle = useCallback(
+    (provider: IntegrationProvider, nextEnabled: boolean) => {
+      setPendingProviderAction({ provider, nextEnabled });
+    },
+    [],
+  );
+
+  const handleConfirmProviderAction = useCallback(async () => {
+    if (!pendingProviderAction) return;
+
+    const { provider, nextEnabled } = pendingProviderAction;
+    const label = providerLabel(provider);
+
+    try {
+      if (nextEnabled) {
+        await enableProvider(provider);
+      } else {
+        await disableProvider(provider);
+      }
+      setPendingProviderAction(null);
+      setMenuOpen(false);
+    } catch (err) {
+      toast(
+        "error",
+        `${nextEnabled ? "Enable" : "Disable"} failed for ${label}: ${String(err)}`,
+      );
     }
+  }, [disableProvider, enableProvider, pendingProviderAction, toast]);
+
+  const confirmCopy = useMemo(
+    () =>
+      pendingProviderAction ? providerActionCopy(pendingProviderAction) : null,
+    [pendingProviderAction],
+  );
+
+  const busyConfirmProvider = pendingProviderAction
+    ? inFlightProviders.has(pendingProviderAction.provider)
+    : false;
+
+  const handleCloseWindow = useCallback(async () => {
+    setMenuOpen(false);
     await onClose();
   }, [onClose]);
 
@@ -281,14 +300,44 @@ function TitleBar({
         <div className="titlebar-menu-anchor">
           <button
             className="titlebar-title-trigger"
-            aria-haspopup="dialog"
-            aria-expanded={providerWindowOpen}
-            onClick={() => void handleToggleProviderWindow()}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            onClick={handleToggleMenu}
           >
             QUILL
           </button>
+          {menuOpen && (
+            <>
+              <div
+                className="provider-menu-backdrop"
+                onMouseDown={() => {
+                  setPendingProviderAction(null);
+                  setMenuOpen(false);
+                }}
+              />
+              <ProviderMenu
+                statuses={statuses}
+                loading={providersLoading}
+                error={providerError}
+                inFlightProviders={inFlightProviders}
+                onRequestToggle={handleRequestToggle}
+              />
+            </>
+          )}
         </div>
       </div>
+      {pendingProviderAction && confirmCopy && (
+        <ConfirmDialog
+          open
+          title={confirmCopy.title}
+          description={confirmCopy.description}
+          confirmLabel={confirmCopy.confirmLabel}
+          destructive={confirmCopy.destructive}
+          busy={busyConfirmProvider}
+          onCancel={() => setPendingProviderAction(null)}
+          onConfirm={handleConfirmProviderAction}
+        />
+      )}
       <div className="titlebar-right">
         {pendingUpdate && (
           <button

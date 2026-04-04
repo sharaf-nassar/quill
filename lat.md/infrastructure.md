@@ -60,13 +60,17 @@ It retries the draft lookup for API eventual consistency, updates `latest.json` 
 
 Available subcommands for the release script.
 
-- `./release.sh bump <major|minor|patch>` — Bump version, generate notes via Claude Haiku, create annotated git tag, push to trigger CI
-- `./release.sh retag [version]` — Re-point existing tag to HEAD (optionally regenerate notes)
+- `./release.sh [--ai auto|codex|claude] bump <major|minor|patch>` — Bump version, auto-select a release-notes CLI, create annotated git tag, and push to trigger CI
+- `./release.sh [--ai auto|codex|claude] retag [version]` — Re-point existing tag to HEAD and optionally regenerate notes with the selected CLI
 - `./release.sh latest` — Show current version
 
 ### AI Release Notes
 
-Uses the `claude` CLI with Haiku model to generate changelog entries from commits since the last release.
+Uses `codex` when installed, otherwise falls back to `claude`; `--ai claude` or `--ai codex` overrides the default selection.
+
+The Codex path pins `gpt-5.4`, `model_reasoning_effort="xhigh"`, and `service_tier="fast"` in non-interactive mode, forces `-C` to the git repo root, and leaves Claude on the existing Haiku-based path.
+
+When release notes are generated through Codex in an interactive terminal, `release.sh` shows a live spinner plus a framed tail of the last 20 user-meaningful Codex progress lines. Internal hook, MCP, router, and sandbox-noise lines stay hidden unless the run fails.
 
 Prompt instructs the model to focus on user-visible features only, omitting refactors, dependency updates, and CI changes. Output format: "## What's New" section with bold feature headings.
 

@@ -3,9 +3,8 @@ import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import TabBar from "./TabBar";
 import NowTab from "./NowTab";
 import TrendsTab from "./TrendsTab";
-import { providerLabel } from "../../utils/providers";
 import type { RangeType, UsageBucket, AnalyticsTab } from "../../types";
-import { usageBucketRefKey } from "../../types";
+import { mergeBucketsByLabel } from "../../types";
 
 const ChartsTab = React.lazy(() => import("./ChartsTab"));
 
@@ -50,29 +49,26 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		} catch { /* ignore */ }
 	};
 
-	const bucketsKey = (currentBuckets ?? [])
-		.map((bucket) =>
-			`${bucket.provider}:${bucket.key}:${bucket.label}:${bucket.utilization}:${bucket.resets_at ?? ""}`,
-		)
-		.join(",");
-	// eslint-disable-next-line react-hooks/exhaustive-deps -- bucketsKey is an intentional stabilizer
-	const stableBuckets = useMemo(() => currentBuckets, [bucketsKey]);
+	const mergedBuckets = useMemo(
+		() => mergeBucketsByLabel(currentBuckets),
+		[currentBuckets],
+	);
 
 	useEffect(() => {
-		if (stableBuckets.length === 0) {
+		if (mergedBuckets.length === 0) {
 			setSelectedBucketKey(null);
 			return;
 		}
 
 		if (
 			selectedBucketKey &&
-			stableBuckets.some((bucket) => usageBucketRefKey(bucket) === selectedBucketKey)
+			mergedBuckets.some((mb) => mb.label === selectedBucketKey)
 		) {
 			return;
 		}
 
-		setSelectedBucketKey(usageBucketRefKey(stableBuckets[0]));
-	}, [selectedBucketKey, stableBuckets]);
+		setSelectedBucketKey(mergedBuckets[0].label);
+	}, [selectedBucketKey, mergedBuckets]);
 
 	useEffect(() => {
 		if (!bucketMenuOpen) return;
@@ -88,8 +84,8 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		return () => document.removeEventListener("mousedown", handler);
 	}, [bucketMenuOpen]);
 
-	const selectedBucket = stableBuckets.find(
-		(bucket) => usageBucketRefKey(bucket) === selectedBucketKey,
+	const selectedBucket = mergedBuckets.find(
+		(mb) => mb.label === selectedBucketKey,
 	) ?? null;
 
 	const { snapshotCount, loading } = useAnalyticsData(selectedBucket, "24h");
@@ -126,13 +122,13 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 	}
 
 	const selectedBucketLabel = selectedBucket
-		? `${providerLabel(selectedBucket.provider)} · ${selectedBucket.label}`
+		? selectedBucket.label
 		: "No live metric";
 
 	return (
 		<div className="analytics-view">
 			<TabBar activeTab={activeTab} onTabChange={handleTabChange} />
-			{stableBuckets.length > 0 && (
+			{mergedBuckets.length > 0 && (
 				<div className="analytics-controls analytics-controls--metric">
 					<div className="bucket-dropdown-wrap" ref={bucketMenuRef}>
 						<button
@@ -148,23 +144,20 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 						</button>
 						{bucketMenuOpen && (
 							<div className="bucket-dropdown-menu" role="menu">
-								{stableBuckets.map((bucket) => {
-									const bucketKey = usageBucketRefKey(bucket);
-									return (
-										<button
-											key={bucketKey}
-											className={`bucket-dropdown-item${bucketKey === selectedBucketKey ? " active" : ""}`}
-											role="menuitemradio"
-											aria-checked={bucketKey === selectedBucketKey}
-											onClick={() => {
-												setSelectedBucketKey(bucketKey);
-												setBucketMenuOpen(false);
-											}}
-										>
-											{providerLabel(bucket.provider)} · {bucket.label}
-										</button>
-									);
-								})}
+								{mergedBuckets.map((mb) => (
+									<button
+										key={mb.label}
+										className={`bucket-dropdown-item${mb.label === selectedBucketKey ? " active" : ""}`}
+										role="menuitemradio"
+										aria-checked={mb.label === selectedBucketKey}
+										onClick={() => {
+											setSelectedBucketKey(mb.label);
+											setBucketMenuOpen(false);
+										}}
+									>
+										{mb.label}
+									</button>
+								))}
 							</div>
 						)}
 					</div>

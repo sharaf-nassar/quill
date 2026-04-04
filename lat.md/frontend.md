@@ -6,7 +6,7 @@ The React 19 frontend is a multi-window Tauri application with custom hooks for 
 
 [[src/main.tsx]] routes to window-specific components based on the `?view=` URL parameter.
 
-Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications, and [[src/hooks/useIntegrations.ts]] gates secondary windows when no provider is enabled.
+Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range via Tauri's native webview zoom API, falling back to CSS `zoom` only outside Tauri. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications, and [[src/hooks/useIntegrations.ts]] gates secondary windows when no provider is enabled.
 
 ### Window Routes
 
@@ -20,7 +20,7 @@ Seven Tauri windows are routed by the `?view=` URL parameter, each with its own 
 | `?view=plugins` | `PluginsWindowView` | Plugin management |
 | `?view=restart` | `RestartWindowView` | Claude Code instance restart |
 | `?view=runs` | `RunsWindowView` | Learning run history details |
-| `?view=integrations` | `IntegrationsWindowView` | Anchored provider enable/disable popup |
+| `?view=integrations` | `IntegrationsWindowView` | Standalone provider enable/disable (unused since inline popover migration) |
 
 ## Main Window Layout
 
@@ -30,7 +30,9 @@ The split ratio (0.15-0.85) persists in localStorage. The layout supports keyboa
 
 ### Component Tree
 
-The main window nests: `TitleBar` (feature buttons on the left, centered QUILL popup trigger, update/version/close on the right) at the top, `UsageDisplay` (live rate limit buckets) on the left, and `AnalyticsView` (tabbed analytics) on the right.
+The main window nests `TitleBar` at the top, `UsageDisplay` on the left, and `AnalyticsView` on the right.
+
+`TitleBar` has feature buttons on the left, a centered QUILL trigger with inline integrations popover, and version/close controls on the right. `UsageDisplay` shows live rate limit buckets. `AnalyticsView` renders tabbed analytics.
 
 ## Components
 
@@ -40,13 +42,13 @@ Components are organized by feature domain under `src/components/`.
 
 Top-level UI chrome and live rate limit display shared across the main window.
 
-- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a QUILL trigger that opens the anchored integrations popup window, and version/close controls on the right.
+- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered QUILL trigger that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, and version/close controls on the right. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
 - **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel that shows Claude Code and Codex availability, enabled state, and the next enable or disable action.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
-- **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Popup-window host for `ProviderMenu` that auto-closes on blur and owns the confirmation-driven enable/disable flow.
-- **UsageDisplay** (`src/components/UsageDisplay.tsx`) — Composes live sections from enabled providers, keeps the time mode selector and provider-error handling, and delegates provider-specific rendering to [[src/components/live/ClaudeLiveModule.tsx]] and [[src/components/live/CodexLiveModule.tsx]].
-- **ClaudeLiveModule** (`src/components/live/ClaudeLiveModule.tsx`) — Claude-specific live bucket section that preserves the existing quota UI for API-backed limits.
-- **CodexLiveModule** (`src/components/live/CodexLiveModule.tsx`) — Codex-specific workload module with three sparkline-backed summary stats, a ranked active-session ledger, and a header selector for 1h/6h/12h/24h live ranges with container-query reflow for narrow split-pane widths.
+- **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).
+- **UsageDisplay** (`src/components/UsageDisplay.tsx`) — Composes the shared workload summary rail, grouped provider limit sections, the detailed-row time mode selector, and provider-error handling for the main window's live pane.
+- **LiveSummaryModule** (`src/components/live/LiveSummaryModule.tsx`) — Shared top-of-pane workload module with the 1h/6h/12h/24h selector, freshness label, and aggregate `Sessions`, `Projects`, and `Tokens` cards across the enabled providers.
+- **ProviderUsageModule** (`src/components/live/ProviderUsageModule.tsx`) — Reusable provider section that renders Claude or Codex quota rows with a provider badge and source note.
 - **UsageRow** (`src/components/UsageRow.tsx`, 222 lines) — Individual rate limit visualization with three display modes: pace marker (vertical line), dual bars (time elapsed vs utilization), or background fill.
 
 ### Analytics Components
@@ -105,7 +107,7 @@ All data hooks use Tauri `invoke()` for request-response and `listen()` for push
 
 ### Integration Hook
 
-`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses, listens for `integrations-updated`, tracks per-provider in-flight actions, and drives the integrations popup window plus blocked-window gating.
+`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses, listens for `integrations-updated`, tracks per-provider in-flight actions, and drives the inline integrations popover in TitleBar plus blocked-window gating.
 
 ### Data Fetching Hooks
 
@@ -113,9 +115,9 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 
 | Hook | Returns | Tauri Commands |
 |------|---------|----------------|
-| `useAnalyticsData` | Usage history, stats, snapshot count | `get_usage_history`, `get_usage_stats`, `get_snapshot_count` |
+| `useAnalyticsData` | Usage history, stats, snapshot count (accepts `MergedBucket`, queries all sources and averages) | `get_usage_history`, `get_usage_stats`, `get_snapshot_count` |
+| `useLiveSummaryData` | Aggregate live `Sessions`, `Projects`, and range-scoped `Tokens` cards across enabled providers | `get_session_breakdown`, `get_token_history` |
 | `useTokenData` | Token history with hostname/session filtering | `get_token_history`, `get_token_stats`, `get_token_hostnames` |
-| `useCodexLiveData` | Codex live-pane summary, range-aware token sparklines, active sessions/projects | `get_session_breakdown` (provider-scoped, 24h fetch), `get_token_history` (24h provider + per-session) |
 | `useCodeStats` | Lines added/removed by language | `get_code_stats`, `get_code_stats_history` |
 | `useBreakdownData` | Host/project/session breakdown tables | `get_host_breakdown`, `get_project_breakdown`, `get_session_breakdown` |
 | `useSessionHealth` | Avg duration, tokens, sessions/day with trend | `get_session_stats` |
@@ -130,7 +132,7 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `usePluginData` | Installed plugins, marketplaces, updates | Multiple plugin commands |
 | `useCacheEfficiency` | Cache hit rate (derived from token history) | None (derived) |
 
-`useCodexLiveData` accepts a Codex-only live range (`1h`, `6h`, `12h`, `24h`) and derives the visible live metrics from a provider-scoped 24-hour token/session snapshot. The Codex live header pairs that selector with responsive container-query styling so the control cluster stays compact in narrow panes, while the module itself applies a ResizeObserver-driven compact mode keyed off the enclosing split pane when the live area gets short enough to collapse the summary rail above the ledger.
+`useLiveSummaryData` fetches provider-filtered token and session history on demand so the top workload rail can aggregate `Sessions`, `Projects`, and range-scoped `Tokens` across whichever providers are enabled, while the grouped row sections continue to consume the already-fetched `UsageData` snapshot from `fetch_usage_data`.
 
 ### State Pattern
 
@@ -147,7 +149,7 @@ React Context providers used across the frontend for shared state.
 
 [[src/types.ts]] contains all TypeScript types (434 lines), mirroring the Rust models in [[src-tauri/src/models.rs]].
 
-Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
+Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
 
 Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`, `PluginsTab`.
 
@@ -181,9 +183,9 @@ Semantic color palette used across all stylesheets for consistent status indicat
 
 The CSS variable `--s` scales all dimensions based on container size. Per-layout window sizes persist in localStorage (`quill-size-{live|analytics|both}`).
 
-[[src/App.tsx]] now measures the rendered live content height at `--s: 1` before choosing the next scale, so provider modules shrink against the available split-pane height instead of relying on a Claude-sized fixed baseline.
+[[src/App.tsx]] now measures the rendered live content height at `--s: 1` before choosing the next scale, then applies a second fit-to-height correction pass against the actual post-scale `scrollHeight`. A `MutationObserver` on the live subtree retriggers that sizing pass when async live widgets change after the initial provider fetch, and split-ratio changes rerun the same fit logic with a small height gutter so the last usage row stays visible.
 
-The Codex live module adds container queries on top of `--s`, keeping its summary rail flat on wider panes, capping the active-session ledger width so extra room feeds the summary column, and reflowing those metrics into compact multi-column and stacked layouts before the session ledger loses readability. In the default two-column state, the summary rail stretches to the ledger height and divides that space across three equal stat rows. When the live pane gets short, compact-height mode flips that rail into a horizontal summary row above the ledger so the bottom sparkline does not clip. The live split pane top-aligns its content, allows a lower minimum `--s`, caps split-mode upscaling at `1`, and uses a module-level compact-height mode keyed to the outer live pane, including tighter spacing and fewer visible ledger rows, instead of allowing an internal scrollbar in the live section.
+The live pane keeps the same `--s`-driven scaling strategy, but its summary rail is now provider-agnostic: the top card grid auto-fits whichever Claude and Codex buckets are present, while the grouped row sections below continue to shrink with the split divider instead of relying on a fixed Claude-only baseline. In split mode the main window stylesheet allows vertical scrolling in the live pane as a fallback, and the fit calculation reserves a bottom gutter above the divider so the last usage row does not sit flush against the resize bar.
 
 ## Utilities
 

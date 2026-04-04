@@ -56,6 +56,8 @@ pub struct UsageBucket {
     pub label: String,
     pub utilization: f64,
     pub resets_at: Option<String>,
+    #[serde(default)]
+    pub sort_order: u32,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -65,9 +67,16 @@ pub struct UsageProviderError {
 }
 
 #[derive(Serialize, Clone, Debug)]
+pub struct ProviderCredits {
+    pub provider: IntegrationProvider,
+    pub balance: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
 pub struct UsageData {
     pub buckets: Vec<UsageBucket>,
     pub provider_errors: Vec<UsageProviderError>,
+    pub provider_credits: Vec<ProviderCredits>,
     pub error: Option<String>,
 }
 

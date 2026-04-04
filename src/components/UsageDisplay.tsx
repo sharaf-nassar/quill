@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect } from "react";
-import ClaudeLiveModule from "./live/ClaudeLiveModule";
-import CodexLiveModule from "./live/CodexLiveModule";
+import LiveSummaryModule from "./live/LiveSummaryModule";
+import ProviderUsageModule from "./live/ProviderUsageModule";
 import type {
   IntegrationProvider,
+  ProviderCredits,
   TimeMode,
   UsageBucket,
   UsageData,
@@ -34,62 +35,24 @@ interface UsageDisplayProps {
   onTimeModeChange: (mode: TimeMode) => void;
 }
 
-type ClaudeUsageBucket = UsageBucket & { provider: "claude" };
-type CodexUsageBucket = UsageBucket & { provider: "codex" };
-
-interface ClaudeProviderSection {
-  provider: "claude";
-  buckets: ClaudeUsageBucket[];
-}
-
-interface CodexProviderSection {
-  provider: "codex";
-  buckets: CodexUsageBucket[];
-}
-
-type ProviderSection = ClaudeProviderSection | CodexProviderSection;
-
-function isClaudeBucket(bucket: UsageBucket): bucket is ClaudeUsageBucket {
-  return bucket.provider === "claude";
-}
-
-function isCodexBucket(bucket: UsageBucket): bucket is CodexUsageBucket {
-  return bucket.provider === "codex";
-}
-
-function isClaudeSection(
-  section: ProviderSection,
-): section is ClaudeProviderSection {
-  return section.provider === "claude";
+interface ProviderSection {
+  provider: IntegrationProvider;
+  buckets: UsageBucket[];
 }
 
 function buildProviderSections(
   enabledProviders: IntegrationProvider[],
   buckets: UsageBucket[],
 ): ProviderSection[] {
-  const sections: ProviderSection[] = [];
-  const claudeBuckets = buckets.filter(isClaudeBucket);
-  const codexBuckets = buckets.filter(isCodexBucket);
+  const providers =
+    enabledProviders.length > 0 ? enabledProviders : (["claude", "codex"] as const);
 
-  if (enabledProviders.length === 0) {
-    if (claudeBuckets.length > 0) {
-      sections.push({ provider: "claude", buckets: claudeBuckets });
-    }
-    if (codexBuckets.length > 0) {
-      sections.push({ provider: "codex", buckets: codexBuckets });
-    }
-    return sections;
-  }
-
-  if (enabledProviders.includes("claude") && claudeBuckets.length > 0) {
-    sections.push({ provider: "claude", buckets: claudeBuckets });
-  }
-
-  if (enabledProviders.includes("codex")) {
-    sections.push({ provider: "codex", buckets: codexBuckets });
-  }
-
-  return sections;
+  return providers.flatMap((provider) => {
+    const providerBuckets = buckets.filter((bucket) => bucket.provider === provider);
+    return providerBuckets.length > 0
+      ? [{ provider, buckets: providerBuckets }]
+      : [];
+  });
 }
 
 function UsageDisplay({
@@ -129,7 +92,7 @@ function UsageDisplay({
     const msg = data.error.includes("Credentials")
       ? data.error
       : "Failed to load usage data";
-    if (data.buckets.length === 0 && !enabledProviders.includes("codex")) {
+    if (data.buckets.length === 0) {
       return (
         <div className="error-label" role="alert">
           {msg}
@@ -144,12 +107,16 @@ function UsageDisplay({
     return <div className="loading">No usage data</div>;
   }
 
-  const hasClaudeSection = providerSections.some(isClaudeSection);
   const showProviderHeadings = enabledProviders.length > 1;
+
+  const creditsByProvider = new Map<IntegrationProvider, ProviderCredits>(
+    data.provider_credits.map((c) => [c.provider, c]),
+  );
 
   return (
     <div className="usage-display">
-      {hasClaudeSection && (
+      <LiveSummaryModule enabledProviders={enabledProviders} />
+      {providerSections.length > 0 && (
         <div className="col-header">
           <span className="col-limits">Limits</span>
           <span className="col-center-cog">
@@ -246,25 +213,18 @@ function UsageDisplay({
           ))}
         </div>
       )}
-      {providerSections.map((section) => {
-        if (isClaudeSection(section)) {
-          return (
-            <ClaudeLiveModule
-              key={section.provider}
-              section={section}
-              timeMode={timeMode}
-              showHeading={showProviderHeadings}
-            />
-          );
-        }
-
-        return (
-          <CodexLiveModule
+      <div className="usage-providers">
+        {providerSections.map((section) => (
+          <ProviderUsageModule
             key={section.provider}
+            provider={section.provider}
+            buckets={section.buckets}
+            timeMode={timeMode}
             showHeading={showProviderHeadings}
+            credits={creditsByProvider.get(section.provider)}
           />
-        );
-      })}
+        ))}
+      </div>
     </div>
   );
 }

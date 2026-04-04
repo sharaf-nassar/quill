@@ -13,7 +13,7 @@ import TokenSparkline from "./TokenSparkline";
 import CodeSparkline from "./CodeSparkline";
 import type {
 	RangeType,
-	UsageBucket,
+	MergedBucket,
 	BreakdownSelection,
 } from "../../types";
 
@@ -42,7 +42,7 @@ const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 interface NowTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
-	currentBucket: UsageBucket | null;
+	currentBucket: MergedBucket | null;
 }
 
 function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {

@@ -6,6 +6,7 @@ export interface UsageBucket {
   label: string;
   utilization: number;
   resets_at: string | null;
+  sort_order?: number;
 }
 
 export interface UsageProviderError {
@@ -13,9 +14,15 @@ export interface UsageProviderError {
   message: string;
 }
 
+export interface ProviderCredits {
+  provider: IntegrationProvider;
+  balance: string | null;
+}
+
 export interface UsageData {
   buckets: UsageBucket[];
   provider_errors: UsageProviderError[];
+  provider_credits: ProviderCredits[];
   error: string | null;
 }
 
@@ -87,7 +94,6 @@ export interface ProjectBreakdown {
 export type TimeMode = "marker" | "dual" | "background";
 
 export type RangeType = "1h" | "24h" | "7d" | "30d";
-export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
 export type TrendType = "up" | "down" | "flat" | "unknown";
 
@@ -170,37 +176,6 @@ export interface SessionCodeStats {
 	net_change: number;
 }
 
-export interface CodexLiveCountSeries {
-  value: number;
-  sparkline: SparklinePoint[];
-  lastActivityAt: string | null;
-}
-
-export interface CodexLiveTokenSeries {
-  value: number;
-  sparkline: SparklinePoint[];
-  lastActivityAt: string | null;
-}
-
-export interface CodexLiveSessionRow {
-  provider: "codex";
-  sessionId: string;
-  hostname: string;
-  project: string | null;
-  firstSeen: string;
-  lastActive: string;
-  tokenTotal: number;
-}
-
-export interface CodexLiveData {
-  fetchedAt: string;
-  lastActivityAt: string | null;
-  tokens: CodexLiveTokenSeries;
-  activeSessions: CodexLiveCountSeries;
-  activeProjects: CodexLiveCountSeries;
-  sessions: CodexLiveSessionRow[];
-}
-
 // Learning system types
 
 export interface LearningSettings {
@@ -270,6 +245,34 @@ export function usageBucketRefKey(
   bucket: Pick<UsageBucket, "provider" | "key">,
 ): string {
   return `${bucket.provider}:${bucket.key}`;
+}
+
+// Unified bucket that groups multiple providers sharing the same label
+export interface MergedBucket {
+  label: string;
+  sources: UsageBucket[];
+  utilization: number;
+  resets_at: string | null;
+}
+
+export function mergeBucketsByLabel(buckets: UsageBucket[]): MergedBucket[] {
+  const groups = new Map<string, UsageBucket[]>();
+  for (const bucket of buckets) {
+    const existing = groups.get(bucket.label) ?? [];
+    existing.push(bucket);
+    groups.set(bucket.label, existing);
+  }
+  return Array.from(groups.entries()).map(([label, sources]) => ({
+    label,
+    sources,
+    utilization:
+      sources.reduce((sum, s) => sum + s.utilization, 0) / sources.length,
+    resets_at:
+      sources
+        .map((s) => s.resets_at)
+        .filter((r): r is string => r !== null)
+        .sort()[0] ?? null,
+  }));
 }
 
 export function sessionRefKey(ref: SessionRef): string {
