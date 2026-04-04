@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { IntegrationProvider, ProviderStatus } from "../types";
 
-const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex"];
+const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
 
 function sortStatuses(statuses: ProviderStatus[]): ProviderStatus[] {
   return [...statuses].sort(
@@ -31,7 +31,7 @@ export interface UseIntegrationsResult {
   inFlightProviders: ReadonlySet<IntegrationProvider>;
   hasEnabledProvider: boolean;
   refresh: () => Promise<void>;
-  enableProvider: (provider: IntegrationProvider) => Promise<ProviderStatus>;
+  enableProvider: (provider: IntegrationProvider, apiKey?: string) => Promise<ProviderStatus>;
   disableProvider: (provider: IntegrationProvider) => Promise<ProviderStatus>;
 }
 
@@ -75,10 +75,11 @@ export function useIntegrations(): UseIntegrationsResult {
     async (
       provider: IntegrationProvider,
       command: "confirm_enable_provider" | "confirm_disable_provider",
+      extraArgs?: Record<string, unknown>,
     ) => {
       setInFlightProviders((prev) => new Set(prev).add(provider));
       try {
-        const updated = await invoke<ProviderStatus>(command, { provider });
+        const updated = await invoke<ProviderStatus>(command, { provider, ...extraArgs });
         setStatuses((prev) => upsertStatus(prev, updated));
         setError(null);
         return updated;
@@ -98,8 +99,8 @@ export function useIntegrations(): UseIntegrationsResult {
   );
 
   const enableProvider = useCallback(
-    async (provider: IntegrationProvider) => {
-      return runProviderCommand(provider, "confirm_enable_provider");
+    async (provider: IntegrationProvider, apiKey?: string) => {
+      return runProviderCommand(provider, "confirm_enable_provider", apiKey ? { apiKey } : undefined);
     },
     [runProviderCommand],
   );

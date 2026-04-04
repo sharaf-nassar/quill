@@ -13,7 +13,9 @@ interface ProviderMenuProps {
 }
 
 function providerLabel(provider: IntegrationProvider): string {
-  return provider === "claude" ? "Claude Code" : "Codex";
+  if (provider === "claude") return "Claude Code";
+  if (provider === "codex") return "Codex";
+  return "MiniMax";
 }
 
 function providerBadge(status: ProviderStatus): string {
@@ -32,6 +34,11 @@ function providerBadge(status: ProviderStatus): string {
 function providerSummary(status: ProviderStatus): string {
   if (status.lastError) {
     return status.lastError;
+  }
+  if (status.provider === "mini_max") {
+    return status.enabled
+      ? "Subscription usage tracking is active."
+      : "Enable to track your MiniMax subscription usage.";
   }
   if (status.enabled) {
     return "Quill integration is installed and active.";

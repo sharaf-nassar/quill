@@ -109,7 +109,7 @@ fn build_owned_manifest() -> OwnedAssetManifest {
             templates_dir().to_string_lossy().to_string(),
         ],
         config_keys: vec![MCP_SERVER_KEY.to_string()],
-        markdown_blocks: vec![SECTION_HEADING.to_string()],
+        markdown_blocks: vec![BLOCK_START.to_string()],
     }
 }
 
@@ -338,7 +338,7 @@ fn remove_quill_mcp_key(manifest: &OwnedAssetManifest) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_claude_md_sections(blocks: &[String]) -> Result<(), String> {
+fn remove_claude_md_sections(_blocks: &[String]) -> Result<(), String> {
     let claude_md_path = dirs::home_dir()
         .ok_or("Cannot determine home directory")?
         .join(".claude")
@@ -348,29 +348,55 @@ fn remove_claude_md_sections(blocks: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut changed = false;
-    let mut content = fs::read_to_string(&claude_md_path)
+    let content = fs::read_to_string(&claude_md_path)
         .map_err(|err| format!("Failed to read CLAUDE.md: {err}"))?;
 
-    for heading in blocks {
-        if let Some(start) = content.find(heading) {
-            let after_heading = start + heading.len();
-            let end = content[after_heading..]
-                .find("\n### ")
-                .or_else(|| content[after_heading..].find("\n## "))
-                .map(|pos| after_heading + pos)
-                .unwrap_or(content.len());
+    // Try block markers first (new style), then fall back to legacy heading
+    let updated = if content.contains(BLOCK_START) && content.contains(BLOCK_END) {
+        strip_md_block(&content, BLOCK_START, BLOCK_END)
+    } else if let Some(start) = content.find(LEGACY_HEADING) {
+        // Legacy removal: find heading → next heading boundary
+        let after_heading = start + LEGACY_HEADING.len();
+        let end = content[after_heading..]
+            .find("\n### ")
+            .or_else(|| content[after_heading..].find("\n## "))
+            .map(|pos| after_heading + pos)
+            .unwrap_or(content.len());
 
-            let mut stripped = String::with_capacity(content.len());
-            stripped.push_str(&content[..start]);
-            stripped.push_str(&content[end..]);
-            content = stripped;
-            changed = true;
+        // Scan backwards to include preceding legacy markers
+        let mut actual_start = start;
+        let before = &content[..start];
+        for line in before.lines().rev() {
+            let trimmed = line.trim();
+            if (trimmed.starts_with(LEGACY_MARKER_PREFIX) && trimmed.ends_with("-->"))
+                || trimmed.is_empty()
+            {
+                actual_start -= line.len() + 1;
+            } else {
+                break;
+            }
         }
-    }
+        if actual_start > content.len() {
+            actual_start = 0;
+        }
 
-    if changed {
-        fs::write(&claude_md_path, content)
+        let mut result = String::with_capacity(content.len());
+        result.push_str(content[..actual_start].trim_end_matches('\n'));
+        let after = content[end..].trim_start_matches('\n');
+        if !result.is_empty() && !after.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(after);
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result
+    } else {
+        return Ok(());
+    };
+
+    if updated != content {
+        fs::write(&claude_md_path, updated)
             .map_err(|err| format!("Failed to write CLAUDE.md: {err}"))?;
     }
 
@@ -537,7 +563,12 @@ fn create_local_config() -> Result<(), String> {
 
 // ── CLAUDE.md management ──
 
-const SECTION_HEADING: &str = "### Session History Search (Quill MCP)";
+const BLOCK_START: &str = "<!-- quill-managed:claude:start -->";
+const BLOCK_END: &str = "<!-- quill-managed:claude:end -->";
+/// Legacy heading used before block markers were introduced.
+const LEGACY_HEADING: &str = "### Session History Search (Quill MCP)";
+/// Legacy version marker that preceded the heading (caused marker accumulation bug).
+const LEGACY_MARKER_PREFIX: &str = "<!-- quill-v";
 
 /// Update the Quill MCP section in ~/.claude/CLAUDE.md from the deployed template.
 fn update_claude_md() -> Result<(), String> {
@@ -547,20 +578,23 @@ fn update_claude_md() -> Result<(), String> {
         return Ok(());
     }
 
-    let template = fs::read_to_string(&template_path)
+    let raw_template = fs::read_to_string(&template_path)
         .map_err(|e| format!("Failed to read claude-md-section.md: {e}"))?;
+
+    // Wrap the template content in block markers
+    let block_content = format!("{BLOCK_START}\n{}\n{BLOCK_END}", raw_template.trim());
 
     let claude_md_path = dirs::home_dir()
         .ok_or("Cannot determine home directory")?
         .join(".claude")
         .join("CLAUDE.md");
 
-    // If CLAUDE.md doesn't exist, create it with just the template
+    // If CLAUDE.md doesn't exist, create it with the block
     if !claude_md_path.exists() {
         if let Some(parent) = claude_md_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::write(&claude_md_path, &template)
+        fs::write(&claude_md_path, format!("{block_content}\n"))
             .map_err(|e| format!("Failed to create CLAUDE.md: {e}"))?;
         log::info!("Created ~/.claude/CLAUDE.md with Quill MCP section");
         return Ok(());
@@ -569,28 +603,20 @@ fn update_claude_md() -> Result<(), String> {
     let content = fs::read_to_string(&claude_md_path)
         .map_err(|e| format!("Failed to read CLAUDE.md: {e}"))?;
 
-    // Check if template content is already present (exact match = no update needed)
-    if content.contains(template.trim()) {
+    // Check if current block content is already present (no update needed)
+    if content.contains(&block_content) {
         log::debug!("CLAUDE.md already has current Quill section — no update needed");
         return Ok(());
     }
 
-    // Find the existing section boundaries
-    let updated = if let Some(start) = content.find(SECTION_HEADING) {
-        // Find the end: next ### or ## heading, or EOF
-        let after_heading = start + SECTION_HEADING.len();
-        let end = content[after_heading..]
-            .find("\n### ")
-            .or_else(|| content[after_heading..].find("\n## "))
-            .map(|pos| after_heading + pos)
-            .unwrap_or(content.len());
-
-        // Replace the section
-        let mut result = String::with_capacity(content.len());
-        result.push_str(&content[..start]);
-        result.push_str(template.trim());
-        result.push_str(&content[end..]);
-        result
+    // Determine which replacement strategy to use
+    let updated = if content.contains(BLOCK_START) && content.contains(BLOCK_END) {
+        // New-style block markers — replace between them
+        replace_md_block(&content, BLOCK_START, BLOCK_END, &block_content)
+    } else if content.contains(LEGACY_HEADING) {
+        // Migrate from legacy heading-based section to block markers.
+        // Also clean up any orphaned version markers that accumulated.
+        migrate_legacy_section(&content, &block_content)
     } else {
         // Section doesn't exist — append
         let mut result = content.clone();
@@ -598,7 +624,7 @@ fn update_claude_md() -> Result<(), String> {
             result.push('\n');
         }
         result.push('\n');
-        result.push_str(template.trim());
+        result.push_str(&block_content);
         result.push('\n');
         result
     };
@@ -606,6 +632,127 @@ fn update_claude_md() -> Result<(), String> {
     fs::write(&claude_md_path, &updated).map_err(|e| format!("Failed to write CLAUDE.md: {e}"))?;
     log::info!("Updated Quill MCP section in ~/.claude/CLAUDE.md");
     Ok(())
+}
+
+/// Replace content between start/end markers (inclusive).
+fn replace_md_block(content: &str, start: &str, end: &str, replacement: &str) -> String {
+    let Some(s) = content.find(start) else {
+        return content.to_string();
+    };
+    let Some(rel_e) = content[s..].find(end) else {
+        return content.to_string();
+    };
+    let e = s + rel_e + end.len();
+
+    let mut result = String::with_capacity(content.len());
+    let before = content[..s].trim_end_matches('\n');
+    result.push_str(before);
+    if !before.is_empty() {
+        result.push_str("\n\n");
+    }
+    result.push_str(replacement);
+    let after = content[e..].trim_start_matches('\n');
+    if !after.is_empty() {
+        result.push_str("\n\n");
+        result.push_str(after);
+    }
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Strip content between start/end markers (inclusive).
+fn strip_md_block(content: &str, start: &str, end: &str) -> String {
+    let Some(s) = content.find(start) else {
+        return content.to_string();
+    };
+    let Some(rel_e) = content[s..].find(end) else {
+        return content.to_string();
+    };
+    let e = s + rel_e + end.len();
+
+    let mut result = String::new();
+    result.push_str(content[..s].trim_end_matches('\n'));
+    let after = content[e..].trim_start_matches('\n');
+    if !result.is_empty() && !after.is_empty() {
+        result.push_str("\n\n");
+    }
+    result.push_str(after);
+    if !result.is_empty() && !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Migrate from the legacy heading-based section to block markers, cleaning up
+/// any orphaned `<!-- quill-v... -->` markers that accumulated from the old logic.
+fn migrate_legacy_section(content: &str, block_content: &str) -> String {
+    let Some(heading_start) = content.find(LEGACY_HEADING) else {
+        return content.to_string();
+    };
+
+    // Find the end of the legacy section: next ### or ## heading, or EOF
+    let after_heading = heading_start + LEGACY_HEADING.len();
+    let section_end = content[after_heading..]
+        .find("\n### ")
+        .or_else(|| content[after_heading..].find("\n## "))
+        .map(|pos| after_heading + pos)
+        .unwrap_or(content.len());
+
+    // Scan backwards from heading to include any preceding legacy markers.
+    // These are the orphaned `<!-- quill-v1.x.x -->` lines that accumulated.
+    let mut actual_start = heading_start;
+    let before = &content[..heading_start];
+    for line in before.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(LEGACY_MARKER_PREFIX) && trimmed.ends_with("-->") {
+            actual_start -= line.len() + 1; // +1 for the newline
+        } else if trimmed.is_empty() {
+            actual_start -= line.len() + 1;
+        } else {
+            break;
+        }
+    }
+    // Clamp to 0 in case of underflow
+    if actual_start > content.len() {
+        actual_start = 0;
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let before = content[..actual_start].trim_end_matches('\n');
+    result.push_str(before);
+    if !before.is_empty() {
+        result.push_str("\n\n");
+    }
+    result.push_str(block_content);
+    let after = content[section_end..].trim_start_matches('\n');
+    if !after.is_empty() {
+        result.push_str("\n\n");
+        result.push_str(after);
+    }
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+
+    // Clean up any remaining orphaned legacy markers anywhere in the file.
+    // These could be left at different positions from past accumulation.
+    let mut cleaned = String::with_capacity(result.len());
+    for line in result.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(LEGACY_MARKER_PREFIX) && trimmed.ends_with("-->") {
+            continue;
+        }
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+
+    // Collapse runs of 3+ blank lines to 2
+    while cleaned.contains("\n\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n\n", "\n\n\n");
+    }
+
+    cleaned
 }
 
 // ── MCP server registration ──

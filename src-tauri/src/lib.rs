@@ -169,6 +169,38 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
                     }
                 }
             }
+            integrations::IntegrationProvider::MiniMax => {
+                let api_key = get_storage().and_then(|s| {
+                    integrations::minimax::load_api_key(s)?
+                        .ok_or_else(|| "MiniMax API key not configured.".to_string())
+                });
+                match api_key {
+                    Ok(key) => match fetcher::fetch_minimax_usage(&key).await {
+                        Ok(mut buckets) => {
+                            display_buckets.extend(buckets.clone());
+                            live_buckets.append(&mut buckets);
+                        }
+                        Err(message) => {
+                            provider_errors.push(UsageProviderError { provider, message });
+                            if let Ok(storage) = get_storage() {
+                                match run_blocking(move || {
+                                    storage.get_latest_usage_buckets(provider)
+                                }) {
+                                    Ok(mut buckets) => display_buckets.append(&mut buckets),
+                                    Err(err) => log::warn!(
+                                        "Failed to load cached usage buckets for {}: {}",
+                                        provider.as_str(),
+                                        err
+                                    ),
+                                }
+                            }
+                        }
+                    },
+                    Err(message) => {
+                        provider_errors.push(UsageProviderError { provider, message });
+                    }
+                }
+            }
         }
     }
 
@@ -362,9 +394,10 @@ async fn get_provider_statuses() -> Result<Vec<ProviderStatus>, String> {
 #[tauri::command]
 async fn confirm_enable_provider(
     provider: integrations::IntegrationProvider,
+    api_key: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<ProviderStatus, String> {
-    run_blocking(move || integrations::confirm_enable(&app, provider))
+    run_blocking(move || integrations::confirm_enable_with_key(&app, provider, api_key))
 }
 
 #[tauri::command]

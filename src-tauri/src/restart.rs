@@ -145,6 +145,7 @@ pub fn resume_dir_for_provider(provider: IntegrationProvider) -> PathBuf {
     let suffix = match provider {
         IntegrationProvider::Claude => "claude-resume",
         IntegrationProvider::Codex => "codex-resume",
+        IntegrationProvider::MiniMax => "minimax-resume",
     };
 
     dirs::cache_dir()
@@ -253,6 +254,7 @@ fn cmdline_matches_provider(cmdline: &str, provider: IntegrationProvider) -> boo
             token_match("claude") || cmdline.contains("@anthropic-ai/claude-code")
         }
         IntegrationProvider::Codex => token_match("codex"),
+        IntegrationProvider::MiniMax => false,
     }
 }
 
@@ -1056,6 +1058,7 @@ fn write_resume_file(
     let cmd = match provider {
         IntegrationProvider::Claude => format!("claude --resume \"{session_id}\""),
         IntegrationProvider::Codex => format!("codex resume \"{session_id}\""),
+        IntegrationProvider::MiniMax => return Ok(()),
     };
     fs::write(&file_path, &cmd).map_err(|e| format!("Failed to write resume file: {e}"))?;
 
@@ -1130,6 +1133,7 @@ fn restart_via_tmux(
     let cmd = match provider {
         IntegrationProvider::Claude => format!("claude --resume \"{session_id}\""),
         IntegrationProvider::Codex => format!("codex resume \"{session_id}\""),
+        IntegrationProvider::MiniMax => return Ok(()),
     };
     let output = Command::new("tmux")
         .args(["send-keys", "-t", target, &cmd, "Enter"])
@@ -1161,6 +1165,7 @@ fn should_wait_for_idle(instance: &RestartInstance) -> bool {
                 || instance.status == InstanceStatus::Unknown
         }
         IntegrationProvider::Codex => false,
+        IntegrationProvider::MiniMax => false,
     }
 }
 
@@ -1444,6 +1449,7 @@ pub async fn install_restart_hooks(provider: Option<IntegrationProvider>) -> Res
                 install_shell_integration()
             }
             IntegrationProvider::Codex => install_shell_integration(),
+            IntegrationProvider::MiniMax => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -1460,6 +1466,7 @@ pub async fn check_restart_hooks_installed(provider: Option<IntegrationProvider>
         match provider.unwrap_or(IntegrationProvider::Claude) {
             IntegrationProvider::Claude => hooks_installed() && shell_integration_installed(),
             IntegrationProvider::Codex => shell_integration_installed(),
+            IntegrationProvider::MiniMax => false,
         }
     }
     #[cfg(not(unix))]

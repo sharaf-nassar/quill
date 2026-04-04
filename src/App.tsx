@@ -319,7 +319,7 @@ function App({ integrations }: AppProps) {
 		refresh();
 		const interval = setInterval(refresh, 3 * 60_000);
 		return () => clearInterval(interval);
-	}, [hasEnabledProvider, providersLoading, refresh]);
+	}, [hasEnabledProvider, liveProviderKey, providersLoading, refresh]);
 
 	const [pendingUpdate, setPendingUpdate] = useState<PendingUpdate | null>(null);
 	const [updating, setUpdating] = useState(false);

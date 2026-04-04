@@ -1,4 +1,3 @@
-<!-- quill-v1.11.0 -->
 ### Session History Search (Quill MCP)
 
 - **Session History Tool**: Use the Quill MCP tools to search past Claude Code session history.

@@ -124,7 +124,7 @@ export interface PendingUpdate {
 
 // Integration provider types
 
-export type IntegrationProvider = "claude" | "codex";
+export type IntegrationProvider = "claude" | "codex" | "mini_max";
 export type ProviderFilter = "all" | IntegrationProvider;
 
 export type ProviderSetupState =

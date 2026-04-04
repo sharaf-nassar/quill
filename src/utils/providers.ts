@@ -1,9 +1,11 @@
 import type { IntegrationProvider, ProviderFilter } from "../types";
 
-const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex"];
+const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
 
 export function providerLabel(provider: IntegrationProvider): string {
-  return provider === "claude" ? "Claude" : "Codex";
+  if (provider === "claude") return "Claude";
+  if (provider === "codex") return "Codex";
+  return "MiniMax";
 }
 
 export function normalizeProviderScope(

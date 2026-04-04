@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+const MINIMAX_USAGE_URL: &str = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
 
 const BUCKET_KEYS: &[(&str, &str)] = &[
     ("five_hour", "5 hours"),
@@ -585,4 +586,126 @@ pub fn fetch_codex_usage() -> Result<(Vec<UsageBucket>, Option<ProviderCredits>)
                 })
         }
     }
+}
+
+// --- MiniMax usage ---
+
+#[derive(Debug, Deserialize)]
+struct MiniMaxBaseResp {
+    status_code: i64,
+    status_msg: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MiniMaxModelRemains {
+    model_name: String,
+    #[serde(default)]
+    current_interval_total_count: i64,
+    #[serde(default)]
+    current_interval_usage_count: i64,
+    #[serde(default)]
+    remains_time: i64,
+    #[serde(default)]
+    current_weekly_total_count: i64,
+    #[serde(default)]
+    current_weekly_usage_count: i64,
+    #[serde(default)]
+    weekly_remains_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MiniMaxUsageResponse {
+    #[serde(default)]
+    model_remains: Vec<MiniMaxModelRemains>,
+    base_resp: MiniMaxBaseResp,
+}
+
+fn minimax_resets_at(remains_ms: i64) -> Option<String> {
+    if remains_ms <= 0 {
+        return None;
+    }
+    let reset_time = Utc::now() + chrono::TimeDelta::milliseconds(remains_ms);
+    Some(reset_time.to_rfc3339())
+}
+
+fn minimax_utilization(total: i64, remaining: i64) -> f64 {
+    if total <= 0 {
+        return 0.0;
+    }
+    let used = total - remaining;
+    (used as f64 / total as f64) * 100.0
+}
+
+fn minimax_model_label(name: &str) -> String {
+    // Shorten "MiniMax-M*" to "M*", keep others as-is
+    name.strip_prefix("MiniMax-").unwrap_or(name).to_string()
+}
+
+pub async fn fetch_minimax_usage(api_key: &str) -> Result<Vec<UsageBucket>, String> {
+    let resp = http_client()
+        .get(MINIMAX_USAGE_URL)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .send()
+        .await
+        .map_err(|e| format!("MiniMax request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("MiniMax API error: {}", resp.status()));
+    }
+
+    let data: MiniMaxUsageResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("MiniMax parse error: {e}"))?;
+
+    if data.base_resp.status_code != 0 {
+        return Err(format!(
+            "MiniMax API error: {} (code {})",
+            data.base_resp.status_msg, data.base_resp.status_code
+        ));
+    }
+
+    let mut buckets = Vec::new();
+
+    for model in &data.model_remains {
+        let has_interval = model.current_interval_total_count > 0;
+        let has_weekly = model.current_weekly_total_count > 0;
+
+        if !has_interval && !has_weekly {
+            continue;
+        }
+
+        let label = minimax_model_label(&model.model_name);
+
+        if has_interval {
+            buckets.push(UsageBucket {
+                provider: IntegrationProvider::MiniMax,
+                key: format!("minimax_{}_5h", model.model_name),
+                label: format!("{label} (5h)"),
+                utilization: minimax_utilization(
+                    model.current_interval_total_count,
+                    model.current_interval_usage_count,
+                ),
+                resets_at: minimax_resets_at(model.remains_time),
+                sort_order: 0,
+            });
+        }
+
+        if has_weekly {
+            buckets.push(UsageBucket {
+                provider: IntegrationProvider::MiniMax,
+                key: format!("minimax_{}_weekly", model.model_name),
+                label: format!("{label} (Weekly)"),
+                utilization: minimax_utilization(
+                    model.current_weekly_total_count,
+                    model.current_weekly_usage_count,
+                ),
+                resets_at: minimax_resets_at(model.weekly_remains_time),
+                sort_order: 1,
+            });
+        }
+    }
+
+    Ok(buckets)
 }

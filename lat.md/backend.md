@@ -133,6 +133,8 @@ The live-usage commands now treat utilization history as `(provider, bucket_key)
 
 Codex live usage now comes from `codex app-server` `account/rateLimits/read` instead of transcript-only scraping. The backend normalizes the returned `rateLimitsByLimitId` map into provider buckets so Quill can store both the base Codex windows and model-specific limits such as Codex Spark in the same usage tables, while preserving the legacy base Codex bucket keys for history continuity. Model-specific `limitName` values are abbreviated for display via [[src-tauri/src/fetcher.rs#abbreviate_codex_model]] (e.g. `GPT-5.3-Codex-Spark` → `5.3-Spark`) by stripping the redundant `GPT-` prefix and `-Codex` infix. The stdio helper ignores unrelated app-server frames such as the `initialize` response and only deserializes the matching request id for the rate-limit call. If the direct app-server request fails, the fetcher falls back to transcript `token_count` `rate_limits`.
 
+MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-tauri/src/fetcher.rs#fetch_minimax_usage]]. It reads the API key from the SQLite settings table and parses the `model_remains` array into 5-hour and weekly `UsageBucket` entries, filtering out models with zero quota.
+
 `get_session_breakdown` now accepts optional provider and limit arguments so Codex live views can request a provider-scoped active set without being crowded out by Claude sessions.
 
 ### Project and Session Management (7)
@@ -141,9 +143,9 @@ Codex live usage now comes from `codex app-server` `account/rateLimits/read` ins
 
 ### Integration Commands (3)
 
-Commands for detecting supported CLI providers and running provider-specific install and uninstall flows.
-Provider setup state is persisted through the settings table using key `integration.providers.v1`
-to survive app restarts.
+Commands for detecting providers and running install/uninstall flows.
+
+Provider setup state is persisted through the settings table using key `integration.providers.v1` to survive app restarts. The `confirm_enable_provider` command accepts an optional `api_key` parameter used by service-only providers like MiniMax.
 
 `get_provider_statuses`, `confirm_enable_provider`, `confirm_disable_provider`.
 
@@ -191,8 +193,8 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 ### Integration Commands (2)
 
 `get_provider_statuses` and `confirm_enable_provider` expose provider detection and enable state.
-Detection runs via `--version` checks and profile directory presence checks for CLI providers.
-Implementation lives in [[src-tauri/src/integrations/mod.rs]].
+
+Detection runs via `--version` checks for CLI providers. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]].
 
 ## Event System
 

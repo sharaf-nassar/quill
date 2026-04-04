@@ -648,6 +648,7 @@ pub fn get_installed_plugins(
     match provider {
         IntegrationProvider::Claude => get_claude_installed_plugins(),
         IntegrationProvider::Codex => get_codex_installed_plugins(),
+        IntegrationProvider::MiniMax => Ok(Vec::new()),
     }
 }
 
@@ -655,6 +656,7 @@ pub fn get_marketplaces(provider: IntegrationProvider) -> Result<Vec<Marketplace
     match provider {
         IntegrationProvider::Claude => get_claude_marketplaces(),
         IntegrationProvider::Codex => get_codex_marketplaces(),
+        IntegrationProvider::MiniMax => Ok(Vec::new()),
     }
 }
 
@@ -708,6 +710,7 @@ pub fn get_available_updates(provider: IntegrationProvider) -> Result<Vec<Plugin
     match provider {
         IntegrationProvider::Claude => get_claude_available_updates(),
         IntegrationProvider::Codex => Ok(Vec::new()),
+        IntegrationProvider::MiniMax => Ok(Vec::new()),
     }
 }
 
@@ -935,6 +938,7 @@ pub fn install_plugin(
                 .ok_or_else(|| "Codex plugin installs require a marketplace path".to_string())?;
             install_codex_plugin(name, path)
         }
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -947,6 +951,7 @@ pub fn remove_plugin(
     match provider {
         IntegrationProvider::Claude => remove_claude_plugin(name, marketplace),
         IntegrationProvider::Codex => remove_codex_plugin(plugin_id),
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -956,6 +961,7 @@ pub fn enable_plugin(provider: IntegrationProvider, name: &str) -> Result<String
         IntegrationProvider::Codex => Err(
             "Codex plugins do not expose a separate enable action through app-server".to_string(),
         ),
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -965,6 +971,7 @@ pub fn disable_plugin(provider: IntegrationProvider, name: &str) -> Result<Strin
         IntegrationProvider::Codex => Err(
             "Codex plugins do not expose a separate disable action through app-server".to_string(),
         ),
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -980,6 +987,7 @@ pub fn update_plugin(
         IntegrationProvider::Codex => Err(
             "Codex plugins do not expose versioned update metadata through app-server".to_string(),
         ),
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -989,6 +997,7 @@ pub fn add_marketplace(provider: IntegrationProvider, repo: &str) -> Result<Stri
         IntegrationProvider::Codex => {
             Err("Codex plugin marketplaces are discovered automatically by app-server".to_string())
         }
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -998,6 +1007,7 @@ pub fn remove_marketplace(provider: IntegrationProvider, name: &str) -> Result<S
         IntegrationProvider::Codex => {
             Err("Codex plugin marketplaces are discovered automatically by app-server".to_string())
         }
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -1008,6 +1018,7 @@ pub fn refresh_marketplace(provider: IntegrationProvider, name: &str) -> Result<
             let _ = name;
             refresh_codex_marketplaces()
         }
+        IntegrationProvider::MiniMax => Err("MiniMax does not support plugins".to_string()),
     }
 }
 
@@ -1046,6 +1057,7 @@ pub fn refresh_all_marketplaces(
                 .collect();
             Ok(results)
         }
+        IntegrationProvider::MiniMax => Ok(Vec::new()),
     }
 }
 
@@ -1067,6 +1079,7 @@ pub fn bulk_update_plugins(updates: &[PluginUpdate], app: &tauri::AppHandle) -> 
         let provider = match update.provider {
             IntegrationProvider::Claude => "Claude",
             IntegrationProvider::Codex => "Codex",
+            IntegrationProvider::MiniMax => "MiniMax",
         };
 
         match update.project_path.as_deref() {

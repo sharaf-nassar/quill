@@ -40,16 +40,18 @@ function formatElapsed(seconds: number): string {
 	return `${m}m ${s}s`;
 }
 
-const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex"];
+const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
 
 function providerHeading(provider: IntegrationProvider): string {
-	return provider === "claude" ? "Claude Code" : "Codex";
+	if (provider === "claude") return "Claude Code";
+	if (provider === "codex") return "Codex";
+	return "MiniMax";
 }
 
 function providerSetupMessage(provider: IntegrationProvider): string {
-	return provider === "claude"
-		? "Claude restart hooks are not installed."
-		: "Codex restart shell integration is not installed.";
+	if (provider === "claude") return "Claude restart hooks are not installed.";
+	if (provider === "codex") return "Codex restart shell integration is not installed.";
+	return "MiniMax restart shell integration is not installed.";
 }
 
 function RestartPanel() {

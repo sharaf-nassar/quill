@@ -107,7 +107,9 @@ All data hooks use Tauri `invoke()` for request-response and `listen()` for push
 
 ### Integration Hook
 
-`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses, listens for `integrations-updated`, tracks per-provider in-flight actions, and drives the inline integrations popover in TitleBar plus blocked-window gating.
+`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses, listens for `integrations-updated`, and tracks per-provider in-flight actions.
+
+It drives the inline integrations popover in TitleBar plus blocked-window gating. The `enableProvider` function accepts an optional `apiKey` argument used by service-only providers like MiniMax.
 
 ### Data Fetching Hooks
 
@@ -197,3 +199,4 @@ Shared formatting and chart helper functions under `src/utils/`.
 | `src/utils/tokens.ts` | `formatTokenCount()` (1.2M, 5.4k display) |
 | `src/utils/time.ts` | `timeAgo()` (ISO string to relative "5m ago") |
 | `src/utils/chartHelpers.ts` | `formatTime()`, `dedupeTickLabels()`, `anchorToNow()`, `getAreaColor()` |
+| `src/utils/providers.ts` | `providerLabel()`, `normalizeProviderScope()`, `providerFilterLabel()`, `providerBadgeClass()` |

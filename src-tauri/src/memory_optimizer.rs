@@ -124,6 +124,7 @@ fn provider_memory_dir(provider: IntegrationProvider, project_path: &str) -> Opt
     match provider {
         IntegrationProvider::Claude => Some(memory_dir(project_path)),
         IntegrationProvider::Codex => None,
+        IntegrationProvider::MiniMax => None,
     }
 }
 
@@ -176,6 +177,7 @@ fn instruction_candidates(
                 "Global Codex instructions".to_string(),
             ),
         ],
+        IntegrationProvider::MiniMax => vec![],
     }
 }
 

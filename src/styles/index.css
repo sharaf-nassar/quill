@@ -315,6 +315,12 @@ body {
   background: rgba(16, 185, 129, 0.12);
 }
 
+.usage-provider-badge--mini_max {
+  color: rgba(251, 191, 36, 0.92);
+  border-color: rgba(251, 191, 36, 0.24);
+  background: rgba(217, 119, 6, 0.12);
+}
+
 .usage-provider-group__meta {
   color: rgba(255, 255, 255, 0.48);
   font-size: calc(9px * var(--s));
@@ -963,6 +969,28 @@ body {
 
 .confirm-dialog-btn--destructive:hover {
   background: rgba(239, 68, 68, 0.2);
+}
+
+.confirm-dialog-input {
+  width: 100%;
+  padding: 8px 10px;
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #e0e0e0;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.confirm-dialog-input:focus {
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.confirm-dialog-input::placeholder {
+  color: rgba(255, 255, 255, 0.3);
 }
 
 .blocked-window {

@@ -123,7 +123,8 @@ Claude integration now has a dedicated adapter shell in
 
 `Task 3A` introduces manifest generation during setup so uninstall can remove only owned artifacts:
 hook entries marked with [[src-tauri/src/claude_setup.rs#HOOK_MARKER]],
-`mcpServers.quill` from `~/.claude.json`, and the `[[src-tauri/src/claude_setup.rs#SECTION_HEADING]]` block in `CLAUDE.md`.
+`mcpServers.quill` from `~/.claude.json`, and the `[[src-tauri/src/claude_setup.rs#BLOCK_START]]`/`[[src-tauri/src/claude_setup.rs#BLOCK_END]]` managed block in `CLAUDE.md`.
+Migration from legacy heading-based detection to block markers happens automatically on first run.
 `confirm_enable_provider` now routes Claude through that adapter install path, and
 [[src-tauri/src/restart.rs#uninstall_claude_restart_assets]] removes Quill-owned restart hooks,
 shell integration lines, and cache files when Claude uninstall runs.
@@ -139,6 +140,7 @@ Files and directories created during first-launch auto-deployment.
 | `~/.claude/commands/` | Custom CLI commands (if applicable) |
 | `~/.claude/settings.json` | Hook registrations (marked with `_source: "quill-setup"`) |
 | `~/.claude.json` | MCP server registration |
+| `~/.claude/CLAUDE.md` | Quill MCP usage instructions injected as a managed block between `<!-- quill-managed:claude:start -->` / `<!-- quill-managed:claude:end -->` markers |
 
 Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching.
 
