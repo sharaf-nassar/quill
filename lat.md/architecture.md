@@ -101,7 +101,9 @@ Quill supports both local single-machine and distributed multi-host setups.
 
 ### Local Setup
 
-On startup, [[src-tauri/src/integrations/manager.rs]] refreshes Claude and Codex provider state for the UI. Provider installers only run after explicit enable confirmation: Claude via [[src-tauri/src/claude_setup.rs]] and Codex via [[src-tauri/src/integrations/codex.rs]].
+On startup, [[src-tauri/src/integrations/manager.rs]] refreshes all provider state for the UI.
+
+CLI providers (Claude, Codex) run installers after explicit enable confirmation: Claude via [[src-tauri/src/claude_setup.rs]] and Codex via [[src-tauri/src/integrations/codex.rs]]. Service-only providers like MiniMax ([[src-tauri/src/integrations/minimax.rs]]) require only an API key, stored in the SQLite settings table.
 
 ### Remote Setup
 

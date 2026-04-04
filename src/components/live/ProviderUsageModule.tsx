@@ -16,7 +16,9 @@ interface ProviderUsageModuleProps {
 }
 
 function providerMeta(provider: IntegrationProvider): string {
-  return provider === "claude" ? "API limits" : "Usage limits";
+  if (provider === "claude") return "API limits";
+  if (provider === "mini_max") return "Subscription";
+  return "Usage limits";
 }
 
 function ProviderUsageModule({

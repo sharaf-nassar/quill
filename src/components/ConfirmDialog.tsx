@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { useEffect } from "react";
 
 interface ConfirmDialogProps {
@@ -8,6 +9,8 @@ interface ConfirmDialogProps {
   cancelLabel?: string;
   destructive?: boolean;
   busy?: boolean;
+  confirmDisabled?: boolean;
+  children?: ReactNode;
   onCancel: () => void;
   onConfirm: () => Promise<void> | void;
 }
@@ -20,6 +23,8 @@ function ConfirmDialog({
   cancelLabel = "Cancel",
   destructive = false,
   busy = false,
+  confirmDisabled = false,
+  children,
   onCancel,
   onConfirm,
 }: ConfirmDialogProps) {
@@ -47,6 +52,7 @@ function ConfirmDialog({
       >
         <h2 className="confirm-dialog-title">{title}</h2>
         <p className="confirm-dialog-description">{description}</p>
+        {children}
         <div className="confirm-dialog-actions">
           <button className="confirm-dialog-btn" onClick={onCancel} disabled={busy}>
             {cancelLabel}
@@ -54,7 +60,7 @@ function ConfirmDialog({
           <button
             className={`confirm-dialog-btn confirm-dialog-btn--confirm${destructive ? " confirm-dialog-btn--destructive" : ""}`}
             onClick={onConfirm}
-            disabled={busy}
+            disabled={busy || confirmDisabled}
           >
             {busy ? "Working..." : confirmLabel}
           </button>

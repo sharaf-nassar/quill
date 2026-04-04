@@ -243,6 +243,7 @@ fn learned_rule_dirs(provider: Option<IntegrationProvider>) -> Vec<PathBuf> {
             push_unique_dir(&mut dirs, codex_dir);
             push_unique_dir(&mut dirs, shared_dir);
         }
+        Some(IntegrationProvider::MiniMax) => {}
         None => {
             push_unique_dir(&mut dirs, claude_dir);
             push_unique_dir(&mut dirs, codex_dir);
@@ -1913,6 +1914,13 @@ impl Storage {
             params![key, value],
         )
         .map_err(|e| format!("Setting write error: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
+            .map_err(|e| format!("Setting delete error: {e}"))?;
         Ok(())
     }
 

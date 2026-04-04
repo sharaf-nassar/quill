@@ -7,6 +7,7 @@ use std::str::FromStr;
 pub enum IntegrationProvider {
     Claude,
     Codex,
+    MiniMax,
 }
 
 #[allow(dead_code)]
@@ -15,6 +16,7 @@ impl IntegrationProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::MiniMax => "mini_max",
         }
     }
 
@@ -26,6 +28,15 @@ impl IntegrationProvider {
         match self {
             Self::Claude => ".claude",
             Self::Codex => ".codex",
+            Self::MiniMax => "",
+        }
+    }
+
+    /// Returns true if this provider requires a local CLI installation.
+    pub fn requires_cli(self) -> bool {
+        match self {
+            Self::Claude | Self::Codex => true,
+            Self::MiniMax => false,
         }
     }
 }
@@ -43,6 +54,7 @@ impl FromStr for IntegrationProvider {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "mini_max" => Ok(Self::MiniMax),
             _ => Err(format!("Unknown integration provider: {value}")),
         }
     }

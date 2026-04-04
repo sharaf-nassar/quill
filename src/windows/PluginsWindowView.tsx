@@ -18,7 +18,9 @@ import type { IntegrationProvider, PluginsTab } from "../types";
 import "../styles/plugins.css";
 
 function providerLabel(provider: IntegrationProvider): string {
-	return provider === "claude" ? "Claude Code" : "Codex";
+	if (provider === "claude") return "Claude Code";
+	if (provider === "codex") return "Codex";
+	return "MiniMax";
 }
 
 function PluginsWindowView() {

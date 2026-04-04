@@ -1286,6 +1286,7 @@ pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl(path),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl(path),
+        IntegrationProvider::MiniMax => extract_claude_messages_from_jsonl(path),
     }
 }
 
@@ -1899,6 +1900,7 @@ fn find_session_path(
 
             Ok(None)
         }
+        IntegrationProvider::MiniMax => Ok(None),
     }
 }
 

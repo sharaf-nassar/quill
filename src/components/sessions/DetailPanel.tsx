@@ -1,5 +1,6 @@
 import DOMPurify from "dompurify";
 import type { SearchHit, SessionContext, SessionCodeStats } from "../../types";
+import { providerLabel } from "../../utils/providers";
 
 interface DetailPanelProps {
 	hit: SearchHit;
@@ -23,7 +24,7 @@ function DetailPanel({ hit, context, locStats }: DetailPanelProps) {
 	const sanitized = DOMPurify.sanitize(hit.snippet, {
 		ALLOWED_TAGS: ["mark"],
 	});
-	const providerLabel = hit.provider === "claude" ? "Claude" : "Codex";
+	const providerLabelText = providerLabel(hit.provider);
 
 	return (
 		<div className="sessions-detail">
@@ -38,7 +39,7 @@ function DetailPanel({ hit, context, locStats }: DetailPanelProps) {
 						{hit.role}
 					</span>
 					<span className={`sessions-provider-badge ${hit.provider}`}>
-						{providerLabel}
+						{providerLabelText}
 					</span>
 					{locStats && (locStats.lines_added > 0 || locStats.lines_removed > 0) && (
 						<span className="sessions-detail-loc">
@@ -53,7 +54,7 @@ function DetailPanel({ hit, context, locStats }: DetailPanelProps) {
 					dangerouslySetInnerHTML={{ __html: sanitized }}
 				/>
 				<div className="sessions-detail-meta">
-					{[providerLabel, hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
+					{[providerLabelText, hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
 						.filter(Boolean)
 						.join(" \u00B7 ")}
 				</div>

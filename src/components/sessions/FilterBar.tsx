@@ -5,6 +5,7 @@ import type {
 	SearchFacets,
 	SortMode,
 } from "../../types";
+import { providerLabel } from "../../utils/providers";
 
 interface FilterBarProps {
 	facets: SearchFacets;
@@ -20,9 +21,6 @@ function FilterBar({ facets, filters, onChange, sortBy, onSortChange }: FilterBa
 	const update = (patch: Partial<SearchFilters>) => {
 		onChange({ ...filters, ...patch });
 	};
-
-	const providerLabel = (provider: IntegrationProvider) =>
-		provider === "claude" ? "Claude Code" : "Codex";
 
 	return (
 		<div className="sessions-filter-bar">

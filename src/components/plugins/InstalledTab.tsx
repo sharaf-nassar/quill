@@ -1,6 +1,7 @@
 import { useState, useMemo, useCallback } from "react";
 import type { InstalledPlugin } from "../../types";
 import { installedPluginInstanceKey } from "../../utils/plugins";
+import { providerLabel } from "../../utils/providers";
 
 function projectName(path: string | null): string {
 	if (!path) return "";
@@ -17,10 +18,6 @@ interface InstalledTabProps {
 		removePlugin: (plugin: InstalledPlugin) => Promise<void>;
 	};
 	onChanged: () => void;
-}
-
-function providerLabel(provider: InstalledPlugin["provider"]): string {
-	return provider === "claude" ? "Claude" : "Codex";
 }
 
 function InstalledTab({ plugins, operations, onChanged }: InstalledTabProps) {

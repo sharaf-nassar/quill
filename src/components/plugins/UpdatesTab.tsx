@@ -6,6 +6,7 @@ import type {
 	UpdateCheckResult,
 } from "../../types";
 import { pluginUpdateInstanceKey } from "../../utils/plugins";
+import { providerLabel } from "../../utils/providers";
 
 function projectName(path: string | null): string {
 	if (!path) return "";
@@ -165,7 +166,7 @@ function UpdatesTab({
 							<div className="plugins-row__info">
 								<div className="plugins-row__header">
 									<span className="plugins-provider-badge">
-										{update.provider === "claude" ? "Claude" : "Codex"}
+										{providerLabel(update.provider)}
 									</span>
 									<span className="plugins-row__name">{update.name}</span>
 									<span className="plugins-row__version">

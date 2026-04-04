@@ -1,5 +1,6 @@
 import DOMPurify from "dompurify";
 import type { SearchHit, SessionCodeStats } from "../../types";
+import { providerLabel } from "../../utils/providers";
 
 interface ResultCardProps {
 	hit: SearchHit;
@@ -24,9 +25,7 @@ function ResultCard({ hit, selected, locStats, onSelect }: ResultCardProps) {
 	const sanitized = DOMPurify.sanitize(hit.snippet, {
 		ALLOWED_TAGS: ["mark"],
 	});
-	const providerLabel = hit.provider === "claude" ? "Claude" : "Codex";
-
-	const meta = [providerLabel, hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
+	const meta = [providerLabel(hit.provider), hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
 		.filter(Boolean)
 		.join(" \u00B7 ");
 
@@ -43,7 +42,7 @@ function ResultCard({ hit, selected, locStats, onSelect }: ResultCardProps) {
 					{hit.role === "user" ? "\u2191" : "\u2193"}
 				</span>
 				<span className={`sessions-provider-badge ${hit.provider}`}>
-					{providerLabel}
+					{providerLabel(hit.provider)}
 				</span>
 				<span
 					className="sessions-result-snippet"

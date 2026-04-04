@@ -33,6 +33,7 @@ fn provider_scope_label(provider_scope: &[IntegrationProvider]) -> String {
         .map(|provider| match provider {
             IntegrationProvider::Claude => "Claude Code",
             IntegrationProvider::Codex => "Codex",
+            IntegrationProvider::MiniMax => "MiniMax",
         })
         .collect();
     match labels.as_slice() {

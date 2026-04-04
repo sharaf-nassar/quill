@@ -14,27 +14,43 @@ interface PendingProviderAction {
 }
 
 function providerLabel(provider: IntegrationProvider): string {
-  return provider === "claude" ? "Claude Code" : "Codex";
+  if (provider === "claude") return "Claude Code";
+  if (provider === "codex") return "Codex";
+  return "MiniMax";
 }
 
 function providerActionCopy(action: PendingProviderAction) {
   const label = providerLabel(action.provider);
   if (action.nextEnabled) {
+    if (action.provider === "mini_max") {
+      return {
+        title: `Enable ${label}?`,
+        description:
+          "Enter your MiniMax API key to track subscription usage. Your key is stored locally and never sent anywhere except the MiniMax API.",
+        confirmLabel: `Enable ${label}`,
+        destructive: false,
+        needsApiKey: true,
+      };
+    }
     return {
       title: `Enable ${label}?`,
       description:
         `Quill will install its ${label} integration assets, including hooks, commands, MCP configuration, and managed instruction blocks.`,
       confirmLabel: `Enable ${label}`,
       destructive: false,
+      needsApiKey: false,
     };
   }
 
   return {
     title: `Disable ${label}?`,
     description:
-      `Quill will remove every ${label} integration asset it installed, including hooks, commands, MCP entries, and managed instruction blocks. Historical Quill data stays in the app.`,
+      action.provider === "mini_max"
+        ? "Quill will remove your stored MiniMax API key and stop tracking subscription usage. Historical data stays in the app."
+        : `Quill will remove every ${label} integration asset it installed, including hooks, commands, MCP entries, and managed instruction blocks. Historical Quill data stays in the app.`,
     confirmLabel: `Disable ${label}`,
     destructive: true,
+    needsApiKey: false,
   };
 }
 
@@ -67,6 +83,7 @@ function TitleBar({
   const [menuOpen, setMenuOpen] = useState(false);
   const [pendingProviderAction, setPendingProviderAction] =
     useState<PendingProviderAction | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState("");
 
   const {
     statuses,
@@ -196,6 +213,7 @@ function TitleBar({
   const handleRequestToggle = useCallback(
     (provider: IntegrationProvider, nextEnabled: boolean) => {
       setPendingProviderAction({ provider, nextEnabled });
+      setApiKeyInput("");
     },
     [],
   );
@@ -208,19 +226,20 @@ function TitleBar({
 
     try {
       if (nextEnabled) {
-        await enableProvider(provider);
+        await enableProvider(provider, provider === "mini_max" ? apiKeyInput : undefined);
       } else {
         await disableProvider(provider);
       }
       setPendingProviderAction(null);
       setMenuOpen(false);
+      setApiKeyInput("");
     } catch (err) {
       toast(
         "error",
         `${nextEnabled ? "Enable" : "Disable"} failed for ${label}: ${String(err)}`,
       );
     }
-  }, [disableProvider, enableProvider, pendingProviderAction, toast]);
+  }, [apiKeyInput, disableProvider, enableProvider, pendingProviderAction, toast]);
 
   const confirmCopy = useMemo(
     () =>
@@ -334,9 +353,24 @@ function TitleBar({
           confirmLabel={confirmCopy.confirmLabel}
           destructive={confirmCopy.destructive}
           busy={busyConfirmProvider}
-          onCancel={() => setPendingProviderAction(null)}
+          confirmDisabled={confirmCopy.needsApiKey && !apiKeyInput.trim()}
+          onCancel={() => {
+            setPendingProviderAction(null);
+            setApiKeyInput("");
+          }}
           onConfirm={handleConfirmProviderAction}
-        />
+        >
+          {confirmCopy.needsApiKey && (
+            <input
+              type="password"
+              className="confirm-dialog-input"
+              placeholder="sk-cp-..."
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              autoFocus
+            />
+          )}
+        </ConfirmDialog>
       )}
       <div className="titlebar-right">
         {pendingUpdate && (

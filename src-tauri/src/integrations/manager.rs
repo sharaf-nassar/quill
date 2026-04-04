@@ -1,4 +1,4 @@
-use super::{claude, codex};
+use super::{claude, codex, minimax};
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::storage::Storage;
 use tauri::{AppHandle, Emitter};
@@ -23,9 +23,18 @@ pub fn request_enable(provider: IntegrationProvider) -> Result<ProviderStatus, S
     Ok(status)
 }
 
+#[allow(dead_code)]
 pub fn confirm_enable(
     app: &AppHandle,
     provider: IntegrationProvider,
+) -> Result<ProviderStatus, String> {
+    confirm_enable_with_key(app, provider, None)
+}
+
+pub fn confirm_enable_with_key(
+    app: &AppHandle,
+    provider: IntegrationProvider,
+    api_key: Option<String>,
 ) -> Result<ProviderStatus, String> {
     let storage = Storage::init()?;
 
@@ -35,6 +44,13 @@ pub fn confirm_enable(
         }
         IntegrationProvider::Codex => {
             codex::install(app)?;
+        }
+        IntegrationProvider::MiniMax => {
+            let key = api_key
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| "API key is required to enable MiniMax.".to_string())?;
+            minimax::save_api_key(&storage, &key)?;
         }
     }
 
@@ -77,6 +93,9 @@ pub fn confirm_disable(
         IntegrationProvider::Codex => {
             codex::uninstall(remove_shared_restart_assets)?;
         }
+        IntegrationProvider::MiniMax => {
+            minimax::delete_api_key(&storage)?;
+        }
     }
 
     let mut statuses = detect_all_with_storage(&storage)?;
@@ -112,17 +131,22 @@ pub fn startup_refresh(app: &AppHandle) -> Result<(), String> {
 }
 
 fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    [IntegrationProvider::Claude, IntegrationProvider::Codex]
-        .into_iter()
-        .map(detect_provider)
-        .collect::<Result<Vec<_>, _>>()
-        .and_then(|detected| merge_saved_statuses(storage, detected))
+    [
+        IntegrationProvider::Claude,
+        IntegrationProvider::Codex,
+        IntegrationProvider::MiniMax,
+    ]
+    .into_iter()
+    .map(detect_provider)
+    .collect::<Result<Vec<_>, _>>()
+    .and_then(|detected| merge_saved_statuses(storage, detected))
 }
 
 fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, String> {
     match provider {
         IntegrationProvider::Claude => claude::detect(),
         IntegrationProvider::Codex => codex::detect(),
+        IntegrationProvider::MiniMax => minimax::detect(),
     }
 }
 

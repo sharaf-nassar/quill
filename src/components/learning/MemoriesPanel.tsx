@@ -5,6 +5,7 @@ import type { ProviderFilter } from "../../types";
 import {
   memoryTypeLabel,
   providerBadgeClass,
+  providerLabel,
   providerScopeClass,
   providerScopeLabel,
 } from "../../utils/providers";
@@ -163,7 +164,7 @@ function MemoryFileCard({ file: mf, expanded, onToggle, onDelete }: MemoryFileCa
         </span>
         <span className="learning-rule-name">{mf.file_name}</span>
         <span className={providerBadgeClass(mf.provider)}>
-          {mf.provider === "claude" ? "Claude" : "Codex"}
+          {providerLabel(mf.provider)}
         </span>
         {mf.memory_type && (
           <span style={typeBadgeStyle(mf.memory_type)}>
@@ -216,7 +217,7 @@ function InstructionFileCard({
         </span>
         <span className="learning-rule-name">{mf.file_name}</span>
         <span className={providerBadgeClass(mf.provider)}>
-          {mf.provider === "claude" ? "Claude" : "Codex"}
+          {providerLabel(mf.provider)}
         </span>
         <span style={typeBadgeStyle(mf.memory_type ?? "reference")}>
           {memoryTypeLabel(mf.memory_type)}
@@ -484,7 +485,7 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
                     {nameFor(projectPath)}
                     {projectProviders.map((provider) => (
                       <span key={`${projectPath}-${provider}`} className={providerBadgeClass(provider)}>
-                        {provider === "claude" ? "Claude" : "Codex"}
+                        {providerLabel(provider)}
                       </span>
                     ))}
                     <span className="learning-section-count">

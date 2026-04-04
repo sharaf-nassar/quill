@@ -579,6 +579,11 @@
   color: #67E8F9;
 }
 
+.learning-provider-badge--mini_max {
+  background: rgba(251, 191, 36, 0.14);
+  color: #FBBF24;
+}
+
 .learning-provider-badge--shared {
   background: rgba(34, 197, 94, 0.14);
   color: #4ADE80;
