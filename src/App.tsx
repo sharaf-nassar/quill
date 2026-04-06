@@ -9,7 +9,7 @@ import UsageDisplay from "./components/UsageDisplay";
 import AnalyticsView from "./components/analytics/AnalyticsView";
 import type { UseIntegrationsResult } from "./hooks/useIntegrations";
 import { useToast } from "./hooks/useToast";
-import type { UsageData, TimeMode, PendingUpdate } from "./types";
+import type { UsageData, TimeMode, LayoutMode, PendingUpdate } from "./types";
 
 const BASE_WIDTH = 260;
 const MIN_LIVE_SCALE = 0.35;
@@ -24,7 +24,10 @@ const SHOW_LIVE_KEY = "quill-show-live";
 const SHOW_ANALYTICS_KEY = "quill-show-analytics";
 const SIZE_PREFIX = "quill-size-";
 const SPLIT_RATIO_KEY = "quill-split-ratio";
+const SPLIT_RATIO_H_KEY = "quill-split-ratio-h";
+const LAYOUT_MODE_KEY = "quill-layout-mode";
 const DEFAULT_SPLIT_RATIO = 0.4;
+const DEFAULT_SPLIT_RATIO_H = 0.5;
 const MIN_SPLIT = 0.15;
 const MAX_SPLIT = 0.85;
 
@@ -80,6 +83,25 @@ function loadSplitRatio(): number {
 	return DEFAULT_SPLIT_RATIO;
 }
 
+function loadSplitRatioH(): number {
+	try {
+		const stored = localStorage.getItem(SPLIT_RATIO_H_KEY);
+		if (stored) {
+			const val = parseFloat(stored);
+			if (val >= MIN_SPLIT && val <= MAX_SPLIT) return val;
+		}
+	} catch { /* ignore */ }
+	return DEFAULT_SPLIT_RATIO_H;
+}
+
+function loadLayoutMode(): LayoutMode {
+	try {
+		const stored = localStorage.getItem(LAYOUT_MODE_KEY);
+		if (stored === "stacked" || stored === "side-by-side") return stored;
+	} catch { /* ignore */ }
+	return "stacked";
+}
+
 function loadTimeMode(): TimeMode {
 	try {
 		const stored = localStorage.getItem(TIME_MODE_KEY);
@@ -101,9 +123,13 @@ function App({ integrations }: AppProps) {
 	const [showLive, setShowLive] = useState(() => loadBool(SHOW_LIVE_KEY, true));
 	const [showAnalytics, setShowAnalytics] = useState(() => loadBool(SHOW_ANALYTICS_KEY, false));
 	const [splitRatio, setSplitRatio] = useState(loadSplitRatio);
+	const [splitRatioH, setSplitRatioH] = useState(loadSplitRatioH);
+	const [layoutMode, setLayoutMode] = useState<LayoutMode>(loadLayoutMode);
 	const liveRef = useRef<HTMLDivElement>(null);
 	const upperRef = useRef<HTMLDivElement>(null);
 	const splitRatioRef = useRef(splitRatio);
+	const splitRatioHRef = useRef(splitRatioH);
+	const layoutModeRef = useRef(layoutMode);
 	const observerRef = useRef<ResizeObserver | null>(null);
 	const showLiveRef = useRef(showLive);
 	const showAnalyticsRef = useRef(showAnalytics);
@@ -189,7 +215,14 @@ function App({ integrations }: AppProps) {
 		try { localStorage.setItem(TIME_MODE_KEY, mode); } catch { /* ignore */ }
 	}, []);
 
+	const handleLayoutModeChange = useCallback((mode: LayoutMode) => {
+		setLayoutMode(mode);
+		layoutModeRef.current = mode;
+		try { localStorage.setItem(LAYOUT_MODE_KEY, mode); } catch { /* ignore */ }
+	}, []);
+
 	const isSplit = showLive && showAnalytics;
+	const isHorizontal = layoutMode === "side-by-side";
 
 	const observeLiveTargets = useCallback((observer: ResizeObserver) => {
 		const liveEl = liveRef.current;
@@ -209,57 +242,71 @@ function App({ integrations }: AppProps) {
 			const liveEl = liveRef.current;
 			const containerEl = upperRef.current;
 			if (!liveEl || !containerEl) return;
+
+			const horizontal = layoutModeRef.current === "side-by-side";
 			const dividerRect = e.currentTarget.getBoundingClientRect();
-			const dragOffset = e.clientY - dividerRect.top;
+			const dragOffset = horizontal
+				? e.clientX - dividerRect.left
+				: e.clientY - dividerRect.top;
 
 			const liveInner = liveEl.querySelector(".usage-display") as HTMLElement | null;
 			const analyticsInner = containerEl.querySelector(".analytics-view") as HTMLElement | null;
+			const freezeProp = horizontal ? "width" : "height";
 			if (liveInner) {
-				liveInner.style.height = `${liveInner.offsetHeight}px`;
+				liveInner.style[freezeProp] = `${horizontal ? liveInner.offsetWidth : liveInner.offsetHeight}px`;
 				liveInner.style.overflow = "hidden";
 				liveInner.style.flex = "none";
 			}
 			if (analyticsInner) {
-				analyticsInner.style.height = `${analyticsInner.offsetHeight}px`;
+				analyticsInner.style[freezeProp] = `${horizontal ? analyticsInner.offsetWidth : analyticsInner.offsetHeight}px`;
 				analyticsInner.style.overflow = "hidden";
 				analyticsInner.style.flex = "none";
 			}
 
 			observerRef.current?.disconnect();
 
-			document.documentElement.classList.add("dragging-divider");
-			(e.currentTarget as HTMLElement).classList.add("active");
+			const dragClass = horizontal ? "dragging-divider-h" : "dragging-divider";
+			document.documentElement.classList.add(dragClass);
+			const dividerEl = e.currentTarget as HTMLElement;
+			dividerEl.classList.add("active");
 
 			let rafId = 0;
 
 			const onMouseMove = (ev: MouseEvent) => {
 				cancelAnimationFrame(rafId);
-				const clientY = ev.clientY;
+				const clientPos = horizontal ? ev.clientX : ev.clientY;
 				rafId = requestAnimationFrame(() => {
 					const rect = containerEl.getBoundingClientRect();
-					const dividerTop = clientY - dragOffset;
+					const origin = horizontal ? rect.left : rect.top;
+					const size = horizontal ? rect.width : rect.height;
+					const dividerPos = clientPos - dragOffset;
 					const ratio = Math.max(
 						MIN_SPLIT,
-						Math.min(MAX_SPLIT, (dividerTop - rect.top) / rect.height),
+						Math.min(MAX_SPLIT, (dividerPos - origin) / size),
 					);
-					splitRatioRef.current = ratio;
+					if (horizontal) {
+						splitRatioHRef.current = ratio;
+					} else {
+						splitRatioRef.current = ratio;
+					}
 					liveEl.style.flex = `0 0 ${ratio * 100}%`;
 				});
 			};
 
 			const onMouseUp = () => {
 				cancelAnimationFrame(rafId);
-				document.documentElement.classList.remove("dragging-divider");
+				document.documentElement.classList.remove(dragClass);
+				dividerEl.classList.remove("active");
 				document.removeEventListener("mousemove", onMouseMove);
 				document.removeEventListener("mouseup", onMouseUp);
 
 				if (liveInner) {
-					liveInner.style.height = "";
+					liveInner.style[freezeProp] = "";
 					liveInner.style.overflow = "";
 					liveInner.style.flex = "";
 				}
 				if (analyticsInner) {
-					analyticsInner.style.height = "";
+					analyticsInner.style[freezeProp] = "";
 					analyticsInner.style.overflow = "";
 					analyticsInner.style.flex = "";
 				}
@@ -268,8 +315,13 @@ function App({ integrations }: AppProps) {
 					observeLiveTargets(observerRef.current);
 				}
 
-				setSplitRatio(splitRatioRef.current);
-				try { localStorage.setItem(SPLIT_RATIO_KEY, String(splitRatioRef.current)); } catch { /* ignore */ }
+				if (horizontal) {
+					setSplitRatioH(splitRatioHRef.current);
+					try { localStorage.setItem(SPLIT_RATIO_H_KEY, String(splitRatioHRef.current)); } catch { /* ignore */ }
+				} else {
+					setSplitRatio(splitRatioRef.current);
+					try { localStorage.setItem(SPLIT_RATIO_KEY, String(splitRatioRef.current)); } catch { /* ignore */ }
+				}
 			};
 
 			document.addEventListener("mousemove", onMouseMove);
@@ -281,19 +333,32 @@ function App({ integrations }: AppProps) {
 	const handleDividerKeyDown = useCallback(
 		(e: React.KeyboardEvent<HTMLDivElement>) => {
 			const step = 0.02;
+			const horizontal = layoutModeRef.current === "side-by-side";
 			let delta = 0;
-			if (e.key === "ArrowUp") delta = -step;
-			else if (e.key === "ArrowDown") delta = step;
-			else return;
+			if (horizontal) {
+				if (e.key === "ArrowLeft") delta = -step;
+				else if (e.key === "ArrowRight") delta = step;
+				else return;
+			} else {
+				if (e.key === "ArrowUp") delta = -step;
+				else if (e.key === "ArrowDown") delta = step;
+				else return;
+			}
 
 			e.preventDefault();
-			const next = Math.max(MIN_SPLIT, Math.min(MAX_SPLIT, splitRatioRef.current + delta));
-			splitRatioRef.current = next;
-			setSplitRatio(next);
+			const ref = horizontal ? splitRatioHRef : splitRatioRef;
+			const next = Math.max(MIN_SPLIT, Math.min(MAX_SPLIT, ref.current + delta));
+			ref.current = next;
+			if (horizontal) {
+				setSplitRatioH(next);
+				try { localStorage.setItem(SPLIT_RATIO_H_KEY, String(next)); } catch { /* ignore */ }
+			} else {
+				setSplitRatio(next);
+				try { localStorage.setItem(SPLIT_RATIO_KEY, String(next)); } catch { /* ignore */ }
+			}
 			if (liveRef.current) {
 				liveRef.current.style.flex = `0 0 ${next * 100}%`;
 			}
-			try { localStorage.setItem(SPLIT_RATIO_KEY, String(next)); } catch { /* ignore */ }
 		},
 		[],
 	);
@@ -444,7 +509,7 @@ function App({ integrations }: AppProps) {
 			observerRef.current = null;
 			cancelAnimationFrame(rafId);
 		};
-	}, [isSplit, splitRatio, timeMode, showLive, usageData, liveProviderKey, observeLiveTargets]);
+	}, [isSplit, splitRatio, splitRatioH, layoutMode, timeMode, showLive, usageData, liveProviderKey, observeLiveTargets]);
 
 	const handleContextMenu = (e: React.MouseEvent) => {
 		e.preventDefault();
@@ -472,7 +537,8 @@ function App({ integrations }: AppProps) {
 		}
 	};
 
-	const liveStyle = isSplit ? { flex: `0 0 ${splitRatio * 100}%` } : undefined;
+	const activeSplitRatio = isHorizontal ? splitRatioH : splitRatio;
+	const liveStyle = isSplit ? { flex: `0 0 ${activeSplitRatio * 100}%` } : undefined;
 	const emptyState = (() => {
 		if (providersError) {
 			return {
@@ -502,6 +568,8 @@ function App({ integrations }: AppProps) {
 				showAnalytics={showAnalytics}
 				onToggleLive={handleToggleLive}
 				onToggleAnalytics={handleToggleAnalytics}
+				layoutMode={layoutMode}
+				onLayoutModeChange={handleLayoutModeChange}
 				onClose={handleClose}
 				pendingUpdate={pendingUpdate}
 				updating={updating}
@@ -509,7 +577,7 @@ function App({ integrations }: AppProps) {
 				integrations={integrations}
 			/>
 			<div
-				className={`panels${isSplit ? " panels--split" : ""}`}
+				className={`panels${isSplit ? " panels--split" : ""}${isSplit && isHorizontal ? " panels--side-by-side" : ""}`}
 				ref={upperRef}
 			>
 				{providersLoading ? (
@@ -551,7 +619,7 @@ function App({ integrations }: AppProps) {
 					<div
 						className="panel-divider"
 						role="separator"
-						aria-orientation="horizontal"
+						aria-orientation={isHorizontal ? "vertical" : "horizontal"}
 						aria-label="Resize panels"
 						tabIndex={0}
 						onMouseDown={handleDividerMouseDown}

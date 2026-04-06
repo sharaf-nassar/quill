@@ -91,6 +91,8 @@ export interface ProjectBreakdown {
   last_active: string;
 }
 
+export type LayoutMode = "stacked" | "side-by-side";
+
 export type TimeMode = "marker" | "dual" | "background";
 
 export type RangeType = "1h" | "24h" | "7d" | "30d";

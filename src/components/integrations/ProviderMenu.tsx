@@ -1,4 +1,4 @@
-import type { IntegrationProvider, ProviderStatus } from "../../types";
+import type { IntegrationProvider, LayoutMode, ProviderStatus } from "../../types";
 
 interface ProviderMenuProps {
   className?: string;
@@ -10,6 +10,8 @@ interface ProviderMenuProps {
     provider: IntegrationProvider,
     nextEnabled: boolean,
   ) => void;
+  layoutMode?: LayoutMode;
+  onLayoutModeChange?: (mode: LayoutMode) => void;
 }
 
 function providerLabel(provider: IntegrationProvider): string {
@@ -72,6 +74,8 @@ function ProviderMenu({
   error,
   inFlightProviders,
   onRequestToggle,
+  layoutMode,
+  onLayoutModeChange,
 }: ProviderMenuProps) {
   return (
     <div
@@ -79,6 +83,38 @@ function ProviderMenu({
       role="menu"
       aria-label="Provider settings"
     >
+      {layoutMode != null && onLayoutModeChange != null && (
+        <>
+          <div className="provider-menu-header">Layout</div>
+          <div className="provider-menu-layout-row">
+            <button
+              className={`layout-toggle-btn${layoutMode === "stacked" ? " layout-toggle-btn--active" : ""}`}
+              onClick={() => onLayoutModeChange("stacked")}
+              aria-pressed={layoutMode === "stacked"}
+              aria-label="Stacked layout"
+              title="Stacked"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="2" y="2" width="12" height="5" rx="1.5" fill="currentColor" />
+                <rect x="2" y="9" width="12" height="5" rx="1.5" fill="currentColor" />
+              </svg>
+            </button>
+            <button
+              className={`layout-toggle-btn${layoutMode === "side-by-side" ? " layout-toggle-btn--active" : ""}`}
+              onClick={() => onLayoutModeChange("side-by-side")}
+              aria-pressed={layoutMode === "side-by-side"}
+              aria-label="Side by side layout"
+              title="Side by side"
+            >
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="1" y="2" width="6" height="12" rx="1.5" fill="currentColor" />
+                <rect x="9" y="2" width="6" height="12" rx="1.5" fill="currentColor" />
+              </svg>
+            </button>
+          </div>
+          <div className="provider-menu-section-divider" />
+        </>
+      )}
       <div className="provider-menu-header">Integrations</div>
       {loading ? (
         <div className="provider-menu-empty">Checking provider status...</div>

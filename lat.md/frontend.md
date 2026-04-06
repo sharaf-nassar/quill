@@ -26,13 +26,13 @@ Seven Tauri windows are routed by the `?view=` URL parameter, each with its own 
 
 [[src/App.tsx]] implements a split-pane layout with a draggable divider separating the [[features#Live Usage View]] and [[features#Analytics Dashboard]].
 
-The split ratio (0.15-0.85) persists in localStorage. The layout supports keyboard-driven resizing, pointer-anchored divider dragging, and window resize events. Usage data refreshes every 3 minutes via `fetch_usage_data()` only while a provider is active. Right-click shows a context menu with Refresh and Quit options, and the main panel swaps to an integration empty state with a provider rescan action when Claude Code and Codex are both inactive.
+The layout supports two orientations controlled by a `LayoutMode` toggle (`"stacked"` or `"side-by-side"`) persisted in localStorage as `quill-layout-mode`. Stacked mode (default) places Live above Analytics with a horizontal divider; side-by-side mode places Live on the left and Analytics on the right with a vertical divider. Each orientation has an independent split ratio (0.15-0.85) persisted separately (`quill-split-ratio` for stacked, `quill-split-ratio-h` for side-by-side). The layout supports keyboard-driven resizing (ArrowUp/Down for stacked, ArrowLeft/Right for side-by-side), pointer-anchored divider dragging, and window resize events. Usage data refreshes every 3 minutes via `fetch_usage_data()` only while a provider is active. Right-click shows a context menu with Refresh and Quit options, and the main panel swaps to an integration empty state with a provider rescan action when Claude Code and Codex are both inactive.
 
 ### Component Tree
 
-The main window nests `TitleBar` at the top, `UsageDisplay` on the left, and `AnalyticsView` on the right.
+The main window nests `TitleBar` at the top, `UsageDisplay` and `AnalyticsView` in the panels area.
 
-`TitleBar` has feature buttons on the left, a centered QUILL trigger with inline integrations popover, and version/close controls on the right. `UsageDisplay` shows live rate limit buckets. `AnalyticsView` renders tabbed analytics.
+`TitleBar` has feature buttons on the left, a centered QUILL trigger with inline integrations popover (including a Layout section with stacked/side-by-side toggle above the Integrations section), and version/close controls on the right. `UsageDisplay` shows live rate limit buckets. `AnalyticsView` renders tabbed analytics. In stacked mode, Live is above Analytics; in side-by-side mode, Live is on the left and Analytics on the right.
 
 ## Components
 
@@ -43,7 +43,7 @@ Components are organized by feature domain under `src/components/`.
 Top-level UI chrome and live rate limit display shared across the main window.
 
 - **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered QUILL trigger that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, and version/close controls on the right. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
-- **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel that shows Claude Code and Codex availability, enabled state, and the next enable or disable action.
+- **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel with a Layout section (stacked/side-by-side toggle) above the Integrations section showing Claude Code, Codex, and MiniMax availability, enabled state, and the next enable or disable action. Layout props are optional for backward compatibility with the legacy `IntegrationsWindowView`.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
 - **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).
 - **UsageDisplay** (`src/components/UsageDisplay.tsx`) — Composes the shared workload summary rail, grouped provider limit sections, the detailed-row time mode selector, and provider-error handling for the main window's live pane.
@@ -165,7 +165,7 @@ Per-window CSS files under `src/styles/`, each scoped to a specific feature doma
 
 | File | Lines | Scope |
 |------|-------|-------|
-| `src/styles/index.css` | 2,026 | Global styles, main window, analytics |
+| `src/styles/index.css` | 3,161 | Global styles, main window, analytics, layout toggle |
 | `src/styles/learning.css` | 810 | Learning window and components |
 | `src/styles/sessions.css` | 475 | Session search window |
 | `src/styles/plugins.css` | 786 | Plugin manager |

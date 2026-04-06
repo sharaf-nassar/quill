@@ -12,6 +12,7 @@ mod models;
 mod plugins;
 mod prompt_utils;
 mod restart;
+mod rule_watcher;
 mod server;
 pub(crate) mod sessions;
 mod storage;
@@ -1250,6 +1251,11 @@ pub fn run() {
                         }
                     }
                 });
+            }
+
+            // Rule filesystem watcher for real-time reconciliation
+            if let Some(storage) = STORAGE.get() {
+                rule_watcher::start(app.handle().clone(), storage);
             }
 
             // Plugin update checker (every 4 hours)
