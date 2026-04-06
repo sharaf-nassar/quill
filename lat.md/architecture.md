@@ -92,7 +92,6 @@ Several background tasks start on app launch in [[src-tauri/src/lib.rs]].
 - **Hourly cleanup**: Aggregates snapshots into hourly tables, prunes old data, compresses observations
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
 - **Plugin update checker**: Polls marketplaces every 4 hours for available updates
-- **Session index scan**: Ingests new JSONL session files on startup
 - **Integration refresh**: Detects Claude and Codex CLI/home state and emits `integrations-updated`
 
 ## Local vs Remote Architecture

@@ -148,7 +148,7 @@ Files and directories created during first-launch auto-deployment.
 | `~/.claude.json` | MCP server registration |
 | `~/.claude/CLAUDE.md` | Quill MCP usage instructions injected as a managed block between `<!-- quill-managed:claude:start -->` / `<!-- quill-managed:claude:end -->` markers |
 
-Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching.
+Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching. Deployed `observe.cjs` and `session-sync.cjs` hooks cap HTTP waits at 500ms for localhost widgets and 2s for remote widget URLs so provider CLIs fail open instead of timing out on Quill stalls.
 
 ## Codex Integration Deployment
 
@@ -167,7 +167,7 @@ Files and config entries created when the Codex provider is enabled. Deployment 
 | `~/.codex/config.toml` | `codex_hooks = true` plus a Quill-managed `mcp_servers.quill` block when no manual entry exists |
 | `~/.codex/AGENTS.md` | Managed Quill session-history guidance block |
 
-Codex uninstall removes only Quill-marked hooks, config blocks, AGENTS blocks, and the provider-owned asset directories.
+Codex uninstall removes only Quill-marked hooks, config blocks, AGENTS blocks, and the provider-owned asset directories. Codex deploys the same bounded-wait observation and session-sync behavior as Claude so a slow local widget cannot hold Codex hooks open until the host kills them.
 
 ## Remote Plugin
 

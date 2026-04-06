@@ -46,6 +46,8 @@ function SessionsWindowView() {
 	const [sortBy, setSortBy] = useState<SortMode>("relevance");
 	const [selectedHit, setSelectedHit] = useState<SearchHit | null>(null);
 	const [context, setContext] = useState<Record<string, SessionContext>>({});
+	const [syncingIndex, setSyncingIndex] = useState(true);
+	const [syncError, setSyncError] = useState<string | null>(null);
 	const [loading, setLoading] = useState(false);
 	const [page, setPage] = useState(0);
 	const [query, setQuery] = useState("");
@@ -56,7 +58,41 @@ function SessionsWindowView() {
 	);
 
 	useEffect(() => {
-		invoke<SearchFacets>("get_search_facets").then(setFacets).catch(() => {});
+		let cancelled = false;
+
+		const syncIndex = async () => {
+			setSyncingIndex(true);
+			setSyncError(null);
+
+			try {
+				await invoke<number>("rebuild_search_index");
+			} catch (error) {
+				if (!cancelled) {
+					setSyncError(String(error));
+				}
+			}
+
+			try {
+				const nextFacets = await invoke<SearchFacets>("get_search_facets");
+				if (!cancelled) {
+					setFacets(nextFacets);
+				}
+			} catch (error) {
+				if (!cancelled) {
+					setSyncError((prev) => prev ?? String(error));
+				}
+			} finally {
+				if (!cancelled) {
+					setSyncingIndex(false);
+				}
+			}
+		};
+
+		void syncIndex();
+
+		return () => {
+			cancelled = true;
+		};
 	}, []);
 
 	const handleSearch = useCallback(
@@ -212,48 +248,59 @@ function SessionsWindowView() {
 			<div className="sessions-split">
 				<div className="sessions-list-panel">
 					<div className="sessions-list-scroll">
-						<SearchBar onSearch={handleSearch} />
-						<FilterBar
-							facets={facets}
-							filters={filters}
-							onChange={handleFiltersChange}
-							sortBy={sortBy}
-							onSortChange={handleSortChange}
-						/>
-						{query.trim() && !loading && (
-							<div className="sessions-results-header">
-								{totalHits} result{totalHits !== 1 ? "s" : ""} in {queryTimeMs}ms
-							</div>
+						{syncingIndex ? (
+							<div className="sessions-loading">Refreshing session index...</div>
+						) : (
+							<>
+								<SearchBar onSearch={handleSearch} />
+								<FilterBar
+									facets={facets}
+									filters={filters}
+									onChange={handleFiltersChange}
+									sortBy={sortBy}
+									onSortChange={handleSortChange}
+								/>
+								{syncError && (
+									<div className="sessions-loading">
+										Session index refresh failed. Results may be stale.
+									</div>
+								)}
+								{query.trim() && !loading && (
+									<div className="sessions-results-header">
+										{totalHits} result{totalHits !== 1 ? "s" : ""} in {queryTimeMs}ms
+									</div>
+								)}
+								{loading && results.length === 0 && (
+									<div className="sessions-loading">Searching...</div>
+								)}
+								{results.map((hit) => (
+									<ResultCard
+										key={hitKey(hit)}
+										hit={hit}
+										selected={
+											selectedHit ? hitKey(selectedHit) === hitKey(hit) : false
+										}
+										locStats={
+											locStatsMap[sessionRefKey({
+												provider: hit.provider,
+												session_id: hit.session_id,
+											})] ?? null
+										}
+										onSelect={() => handleSelect(hit)}
+									/>
+								))}
+								{results.length >= PAGE_SIZE &&
+									results.length < totalHits && (
+										<button
+											className="sessions-load-more"
+											onClick={handleLoadMore}
+											disabled={loading}
+										>
+											{loading ? "Loading..." : "Load more"}
+										</button>
+									)}
+							</>
 						)}
-						{loading && results.length === 0 && (
-							<div className="sessions-loading">Searching...</div>
-						)}
-						{results.map((hit) => (
-							<ResultCard
-								key={hitKey(hit)}
-								hit={hit}
-								selected={
-									selectedHit ? hitKey(selectedHit) === hitKey(hit) : false
-								}
-								locStats={
-									locStatsMap[sessionRefKey({
-										provider: hit.provider,
-										session_id: hit.session_id,
-									})] ?? null
-								}
-								onSelect={() => handleSelect(hit)}
-							/>
-						))}
-						{results.length >= PAGE_SIZE &&
-							results.length < totalHits && (
-								<button
-									className="sessions-load-more"
-									onClick={handleLoadMore}
-									disabled={loading}
-								>
-									{loading ? "Loading..." : "Load more"}
-								</button>
-							)}
 					</div>
 				</div>
 				<div className="sessions-detail-panel">

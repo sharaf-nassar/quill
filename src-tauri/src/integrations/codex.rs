@@ -117,6 +117,7 @@ pub fn verify() -> Result<(), String> {
 fn detect_codex_cli() -> bool {
     Command::new("codex")
         .arg("--version")
+        .env("PATH", crate::config::shell_path())
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)

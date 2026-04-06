@@ -1082,23 +1082,6 @@ pub fn run() {
                         let idx = Arc::new(idx);
                         app.manage(sessions::SessionIndexState(idx.clone()));
 
-                        // Spawn background startup scan
-                        let scan_idx = idx.clone();
-                        let scan_handle = app.handle().clone();
-                        tauri::async_runtime::spawn(async move {
-                            let storage_ref = STORAGE.get();
-                            match tokio::task::block_in_place(|| {
-                                scan_idx.startup_scan(&scan_handle, storage_ref)
-                            }) {
-                                Ok(count) => {
-                                    log::info!("Session index startup scan: {count} messages");
-                                }
-                                Err(e) => {
-                                    log::error!("Session index startup scan failed: {e}");
-                                }
-                            }
-                        });
-
                         Some(idx)
                     }
                     Err(e) => {

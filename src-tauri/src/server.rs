@@ -225,6 +225,169 @@ fn check_rate_limit_with_max(rate_limiter: &Mutex<VecDeque<Instant>>, max: usize
     true
 }
 
+fn store_observation_in_background(storage: &'static Storage, payload: ObservationPayload) {
+    let _task = tokio::task::spawn_blocking(move || {
+        if let Err(err) = storage.store_observation(&payload) {
+            log::error!("Failed to store observation: {err}");
+        }
+    });
+}
+
+fn index_session_notify_in_background(
+    storage: &'static Storage,
+    app_handle: tauri::AppHandle,
+    session_index: Arc<sessions::SessionIndex>,
+    payload: SessionNotifyPayload,
+) {
+    let _task = tokio::task::spawn_blocking(move || {
+        let path = std::path::PathBuf::from(&payload.jsonl_path);
+
+        let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
+        if let Some(git_branch) = payload
+            .git_branch
+            .as_deref()
+            .filter(|branch| !branch.is_empty())
+        {
+            for msg in &mut extracted.messages {
+                if msg.git_branch.is_empty() {
+                    msg.git_branch = git_branch.to_string();
+                }
+            }
+        }
+        if extracted.messages.is_empty() {
+            return;
+        }
+
+        let project_name = payload
+            .project
+            .clone()
+            .filter(|project| !project.is_empty())
+            .or_else(|| extracted.project_name.clone())
+            .or_else(|| {
+                payload.cwd.as_deref().and_then(|cwd| {
+                    std::path::Path::new(cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| name.to_string())
+                })
+            })
+            .or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(sessions::SessionIndex::project_display_name)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        let host = payload
+            .host
+            .clone()
+            .filter(|host| !host.is_empty())
+            .unwrap_or_else(|| "local".to_string());
+        let session_id = if extracted.session_id.is_empty() {
+            payload.session_id.clone()
+        } else {
+            extracted.session_id.clone()
+        };
+
+        let result = (|| -> Result<usize, String> {
+            // Delete existing docs + tool_actions for this session before re-indexing.
+            session_index.delete_session_docs(payload.provider, &session_id)?;
+            if let Err(err) = storage.delete_tool_actions_for_session(payload.provider, &session_id)
+            {
+                log::warn!("Failed to delete old tool_actions: {err}");
+            }
+            if let Err(err) =
+                storage.delete_response_times_for_session(payload.provider, &session_id)
+            {
+                log::warn!("Failed to delete old response_times: {err}");
+            }
+
+            let mut count = 0usize;
+            for msg in &extracted.messages {
+                session_index.index_message(payload.provider, msg, &project_name, &host)?;
+                count += 1;
+            }
+
+            if let Err(err) =
+                storage.store_tool_actions_for_messages(payload.provider, &extracted.messages)
+            {
+                log::warn!("Failed to store tool actions: {err}");
+            }
+
+            let mut writer = session_index.writer.lock();
+            writer
+                .commit()
+                .map_err(|err| format!("Commit index: {err}"))?;
+            Ok(count)
+        })();
+
+        match result {
+            Ok(count) => {
+                let rt_pairs: Vec<(&str, &str)> = extracted
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+                    .collect();
+                if let Err(err) =
+                    storage.ingest_response_times(payload.provider, &session_id, &rt_pairs)
+                {
+                    log::warn!("Failed to store response times: {err}");
+                }
+                let _ = app_handle.emit("sessions-index-updated", count);
+            }
+            Err(err) => {
+                log::error!("Failed to index session notify: {err}");
+            }
+        }
+    });
+}
+
+fn index_session_messages_in_background(
+    storage: &'static Storage,
+    app_handle: tauri::AppHandle,
+    session_index: Arc<sessions::SessionIndex>,
+    payload: SessionMessagesPayload,
+    extracted: Vec<sessions::ExtractedMessage>,
+) {
+    let _task = tokio::task::spawn_blocking(move || {
+        let host = payload.host.clone();
+        let project = payload.project.clone();
+
+        let result = (|| -> Result<usize, String> {
+            let mut count = 0usize;
+            for msg in &extracted {
+                session_index.index_message(payload.provider, msg, &project, &host)?;
+                count += 1;
+            }
+
+            let mut writer = session_index.writer.lock();
+            writer
+                .commit()
+                .map_err(|err| format!("Commit index: {err}"))?;
+            Ok(count)
+        })();
+
+        match result {
+            Ok(count) => {
+                let rt_pairs: Vec<(&str, &str)> = payload
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+                    .collect();
+                if let Err(err) =
+                    storage.ingest_response_times(payload.provider, &payload.session_id, &rt_pairs)
+                {
+                    log::warn!("Failed to store response times: {err}");
+                }
+                let _ = app_handle.emit("sessions-index-updated", count);
+            }
+            Err(err) => {
+                log::error!("Failed to index session messages: {err}");
+            }
+        }
+    });
+}
+
 async fn post_observation(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
@@ -269,16 +432,8 @@ async fn post_observation(
         return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
     }
 
-    match state.storage.store_observation(&payload) {
-        Ok(()) => (StatusCode::OK, "ok".to_string()),
-        Err(e) => {
-            log::error!("Failed to store observation: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-            )
-        }
-    }
+    store_observation_in_background(state.storage, payload);
+    (StatusCode::ACCEPTED, "queued".to_string())
 }
 
 async fn get_observations(
@@ -536,54 +691,6 @@ async fn post_session_notify(
         );
     }
 
-    // Extract messages from the JSONL file
-    let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, path);
-    if let Some(git_branch) = payload
-        .git_branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty())
-    {
-        for msg in &mut extracted.messages {
-            if msg.git_branch.is_empty() {
-                msg.git_branch = git_branch.to_string();
-            }
-        }
-    }
-    if extracted.messages.is_empty() {
-        return (StatusCode::OK, "ok (no messages)".to_string());
-    }
-
-    let project_name = payload
-        .project
-        .clone()
-        .filter(|project| !project.is_empty())
-        .or_else(|| extracted.project_name.clone())
-        .or_else(|| {
-            payload.cwd.as_deref().and_then(|cwd| {
-                std::path::Path::new(cwd)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.to_string())
-            })
-        })
-        .or_else(|| {
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(sessions::SessionIndex::project_display_name)
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let host = payload
-        .host
-        .clone()
-        .filter(|host| !host.is_empty())
-        .unwrap_or_else(|| "local".to_string());
-    let session_id = if extracted.session_id.is_empty() {
-        payload.session_id.clone()
-    } else {
-        extracted.session_id.clone()
-    };
-
     let idx = match &state.session_index {
         Some(idx) => idx.clone(),
         None => {
@@ -593,70 +700,9 @@ async fn post_session_notify(
             );
         }
     };
-    let result = tokio::task::block_in_place(|| -> Result<usize, String> {
-        // Delete existing docs + tool_actions for this session before re-indexing
-        idx.delete_session_docs(payload.provider, &session_id)?;
-        if let Err(e) = state
-            .storage
-            .delete_tool_actions_for_session(payload.provider, &session_id)
-        {
-            log::warn!("Failed to delete old tool_actions: {e}");
-        }
-        if let Err(e) = state
-            .storage
-            .delete_response_times_for_session(payload.provider, &session_id)
-        {
-            log::warn!("Failed to delete old response_times: {e}");
-        }
 
-        let mut count = 0usize;
-        for msg in &extracted.messages {
-            idx.index_message(payload.provider, msg, &project_name, &host)?;
-            // Store tool actions in SQLite for this message
-            if !msg.tool_actions.is_empty()
-                && let Err(e) = state.storage.store_tool_actions(
-                    payload.provider,
-                    &msg.tool_actions,
-                    &msg.uuid,
-                    &msg.session_id,
-                )
-            {
-                log::warn!("Failed to store tool actions: {e}");
-            }
-            count += 1;
-        }
-
-        let mut writer = idx.writer.lock();
-        writer.commit().map_err(|e| format!("Commit index: {e}"))?;
-        Ok(count)
-    });
-
-    match result {
-        Ok(count) => {
-            // Re-index re-processes the whole session, so delete and re-populate response_times
-            let rt_pairs: Vec<(&str, &str)> = extracted
-                .messages
-                .iter()
-                .map(|m| (m.role.as_str(), m.timestamp.as_str()))
-                .collect();
-            if let Err(e) =
-                state
-                    .storage
-                    .ingest_response_times(payload.provider, &session_id, &rt_pairs)
-            {
-                log::warn!("Failed to store response times: {e}");
-            }
-            let _ = state.app_handle.emit("sessions-index-updated", count);
-            (StatusCode::OK, format!("ok ({count} messages indexed)"))
-        }
-        Err(e) => {
-            log::error!("Failed to index session notify: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-            )
-        }
-    }
+    index_session_notify_in_background(state.storage, state.app_handle.clone(), idx, payload);
+    (StatusCode::ACCEPTED, "queued".to_string())
 }
 
 async fn post_session_messages(
@@ -734,45 +780,15 @@ async fn post_session_messages(
             );
         }
     };
-    let host = payload.host.clone();
-    let project = payload.project.clone();
-    let result = tokio::task::block_in_place(|| -> Result<usize, String> {
-        let mut count = 0usize;
-        for msg in &extracted {
-            idx.index_message(payload.provider, msg, &project, &host)?;
-            count += 1;
-        }
 
-        let mut writer = idx.writer.lock();
-        writer.commit().map_err(|e| format!("Commit index: {e}"))?;
-        Ok(count)
-    });
-
-    match result {
-        Ok(count) => {
-            let rt_pairs: Vec<(&str, &str)> = payload
-                .messages
-                .iter()
-                .map(|m| (m.role.as_str(), m.timestamp.as_str()))
-                .collect();
-            if let Err(e) = state.storage.ingest_response_times(
-                payload.provider,
-                &payload.session_id,
-                &rt_pairs,
-            ) {
-                log::warn!("Failed to store response times: {e}");
-            }
-            let _ = state.app_handle.emit("sessions-index-updated", count);
-            (StatusCode::OK, format!("ok ({count} messages indexed)"))
-        }
-        Err(e) => {
-            log::error!("Failed to index session messages: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error".to_string(),
-            )
-        }
-    }
+    index_session_messages_in_background(
+        state.storage,
+        state.app_handle.clone(),
+        idx,
+        payload,
+        extracted,
+    );
+    (StatusCode::ACCEPTED, "queued".to_string())
 }
 
 // --- Session search/context/facets GET endpoints ---

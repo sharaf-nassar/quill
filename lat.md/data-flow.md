@@ -27,7 +27,7 @@ Tool-use observations and git history are analyzed by LLMs to discover reusable 
 
 1. Provider hook script (`observe.cjs`) captures PreToolUse/PostToolUse events
 2. POSTs observation to `POST /api/v1/learning/observations`
-3. Observations stored in `observations` with provider provenance, marked unanalyzed
+3. Server validates and fast-acknowledges the hook request, then stores the observation in `observations` with provider provenance and `analyzed = false`
 4. Trigger fires (on-demand, session-end, or periodic timer) with optional provider scope from the UI or session-end payload
 5. [[src-tauri/src/learning.rs]] spawns async analysis task scoped to Claude, Codex, or both providers
 6. **Stream A**: Fetch up to 100 unanalyzed observations, compress for LLM context
@@ -47,14 +47,15 @@ Observations are compressed for LLM context using [[src-tauri/src/prompt_utils.r
 Session transcripts are indexed for full-text search with enriched metadata, while provider-aware side tables keep tool and latency data distinct.
 
 1. Claude Code writes session JSONL files to `~/.claude/projects/`, and Codex writes rollout transcripts to `~/.codex/sessions/`
-2. On app startup, [[src-tauri/src/sessions.rs]] scans both provider transcript roots incrementally by mtime
+2. When Session Search opens, [[src-tauri/src/sessions.rs]] scans both provider transcript roots incrementally by mtime
 3. Provider hook scripts can also post `POST /api/v1/sessions/notify` with JSONL path plus provider metadata
-4. Or direct message ingestion via `POST /api/v1/sessions/messages`
-5. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details
-6. Indexed into Tantivy with fields: provider, message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
-7. Tool action details and response-time metrics are stored in provider-aware SQLite tables for deep inspection via MCP and analytics
-8. Frontend search queries use TF-IDF weighted scoring with snippet generation
-9. Faceted search pre-aggregates provider, project, and host counts
+4. Or direct message ingestion via `POST /api/v1/sessions/messages`; both routes validate and acknowledge first, then finish extraction and indexing on background workers
+5. Local hook scripts stop their request timer on the first HTTP response from Quill instead of waiting for the full body to drain, so hook latency is tied to enqueue acknowledgement rather than background work
+6. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details
+7. Indexed into Tantivy with fields: provider, message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
+8. Tool action details and response-time metrics are stored in provider-aware SQLite tables for deep inspection via MCP and analytics, with transcript reindexing batching tool-action inserts per file/session
+9. Frontend search queries use TF-IDF weighted scoring with snippet generation
+10. Faceted search pre-aggregates provider, project, and host counts
 
 ### Enrichment
 

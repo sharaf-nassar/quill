@@ -503,18 +503,13 @@ impl SessionIndex {
                 {
                     log::warn!("Failed to index message: {e}");
                 }
+            }
 
-                if !msg.tool_actions.is_empty()
-                    && let Some(storage) = storage
-                    && let Err(e) = storage.store_tool_actions(
-                        discovered.provider,
-                        &msg.tool_actions,
-                        &msg.uuid,
-                        &msg.session_id,
-                    )
-                {
-                    log::warn!("Failed to store tool actions: {e}");
-                }
+            if let Some(storage) = storage
+                && let Err(e) = storage
+                    .store_tool_actions_for_messages(discovered.provider, &extracted.messages)
+            {
+                log::warn!("Failed to store tool actions: {e}");
             }
 
             if let Some(storage) = storage

@@ -191,8 +191,10 @@ fn run_codex_app_server_request<T: DeserializeOwned>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<T, String> {
+    let shell_path = crate::config::shell_path().to_string();
     let mut child = Command::new("codex")
         .args(["app-server", "--enable", "apps", "--listen", "stdio://"])
+        .env("PATH", shell_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -92,7 +92,7 @@ Full-text search across Claude Code and Codex session transcripts, powered by Ta
 
 ### Indexing
 
-Session JSONL files are incrementally indexed on app startup (by file mtime) and via HTTP endpoint. Each message is enriched with code_changes, commands_run, tool_details, files_modified metadata. Stored in a Tantivy index at the app data directory.
+Opening Session Search triggers an mtime-based transcript sync, and hook endpoints can also ingest updates. Indexed messages include code_changes, commands_run, tool_details, and files_modified metadata.
 
 ### Search Interface
 

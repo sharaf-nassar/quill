@@ -8,7 +8,7 @@ It communicates with the frontend through 68 Tauri IPC commands and 11 documente
 
 [[src-tauri/src/lib.rs]] (1,132 lines) is the application entry point. It initializes storage, starts the HTTP server, registers all Tauri commands, sets up the tray icon, and launches [[architecture#Background Tasks]].
 
-Tauri plugins configured: `tauri-plugin-log`, `tauri-plugin-updater`, `tauri-plugin-process`, `tauri-plugin-window-state`.
+Tauri plugins configured: `tauri-plugin-log`, `tauri-plugin-updater`, `tauri-plugin-process`, `tauri-plugin-window-state`. Session transcript catch-up is no longer part of app launch; the Sessions window requests an incremental sync when search is opened.
 
 ## HTTP API Server
 
@@ -50,7 +50,7 @@ The HTTP API exposes 14 endpoints for token ingestion, learning observations, an
 | GET | `/api/v1/sessions/context` | Get surrounding messages |
 | GET | `/api/v1/sessions/facets` | Get search facets |
 
-Each endpoint validates input (length limits, range checks, type validation) before processing. Provider-aware payloads default legacy callers to `claude`, while new Claude and Codex hooks send explicit provider tags for telemetry and session ingestion.
+Each endpoint validates input (length limits, range checks, type validation) before processing. Provider-aware payloads default legacy callers to `claude`, while new Claude and Codex hooks send explicit provider tags for telemetry and session ingestion. Hook-facing observation and session-ingest POSTs acknowledge after validation and finish SQLite/Tantivy work on background blocking tasks so CLI hooks do not wait on local indexing. Local hook scripts treat receipt of response headers as the success boundary and use a short 1.5-second local timeout, which keeps the CLI path tolerant of slow response teardown without waiting on background indexing.
 
 ## Database
 
@@ -97,7 +97,7 @@ Tables for the behavioral learning pipeline: observations, summaries, analysis r
 
 Stores detailed tool invocation and response-time data for MCP-powered session search.
 
-- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output). Indexed on provider/session, message_id, file_path, and category.
+- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output). Indexed on provider/session, message_id, file_path, and category. Startup and notify-driven reindexing batch these inserts per extracted message set so analytics queries do not wait behind one transaction per message.
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs). Unique on (provider, session_id, timestamp).
 
 #### Memory Optimizer
@@ -131,7 +131,7 @@ Key-value configuration and schema migration version tracking.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
 
-Codex live usage now comes from `codex app-server` `account/rateLimits/read` instead of transcript-only scraping. The backend normalizes the returned `rateLimitsByLimitId` map into provider buckets so Quill can store both the base Codex windows and model-specific limits such as Codex Spark in the same usage tables, while preserving the legacy base Codex bucket keys for history continuity. Model-specific `limitName` values are abbreviated for display via [[src-tauri/src/fetcher.rs#abbreviate_codex_model]] (e.g. `GPT-5.3-Codex-Spark` → `5.3-Spark`) by stripping the redundant `GPT-` prefix and `-Codex` infix. The stdio helper ignores unrelated app-server frames such as the `initialize` response and only deserializes the matching request id for the rate-limit call. If the direct app-server request fails, the fetcher falls back to transcript `token_count` `rate_limits`.
+Codex live usage now comes from `codex app-server` `account/rateLimits/read` instead of transcript-only scraping. The backend normalizes the returned `rateLimitsByLimitId` map into provider buckets so Quill can store both the base Codex windows and model-specific limits such as Codex Spark in the same usage tables, while preserving the legacy base Codex bucket keys for history continuity. Model-specific `limitName` values are abbreviated for display via [[src-tauri/src/fetcher.rs#abbreviate_codex_model]] (e.g. `GPT-5.3-Codex-Spark` → `5.3-Spark`) by stripping the redundant `GPT-` prefix and `-Codex` infix. The stdio helper runs with the user's login-shell `PATH` so Node-backed Codex launchers installed under shell-managed toolchains still start from the Tauri app, ignores unrelated app-server frames such as the `initialize` response, and only deserializes the matching request id for the rate-limit call. If the direct app-server request fails, the fetcher falls back to transcript `token_count` `rate_limits`.
 
 MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-tauri/src/fetcher.rs#fetch_minimax_usage]]. It reads the API key from the SQLite settings table and parses the `model_remains` array into 5-hour and weekly `UsageBucket` entries, filtering out models with zero quota.
 
@@ -174,7 +174,7 @@ All plugin commands take a provider argument so the frontend can target Claude o
 
 `get_installed_plugins`, `get_marketplaces`, `get_available_updates`, `check_updates_now`, `install_plugin`, `remove_plugin`, `enable_plugin`, `disable_plugin`, `update_plugin`, `update_all_plugins`, `add_marketplace`, `remove_marketplace`, `refresh_marketplace`, `refresh_all_marketplaces`.
 
-Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git repos. Codex plugin reads and install/remove operations use `codex app-server` JSON-RPC over stdio, while unsupported Codex mutations return provider-specific errors instead of guessing behavior.
+Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git repos. Codex plugin reads and install/remove operations use `codex app-server` JSON-RPC over stdio with the login-shell `PATH`, while unsupported Codex mutations return provider-specific errors instead of guessing behavior.
 
 ### Session Indexing Commands (4)
 
@@ -194,7 +194,7 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 `get_provider_statuses` and `confirm_enable_provider` expose provider detection and enable state.
 
-Detection runs via `--version` checks for CLI providers. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]].
+Detection runs via `--version` checks for CLI providers. CLI probes use the user's login-shell `PATH`, which lets desktop-launched Quill detect Node-backed wrappers like Codex even when the app's inherited `PATH` omits the underlying runtime. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]].
 
 ## Event System
 
@@ -227,7 +227,9 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 ### Indexing Strategy
 
-Startup indexing scans `~/.claude/projects/` and `~/.codex/sessions/**` incrementally by mtime.
+Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
+
+When a transcript is reprocessed, Tantivy documents are still rewritten per message, but SQLite `tool_actions` side-table writes are batched once per extracted file or notify payload. This keeps the shared storage connection available for launch-time analytics instead of monopolizing it with thousands of tiny transactions.
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. TF-IDF scoring plus snippet generation power the shared search UI with provider filters and badges.
 

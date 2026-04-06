@@ -15,6 +15,32 @@ use crate::models::{
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 
+fn insert_tool_actions(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    provider: IntegrationProvider,
+    actions: &[crate::sessions::ToolAction],
+    message_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    for action in actions {
+        stmt.execute(rusqlite::params![
+            provider.as_str(),
+            message_id,
+            session_id,
+            action.tool_name,
+            action.category,
+            action.file_path,
+            action.summary,
+            action.full_input,
+            action.full_output,
+            action.timestamp,
+        ])
+        .map_err(|e| format!("Insert tool_action: {e}"))?;
+    }
+
+    Ok(())
+}
+
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
     let n = alpha + beta;
     if n < 0.01 {
@@ -3336,17 +3362,22 @@ impl Storage {
         Ok(())
     }
 
-    pub fn store_tool_actions(
+    pub fn store_tool_actions_for_messages(
         &self,
         provider: IntegrationProvider,
-        actions: &[crate::sessions::ToolAction],
-        message_id: &str,
-        session_id: &str,
+        messages: &[crate::sessions::ExtractedMessage],
     ) -> Result<(), String> {
+        if !messages
+            .iter()
+            .any(|message| !message.tool_actions.is_empty())
+        {
+            return Ok(());
+        }
+
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
-            .map_err(|e| format!("Begin tool_actions transaction: {e}"))?;
+            .map_err(|e| format!("Begin tool_actions batch transaction: {e}"))?;
 
         {
             let mut stmt = tx
@@ -3354,27 +3385,25 @@ impl Storage {
                     "INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category, file_path, summary, full_input, full_output, timestamp)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
-                .map_err(|e| format!("Prepare store_tool_actions: {e}"))?;
+                .map_err(|e| format!("Prepare store_tool_actions batch: {e}"))?;
 
-            for action in actions {
-                stmt.execute(rusqlite::params![
-                    provider.as_str(),
-                    message_id,
-                    session_id,
-                    action.tool_name,
-                    action.category,
-                    action.file_path,
-                    action.summary,
-                    action.full_input,
-                    action.full_output,
-                    action.timestamp,
-                ])
-                .map_err(|e| format!("Insert tool_action: {e}"))?;
+            for message in messages {
+                if message.tool_actions.is_empty() {
+                    continue;
+                }
+
+                insert_tool_actions(
+                    &mut stmt,
+                    provider,
+                    &message.tool_actions,
+                    &message.uuid,
+                    &message.session_id,
+                )?;
             }
         }
 
         tx.commit()
-            .map_err(|e| format!("Commit tool_actions: {e}"))?;
+            .map_err(|e| format!("Commit tool_actions batch: {e}"))?;
         Ok(())
     }
 
