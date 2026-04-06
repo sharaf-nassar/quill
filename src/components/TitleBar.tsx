@@ -6,7 +6,7 @@ import ConfirmDialog from "./ConfirmDialog";
 import ProviderMenu from "./integrations/ProviderMenu";
 import type { UseIntegrationsResult } from "../hooks/useIntegrations";
 import { useToast } from "../hooks/useToast";
-import type { IntegrationProvider, PendingUpdate } from "../types";
+import type { IntegrationProvider, LayoutMode, PendingUpdate } from "../types";
 
 interface PendingProviderAction {
   provider: IntegrationProvider;
@@ -59,6 +59,8 @@ interface TitleBarProps {
   showAnalytics: boolean;
   onToggleLive: (on: boolean) => void;
   onToggleAnalytics: (on: boolean) => void;
+  layoutMode: LayoutMode;
+  onLayoutModeChange: (mode: LayoutMode) => void;
   onClose: () => void;
   pendingUpdate: PendingUpdate | null;
   updating: boolean;
@@ -71,6 +73,8 @@ function TitleBar({
   showAnalytics,
   onToggleLive,
   onToggleAnalytics,
+  layoutMode,
+  onLayoutModeChange,
   onClose,
   pendingUpdate,
   updating,
@@ -340,6 +344,8 @@ function TitleBar({
                 error={providerError}
                 inFlightProviders={inFlightProviders}
                 onRequestToggle={handleRequestToggle}
+                layoutMode={layoutMode}
+                onLayoutModeChange={onLayoutModeChange}
               />
             </>
           )}
