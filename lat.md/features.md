@@ -74,6 +74,12 @@ Rules are tracked in the `learned_rules` database table with `provider_scope` pr
 
 Rules above the confidence threshold are automatically written to disk. Claude-only rules live under `~/.claude/rules/learned/`, Codex-only rules live under `~/.config/quill/learned-rules/codex/`, and shared rules live under `~/.config/quill/learned-rules/shared/`. Users can manually promote any discovered rule via the UI, writing stored content to the directory implied by its provider scope regardless of confidence.
 
+### Rule Watcher
+
+[[src-tauri/src/rule_watcher.rs]] monitors learned-rule directories for real-time filesystem changes using the `notify` crate.
+
+On Create/Remove/Modify events for `.md` files, a debounced (300ms) reconciliation pass diffs the DB against the filesystem: new files are INSERTed with frontmatter-parsed metadata (`source = 'manual'`), deleted files are soft-suppressed (`beta += 5.0`), and modified files have their `content` and `content_hash` updated via [[src-tauri/src/storage.rs#Storage#reconcile_learned_rules]]. Emits `learning-updated` for instant UI refresh.
+
 ### Rule Promotion
 
 Users can promote discovered rules to active rules via [[src-tauri/src/storage.rs#Storage#promote_learned_rule]].

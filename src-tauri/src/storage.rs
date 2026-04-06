@@ -280,6 +280,37 @@ fn inferred_rule_provider_scope(path: &std::path::Path) -> Vec<IntegrationProvid
     vec![IntegrationProvider::Claude]
 }
 
+#[allow(dead_code)]
+fn parse_rule_frontmatter(content: &str) -> (Option<String>, bool, String) {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return (None, false, content.to_string());
+    }
+    let after_opening = &trimmed[3..];
+    let Some(end_idx) = after_opening.find("\n---") else {
+        return (None, false, content.to_string());
+    };
+    let frontmatter = &after_opening[..end_idx];
+    let body = after_opening[end_idx + 4..]
+        .trim_start_matches('\n')
+        .to_string();
+
+    let mut domain = None;
+    let mut is_anti = false;
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("domain:") {
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                domain = Some(val.to_string());
+            }
+        } else if let Some(val) = line.strip_prefix("anti_pattern:") {
+            is_anti = val.trim().eq_ignore_ascii_case("true");
+        }
+    }
+    (domain, is_anti, body)
+}
+
 fn range_to_duration(range: &str) -> TimeDelta {
     match range {
         "1h" => TimeDelta::hours(1),
@@ -1035,6 +1066,22 @@ impl Storage {
 
             conn.execute("INSERT INTO schema_version (version) VALUES (14)", [])
                 .map_err(|e| format!("Failed to record migration 14: {e}"))?;
+        }
+
+        if current_version < 15 {
+            let has_content_hash: bool = conn
+                .prepare("SELECT content_hash FROM learned_rules LIMIT 0")
+                .is_ok();
+            if !has_content_hash {
+                conn.execute(
+                    "ALTER TABLE learned_rules ADD COLUMN content_hash TEXT DEFAULT NULL;",
+                    [],
+                )
+                .map_err(|e| format!("Migration 15 (content_hash): {e}"))?;
+            }
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (15)", [])
+                .map_err(|e| format!("Failed to record migration 15: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -2970,6 +3017,170 @@ impl Storage {
         .map_err(|e| format!("Update file_path error: {e}"))?;
 
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn update_rule_content_hash(&self, name: &str, hash: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE learned_rules SET content_hash = ?1, updated_at = datetime('now') WHERE name = ?2",
+            params![hash, name],
+        )
+        .map_err(|e| format!("Update content_hash error: {e}"))?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn reconcile_learned_rules(&self) -> Result<bool, String> {
+        use sha2::{Digest, Sha256};
+
+        // Step 1: Scan filesystem
+        let mut fs_rules: std::collections::HashMap<
+            String,
+            (
+                std::path::PathBuf,
+                Vec<crate::integrations::IntegrationProvider>,
+            ),
+        > = std::collections::HashMap::new();
+
+        for rules_dir in learned_rule_dirs(None) {
+            if !rules_dir.exists() {
+                continue;
+            }
+            fn collect_files(dir: &std::path::Path, out: &mut Vec<(String, std::path::PathBuf)>) {
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            collect_files(&path, out);
+                        } else if path.extension().is_some_and(|ext| ext == "md") {
+                            let name = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            out.push((name, path));
+                        }
+                    }
+                }
+            }
+            let mut files = Vec::new();
+            collect_files(&rules_dir, &mut files);
+            for (name, path) in files {
+                fs_rules.entry(name).or_insert_with(|| {
+                    let scope = inferred_rule_provider_scope(&path);
+                    (path, scope)
+                });
+            }
+        }
+
+        // Step 2: Query DB for non-suppressed rules
+        let db_rules: std::collections::HashMap<String, (String, Option<String>, Option<String>)> = {
+            let conn = self.conn.lock();
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT name, file_path, content_hash, provider_scope FROM learned_rules WHERE state != 'suppressed'",
+                )
+                .map_err(|e| format!("Prepare error: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|e| format!("Query error: {e}"))?;
+            let mut map = std::collections::HashMap::new();
+            for row in rows {
+                let (name, file_path, content_hash, _provider_scope) =
+                    row.map_err(|e| format!("Row error: {e}"))?;
+                map.insert(name, (file_path, content_hash, _provider_scope));
+            }
+            map
+        };
+
+        let mut changed = false;
+
+        // Step 3a: Files on disk but not in DB -> INSERT
+        for (name, (path, scope)) in &fs_rules {
+            if db_rules.contains_key(name) {
+                continue;
+            }
+            if !crate::learning::is_safe_rule_name(name) {
+                continue;
+            }
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            let content_str = String::from_utf8_lossy(&bytes);
+            let (domain, is_anti, body) = parse_rule_frontmatter(&content_str);
+            let scope_json =
+                serde_json::to_string(&scope.iter().map(|p| p.to_string()).collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[\"claude\"]".to_string());
+            let file_path_str = path.to_string_lossy();
+
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT OR IGNORE INTO learned_rules (name, domain, alpha, beta_param, observation_count, state, file_path, provider_scope, source, content, content_hash, is_anti_pattern)
+                 VALUES (?1, ?2, 1.0, 1.0, 0, 'emerging', ?3, ?4, 'manual', ?5, ?6, ?7)",
+                params![name, domain, file_path_str.as_ref(), scope_json, body, hash, is_anti as i32],
+            )
+            .map_err(|e| format!("Insert reconciled rule error: {e}"))?;
+            changed = true;
+        }
+
+        // Step 3b: DB rows with file_path but file missing -> soft-suppress
+        for (name, (file_path, _content_hash, _provider_scope)) in &db_rules {
+            if file_path.is_empty() {
+                continue;
+            }
+            if fs_rules.contains_key(name) {
+                continue;
+            }
+            let path = std::path::Path::new(file_path.as_str());
+            if !path.exists() {
+                let conn = self.conn.lock();
+                conn.execute(
+                    "UPDATE learned_rules SET beta_param = beta_param + 5.0, state = 'suppressed', file_path = '', updated_at = datetime('now') WHERE name = ?1",
+                    params![name],
+                )
+                .map_err(|e| format!("Suppress reconciled rule error: {e}"))?;
+                changed = true;
+            }
+        }
+
+        // Step 3c: Both exist, check content hash
+        for (name, (path, _scope)) in &fs_rules {
+            let Some((file_path, existing_hash, _provider_scope)) = db_rules.get(name) else {
+                continue;
+            };
+            if file_path.is_empty() {
+                continue;
+            }
+            let bytes = match std::fs::read(path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            if existing_hash.as_deref() == Some(hash.as_str()) {
+                continue;
+            }
+            let content_str = String::from_utf8_lossy(&bytes);
+            let (_domain, _is_anti, body) = parse_rule_frontmatter(&content_str);
+            let conn = self.conn.lock();
+            conn.execute(
+                "UPDATE learned_rules SET content = ?1, content_hash = ?2, updated_at = datetime('now') WHERE name = ?3",
+                params![body, hash, name],
+            )
+            .map_err(|e| format!("Update reconciled rule content error: {e}"))?;
+            changed = true;
+        }
+
+        Ok(changed)
     }
 
     pub fn get_learning_status(&self) -> Result<LearningStatus, String> {
