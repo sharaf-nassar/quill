@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { useBreakdownData } from "../../hooks/useBreakdownData";
 import { useToast } from "../../hooks/useToast";
 import { formatTokenCount } from "../../utils/tokens";
-import { providerLabel } from "../../utils/providers";
 import type {
   BreakdownMode,
   BreakdownSelection,
@@ -52,6 +51,10 @@ const MODE_LABELS: Record<BreakdownMode, string> = {
 };
 const PAGE_SIZE = 5;
 const CONFIRM_TIMEOUT_MS = 3000;
+
+function providerLabel(provider: SessionRef["provider"]): string {
+  return provider === "claude" ? "Claude" : "Codex";
+}
 
 interface TrashIconProps {
   size?: number;

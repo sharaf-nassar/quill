@@ -28,9 +28,15 @@ Bundle targets: DMG, NSIS, AppImage, DEB. Auto-updater uses GitHub releases endp
 
 GitHub Actions workflow (`.github/workflows/release.yml`) triggers on `v*` tags or manual dispatch.
 
+### Draft Release Pre-Creation
+
+A `create-release` job runs before all builds to create a single draft release. This prevents a race condition where parallel `tauri-action` instances each create their own draft, splitting assets across multiple releases and breaking the updater.
+
 ### Build Matrix
 
-Four parallel builds (fail-fast disabled): Linux (Ubuntu 22.04, AppImage + DEB), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS). Each installs Node.js LTS, Rust stable, and platform-specific system dependencies.
+Four parallel builds (fail-fast disabled), all depending on `create-release` so `tauri-action` finds the existing draft.
+
+Platforms: Linux (Ubuntu 22.04, AppImage + DEB), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS). Each installs Node.js LTS, Rust stable, and platform-specific system dependencies.
 
 ### Version Injection
 
@@ -44,7 +50,7 @@ After build, submits DMG to Apple notary service (35-minute timeout), staples th
 
 ### Release Publishing
 
-A second job (`publish`) waits for all builds, finds the draft release, and renames assets with platform labels (e.g., `Quill_0.3.1_macOS_amd64.dmg`).
+A third job (`publish`) waits for all builds, finds the draft release, and renames assets with platform labels (e.g., `Quill_0.3.1_macOS_amd64.dmg`).
 
 It retries the draft lookup for API eventual consistency, updates `latest.json` for the auto-updater, and publishes the release.
 

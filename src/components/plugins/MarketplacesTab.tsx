@@ -1,6 +1,5 @@
 import { useState, useCallback } from "react";
 import type { Marketplace } from "../../types";
-import { providerLabel } from "../../utils/providers";
 
 function formatLastUpdated(ts: string | null): string {
 	if (!ts) return "Never";
@@ -20,6 +19,10 @@ interface MarketplacesTabProps {
 	onRemove: (name: string) => Promise<void>;
 	onRefresh: (name: string) => Promise<void>;
 	onRefreshAll: () => Promise<void>;
+}
+
+function providerLabel(provider: Marketplace["provider"]): string {
+	return provider === "claude" ? "Claude" : "Codex";
 }
 
 function MarketplacesTab({

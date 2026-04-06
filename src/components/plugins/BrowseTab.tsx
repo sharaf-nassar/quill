@@ -1,6 +1,5 @@
 import { useState, useMemo, useCallback } from "react";
 import type { Marketplace, MarketplacePlugin } from "../../types";
-import { providerLabel } from "../../utils/providers";
 
 interface BrowseTabProps {
 	marketplaces: Marketplace[];
@@ -12,6 +11,10 @@ interface BrowseTabProps {
 		) => Promise<void>;
 	};
 	onChanged: () => void;
+}
+
+function providerLabel(provider: Marketplace["provider"]): string {
+	return provider === "claude" ? "Claude" : "Codex";
 }
 
 function BrowseTab({ marketplaces, operations, onChanged }: BrowseTabProps) {

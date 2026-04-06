@@ -19,6 +19,11 @@ export interface ProviderCredits {
   balance: string | null;
 }
 
+export interface UsageProviderError {
+  provider: IntegrationProvider;
+  message: string;
+}
+
 export interface UsageData {
   buckets: UsageBucket[];
   provider_errors: UsageProviderError[];
@@ -96,6 +101,7 @@ export type LayoutMode = "stacked" | "side-by-side";
 export type TimeMode = "marker" | "dual" | "background";
 
 export type RangeType = "1h" | "24h" | "7d" | "30d";
+export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
 export type TrendType = "up" | "down" | "flat" | "unknown";
 
@@ -176,6 +182,42 @@ export interface SessionCodeStats {
 	lines_added: number;
 	lines_removed: number;
 	net_change: number;
+}
+
+export interface CodexLiveCountSeries {
+  value: number;
+  sparkline: SparklinePoint[];
+  lastActivityAt: string | null;
+}
+
+export interface CodexLiveTokenSeries {
+  value: number;
+  sparkline: SparklinePoint[];
+  lastActivityAt: string | null;
+}
+
+export interface CodexLiveSessionRow {
+  provider: "codex";
+  sessionId: string;
+  hostname: string;
+  project: string | null;
+  firstSeen: string;
+  lastActive: string;
+  tokens: number;
+  turnEstimate: number;
+  linesAdded: number;
+  linesRemoved: number;
+  netChange: number;
+}
+
+export interface CodexLiveData {
+  fetchedAt: string;
+  lastActivityAt: string | null;
+  tokens: CodexLiveTokenSeries;
+  activeSessions: CodexLiveCountSeries;
+  activeProjects: CodexLiveCountSeries;
+  activityPulse: SparklinePoint[];
+  sessions: CodexLiveSessionRow[];
 }
 
 // Learning system types

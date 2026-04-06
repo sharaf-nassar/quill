@@ -7,7 +7,41 @@ on:
   workflow_dispatch:
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          VERSION="${TAG_NAME#v}"
+          # Try creating a new draft release; if tag already has one, find it
+          if gh release create "$TAG_NAME" \
+            --draft \
+            --title "Quill v${VERSION}" \
+            --notes "Download the installer for your platform from the assets below." 2>/dev/null; then
+            echo "Created new draft release"
+          else
+            echo "Draft release already exists"
+          fi
+          RELEASE_ID=$(gh api "repos/${GH_REPO}/releases" \
+            --paginate -q ".[] | select(.tag_name == \"${TAG_NAME}\") | .id" | head -n1)
+          echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+          echo "Draft release ID: ${RELEASE_ID}"
+
   build:
+    needs: create-release
     permissions:
       contents: write
     strategy:
@@ -133,7 +167,7 @@ jobs:
           gh release upload "${{ github.ref_name }}" "$DMG" --clobber
 
   publish:
-    needs: build
+    needs: [create-release, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
