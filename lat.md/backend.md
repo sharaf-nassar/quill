@@ -194,7 +194,7 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 `get_provider_statuses` and `confirm_enable_provider` expose provider detection and enable state.
 
-Detection runs via `--version` checks for CLI providers. CLI probes use the user's login-shell `PATH`, which lets desktop-launched Quill detect Node-backed wrappers like Codex even when the app's inherited `PATH` omits the underlying runtime. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]].
+Detection runs via `--version` checks for CLI providers. Codex probes use the user's login-shell `PATH`, while Claude resolves the executable path from the login shell and common macOS install locations before running `--version`, which avoids false negatives when desktop-launched Quill inherits a stripped PATH. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]], [[src-tauri/src/integrations/claude.rs]], [[src-tauri/src/integrations/codex.rs]], and [[src-tauri/src/config.rs]].
 
 ## Event System
 

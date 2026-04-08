@@ -22,7 +22,7 @@ The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system depe
 
 `src-tauri/tauri.conf.json` defines product name "Quill", identifier `com.quilltoolkit.app`, with a borderless transparent main window (280x340px, min 240x200).
 
-Bundle targets: DMG, NSIS, AppImage, DEB. Auto-updater uses GitHub releases endpoint with minisign public key verification.
+Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage and DEB. Auto-updater uses GitHub releases endpoint with minisign public key verification, and macOS update detection depends on shipping the signed `.app.tar.gz` updater bundle in addition to the DMG installer.
 
 ## CI/CD Pipeline
 
@@ -52,7 +52,7 @@ After build, submits DMG to Apple notary service (35-minute timeout), staples th
 
 A third job (`publish`) waits for all builds, finds the draft release, and renames assets with platform labels (e.g., `Quill_0.3.1_macOS_amd64.dmg`).
 
-It retries the draft lookup for API eventual consistency, updates `latest.json` for the auto-updater, and publishes the release.
+It retries the draft lookup for API eventual consistency, updates `latest.json` for the auto-updater, and publishes the release. The macOS build now verifies that `*.app.tar.gz` plus its `.sig` exist before continuing so the published manifest includes `darwin-*` updater entries instead of DMG-only downloads.
 
 ### Required Secrets
 
@@ -119,6 +119,12 @@ Utility scripts for development, testing, and documentation tasks.
 `scripts/populate_dummy_data.py` seeds the SQLite database with deterministic sample data (seed 42) across all 16 tables.
 
 Checks that Quill is not running before modifying the DB to prevent WAL corruption. Creates a backup before seeding. Populates observations, rules, memory files, tool actions, and writes sample rule files to `~/.claude/rules/learned/`.
+
+### macOS Bootstrap
+
+`scripts/mac.sh` bootstraps a macOS 14+ machine by installing Homebrew with the current official installer, then refreshing Homebrew metadata before installing or upgrading the moving `node` formula and `docker-desktop` cask.
+
+The script exits early on non-macOS hosts and unsupported macOS releases so failures are explicit. It treats Docker as Docker Desktop on macOS because that installs the app/runtime rather than only the standalone `docker` client binary.
 
 ## Claude Integration Deployment
 

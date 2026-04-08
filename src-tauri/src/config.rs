@@ -35,16 +35,81 @@ pub fn claude_user_agent() -> &'static str {
 /// hard-coding bash, since macOS defaults to zsh since Catalina.
 pub fn shell_path() -> &'static str {
     SHELL_PATH.get_or_init(|| {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "bash".into());
-        std::process::Command::new(&shell)
-            .args(["-lc", "echo $PATH"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        capture_login_shell_output(r#"printf '%s\n' "$PATH""#)
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
     })
+}
+
+pub fn resolve_command_path(command: &str) -> Option<PathBuf> {
+    let shell_command = format!("command -v -- {command}");
+    if let Some(path) = capture_login_shell_output(&shell_command) {
+        let candidate = PathBuf::from(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for dir in std::env::split_paths(std::ffi::OsStr::new(shell_path())) {
+        candidates.push(dir.join(command));
+    }
+
+    if cfg!(target_os = "macos") {
+        if let Some(home) = dirs::home_dir() {
+            candidates.push(home.join(".local").join("bin").join(command));
+        }
+        candidates.push(PathBuf::from("/opt/homebrew/bin").join(command));
+        candidates.push(PathBuf::from("/usr/local/bin").join(command));
+    }
+
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn capture_login_shell_output(command: &str) -> Option<String> {
+    for shell in login_shell_candidates() {
+        let Ok(output) = std::process::Command::new(&shell)
+            .args(["-lc", command])
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        let Ok(stdout) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let line = stdout
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        if let Some(line) = line {
+            return Some(line.to_string());
+        }
+    }
+
+    None
+}
+
+fn login_shell_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Ok(shell) = std::env::var("SHELL")
+        && !shell.trim().is_empty()
+    {
+        candidates.push(shell);
+    }
+
+    for fallback in ["/bin/zsh", "/bin/bash", "/bin/sh", "bash"] {
+        if candidates.iter().all(|candidate| candidate != fallback) {
+            candidates.push(fallback.to_string());
+        }
+    }
+
+    candidates
 }
 
 fn credentials_path() -> Option<PathBuf> {

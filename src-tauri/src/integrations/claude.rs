@@ -38,8 +38,13 @@ pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
 }
 
 fn detect_claude_cli() -> bool {
-    Command::new("claude")
+    let Some(claude_path) = crate::config::resolve_command_path("claude") else {
+        return false;
+    };
+
+    Command::new(claude_path)
         .arg("--version")
+        .env("PATH", crate::config::shell_path())
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)

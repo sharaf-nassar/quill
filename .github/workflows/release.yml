@@ -137,6 +137,18 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
+      - name: Verify macOS updater artifacts
+        if: matrix.platform == 'macos-latest'
+        run: |
+          TARGET=$(echo "${{ matrix.args }}" | sed 's/--target //')
+          APP_TAR=$(find "src-tauri/target/${TARGET}/release/bundle/macos" -name "*.app.tar.gz" 2>/dev/null | head -1)
+          APP_SIG=$(find "src-tauri/target/${TARGET}/release/bundle/macos" -name "*.app.tar.gz.sig" 2>/dev/null | head -1)
+          if [ -z "$APP_TAR" ] || [ -z "$APP_SIG" ]; then
+            echo "::error::Missing macOS updater bundle or signature for target ${TARGET}"
+            echo "Expected *.app.tar.gz and *.app.tar.gz.sig in src-tauri/target/${TARGET}/release/bundle/macos"
+            exit 1
+          fi
+
       - name: Notarize macOS DMG
         if: matrix.platform == 'macos-latest'
         timeout-minutes: 35
