@@ -1433,6 +1433,19 @@ impl Storage {
         Ok(buckets)
     }
 
+    pub fn get_latest_usage_snapshot_timestamp(
+        &self,
+        provider: IntegrationProvider,
+    ) -> Result<Option<String>, String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT MAX(timestamp) FROM usage_snapshots WHERE provider = ?1",
+            params![provider.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Query error: {e}"))
+    }
+
     pub fn get_snapshot_count(&self) -> Result<i64, String> {
         let conn = self.conn.lock();
         conn.query_row("SELECT COUNT(*) FROM usage_snapshots", [], |row| row.get(0))

@@ -23,6 +23,12 @@ const BUCKET_KEYS: &[(&str, &str)] = &[
     ("extra_usage", "Extra"),
 ];
 
+#[derive(Debug)]
+pub struct ClaudeUsageError {
+    pub message: String,
+    pub retry_after_seconds: Option<i64>,
+}
+
 async fn do_fetch(token: &str) -> Result<reqwest::Response, reqwest::Error> {
     http_client()
         .get(USAGE_URL)
@@ -33,6 +39,15 @@ async fn do_fetch(token: &str) -> Result<reqwest::Response, reqwest::Error> {
         .header("anthropic-beta", "oauth-2025-04-20")
         .send()
         .await
+}
+
+fn parse_retry_after_seconds(response: &reqwest::Response) -> Option<i64> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0)
 }
 
 fn validate_utilization(val: f64) -> Option<f64> {
@@ -547,29 +562,49 @@ fn fetch_codex_usage_from_sessions() -> Result<Vec<UsageBucket>, String> {
         })
 }
 
-pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, String> {
+pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> {
     let token = match read_access_token() {
         Ok(t) => t,
         Err(e) => {
-            return Err(e);
+            return Err(ClaudeUsageError {
+                message: e,
+                retry_after_seconds: None,
+            });
         }
     };
 
     let resp = match do_fetch(&token).await {
         Ok(r) => r,
         Err(e) => {
-            return Err(format!("Request failed: {e}"));
+            return Err(ClaudeUsageError {
+                message: format!("Request failed: {e}"),
+                retry_after_seconds: None,
+            });
         }
     };
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        Err("Token expired or revoked. Please run: claude /login".into())
+        Err(ClaudeUsageError {
+            message: "Token expired or revoked. Please run: claude /login".into(),
+            retry_after_seconds: None,
+        })
     } else if !resp.status().is_success() {
-        Err(format!("API error: {}", resp.status()))
+        let retry_after_seconds = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            parse_retry_after_seconds(&resp)
+        } else {
+            None
+        };
+        Err(ClaudeUsageError {
+            message: format!("API error: {}", resp.status()),
+            retry_after_seconds,
+        })
     } else {
         match resp.json::<serde_json::Value>().await {
             Ok(data) => Ok(parse_buckets(&data)),
-            Err(e) => Err(format!("Parse error: {e}")),
+            Err(e) => Err(ClaudeUsageError {
+                message: format!("Parse error: {e}"),
+                retry_after_seconds: None,
+            }),
         }
     }
 }

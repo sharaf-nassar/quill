@@ -17,6 +17,7 @@ mod server;
 pub(crate) mod sessions;
 mod storage;
 
+use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
     LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, ProviderStatus,
@@ -35,6 +36,10 @@ use tauri_plugin_updater::UpdaterExt;
 
 static STORAGE: OnceLock<Storage> = OnceLock::new();
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
+const LIVE_USAGE_REFRESH_INTERVAL_SECS: i64 = 3 * 60;
+const CLAUDE_USAGE_LAST_ATTEMPT_KEY: &str = "usage.claude.last_attempt_at";
+const CLAUDE_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.claude.cooldown_until";
+const CLAUDE_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -100,6 +105,56 @@ where
     tokio::task::block_in_place(f)
 }
 
+fn parse_timestamp(value: Option<String>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn load_cached_usage_buckets(
+    provider: integrations::IntegrationProvider,
+) -> Option<Vec<models::UsageBucket>> {
+    let storage = get_storage().ok()?;
+    match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
+        Ok(buckets) if !buckets.is_empty() => Some(buckets),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn latest_usage_snapshot_at(provider: integrations::IntegrationProvider) -> Option<DateTime<Utc>> {
+    let storage = get_storage().ok()?;
+    let timestamp = run_blocking(move || storage.get_latest_usage_snapshot_timestamp(provider))
+        .ok()
+        .flatten()?;
+    parse_timestamp(Some(timestamp))
+}
+
+fn usage_setting_timestamp(key: &'static str) -> Option<DateTime<Utc>> {
+    let storage = get_storage().ok()?;
+    let value = run_blocking(move || storage.get_setting(key))
+        .ok()
+        .flatten()?;
+    parse_timestamp(Some(value))
+}
+
+fn write_usage_setting_timestamp(key: &'static str, value: DateTime<Utc>) {
+    let Ok(storage) = get_storage() else {
+        return;
+    };
+    if let Err(err) = run_blocking(move || storage.set_setting(key, &value.to_rfc3339())) {
+        log::warn!("Failed to persist usage setting {key}: {err}");
+    }
+}
+
+fn clear_usage_setting(key: &'static str) {
+    let Ok(storage) = get_storage() else {
+        return;
+    };
+    if let Err(err) = run_blocking(move || storage.delete_setting(key)) {
+        log::warn!("Failed to clear usage setting {key}: {err}");
+    }
+}
+
 #[tauri::command]
 async fn fetch_usage_data() -> Result<UsageData, String> {
     let statuses = run_blocking(integrations::detect_all)?;
@@ -126,22 +181,59 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
     for provider in enabled_providers {
         match provider {
             integrations::IntegrationProvider::Claude => {
+                let now = Utc::now();
+                let recent_cutoff = now - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
+
+                if latest_usage_snapshot_at(provider)
+                    .is_some_and(|timestamp| timestamp >= recent_cutoff)
+                    && let Some(mut buckets) = load_cached_usage_buckets(provider)
+                {
+                    display_buckets.append(&mut buckets);
+                    continue;
+                }
+
+                if usage_setting_timestamp(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY)
+                    .is_some_and(|timestamp| timestamp > now)
+                {
+                    if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                        display_buckets.append(&mut buckets);
+                    } else {
+                        provider_errors.push(UsageProviderError {
+                            provider,
+                            message: "Claude usage polling is temporarily paused after a recent 429 response."
+                                .to_string(),
+                        });
+                    }
+                    continue;
+                }
+
+                write_usage_setting_timestamp(CLAUDE_USAGE_LAST_ATTEMPT_KEY, now);
+
                 match fetcher::fetch_claude_usage().await {
                     Ok(mut buckets) => {
+                        clear_usage_setting(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY);
                         display_buckets.extend(buckets.clone());
                         live_buckets.append(&mut buckets);
                     }
-                    Err(message) => {
-                        provider_errors.push(UsageProviderError { provider, message });
-                        if let Ok(storage) = get_storage() {
-                            match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
-                                Ok(mut buckets) => display_buckets.append(&mut buckets),
-                                Err(err) => log::warn!(
-                                    "Failed to load cached usage buckets for {}: {}",
-                                    provider.as_str(),
-                                    err
-                                ),
-                            }
+                    Err(error) => {
+                        if let Some(retry_after_seconds) = error.retry_after_seconds {
+                            write_usage_setting_timestamp(
+                                CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
+                                now + TimeDelta::seconds(retry_after_seconds),
+                            );
+                        } else if error.message.contains("429") {
+                            write_usage_setting_timestamp(
+                                CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
+                                now + TimeDelta::seconds(CLAUDE_USAGE_FALLBACK_BACKOFF_SECS),
+                            );
+                        }
+
+                        provider_errors.push(UsageProviderError {
+                            provider,
+                            message: error.message,
+                        });
+                        if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                            display_buckets.append(&mut buckets);
                         }
                     }
                 }
