@@ -121,3 +121,13 @@ The main window polls enabled providers for live rate limit status and stores th
 8. If a provider poll fails, the command loads the last stored buckets for that provider and returns a provider-scoped error alongside the cached rows
 8a. Claude 429 responses also persist a cooldown timestamp in the settings store, and subsequent refreshes honor that cooldown before retrying the live API
 9. Frontend live usage groups rows by provider, while analytics selects one concrete provider bucket for utilization history and stats
+10. `emit_usage_updates()` rebuilds the backend-owned indicator state, emits `indicator-updated`, and lets the tray listener update title text plus `Now`, `Resets`, and `Week` summary rows from the same payload
+## Indicator Preference Pipeline
+
+The status indicator has one backend-owned provider preference shared across the tray and the integrations menu.
+
+1. `useIntegrations()` loads `get_indicator_primary_provider` alongside provider statuses so both the main titlebar menu and the standalone integrations window start from the persisted preference
+2. `ProviderMenu` renders an `Automatic` option plus enabled providers, and preserves a disabled unavailable option when a saved provider is temporarily missing
+3. Changing the selector invokes `set_indicator_primary_provider`, which stores the configured provider in the settings table
+4. The backend recomputes `StatusIndicatorState`, emits `indicator-updated`, and updates the tray summary from that backend-owned payload
+5. `useIntegrations()` listens for `indicator-updated` to keep all mounted selector instances synchronized

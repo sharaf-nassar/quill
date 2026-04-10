@@ -1,4 +1,9 @@
-import type { IntegrationProvider, LayoutMode, ProviderStatus } from "../../types";
+import type {
+  IndicatorPrimaryProvider,
+  IntegrationProvider,
+  LayoutMode,
+  ProviderStatus,
+} from "../../types";
 
 interface ProviderMenuProps {
   className?: string;
@@ -6,10 +11,12 @@ interface ProviderMenuProps {
   loading: boolean;
   error: string | null;
   inFlightProviders: ReadonlySet<IntegrationProvider>;
+  indicatorPrimaryProvider: IndicatorPrimaryProvider;
   onRequestToggle: (
     provider: IntegrationProvider,
     nextEnabled: boolean,
   ) => void;
+  onIndicatorPrimaryProviderChange: (provider: IndicatorPrimaryProvider) => void;
   layoutMode?: LayoutMode;
   onLayoutModeChange?: (mode: LayoutMode) => void;
 }
@@ -33,30 +40,6 @@ function providerBadge(status: ProviderStatus): string {
   return "Available";
 }
 
-function providerSummary(status: ProviderStatus): string {
-  if (status.lastError) {
-    return status.lastError;
-  }
-  if (status.provider === "mini_max") {
-    return status.enabled
-      ? "Subscription usage tracking is active."
-      : "Enable to track your MiniMax subscription usage.";
-  }
-  if (status.enabled) {
-    return "Quill integration is installed and active.";
-  }
-  if (!status.detectedCli && status.detectedHome) {
-    return "Provider files exist locally, but the CLI is not available on PATH.";
-  }
-  if (!status.detectedCli) {
-    return "Install the CLI first, then enable Quill integration here.";
-  }
-  if (!status.detectedHome) {
-    return "CLI detected. Quill will install its managed files when enabled.";
-  }
-  return "Detected and ready. Enable to install Quill hooks, commands, and instructions.";
-}
-
 function actionLabel(status: ProviderStatus): string {
   if (status.enabled) {
     return "Disable";
@@ -73,10 +56,19 @@ function ProviderMenu({
   loading,
   error,
   inFlightProviders,
+  indicatorPrimaryProvider,
   onRequestToggle,
+  onIndicatorPrimaryProviderChange,
   layoutMode,
   onLayoutModeChange,
 }: ProviderMenuProps) {
+  const enabledProviders = statuses
+    .filter((status) => status.enabled)
+    .map((status) => status.provider);
+  const unavailablePreferredProvider =
+    indicatorPrimaryProvider != null &&
+    !enabledProviders.includes(indicatorPrimaryProvider);
+
   return (
     <div
       className={className ? `provider-menu ${className}` : "provider-menu"}
@@ -115,6 +107,41 @@ function ProviderMenu({
           <div className="provider-menu-section-divider" />
         </>
       )}
+      <div className="provider-menu-header">Status</div>
+      <div className="provider-menu-row">
+        <div className="provider-menu-copy">
+          <div className="provider-menu-title-row">
+            <label className="provider-menu-title" htmlFor="indicator-primary-provider">
+              Status provider
+            </label>
+          </div>
+        </div>
+        <select
+          id="indicator-primary-provider"
+          className="provider-menu-action"
+          value={indicatorPrimaryProvider ?? ""}
+          disabled={loading}
+          onChange={(event) =>
+            onIndicatorPrimaryProviderChange(
+              (event.target.value || null) as IndicatorPrimaryProvider,
+            )
+          }
+          aria-label="Status provider"
+        >
+          <option value="">Automatic</option>
+          {unavailablePreferredProvider ? (
+            <option value={indicatorPrimaryProvider ?? ""} disabled>
+              {providerLabel(indicatorPrimaryProvider)} (unavailable)
+            </option>
+          ) : null}
+          {enabledProviders.map((provider) => (
+            <option key={provider} value={provider}>
+              {providerLabel(provider)}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="provider-menu-section-divider" />
       <div className="provider-menu-header">Integrations</div>
       {loading ? (
         <div className="provider-menu-empty">Checking provider status...</div>
@@ -139,9 +166,6 @@ function ProviderMenu({
                     {providerBadge(status)}
                   </span>
                 </div>
-                <p className="provider-menu-description">
-                  {providerSummary(status)}
-                </p>
               </div>
               <button
                 className={`provider-menu-action${status.enabled ? " provider-menu-action--destructive" : ""}`}

@@ -14,6 +14,8 @@ use crate::models::{
 };
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
+#[allow(dead_code)]
+const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
 
 fn insert_tool_actions(
     stmt: &mut rusqlite::CachedStatement<'_>,
@@ -2016,6 +2018,34 @@ impl Storage {
 
     pub fn set_provider_settings_json(&self, value: &str) -> Result<(), String> {
         self.set_setting(PROVIDER_SETTINGS_KEY, value)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_indicator_primary_provider(&self) -> Result<Option<IntegrationProvider>, String> {
+        let Some(raw) = self.get_setting(INDICATOR_PRIMARY_PROVIDER_KEY)? else {
+            return Ok(None);
+        };
+
+        match serde_json::from_str(&raw) {
+            Ok(provider) => Ok(provider),
+            Err(_) => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_indicator_primary_provider(
+        &self,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<(), String> {
+        match provider {
+            Some(provider) => {
+                let encoded = serde_json::to_string(&Some(provider)).map_err(|e| {
+                    format!("Serialize error for indicator.primary_provider.v1: {e}")
+                })?;
+                self.set_setting(INDICATOR_PRIMARY_PROVIDER_KEY, &encoded)
+            }
+            None => self.delete_setting(INDICATOR_PRIMARY_PROVIDER_KEY),
+        }
     }
 
     pub fn delete_host_data(&self, hostname: &str) -> Result<u64, String> {

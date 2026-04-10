@@ -36,6 +36,27 @@ export interface DataPoint {
   utilization: number;
 }
 
+export interface IndicatorMetric {
+  provider: IntegrationProvider;
+  key: string;
+  label: string;
+  modelLabel: string | null;
+  utilization: number;
+  resetsAt: string | null;
+  displayResetTime: string | null;
+}
+
+export interface StatusIndicatorState {
+  configuredPrimaryProvider: IntegrationProvider | null;
+  resolvedPrimaryProvider: IntegrationProvider | null;
+  status: "ready" | "degraded" | "unavailable";
+  titleText: string;
+  warning: string | null;
+  updatedAt: string | null;
+  shortWindow: IndicatorMetric | null;
+  weeklyWindow: IndicatorMetric | null;
+}
+
 export interface TokenDataPoint {
   timestamp: string;
   input_tokens: number;
@@ -133,6 +154,7 @@ export interface PendingUpdate {
 // Integration provider types
 
 export type IntegrationProvider = "claude" | "codex" | "mini_max";
+export type IndicatorPrimaryProvider = IntegrationProvider | null;
 export type ProviderFilter = "all" | IntegrationProvider;
 
 export type ProviderSetupState =

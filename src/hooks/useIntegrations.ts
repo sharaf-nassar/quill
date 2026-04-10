@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { IntegrationProvider, ProviderStatus } from "../types";
+import type {
+  IndicatorPrimaryProvider,
+  IntegrationProvider,
+  ProviderStatus,
+  StatusIndicatorState,
+} from "../types";
 
 const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
 
@@ -26,17 +31,21 @@ function upsertStatus(
 
 export interface UseIntegrationsResult {
   statuses: ProviderStatus[];
+  indicatorPrimaryProvider: IndicatorPrimaryProvider;
   loading: boolean;
   error: string | null;
   inFlightProviders: ReadonlySet<IntegrationProvider>;
   hasEnabledProvider: boolean;
   refresh: () => Promise<void>;
+  saveIndicatorPrimaryProvider: (provider: IndicatorPrimaryProvider) => Promise<void>;
   enableProvider: (provider: IntegrationProvider, apiKey?: string) => Promise<ProviderStatus>;
   disableProvider: (provider: IntegrationProvider) => Promise<ProviderStatus>;
 }
 
 export function useIntegrations(): UseIntegrationsResult {
   const [statuses, setStatuses] = useState<ProviderStatus[]>([]);
+  const [indicatorPrimaryProvider, setIndicatorPrimaryProviderState] =
+    useState<IndicatorPrimaryProvider>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [inFlightProviders, setInFlightProviders] = useState<Set<IntegrationProvider>>(
@@ -46,8 +55,12 @@ export function useIntegrations(): UseIntegrationsResult {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await invoke<ProviderStatus[]>("get_provider_statuses");
-      setStatuses(sortStatuses(data));
+      const [nextStatuses, nextPrimaryProvider] = await Promise.all([
+        invoke<ProviderStatus[]>("get_provider_statuses"),
+        invoke<IndicatorPrimaryProvider>("get_indicator_primary_provider"),
+      ]);
+      setStatuses(sortStatuses(nextStatuses));
+      setIndicatorPrimaryProviderState(nextPrimaryProvider);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -65,6 +78,15 @@ export function useIntegrations(): UseIntegrationsResult {
       setStatuses(sortStatuses(event.payload));
       setLoading(false);
       setError(null);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<StatusIndicatorState>("indicator-updated", (event) => {
+      setIndicatorPrimaryProviderState(event.payload.configuredPrimaryProvider);
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -98,6 +120,21 @@ export function useIntegrations(): UseIntegrationsResult {
     [],
   );
 
+  const saveIndicatorPrimaryProvider = useCallback(
+    async (provider: IndicatorPrimaryProvider) => {
+      try {
+        await invoke("set_indicator_primary_provider", { provider });
+        setIndicatorPrimaryProviderState(provider);
+        setError(null);
+      } catch (e) {
+        const message = String(e);
+        setError(message);
+        throw new Error(message);
+      }
+    },
+    [],
+  );
+
   const enableProvider = useCallback(
     async (provider: IntegrationProvider, apiKey?: string) => {
       return runProviderCommand(provider, "confirm_enable_provider", apiKey ? { apiKey } : undefined);
@@ -119,11 +156,13 @@ export function useIntegrations(): UseIntegrationsResult {
 
   return {
     statuses,
+    indicatorPrimaryProvider,
     loading,
     error,
     inFlightProviders,
     hasEnabledProvider,
     refresh,
+    saveIndicatorPrimaryProvider,
     enableProvider,
     disableProvider,
   };

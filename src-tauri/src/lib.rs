@@ -5,6 +5,7 @@ mod claude_setup;
 mod config;
 mod fetcher;
 mod git_analysis;
+mod indicator;
 mod integrations;
 mod learning;
 mod memory_optimizer;
@@ -22,24 +23,40 @@ use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
     LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, ProviderStatus,
     ResponseTimeStats, SessionBreakdown, SessionCodeStats, SessionEndPayload, SessionRef,
-    SessionStats, TokenDataPoint, TokenStats, ToolCount, UsageData, UsageProviderError,
+    SessionStats, StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, UsageBucket,
+    UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use storage::Storage;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Listener, Manager, PhysicalPosition};
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_updater::UpdaterExt;
 
 static STORAGE: OnceLock<Storage> = OnceLock::new();
+static USAGE_CACHE: OnceLock<Mutex<Option<UsageCacheEntry>>> = OnceLock::new();
+static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static USAGE_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
 const LIVE_USAGE_REFRESH_INTERVAL_SECS: i64 = 3 * 60;
 const CLAUDE_USAGE_LAST_ATTEMPT_KEY: &str = "usage.claude.last_attempt_at";
 const CLAUDE_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.claude.cooldown_until";
 const CLAUDE_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
+const TRAY_ID: &str = "main";
+
+#[derive(Clone, Debug)]
+struct UsageCacheEntry {
+    refreshed_at: DateTime<Utc>,
+    provider_status_key: String,
+    statuses: Vec<ProviderStatus>,
+    usage: UsageData,
+}
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -48,6 +65,56 @@ fn show_main_window(app: &tauri::AppHandle) {
             let _ = w.set_position(pos);
         }
         let _ = w.set_focus();
+    }
+}
+
+fn indicator_now_text(state: &StatusIndicatorState) -> String {
+    let value = state
+        .short_window
+        .as_ref()
+        .map(|metric| format!("{:.0}%", metric.utilization))
+        .unwrap_or_else(|| "--".to_string());
+    format!("Now: {value}")
+}
+
+fn indicator_reset_text(state: &StatusIndicatorState) -> String {
+    let value = state
+        .short_window
+        .as_ref()
+        .and_then(|metric| metric.display_reset_time.as_deref())
+        .unwrap_or("--");
+    format!("Resets: {value}")
+}
+
+fn indicator_week_text(state: &StatusIndicatorState) -> String {
+    let value = state
+        .weekly_window
+        .as_ref()
+        .map(|metric| format!("{:.0}%", metric.utilization))
+        .unwrap_or_else(|| "--".to_string());
+    format!("Week: {value}")
+}
+
+fn update_indicator_tray_summary(
+    app: &tauri::AppHandle,
+    summary_now: &MenuItem<tauri::Wry>,
+    summary_reset: &MenuItem<tauri::Wry>,
+    summary_week: &MenuItem<tauri::Wry>,
+    state: &StatusIndicatorState,
+) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID)
+        && let Err(error) = tray.set_title(Some(state.title_text.clone()))
+    {
+        log::warn!("Failed to update tray title: {error}");
+    }
+    if let Err(error) = summary_now.set_text(indicator_now_text(state)) {
+        log::warn!("Failed to update indicator now summary: {error}");
+    }
+    if let Err(error) = summary_reset.set_text(indicator_reset_text(state)) {
+        log::warn!("Failed to update indicator reset summary: {error}");
+    }
+    if let Err(error) = summary_week.set_text(indicator_week_text(state)) {
+        log::warn!("Failed to update indicator week summary: {error}");
     }
 }
 
@@ -95,6 +162,14 @@ fn get_storage() -> Result<&'static Storage, String> {
     STORAGE
         .get()
         .ok_or_else(|| "Storage not initialized".to_string())
+}
+
+fn usage_cache() -> &'static Mutex<Option<UsageCacheEntry>> {
+    USAGE_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn usage_refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    USAGE_REFRESH_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 fn run_blocking<F, T>(f: F) -> Result<T, String>
@@ -155,172 +230,93 @@ fn clear_usage_setting(key: &'static str) {
     }
 }
 
-#[tauri::command]
-async fn fetch_usage_data() -> Result<UsageData, String> {
-    let statuses = run_blocking(integrations::detect_all)?;
-    let enabled_providers = statuses
-        .into_iter()
+// Only partition the usage cache by provider identity and enabled state.
+// Detection and setup metadata can churn without changing whether a fresh
+// in-memory usage snapshot is still valid to reuse.
+fn provider_status_key(statuses: &[ProviderStatus]) -> String {
+    let mut fields = statuses
+        .iter()
+        .map(|status| format!("{}:{}", status.provider.as_str(), status.enabled))
+        .collect::<Vec<_>>();
+    fields.sort();
+    fields.join("|")
+}
+
+fn current_usage_cache(provider_status_key: &str) -> Option<UsageData> {
+    usage_cache()
+        .lock()
+        .as_ref()
+        .filter(|entry| entry.provider_status_key == provider_status_key)
+        .map(|entry| entry.usage.clone())
+}
+
+fn current_usage_context() -> Option<(Vec<ProviderStatus>, UsageData)> {
+    usage_cache()
+        .lock()
+        .as_ref()
+        .map(|entry| (entry.statuses.clone(), entry.usage.clone()))
+}
+
+fn current_recent_usage_cache(provider_status_key: &str) -> Option<UsageData> {
+    let recent_cutoff = Utc::now() - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
+    usage_cache()
+        .lock()
+        .as_ref()
+        .filter(|entry| entry.provider_status_key == provider_status_key)
+        .and_then(|entry| (entry.refreshed_at >= recent_cutoff).then(|| entry.usage.clone()))
+}
+
+fn store_usage_cache(
+    usage: UsageData,
+    provider_status_key: &str,
+    statuses: &[ProviderStatus],
+) -> UsageData {
+    *usage_cache().lock() = Some(UsageCacheEntry {
+        refreshed_at: Utc::now(),
+        provider_status_key: provider_status_key.to_string(),
+        statuses: statuses.to_vec(),
+        usage: usage.clone(),
+    });
+    usage
+}
+
+async fn clear_usage_cache() {
+    let _refresh_guard = usage_refresh_lock().lock().await;
+    USAGE_CACHE_EPOCH.fetch_add(1, AtomicOrdering::SeqCst);
+    *usage_cache().lock() = None;
+}
+
+fn enabled_providers(statuses: &[ProviderStatus]) -> Vec<integrations::IntegrationProvider> {
+    statuses
+        .iter()
         .filter(|status| status.enabled)
         .map(|status| status.provider)
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    if enabled_providers.is_empty() {
-        return Ok(UsageData {
-            buckets: Vec::new(),
-            provider_errors: Vec::new(),
-            provider_credits: Vec::new(),
-            error: Some("No providers are enabled.".to_string()),
-        });
-    }
-
-    let mut live_buckets = Vec::new();
-    let mut display_buckets = Vec::new();
-    let mut provider_errors = Vec::new();
-    let mut provider_credits = Vec::new();
-
-    for provider in enabled_providers {
-        match provider {
-            integrations::IntegrationProvider::Claude => {
-                let now = Utc::now();
-                let recent_cutoff = now - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
-
-                if latest_usage_snapshot_at(provider)
-                    .is_some_and(|timestamp| timestamp >= recent_cutoff)
-                    && let Some(mut buckets) = load_cached_usage_buckets(provider)
-                {
-                    display_buckets.append(&mut buckets);
-                    continue;
-                }
-
-                if usage_setting_timestamp(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY)
-                    .is_some_and(|timestamp| timestamp > now)
-                {
-                    if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                        display_buckets.append(&mut buckets);
-                    } else {
-                        provider_errors.push(UsageProviderError {
-                            provider,
-                            message: "Claude usage polling is temporarily paused after a recent 429 response."
-                                .to_string(),
-                        });
-                    }
-                    continue;
-                }
-
-                write_usage_setting_timestamp(CLAUDE_USAGE_LAST_ATTEMPT_KEY, now);
-
-                match fetcher::fetch_claude_usage().await {
-                    Ok(mut buckets) => {
-                        clear_usage_setting(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY);
-                        display_buckets.extend(buckets.clone());
-                        live_buckets.append(&mut buckets);
-                    }
-                    Err(error) => {
-                        if let Some(retry_after_seconds) = error.retry_after_seconds {
-                            write_usage_setting_timestamp(
-                                CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
-                                now + TimeDelta::seconds(retry_after_seconds),
-                            );
-                        } else if error.message.contains("429") {
-                            write_usage_setting_timestamp(
-                                CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
-                                now + TimeDelta::seconds(CLAUDE_USAGE_FALLBACK_BACKOFF_SECS),
-                            );
-                        }
-
-                        provider_errors.push(UsageProviderError {
-                            provider,
-                            message: error.message,
-                        });
-                        if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                            display_buckets.append(&mut buckets);
-                        }
-                    }
-                }
-            }
-            integrations::IntegrationProvider::Codex => {
-                match run_blocking(fetcher::fetch_codex_usage) {
-                    Ok((mut buckets, credits)) => {
-                        display_buckets.extend(buckets.clone());
-                        live_buckets.append(&mut buckets);
-                        if let Some(c) = credits {
-                            provider_credits.push(c);
-                        }
-                    }
-                    Err(message) => {
-                        provider_errors.push(UsageProviderError { provider, message });
-                        if let Ok(storage) = get_storage() {
-                            match run_blocking(move || storage.get_latest_usage_buckets(provider)) {
-                                Ok(mut buckets) => display_buckets.append(&mut buckets),
-                                Err(err) => log::warn!(
-                                    "Failed to load cached usage buckets for {}: {}",
-                                    provider.as_str(),
-                                    err
-                                ),
-                            }
-                        }
-                    }
-                }
-            }
-            integrations::IntegrationProvider::MiniMax => {
-                let api_key = get_storage().and_then(|s| {
-                    integrations::minimax::load_api_key(s)?
-                        .ok_or_else(|| "MiniMax API key not configured.".to_string())
-                });
-                match api_key {
-                    Ok(key) => match fetcher::fetch_minimax_usage(&key).await {
-                        Ok(mut buckets) => {
-                            display_buckets.extend(buckets.clone());
-                            live_buckets.append(&mut buckets);
-                        }
-                        Err(message) => {
-                            provider_errors.push(UsageProviderError { provider, message });
-                            if let Ok(storage) = get_storage() {
-                                match run_blocking(move || {
-                                    storage.get_latest_usage_buckets(provider)
-                                }) {
-                                    Ok(mut buckets) => display_buckets.append(&mut buckets),
-                                    Err(err) => log::warn!(
-                                        "Failed to load cached usage buckets for {}: {}",
-                                        provider.as_str(),
-                                        err
-                                    ),
-                                }
-                            }
-                        }
-                    },
-                    Err(message) => {
-                        provider_errors.push(UsageProviderError { provider, message });
-                    }
-                }
-            }
-        }
-    }
-
-    if !live_buckets.is_empty()
-        && let Ok(storage) = get_storage()
-    {
-        let buckets = live_buckets.clone();
-        if let Err(e) = run_blocking(move || storage.store_snapshot(&buckets)) {
-            log::warn!("Failed to store snapshot: {e}");
-        }
-    }
-
-    display_buckets.sort_by(|left, right| {
+fn sort_and_dedup_usage_buckets(buckets: &mut Vec<UsageBucket>) {
+    buckets.sort_by(|left, right| {
         left.provider
             .as_str()
             .cmp(right.provider.as_str())
             .then_with(|| left.sort_order.cmp(&right.sort_order))
             .then_with(|| left.label.cmp(&right.label))
     });
-    display_buckets.dedup_by(|left, right| {
+    buckets.dedup_by(|left, right| {
         left.provider == right.provider
             && left.key == right.key
             && left.utilization == right.utilization
             && left.resets_at == right.resets_at
     });
+}
 
-    let error = if display_buckets.is_empty() {
+fn build_usage_data(
+    mut buckets: Vec<UsageBucket>,
+    provider_errors: Vec<UsageProviderError>,
+    provider_credits: Vec<models::ProviderCredits>,
+) -> UsageData {
+    sort_and_dedup_usage_buckets(&mut buckets);
+    let error = if buckets.is_empty() {
         provider_errors
             .first()
             .map(|provider_error| provider_error.message.clone())
@@ -329,12 +325,305 @@ async fn fetch_usage_data() -> Result<UsageData, String> {
         None
     };
 
-    Ok(UsageData {
-        buckets: display_buckets,
+    UsageData {
+        buckets,
         provider_errors,
         provider_credits,
         error,
-    })
+    }
+}
+
+fn load_cached_usage_data(statuses: &[ProviderStatus]) -> UsageData {
+    let enabled_providers = enabled_providers(statuses);
+    if enabled_providers.is_empty() {
+        return UsageData {
+            buckets: Vec::new(),
+            provider_errors: Vec::new(),
+            provider_credits: Vec::new(),
+            error: Some("No providers are enabled.".to_string()),
+        };
+    }
+
+    let mut buckets = Vec::new();
+    for provider in enabled_providers {
+        if let Some(mut provider_buckets) = load_cached_usage_buckets(provider) {
+            buckets.append(&mut provider_buckets);
+        }
+    }
+
+    build_usage_data(buckets, Vec::new(), Vec::new())
+}
+
+fn build_indicator_state(
+    statuses: &[ProviderStatus],
+    usage: &UsageData,
+) -> Result<StatusIndicatorState, String> {
+    let storage = get_storage()?;
+    let configured_provider = run_blocking(move || storage.get_indicator_primary_provider())?;
+    let mut state = indicator::resolve_indicator_state(configured_provider, statuses, usage);
+    state.updated_at = state
+        .resolved_primary_provider
+        .and_then(latest_usage_snapshot_at)
+        .map(|timestamp| timestamp.to_rfc3339());
+    Ok(state)
+}
+
+fn current_indicator_state(statuses: &[ProviderStatus]) -> Result<StatusIndicatorState, String> {
+    let status_key = provider_status_key(statuses);
+    let usage =
+        current_usage_cache(&status_key).unwrap_or_else(|| load_cached_usage_data(statuses));
+    build_indicator_state(statuses, &usage)
+}
+
+fn emit_usage_updates(
+    app: &tauri::AppHandle,
+    statuses: &[ProviderStatus],
+    usage: &UsageData,
+) -> Result<(), String> {
+    let indicator_state = build_indicator_state(statuses, usage)?;
+    let _ = app.emit("usage-updated", ());
+    let _ = app.emit(indicator::INDICATOR_UPDATED_EVENT, indicator_state);
+    Ok(())
+}
+
+async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData, String> {
+    let _refresh_guard = usage_refresh_lock().lock().await;
+
+    loop {
+        let statuses = run_blocking(integrations::detect_all)?;
+        let status_key = provider_status_key(&statuses);
+
+        if let Some(usage) = current_recent_usage_cache(&status_key) {
+            return Ok(usage);
+        }
+
+        let refresh_epoch = USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst);
+        let enabled_providers = enabled_providers(&statuses);
+
+        if enabled_providers.is_empty() {
+            let usage = UsageData {
+                buckets: Vec::new(),
+                provider_errors: Vec::new(),
+                provider_credits: Vec::new(),
+                error: Some("No providers are enabled.".to_string()),
+            };
+
+            if USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst) != refresh_epoch {
+                continue;
+            }
+
+            let usage = store_usage_cache(usage, &status_key, &statuses);
+
+            if let Some(app) = app {
+                emit_usage_updates(app, &statuses, &usage)?;
+            }
+
+            return Ok(usage);
+        }
+
+        let mut live_buckets = Vec::new();
+        let mut display_buckets = Vec::new();
+        let mut provider_errors = Vec::new();
+        let mut provider_credits = Vec::new();
+
+        for provider in enabled_providers {
+            match provider {
+                integrations::IntegrationProvider::Claude => {
+                    let now = Utc::now();
+                    let recent_cutoff = now - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
+
+                    if latest_usage_snapshot_at(provider)
+                        .is_some_and(|timestamp| timestamp >= recent_cutoff)
+                        && let Some(mut buckets) = load_cached_usage_buckets(provider)
+                    {
+                        display_buckets.append(&mut buckets);
+                        continue;
+                    }
+
+                    if usage_setting_timestamp(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY)
+                        .is_some_and(|timestamp| timestamp > now)
+                    {
+                        if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                            display_buckets.append(&mut buckets);
+                        } else {
+                            provider_errors.push(UsageProviderError {
+                                provider,
+                                message: "Claude usage polling is temporarily paused after a recent 429 response."
+                                    .to_string(),
+                            });
+                        }
+                        continue;
+                    }
+
+                    write_usage_setting_timestamp(CLAUDE_USAGE_LAST_ATTEMPT_KEY, now);
+
+                    match fetcher::fetch_claude_usage().await {
+                        Ok(mut buckets) => {
+                            clear_usage_setting(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY);
+                            display_buckets.extend(buckets.clone());
+                            live_buckets.append(&mut buckets);
+                        }
+                        Err(error) => {
+                            if let Some(retry_after_seconds) = error.retry_after_seconds {
+                                write_usage_setting_timestamp(
+                                    CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
+                                    now + TimeDelta::seconds(retry_after_seconds),
+                                );
+                            } else if error.message.contains("429") {
+                                write_usage_setting_timestamp(
+                                    CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
+                                    now + TimeDelta::seconds(CLAUDE_USAGE_FALLBACK_BACKOFF_SECS),
+                                );
+                            }
+
+                            provider_errors.push(UsageProviderError {
+                                provider,
+                                message: error.message,
+                            });
+                            if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                                display_buckets.append(&mut buckets);
+                            }
+                        }
+                    }
+                }
+                integrations::IntegrationProvider::Codex => {
+                    match run_blocking(fetcher::fetch_codex_usage) {
+                        Ok((mut buckets, credits)) => {
+                            display_buckets.extend(buckets.clone());
+                            live_buckets.append(&mut buckets);
+                            if let Some(credits) = credits {
+                                provider_credits.push(credits);
+                            }
+                        }
+                        Err(message) => {
+                            provider_errors.push(UsageProviderError { provider, message });
+                            if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                                display_buckets.append(&mut buckets);
+                            }
+                        }
+                    }
+                }
+                integrations::IntegrationProvider::MiniMax => {
+                    let api_key = get_storage().and_then(|storage| {
+                        integrations::minimax::load_api_key(storage)?
+                            .ok_or_else(|| "MiniMax API key not configured.".to_string())
+                    });
+                    match api_key {
+                        Ok(key) => match fetcher::fetch_minimax_usage(&key).await {
+                            Ok(mut buckets) => {
+                                display_buckets.extend(buckets.clone());
+                                live_buckets.append(&mut buckets);
+                            }
+                            Err(message) => {
+                                provider_errors.push(UsageProviderError { provider, message });
+                                if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                                    display_buckets.append(&mut buckets);
+                                }
+                            }
+                        },
+                        Err(message) => {
+                            provider_errors.push(UsageProviderError { provider, message });
+                        }
+                    }
+                }
+            }
+        }
+
+        if USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst) != refresh_epoch {
+            continue;
+        }
+
+        if !live_buckets.is_empty()
+            && let Ok(storage) = get_storage()
+        {
+            let buckets = live_buckets.clone();
+            if let Err(error) = run_blocking(move || storage.store_snapshot(&buckets)) {
+                log::warn!("Failed to store snapshot: {error}");
+            }
+        }
+
+        if USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst) != refresh_epoch {
+            continue;
+        }
+
+        let usage = store_usage_cache(
+            build_usage_data(display_buckets, provider_errors, provider_credits),
+            &status_key,
+            &statuses,
+        );
+
+        if let Some(app) = app {
+            emit_usage_updates(app, &statuses, &usage)?;
+        }
+
+        return Ok(usage);
+    }
+}
+
+#[tauri::command]
+async fn fetch_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
+    match run_blocking(integrations::detect_all) {
+        Ok(statuses) => {
+            let status_key = provider_status_key(&statuses);
+            if let Some(usage) = current_recent_usage_cache(&status_key) {
+                emit_usage_updates(&app, &statuses, &usage)?;
+                return Ok(usage);
+            }
+        }
+        Err(error) => {
+            if let Some((statuses, usage)) = current_usage_context() {
+                emit_usage_updates(&app, &statuses, &usage)?;
+                return Ok(usage);
+            }
+            return Err(error);
+        }
+    }
+
+    refresh_usage_cache(Some(&app)).await
+}
+
+#[tauri::command]
+async fn get_indicator_primary_provider()
+-> Result<Option<integrations::IntegrationProvider>, String> {
+    let storage = get_storage()?;
+    storage.get_indicator_primary_provider()
+}
+
+#[tauri::command]
+async fn set_indicator_primary_provider(
+    provider: Option<integrations::IntegrationProvider>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.set_indicator_primary_provider(provider))?;
+
+    let state = match run_blocking(integrations::detect_all) {
+        Ok(statuses) => current_indicator_state(&statuses),
+        Err(error) => {
+            log::warn!("Failed to detect providers after primary provider change: {error}");
+            if let Some((statuses, usage)) = current_usage_context() {
+                build_indicator_state(&statuses, &usage)
+            } else {
+                current_indicator_state(&[])
+            }
+        }
+    }?;
+
+    let _ = app.emit(indicator::INDICATOR_UPDATED_EVENT, state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_indicator_state() -> Result<StatusIndicatorState, String> {
+    match run_blocking(integrations::detect_all) {
+        Ok(statuses) => current_indicator_state(&statuses),
+        Err(error) => {
+            if let Some((statuses, usage)) = current_usage_context() {
+                return build_indicator_state(&statuses, &usage);
+            }
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -481,7 +770,8 @@ async fn delete_session_data(
 
 #[tauri::command]
 async fn get_provider_statuses() -> Result<Vec<ProviderStatus>, String> {
-    run_blocking(integrations::detect_all)
+    let storage = get_storage()?;
+    integrations::load_statuses(storage)
 }
 
 #[tauri::command]
@@ -490,7 +780,17 @@ async fn confirm_enable_provider(
     api_key: Option<String>,
     app: tauri::AppHandle,
 ) -> Result<ProviderStatus, String> {
-    run_blocking(move || integrations::confirm_enable_with_key(&app, provider, api_key))
+    let status = {
+        let app_handle = app.clone();
+        run_blocking(move || integrations::confirm_enable_with_key(&app_handle, provider, api_key))
+    }?;
+
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after enabling provider failed: {error}");
+    }
+
+    Ok(status)
 }
 
 #[tauri::command]
@@ -498,7 +798,17 @@ async fn confirm_disable_provider(
     provider: integrations::IntegrationProvider,
     app: tauri::AppHandle,
 ) -> Result<ProviderStatus, String> {
-    run_blocking(move || integrations::confirm_disable(&app, provider))
+    let status = {
+        let app_handle = app.clone();
+        run_blocking(move || integrations::confirm_disable(&app_handle, provider))
+    }?;
+
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after disabling provider failed: {error}");
+    }
+
+    Ok(status)
 }
 
 // --- Learning IPC commands ---
@@ -1348,14 +1658,22 @@ pub fn run() {
                 restart::startup_cleanup();
             }
 
-            // Refresh provider integration state on startup.
+            // startup_refresh is merged into the tray summary spawn below
+            // to avoid redundant detect_all calls.
+
+            // Refresh live usage in the background on the same 3-minute interval as the widget.
             {
-                let setup_handle = app.handle().clone();
+                let usage_refresh_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    if let Err(e) =
-                        tokio::task::block_in_place(|| integrations::startup_refresh(&setup_handle))
-                    {
-                        log::error!("Integration startup refresh failed: {e}");
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        LIVE_USAGE_REFRESH_INTERVAL_SECS as u64,
+                    ));
+                    interval.tick().await;
+                    loop {
+                        interval.tick().await;
+                        if let Err(error) = refresh_usage_cache(Some(&usage_refresh_handle)).await {
+                            log::warn!("Periodic usage refresh failed: {error}");
+                        }
                     }
                 });
             }
@@ -1380,6 +1698,12 @@ pub fn run() {
                 }
             }
 
+            let summary_now =
+                MenuItem::with_id(app, "indicator_now", "Now: --", false, None::<&str>)?;
+            let summary_reset =
+                MenuItem::with_id(app, "indicator_reset", "Resets: --", false, None::<&str>)?;
+            let summary_week =
+                MenuItem::with_id(app, "indicator_week", "Week: --", false, None::<&str>)?;
             let show = MenuItem::with_id(app, "show", "Show Widget", true, None::<&str>)?;
             let on_top = CheckMenuItem::with_id(
                 app,
@@ -1389,17 +1713,47 @@ pub fn run() {
                 on_top_enabled,
                 None::<&str>,
             )?;
-            let separator = PredefinedMenuItem::separator(app)?;
             let update =
                 MenuItem::with_id(app, "check_update", "Check for Update", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &on_top, &separator, &update, &quit])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &summary_now,
+                    &summary_reset,
+                    &summary_week,
+                    &show,
+                    &on_top,
+                    &update,
+                    &quit,
+                ],
+            )?;
 
-            TrayIconBuilder::new()
+            let summary_now_handle = summary_now.clone();
+            let summary_reset_handle = summary_reset.clone();
+            let summary_week_handle = summary_week.clone();
+            let tray_update_handle = app.handle().clone();
+            let _indicator_tray_listener =
+                app.listen(indicator::INDICATOR_UPDATED_EVENT, move |event| {
+                    match serde_json::from_str::<StatusIndicatorState>(event.payload()) {
+                        Ok(state) => update_indicator_tray_summary(
+                            &tray_update_handle,
+                            &summary_now_handle,
+                            &summary_reset_handle,
+                            &summary_week_handle,
+                            &state,
+                        ),
+                        Err(error) => {
+                            log::warn!("Failed to parse indicator tray update payload: {error}");
+                        }
+                    }
+                });
+
+            let tray_builder = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("Quill")
+                .title("Indicator state unavailable")
                 .menu(&menu)
-                .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "show" => show_main_window(app),
                     "on_top" => {
@@ -1424,22 +1778,87 @@ pub fn run() {
                     }
                     "quit" => app.exit(0),
                     _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        show_main_window(tray.app_handle());
+                });
+            let tray = tray_builder.build(app)?;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = tray.set_icon_as_template(true);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = tray;
+
+            // Refresh provider state and populate tray summary in one
+            // background task.  Uses a dedicated Storage connection so
+            // slow debug-build queries don't block the global Mutex
+            // that frontend invoke handlers need.
+            {
+                let tray_handle = app.handle().clone();
+                let sn = summary_now.clone();
+                let sr = summary_reset.clone();
+                let sw = summary_week.clone();
+                tauri::async_runtime::spawn(async move {
+                    match tokio::task::block_in_place(|| {
+                        integrations::startup_refresh(&tray_handle)
+                    }) {
+                        Ok(statuses) => {
+                            tokio::task::block_in_place(|| {
+                                let Ok(tray_storage) = Storage::init() else {
+                                    return;
+                                };
+                                let status_key = provider_status_key(&statuses);
+                                let usage = current_usage_cache(&status_key).unwrap_or_else(|| {
+                                    let enabled = enabled_providers(&statuses);
+                                    if enabled.is_empty() {
+                                        return UsageData {
+                                            buckets: Vec::new(),
+                                            provider_errors: Vec::new(),
+                                            provider_credits: Vec::new(),
+                                            error: Some("No providers are enabled.".to_string()),
+                                        };
+                                    }
+                                    let mut buckets = Vec::new();
+                                    for provider in enabled {
+                                        if let Ok(b) =
+                                            tray_storage.get_latest_usage_buckets(provider)
+                                            && !b.is_empty()
+                                        {
+                                            buckets.extend(b);
+                                        }
+                                    }
+                                    build_usage_data(buckets, Vec::new(), Vec::new())
+                                });
+                                let configured_provider = tray_storage
+                                    .get_indicator_primary_provider()
+                                    .unwrap_or(None);
+                                let mut state = indicator::resolve_indicator_state(
+                                    configured_provider,
+                                    &statuses,
+                                    &usage,
+                                );
+                                state.updated_at = state.resolved_primary_provider.and_then(|p| {
+                                    tray_storage
+                                        .get_latest_usage_snapshot_timestamp(p)
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|ts| parse_timestamp(Some(ts)))
+                                        .map(|dt| dt.to_rfc3339())
+                                });
+                                update_indicator_tray_summary(&tray_handle, &sn, &sr, &sw, &state);
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("Integration startup refresh failed: {e}");
+                        }
                     }
-                })
-                .build(app)?;
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             fetch_usage_data,
+            get_indicator_primary_provider,
+            set_indicator_primary_provider,
+            get_indicator_state,
             get_usage_history,
             get_usage_stats,
             get_all_bucket_stats,

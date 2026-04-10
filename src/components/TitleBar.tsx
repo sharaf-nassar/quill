@@ -91,10 +91,12 @@ function TitleBar({
 
   const {
     statuses,
+    indicatorPrimaryProvider,
     loading: providersLoading,
     error: providerError,
     hasEnabledProvider,
     inFlightProviders,
+    saveIndicatorPrimaryProvider,
     enableProvider,
     disableProvider,
   } = integrations;
@@ -343,7 +345,11 @@ function TitleBar({
                 loading={providersLoading}
                 error={providerError}
                 inFlightProviders={inFlightProviders}
+                indicatorPrimaryProvider={indicatorPrimaryProvider}
                 onRequestToggle={handleRequestToggle}
+                onIndicatorPrimaryProviderChange={(provider) => {
+                  void saveIndicatorPrimaryProvider(provider);
+                }}
                 layoutMode={layoutMode}
                 onLayoutModeChange={onLayoutModeChange}
               />

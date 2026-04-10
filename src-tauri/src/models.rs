@@ -80,10 +80,37 @@ pub struct UsageData {
     pub error: Option<String>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DataPoint {
     pub timestamp: String,
     pub utilization: f64,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IndicatorMetric {
+    pub provider: IntegrationProvider,
+    pub key: String,
+    pub label: String,
+    pub model_label: Option<String>,
+    pub utilization: f64,
+    pub resets_at: Option<String>,
+    pub display_reset_time: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusIndicatorState {
+    pub configured_primary_provider: Option<IntegrationProvider>,
+    pub resolved_primary_provider: Option<IntegrationProvider>,
+    pub status: String,
+    pub title_text: String,
+    pub warning: Option<String>,
+    pub updated_at: Option<String>,
+    pub short_window: Option<IndicatorMetric>,
+    pub weekly_window: Option<IndicatorMetric>,
 }
 
 // Host-level token breakdown

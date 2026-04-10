@@ -1,12 +1,12 @@
 # Backend
 
-The Rust backend handles storage, ingestion, search, LLM analysis, plugin management, and provider lifecycle management.
+The Rust backend handles storage, ingestion, search, LLM analysis, plugin management, provider lifecycle management, and the cross-platform status indicator.
 
-It communicates with the frontend through 68 Tauri IPC commands and 11 documented push events.
+It communicates with the frontend through a broad Tauri IPC surface and documented push events.
 
 ## Entry Point
 
-[[src-tauri/src/lib.rs]] (1,132 lines) is the application entry point. It initializes storage, starts the HTTP server, registers all Tauri commands, sets up the tray icon, and launches [[architecture#Background Tasks]].
+[[src-tauri/src/lib.rs]] is the application entry point. It initializes storage, starts the HTTP server, registers all Tauri commands, sets up the tray icon, and launches [[architecture#Background Tasks]].
 
 Tauri plugins configured: `tauri-plugin-log`, `tauri-plugin-updater`, `tauri-plugin-process`, `tauri-plugin-window-state`. Session transcript catch-up is no longer part of app launch; the Sessions window requests an incremental sync when search is opened.
 
@@ -74,7 +74,7 @@ Tables for recording and aggregating provider-aware live usage bucket utilizatio
 - **usage_snapshots** — Raw live usage snapshots keyed by provider plus bucket key (timestamp, provider, bucket_key, bucket_label, utilization, resets_at).
 - **usage_hourly** — Hourly aggregates keyed by provider plus bucket key (avg/max/min utilization, sample_count). Unique on (hour, provider, bucket_key).
 
-Live usage ingestion stores Claude API buckets and Codex transcript-derived rate-limit buckets in the same tables. Codex `rate_limits.resets_at` values are normalized from transcript epoch timestamps into RFC3339 strings before storage so the live pane can show the same reset countdown semantics as Claude. Migration 14 backfills older Claude-only rows by deriving stable bucket keys from legacy labels, and startup creates provider-only indexes after migrations so older databases can still boot before those columns exist. The generic `settings` table also stores Claude live-usage fetch metadata such as the last attempted poll time and any active 429 cooldown so reopen/restart flows can respect recent fetches.
+Live usage ingestion stores Claude API buckets and Codex transcript-derived rate-limit buckets in the same tables. Codex `rate_limits.resets_at` values are normalized from transcript epoch timestamps into RFC3339 strings before storage so the live pane can show the same reset countdown semantics as Claude. Migration 14 backfills older Claude-only rows by deriving stable bucket keys from legacy labels, and startup creates provider-only indexes after migrations so older databases can still boot before those columns exist. The generic `settings` table also stores Claude live-usage fetch metadata such as the last attempted poll time, any active 429 cooldown, and the configured indicator primary-provider preference used by the tray and indicator window.
 
 #### Token Tracking
 
@@ -123,7 +123,7 @@ Key-value configuration and schema migration version tracking.
 
 ## Tauri IPC Commands
 
-68 async commands registered in [[src-tauri/src/lib.rs]], grouped by feature.
+The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
 ### Usage and Token Commands (10)
 
@@ -136,6 +136,12 @@ Codex live usage now comes from `codex app-server` `account/rateLimits/read` ins
 MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-tauri/src/fetcher.rs#fetch_minimax_usage]]. It reads the API key from the SQLite settings table and parses the `model_remains` array into 5-hour and weekly `UsageBucket` entries, filtering out models with zero quota.
 
 `get_session_breakdown` now accepts optional provider and limit arguments so Codex live views can request a provider-scoped active set without being crowded out by Claude sessions.
+
+### Indicator Commands (3)
+
+`get_indicator_primary_provider`, `set_indicator_primary_provider`, and `get_indicator_state` keep one backend-owned indicator model shared across the tray title, tray summary rows, and the integrations menu.
+
+`set_indicator_primary_provider` persists the configured provider in the settings table, recomputes the resolved indicator state from the shared usage cache or fallback rows, and emits `indicator-updated` so the tray summary and integrations menu stay synchronized without a second polling path.
 
 ### Project and Session Management (7)
 
@@ -194,6 +200,8 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 `get_provider_statuses` and `confirm_enable_provider` expose provider detection and enable state.
 
+`get_provider_statuses` returns the last saved provider statuses from storage rather than re-running detection. Fresh detection happens once at startup via the background `startup_refresh` task, which saves results and emits `integrations-updated`. This avoids redundant subprocess calls and eliminates the visible "Checking integrations..." loading state on the main window.
+
 Detection runs via `--version` checks for CLI providers. Codex probes use the user's login-shell `PATH`, while Claude resolves the executable path from the login shell and common macOS install locations before running `--version`, which avoids false negatives when desktop-launched Quill inherits a stripped PATH. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]], [[src-tauri/src/integrations/claude.rs]], [[src-tauri/src/integrations/codex.rs]], and [[src-tauri/src/config.rs]].
 
 ## Event System
@@ -211,9 +219,12 @@ The backend pushes real-time updates to the frontend via Tauri's emit system.
 | `provider-status-updated` | integrations | `Vec<ProviderStatus>` | Startup provider detection refresh |
 | `restart-status-changed` | restart.rs | `RestartStatus` | Restart phase change |
 | `integrations-updated` | integrations/manager.rs | `ProviderStatus[]` | Startup refresh or provider enable/disable completed |
+| `indicator-updated` | lib.rs | `StatusIndicatorState` | Shared usage refresh or primary-provider change recomputed indicator state |
 | `memory-optimizer-log` | memory_optimizer.rs | `{message}` | Optimization run progress |
 | `memory-optimizer-updated` | memory_optimizer.rs | `{run_id, status}` | Run completed |
 | `memory-files-updated` | memory_optimizer.rs | `{project_path}` | Memory files changed |
+
+Indicator state payloads use the explicit status vocabulary `ready`, `degraded`, or `unavailable` so the frontend can treat healthy state distinctly from warning and empty-state cases without legacy `ok` handling.
 
 ## Session Indexing
 

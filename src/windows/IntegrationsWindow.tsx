@@ -57,9 +57,11 @@ function IntegrationsWindowView() {
   const currentWindow = getCurrentWindow();
   const {
     statuses,
+    indicatorPrimaryProvider,
     loading,
     error,
     inFlightProviders,
+    saveIndicatorPrimaryProvider,
     enableProvider,
     disableProvider,
   } = useIntegrations();
@@ -141,7 +143,11 @@ function IntegrationsWindowView() {
           loading={loading}
           error={error}
           inFlightProviders={inFlightProviders}
+          indicatorPrimaryProvider={indicatorPrimaryProvider}
           onRequestToggle={handleRequestToggle}
+          onIndicatorPrimaryProviderChange={(provider) => {
+            void saveIndicatorPrimaryProvider(provider);
+          }}
         />
       </div>
       {pendingProviderAction && confirmCopy && (

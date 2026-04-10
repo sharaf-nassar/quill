@@ -15,7 +15,7 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 Each major feature runs in its own Tauri window, routed via URL query parameter in [[src/main.tsx]].
 
-The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], and [[features#Restart Orchestrator]], but [[src/main.tsx]] blocks those windows with an empty state when no provider is enabled.
+The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], and [[features#Restart Orchestrator]], with [[src/main.tsx]] blocking provider-dependent windows when no provider is enabled.
 
 The QUILL titlebar trigger opens an inline popover for provider enable/disable actions, rendered inside the main window with a backdrop overlay for click-outside dismissal.
 
@@ -44,6 +44,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Plugins | [[src-tauri/src/plugins.rs]] | Plugin and marketplace management |
 | Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
 | Integrations | [[src-tauri/src/integrations/mod.rs]] | Provider detection plus persisted enable and disable lifecycle for Claude and Codex |
+| Indicator | [[src-tauri/src/indicator.rs]] | Primary-provider resolution, compact title text, and warnings for the tray summary |
 | Models | [[src-tauri/src/models.rs]] | All shared data structures and serde types |
 | AI client | [[src-tauri/src/ai_client.rs]] | Anthropic API integration via rig-core |
 | Git analysis | [[src-tauri/src/git_analysis.rs]] | Commit pattern extraction and hotspot analysis |
@@ -73,7 +74,9 @@ Data flows through three communication channels between the system's components.
 
 ### Tauri IPC
 
-The primary frontend-backend channel. React hooks call `invoke()` for request-response and `listen()` for push events, including provider-status refresh via `integrations-updated`. See [[data-flow]] for specific flows.
+The primary frontend-backend channel. React hooks call `invoke()` for request-response and `listen()` for push events.
+
+Provider-status refresh uses `integrations-updated`, while indicator refresh uses `indicator-updated`. See [[data-flow]] for specific flows.
 
 ### HTTP API
 
@@ -83,16 +86,19 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 Backend pushes real-time updates to the frontend via `emit()`.
 
-Current events include `tokens-updated`, `learning-updated`, `learning-log`, `plugin-changed`, `restart-status-changed`, `integrations-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
+Current events include `tokens-updated`, `learning-updated`, `learning-log`, `plugin-changed`, `restart-status-changed`, `integrations-updated`, `indicator-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
 
 ## Background Tasks
 
 Several background tasks start on app launch in [[src-tauri/src/lib.rs]].
 
+All tasks that touch the database or network MUST be spawned async — never block the main thread inside `.setup()`, as this prevents GTK from starting and stalls webview loading.
+
 - **Hourly cleanup**: Aggregates snapshots into hourly tables, prunes old data, compresses observations
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
 - **Plugin update checker**: Polls marketplaces every 4 hours for available updates
-- **Integration refresh**: Detects Claude and Codex CLI/home state and emits `integrations-updated`
+- **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
+- **Live usage refresh**: Reuses one shared 3-minute refresh path to update the main widget and tray summary rows
 
 ## Local vs Remote Architecture
 

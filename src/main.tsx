@@ -151,7 +151,7 @@ function BlockedWindow({
   );
 }
 
-function RoutedView() {
+function ProviderRoutedView() {
   const integrations = useIntegrations();
   const hasDetectedProvider = integrations.statuses.some(
     (status) => status.detectedCli,
@@ -198,6 +198,10 @@ function RoutedView() {
   ) : (
     <App integrations={integrations} />
   );
+}
+
+function RoutedView() {
+  return <ProviderRoutedView />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

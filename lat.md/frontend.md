@@ -6,7 +6,7 @@ The React 19 frontend is a multi-window Tauri application with custom hooks for 
 
 [[src/main.tsx]] routes to window-specific components based on the `?view=` URL parameter.
 
-Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range via Tauri's native webview zoom API, falling back to CSS `zoom` only outside Tauri. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications, [[src/hooks/useIntegrations.ts]] gates secondary windows when no provider is enabled, and [[src/windows/SessionsWindowView.tsx]] refreshes the session index on demand before loading search facets.
+Each window gets its own Suspense boundary with a fallback. Per-window zoom persistence is stored in localStorage (`quill-zoom-{view}`) and supports Ctrl+/-, Ctrl+0 with a 0.5-2.0x range via Tauri's native webview zoom API, falling back to CSS `zoom` only outside Tauri. Ctrl+F is blocked to prevent the webview's native find-in-page (no search UI exists). A `ToastProvider` context wraps all views for notifications, [[src/hooks/useIntegrations.ts]] gates provider-dependent secondary windows when no provider is enabled, and [[src/windows/SessionsWindowView.tsx]] refreshes the session index on demand before loading search facets.
 
 ### Window Routes
 
@@ -28,6 +28,8 @@ Seven Tauri windows are routed by the `?view=` URL parameter, each with its own 
 
 The layout supports two orientations controlled by a `LayoutMode` toggle (`"stacked"` or `"side-by-side"`) persisted in localStorage as `quill-layout-mode`. Stacked mode (default) places Live above Analytics with a horizontal divider; side-by-side mode places Live on the left and Analytics on the right with a vertical divider. Each orientation has an independent split ratio (0.15-0.85) persisted separately (`quill-split-ratio` for stacked, `quill-split-ratio-h` for side-by-side). The layout supports keyboard-driven resizing (ArrowUp/Down for stacked, ArrowLeft/Right for side-by-side), pointer-anchored divider dragging, and window resize events. Usage data refreshes every 3 minutes via `fetch_usage_data()` only while a provider is active. Right-click shows a context menu with Refresh and Quit options, and the main panel swaps to an integration empty state with a provider rescan action when Claude Code and Codex are both inactive.
 
+The split panes keep their root content views shrinkable with `min-width: 0` on `UsageDisplay` and `AnalyticsView`, preventing intrinsic child widths from forcing the macOS window wider when switching orientations.
+
 ### Component Tree
 
 The main window nests `TitleBar` at the top, `UsageDisplay` and `AnalyticsView` in the panels area.
@@ -43,7 +45,7 @@ Components are organized by feature domain under `src/components/`.
 Top-level UI chrome and live rate limit display shared across the main window.
 
 - **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered QUILL trigger that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, and version/close controls on the right. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
-- **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel with a Layout section (stacked/side-by-side toggle) above the Integrations section showing Claude Code, Codex, and MiniMax availability, enabled state, and the next enable or disable action. Layout props are optional for backward compatibility with the legacy `IntegrationsWindowView`.
+- **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel with a Layout section (stacked/side-by-side toggle), a Status provider selector that persists the indicator primary provider, and an Integrations section showing Claude Code, Codex, and MiniMax availability, enabled state, and the next enable or disable action. Layout props are optional for backward compatibility with the legacy `IntegrationsWindowView`.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
 - **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).
 - **UsageDisplay** (`src/components/UsageDisplay.tsx`) — Composes the shared workload summary rail, grouped provider limit sections, the detailed-row time mode selector, and provider-error handling for the main window's live pane.
@@ -107,9 +109,9 @@ All data hooks use Tauri `invoke()` for request-response and `listen()` for push
 
 ### Integration Hook
 
-`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses, listens for `integrations-updated`, and tracks per-provider in-flight actions.
+`useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses plus the persisted indicator primary provider, listens for `integrations-updated` and `indicator-updated`, and tracks per-provider in-flight actions.
 
-It drives the inline integrations popover in TitleBar plus blocked-window gating. The `enableProvider` function accepts an optional `apiKey` argument used by service-only providers like MiniMax.
+It drives the inline integrations popover in TitleBar, the standalone integrations window, and blocked-window gating. The `enableProvider` function accepts an optional `apiKey` argument used by service-only providers like MiniMax, while `saveIndicatorPrimaryProvider` persists the status-indicator preference without introducing a separate frontend polling path.
 
 ### Data Fetching Hooks
 
@@ -151,7 +153,7 @@ React Context providers used across the frontend for shared state.
 
 [[src/types.ts]] contains all TypeScript types (434 lines), mirroring the Rust models in [[src-tauri/src/models.rs]].
 
-Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
+Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
 
 Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`, `PluginsTab`.
 

@@ -120,14 +120,18 @@ pub fn confirm_disable(
     Ok(status)
 }
 
-pub fn startup_refresh(app: &AppHandle) -> Result<(), String> {
+pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
     let storage = Storage::init()?;
     let statuses = detect_all_with_storage(&storage)?;
     save_statuses(&storage, &statuses)?;
     log_statuses(&statuses);
     emit_statuses(app, &statuses);
 
-    Ok(())
+    Ok(statuses)
+}
+
+pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
+    load_saved_statuses(storage)
 }
 
 fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {

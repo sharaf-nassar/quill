@@ -5,7 +5,9 @@ pub mod manifest;
 pub mod minimax;
 pub mod types;
 
-pub use manager::{confirm_disable, confirm_enable_with_key, detect_all, startup_refresh};
+pub use manager::{
+    confirm_disable, confirm_enable_with_key, detect_all, load_statuses, startup_refresh,
+};
 #[allow(unused_imports)]
 pub use manifest::OwnedAssetManifest;
 pub use types::{IntegrationProvider, ProviderStatus};
