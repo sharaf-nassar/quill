@@ -112,9 +112,11 @@ Tables for tracking memory files, optimization runs, and actionable suggestions 
 - **optimization_runs** — Optimization run records (project_path, trigger, memories_scanned, suggestions_created, status, timestamps).
 - **optimization_suggestions** — Suggestions with lifecycle (run_id FK, action_type, target_file, reasoning, proposed_content, status, backup_data, group_id). Indexed on run_id, project_path+status, group_id.
 
-#### Code and Response Metrics
+#### Code and Runtime Metrics
 
-Tables for tracking response latency per turn and caching git commit history per project.
+Tables for tracking per-turn LLM response latency and caching git commit history per project.
+
+`get_llm_runtime_stats` groups consecutive rows into logical turns using `idle_secs` to detect tool-execution gaps, then measures each turn's full wall-clock span.
 
 - **git_snapshots** — Cached git history per project (project unique, commit_hash, commit_count, raw_data).
 
@@ -170,7 +172,7 @@ Read and trigger commands accept an optional provider filter so the UI can reque
 
 ### Code and Response Stats (4)
 
-`get_code_stats`, `get_code_stats_history`, `get_batch_session_code_stats`, `get_response_time_stats`.
+`get_code_stats`, `get_code_stats_history`, `get_batch_session_code_stats`, `get_llm_runtime_stats`.
 
 `get_batch_session_code_stats` fans out one SQL branch per `(provider, session_id)` pair with `UNION ALL` so SQLite can use the `tool_actions` provider/session index instead of falling back to a broad category scan across the entire code-change corpus.
 

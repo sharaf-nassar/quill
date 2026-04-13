@@ -3,7 +3,7 @@ import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import { useTokenData } from "../../hooks/useTokenData";
 import { useCodeStats } from "../../hooks/useCodeStats";
 import { useCodeInsights } from "../../hooks/useCodeInsights";
-import { useResponseTimeStats } from "../../hooks/useResponseTimeStats";
+import { useLlmRuntimeStats } from "../../hooks/useLlmRuntimeStats";
 import { formatNumber, formatDurationSecs } from "../../utils/format";
 import InsightCard from "./InsightCard";
 import CompactStatsRow from "./CompactStatsRow";
@@ -12,7 +12,6 @@ import TokenSparkline from "./TokenSparkline";
 import CodeSparkline from "./CodeSparkline";
 import type {
 	RangeType,
-	MergedBucket,
 	BreakdownSelection,
 } from "../../types";
 
@@ -41,10 +40,9 @@ const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 interface NowTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
-	currentBucket: MergedBucket | null;
 }
 
-function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {
+function NowTab({ range, onRangeChange }: NowTabProps) {
 	const [breakdownSelection, setBreakdownSelection] =
 		useState<BreakdownSelection | null>(null);
 	const [breakdownCollapsed, setBreakdownCollapsed] = useState(() => {
@@ -61,11 +59,11 @@ function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {
 		: range;
 
 	const { loading, error } = useAnalyticsData(
-		currentBucket,
+		null,
 		range,
 	);
 
-	const responseTimeStats = useResponseTimeStats(range);
+	const runtimeStats = useLlmRuntimeStats(range);
 
 	const tokenHostname =
 		breakdownSelection?.type === "host" ? breakdownSelection.key : null;
@@ -130,6 +128,22 @@ function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {
 					{/* Insight cards row */}
 					<div className="insight-cards-row">
 						<InsightCard
+							label="LLM Runtime"
+							value={
+								runtimeStats.totalRuntimeSecs !== null
+									? formatDurationSecs(runtimeStats.totalRuntimeSecs)
+									: null
+							}
+							subtitle={
+								runtimeStats.totalRuntimeSecs !== null
+									? `${runtimeStats.sessionCount} sessions \u00b7 ${runtimeStats.turnCount} turns \u00b7 avg ${formatDurationSecs(runtimeStats.avgPerTurnSecs)}`
+									: "no data"
+							}
+							trend={null}
+							sparkline={runtimeStats.sparkline}
+							accentColor="#34d399"
+						/>
+						<InsightCard
 							label="Efficiency"
 							value={
 								efficiencyStats.tokensPerLoc !== null
@@ -152,22 +166,6 @@ function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {
 							trend={velocityStats.trend}
 							sparkline={velocityStats.sparkline}
 							accentColor="#a78bfa"
-						/>
-						<InsightCard
-							label="Response Time"
-							value={
-								responseTimeStats.avgResponseSecs !== null
-									? formatDurationSecs(responseTimeStats.avgResponseSecs)
-									: null
-							}
-							subtitle={
-								responseTimeStats.avgResponseSecs !== null
-									? `peak ${formatDurationSecs(responseTimeStats.peakResponseSecs)} \u00b7 avg idle ${formatDurationSecs(responseTimeStats.avgIdleSecs)}`
-									: "no data"
-							}
-							trend={null}
-							sparkline={responseTimeStats.sparkline}
-							accentColor={responseTimeStats.accentColor}
 						/>
 					</div>
 

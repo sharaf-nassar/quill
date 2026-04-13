@@ -21,8 +21,8 @@ mod storage;
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
-    LearningRun, LearningSettings, ProjectBreakdown, ProjectTokens, ProviderStatus,
-    ResponseTimeStats, SessionBreakdown, SessionCodeStats, SessionEndPayload, SessionRef,
+    LearningRun, LearningSettings, LlmRuntimeStats, ProjectBreakdown, ProjectTokens,
+    ProviderStatus, SessionBreakdown, SessionCodeStats, SessionEndPayload, SessionRef,
     SessionStats, StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, UsageBucket,
     UsageData, UsageProviderError,
 };
@@ -990,9 +990,9 @@ async fn get_batch_session_code_stats(
 }
 
 #[tauri::command]
-async fn get_response_time_stats(range: String) -> Result<ResponseTimeStats, String> {
+async fn get_llm_runtime_stats(range: String) -> Result<LlmRuntimeStats, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_response_time_stats(&range))
+    run_blocking(move || storage.get_llm_runtime_stats(&range))
 }
 
 #[tauri::command]
@@ -1932,7 +1932,7 @@ pub fn run() {
             get_code_stats,
             get_code_stats_history,
             get_batch_session_code_stats,
-            get_response_time_stats,
+            get_llm_runtime_stats,
             get_installed_plugins,
             get_marketplaces,
             get_available_updates,

@@ -10,7 +10,6 @@ import {
 	ReferenceLine,
 	ResponsiveContainer,
 } from "recharts";
-import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import { useTokenData } from "../../hooks/useTokenData";
 import { useCodeStats } from "../../hooks/useCodeStats";
 import { useCacheEfficiency } from "../../hooks/useCacheEfficiency";
@@ -19,11 +18,10 @@ import {
 	formatTime,
 	dedupeTickLabels,
 	anchorToNow,
-	getAreaColor,
 } from "../../utils/chartHelpers";
 import { CrosshairProvider, useCrosshair } from "./ChartCrosshairContext";
 import MiniChart from "./MiniChart";
-import type { RangeType, MergedBucket } from "../../types";
+import type { RangeType } from "../../types";
 
 const RANGES: RangeType[] = ["1h", "24h", "7d", "30d"];
 const RANGE_LABELS: Record<RangeType, string> = {
@@ -34,23 +32,22 @@ const RANGE_LABELS: Record<RangeType, string> = {
 };
 
 /**
- * Unified tooltip that reads crosshair position and shows all 4 values.
+ * Unified tooltip that reads crosshair position and shows all 3 values.
  *
  * Uses useState intentionally — tooltip content changes on every mouse move
  * and must trigger a re-render. Only this component re-renders on hover;
- * the 4 MiniCharts use ref-based DOM updates and do NOT re-render.
+ * the 3 MiniCharts use ref-based DOM updates and do NOT re-render.
  */
 interface UnifiedTooltipProps {
-	utilData: { timestamp: string; utilization: number }[];
 	tokenData: { timestamp: string; total_tokens: number }[];
 	codeData: { timestamp: string; lines_added: number; lines_removed: number }[];
 	cacheData: { timestamp: string; hitRate: number }[];
 }
 
-function UnifiedTooltip({ utilData, tokenData, codeData, cacheData }: UnifiedTooltipProps) {
+function UnifiedTooltip({ tokenData, codeData, cacheData }: UnifiedTooltipProps) {
 	const { subscribe } = useCrosshair();
 	const [values, setValues] = useState<{
-		time: string; util: string; tokens: string; code: string; cache: string;
+		time: string; tokens: string; code: string; cache: string;
 	} | null>(null);
 	const [xPct, setXPct] = useState<number | null>(null);
 
@@ -59,21 +56,19 @@ function UnifiedTooltip({ utilData, tokenData, codeData, cacheData }: UnifiedToo
 			const idx = (arr: { timestamp: string }[]) =>
 				arr.length > 0 ? Math.round(pct * (arr.length - 1)) : -1;
 
-			const ui = idx(utilData);
 			const ti = idx(tokenData);
 			const ci = idx(codeData);
 			const ki = idx(cacheData);
 
-			const ts = utilData[ui]?.timestamp ?? tokenData[ti]?.timestamp ?? "";
+			const ts = tokenData[ti]?.timestamp ?? "";
 			return {
 				time: ts ? new Date(ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "",
-				util: ui >= 0 ? `${utilData[ui].utilization.toFixed(0)}%` : "\u2014",
 				tokens: ti >= 0 ? formatTokenCount(tokenData[ti].total_tokens) : "\u2014",
 				code: ci >= 0 ? `+${codeData[ci].lines_added} / -${codeData[ci].lines_removed}` : "\u2014",
 				cache: ki >= 0 ? `${cacheData[ki].hitRate.toFixed(0)}%` : "\u2014",
 			};
 		},
-		[utilData, tokenData, codeData, cacheData],
+		[tokenData, codeData, cacheData],
 	);
 
 	useEffect(() => {
@@ -96,7 +91,6 @@ function UnifiedTooltip({ utilData, tokenData, codeData, cacheData }: UnifiedToo
 			style={{ left: `${xPct * 100}%` }}
 		>
 			<div className="chart-tooltip-time">{values.time}</div>
-			<div className="chart-tooltip-value" style={{ color: "#34d399" }}>Util {values.util}</div>
 			<div className="chart-tooltip-value" style={{ color: "#60a5fa" }}>Tokens {values.tokens}</div>
 			<div className="chart-tooltip-value" style={{ color: "#a78bfa" }}>Code {values.code}</div>
 			<div className="chart-tooltip-value" style={{ color: "#fbbf24" }}>Cache {values.cache}</div>
@@ -107,15 +101,9 @@ function UnifiedTooltip({ utilData, tokenData, codeData, cacheData }: UnifiedToo
 interface ChartsTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
-	currentBucket: MergedBucket | null;
 }
 
-function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
-	const { history: utilHistory, loading: utilLoading, error: utilError } = useAnalyticsData(
-		currentBucket,
-		range,
-	);
-
+function ChartsTab({ range, onRangeChange }: ChartsTabProps) {
 	const { history: tokenHistory, loading: tokenLoading, error: tokenError } = useTokenData(
 		range,
 		null,
@@ -129,11 +117,6 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 	const cacheData = useCacheEfficiency(tokenHistory);
 
 	// Anchor data to "now" so idle gaps are visible
-	const anchoredUtil = useMemo(
-		() => anchorToNow(utilHistory, { utilization: 0 }),
-		[utilHistory],
-	);
-
 	const anchoredTokens = useMemo(
 		() =>
 			anchorToNow(tokenHistory, {
@@ -165,12 +148,6 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 	);
 
 	// Current values for display
-	const utilColor = getAreaColor(anchoredUtil);
-	const utilValue =
-		anchoredUtil.length > 0
-			? `${anchoredUtil[anchoredUtil.length - 1].utilization.toFixed(0)}%`
-			: "\u2014";
-
 	const tokenValue =
 		tokenHistory.length > 0
 			? formatTokenCount(
@@ -196,14 +173,14 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 	const formatter = (v: string) => formatTime(v, range);
 
 	// Compute ticks from the longest dataset for the shared axis
-	const longestData = [anchoredUtil, anchoredTokens, anchoredCode, anchoredCache]
+	const longestData = [anchoredTokens, anchoredCode, anchoredCache]
 		.reduce((a, b) => (a.length >= b.length ? a : b), []);
 	const axisTicks = dedupeTickLabels(longestData, formatter);
 	const axisTimestamps = longestData
 		.filter((_, i) => axisTicks.has(i))
 		.map((d) => d.timestamp);
 
-	const isLoading = utilLoading || tokenLoading || codeLoading;
+	const isLoading = tokenLoading || codeLoading;
 
 	// Chart grid config — shared across all charts
 	const gridProps = {
@@ -243,63 +220,13 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 			{isLoading ? (
 				<div className="charts-stack">
 					<div className="chart-skeleton" style={{ height: 80 }} />
-					<div className="chart-skeleton" style={{ height: 80 }} />
 					<div className="chart-skeleton" style={{ height: 100 }} />
 					<div className="chart-skeleton" style={{ height: 80 }} />
 				</div>
 			) : (
 				<CrosshairProvider>
 					<div className="charts-stack">
-						{/* 1. Utilization */}
-						<MiniChart
-							label="Utilization"
-							currentValue={utilValue}
-							color={utilColor}
-							height={80}
-							isEmpty={anchoredUtil.length === 0}
-							emptyText="No utilization data"
-							error={utilError}
-						>
-							<ResponsiveContainer width="100%" height="100%">
-								<AreaChart
-									data={anchoredUtil}
-									margin={{ top: 16, right: 0, left: 0, bottom: 0 }}
-								>
-									<defs>
-										<linearGradient id="grad-util" x1="0" y1="0" x2="0" y2="1">
-											<stop offset="5%" stopColor={utilColor} stopOpacity={0.15} />
-											<stop offset="95%" stopColor={utilColor} stopOpacity={0.01} />
-										</linearGradient>
-									</defs>
-									<CartesianGrid {...gridProps} />
-									<XAxis {...xAxisProps} />
-									<YAxis
-										domain={[0, 100]}
-										ticks={[0, 50, 100]}
-										stroke="rgba(255,255,255,0.2)"
-										fontSize={9}
-										tickLine={false}
-										axisLine={false}
-										tickFormatter={(v) => `${v}%`}
-										width={0}
-										hide
-									/>
-									<ReferenceLine y={80} stroke="rgba(248,113,113,0.3)" strokeDasharray="4 4" />
-									<ReferenceLine y={50} stroke="rgba(251,191,36,0.2)" strokeDasharray="4 4" />
-									<Area
-										type="monotone"
-										dataKey="utilization"
-										stroke={utilColor}
-										strokeWidth={1.5}
-										fill="url(#grad-util)"
-										dot={false}
-										isAnimationActive={false}
-									/>
-								</AreaChart>
-							</ResponsiveContainer>
-						</MiniChart>
-
-						{/* 2. Token Breakdown */}
+						{/* 1. Token Breakdown */}
 						<MiniChart
 							label="Tokens"
 							currentValue={tokenValue}
@@ -352,7 +279,7 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 							</ResponsiveContainer>
 						</MiniChart>
 
-						{/* 3. Code Changes */}
+						{/* 2. Code Changes */}
 						<MiniChart
 							label="Code"
 							currentValue={codeValue}
@@ -391,7 +318,7 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 							</ResponsiveContainer>
 						</MiniChart>
 
-						{/* 4. Cache Efficiency */}
+						{/* 3. Cache Efficiency */}
 						<MiniChart
 							label="Cache"
 							currentValue={cacheValue}
@@ -437,7 +364,6 @@ function ChartsTab({ range, onRangeChange, currentBucket }: ChartsTabProps) {
 
 						{/* Unified tooltip — inside charts-stack for correct absolute positioning */}
 						<UnifiedTooltip
-							utilData={anchoredUtil}
 							tokenData={anchoredTokens}
 							codeData={anchoredCode}
 							cacheData={anchoredCache}

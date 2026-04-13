@@ -1,20 +1,15 @@
-import React, { useState, useMemo, Suspense, useEffect, useRef } from "react";
+import React, { useState, Suspense } from "react";
 import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import TabBar from "./TabBar";
 import NowTab from "./NowTab";
 import TrendsTab from "./TrendsTab";
-import type { RangeType, UsageBucket, AnalyticsTab } from "../../types";
-import { mergeBucketsByLabel } from "../../types";
+import type { RangeType, AnalyticsTab } from "../../types";
 
 const ChartsTab = React.lazy(() => import("./ChartsTab"));
 
 const TAB_KEY = "quill-analytics-tab";
 
-interface AnalyticsViewProps {
-	currentBuckets: UsageBucket[];
-}
-
-function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
+function AnalyticsView() {
 	const [activeTab, setActiveTab] = useState<AnalyticsTab>(() => {
 		try {
 			const saved = localStorage.getItem(TAB_KEY);
@@ -31,9 +26,6 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		} catch { /* ignore */ }
 		return "24h";
 	});
-	const [selectedBucketKey, setSelectedBucketKey] = useState<string | null>(null);
-	const [bucketMenuOpen, setBucketMenuOpen] = useState(false);
-	const bucketMenuRef = useRef<HTMLDivElement>(null);
 
 	const handleChartsRangeChange = (r: RangeType) => {
 		setChartsRange(r);
@@ -49,46 +41,7 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		} catch { /* ignore */ }
 	};
 
-	const mergedBuckets = useMemo(
-		() => mergeBucketsByLabel(currentBuckets),
-		[currentBuckets],
-	);
-
-	useEffect(() => {
-		if (mergedBuckets.length === 0) {
-			setSelectedBucketKey(null);
-			return;
-		}
-
-		if (
-			selectedBucketKey &&
-			mergedBuckets.some((mb) => mb.label === selectedBucketKey)
-		) {
-			return;
-		}
-
-		setSelectedBucketKey(mergedBuckets[0].label);
-	}, [selectedBucketKey, mergedBuckets]);
-
-	useEffect(() => {
-		if (!bucketMenuOpen) return;
-		const handler = (event: MouseEvent) => {
-			if (
-				bucketMenuRef.current &&
-				!bucketMenuRef.current.contains(event.target as Node)
-			) {
-				setBucketMenuOpen(false);
-			}
-		};
-		document.addEventListener("mousedown", handler);
-		return () => document.removeEventListener("mousedown", handler);
-	}, [bucketMenuOpen]);
-
-	const selectedBucket = mergedBuckets.find(
-		(mb) => mb.label === selectedBucketKey,
-	) ?? null;
-
-	const { snapshotCount, loading } = useAnalyticsData(selectedBucket, "24h");
+	const { snapshotCount, loading } = useAnalyticsData(null, "24h");
 
 	if (snapshotCount === 0 && !loading) {
 		return (
@@ -121,53 +74,13 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 		);
 	}
 
-	const selectedBucketLabel = selectedBucket
-		? selectedBucket.label
-		: "No live metric";
-
 	return (
 		<div className="analytics-view">
 			<TabBar activeTab={activeTab} onTabChange={handleTabChange} />
-			{mergedBuckets.length > 0 && (
-				<div className="analytics-controls analytics-controls--metric">
-					<div className="bucket-dropdown-wrap" ref={bucketMenuRef}>
-						<button
-							className="bucket-dropdown-trigger"
-							onClick={() => setBucketMenuOpen((open) => !open)}
-							aria-haspopup="true"
-							aria-expanded={bucketMenuOpen}
-						>
-							<span>{selectedBucketLabel}</span>
-							<span className="bucket-dropdown-arrow">
-								{bucketMenuOpen ? "\u25B4" : "\u25BE"}
-							</span>
-						</button>
-						{bucketMenuOpen && (
-							<div className="bucket-dropdown-menu" role="menu">
-								{mergedBuckets.map((mb) => (
-									<button
-										key={mb.label}
-										className={`bucket-dropdown-item${mb.label === selectedBucketKey ? " active" : ""}`}
-										role="menuitemradio"
-										aria-checked={mb.label === selectedBucketKey}
-										onClick={() => {
-											setSelectedBucketKey(mb.label);
-											setBucketMenuOpen(false);
-										}}
-									>
-										{mb.label}
-									</button>
-								))}
-							</div>
-						)}
-					</div>
-				</div>
-			)}
 			{activeTab === "now" && (
 				<NowTab
 					range={nowRange}
 					onRangeChange={setNowRange}
-					currentBucket={selectedBucket}
 				/>
 			)}
 			{activeTab === "trends" && (
@@ -181,7 +94,6 @@ function AnalyticsView({ currentBuckets }: AnalyticsViewProps) {
 					<ChartsTab
 						range={chartsRange}
 						onRangeChange={handleChartsRangeChange}
-						currentBucket={selectedBucket}
 					/>
 				</Suspense>
 			)}

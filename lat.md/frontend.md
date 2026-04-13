@@ -120,14 +120,14 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 
 | Hook | Returns | Tauri Commands |
 |------|---------|----------------|
-| `useAnalyticsData` | Usage history, stats, snapshot count (accepts `MergedBucket`, queries all sources and averages) | `get_usage_history`, `get_usage_stats`, `get_snapshot_count` |
+| `useAnalyticsData` | Snapshot count, loading, and error state for analytics empty-state gating | `get_snapshot_count` |
 | `useLiveSummaryData` | Aggregate live `Sessions`, `Projects`, and range-scoped `Tokens` cards across enabled providers | `get_session_breakdown`, `get_token_history` |
 | `useTokenData` | Token history with hostname/session filtering | `get_token_history`, `get_token_stats`, `get_token_hostnames` |
 | `useCodeStats` | Lines added/removed by language | `get_code_stats`, `get_code_stats_history` |
 | `useBreakdownData` | Host/project/session breakdown tables | `get_host_breakdown`, `get_project_breakdown`, `get_session_breakdown` |
 | `useSessionHealth` | Avg duration, tokens, sessions/day with trend | `get_session_stats` |
 | `useActivityPattern` | 24-hour hourly token distribution | `get_token_history` (derived) |
-| `useResponseTimeStats` | Avg/peak response time, idle time, sparkline | `get_response_time_stats` |
+| `useLlmRuntimeStats` | Cumulative runtime, session count, turn count, avg per turn, sparkline | `get_llm_runtime_stats` |
 | `useEfficiencyStats` | Tokens-per-LOC ratio with trend | Derived from token + code stats |
 | `useVelocityStats` | LOC-per-hour with trend | Derived from code stats |
 | `useLearningStats` | Rule counts by state, confidence buckets | `get_learned_rules` (derived) |

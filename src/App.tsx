@@ -628,7 +628,7 @@ function App({ integrations }: AppProps) {
 						)}
 						{showAnalytics && (
 					<div className="content analytics-content">
-						<AnalyticsView currentBuckets={usageData?.buckets ?? []} />
+						<AnalyticsView />
 					</div>
 						)}
 						{!showLive && !showAnalytics && (

@@ -555,13 +555,13 @@ export interface BulkUpdateItem {
 	error: string | null;
 }
 
-// Response time types
+// LLM runtime types
 
-export interface ResponseTimeStats {
-	avg_response_secs: number;
-	peak_response_secs: number;
-	avg_idle_secs: number;
-	sample_count: number;
+export interface LlmRuntimeStats {
+	total_runtime_secs: number;
+	turn_count: number;
+	session_count: number;
+	avg_per_turn_secs: number;
 	sparkline: number[];
 }
 

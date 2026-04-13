@@ -659,12 +659,12 @@ pub struct SessionCodeStats {
     pub net_change: i64,
 }
 
-/// Aggregate response time stats for a time range
+/// Cumulative LLM runtime stats for a time range
 #[derive(Serialize, Clone, Debug)]
-pub struct ResponseTimeStats {
-    pub avg_response_secs: f64,
-    pub peak_response_secs: f64,
-    pub avg_idle_secs: f64,
-    pub sample_count: i64,
+pub struct LlmRuntimeStats {
+    pub total_runtime_secs: f64,
+    pub turn_count: i64,
+    pub session_count: i64,
+    pub avg_per_turn_secs: f64,
     pub sparkline: Vec<f64>,
 }

@@ -8,7 +8,7 @@ use crate::integrations::IntegrationProvider;
 use crate::models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, GitSnapshot, HostBreakdown,
     LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
-    LearningStatus, ObservationPayload, ProjectBreakdown, ProjectTokens, ResponseTimeStats,
+    LearningStatus, LlmRuntimeStats, ObservationPayload, ProjectBreakdown, ProjectTokens,
     SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, TokenDataPoint,
     TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
@@ -4428,79 +4428,134 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_response_time_stats(&self, range: &str) -> Result<ResponseTimeStats, String> {
+    pub fn get_llm_runtime_stats(&self, range: &str) -> Result<LlmRuntimeStats, String> {
         let conn = self.conn.lock();
         let now = Utc::now();
         let from = now - range_to_duration(range);
         let from_str = from.to_rfc3339();
 
-        // Overall aggregates
-        let (avg_response_secs, peak_response_secs, avg_idle_secs, sample_count) = conn
-            .query_row(
-                "SELECT
-                     COALESCE(AVG(response_secs), 0.0),
-                     COALESCE(MAX(response_secs), 0.0),
-                     COALESCE(AVG(idle_secs), 0.0),
-                     COUNT(response_secs)
-                 FROM response_times
-                 WHERE timestamp >= ?1",
-                params![from_str],
-                |row| {
-                    Ok((
-                        row.get::<_, f64>(0)?,
-                        row.get::<_, f64>(1)?,
-                        row.get::<_, f64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("Query error: {e}"))?;
-
-        // 7-bucket sparkline — single query + in-memory bucketing
         let range_secs = range_to_duration(range).num_seconds() as f64;
         let bucket_secs = range_secs / 7.0;
         let from_epoch = from.timestamp_millis() as f64;
 
-        // bucket_sums[i] = (sum_of_response_secs, count)
-        let mut bucket_sums: [(f64, u64); 7] = [(0.0, 0); 7];
+        // Logical turn grouping: consecutive rows in the same session where
+        // idle_secs is present (gap <= 600s) belong to the same working cycle
+        // (tool execution between LLM calls). A new logical turn starts when
+        // idle_secs is NULL (first turn or gap > 600s) or the session changes.
+        // Each logical turn's duration = last assistant_ts - first user_ts,
+        // capturing full working time including tool execution.
+        let mut total_runtime_secs: f64 = 0.0;
+        let mut turn_count: i64 = 0;
+        let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut bucket_sums: [f64; 7] = [0.0; 7];
+
+        // Current logical turn state
+        let mut cur_session: Option<String> = None;
+        let mut turn_start_ms: f64 = 0.0; // first user_ts in logical turn
+        let mut turn_end_ms: f64 = 0.0; // last assistant_ts in logical turn
+
+        let flush_turn = |start_ms: f64,
+                          end_ms: f64,
+                          total: &mut f64,
+                          count: &mut i64,
+                          buckets: &mut [f64; 7],
+                          from_ep: f64,
+                          bkt_secs: f64| {
+            let dur = (end_ms - start_ms) / 1000.0;
+            if dur > 0.0 {
+                *total += dur;
+                *count += 1;
+                let offset_ms = start_ms - from_ep;
+                let bucket = ((offset_ms / 1000.0) / bkt_secs) as usize;
+                buckets[bucket.min(6)] += dur;
+            }
+        };
 
         {
             let mut stmt = conn
                 .prepare_cached(
-                    "SELECT timestamp, response_secs FROM response_times
-                     WHERE timestamp >= ?1 AND response_secs IS NOT NULL",
+                    "SELECT timestamp, response_secs, idle_secs, provider, session_id
+                     FROM response_times
+                     WHERE timestamp >= ?1 AND response_secs IS NOT NULL
+                     ORDER BY provider, session_id, timestamp",
                 )
-                .map_err(|e| format!("Prepare sparkline query: {e}"))?;
+                .map_err(|e| format!("Prepare runtime query: {e}"))?;
 
             let rows = stmt
                 .query_map(params![from_str], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
                 })
-                .map_err(|e| format!("Sparkline query error: {e}"))?;
+                .map_err(|e| format!("Runtime query error: {e}"))?;
 
             for row in rows.flatten() {
-                let (ts_str, secs) = row;
-                if let Ok(ts) = DateTime::parse_from_rfc3339(&ts_str) {
-                    let offset_ms = (ts.timestamp_millis() as f64) - from_epoch;
-                    let bucket = ((offset_ms / 1000.0) / bucket_secs) as usize;
-                    let bucket = bucket.min(6);
-                    bucket_sums[bucket].0 += secs;
-                    bucket_sums[bucket].1 += 1;
+                let (ts_str, response_secs, idle_secs, provider, session_id) = row;
+                let ts = match DateTime::parse_from_rfc3339(&ts_str) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                let assistant_ms = ts.timestamp_millis() as f64;
+                let user_ms = assistant_ms - (response_secs * 1000.0);
+                let session_key = format!("{provider}:{session_id}");
+
+                sessions.insert(session_key.clone());
+
+                // New logical turn if: different session, or idle_secs is NULL
+                // (first turn / gap > 600s)
+                let is_new = cur_session.as_ref() != Some(&session_key) || idle_secs.is_none();
+
+                if is_new {
+                    // Flush previous logical turn
+                    if cur_session.is_some() {
+                        flush_turn(
+                            turn_start_ms,
+                            turn_end_ms,
+                            &mut total_runtime_secs,
+                            &mut turn_count,
+                            &mut bucket_sums,
+                            from_epoch,
+                            bucket_secs,
+                        );
+                    }
+                    cur_session = Some(session_key);
+                    turn_start_ms = user_ms;
                 }
+
+                turn_end_ms = assistant_ms;
+            }
+
+            // Flush last logical turn
+            if cur_session.is_some() {
+                flush_turn(
+                    turn_start_ms,
+                    turn_end_ms,
+                    &mut total_runtime_secs,
+                    &mut turn_count,
+                    &mut bucket_sums,
+                    from_epoch,
+                    bucket_secs,
+                );
             }
         }
 
-        let sparkline: Vec<f64> = bucket_sums
-            .iter()
-            .map(|&(sum, count)| if count > 0 { sum / count as f64 } else { 0.0 })
-            .collect();
+        let avg_per_turn_secs = if turn_count > 0 {
+            total_runtime_secs / turn_count as f64
+        } else {
+            0.0
+        };
 
-        Ok(ResponseTimeStats {
-            avg_response_secs,
-            peak_response_secs,
-            avg_idle_secs,
-            sample_count,
-            sparkline,
+        Ok(LlmRuntimeStats {
+            total_runtime_secs,
+            turn_count,
+            session_count: sessions.len() as i64,
+            avg_per_turn_secs,
+            sparkline: bucket_sums.to_vec(),
         })
     }
 }

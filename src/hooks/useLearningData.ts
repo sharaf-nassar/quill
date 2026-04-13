@@ -36,8 +36,10 @@ export function useLearningData(providerFilter: ProviderFilter = "all") {
   const [liveLogs, setLiveLogs] = useState<Record<number, string[]>>({});
   const [loading, setLoading] = useState(true);
 
-  const refresh = useCallback(async () => {
-    setLoading(true);
+  const refresh = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const provider = filterToProvider(providerFilter);
       const [s, r, ru, oc, uc, tt, sp] = await Promise.all([
@@ -76,14 +78,16 @@ export function useLearningData(providerFilter: ProviderFilter = "all") {
   }, [providerFilter, toast]);
 
   useEffect(() => {
-    refresh();
-    const interval = setInterval(refresh, 10_000);
+    void refresh(true);
+    const interval = setInterval(() => {
+      void refresh();
+    }, 10_000);
     return () => clearInterval(interval);
   }, [refresh]);
 
   useEffect(() => {
     const unlisten = listen("learning-updated", () => {
-      refresh();
+      void refresh();
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -110,7 +114,7 @@ export function useLearningData(providerFilter: ProviderFilter = "all") {
         await invoke("set_learning_settings", { settings: next });
       } catch (e) {
         toast("error", `Failed to save learning settings: ${e}`);
-        refresh();
+        void refresh();
       }
     },
     [refresh, toast],

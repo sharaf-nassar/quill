@@ -22,13 +22,13 @@ The shared workload rail lives in [[src/components/live/LiveSummaryModule.tsx]],
 
 Three-tab analytics view in the main window's right pane, powered by [[frontend#Custom Hooks]] and Recharts.
 
-The dashboard uses a shared metric selector that groups buckets by label (e.g. "5 hours", "7 days") across all providers via [[src/types.ts#mergeBucketsByLabel]]. When multiple providers share a label, their utilization is averaged. The dropdown shows unified labels without provider prefixes.
+All analytics data is aggregated across all LLM providers — there is no per-bucket or per-provider filtering.
 
 ### Now Tab
 
 Real-time metrics dashboard with configurable time range (1h, 24h, 7d, 30d).
 
-Six insight cards: **Session Health** (avg duration, tokens, sessions/day with trend), **Response Time** (avg/peak response, idle time), **Project Focus** (top project breakdown), **Learning Progress** (rule counts, confidence distribution), **Efficiency** (tokens-per-LOC ratio), **Velocity** (LOC-per-hour). Below the cards: a 24-hour activity heatmap and a sortable breakdown panel switchable between hosts, projects, and sessions.
+Six insight cards: **Session Health** (avg duration, tokens, sessions/day with trend), **LLM Runtime** (cumulative response time, session count, turn count, avg per turn), **Project Focus** (top project breakdown), **Learning Progress** (rule counts, confidence distribution), **Efficiency** (tokens-per-LOC ratio), **Velocity** (LOC-per-hour). Below the cards: a 24-hour activity heatmap and a sortable breakdown panel switchable between hosts, projects, and sessions.
 
 When a session row is selected, the breakdown stores both provider and session id, which keeps token history, compact token stats, and delete-session actions aligned with the right Claude or Codex transcript.
 
@@ -38,9 +38,9 @@ Week-over-week comparison charts for token usage trends, code velocity, and cach
 
 ### Charts Tab
 
-Composite Recharts visualization with three synchronized axes: utilization, tokens, and LOC.
+Composite Recharts visualization with three synchronized charts: tokens, code changes, and cache efficiency.
 
-Crosshair context synchronizes tooltip position across chart components. Lazy-loaded with React Suspense to reduce initial bundle size, and the utilization series follows the currently selected merged bucket from the shared analytics metric selector.
+Crosshair context synchronizes tooltip position across chart components. Lazy-loaded with React Suspense to reduce initial bundle size.
 
 ## Learning System
 
@@ -158,7 +158,7 @@ Approved suggestions are executed (file written/deleted/merged), with original c
 
 The Memories tab in the Learning window shows a project selector, provider filter, instruction and memory file browser with content preview, and suggestion cards with actions.
 
-Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion.
+Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion. Background learning refreshes update in place so the current project selection and expanded memory view do not snap back to the default project during polling.
 
 ## Restart Orchestrator
 
