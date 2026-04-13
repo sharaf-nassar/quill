@@ -203,4 +203,4 @@ TypeScript 5.9, Vite 6.0, ESLint 9.39, @vitejs/plugin-react.
 
 ### Backend
 
-Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, reqwest 0.13, rig-core 0.32, serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix). Full list in `src-tauri/Cargo.toml`.
+Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, reqwest 0.13, rig-core 0.32, serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, tauri-plugin-dialog 2, nix (unix). Full list in `src-tauri/Cargo.toml`.

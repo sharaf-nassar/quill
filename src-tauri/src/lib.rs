@@ -119,6 +119,8 @@ fn update_indicator_tray_summary(
 }
 
 async fn check_for_update(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
@@ -131,27 +133,47 @@ async fn check_for_update(app: &tauri::AppHandle) {
         Ok(Some(update)) => {
             let version = update.version.clone();
             log::info!("Update available: {version}");
-            let mut downloaded = 0u64;
-            match update
-                .download_and_install(
-                    |chunk_length, _content_length| {
-                        downloaded += chunk_length as u64;
-                    },
-                    || {},
-                )
-                .await
-            {
-                Ok(()) => {
-                    log::info!("Update {version} installed, restarting...");
-                    app.restart();
-                }
-                Err(e) => {
-                    log::error!("Failed to install update: {e}");
-                }
-            }
+            let app_handle = app.clone();
+            let ver = version.clone();
+            app.dialog()
+                .message(format!("Version {version} is available. Install now?"))
+                .title("Update Available")
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "Install".into(),
+                    "Not Now".into(),
+                ))
+                .show(move |confirmed| {
+                    if confirmed {
+                        tauri::async_runtime::spawn(async move {
+                            let mut downloaded = 0u64;
+                            match update
+                                .download_and_install(
+                                    |chunk_length, _content_length| {
+                                        downloaded += chunk_length as u64;
+                                    },
+                                    || {},
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    log::info!("Update {ver} installed, restarting...");
+                                    app_handle.restart();
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to install update: {e}");
+                                }
+                            }
+                        });
+                    }
+                });
         }
-        Ok(None) => {}
-
+        Ok(None) => {
+            app.dialog()
+                .message("You're already running the latest version.")
+                .title("No Update Available")
+                .kind(MessageDialogKind::Info)
+                .show(|_| {});
+        }
         Err(e) => {
             log::error!("Update check failed: {e}");
         }
@@ -1462,6 +1484,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {

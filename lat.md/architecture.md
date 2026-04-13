@@ -99,6 +99,7 @@ All tasks that touch the database or network MUST be spawned async — never blo
 - **Plugin update checker**: Polls marketplaces every 4 hours for available updates
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
 - **Live usage refresh**: Reuses one shared 3-minute refresh path to update the main widget and tray summary rows
+- **Tray "Check for Update"**: Manual trigger via system tray menu. Uses `tauri-plugin-dialog` to show a native OS confirmation dialog when an update is found (Install / Not Now), or an info dialog when already up to date. The frontend has its own independent 4-hour auto-check via `@tauri-apps/plugin-updater`.
 
 ## Local vs Remote Architecture
 
