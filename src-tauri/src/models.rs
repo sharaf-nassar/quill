@@ -336,7 +336,7 @@ pub struct LearningStatus {
 // --- Session indexing HTTP payloads ---
 
 /// Notify that a session JSONL file has been created/updated
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct SessionNotifyPayload {
     #[serde(default = "default_provider")]
     pub provider: IntegrationProvider,

@@ -48,9 +48,9 @@ Session transcripts are indexed for full-text search with enriched metadata, whi
 
 1. Claude Code writes session JSONL files to `~/.claude/projects/`, and Codex writes rollout transcripts to `~/.codex/sessions/`
 2. When Session Search opens, [[src-tauri/src/sessions.rs]] scans both provider transcript roots incrementally by mtime
-3. Provider hook scripts can also post `POST /api/v1/sessions/notify` with JSONL path plus provider metadata
-4. Or direct message ingestion via `POST /api/v1/sessions/messages`; both routes validate and acknowledge first, then finish extraction and indexing on background workers
-5. Local hook scripts stop their request timer on the first HTTP response from Quill instead of waiting for the full body to drain, so hook latency is tied to enqueue acknowledgement rather than background work
+3. Provider hook scripts can also post `POST /api/v1/sessions/notify` with JSONL path plus provider metadata, while incremental remote sync can push `POST /api/v1/sessions/messages`
+4. `notify` requests are acknowledged first, then coalesced per session and replayed as one atomic delete-and-rebuild batch; `messages` batches append under one writer lock and commit atomically
+5. Local Claude full-transcript sync now runs on Stop instead of every PostToolUse event, so full-file reindexing happens at a stable boundary instead of after each tool completion
 6. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details
 7. Indexed into Tantivy with fields: provider, message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
 8. Tool action details and response-time metrics are stored in provider-aware SQLite tables for deep inspection via MCP and analytics, with transcript reindexing batching tool-action inserts per file/session

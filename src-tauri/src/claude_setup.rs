@@ -883,11 +883,6 @@ fn register_hooks() -> Result<(), String> {
                         "type": "command",
                         "command": format!("node {}/observe.cjs", sd_str),
                         "timeout": 3
-                    },
-                    {
-                        "type": "command",
-                        "command": format!("node {}/session-sync.cjs", sd_str),
-                        "timeout": 3
                     }
                 ]
             }),

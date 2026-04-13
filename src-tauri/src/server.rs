@@ -1,6 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -37,6 +37,13 @@ const MAX_SESSION_MSG_REQUESTS: usize = 100;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_CONTENT_LEN: usize = 1_000_000;
 const MAX_MESSAGES_PER_BATCH: usize = 500;
+const SESSION_NOTIFY_DEBOUNCE_MS: u64 = 250;
+
+struct PendingSessionNotify {
+    generation: u64,
+    updated_at: Instant,
+    latest: SessionNotifyPayload,
+}
 
 struct ServerState {
     storage: &'static Storage,
@@ -44,6 +51,7 @@ struct ServerState {
     rate_limiter: Mutex<VecDeque<Instant>>,
     obs_rate_limiter: Mutex<VecDeque<Instant>>,
     session_rate_limiter: Mutex<VecDeque<Instant>>,
+    pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
 }
@@ -97,6 +105,7 @@ pub async fn start_server(
         rate_limiter: Mutex::new(VecDeque::new()),
         obs_rate_limiter: Mutex::new(VecDeque::new()),
         session_rate_limiter: Mutex::new(VecDeque::new()),
+        pending_session_notifies: Mutex::new(HashMap::new()),
         app_handle,
         session_index,
     });
@@ -233,113 +242,188 @@ fn store_observation_in_background(storage: &'static Storage, payload: Observati
     });
 }
 
-fn index_session_notify_in_background(
+fn session_notify_key(payload: &SessionNotifyPayload) -> String {
+    format!("{}:{}", payload.provider.as_str(), payload.session_id)
+}
+
+fn queue_session_notify(state: Arc<ServerState>, payload: SessionNotifyPayload) {
+    let key = session_notify_key(&payload);
+    let should_spawn = {
+        let mut pending = state.pending_session_notifies.lock();
+        match pending.get_mut(&key) {
+            Some(entry) => {
+                entry.generation = entry.generation.saturating_add(1);
+                entry.updated_at = Instant::now();
+                entry.latest = payload;
+                false
+            }
+            None => {
+                pending.insert(
+                    key.clone(),
+                    PendingSessionNotify {
+                        generation: 0,
+                        updated_at: Instant::now(),
+                        latest: payload,
+                    },
+                );
+                true
+            }
+        }
+    };
+
+    if should_spawn {
+        tauri::async_runtime::spawn(drain_session_notify_queue(state, key));
+    }
+}
+
+async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
+    loop {
+        let (generation, updated_at, payload) = {
+            let pending = state.pending_session_notifies.lock();
+            let Some(entry) = pending.get(&key) else {
+                return;
+            };
+            (entry.generation, entry.updated_at, entry.latest.clone())
+        };
+
+        let debounce = Duration::from_millis(SESSION_NOTIFY_DEBOUNCE_MS);
+        let elapsed = updated_at.elapsed();
+        if elapsed < debounce {
+            tokio::time::sleep(debounce - elapsed).await;
+        }
+
+        {
+            let pending = state.pending_session_notifies.lock();
+            let Some(entry) = pending.get(&key) else {
+                return;
+            };
+            if entry.generation != generation {
+                continue;
+            }
+        }
+
+        let Some(idx) = state.session_index.clone() else {
+            let mut pending = state.pending_session_notifies.lock();
+            pending.remove(&key);
+            return;
+        };
+
+        let storage = state.storage;
+        let app_handle = state.app_handle.clone();
+        match tokio::task::spawn_blocking(move || {
+            process_session_notify_payload(storage, app_handle, idx, payload)
+        })
+        .await
+        {
+            Ok(Err(err)) => log::error!("Failed to index session notify: {err}"),
+            Err(err) => log::error!("Session notify worker panicked: {err}"),
+            Ok(Ok(_)) => {}
+        }
+
+        let should_stop = {
+            let mut pending = state.pending_session_notifies.lock();
+            match pending.get(&key) {
+                Some(entry) if entry.generation == generation => {
+                    pending.remove(&key);
+                    true
+                }
+                Some(_) => false,
+                None => true,
+            }
+        };
+
+        if should_stop {
+            break;
+        }
+    }
+}
+
+fn process_session_notify_payload(
     storage: &'static Storage,
     app_handle: tauri::AppHandle,
     session_index: Arc<sessions::SessionIndex>,
     payload: SessionNotifyPayload,
-) {
-    let _task = tokio::task::spawn_blocking(move || {
-        let path = std::path::PathBuf::from(&payload.jsonl_path);
+) -> Result<usize, String> {
+    let path = std::path::PathBuf::from(&payload.jsonl_path);
 
-        let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
-        if let Some(git_branch) = payload
-            .git_branch
-            .as_deref()
-            .filter(|branch| !branch.is_empty())
-        {
-            for msg in &mut extracted.messages {
-                if msg.git_branch.is_empty() {
-                    msg.git_branch = git_branch.to_string();
-                }
+    let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
+    if let Some(git_branch) = payload
+        .git_branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+    {
+        for msg in &mut extracted.messages {
+            if msg.git_branch.is_empty() {
+                msg.git_branch = git_branch.to_string();
             }
         }
-        if extracted.messages.is_empty() {
-            return;
-        }
+    }
+    if extracted.messages.is_empty() {
+        return Ok(0);
+    }
 
-        let project_name = payload
-            .project
-            .clone()
-            .filter(|project| !project.is_empty())
-            .or_else(|| extracted.project_name.clone())
-            .or_else(|| {
-                payload.cwd.as_deref().and_then(|cwd| {
-                    std::path::Path::new(cwd)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .map(|name| name.to_string())
-                })
+    let project_name = payload
+        .project
+        .clone()
+        .filter(|project| !project.is_empty())
+        .or_else(|| extracted.project_name.clone())
+        .or_else(|| {
+            payload.cwd.as_deref().and_then(|cwd| {
+                std::path::Path::new(cwd)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
             })
-            .or_else(|| {
-                path.parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .map(sessions::SessionIndex::project_display_name)
-            })
-            .unwrap_or_else(|| "unknown".to_string());
-        let host = payload
-            .host
-            .clone()
-            .filter(|host| !host.is_empty())
-            .unwrap_or_else(|| "local".to_string());
-        let session_id = if extracted.session_id.is_empty() {
-            payload.session_id.clone()
-        } else {
-            extracted.session_id.clone()
-        };
+        })
+        .or_else(|| {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(sessions::SessionIndex::project_display_name)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let host = payload
+        .host
+        .clone()
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "local".to_string());
+    let session_id = if extracted.session_id.is_empty() {
+        payload.session_id.clone()
+    } else {
+        extracted.session_id.clone()
+    };
 
-        let result = (|| -> Result<usize, String> {
-            // Delete existing docs + tool_actions for this session before re-indexing.
-            session_index.delete_session_docs(payload.provider, &session_id)?;
-            if let Err(err) = storage.delete_tool_actions_for_session(payload.provider, &session_id)
-            {
-                log::warn!("Failed to delete old tool_actions: {err}");
-            }
-            if let Err(err) =
-                storage.delete_response_times_for_session(payload.provider, &session_id)
-            {
-                log::warn!("Failed to delete old response_times: {err}");
-            }
+    if let Err(err) = storage.delete_tool_actions_for_session(payload.provider, &session_id) {
+        log::warn!("Failed to delete old tool_actions: {err}");
+    }
+    if let Err(err) = storage.delete_response_times_for_session(payload.provider, &session_id) {
+        log::warn!("Failed to delete old response_times: {err}");
+    }
 
-            let mut count = 0usize;
-            for msg in &extracted.messages {
-                session_index.index_message(payload.provider, msg, &project_name, &host)?;
-                count += 1;
-            }
+    let count = session_index.replace_session_docs_batch(
+        payload.provider,
+        &session_id,
+        &project_name,
+        &host,
+        &extracted.messages,
+    )?;
 
-            if let Err(err) =
-                storage.store_tool_actions_for_messages(payload.provider, &extracted.messages)
-            {
-                log::warn!("Failed to store tool actions: {err}");
-            }
+    if let Err(err) = storage.store_tool_actions_for_messages(payload.provider, &extracted.messages)
+    {
+        log::warn!("Failed to store tool actions: {err}");
+    }
 
-            let mut writer = session_index.writer.lock();
-            writer
-                .commit()
-                .map_err(|err| format!("Commit index: {err}"))?;
-            Ok(count)
-        })();
+    let rt_pairs: Vec<(&str, &str)> = extracted
+        .messages
+        .iter()
+        .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+        .collect();
+    if let Err(err) = storage.ingest_response_times(payload.provider, &session_id, &rt_pairs) {
+        log::warn!("Failed to store response times: {err}");
+    }
+    let _ = app_handle.emit("sessions-index-updated", count);
 
-        match result {
-            Ok(count) => {
-                let rt_pairs: Vec<(&str, &str)> = extracted
-                    .messages
-                    .iter()
-                    .map(|m| (m.role.as_str(), m.timestamp.as_str()))
-                    .collect();
-                if let Err(err) =
-                    storage.ingest_response_times(payload.provider, &session_id, &rt_pairs)
-                {
-                    log::warn!("Failed to store response times: {err}");
-                }
-                let _ = app_handle.emit("sessions-index-updated", count);
-            }
-            Err(err) => {
-                log::error!("Failed to index session notify: {err}");
-            }
-        }
-    });
+    Ok(count)
 }
 
 fn index_session_messages_in_background(
@@ -353,19 +437,8 @@ fn index_session_messages_in_background(
         let host = payload.host.clone();
         let project = payload.project.clone();
 
-        let result = (|| -> Result<usize, String> {
-            let mut count = 0usize;
-            for msg in &extracted {
-                session_index.index_message(payload.provider, msg, &project, &host)?;
-                count += 1;
-            }
-
-            let mut writer = session_index.writer.lock();
-            writer
-                .commit()
-                .map_err(|err| format!("Commit index: {err}"))?;
-            Ok(count)
-        })();
+        let result =
+            session_index.append_messages_batch(payload.provider, &project, &host, &extracted);
 
         match result {
             Ok(count) => {
@@ -691,17 +764,14 @@ async fn post_session_notify(
         );
     }
 
-    let idx = match &state.session_index {
-        Some(idx) => idx.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Session index not available".to_string(),
-            );
-        }
-    };
+    if state.session_index.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session index not available".to_string(),
+        );
+    }
 
-    index_session_notify_in_background(state.storage, state.app_handle.clone(), idx, payload);
+    queue_session_notify(state.clone(), payload);
     (StatusCode::ACCEPTED, "queued".to_string())
 }
 

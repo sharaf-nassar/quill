@@ -258,14 +258,13 @@ impl SessionIndex {
             .to_string()
     }
 
-    /// Index a single extracted message into the tantivy index.
-    pub fn index_message(
+    fn build_index_document(
         &self,
         provider: IntegrationProvider,
         msg: &ExtractedMessage,
         project_facet: &str,
         host_facet: &str,
-    ) -> Result<(), String> {
+    ) -> TantivyDocument {
         let mut doc = TantivyDocument::default();
 
         doc.add_text(self.fields.provider, provider.as_str());
@@ -317,16 +316,27 @@ impl SessionIndex {
         };
         doc.add_date(self.fields.timestamp, ts);
 
-        let writer = self.writer.lock();
+        doc
+    }
+
+    fn add_message_to_writer(
+        &self,
+        writer: &IndexWriter,
+        provider: IntegrationProvider,
+        msg: &ExtractedMessage,
+        project_facet: &str,
+        host_facet: &str,
+    ) -> Result<(), String> {
+        let doc = self.build_index_document(provider, msg, project_facet, host_facet);
         writer
             .add_document(doc)
             .map_err(|e| format!("Add document: {e}"))?;
-
         Ok(())
     }
 
-    pub(crate) fn delete_session_docs(
+    fn delete_session_docs_with_writer(
         &self,
+        writer: &IndexWriter,
         provider: IntegrationProvider,
         session_id: &str,
     ) -> Result<(), String> {
@@ -343,11 +353,42 @@ impl SessionIndex {
             ),
         ]);
 
-        let writer = self.writer.lock();
         writer
             .delete_query(Box::new(delete_query))
             .map(|_| ())
             .map_err(|e| format!("Delete session docs: {e}"))
+    }
+
+    pub(crate) fn replace_session_docs_batch(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+        project_facet: &str,
+        host_facet: &str,
+        messages: &[ExtractedMessage],
+    ) -> Result<usize, String> {
+        let mut writer = self.writer.lock();
+        self.delete_session_docs_with_writer(&writer, provider, session_id)?;
+        for msg in messages {
+            self.add_message_to_writer(&writer, provider, msg, project_facet, host_facet)?;
+        }
+        writer.commit().map_err(|e| format!("Commit index: {e}"))?;
+        Ok(messages.len())
+    }
+
+    pub(crate) fn append_messages_batch(
+        &self,
+        provider: IntegrationProvider,
+        project_facet: &str,
+        host_facet: &str,
+        messages: &[ExtractedMessage],
+    ) -> Result<usize, String> {
+        let mut writer = self.writer.lock();
+        for msg in messages {
+            self.add_message_to_writer(&writer, provider, msg, project_facet, host_facet)?;
+        }
+        writer.commit().map_err(|e| format!("Commit index: {e}"))?;
+        Ok(messages.len())
     }
 
     fn local_hostname() -> String {
@@ -452,8 +493,10 @@ impl SessionIndex {
         use tauri::Emitter;
 
         let mut total_indexed = 0usize;
+        let mut index_changed = false;
         let mut state = self.state.lock();
         let hostname = Self::local_hostname();
+        let mut writer = self.writer.lock();
 
         for discovered in Self::discover_session_files()? {
             let file_key = discovered.path.to_string_lossy().to_string();
@@ -477,9 +520,14 @@ impl SessionIndex {
                 .unwrap_or_else(|| discovered.default_project.clone());
 
             if known_mtime.is_some() && !extracted.session_id.is_empty() {
-                if let Err(e) = self.delete_session_docs(discovered.provider, &extracted.session_id)
-                {
+                if let Err(e) = self.delete_session_docs_with_writer(
+                    &writer,
+                    discovered.provider,
+                    &extracted.session_id,
+                ) {
                     log::warn!("Failed to delete old session docs: {e}");
+                } else {
+                    index_changed = true;
                 }
 
                 if let Some(storage) = storage {
@@ -498,10 +546,16 @@ impl SessionIndex {
             }
 
             for msg in &extracted.messages {
-                if let Err(e) =
-                    self.index_message(discovered.provider, msg, &project_name, &hostname)
-                {
+                if let Err(e) = self.add_message_to_writer(
+                    &writer,
+                    discovered.provider,
+                    msg,
+                    &project_name,
+                    &hostname,
+                ) {
                     log::warn!("Failed to index message: {e}");
+                } else {
+                    index_changed = true;
                 }
             }
 
@@ -535,10 +589,11 @@ impl SessionIndex {
         }
 
         // Commit all changes
-        if total_indexed > 0 {
-            let mut writer = self.writer.lock();
+        if index_changed {
             writer.commit().map_err(|e| format!("Commit index: {e}"))?;
         }
+
+        drop(writer);
 
         // Must drop state lock before save_state which acquires it
         drop(state);

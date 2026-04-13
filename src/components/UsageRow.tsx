@@ -14,7 +14,7 @@ function statusText(utilization: number): { short: string; full: string } {
   return { short: "Crit", full: "Critical usage" };
 }
 
-function gradientColor(utilization: number): string {
+export function gradientColor(utilization: number): string {
   const t = Math.max(0, Math.min(utilization / 100, 1));
   let r: number, g: number, b: number;
   if (t < 0.5) {
@@ -31,7 +31,7 @@ function gradientColor(utilization: number): string {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
-function formatCountdown(resetsAt: string | null): ReactNode[] | null {
+export function formatCountdown(resetsAt: string | null): ReactNode[] | null {
   if (!resetsAt) return null;
   try {
     const resetDate = new Date(resetsAt);

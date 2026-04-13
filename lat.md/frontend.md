@@ -50,14 +50,15 @@ Top-level UI chrome and live rate limit display shared across the main window.
 - **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).
 - **UsageDisplay** (`src/components/UsageDisplay.tsx`) — Composes the shared workload summary rail, grouped provider limit sections, the detailed-row time mode selector, and provider-error handling for the main window's live pane.
 - **LiveSummaryModule** (`src/components/live/LiveSummaryModule.tsx`) — Shared top-of-pane workload module with the 1h/6h/12h/24h selector, freshness label, and aggregate `Sessions`, `Projects`, and `Tokens` cards across the enabled providers.
-- **ProviderUsageModule** (`src/components/live/ProviderUsageModule.tsx`) — Reusable provider section that renders Claude or Codex quota rows with a provider badge and source note.
-- **UsageRow** (`src/components/UsageRow.tsx`, 222 lines) — Individual rate limit visualization with three display modes: pace marker (vertical line), dual bars (time elapsed vs utilization), or background fill.
+- **ProviderUsageModule** (`src/components/live/ProviderUsageModule.tsx`) — Reusable provider section that renders quota rows with a provider badge and source note. For MiniMax, filters buckets to primary models (M\*, coding-plan-search, coding-plan-vlm) and shows an "All models" hover badge with a tooltip displaying the remaining models' name, utilization, and reset countdown.
+- **UsageRow** (`src/components/UsageRow.tsx`, 222 lines) — Individual rate limit visualization with three display modes: pace marker (vertical line), dual bars (time elapsed vs utilization), or background fill. Exports `formatCountdown` and `gradientColor` utilities for reuse by tooltip renderers.
 
 ### Analytics Components
 
 Recharts-based analytics in `src/components/analytics/` with three tabs: Now, Trends, and Charts.
 
 - **NowTab** (214 lines) — Real-time metrics with range selector (1h/24h/7d/30d), six insight cards, a 24-hour activity heatmap, and a switchable breakdown panel (hosts/projects/sessions).
+- `NowTab` shares one comparison-range code-history fetch between the efficiency and velocity cards via `src/hooks/useCodeInsights.ts`, which avoids firing the same `get_code_stats_history` IPC call twice per refresh.
 - Selecting a session in `NowTab` now keeps provider identity alongside `session_id`, so token charts, compact token stats, and delete actions stay scoped to the correct Claude or Codex session.
 - **TrendsTab** (105 lines) — Token trends, code velocity, and cache efficiency charts with week-over-week comparison.
 - **ChartsTab** (454 lines) — Composite Recharts chart with three axes (utilization, tokens, LOC). Lazy-loaded with Suspense.

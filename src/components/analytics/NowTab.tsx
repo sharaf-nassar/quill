@@ -2,8 +2,7 @@ import { useState } from "react";
 import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import { useTokenData } from "../../hooks/useTokenData";
 import { useCodeStats } from "../../hooks/useCodeStats";
-import { useEfficiencyStats } from "../../hooks/useEfficiencyStats";
-import { useVelocityStats } from "../../hooks/useVelocityStats";
+import { useCodeInsights } from "../../hooks/useCodeInsights";
 import { useResponseTimeStats } from "../../hooks/useResponseTimeStats";
 import { formatNumber, formatDurationSecs } from "../../utils/format";
 import InsightCard from "./InsightCard";
@@ -89,9 +88,7 @@ function NowTab({ range, onRangeChange, currentBucket }: NowTabProps) {
 	);
 
 	const { stats: codeStats, history: codeHistory } = useCodeStats(range);
-
-	const efficiencyStats = useEfficiencyStats(range);
-	const velocityStats = useVelocityStats(range);
+	const { efficiency: efficiencyStats, velocity: velocityStats } = useCodeInsights(range);
 
 	return (
 		<>

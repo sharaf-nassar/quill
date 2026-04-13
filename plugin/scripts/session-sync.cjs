@@ -130,8 +130,10 @@ function main() {
     const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
     if (isLocal(config.url)) {
-      // LOCAL: notify the server to read the JSONL itself
+      // LOCAL: full-transcript reindexing is expensive, so only do it on Stop.
+      if (input.hook_event_name !== "Stop") return;
       postJSON(config, "/api/v1/sessions/notify", {
+        provider: "claude",
         session_id: sessionId,
         jsonl_path: transcriptPath,
       });

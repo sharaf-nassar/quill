@@ -76,6 +76,8 @@ Tables for recording and aggregating provider-aware live usage bucket utilizatio
 
 Live usage ingestion stores Claude API buckets and Codex transcript-derived rate-limit buckets in the same tables. Codex `rate_limits.resets_at` values are normalized from transcript epoch timestamps into RFC3339 strings before storage so the live pane can show the same reset countdown semantics as Claude. Migration 14 backfills older Claude-only rows by deriving stable bucket keys from legacy labels, and startup creates provider-only indexes after migrations so older databases can still boot before those columns exist. The generic `settings` table also stores Claude live-usage fetch metadata such as the last attempted poll time, any active 429 cooldown, and the configured indicator primary-provider preference used by the tray and indicator window.
 
+The startup path restores recent live buckets from `usage_snapshots` through [[src-tauri/src/storage.rs#Storage#get_latest_usage_buckets]]. That lookup now uses a grouped latest-timestamp join instead of a correlated subquery because the older form could take tens of seconds once `usage_snapshots` grew large, which left the live pane stuck on `Loading…` during app startup.
+
 #### Token Tracking
 
 Tables for recording per-session token consumption and hourly host-level aggregates with provider provenance.
@@ -92,6 +94,8 @@ Tables for the behavioral learning pipeline: observations, summaries, analysis r
 - **observation_summaries** — Per-period/provider/project summaries (tool_counts JSON, error_count, total). Unique on (period, provider, project).
 - **learning_runs** — Analysis run records (trigger_mode, observations_analyzed, rules created/updated, duration, status, error).
 - **learned_rules** — Discovered patterns (name unique, domain, confidence, observation_count, file_path, content, state, is_anti_pattern, source). The `content` column (migration 11) stores sanitized rule text for manual promotion.
+
+Startup also creates covering observation indexes for `(created_at, tool_name)` and `(provider, created_at, tool_name)` so learning UI queries such as `get_top_tools` can stay on exact raw-observation windows without paying extra table scans. The same startup pass adds `tool_actions` indexes for `(category, timestamp)` and `(category, provider, session_id)` so ordered code-history lookups and per-session code aggregations avoid broad category scans.
 
 #### Session Indexing
 
@@ -162,9 +166,13 @@ Read and trigger commands accept an optional provider filter so the UI can reque
 
 `get_learning_settings`, `set_learning_settings`, `get_learned_rules`, `delete_learned_rule`, `promote_learned_rule`, `get_learning_runs`, `trigger_analysis`, `get_observation_count`, `get_unanalyzed_observation_count`, `get_top_tools`, `get_observation_sparkline`, `read_rule_content`.
 
+`get_top_tools` intentionally reads exact raw-observation windows instead of reusing `observation_summaries`, because summary rows are keyed by cleanup period rather than original event timestamps. The backend relies on the covering observation indexes above to keep that exact-window query responsive.
+
 ### Code and Response Stats (4)
 
 `get_code_stats`, `get_code_stats_history`, `get_batch_session_code_stats`, `get_response_time_stats`.
+
+`get_batch_session_code_stats` fans out one SQL branch per `(provider, session_id)` pair with `UNION ALL` so SQLite can use the `tool_actions` provider/session index instead of falling back to a broad category scan across the entire code-change corpus.
 
 ### Memory Optimizer Commands (16)
 
@@ -240,9 +248,9 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
 
-When a transcript is reprocessed, Tantivy documents are still rewritten per message, but SQLite `tool_actions` side-table writes are batched once per extracted file or notify payload. This keeps the shared storage connection available for launch-time analytics instead of monopolizing it with thousands of tiny transactions.
+When a transcript is reprocessed, Quill now coalesces repeated `notify` requests per session and applies each rewrite under one Tantivy writer lock with a single commit. This avoids overlapping delete-and-reindex batches while keeping SQLite `tool_actions` writes batched per extracted file or payload.
 
-The HTTP API also accepts provider-tagged notify and direct message ingestion. TF-IDF scoring plus snippet generation power the shared search UI with provider filters and badges.
+The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. TF-IDF scoring plus snippet generation power the shared search UI with provider filters and badges.
 
 ## AI Client
 

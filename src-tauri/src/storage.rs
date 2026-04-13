@@ -383,8 +383,18 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
         ),
         (
             table_has_column(conn, "observations", "provider"),
-            "CREATE INDEX IF NOT EXISTS idx_obs_provider_created ON observations(provider, created_at);",
+            "CREATE INDEX IF NOT EXISTS idx_obs_provider_created ON observations(provider, created_at);
+             CREATE INDEX IF NOT EXISTS idx_obs_provider_created_tool ON observations(provider, created_at, tool_name);
+             CREATE INDEX IF NOT EXISTS idx_obs_created_tool ON observations(created_at, tool_name);",
             "observation provider indexes",
+        ),
+        (
+            table_has_column(conn, "tool_actions", "category")
+                && table_has_column(conn, "tool_actions", "provider")
+                && table_has_column(conn, "tool_actions", "session_id"),
+            "CREATE INDEX IF NOT EXISTS idx_tool_actions_category_timestamp ON tool_actions(category, timestamp);
+             CREATE INDEX IF NOT EXISTS idx_tool_actions_category_provider_session ON tool_actions(category, provider, session_id);",
+            "tool action query indexes",
         ),
     ];
 
@@ -1400,15 +1410,20 @@ impl Storage {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT bucket_key, bucket_label, utilization, resets_at
+                // Avoid the correlated MAX(timestamp) subquery here. On large
+                // usage_snapshots tables it scales poorly enough to stall the
+                // startup fetch path that restores cached live buckets.
+                "SELECT snapshot.bucket_key, snapshot.bucket_label, snapshot.utilization, snapshot.resets_at
                  FROM usage_snapshots snapshot
+                 INNER JOIN (
+                     SELECT bucket_key, MAX(timestamp) AS latest_timestamp
+                     FROM usage_snapshots
+                     WHERE provider = ?1
+                     GROUP BY bucket_key
+                 ) latest
+                   ON latest.bucket_key = snapshot.bucket_key
+                  AND latest.latest_timestamp = snapshot.timestamp
                  WHERE snapshot.provider = ?1
-                   AND snapshot.timestamp = (
-                       SELECT MAX(inner_snapshot.timestamp)
-                       FROM usage_snapshots inner_snapshot
-                       WHERE inner_snapshot.provider = snapshot.provider
-                         AND inner_snapshot.bucket_key = snapshot.bucket_key
-                   )
                  ORDER BY
                      CASE snapshot.provider WHEN 'claude' THEN 0 ELSE 1 END,
                      snapshot.bucket_label ASC",
@@ -4216,30 +4231,36 @@ impl Storage {
         }
 
         let conn = self.conn.lock();
-
-        let predicates: Vec<String> = session_refs
+        let mut seen = std::collections::HashSet::new();
+        let unique_refs: Vec<&SessionRef> = session_refs
+            .iter()
+            .filter(|session_ref| {
+                seen.insert(session_key(session_ref.provider, &session_ref.session_id))
+            })
+            .collect();
+        let sql = unique_refs
             .iter()
             .enumerate()
             .map(|(idx, _)| {
                 let provider_pos = idx * 2 + 1;
                 let session_pos = provider_pos + 1;
-                format!("(provider = ?{provider_pos} AND session_id = ?{session_pos})")
+                format!(
+                    "SELECT provider, session_id, tool_name, full_input
+                     FROM tool_actions
+                     WHERE category = 'code_change'
+                       AND full_input IS NOT NULL
+                       AND provider = ?{provider_pos}
+                       AND session_id = ?{session_pos}"
+                )
             })
-            .collect();
-        let sql = format!(
-            "SELECT provider, session_id, tool_name, full_input
-			 FROM tool_actions
-			 WHERE category = 'code_change'
-			   AND full_input IS NOT NULL
-			   AND ({})",
-            predicates.join(" OR ")
-        );
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
 
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("Prepare error: {e}"))?;
 
-        let params: Vec<Box<dyn rusqlite::types::ToSql>> = session_refs
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = unique_refs
             .iter()
             .flat_map(|session_ref| {
                 [
