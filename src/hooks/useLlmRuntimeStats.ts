@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { RangeType, LlmRuntimeStats, SparklinePoint } from "../types";
+
+const REFRESH_DEBOUNCE_MS = 1000;
 
 interface LlmRuntimeStatsResult {
 	totalRuntimeSecs: number | null;
@@ -47,6 +50,21 @@ export function useLlmRuntimeStats(range: RangeType): LlmRuntimeStatsResult {
 	}, [range]);
 
 	useEffect(() => { fetchData(); }, [fetchData]);
+	useEffect(() => {
+		let mounted = true;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const unlistenPromise = listen("sessions-index-updated", () => {
+			if (!mounted) return;
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
+		});
+
+		return () => {
+			mounted = false;
+			if (timer) clearTimeout(timer);
+			unlistenPromise.then((fn) => fn());
+		};
+	}, [fetchData]);
 	useEffect(() => {
 		const interval = setInterval(fetchData, 60_000);
 		return () => clearInterval(interval);

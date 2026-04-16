@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
 	RangeType,
 	TokenDataPoint,
@@ -28,6 +29,7 @@ interface CodeInsightsResult {
 }
 
 const SPARKLINE_BUCKETS = 7;
+const REFRESH_DEBOUNCE_MS = 1000;
 
 function getRangeMs(range: RangeType): number {
 	switch (range) {
@@ -202,6 +204,28 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 
 	useEffect(() => {
 		fetchData();
+	}, [fetchData]);
+
+	useEffect(() => {
+		let mounted = true;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const scheduleRefresh = () => {
+			if (!mounted) return;
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
+		};
+		const unlistenPromises = [
+			listen("tokens-updated", scheduleRefresh),
+			listen("sessions-index-updated", scheduleRefresh),
+		];
+
+		return () => {
+			mounted = false;
+			if (timer) clearTimeout(timer);
+			for (const unlistenPromise of unlistenPromises) {
+				unlistenPromise.then((fn) => fn());
+			}
+		};
 	}, [fetchData]);
 
 	useEffect(() => {

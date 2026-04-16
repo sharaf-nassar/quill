@@ -66,15 +66,21 @@ export function useBreakdownData(mode: BreakdownMode, days: number) {
   useEffect(() => {
     let mounted = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const unlistenPromise = listen("tokens-updated", () => {
+    const scheduleRefresh = () => {
       if (!mounted) return;
       if (timer) clearTimeout(timer);
       timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
-    });
+    };
+    const unlistenPromises = [
+      listen("tokens-updated", scheduleRefresh),
+      listen("sessions-index-updated", scheduleRefresh),
+    ];
     return () => {
       mounted = false;
       if (timer) clearTimeout(timer);
-      unlistenPromise.then((fn) => fn());
+      for (const unlistenPromise of unlistenPromises) {
+        unlistenPromise.then((fn) => fn());
+      }
     };
   }, [fetchData]);
 

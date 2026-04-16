@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { RangeType, CodeStats, CodeStatsHistoryPoint } from "../types";
+
+const REFRESH_DEBOUNCE_MS = 1000;
 
 export function useCodeStats(range: RangeType) {
 	const [stats, setStats] = useState<CodeStats | null>(null);
@@ -33,6 +36,22 @@ export function useCodeStats(range: RangeType) {
 
 	useEffect(() => {
 		fetchData();
+	}, [fetchData]);
+
+	useEffect(() => {
+		let mounted = true;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const unlistenPromise = listen("sessions-index-updated", () => {
+			if (!mounted) return;
+			if (timer) clearTimeout(timer);
+			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
+		});
+
+		return () => {
+			mounted = false;
+			if (timer) clearTimeout(timer);
+			unlistenPromise.then((fn) => fn());
+		};
 	}, [fetchData]);
 
 	// Periodic refresh every 60s
