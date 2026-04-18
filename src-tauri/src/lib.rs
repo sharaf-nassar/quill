@@ -1051,13 +1051,17 @@ async fn get_optimization_suggestions(
     let limit = limit.unwrap_or(200);
     let offset = offset.unwrap_or(0);
     run_blocking(move || {
-        storage.get_optimization_suggestions(
+        let suggestions = storage.get_optimization_suggestions(
             &project_path,
             provider,
             status_filter.as_deref(),
             limit,
             offset,
-        )
+        )?;
+        Ok(suggestions
+            .into_iter()
+            .filter(memory_optimizer::should_surface_suggestion)
+            .collect())
     })
 }
 

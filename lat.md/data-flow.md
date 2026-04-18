@@ -73,13 +73,14 @@ LLM analyzes project memory files to suggest consolidation, cleanup, and improve
 4. Compute dynamic budget allocation based on available section types
 5. Assemble LLM prompt: memory file contents + scoped `CLAUDE.md` or `AGENTS.md` instruction files + learned rules + instinct sections
 6. Call Haiku to generate structured optimization suggestions
-7. Suggestions stored in `optimization_suggestions` with `provider_scope` and status=pending
-8. `memory-optimizer-updated` event notifies frontend
-9. User reviews suggestions in the Memories panel with provider badges and a shared provider filter
-10. On approve: execute action (write/delete/merge file), store backup in `backup_data` column, set status=executed
-11. On deny: set status=denied (can be un-denied later)
-12. On undo: restore from backup_data, set status=reverted
-13. `memory-files-updated` event triggers UI refresh
+7. Backend validates suggestion shape before storage: malformed merges, missing content/targets, instruction-file merges, and other unsafe outputs are discarded instead of being surfaced in the UI
+8. Valid suggestions stored in `optimization_suggestions` with `provider_scope` and status=pending
+9. `memory-optimizer-updated` event notifies frontend
+10. User reviews suggestions in the Memories panel with provider badges and a shared provider filter
+11. On approve: execute action (write/delete/merge file), store backup in `backup_data` column, set status=executed
+12. On deny: set status=denied (can be un-denied later)
+13. On undo: restore from backup_data, set status=reverted
+14. `memory-files-updated` event triggers UI refresh
 
 ### Suggestion Types
 

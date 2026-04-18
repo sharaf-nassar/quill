@@ -152,13 +152,13 @@ Calls Haiku to generate provider-scoped optimization suggestions. Suggestion typ
 
 Suggestions follow a status flow: pending -> approved/denied, with backup for undo. Group operations allow batch approve/deny.
 
-Approved suggestions are executed (file written/deleted/merged), with original content backed up. Denied suggestions can be un-denied. Executed suggestions can be undone (restores from backup).
+Approved suggestions are executed (file written/deleted/merged), with original content backed up. Denied suggestions can be un-denied. Executed suggestions can be undone (restores from backup). Malformed LLM output is filtered before storage so the UI only surfaces actionable suggestions, and `MEMORY.md` is treated as a special index file that can be updated directly but not merged as a source.
 
 ### UI
 
 The Memories tab in the Learning window shows a project selector, provider filter, instruction and memory file browser with content preview, and suggestion cards with actions.
 
-Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion. Background learning refreshes update in place so the current project selection and expanded memory view do not snap back to the default project during polling.
+Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion. The manage panel bulk delete acts on the current Memories selection, including aggregated deletion across `All Projects`, while still leaving instruction files untouched. Background learning refreshes update in place so the current project selection and expanded memory view do not snap back to the default project during polling. Bulk `Optimize All` runs keep the panel in a stable in-place state instead of flashing the all-projects browser as individual runs finish.
 
 ## Restart Orchestrator
 

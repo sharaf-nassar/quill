@@ -570,6 +570,12 @@ fn build_prompt(
         "5. Gaps where a new memory or instruction update would help (project-specific context not captured elsewhere)\n\n",
     );
     prompt.push_str(
+        "MEMORY.md is a special index file: suggest update if it needs edits, but never merge it with other files.\n",
+    );
+    prompt.push_str(
+        "Never propose merge suggestions that include CLAUDE.md, AGENTS.md, ~/.claude/CLAUDE.md, or ~/.codex/AGENTS.md as sources.\n\n",
+    );
+    prompt.push_str(
         "If the memories are already clean and optimal, return an empty suggestions array.\n",
     );
     prompt.push_str(
@@ -753,13 +759,27 @@ pub async fn run_optimization_with_run(
             }),
             _ => suggestion.target_file.clone(),
         };
+        let action_type = suggestion.action_type.to_string();
+
+        if let Err(err) = validate_generated_suggestion(
+            &action_type,
+            project_path,
+            &mem_dir,
+            target_file.as_deref(),
+            suggestion.proposed_content.as_deref(),
+            suggestion.merge_sources.as_deref(),
+        ) {
+            log::warn!(
+                "Skipping invalid {} suggestion on '{}': {}",
+                action_type,
+                target_file.as_deref().unwrap_or("(new)"),
+                err
+            );
+            continue;
+        }
 
         if storage
-            .has_duplicate_pending(
-                project_path,
-                &suggestion.action_type.to_string(),
-                target_file.as_deref(),
-            )
+            .has_duplicate_pending(project_path, &action_type, target_file.as_deref())
             .unwrap_or(false)
         {
             log::info!(
@@ -822,7 +842,7 @@ pub async fn run_optimization_with_run(
         let sug_id = storage.store_optimization_suggestion(
             run_id,
             project_path,
-            &suggestion.action_type.to_string(),
+            &action_type,
             target_file.as_deref(),
             &suggestion.reasoning,
             suggestion.proposed_content.as_deref(),
@@ -844,7 +864,7 @@ pub async fn run_optimization_with_run(
     storage.update_optimization_run(
         run_id,
         actual_count as i64,
-        result.suggestions.len() as i64,
+        stored_suggestions.len() as i64,
         &context_sources_json,
         "completed",
         None,
@@ -880,6 +900,8 @@ fn resolve_target_path(
     } else if target.contains("/.codex/AGENTS.md") || target == "~/.codex/AGENTS.md" {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         Ok(home.join(".codex").join("AGENTS.md"))
+    } else if target == "MEMORY.md" {
+        Ok(mem_dir.join("MEMORY.md"))
     } else {
         let resolved = mem_dir.join(target);
         for component in resolved.components() {
@@ -896,6 +918,112 @@ fn resolve_target_path(
         }
         Ok(resolved)
     }
+}
+
+fn is_memory_index_target(target: &str) -> bool {
+    target == "MEMORY.md"
+}
+
+fn validate_suggestion_shape(
+    action_type: &str,
+    target_file: Option<&str>,
+    proposed_content: Option<&str>,
+    merge_sources: Option<&[String]>,
+) -> Result<(), String> {
+    let non_empty_content = proposed_content
+        .map(str::trim)
+        .filter(|content| !content.is_empty());
+
+    match action_type {
+        "delete" => {
+            target_file.ok_or("Delete suggestion missing target_file")?;
+        }
+        "update" => {
+            target_file.ok_or("Update suggestion missing target_file")?;
+            non_empty_content.ok_or("Update suggestion missing proposed_content")?;
+        }
+        "create" => {
+            target_file.ok_or("Create suggestion missing target filename")?;
+            non_empty_content.ok_or("Create suggestion missing proposed_content")?;
+        }
+        "merge" => {
+            target_file.ok_or("Merge suggestion missing target_file")?;
+            non_empty_content.ok_or("Merge suggestion missing proposed_content")?;
+            let sources = merge_sources.ok_or("Merge suggestion missing merge_sources")?;
+            if sources.is_empty() {
+                return Err("Merge suggestion missing merge_sources".to_string());
+            }
+        }
+        "flag" => {}
+        other => return Err(format!("Unknown action type: {other}")),
+    }
+
+    if action_type == "merge"
+        && let Some(sources) = merge_sources
+        && sources
+            .iter()
+            .any(|source| is_instruction_target(source) || is_memory_index_target(source))
+    {
+        return Err("Merge suggestions cannot include instruction files or MEMORY.md".to_string());
+    }
+
+    if action_type == "create"
+        && let Some(target) = target_file
+        && is_memory_index_target(target)
+    {
+        return Err("Create suggestions cannot target MEMORY.md".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_generated_suggestion(
+    action_type: &str,
+    project_path: &str,
+    mem_dir: &Path,
+    target_file: Option<&str>,
+    proposed_content: Option<&str>,
+    merge_sources: Option<&[String]>,
+) -> Result<(), String> {
+    validate_suggestion_shape(action_type, target_file, proposed_content, merge_sources)?;
+
+    if let Some(target) = target_file {
+        match action_type {
+            "update" | "flag" => {
+                resolve_target_path(target, project_path, mem_dir)?;
+            }
+            "delete" | "create" | "merge" => {
+                if is_instruction_target(target) {
+                    return Err(format!(
+                        "{} suggestions cannot target instruction files",
+                        action_type
+                    ));
+                }
+                resolve_target_path(target, project_path, mem_dir)?;
+            }
+            _ => {}
+        }
+    }
+
+    if action_type == "merge"
+        && let Some(sources) = merge_sources
+    {
+        for source in sources {
+            resolve_target_path(source, project_path, mem_dir)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn should_surface_suggestion(suggestion: &crate::models::OptimizationSuggestion) -> bool {
+    validate_suggestion_shape(
+        &suggestion.action_type,
+        suggestion.target_file.as_deref(),
+        suggestion.proposed_content.as_deref(),
+        suggestion.merge_sources.as_deref(),
+    )
+    .is_ok()
 }
 
 /// Read a target file's content, resolving instruction file paths specially.

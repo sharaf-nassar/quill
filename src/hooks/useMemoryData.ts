@@ -66,6 +66,15 @@ function filterToProvider(
   return providerFilter === "all" ? null : providerFilter;
 }
 
+interface RefreshOptions {
+  showLoading?: boolean;
+}
+
+interface DeleteProjectMemoriesOptions {
+  refreshAfter?: boolean;
+  showToast?: boolean;
+}
+
 export function useMemoryData(providerFilter: ProviderFilter = "all") {
   const { toast } = useToast();
   const [projects, setProjects] = useState<KnownProject[]>([]);
@@ -75,9 +84,29 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
   const [memoryFiles, setMemoryFiles] = useState<MemoryFile[]>([]);
   const [suggestions, setSuggestions] = useState<OptimizationSuggestion[]>([]);
   const [runs, setRuns] = useState<OptimizationRun[]>([]);
-  const [optimizing, setOptimizing] = useState(false);
+  const [activeRunIds, setActiveRunIds] = useState<Set<number>>(new Set());
+  const activeRunIdsRef = useRef(activeRunIds);
+  activeRunIdsRef.current = activeRunIds;
+  const [startingOptimization, setStartingOptimization] = useState(false);
+  const startingOptimizationRef = useRef(startingOptimization);
+  startingOptimizationRef.current = startingOptimization;
   const [loading, setLoading] = useState(true);
   const [logs, setLogs] = useState<string[]>([]);
+  const optimizing =
+    startingOptimization ||
+    activeRunIds.size > 0 ||
+    runs.some((run) => run.status === "running");
+
+  const updateActiveRunIds = useCallback(
+    (updater: (prev: Set<number>) => Set<number>) => {
+      setActiveRunIds((prev) => {
+        const next = updater(prev);
+        activeRunIdsRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
 
   const loadProjects = useCallback(async () => {
     try {
@@ -93,9 +122,14 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
     }
   }, [providerFilter, toast]);
 
-  const loadProjectData = useCallback(async (projectPath: string) => {
+  const loadProjectData = useCallback(async (
+    projectPath: string,
+    { showLoading = true }: RefreshOptions = {},
+  ) => {
     if (!projectPath) return;
-    setLoading(true);
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const provider = filterToProvider(providerFilter);
       const [files, sugs, r] = await Promise.all([
@@ -116,20 +150,24 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
       setMemoryFiles(files);
       setSuggestions(sugs);
       setRuns(r);
-      // Check if there's a running optimization
-      setOptimizing(r.some((run) => run.status === "running"));
     } catch (e) {
       toast("error", `Failed to load project data: ${e}`);
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   }, [providerFilter, toast]);
 
   const projectsRef = useRef(projects);
   projectsRef.current = projects;
 
-  const loadAllProjectData = useCallback(async () => {
-    setLoading(true);
+  const loadAllProjectData = useCallback(async (
+    { showLoading = true }: RefreshOptions = {},
+  ) => {
+    if (showLoading) {
+      setLoading(true);
+    }
     try {
       const provider = filterToProvider(providerFilter);
       const withMemories = projectsRef.current.filter((p) => p.memory_count > 0);
@@ -141,20 +179,22 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
       setMemoryFiles(allFiles.flat());
       setSuggestions([]);
       setRuns([]);
-      setOptimizing(false);
     } catch (e) {
       toast("error", `Failed to load all project data: ${e}`);
     } finally {
-      setLoading(false);
+      if (showLoading) {
+        setLoading(false);
+      }
     }
   }, [providerFilter, toast]);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback((options?: RefreshOptions) => {
     if (selectedProject === "__all__") {
-      loadAllProjectData();
+      return loadAllProjectData(options);
     } else if (selectedProject) {
-      loadProjectData(selectedProject);
+      return loadProjectData(selectedProject, options);
     }
+    return Promise.resolve();
   }, [selectedProject, loadProjectData, loadAllProjectData]);
 
   // Load projects on mount
@@ -176,11 +216,28 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
     const unlistenUpdated = listen<{ run_id: number; status: string }>(
       "memory-optimizer-updated",
       (event) => {
-        const { status } = event.payload;
-        setOptimizing(status === "running");
+        const { run_id, status } = event.payload;
+        if (status === "running") {
+          updateActiveRunIds((prev) => {
+            if (prev.has(run_id)) return prev;
+            const next = new Set(prev);
+            next.add(run_id);
+            return next;
+          });
+          return;
+        }
+
+        const remainingActiveRuns = new Set(activeRunIdsRef.current);
+        remainingActiveRuns.delete(run_id);
+        updateActiveRunIds(() => remainingActiveRuns);
+
         if (status !== "running") {
-          refresh();
-          setLogs([]);
+          if (selectedProjectRef.current !== "__all__") {
+            void refresh({ showLoading: false });
+          }
+          if (!startingOptimizationRef.current && remainingActiveRuns.size === 0) {
+            setLogs([]);
+          }
         }
       },
     );
@@ -195,7 +252,7 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
     const unlistenFiles = listen<{ project_path: string }>(
       "memory-files-updated",
       () => {
-        refresh();
+        void refresh({ showLoading: false });
       },
     );
 
@@ -204,22 +261,29 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
       unlistenLog.then((fn) => fn());
       unlistenFiles.then((fn) => fn());
     };
-  }, [refresh]);
+  }, [refresh, updateActiveRunIds]);
 
   const triggerOptimization = useCallback(async () => {
     if (!selectedProject || optimizing) return;
-    setOptimizing(true);
+    setStartingOptimization(true);
     setLogs([]);
     try {
-      await invoke("trigger_memory_optimization", {
+      const runId = await invoke<number>("trigger_memory_optimization", {
         projectPath: selectedProject,
         provider: filterToProvider(providerFilter),
       });
+      updateActiveRunIds((prev) => {
+        if (prev.has(runId)) return prev;
+        const next = new Set(prev);
+        next.add(runId);
+        return next;
+      });
     } catch (e) {
       toast("warning", String(e));
-      setOptimizing(false);
+    } finally {
+      setStartingOptimization(false);
     }
-  }, [providerFilter, selectedProject, optimizing, toast]);
+  }, [providerFilter, selectedProject, optimizing, toast, updateActiveRunIds]);
 
   const approveSuggestion = useCallback(
     async (id: number) => {
@@ -335,19 +399,83 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
   );
 
   const deleteProjectMemories = useCallback(
-    async (projectPath: string) => {
+    async (
+      projectPath: string,
+      { refreshAfter = true, showToast = true }: DeleteProjectMemoriesOptions = {},
+    ) => {
       try {
         const count = await invoke<number>("delete_project_memories", {
           projectPath,
         });
-        toast("info", `Deleted ${count} memory file(s)`);
-        await Promise.all([loadProjects(), loadProjectData(projectPath)]);
+        if (showToast) {
+          toast("info", `Deleted ${count} memory file(s)`);
+        }
+        if (refreshAfter) {
+          await Promise.all([loadProjects(), loadProjectData(projectPath)]);
+        }
+        return count;
       } catch (e) {
-        toast("error", `Failed to delete memories: ${e}`);
+        if (showToast) {
+          toast("error", `Failed to delete memories: ${e}`);
+        }
+        throw e;
       }
     },
     [loadProjects, loadProjectData, toast],
   );
+
+  const deleteCurrentViewMemories = useCallback(async () => {
+    const currentSelection = selectedProjectRef.current;
+    if (!currentSelection) {
+      return;
+    }
+
+    if (currentSelection !== "__all__") {
+      await deleteProjectMemories(currentSelection);
+      return;
+    }
+
+    const targetProjects = projectsRef.current.filter((project) => project.memory_count > 0);
+    if (targetProjects.length === 0) {
+      toast("info", "No memories to delete");
+      return;
+    }
+
+    const results = await Promise.allSettled(
+      targetProjects.map((project) =>
+        deleteProjectMemories(project.path, { refreshAfter: false, showToast: false }),
+      ),
+    );
+
+    const deletedCount = results.reduce(
+      (sum, result) => (result.status === "fulfilled" ? sum + result.value : sum),
+      0,
+    );
+    const failures = results.filter((result) => result.status === "rejected");
+
+    await Promise.all([loadProjects(), loadAllProjectData()]);
+
+    if (failures.length === 0) {
+      toast("info", `Deleted ${deletedCount} memory file(s)`);
+      return;
+    }
+
+    if (deletedCount > 0) {
+      toast(
+        "warning",
+        `Deleted ${deletedCount} memory file(s); ${failures.length} project(s) failed`,
+      );
+      return;
+    }
+
+    const firstFailure = failures[0];
+    toast(
+      "error",
+      `Failed to delete memories: ${
+        firstFailure?.status === "rejected" ? String(firstFailure.reason) : "Unknown error"
+      }`,
+    );
+  }, [deleteProjectMemories, loadAllProjectData, loadProjects, toast]);
 
   const triggerOptimizeAll = useCallback(
     async () => {
@@ -357,28 +485,45 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
         toast("info", "No projects with memories to optimize");
         return;
       }
-      setOptimizing(true);
+      setStartingOptimization(true);
       setLogs([]);
       const BATCH_SIZE = 3;
       try {
         for (let i = 0; i < withMemories.length; i += BATCH_SIZE) {
           const batch = withMemories.slice(i, i + BATCH_SIZE);
-          await Promise.allSettled(
+          const results = await Promise.allSettled(
             batch.map((p) =>
-              invoke("trigger_memory_optimization", {
+              invoke<number>("trigger_memory_optimization", {
                 projectPath: p.path,
                 provider: filterToProvider(providerFilter),
               }),
             ),
           );
+          const startedRunIds = results.flatMap((result) =>
+            result.status === "fulfilled" ? [result.value] : [],
+          );
+          if (startedRunIds.length > 0) {
+            updateActiveRunIds((prev) => {
+              const next = new Set(prev);
+              for (const runId of startedRunIds) {
+                next.add(runId);
+              }
+              return next;
+            });
+          }
+
+          const firstFailure = results.find((result) => result.status === "rejected");
+          if (firstFailure?.status === "rejected") {
+            toast("warning", String(firstFailure.reason));
+          }
         }
       } catch (e) {
         toast("warning", String(e));
       } finally {
-        setOptimizing(false);
+        setStartingOptimization(false);
       }
     },
-    [projects, providerFilter, optimizing, toast],
+    [projects, providerFilter, optimizing, toast, updateActiveRunIds],
   );
 
   return {
@@ -402,6 +547,7 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
     removeCustomProject,
     deleteMemoryFile,
     deleteProjectMemories,
+    deleteCurrentViewMemories,
     triggerOptimizeAll,
     refresh,
   };

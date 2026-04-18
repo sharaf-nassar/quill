@@ -141,6 +141,8 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 
 The analytics hooks for the `Now` tab subscribe to backend push events instead of relying only on the 60-second polling fallback. `useCodeStats`, `useLlmRuntimeStats`, and `useBreakdownData` refresh on `sessions-index-updated`, while `useCodeInsights` refreshes on both `sessions-index-updated` and `tokens-updated` because it combines code and token history.
 
+`useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The same hook also reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
+
 ### State Pattern
 
 Hooks follow a consistent async state pattern: `useState` for data/loading/error, `useRef` for initial load tracking, `useEffect` for fetching, periodic interval refresh, and Tauri event listener cleanup.

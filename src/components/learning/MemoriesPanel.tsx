@@ -262,7 +262,7 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
     addCustomProject,
     removeCustomProject,
     deleteMemoryFile,
-    deleteProjectMemories,
+    deleteCurrentViewMemories,
   } = useMemoryData(providerFilter);
 
   const [showManage, setShowManage] = useState(false);
@@ -308,6 +308,18 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
   const actionableSuggestions = [...pendingSuggestions, ...suggestions.filter((s) => s.status === "undone")];
 
   const projectsWithMemories = projects.filter((p) => p.memory_count > 0);
+  const currentViewMemoryCount = actualMemoryFiles.length;
+  const currentViewProjectCount = isAllView
+    ? projectsWithMemories.length
+    : selectedProject
+      ? 1
+      : 0;
+  const deleteCurrentViewLabel = isAllView
+    ? "Delete all memories for current view"
+    : "Delete all memories for this project";
+  const deleteCurrentViewConfirmLabel = isAllView
+    ? `Delete all ${currentViewMemoryCount} memories across ${currentViewProjectCount} projects?`
+    : `Delete all ${currentViewMemoryCount} memories?`;
 
   const toggleFile = (fp: string) => {
     setExpandedFiles((prev) => {
@@ -352,8 +364,8 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
         </button>
       </div>
 
-      {/* Manage panel (hidden in all-projects view) */}
-      {showManage && !isAllView && (
+      {/* Manage panel */}
+      {showManage && (
         <div style={STYLES.managePanel}>
           {/* Show empty toggle */}
           <label style={STYLES.showEmptyLabel}>
@@ -365,19 +377,19 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
             Show projects with no memories
           </label>
 
-          {/* Delete all memories for selected project */}
-          {selectedProject && actualMemoryFiles.length > 0 && (
+          {/* Delete all memories for current view */}
+          {selectedProject && currentViewMemoryCount > 0 && (
             <div style={STYLES.deleteAllDeleteMb}>
               {confirmDelete?.type === "project" && confirmDelete.path === selectedProject ? (
                 <div style={STYLES.deleteConfirmRow}>
                   <span style={STYLES.deleteConfirmLabel}>
-                    Delete all {actualMemoryFiles.length} memories?
+                    {deleteCurrentViewConfirmLabel}
                   </span>
                   <button
                     className="learning-analyze-btn"
                     style={STYLES.deleteConfirmBtn}
-                    onClick={() => {
-                      deleteProjectMemories(selectedProject);
+                    onClick={async () => {
+                      await deleteCurrentViewMemories();
                       setConfirmDelete(null);
                     }}
                   >
@@ -397,7 +409,7 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
                   style={STYLES.deleteAllBtn}
                   onClick={() => setConfirmDelete({ type: "project", path: selectedProject })}
                 >
-                  Delete all memories for this project
+                  {deleteCurrentViewLabel}
                 </button>
               )}
             </div>
