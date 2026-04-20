@@ -17,8 +17,8 @@ use tauri::Emitter;
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{
-    LearnedRulePayload, LearningRunPayload, ObservationPayload, SessionEndPayload,
-    SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
+    LearnedRulePayload, LearningRunPayload, ObservationPayload, SessionMessagesPayload,
+    SessionNotifyPayload, TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -115,7 +115,6 @@ pub async fn start_server(
         .route("/api/v1/tokens", post(report_tokens))
         .route("/api/v1/learning/observations", post(post_observation))
         .route("/api/v1/learning/observations", get(get_observations))
-        .route("/api/v1/learning/session-end", post(post_session_end))
         .route("/api/v1/learning/status", get(get_learning_status))
         .route("/api/v1/learning/runs", post(post_learning_run))
         .route("/api/v1/learning/runs", get(get_learning_runs))
@@ -550,58 +549,6 @@ async fn get_observations(
             )
         }
     }
-}
-
-async fn post_session_end(
-    State(state): State<Arc<ServerState>>,
-    headers: HeaderMap,
-    Json(payload): Json<SessionEndPayload>,
-) -> impl IntoResponse {
-    if !check_auth(&headers, &state.secret) {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
-    }
-    if payload.session_id.is_empty() || payload.session_id.len() > MAX_STRING_LEN {
-        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
-    }
-    if payload
-        .transcript_path
-        .as_ref()
-        .is_some_and(|p| p.len() > MAX_CWD_LEN)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "transcript_path too long".to_string(),
-        );
-    }
-    if payload.cwd.as_ref().is_some_and(|c| c.len() > MAX_CWD_LEN) {
-        return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
-    }
-
-    // Check if learning is enabled and trigger mode includes session-end
-    let enabled = state
-        .storage
-        .get_setting("learning.enabled")
-        .ok()
-        .flatten()
-        .is_some_and(|v| v == "true");
-    let trigger_mode = state
-        .storage
-        .get_setting("learning.trigger_mode")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
-    if enabled && (trigger_mode == "session-end" || trigger_mode.contains("session-end")) {
-        let _ = state.app_handle.emit(
-            "learning-session-end",
-            serde_json::json!({
-                "provider": payload.provider,
-                "session_id": payload.session_id,
-            }),
-        );
-    }
-
-    (StatusCode::OK, "ok".to_string())
 }
 
 async fn get_learning_status(

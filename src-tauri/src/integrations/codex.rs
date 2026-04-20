@@ -18,12 +18,7 @@ const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
 
-const MANAGED_SCRIPT_FILES: [&str; 4] = [
-    "observe.cjs",
-    "report-tokens.sh",
-    "session-end-learn.cjs",
-    "session-sync.cjs",
-];
+const MANAGED_SCRIPT_FILES: [&str; 3] = ["observe.cjs", "report-tokens.sh", "session-sync.cjs"];
 
 const MANAGED_TEMPLATE_FILES: [&str; 1] = ["agents-md-section.md"];
 
@@ -115,9 +110,16 @@ pub fn verify() -> Result<(), String> {
 }
 
 fn detect_codex_cli() -> bool {
-    Command::new("codex")
+    let Some(codex_path) = crate::config::resolve_command_path("codex") else {
+        return false;
+    };
+
+    Command::new(&codex_path)
         .arg("--version")
-        .env("PATH", crate::config::shell_path())
+        .env(
+            "PATH",
+            crate::config::path_for_resolved_command(&codex_path),
+        )
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
@@ -442,10 +444,6 @@ fn register_hooks() -> Result<(), String> {
         "node {}",
         shell_quote(&scripts_dir().join("session-sync.cjs"))
     );
-    let session_end_command = format!(
-        "node {}",
-        shell_quote(&scripts_dir().join("session-end-learn.cjs"))
-    );
     let tokens_command = shell_quote(&scripts_dir().join("report-tokens.sh"));
 
     let hook_defs: Vec<(&str, Option<&str>, serde_json::Value)> = vec![
@@ -519,11 +517,6 @@ fn register_hooks() -> Result<(), String> {
                     {
                         "type": "command",
                         "command": sync_command,
-                        "timeout": 5
-                    },
-                    {
-                        "type": "command",
-                        "command": session_end_command,
                         "timeout": 5
                     }
                 ]

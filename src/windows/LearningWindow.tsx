@@ -11,9 +11,7 @@ import "../styles/learning.css";
 
 const TRIGGER_OPTIONS = [
   { value: "on-demand", label: "On-demand" },
-  { value: "session-end", label: "Session end" },
   { value: "periodic", label: "Periodic" },
-  { value: "session-end+periodic", label: "Both" },
 ] as const;
 
 interface LearningSettingsInlineProps {
@@ -39,9 +37,17 @@ function LearningSettingsInline({
     return () => document.removeEventListener("mousedown", handler);
   }, [open]);
 
-  const showInterval =
-    settings.trigger_mode === "periodic" ||
-    settings.trigger_mode === "session-end+periodic";
+  const showInterval = settings.trigger_mode === "periodic";
+
+  const handleTriggerModeChange = (
+    triggerMode: LearningSettings["trigger_mode"],
+  ) => {
+    onUpdateSettings({
+      ...settings,
+      enabled: triggerMode === "periodic" ? settings.enabled : false,
+      trigger_mode: triggerMode,
+    });
+  };
 
   return (
     <div className="learning-cog-wrap" ref={ref}>
@@ -59,9 +65,7 @@ function LearningSettingsInline({
             <button
               key={opt.value}
               className={`learning-cog-menu-item${settings.trigger_mode === opt.value ? " active" : ""}`}
-              onClick={() =>
-                onUpdateSettings({ ...settings, trigger_mode: opt.value })
-              }
+              onClick={() => handleTriggerModeChange(opt.value)}
             >
               {opt.label}
             </button>

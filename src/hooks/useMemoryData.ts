@@ -114,8 +114,8 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
         provider: filterToProvider(providerFilter),
       });
       setProjects(p);
-      if (!selectedProjectRef.current && p.length > 0) {
-        setSelectedProject(p[0].path);
+      if (!selectedProjectRef.current) {
+        setSelectedProject("__all__");
       }
     } catch (e) {
       toast("error", `Failed to load projects: ${e}`);

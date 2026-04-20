@@ -28,7 +28,7 @@ Tool-use observations and git history are analyzed by LLMs to discover reusable 
 1. Provider hook script (`observe.cjs`) captures PreToolUse/PostToolUse events
 2. POSTs observation to `POST /api/v1/learning/observations`
 3. Server validates and fast-acknowledges the hook request, then stores the observation in `observations` with provider provenance and `analyzed = false`
-4. Trigger fires (on-demand, session-end, or periodic timer) with optional provider scope from the UI or session-end payload
+4. Trigger fires from the on-demand UI action or periodic timer with optional provider scope from the UI
 5. [[src-tauri/src/learning.rs]] spawns async analysis task scoped to Claude, Codex, or both providers
 6. **Stream A**: Fetch up to 100 unanalyzed observations, compress for LLM context
 7. **Stream B**: Fetch git history for project via [[src-tauri/src/git_analysis.rs]] (cached by HEAD hash)

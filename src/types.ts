@@ -244,9 +244,11 @@ export interface CodexLiveData {
 
 // Learning system types
 
+export type LearningTriggerMode = "on-demand" | "periodic";
+
 export interface LearningSettings {
   enabled: boolean;
-  trigger_mode: string;
+  trigger_mode: LearningTriggerMode;
   periodic_minutes: number;
   min_observations: number;
   min_confidence: number;

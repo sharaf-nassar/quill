@@ -492,7 +492,7 @@ async fn synthesize_findings(
 /// In full mode, runs Stream A (observations), Stream B (git history), and
 /// Stream C (insights) in parallel via `tokio::join!`, then synthesizes findings.
 /// In micro mode, only runs Stream A (existing behavior, no git or synthesis).
-/// Called on session-end, periodic timer, or on-demand.
+/// Called by the periodic timer or on-demand analysis.
 pub async fn spawn_analysis(
     storage: &'static Storage,
     trigger: &str,

@@ -44,7 +44,7 @@ Components are organized by feature domain under `src/components/`.
 
 Top-level UI chrome and live rate limit display shared across the main window.
 
-- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered QUILL trigger that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, and version/close controls on the right. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
+- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered QUILL trigger that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, and version/close controls on the right. When the frontend's periodic updater check finds a release, it also shows an `Update x.y.z` action that installs via [[src-tauri/src/lib.rs#install_app_update]] so the backend owns the restart handoff. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
 - **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel with a Layout section (stacked/side-by-side toggle), a Status provider selector that persists the indicator primary provider, and an Integrations section showing Claude Code, Codex, and MiniMax availability, enabled state, and the next enable or disable action. Layout props are optional for backward compatibility with the legacy `IntegrationsWindowView`.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
 - **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).
@@ -141,7 +141,7 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 
 The analytics hooks for the `Now` tab subscribe to backend push events instead of relying only on the 60-second polling fallback. `useCodeStats`, `useLlmRuntimeStats`, and `useBreakdownData` refresh on `sessions-index-updated`, while `useCodeInsights` refreshes on both `sessions-index-updated` and `tokens-updated` because it combines code and token history.
 
-`useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The same hook also reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
+`useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 
 ### State Pattern
 

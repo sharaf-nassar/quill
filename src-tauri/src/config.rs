@@ -1,5 +1,6 @@
+use std::ffi::OsString;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -57,12 +58,61 @@ pub fn resolve_command_path(command: &str) -> Option<PathBuf> {
     if cfg!(target_os = "macos") {
         if let Some(home) = dirs::home_dir() {
             candidates.push(home.join(".local").join("bin").join(command));
+            candidates.push(home.join(".local").join("share").join("pnpm").join(command));
         }
         candidates.push(PathBuf::from("/opt/homebrew/bin").join(command));
         candidates.push(PathBuf::from("/usr/local/bin").join(command));
+    } else if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local").join("bin").join(command));
+        candidates.push(home.join(".local").join("share").join("pnpm").join(command));
     }
 
     candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+pub fn path_for_resolved_command(command_path: &Path) -> OsString {
+    let mut paths: Vec<PathBuf> =
+        std::env::split_paths(std::ffi::OsStr::new(shell_path())).collect();
+
+    if let Some(parent) = command_path.parent() {
+        push_unique_path(&mut paths, parent.to_path_buf());
+    }
+
+    let mut current = command_path.to_path_buf();
+    for _ in 0..8 {
+        let Ok(target) = fs::read_link(&current) else {
+            break;
+        };
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .map(|parent| parent.join(&target))
+                .unwrap_or(target)
+        };
+        if let Some(parent) = resolved.parent() {
+            push_unique_path(&mut paths, parent.to_path_buf());
+        }
+        if resolved == current {
+            break;
+        }
+        current = resolved;
+    }
+
+    if let Ok(canonical) = command_path.canonicalize()
+        && let Some(parent) = canonical.parent()
+    {
+        push_unique_path(&mut paths, parent.to_path_buf());
+    }
+
+    std::env::join_paths(paths).unwrap_or_else(|_| OsString::from(shell_path()))
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if paths.iter().all(|existing| existing != &path) {
+        paths.push(path);
+    }
 }
 
 fn capture_login_shell_output(command: &str) -> Option<String> {

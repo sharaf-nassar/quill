@@ -284,10 +284,12 @@ fn run_codex_app_server_request<T: DeserializeOwned>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<T, String> {
-    let shell_path = crate::config::shell_path().to_string();
-    let mut child = Command::new("codex")
+    let codex_path = crate::config::resolve_command_path("codex")
+        .ok_or_else(|| "Codex CLI was not found in PATH".to_string())?;
+    let codex_env_path = crate::config::path_for_resolved_command(&codex_path);
+    let mut child = Command::new(&codex_path)
         .args(["app-server", "--enable", "apps", "--listen", "stdio://"])
-        .env("PATH", shell_path)
+        .env("PATH", codex_env_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

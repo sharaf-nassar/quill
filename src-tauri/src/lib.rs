@@ -22,9 +22,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
     LearningRun, LearningSettings, LlmRuntimeStats, ProjectBreakdown, ProjectTokens,
-    ProviderStatus, SessionBreakdown, SessionCodeStats, SessionEndPayload, SessionRef,
-    SessionStats, StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, UsageBucket,
-    UsageData, UsageProviderError,
+    ProviderStatus, SessionBreakdown, SessionCodeStats, SessionRef, SessionStats,
+    StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData,
+    UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -835,15 +835,29 @@ async fn confirm_disable_provider(
 
 // --- Learning IPC commands ---
 
+fn normalize_learning_trigger_mode(trigger_mode: &str) -> &'static str {
+    match trigger_mode {
+        "periodic" => "periodic",
+        _ => "on-demand",
+    }
+}
+
 #[tauri::command]
 async fn get_learning_settings() -> Result<LearningSettings, String> {
     let storage = get_storage()?;
     let enabled = storage
         .get_setting("learning.enabled")?
         .is_some_and(|v| v == "true");
-    let trigger_mode = storage
+    let raw_trigger_mode = storage
         .get_setting("learning.trigger_mode")?
         .unwrap_or_else(|| "on-demand".to_string());
+    let trigger_mode = normalize_learning_trigger_mode(&raw_trigger_mode).to_string();
+    if raw_trigger_mode != trigger_mode {
+        storage.set_setting("learning.trigger_mode", &trigger_mode)?;
+    }
+    if enabled && trigger_mode == "on-demand" {
+        storage.set_setting("learning.enabled", "false")?;
+    }
     let periodic_minutes: i64 = storage
         .get_setting("learning.periodic_minutes")?
         .and_then(|v| v.parse().ok())
@@ -858,7 +872,7 @@ async fn get_learning_settings() -> Result<LearningSettings, String> {
         .unwrap_or(0.95);
 
     Ok(LearningSettings {
-        enabled,
+        enabled: enabled && trigger_mode == "periodic",
         trigger_mode,
         periodic_minutes,
         min_observations,
@@ -869,11 +883,10 @@ async fn get_learning_settings() -> Result<LearningSettings, String> {
 #[tauri::command]
 async fn set_learning_settings(settings: LearningSettings) -> Result<(), String> {
     let storage = get_storage()?;
-    storage.set_setting(
-        "learning.enabled",
-        if settings.enabled { "true" } else { "false" },
-    )?;
-    storage.set_setting("learning.trigger_mode", &settings.trigger_mode)?;
+    let trigger_mode = normalize_learning_trigger_mode(&settings.trigger_mode);
+    let enabled = settings.enabled && trigger_mode == "periodic";
+    storage.set_setting("learning.enabled", if enabled { "true" } else { "false" })?;
+    storage.set_setting("learning.trigger_mode", trigger_mode)?;
     storage.set_setting(
         "learning.periodic_minutes",
         &settings.periodic_minutes.to_string(),
@@ -1439,6 +1452,50 @@ async fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+#[tauri::command]
+async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Failed to create updater: {e}"))?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {e}"))?
+        .ok_or_else(|| "No update available".to_string())?;
+
+    let version = update.version.clone();
+    let relaunch_binary = tauri::process::current_binary(&app.env())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("<unresolved: {error}>"));
+
+    log::info!(
+        "Installing update {version} from backend command; relaunch target: {relaunch_binary}"
+    );
+
+    update
+        .download_and_install(
+            |chunk_length, content_length| {
+                log::debug!(
+                    "Update {version} download chunk: {chunk_length} bytes (content_length={content_length:?})"
+                );
+            },
+            || {
+                log::debug!("Update {version} download finished");
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to install update {version}: {e}"))?;
+
+    log::info!("Update {version} installed; requesting restart");
+
+    std::thread::spawn(move || {
+        app.restart();
+    });
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     match Storage::init() {
@@ -1556,67 +1613,6 @@ pub fn run() {
                     }
                 });
 
-                // Listen for session-end events to trigger analysis (only if enabled)
-                {
-                    let se_handle = app.handle().clone();
-                    app.listen("learning-session-end", move |event| {
-                        let enabled = storage
-                            .get_setting("learning.enabled")
-                            .ok()
-                            .flatten()
-                            .is_some_and(|v| v == "true");
-                        let trigger_mode = storage
-                            .get_setting("learning.trigger_mode")
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default();
-
-                        if !enabled || !trigger_mode.contains("session-end") {
-                            return;
-                        }
-
-                        let provider = serde_json::from_str::<SessionEndPayload>(event.payload())
-                            .map(|payload| payload.provider)
-                            .map_err(|error| {
-                                log::warn!("Failed to parse learning-session-end payload: {error}");
-                                error
-                            })
-                            .ok();
-
-                        let handle = se_handle.clone();
-                        tauri::async_runtime::spawn(async move {
-                            // Try full analysis first; if not enough observations, try micro-update
-                            match learning::spawn_analysis(
-                                storage,
-                                "session-end",
-                                provider,
-                                &handle,
-                                false,
-                            )
-                            .await
-                            {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    // Full analysis failed (likely insufficient observations).
-                                    // Try micro-update with lower threshold to create candidates.
-                                    if let Err(e) = learning::spawn_analysis(
-                                        storage,
-                                        "session-end-micro",
-                                        provider,
-                                        &handle,
-                                        true,
-                                    )
-                                    .await
-                                    {
-                                        log::debug!("Session-end micro analysis skipped: {e}");
-                                    }
-                                }
-                            }
-                            let _ = handle.emit("learning-updated", ());
-                        });
-                    });
-                }
-
                 // Learning periodic analysis timer -- polls every minute, runs when interval elapsed
                 let periodic_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -1635,7 +1631,8 @@ pub fn run() {
                             .flatten()
                             .unwrap_or_default();
 
-                        if !enabled || !trigger_mode.contains("periodic") {
+                        if !enabled || normalize_learning_trigger_mode(&trigger_mode) != "periodic"
+                        {
                             continue;
                         }
 
@@ -1964,6 +1961,7 @@ pub fn run() {
             restart::check_restart_hooks_installed,
             hide_window,
             quit_app,
+            install_app_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

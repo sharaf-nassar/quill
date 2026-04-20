@@ -80,12 +80,11 @@ const MANAGED_COMMAND_FILES: [&str; 5] = [
     "quill-setup.md",
 ];
 
-const MANAGED_SCRIPT_FILES: [&str; 5] = [
+const MANAGED_SCRIPT_FILES: [&str; 4] = [
     "observe.cjs",
     "qbuild-guard.sh",
     "session-sync.cjs",
     "report-tokens.sh",
-    "session-end-learn.cjs",
 ];
 
 const MCP_SERVER_KEY: &str = "mcpServers.quill";
@@ -901,12 +900,6 @@ fn register_hooks() -> Result<(), String> {
                         "type": "command",
                         "command": format!("node {}/session-sync.cjs", sd_str),
                         "timeout": 3
-                    },
-                    {
-                        "type": "command",
-                        "command": format!("node {}/session-end-learn.cjs", sd_str),
-                        "timeout": 5,
-                        "async": true
                     }
                 ]
             }),

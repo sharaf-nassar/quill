@@ -12,7 +12,7 @@ Tauri plugins configured: `tauri-plugin-log`, `tauri-plugin-updater`, `tauri-plu
 
 ## HTTP API Server
 
-[[src-tauri/src/server.rs]] (868 lines) runs an Axum HTTP server on port 19876 (configurable via `QUILL_PORT` env var) to receive data from external hook scripts.
+[[src-tauri/src/server.rs]] (995 lines) runs an Axum HTTP server on port 19876 (configurable via `QUILL_PORT` env var) to receive data from external hook scripts.
 
 ### Authentication
 
@@ -31,7 +31,7 @@ Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 
 ### Endpoints
 
-The HTTP API exposes 14 endpoints for token ingestion, learning observations, and session indexing across Claude Code and Codex.
+The HTTP API exposes 13 endpoints for token ingestion, learning observations, and session indexing across Claude Code and Codex.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
@@ -39,7 +39,6 @@ The HTTP API exposes 14 endpoints for token ingestion, learning observations, an
 | POST | `/api/v1/tokens` | Record token usage from hook scripts |
 | POST | `/api/v1/learning/observations` | Store tool-use observations |
 | GET | `/api/v1/learning/observations` | Retrieve unanalyzed observations |
-| POST | `/api/v1/learning/session-end` | Notify that a session ended |
 | GET | `/api/v1/learning/status` | Learning system status |
 | POST | `/api/v1/learning/runs` | Record a learning analysis run |
 | GET | `/api/v1/learning/runs` | Retrieve learning run history |
@@ -137,7 +136,7 @@ The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
 
-Codex live usage now comes from `codex app-server` `account/rateLimits/read` instead of transcript-only scraping. The backend normalizes the returned `rateLimitsByLimitId` map into provider buckets so Quill can store both the base Codex windows and model-specific limits such as Codex Spark in the same usage tables, while preserving the legacy base Codex bucket keys for history continuity. Model-specific `limitName` values are abbreviated for display via [[src-tauri/src/fetcher.rs#abbreviate_codex_model]] (e.g. `GPT-5.3-Codex-Spark` → `5.3-Spark`) by stripping the redundant `GPT-` prefix and `-Codex` infix. The stdio helper runs with the user's login-shell `PATH` so Node-backed Codex launchers installed under shell-managed toolchains still start from the Tauri app, ignores unrelated app-server frames such as the `initialize` response, and only deserializes the matching request id for the rate-limit call. If the direct app-server request fails, the fetcher falls back to transcript `token_count` `rate_limits`.
+Codex live usage now comes from `codex app-server` `account/rateLimits/read` instead of transcript-only scraping. The backend normalizes the returned `rateLimitsByLimitId` map into provider buckets so Quill can store both the base Codex windows and model-specific limits such as Codex Spark in the same usage tables, while preserving the legacy base Codex bucket keys for history continuity. Model-specific `limitName` values are abbreviated for display via [[src-tauri/src/fetcher.rs#abbreviate_codex_model]] (e.g. `GPT-5.3-Codex-Spark` → `5.3-Spark`) by stripping the redundant `GPT-` prefix and `-Codex` infix. The stdio helper resolves the Codex executable path, then augments the user's login-shell `PATH` with the launcher and symlink-target directories so Node-backed npm installs still start from desktop-launched Quill. It ignores unrelated app-server frames such as the `initialize` response, and only deserializes the matching request id for the rate-limit call. If the direct app-server request fails, the fetcher falls back to transcript `token_count` `rate_limits`.
 
 MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-tauri/src/fetcher.rs#fetch_minimax_usage]]. It reads the API key from the SQLite settings table and parses the `model_remains` array into 5-hour and weekly `UsageBucket` entries, filtering out models with zero quota.
 
@@ -190,7 +189,7 @@ All plugin commands take a provider argument so the frontend can target Claude o
 
 `get_installed_plugins`, `get_marketplaces`, `get_available_updates`, `check_updates_now`, `install_plugin`, `remove_plugin`, `enable_plugin`, `disable_plugin`, `update_plugin`, `update_all_plugins`, `add_marketplace`, `remove_marketplace`, `refresh_marketplace`, `refresh_all_marketplaces`.
 
-Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git repos. Codex plugin reads and install/remove operations use `codex app-server` JSON-RPC over stdio with the login-shell `PATH`, while unsupported Codex mutations return provider-specific errors instead of guessing behavior.
+Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git repos. Codex plugin reads and install/remove operations use resolved `codex app-server` JSON-RPC over stdio with the launcher-aware execution `PATH`, while unsupported Codex mutations return provider-specific errors instead of guessing behavior.
 
 ### Session Indexing Commands (4)
 
@@ -202,9 +201,11 @@ Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git 
 
 Restart commands expose a shared provider-aware row model across Claude and Codex. Hook install/check commands accept an optional provider parameter so restart setup can be applied per provider.
 
-### UI Commands (2)
+### UI Commands (3)
 
-`hide_window`, `quit_app`.
+`hide_window`, `quit_app`, `install_app_update`.
+
+[[src-tauri/src/lib.rs#install_app_update]] re-checks the configured updater from Rust, downloads and installs the release, logs the resolved relaunch binary, and then requests restart so the titlebar update button shares the backend-owned restart boundary with the tray updater.
 
 ### Integration Commands (2)
 
@@ -212,7 +213,7 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 `get_provider_statuses` returns the last saved provider statuses from storage rather than re-running detection. Fresh detection happens once at startup via the background `startup_refresh` task, which saves results and emits `integrations-updated`. This avoids redundant subprocess calls and eliminates the visible "Checking integrations..." loading state on the main window.
 
-Detection runs via `--version` checks for CLI providers. Codex probes use the user's login-shell `PATH`, while Claude resolves the executable path from the login shell and common macOS install locations before running `--version`, which avoids false negatives when desktop-launched Quill inherits a stripped PATH. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]], [[src-tauri/src/integrations/claude.rs]], [[src-tauri/src/integrations/codex.rs]], and [[src-tauri/src/config.rs]].
+Detection runs via `--version` checks for CLI providers. Claude and Codex resolve executable paths from the login shell plus common install locations before running `--version`, which avoids false negatives when desktop-launched Quill inherits a stripped PATH. Codex also adds launcher and symlink-target directories to the child `PATH` so npm-installed launchers can find `node` on macOS and Linux. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]], [[src-tauri/src/integrations/claude.rs]], [[src-tauri/src/integrations/codex.rs]], and [[src-tauri/src/config.rs]].
 
 ## Event System
 

@@ -195,18 +195,6 @@ pub struct ObservationPayload {
     pub cwd: Option<String>,
 }
 
-// Payload from session-end hook
-#[derive(Deserialize, Clone, Debug)]
-pub struct SessionEndPayload {
-    #[serde(default = "default_provider")]
-    pub provider: IntegrationProvider,
-    pub session_id: String,
-    #[serde(default)]
-    pub transcript_path: Option<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-}
-
 // Payload to record a learning run result
 #[derive(Deserialize, Clone, Debug)]
 pub struct LearningRunPayload {

@@ -147,7 +147,7 @@ Files and directories created during first-launch auto-deployment.
 
 | Target | Content |
 |--------|---------|
-| `~/.config/quill/scripts/` | Hook scripts: token reporting, observation capture, session sync, session-end learning |
+| `~/.config/quill/scripts/` | Hook scripts: token reporting, observation capture, and session sync |
 | `~/.config/quill/mcp/` | Python MCP server for session querying tools |
 | `~/.claude/commands/` | Custom CLI commands (if applicable) |
 | `~/.claude/settings.json` | Hook registrations (marked with `_source: "quill-setup"`) |
@@ -166,7 +166,7 @@ Files and config entries created when the Codex provider is enabled. Deployment 
 
 | Target | Content |
 |--------|---------|
-| `~/.config/quill/codex/scripts/` | Hook scripts for observations, token reporting, session sync, and session-end learning |
+| `~/.config/quill/codex/scripts/` | Hook scripts for observations, token reporting, and session sync |
 | `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets |
 | `~/.config/quill/codex/templates/` | Managed AGENTS template block |
 | `~/.codex/hooks.json` | Hook registrations marked with `_source: "quill-codex-setup"` |
@@ -174,6 +174,8 @@ Files and config entries created when the Codex provider is enabled. Deployment 
 | `~/.codex/AGENTS.md` | Managed Quill session-history guidance block |
 
 Codex uninstall removes only Quill-marked hooks, config blocks, AGENTS blocks, and the provider-owned asset directories. Codex deploys the same bounded-wait observation and session-sync behavior as Claude so a slow local widget cannot hold Codex hooks open until the host kills them.
+
+Quill resolves the Codex CLI before running provider checks or `codex app-server`, then augments the child process `PATH` with launcher and symlink-target directories so Homebrew and npm installs work from macOS app launches with stripped inherited environments.
 
 ## Remote Plugin
 

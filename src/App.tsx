@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import TitleBar from "./components/TitleBar";
 import UsageDisplay from "./components/UsageDisplay";
 import AnalyticsView from "./components/analytics/AnalyticsView";
@@ -411,8 +410,7 @@ function App({ integrations }: AppProps) {
 		if (!pendingUpdate || updating) return;
 		setUpdating(true);
 		try {
-			await pendingUpdate.downloadAndInstall();
-			await relaunch();
+			await invoke("install_app_update");
 		} catch (e) {
 			toast("error", `Update failed: ${e}`);
 			setUpdating(false);

@@ -60,7 +60,7 @@ States: **emerging** (new, low confidence), **confirmed** (high confidence, vali
 
 ### Trigger Modes
 
-Analysis can run: **on-demand** (manual), **session-end** (on close), **periodic** (every N minutes), or **both** (session-end + periodic). Configurable via `LearningSettings`.
+Analysis can run **on-demand** (manual) or **periodic** (every N minutes). Configurable via `LearningSettings`.
 
 ### UI
 
@@ -158,7 +158,7 @@ Approved suggestions are executed (file written/deleted/merged), with original c
 
 The Memories tab in the Learning window shows a project selector, provider filter, instruction and memory file browser with content preview, and suggestion cards with actions.
 
-Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion. The manage panel bulk delete acts on the current Memories selection, including aggregated deletion across `All Projects`, while still leaving instruction files untouched. Background learning refreshes update in place so the current project selection and expanded memory view do not snap back to the default project during polling. Bulk `Optimize All` runs keep the panel in a stable in-place state instead of flashing the all-projects browser as individual runs finish.
+Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion. The project selector opens on `All Projects` so the first view is the aggregated memory browser. The manage panel bulk delete acts on the current Memories selection, including aggregated deletion across `All Projects`, while still leaving instruction files untouched. Background learning refreshes update in place so the current project selection and expanded memory view do not snap back to the default project during polling. Bulk `Optimize All` runs keep the panel in a stable in-place state instead of flashing the all-projects browser as individual runs finish.
 
 ## Restart Orchestrator
 
