@@ -17,6 +17,7 @@ mod rule_watcher;
 mod server;
 pub(crate) mod sessions;
 mod storage;
+mod tray_keepalive;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
@@ -40,6 +41,7 @@ use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_updater::UpdaterExt;
 
 static STORAGE: OnceLock<Storage> = OnceLock::new();
+static STARTUP_CLEANUP_DONE: OnceLock<()> = OnceLock::new();
 static USAGE_CACHE: OnceLock<Mutex<Option<UsageCacheEntry>>> = OnceLock::new();
 static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static USAGE_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -184,6 +186,55 @@ fn get_storage() -> Result<&'static Storage, String> {
     STORAGE
         .get()
         .ok_or_else(|| "Storage not initialized".to_string())
+}
+
+fn initialize_storage_or_exit() -> &'static Storage {
+    if let Some(storage) = STORAGE.get() {
+        log::error!("BUG: storage initialization was requested more than once");
+        return storage;
+    }
+
+    match Storage::init() {
+        Ok(storage) => {
+            if STORAGE.set(storage).is_err() {
+                log::error!("BUG: STORAGE was already initialized");
+            }
+        }
+        Err(error) => {
+            log::error!("Fatal: failed to initialize storage: {error}");
+            std::process::exit(1);
+        }
+    }
+
+    STORAGE.get().unwrap_or_else(|| {
+        log::error!("Fatal: storage initialization did not publish global state");
+        std::process::exit(1);
+    })
+}
+
+fn cleanup_interrupted_learning_runs(storage: &Storage) {
+    if STARTUP_CLEANUP_DONE.set(()).is_err() {
+        log::warn!("Skipping duplicate interrupted learning run cleanup");
+        return;
+    }
+
+    match storage.cleanup_interrupted_runs() {
+        Ok(0) => {}
+        Ok(count) => log::info!("Cleaned up {count} interrupted learning run(s)"),
+        Err(error) => log::warn!("Failed to clean up interrupted runs: {error}"),
+    }
+}
+
+fn load_http_auth_secret() -> String {
+    match auth::load_or_create_secret() {
+        Ok(secret) => secret,
+        Err(error) => {
+            log::warn!("Failed to load auth secret, generating ephemeral: {error}");
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            hex::encode(bytes)
+        }
+    }
 }
 
 fn usage_cache() -> &'static Mutex<Option<UsageCacheEntry>> {
@@ -1498,39 +1549,10 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    match Storage::init() {
-        Ok(s) => {
-            if STORAGE.set(s).is_err() {
-                log::error!("BUG: STORAGE was already initialized");
-            }
-        }
-        Err(e) => {
-            log::error!("Fatal: failed to initialize storage: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    // Clean up any runs left in "running" state from a previous crash
-    if let Ok(storage) = get_storage() {
-        match storage.cleanup_interrupted_runs() {
-            Ok(0) => {}
-            Ok(n) => log::info!("Cleaned up {n} interrupted learning run(s)"),
-            Err(e) => log::warn!("Failed to clean up interrupted runs: {e}"),
-        }
-    }
-
-    // Load or generate the auth secret for the HTTP server
-    let secret = match auth::load_or_create_secret() {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("Failed to load auth secret, generating ephemeral: {e}");
-            let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            hex::encode(bytes)
-        }
-    };
-
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(
             tauri_plugin_log::Builder::new()
                 .targets([
@@ -1547,6 +1569,13 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            let storage = initialize_storage_or_exit();
+            // Clean up any runs left in "running" state from a previous crash.
+            // This must stay after the single-instance plugin setup so a
+            // duplicate launch cannot mark the primary's active runs interrupted.
+            cleanup_interrupted_learning_runs(storage);
+            let secret = load_http_auth_secret();
+
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
                 let index_dir = dirs::data_local_dir()
@@ -1810,6 +1839,8 @@ pub fn run() {
             }
             #[cfg(not(target_os = "macos"))]
             let _ = tray;
+
+            tray_keepalive::install(app.handle());
 
             // Refresh provider state and populate tray summary in one
             // background task.  Uses a dedicated Storage connection so

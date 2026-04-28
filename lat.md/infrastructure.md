@@ -205,4 +205,12 @@ TypeScript 5.9, Vite 6.0, ESLint 9.39, @vitejs/plugin-react.
 
 ### Backend
 
-Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, reqwest 0.13, rig-core 0.32, serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, tauri-plugin-dialog 2, nix (unix). Full list in `src-tauri/Cargo.toml`.
+Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
+
+**Core runtime**: Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, reqwest 0.13, rig-core 0.32.
+
+**Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-process 2, tauri-plugin-log 2.
+
+**Utilities**: serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix only).
+
+**macOS-only**: objc2-app-kit 0.3, objc2-foundation 0.3, block2 0.6 — used by [[src-tauri/src/tray_keepalive.rs]] for the workaround that rebuilds the tray after sleep/wake and screen-parameter changes.

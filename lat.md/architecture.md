@@ -45,6 +45,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
 | Integrations | [[src-tauri/src/integrations/mod.rs]] | Provider detection plus persisted enable and disable lifecycle for Claude and Codex |
 | Indicator | [[src-tauri/src/indicator.rs]] | Primary-provider resolution, compact title text, and warnings for the tray summary |
+| Tray keep-alive | [[src-tauri/src/tray_keepalive.rs]] | macOS-only workaround that rebuilds the tray on sleep/wake and screen-parameter changes |
 | Models | [[src-tauri/src/models.rs]] | All shared data structures and serde types |
 | AI client | [[src-tauri/src/ai_client.rs]] | Anthropic API integration via rig-core |
 | Git analysis | [[src-tauri/src/git_analysis.rs]] | Commit pattern extraction and hotspot analysis |
@@ -100,6 +101,24 @@ All tasks that touch the database or network MUST be spawned async — never blo
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
 - **Live usage refresh**: Reuses one shared 3-minute refresh path to update the main widget and tray summary rows
 - **Tray "Check for Update"**: Manual trigger via system tray menu. Uses `tauri-plugin-dialog` to show a native OS confirmation dialog when an update is found (Install / Not Now), or an info dialog when already up to date. The frontend still performs its own 4-hour availability check via `@tauri-apps/plugin-updater`, but the titlebar install action now delegates to [[src-tauri/src/lib.rs#install_app_update]] so Rust owns the install-and-restart boundary.
+
+## Single Instance
+
+Re-launching Quill while it's already running focuses the existing main window instead of starting a duplicate process. The handler is wired in [[src-tauri/src/lib.rs#run]] via `tauri-plugin-single-instance`.
+
+The plugin is registered before every other Tauri plugin so its DBus dispatch handler is in place when the secondary process starts. On a duplicate launch, the secondary process exits and the primary's callback runs [[src-tauri/src/lib.rs#show_main_window]] (`show()` + restore last position + `set_focus()`).
+
+Primary-only startup work that mutates local state runs inside Tauri `.setup()` after plugin setup has completed. This keeps duplicate processes from reaching [[src-tauri/src/lib.rs#initialize_storage_or_exit]] or [[src-tauri/src/lib.rs#cleanup_interrupted_learning_runs]], so an active learning run in the primary cannot be marked `interrupted` by a re-launch.
+
+Without this guard, GTK's `Application` forwards an `activate` signal to the primary, which surfaces as a second `RuntimeRunEvent::Ready` and makes Tauri re-run its internal `setup()`. The second `setup()` rebuilds windows from `tauri.conf.json` and panics with `a webview with label \`main\` already exists`. The primary dies, and the secondary is left orphaned with no webview, no tray icon, and no `tauri::async_runtime::spawn` tasks running.
+
+## macOS Tray Keep-Alive (Workaround)
+
+Workaround for [tauri-apps/tauri#12060](https://github.com/tauri-apps/tauri/issues/12060): on macOS, the tray's `NSStatusItem` subview becomes detached from the menu bar after sleep/wake or screen-parameter changes, leaving the icon invisible.
+
+[[src-tauri/src/tray_keepalive.rs#install]] subscribes the same `block2::RcBlock` to `NSWorkspaceDidWakeNotification` (via `NSWorkspace.sharedWorkspace().notificationCenter()`) and `NSApplicationDidChangeScreenParametersNotification` (via the default `NSNotificationCenter`). On either notification it calls `tray.set_visible(false)` then `tray.set_visible(true)`, which makes `tray-icon` drop the existing `NSStatusItem` (`NSStatusBar::removeStatusItem` + `removeFromSuperview`) and rebuild a fresh one with the cached icon, menu, and title. `set_icon` alone is insufficient because it only updates the existing button's image and would not re-attach a detached subview.
+
+A 500 ms time-based debounce coalesces wake-with-display-change events that fire both notifications nearly simultaneously. The block runs on `NSOperationQueue.mainQueue()` because tray-icon mutations require the main thread. The non-macOS [[src-tauri/src/tray_keepalive.rs#install]] is an empty stub. **Remove this module once the upstream issue ships a fix.**
 
 ## Local vs Remote Architecture
 
