@@ -21,11 +21,11 @@ mod tray_keepalive;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
-    BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, HostBreakdown, LearnedRule,
-    LearningRun, LearningSettings, LlmRuntimeStats, ProjectBreakdown, ProjectTokens,
-    ProviderStatus, SessionBreakdown, SessionCodeStats, SessionRef, SessionStats,
-    StatusIndicatorState, TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData,
-    UsageProviderError,
+    BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
+    ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
+    LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, SessionBreakdown,
+    SessionCodeStats, SessionRef, SessionStats, StatusIndicatorState, TokenDataPoint, TokenStats,
+    ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -839,6 +839,39 @@ async fn delete_session_data(
 ) -> Result<u64, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.delete_session_data(provider, &session_id))
+}
+
+#[tauri::command]
+async fn get_context_savings_analytics(
+    range: String,
+    limit: Option<i64>,
+) -> Result<ContextSavingsAnalytics, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_context_savings_analytics(&range, limit))
+}
+
+#[tauri::command]
+async fn get_context_preservation_status() -> Result<ContextPreservationStatus, String> {
+    let storage = get_storage()?;
+    integrations::get_context_preservation_status(storage)
+}
+
+#[tauri::command]
+async fn set_context_preservation_enabled(
+    enabled: bool,
+    app: tauri::AppHandle,
+) -> Result<ContextPreservationStatus, String> {
+    let status = {
+        let app_handle = app.clone();
+        run_blocking(move || integrations::set_context_preservation_enabled(&app_handle, enabled))
+    }?;
+
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after context preservation toggle failed: {error}");
+    }
+
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1930,6 +1963,9 @@ pub fn run() {
             delete_project_data,
             rename_project,
             delete_session_data,
+            get_context_savings_analytics,
+            get_context_preservation_status,
+            set_context_preservation_enabled,
             get_provider_statuses,
             confirm_enable_provider,
             confirm_disable_provider,

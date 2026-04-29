@@ -1,6 +1,6 @@
 # quill
 
-Claude Code plugin for reporting token usage, tool observations, and session data to a remote [Quill](https://github.com/sharaf-nassar/quill) desktop widget over the network.
+Claude Code plugin for reporting token usage, tool observations, session continuity, and context-routing guidance to a remote [Quill](https://github.com/sharaf-nassar/quill) desktop widget over the network.
 
 > **Local setup?** If the Quill app runs on the same machine as Claude Code, you don't need this plugin — the app automatically configures hooks, MCP, and config on startup. This plugin is only needed when Claude Code runs on a **different machine** than the Quill app.
 
@@ -49,16 +49,18 @@ Multiple remote machines can report to a single Quill app. Install the plugin on
 
 The plugin registers hooks that fire during Claude Code sessions:
 
-- **PreToolUse / PostToolUse** — `observe.js` captures tool observations and POSTs them to the widget
+- **PreToolUse / PostToolUse** — `observe.cjs` captures tool observations and POSTs them to the widget
+- **PreToolUse** — `context-router.cjs` blocks raw WebFetch/curl/wget dumps and nudges large Bash/Read/Grep output toward Quill MCP context tools
+- **SessionStart / UserPromptSubmit / PreCompact / Stop** — `context-capture.cjs` writes compact continuity JSONL under `~/.config/quill/context/continuity` and injects short resume guidance when recent continuity exists
 - **Stop** — `report-tokens.sh` extracts token counts from the JSONL transcript and POSTs them
-- **Stop** — `session-sync.js` syncs session messages to the widget for indexing
-- **Stop** — `session-end-learn.js` triggers learning analysis
+- **Stop** — `session-sync.cjs` syncs session messages to the widget for indexing
+- **Stop** — `session-end-learn.cjs` triggers learning analysis
 
-All data is sent to the configured URL with bearer-token authentication. No data is sent until you run `/quill:setup`.
+Telemetry data is sent to the configured URL with bearer-token authentication. `context-telemetry.cjs` also forwards compact context-savings events, such as router denials, continuity captures, indexed bytes, returned bytes, and approximate token estimates. Continuity snapshots stay local under `~/.config/quill/context/continuity` and are never written to Claude memory paths. No network data is sent until you run `/quill:setup`.
 
 ## MCP server
 
-The plugin includes an MCP server providing 12 tools for querying session history, searching past conversations, and analyzing usage patterns. The MCP server starts automatically with Claude Code after setup.
+The plugin includes an MCP server for querying session history, searching past conversations, indexing large context, executing compact analysis, and preserving continuity. The context-routing hooks specifically recommend `mcp__quill__quill_search_context`, `mcp__quill__quill_execute`, `mcp__quill__quill_execute_file`, `mcp__quill__quill_batch_execute`, `mcp__quill__quill_fetch_and_index`, and `mcp__quill__search_history` when large output or prior work is involved. The MCP server starts automatically with Claude Code after setup.
 
 ## Build skill
 

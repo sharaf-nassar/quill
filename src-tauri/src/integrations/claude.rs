@@ -27,8 +27,8 @@ pub fn detect() -> Result<ProviderStatus, String> {
     })
 }
 
-pub fn install(app: &AppHandle) -> Result<OwnedAssetManifest, String> {
-    crate::claude_setup::install_with_manifest(app)
+pub fn install(app: &AppHandle, context_enabled: bool) -> Result<OwnedAssetManifest, String> {
+    crate::claude_setup::install_with_manifest(app, context_enabled)
 }
 
 pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {

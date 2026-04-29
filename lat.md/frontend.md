@@ -45,7 +45,7 @@ Components are organized by feature domain under `src/components/`.
 Top-level UI chrome and live rate limit display shared across the main window.
 
 - **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered QUILL trigger that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, and version/close controls on the right. When the frontend's periodic updater check finds a release, it also shows an `Update x.y.z` action that installs via [[src-tauri/src/lib.rs#install_app_update]] so the backend owns the restart handoff. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
-- **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel with a Layout section (stacked/side-by-side toggle), a Status provider selector that persists the indicator primary provider, and an Integrations section showing Claude Code, Codex, and MiniMax availability, enabled state, and the next enable or disable action. Layout props are optional for backward compatibility with the legacy `IntegrationsWindowView`.
+- **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel with a Layout section (stacked/side-by-side toggle), a Status provider selector that persists the indicator primary provider, a Context Preservation section for the global default-off context asset toggle, and an Integrations section showing Claude Code, Codex, and MiniMax availability, enabled state, and the next enable or disable action. Layout props are optional for backward compatibility with the legacy `IntegrationsWindowView`.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
 - **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).
 - **UsageDisplay** (`src/components/UsageDisplay.tsx`) — Composes the shared workload summary rail, grouped provider limit sections, the detailed-row time mode selector, and provider-error handling for the main window's live pane.
@@ -55,13 +55,14 @@ Top-level UI chrome and live rate limit display shared across the main window.
 
 ### Analytics Components
 
-Recharts-based analytics in `src/components/analytics/` with three tabs: Now, Trends, and Charts.
+Recharts-based analytics in `src/components/analytics/` with Now, Trends, Charts, and a conditional Context tab.
 
 - **NowTab** (214 lines) — Real-time metrics with range selector (1h/24h/7d/30d), six insight cards, a 24-hour activity heatmap, and a switchable breakdown panel (hosts/projects/sessions).
 - `NowTab` shares one comparison-range code-history fetch between the efficiency and velocity cards via `src/hooks/useCodeInsights.ts`, which avoids firing the same `get_code_stats_history` IPC call twice per refresh.
 - Selecting a session in `NowTab` now keeps provider identity alongside `session_id`, so token charts, compact token stats, and delete actions stay scoped to the correct Claude or Codex session.
 - **TrendsTab** (105 lines) — Token trends, code velocity, and cache efficiency charts with week-over-week comparison.
 - **ChartsTab** (454 lines) — Composite Recharts chart with three axes (utilization, tokens, LOC). Lazy-loaded with Suspense.
+- **ContextSavingsTab** — Context preservation analytics with a four-column stats strip (saved, indexed, returned, routing) over a stacked trend chart, breakdown table, and recent events feed. Breakdown rows render a relative-magnitude bar fill behind each row scaled to the largest event count, and recent events use a single-line log format with category swatches and a directional byte arrow (→ indexed, ← returned). Confidence is hidden for exact estimates. `AnalyticsView` shows this tab only when context preservation is enabled or historical context-savings events exist.
 - **UsageChart** (456 lines) — `ComposedChart` with Area, Line, and custom Tooltip. Uses `ChartCrosshairContext` for tooltip synchronization.
 - **BreakdownPanel** (504 lines) — Sortable table showing hosts, projects, or sessions with token counts and turn counts. Session rows display provider badges and use provider-safe composite keys for selection.
 - **Insight cards**: `InsightCard` (generic), `SessionHealthCard`, `ProjectFocusCard`, `LearningProgressCard` — each shows a metric with trend arrow and sparkline.
@@ -156,9 +157,9 @@ React Context providers used across the frontend for shared state.
 
 ## Type Definitions
 
-[[src/types.ts]] contains all TypeScript types (434 lines), mirroring the Rust models in [[src-tauri/src/models.rs]].
+[[src/types.ts]] contains shared TypeScript types mirroring the Rust models in [[src-tauri/src/models.rs]].
 
-Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
+Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), context savings (`ContextSavingsAnalytics`, `ContextSavingsEvent`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
 
 Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`, `PluginsTab`.
 
@@ -172,11 +173,11 @@ Per-window CSS files under `src/styles/`, each scoped to a specific feature doma
 
 | File | Lines | Scope |
 |------|-------|-------|
-| `src/styles/index.css` | 3,161 | Global styles, main window, analytics, layout toggle |
-| `src/styles/learning.css` | 810 | Learning window and components |
-| `src/styles/sessions.css` | 475 | Session search window |
-| `src/styles/plugins.css` | 786 | Plugin manager |
-| `src/styles/restart.css` | 294 | Restart window |
+| `src/styles/index.css` | 3,798 | Global styles, main window, analytics, layout toggle |
+| `src/styles/learning.css` | 940 | Learning window and components |
+| `src/styles/sessions.css` | 498 | Session search window |
+| `src/styles/plugins.css` | 847 | Plugin manager |
+| `src/styles/restart.css` | 356 | Restart window |
 
 ### Color System
 
@@ -187,6 +188,7 @@ Semantic color palette used across all stylesheets for consistent status indicat
 - Red `#f87171`: error, utilization >= 80%
 - Blue `#60a5fa`: accents, interactive elements
 - Memory type badges: blue (user), red (feedback), green (project), yellow (reference), purple (claude-md)
+- Context savings categories: green (capture), blue (source), amber (router), purple (decision), pink (provider) — derived from the event-type prefix in [[src/components/analytics/ContextSavingsTab.tsx#categoryColor]] and reused by KPI swatches, breakdown dots, and event-line dots
 
 ### Responsive Scaling
 

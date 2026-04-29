@@ -176,6 +176,11 @@ export interface ProviderStatus {
   lastVerifiedAt: string | null;
 }
 
+export interface ContextPreservationStatus {
+  enabled: boolean;
+  hasContextSavingsEvents: boolean;
+}
+
 // Code change stats types
 
 export interface LanguageBreakdown {
@@ -412,7 +417,121 @@ export interface SessionContext {
 
 // Analytics redesign types
 
-export type AnalyticsTab = "now" | "trends" | "charts";
+export type AnalyticsTab = "now" | "trends" | "charts" | "context";
+
+export type ContextSavingsEstimateConfidence =
+	| "exact"
+	| "high"
+	| "medium"
+	| "low"
+	| "none"
+	| number
+	| string;
+
+export interface ContextSavingsSummary {
+	eventCount: number;
+	routerEventCount: number;
+	continuityEventCount: number;
+	indexedBytes: number;
+	returnedBytes: number;
+	inputBytes: number;
+	tokensIndexedEst: number;
+	tokensReturnedEst: number;
+	tokensSavedEst: number;
+	tokensPreservedEst: number;
+}
+
+export interface ContextSavingsTimeSeriesPoint {
+	timestamp: string;
+	eventCount: number;
+	routerEventCount: number;
+	continuityEventCount: number;
+	indexedBytes: number;
+	returnedBytes: number;
+	inputBytes: number;
+	tokensIndexedEst: number;
+	tokensReturnedEst: number;
+	tokensSavedEst: number;
+	tokensPreservedEst: number;
+}
+
+export interface ContextSavingsBreakdownRow {
+	provider: IntegrationProvider | string | null;
+	eventType: string;
+	source: string;
+	eventCount: number;
+	indexedBytes: number;
+	returnedBytes: number;
+	inputBytes: number;
+	tokensIndexedEst: number;
+	tokensReturnedEst: number;
+	tokensSavedEst: number;
+	tokensPreservedEst: number;
+	estimateConfidence: ContextSavingsEstimateConfidence | null;
+}
+
+export interface ContextSavingsBreakdownGroup {
+	key: string;
+	eventCount: number;
+	deliveredCount?: number;
+	indexedBytes: number;
+	returnedBytes: number;
+	inputBytes: number;
+	tokensIndexedEst: number;
+	tokensReturnedEst: number;
+	tokensSavedEst: number;
+	tokensPreservedEst: number;
+}
+
+export interface ContextSavingsBreakdownsResponse {
+	byProvider?: ContextSavingsBreakdownGroup[];
+	byEventType?: ContextSavingsBreakdownGroup[];
+	bySource?: ContextSavingsBreakdownGroup[];
+	byDecision?: ContextSavingsBreakdownGroup[];
+	byCwd?: ContextSavingsBreakdownGroup[];
+}
+
+export interface ContextSavingsEvent {
+	eventId: string;
+	provider: IntegrationProvider;
+	sessionId: string | null;
+	hostname: string;
+	cwd: string | null;
+	timestamp: string;
+	eventType: string;
+	source: string;
+	decision: string | null;
+	reason: string | null;
+	delivered: boolean;
+	indexedBytes: number;
+	returnedBytes: number;
+	inputBytes: number;
+	tokensIndexedEst: number | null;
+	tokensReturnedEst: number | null;
+	tokensSavedEst: number | null;
+	tokensPreservedEst: number | null;
+	estimateMethod: string | null;
+	estimateConfidence: ContextSavingsEstimateConfidence | null;
+	sourceRef: string | null;
+	snapshotRef: string | null;
+	createdAt: string;
+}
+
+export interface ContextSavingsAnalytics {
+	range: RangeType;
+	generatedAt: string;
+	summary: ContextSavingsSummary;
+	timeSeries: ContextSavingsTimeSeriesPoint[];
+	breakdowns: ContextSavingsBreakdownRow[];
+	recentEvents: ContextSavingsEvent[];
+}
+
+export interface ContextSavingsAnalyticsResponse
+	extends Omit<ContextSavingsAnalytics, "timeSeries" | "breakdowns"> {
+	timeSeries?: ContextSavingsTimeSeriesPoint[];
+	timeseries?: ContextSavingsTimeSeriesPoint[];
+	breakdowns?: ContextSavingsBreakdownRow[] | ContextSavingsBreakdownsResponse;
+}
 
 export interface InsightTrend {
 	direction: "up" | "down" | "flat";

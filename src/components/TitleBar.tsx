@@ -96,7 +96,10 @@ function TitleBar({
     error: providerError,
     hasEnabledProvider,
     inFlightProviders,
+    contextPreservation,
+    contextPreservationInFlight,
     saveIndicatorPrimaryProvider,
+    setContextPreservationEnabled,
     enableProvider,
     disableProvider,
   } = integrations;
@@ -224,6 +227,20 @@ function TitleBar({
     [],
   );
 
+  const handleContextPreservationToggle = useCallback(
+    async (enabled: boolean) => {
+      try {
+        await setContextPreservationEnabled(enabled);
+      } catch (err) {
+        toast(
+          "error",
+          `${enabled ? "Enable" : "Disable"} failed for context preservation: ${String(err)}`,
+        );
+      }
+    },
+    [setContextPreservationEnabled, toast],
+  );
+
   const handleConfirmProviderAction = useCallback(async () => {
     if (!pendingProviderAction) return;
 
@@ -345,8 +362,13 @@ function TitleBar({
                 loading={providersLoading}
                 error={providerError}
                 inFlightProviders={inFlightProviders}
+                contextPreservation={contextPreservation}
+                contextPreservationInFlight={contextPreservationInFlight}
                 indicatorPrimaryProvider={indicatorPrimaryProvider}
                 onRequestToggle={handleRequestToggle}
+                onContextPreservationToggle={(enabled) => {
+                  void handleContextPreservationToggle(enabled);
+                }}
                 onIndicatorPrimaryProviderChange={(provider) => {
                   void saveIndicatorPrimaryProvider(provider);
                 }}

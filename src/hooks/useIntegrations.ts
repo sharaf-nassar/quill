@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  ContextPreservationStatus,
   IndicatorPrimaryProvider,
   IntegrationProvider,
   ProviderStatus,
@@ -32,12 +33,15 @@ function upsertStatus(
 export interface UseIntegrationsResult {
   statuses: ProviderStatus[];
   indicatorPrimaryProvider: IndicatorPrimaryProvider;
+  contextPreservation: ContextPreservationStatus;
   loading: boolean;
   error: string | null;
   inFlightProviders: ReadonlySet<IntegrationProvider>;
+  contextPreservationInFlight: boolean;
   hasEnabledProvider: boolean;
   refresh: () => Promise<void>;
   saveIndicatorPrimaryProvider: (provider: IndicatorPrimaryProvider) => Promise<void>;
+  setContextPreservationEnabled: (enabled: boolean) => Promise<ContextPreservationStatus>;
   enableProvider: (provider: IntegrationProvider, apiKey?: string) => Promise<ProviderStatus>;
   disableProvider: (provider: IntegrationProvider) => Promise<ProviderStatus>;
 }
@@ -46,21 +50,29 @@ export function useIntegrations(): UseIntegrationsResult {
   const [statuses, setStatuses] = useState<ProviderStatus[]>([]);
   const [indicatorPrimaryProvider, setIndicatorPrimaryProviderState] =
     useState<IndicatorPrimaryProvider>(null);
+  const [contextPreservation, setContextPreservation] =
+    useState<ContextPreservationStatus>({
+      enabled: false,
+      hasContextSavingsEvents: false,
+    });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [inFlightProviders, setInFlightProviders] = useState<Set<IntegrationProvider>>(
     new Set(),
   );
+  const [contextPreservationInFlight, setContextPreservationInFlight] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextStatuses, nextPrimaryProvider] = await Promise.all([
+      const [nextStatuses, nextPrimaryProvider, nextContextPreservation] = await Promise.all([
         invoke<ProviderStatus[]>("get_provider_statuses"),
         invoke<IndicatorPrimaryProvider>("get_indicator_primary_provider"),
+        invoke<ContextPreservationStatus>("get_context_preservation_status"),
       ]);
       setStatuses(sortStatuses(nextStatuses));
       setIndicatorPrimaryProviderState(nextPrimaryProvider);
+      setContextPreservation(nextContextPreservation);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -87,6 +99,31 @@ export function useIntegrations(): UseIntegrationsResult {
   useEffect(() => {
     const unlisten = listen<StatusIndicatorState>("indicator-updated", (event) => {
       setIndicatorPrimaryProviderState(event.payload.configuredPrimaryProvider);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<ContextPreservationStatus>(
+      "context-preservation-updated",
+      (event) => {
+        setContextPreservation(event.payload);
+        setError(null);
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen("context-savings-updated", () => {
+      setContextPreservation((prev) => ({
+        ...prev,
+        hasContextSavingsEvents: true,
+      }));
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -135,6 +172,25 @@ export function useIntegrations(): UseIntegrationsResult {
     [],
   );
 
+  const setContextPreservationEnabled = useCallback(async (enabled: boolean) => {
+    setContextPreservationInFlight(true);
+    try {
+      const updated = await invoke<ContextPreservationStatus>(
+        "set_context_preservation_enabled",
+        { enabled },
+      );
+      setContextPreservation(updated);
+      setError(null);
+      return updated;
+    } catch (e) {
+      const message = String(e);
+      setError(message);
+      throw new Error(message);
+    } finally {
+      setContextPreservationInFlight(false);
+    }
+  }, []);
+
   const enableProvider = useCallback(
     async (provider: IntegrationProvider, apiKey?: string) => {
       return runProviderCommand(provider, "confirm_enable_provider", apiKey ? { apiKey } : undefined);
@@ -157,12 +213,15 @@ export function useIntegrations(): UseIntegrationsResult {
   return {
     statuses,
     indicatorPrimaryProvider,
+    contextPreservation,
     loading,
     error,
     inFlightProviders,
+    contextPreservationInFlight,
     hasEnabledProvider,
     refresh,
     saveIndicatorPrimaryProvider,
+    setContextPreservationEnabled,
     enableProvider,
     disableProvider,
   };

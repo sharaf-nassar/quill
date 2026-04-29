@@ -1,10 +1,31 @@
 {
   "hooks": {
+    "SessionStart": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/context-capture.cjs\"",
+        "timeout": 3
+      }]
+    }],
+    "UserPromptSubmit": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/context-capture.cjs\"",
+        "timeout": 3
+      }]
+    }],
     "PreToolUse": [{
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/context-router.cjs\"",
+        "timeout": 3
+      },
+      {
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs\"",
         "timeout": 3
       }]
     },
@@ -12,7 +33,7 @@
       "matcher": "Edit|Write|MultiEdit|NotebookEdit",
       "hooks": [{
         "type": "command",
-        "command": "${CLAUDE_PLUGIN_ROOT}/scripts/qbuild-guard.sh",
+        "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/qbuild-guard.sh\"",
         "timeout": 5
       }]
     }],
@@ -20,12 +41,20 @@
       "matcher": "*",
       "hooks": [{
         "type": "command",
-        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/observe.cjs\"",
         "timeout": 3
       },
       {
         "type": "command",
-        "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.cjs",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.cjs\"",
+        "timeout": 3
+      }]
+    }],
+    "PreCompact": [{
+      "matcher": "",
+      "hooks": [{
+        "type": "command",
+        "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/context-capture.cjs\"",
         "timeout": 3
       }]
     }],
@@ -35,16 +64,21 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/report-tokens.sh"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/scripts/report-tokens.sh\""
           },
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.cjs",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-sync.cjs\"",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/scripts/session-end-learn.cjs",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/context-capture.cjs\"",
+            "timeout": 3
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/session-end-learn.cjs\"",
             "timeout": 5
           }
         ]

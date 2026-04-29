@@ -1,30 +1,43 @@
-import React, { useState, Suspense } from "react";
+import React, { useEffect, useState, Suspense } from "react";
 import { useAnalyticsData } from "../../hooks/useAnalyticsData";
 import TabBar from "./TabBar";
 import NowTab from "./NowTab";
 import TrendsTab from "./TrendsTab";
-import type { RangeType, AnalyticsTab } from "../../types";
+import ContextSavingsTab from "./ContextSavingsTab";
+import type { RangeType, AnalyticsTab, ContextPreservationStatus } from "../../types";
 
 const ChartsTab = React.lazy(() => import("./ChartsTab"));
 
 const TAB_KEY = "quill-analytics-tab";
 
-function AnalyticsView() {
+interface AnalyticsViewProps {
+	contextPreservation: ContextPreservationStatus;
+}
+
+function AnalyticsView({ contextPreservation }: AnalyticsViewProps) {
+	const showContextTab =
+		contextPreservation.enabled || contextPreservation.hasContextSavingsEvents;
 	const [activeTab, setActiveTab] = useState<AnalyticsTab>(() => {
 		try {
 			const saved = localStorage.getItem(TAB_KEY);
-			if (saved === "now" || saved === "trends" || saved === "charts") return saved;
+			if (
+				saved === "now" ||
+				saved === "trends" ||
+				saved === "charts" ||
+				(saved === "context" && showContextTab)
+			) return saved;
 		} catch { /* ignore */ }
 		return "now";
 	});
-	const [nowRange, setNowRange] = useState<RangeType>("24h");
+	const [nowRange, setNowRange] = useState<RangeType>("1h");
 	const [trendsRange, setTrendsRange] = useState<RangeType>("7d");
+	const [contextRange, setContextRange] = useState<RangeType>("1h");
 	const [chartsRange, setChartsRange] = useState<RangeType>(() => {
 		try {
 			const saved = localStorage.getItem("quill-charts-range");
 			if (saved === "1h" || saved === "24h" || saved === "7d" || saved === "30d") return saved as RangeType;
 		} catch { /* ignore */ }
-		return "24h";
+		return "1h";
 	});
 
 	const handleChartsRangeChange = (r: RangeType) => {
@@ -35,6 +48,7 @@ function AnalyticsView() {
 	};
 
 	const handleTabChange = (tab: AnalyticsTab) => {
+		if (tab === "context" && !showContextTab) return;
 		setActiveTab(tab);
 		try {
 			localStorage.setItem(TAB_KEY, tab);
@@ -43,9 +57,28 @@ function AnalyticsView() {
 
 	const { snapshotCount, loading } = useAnalyticsData(null, "24h");
 
+	useEffect(() => {
+		if (activeTab !== "context" || showContextTab) return;
+		setActiveTab("now");
+		try {
+			localStorage.setItem(TAB_KEY, "now");
+		} catch { /* ignore */ }
+	}, [activeTab, showContextTab]);
+
 	if (snapshotCount === 0 && !loading) {
 		return (
 			<div className="analytics-view">
+				<TabBar
+					activeTab={activeTab}
+					onTabChange={handleTabChange}
+					showContextTab={showContextTab}
+				/>
+				{activeTab === "context" && showContextTab ? (
+				<ContextSavingsTab
+					range={contextRange}
+					onRangeChange={setContextRange}
+				/>
+			) : (
 				<div className="analytics-empty-state">
 					<svg
 						className="analytics-empty-icon"
@@ -70,13 +103,18 @@ function AnalyticsView() {
 						is captured every 60 seconds.
 					</div>
 				</div>
+			)}
 			</div>
 		);
 	}
 
 	return (
 		<div className="analytics-view">
-			<TabBar activeTab={activeTab} onTabChange={handleTabChange} />
+			<TabBar
+				activeTab={activeTab}
+				onTabChange={handleTabChange}
+				showContextTab={showContextTab}
+			/>
 			{activeTab === "now" && (
 				<NowTab
 					range={nowRange}
@@ -96,6 +134,12 @@ function AnalyticsView() {
 						onRangeChange={handleChartsRangeChange}
 					/>
 				</Suspense>
+			)}
+			{activeTab === "context" && showContextTab && (
+				<ContextSavingsTab
+					range={contextRange}
+					onRangeChange={setContextRange}
+				/>
 			)}
 		</div>
 	);

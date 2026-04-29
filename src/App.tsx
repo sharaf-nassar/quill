@@ -137,6 +137,7 @@ function App({ integrations }: AppProps) {
 	);
 	const {
 		statuses,
+		contextPreservation,
 		loading: providersLoading,
 		error: providersError,
 		hasEnabledProvider,
@@ -626,7 +627,7 @@ function App({ integrations }: AppProps) {
 						)}
 						{showAnalytics && (
 					<div className="content analytics-content">
-						<AnalyticsView />
+						<AnalyticsView contextPreservation={contextPreservation} />
 					</div>
 						)}
 						{!showLive && !showAnalytics && (

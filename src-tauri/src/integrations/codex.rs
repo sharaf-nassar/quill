@@ -10,6 +10,7 @@ use std::process::Command;
 use tauri::Manager;
 
 const HOOK_MARKER: &str = "quill-codex-setup";
+const CONTEXT_HOOK_MARKER: &str = "quill-codex-context-preservation";
 const FEATURES_MARKER: &str = "quill-managed:codex:features";
 const MCP_BLOCK_START: &str = "# quill-managed:codex:mcp:start";
 const MCP_BLOCK_END: &str = "# quill-managed:codex:mcp:end";
@@ -18,9 +19,22 @@ const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
 
-const MANAGED_SCRIPT_FILES: [&str; 3] = ["observe.cjs", "report-tokens.sh", "session-sync.cjs"];
+const BASE_MANAGED_SCRIPT_FILES: [&str; 3] =
+    ["observe.cjs", "report-tokens.sh", "session-sync.cjs"];
+
+const CONTEXT_MANAGED_SCRIPT_FILES: [&str; 3] = [
+    "context-router.cjs",
+    "context-capture.cjs",
+    "context-telemetry.cjs",
+];
 
 const MANAGED_TEMPLATE_FILES: [&str; 1] = ["agents-md-section.md"];
+
+fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
+    BASE_MANAGED_SCRIPT_FILES
+        .into_iter()
+        .chain(CONTEXT_MANAGED_SCRIPT_FILES)
+}
 
 pub fn detect() -> Result<ProviderStatus, String> {
     let detected_cli = detect_codex_cli();
@@ -43,13 +57,16 @@ pub fn detect() -> Result<ProviderStatus, String> {
     })
 }
 
-pub fn install(app: &tauri::AppHandle) -> Result<OwnedAssetManifest, String> {
-    deploy_files(app)?;
+pub fn install(
+    app: &tauri::AppHandle,
+    context_enabled: bool,
+) -> Result<OwnedAssetManifest, String> {
+    deploy_files(app, context_enabled)?;
     create_local_config()?;
-    register_hooks()?;
-    update_config_toml()?;
+    register_hooks(context_enabled)?;
+    update_config_toml(context_enabled)?;
     update_agents_md()?;
-    verify()?;
+    verify(context_enabled)?;
     Ok(build_owned_manifest())
 }
 
@@ -64,17 +81,30 @@ pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn verify() -> Result<(), String> {
+pub fn verify(context_enabled: bool) -> Result<(), String> {
     let mut missing = Vec::new();
 
-    if !scripts_dir().join("observe.cjs").exists() {
-        missing.push("observe.cjs");
+    for script in BASE_MANAGED_SCRIPT_FILES {
+        if !scripts_dir().join(script).exists() {
+            missing.push(script.to_string());
+        }
     }
-    if !scripts_dir().join("session-sync.cjs").exists() {
-        missing.push("session-sync.cjs");
+    if context_enabled {
+        for script in CONTEXT_MANAGED_SCRIPT_FILES {
+            if !scripts_dir().join(script).exists() {
+                missing.push(script.to_string());
+            }
+        }
+    } else if let Some(script) = CONTEXT_MANAGED_SCRIPT_FILES
+        .into_iter()
+        .find(|script| scripts_dir().join(script).exists())
+    {
+        return Err(format!(
+            "Codex context preservation script is still installed: {script}"
+        ));
     }
     if !mcp_dir().join("server.py").exists() {
-        missing.push("mcp/server.py");
+        missing.push("mcp/server.py".to_string());
     }
     if scripts_dir().join(QBUILD_GUARD_SCRIPT).exists() {
         return Err("Codex integration should not deploy qbuild-guard.sh".to_string());
@@ -91,6 +121,18 @@ pub fn verify() -> Result<(), String> {
     if !hooks_content.contains(HOOK_MARKER) {
         return Err("Codex hooks were not written to hooks.json".to_string());
     }
+    if !hooks_content.contains("observe.cjs") || !hooks_content.contains("report-tokens.sh") {
+        return Err("Codex base hooks were not written to hooks.json".to_string());
+    }
+
+    let has_context_hook = hooks_content.contains("context-router.cjs")
+        || hooks_content.contains("context-capture.cjs");
+    if context_enabled && !has_context_hook {
+        return Err("Codex context preservation hooks were not written to hooks.json".to_string());
+    }
+    if !context_enabled && has_context_hook {
+        return Err("Codex context preservation hooks are still installed".to_string());
+    }
 
     let config_content = fs::read_to_string(config_path()).unwrap_or_default();
     if !config_content.contains("codex_hooks = true") {
@@ -100,10 +142,72 @@ pub fn verify() -> Result<(), String> {
     {
         return Err("config.toml does not contain a Quill MCP server entry".to_string());
     }
+    if !config_content.contains("QUILL_PROVIDER = \"codex\"") {
+        return Err("config.toml does not set QUILL_PROVIDER for Quill MCP".to_string());
+    }
+    if context_enabled && !config_content.contains("QUILL_CONTEXT_PRESERVATION = \"1\"") {
+        return Err("config.toml does not enable Quill context preservation".to_string());
+    }
+    if !context_enabled && config_content.contains("QUILL_CONTEXT_PRESERVATION = \"1\"") {
+        return Err("config.toml still enables Quill context preservation".to_string());
+    }
+
+    let context_tool = mcp_dir().join("tools").join("context.py");
+    if context_enabled && !context_tool.exists() {
+        return Err("Codex context MCP tool is missing".to_string());
+    }
+    if !context_enabled && context_tool.exists() {
+        return Err("Codex context MCP tool is still installed".to_string());
+    }
 
     let agents_content = fs::read_to_string(agents_path()).unwrap_or_default();
     if !agents_content.contains(AGENTS_BLOCK_START) {
         return Err("AGENTS.md does not contain the Quill managed block".to_string());
+    }
+
+    verify_mcp(context_enabled)?;
+
+    Ok(())
+}
+
+fn verify_mcp(context_enabled: bool) -> Result<(), String> {
+    let Some(uv_path) = crate::config::resolve_command_path("uv") else {
+        return Err("uv is not available on PATH".to_string());
+    };
+    let uv_path_env = crate::config::path_for_resolved_command(&uv_path);
+
+    let uv_check = Command::new(&uv_path)
+        .arg("--version")
+        .env("PATH", &uv_path_env)
+        .output()
+        .map_err(|err| format!("Failed to run uv --version: {err}"))?;
+    if !uv_check.status.success() {
+        return Err("uv --version exited with non-zero status".to_string());
+    }
+
+    let mcp_path = mcp_dir();
+    let mcp_path_str = mcp_path.to_string_lossy().to_string();
+    let verify = Command::new(&uv_path)
+        .args([
+            "run",
+            "--directory",
+            &mcp_path_str,
+            "python",
+            "-c",
+            "from server import mcp; print('ok')",
+        ])
+        .env("PATH", uv_path_env)
+        .env("QUILL_PROVIDER", "codex")
+        .env(
+            "QUILL_CONTEXT_PRESERVATION",
+            if context_enabled { "1" } else { "0" },
+        )
+        .output()
+        .map_err(|err| format!("Failed to run Codex MCP verification: {err}"))?;
+
+    if !verify.status.success() {
+        let stderr = String::from_utf8_lossy(&verify.stderr);
+        return Err(format!("Codex MCP server verification failed: {stderr}"));
     }
 
     Ok(())
@@ -211,8 +315,7 @@ fn get_hostname() -> String {
 }
 
 fn build_owned_manifest() -> OwnedAssetManifest {
-    let mut files: Vec<String> = MANAGED_SCRIPT_FILES
-        .into_iter()
+    let mut files: Vec<String> = all_managed_script_files()
         .map(|name| scripts_dir().join(name).to_string_lossy().to_string())
         .collect();
     files.extend(
@@ -297,7 +400,7 @@ fn clean_owned_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
+fn deploy_files(app: &tauri::AppHandle, context_enabled: bool) -> Result<(), String> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -326,14 +429,20 @@ fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
     copy_named_files(
         &codex_source.join("scripts"),
         &scripts_dir(),
-        &MANAGED_SCRIPT_FILES,
+        &BASE_MANAGED_SCRIPT_FILES,
     )?;
-    copy_named_files(
-        &codex_source.join("templates"),
-        &templates_dir(),
-        &MANAGED_TEMPLATE_FILES,
-    )?;
+    if context_enabled {
+        copy_named_files(
+            &codex_source.join("scripts"),
+            &scripts_dir(),
+            &CONTEXT_MANAGED_SCRIPT_FILES,
+        )?;
+    }
+    deploy_template(&codex_source.join("templates"), context_enabled)?;
     copy_dir_recursive(&shared_mcp_source, &mcp_dir())?;
+    if !context_enabled {
+        remove_context_mcp_tool()?;
+    }
 
     #[cfg(unix)]
     {
@@ -346,6 +455,36 @@ fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+fn deploy_template(src_dir: &Path, context_enabled: bool) -> Result<(), String> {
+    fs::create_dir_all(templates_dir())
+        .map_err(|err| format!("Failed to create templates dir: {err}"))?;
+    let template_name = if context_enabled {
+        "agents-md-section.md"
+    } else {
+        "agents-md-section-base.md"
+    };
+    let source = src_dir.join(template_name);
+    if !source.exists() {
+        return Err(format!("Bundled template missing at {}", source.display()));
+    }
+    fs::copy(source, templates_dir().join("agents-md-section.md"))
+        .map_err(|err| format!("Failed to deploy Codex template: {err}"))?;
+    Ok(())
+}
+
+fn remove_context_mcp_tool() -> Result<(), String> {
+    let context_tool = mcp_dir().join("tools").join("context.py");
+    if context_tool.exists() {
+        fs::remove_file(&context_tool).map_err(|err| {
+            format!(
+                "Failed to remove context MCP tool {}: {err}",
+                context_tool.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -402,7 +541,7 @@ fn create_local_config() -> Result<(), String> {
     Ok(())
 }
 
-fn register_hooks() -> Result<(), String> {
+fn register_hooks(context_enabled: bool) -> Result<(), String> {
     let path = hooks_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -434,22 +573,32 @@ fn register_hooks() -> Result<(), String> {
         if let Some(arr) = entries.as_array_mut() {
             arr.retain(|entry| {
                 let raw = entry.to_string();
-                !raw.contains(HOOK_MARKER) && !raw.contains(&script_root)
+                !raw.contains(HOOK_MARKER)
+                    && !raw.contains(CONTEXT_HOOK_MARKER)
+                    && !raw.contains(&script_root)
             });
         }
     }
 
     let observe_command = format!("node {}", shell_quote(&scripts_dir().join("observe.cjs")));
+    let context_router_command = format!(
+        "node {}",
+        shell_quote(&scripts_dir().join("context-router.cjs"))
+    );
+    let context_capture_command = format!(
+        "node {}",
+        shell_quote(&scripts_dir().join("context-capture.cjs"))
+    );
     let sync_command = format!(
         "node {}",
         shell_quote(&scripts_dir().join("session-sync.cjs"))
     );
     let tokens_command = shell_quote(&scripts_dir().join("report-tokens.sh"));
 
-    let hook_defs: Vec<(&str, Option<&str>, serde_json::Value)> = vec![
+    let mut hook_defs: Vec<(&str, Option<&str>, serde_json::Value)> = vec![
         (
             "SessionStart",
-            Some("startup|resume"),
+            Some(""),
             serde_json::json!({
                 "_source": HOOK_MARKER,
                 "hooks": [
@@ -524,6 +673,67 @@ fn register_hooks() -> Result<(), String> {
         ),
     ];
 
+    if context_enabled {
+        hook_defs.extend([
+            (
+                "SessionStart",
+                Some(""),
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "UserPromptSubmit",
+                None,
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "PreToolUse",
+                None,
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_router_command,
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "Stop",
+                None,
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command,
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+        ]);
+    }
+
     for (event, matcher, entry) in hook_defs {
         let arr = hooks_obj
             .entry(event.to_string())
@@ -545,7 +755,7 @@ fn register_hooks() -> Result<(), String> {
     Ok(())
 }
 
-fn update_config_toml() -> Result<(), String> {
+fn update_config_toml(context_enabled: bool) -> Result<(), String> {
     let path = config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -561,9 +771,9 @@ fn update_config_toml() -> Result<(), String> {
     let without_managed_block = strip_block(&existing, MCP_BLOCK_START, MCP_BLOCK_END);
     let with_features = upsert_features_flag(&without_managed_block);
     let updated = if with_features.contains("[mcp_servers.quill]") {
-        with_features
+        ensure_codex_mcp_env(&with_features, context_enabled)
     } else {
-        append_managed_mcp_block(&with_features)
+        append_managed_mcp_block(&with_features, context_enabled)
     };
 
     fs::write(&path, updated).map_err(|err| format!("Failed to write config.toml: {err}"))?;
@@ -626,7 +836,9 @@ fn remove_managed_hooks() -> Result<(), String> {
             if let Some(arr) = entries.as_array_mut() {
                 arr.retain(|entry| {
                     let raw = entry.to_string();
-                    !raw.contains(HOOK_MARKER) && !raw.contains(&script_root)
+                    !raw.contains(HOOK_MARKER)
+                        && !raw.contains(CONTEXT_HOOK_MARKER)
+                        && !raw.contains(&script_root)
                 });
             }
         }
@@ -804,10 +1016,19 @@ fn upsert_features_flag(content: &str) -> String {
     normalize_lines(lines, true)
 }
 
-fn append_managed_mcp_block(content: &str) -> String {
+fn context_preservation_env_line(context_enabled: bool) -> &'static str {
+    if context_enabled {
+        "QUILL_CONTEXT_PRESERVATION = \"1\""
+    } else {
+        "QUILL_CONTEXT_PRESERVATION = \"0\""
+    }
+}
+
+fn append_managed_mcp_block(content: &str, context_enabled: bool) -> String {
     let mcp_path = toml_string(&mcp_dir());
+    let context_line = context_preservation_env_line(context_enabled);
     let block = format!(
-        "{MCP_BLOCK_START}\n[mcp_servers.quill]\ncommand = \"uv\"\nargs = [\"run\", \"--directory\", \"{mcp_path}\", \"python\", \"server.py\"]\nenabled = true\n{MCP_BLOCK_END}"
+        "{MCP_BLOCK_START}\n[mcp_servers.quill]\ncommand = \"uv\"\nargs = [\"run\", \"--directory\", \"{mcp_path}\", \"python\", \"server.py\"]\nenabled = true\n\n[mcp_servers.quill.env]\nQUILL_PROVIDER = \"codex\"\n{context_line}\n{MCP_BLOCK_END}"
     );
 
     if content.trim().is_empty() {
@@ -815,6 +1036,65 @@ fn append_managed_mcp_block(content: &str) -> String {
     }
 
     format!("{}\n\n{block}\n", content.trim_end())
+}
+
+fn ensure_codex_mcp_env(content: &str, context_enabled: bool) -> String {
+    let provider_line = "QUILL_PROVIDER = \"codex\"";
+    let context_line = context_preservation_env_line(context_enabled);
+    if content.contains("[mcp_servers.quill.env]") {
+        let mut lines = Vec::new();
+        let mut in_env_section = false;
+        let mut provider_written = false;
+        let mut context_written = false;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if in_env_section && trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if !provider_written {
+                    lines.push(provider_line.to_string());
+                }
+                if !context_written {
+                    lines.push(context_line.to_string());
+                }
+                in_env_section = false;
+            }
+
+            if in_env_section && trimmed.starts_with("QUILL_PROVIDER") {
+                lines.push(provider_line.to_string());
+                provider_written = true;
+                continue;
+            }
+            if in_env_section && trimmed.starts_with("QUILL_CONTEXT_PRESERVATION") {
+                lines.push(context_line.to_string());
+                context_written = true;
+                continue;
+            }
+
+            lines.push(line.to_string());
+            if trimmed == "[mcp_servers.quill.env]" {
+                in_env_section = true;
+                provider_written = false;
+                context_written = false;
+            }
+        }
+
+        if in_env_section {
+            if !provider_written {
+                lines.push(provider_line.to_string());
+            }
+            if !context_written {
+                lines.push(context_line.to_string());
+            }
+        }
+
+        return normalize_lines(lines, true);
+    }
+
+    let env_block = format!("[mcp_servers.quill.env]\n{provider_line}\n{context_line}");
+    if content.trim().is_empty() {
+        return format!("{env_block}\n");
+    }
+    format!("{}\n\n{env_block}\n", content.trim_end())
 }
 
 fn remove_features_flag(content: &str) -> String {

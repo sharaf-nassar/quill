@@ -67,7 +67,7 @@ React and TypeScript sources organized by feature domain under `src/`.
 | `src/windows/` | Secondary window entry points |
 | `src/utils/` | Formatting helpers (time, tokens, charts) |
 | `src/styles/` | Pure CSS stylesheets (dark theme) |
-| [[src/types.ts]] | All TypeScript type definitions (434 lines) |
+| [[src/types.ts]] | Shared TypeScript type definitions for Rust IPC models and frontend state |
 
 ## Communication Layers
 

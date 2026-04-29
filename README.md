@@ -4,7 +4,7 @@
   <img src="src-tauri/icons/quill-original.png" width="128" alt="Quill icon" />
 </p>
 
-A cross-platform desktop widget that displays your Claude AI plan usage in a compact, always-on-top floating window. Built with Tauri + React.
+A cross-platform desktop widget that displays your Claude Code, Codex, and other AI assistant usage in a compact, always-on-top floating window — with full-text session search, behavioral learning, and an optional context preservation feature that keeps large working context out of LLM transcripts. Built with Tauri + React.
 
 ## Features
 
@@ -21,7 +21,8 @@ A cross-platform desktop widget that displays your Claude AI plan usage in a com
 - Per-bucket statistics with min/max/average, trend indicators, and sparklines
 - **Breakdown panels** — token usage grouped by host, project, or session with per-item data deletion
 - Time range selection (1h, 24h, 7d, 30d)
-- **Tabbed dashboard** — Now (current period stats), Trends (historical patterns), and Charts (4 synchronized mini-charts)
+- **Tabbed dashboard** — Now (current period stats), Trends (historical patterns), Charts (synchronized mini-charts), and a conditional Context tab when context preservation is active
+- **Context tab** — four-column stats strip (saved / indexed / returned / routing tokens), stacked-bar trend chart, magnitude-fill breakdown by event type, and a single-line event log with a directional byte indicator (→ indexed, ← returned)
 - Activity heatmap showing usage patterns over time
 - Project focus, session health, and learning progress insight cards
 - Efficiency metrics (cache hit ratio, avg tokens per turn)
@@ -52,15 +53,27 @@ A cross-platform desktop widget that displays your Claude AI plan usage in a com
 - Undo any applied change to restore the original file
 - Batched "optimize all" to review and apply suggestions across an entire project
 
+### Working context preservation
+- Optional, default-off feature toggled from the QUILL menu in the titlebar — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
+- **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_record_continuity_event`, `quill_create_compaction_snapshot` / `quill_get_compaction_snapshot`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
+- **Routing hooks** — block raw `WebFetch` and noisy `curl`/`wget` dumps, nudge broad `Bash`/`Read`/`Grep`/build/test output toward `quill_*` tools, and use per-session marker files to avoid repeating guidance
+- **Continuity capture** — small task and decision hints recorded across sessions so a new session can resume context without writing to provider memory paths
+- **Telemetry** — every preservation event reports compact byte and token estimates to the Context tab; large content stays in the local context store and never enters the analytics database
+- Toggling the feature deploys or removes context scripts, the context MCP tool, instruction templates, and hooks for currently enabled providers; historical context stores and analytics rows are preserved on disable
+- Available for both Claude Code and Codex via their respective integrations
+
 ### MCP server
-- Gives Claude Code direct access to your indexed session history via MCP tools
-- **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use
-- **`list_projects`** / **`list_sessions`** — browse projects and sessions
-- **`get_session_context`** — retrieve surrounding messages for a search hit
-- **`get_branch_activity`** — see all work done on a git branch
-- **`get_token_usage`** — query token usage and cost analytics
-- **`get_learned_rules`** — retrieve learned coding patterns
-- **`get_tool_details`** — inspect full tool input/output for a specific action
+- Gives Claude Code (and Codex) direct access to your indexed session history and — when context preservation is enabled — the working context store
+- Session-history tools:
+  - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use
+  - **`list_projects`** / **`list_sessions`** — browse projects and sessions
+  - **`get_session_context`** — retrieve surrounding messages for a search hit
+  - **`get_branch_activity`** — see all work done on a git branch
+  - **`get_file_history`** / **`find_related_sessions`** — track changes to a file or sessions that share files
+  - **`get_token_usage`** — query token usage and cost analytics
+  - **`get_learned_rules`** — retrieve learned coding patterns
+  - **`get_tool_details`** — inspect full tool input/output for a specific action
+- Context tools (only when context preservation is enabled): see the Working context preservation section above
 - Automatically configured on local installs when the app starts — no plugin or manual setup needed
 - For remote hosts, available after installing the plugin and running `/quill:setup`
 
@@ -274,6 +287,10 @@ claude /login
 
 No additional configuration is needed — the widget starts tracking utilization immediately.
 
+### Enabling context preservation (optional)
+
+Open the **QUILL** menu in the titlebar and toggle the **Context Preservation** switch. Enabling installs the context MCP tool, routing hooks, and capture scripts for currently active providers (Claude Code, Codex). Disabling redeploys the base integration and removes context assets while preserving historical context stores and analytics rows. When at least one event is recorded, the **Context** tab appears in Analytics.
+
 ## Token Tracking, Learning & Session Search
 
 The app includes an HTTP server (port `19876`, configurable via `QUILL_PORT`) that receives data from Claude Code via hooks. This powers three features:
@@ -368,6 +385,7 @@ cargo tauri dev
 
 - **Drag the title bar** to move the window
 - **Drag any edge or corner** to resize
+- **QUILL** title in the titlebar opens the provider menu (layout, indicator provider, context preservation toggle, and Claude Code / Codex / MiniMax integration controls)
 - **Live tab** to toggle the live usage view
 - **Analytics tab** to toggle the analytics view
 - **Brain icon (🧠)** to open the learning window
@@ -390,10 +408,11 @@ src/                          # React frontend
     UsageRow.tsx              # Usage row with progress bar + token sparkline
     UsageDisplay.tsx          # Container for all usage rows
     analytics/
-      AnalyticsView.tsx       # Tabbed analytics (Now, Trends, Charts)
+      AnalyticsView.tsx       # Tabbed analytics (Now, Trends, Charts, conditional Context)
       NowTab.tsx              # Current period stats with code sparkline
       TrendsTab.tsx           # Historical trend analysis
       ChartsTab.tsx           # Four synchronized mini-charts
+      ContextSavingsTab.tsx   # Context preservation analytics (savings strip, magnitude breakdown, event log)
       BreakdownPanel.tsx      # Host/project/session breakdown with deletion
       UsageChart.tsx          # Dual-axis chart (utilization + tokens)
       MiniChart.tsx           # Compact chart for the Charts tab
@@ -452,6 +471,7 @@ src/                          # React frontend
     useActivityPattern.ts     # Activity heatmap data
     useCacheEfficiency.ts     # Cache efficiency calculations
     useResponseTimeStats.ts   # Response time and idle time stats
+    useContextSavingsStats.ts # Context preservation telemetry aggregates
     usePluginData.ts          # Plugin list, updates, marketplace data
     useToast.tsx              # Toast notification system
   utils/
@@ -490,14 +510,19 @@ src-tauri/                    # Rust backend
       report-tokens.sh        # Extracts tokens from transcript, POSTs to widget
       session-sync.cjs        # Syncs session metadata and messages to widget
       session-end-learn.cjs   # Triggers learning analysis on session end
+      context-capture.cjs     # Records continuity events, snapshots, and capture telemetry
+      context-router.cjs      # Routes broad tool calls toward quill_* MCP tools (when enabled)
+      context-telemetry.cjs   # Builds and posts context-savings events to the widget
     mcp/                      # MCP server deployed to ~/.config/quill/mcp/
-      server.py               # FastMCP server for session history tools
+      server.py               # FastMCP server for session history (and context) tools
       dependencies.py         # Lifespan and shared state
       tools/
         search.py             # search_history, get_session_context, get_branch_activity
         discovery.py          # list_projects, list_sessions, get_session_overview
         analytics.py          # get_token_usage, get_learned_rules
         details.py            # get_tool_details, get_file_history
+        context.py            # quill_index_context, quill_search_context, quill_execute, fetch_and_index, snapshots, etc.
+  codex-integration/          # Parallel resources for Codex CLI (mirrors claude-integration scripts and tools)
   tauri.conf.json             # Tauri window and build configuration
 plugin/                       # Claude Code plugin (for remote host setups only)
   .claude-plugin/

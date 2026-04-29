@@ -6,16 +6,81 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{
-    BucketStats, CodeStats, CodeStatsHistoryPoint, DataPoint, GitSnapshot, HostBreakdown,
-    LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
-    LearningStatus, LlmRuntimeStats, ObservationPayload, ProjectBreakdown, ProjectTokens,
-    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, TokenDataPoint,
-    TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    BucketStats, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
+    ContextSavingsBreakdownItem, ContextSavingsBreakdowns, ContextSavingsEvent,
+    ContextSavingsEventPayload, ContextSavingsInsertResult, ContextSavingsSummary,
+    ContextSavingsTimeseriesPoint, DataPoint, GitSnapshot, HostBreakdown, LanguageBreakdown,
+    LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload, LearningStatus,
+    LlmRuntimeStats, ObservationPayload, ProjectBreakdown, ProjectTokens, SessionBreakdown,
+    SessionCodeStats, SessionRef, SessionStats, TokenDataPoint, TokenReportPayload, TokenStats,
+    ToolCount, UsageBucket,
 };
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 #[allow(dead_code)]
 const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
+const CONTEXT_SAVINGS_EVENTS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS context_savings_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    schema_version INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    session_id TEXT,
+    hostname TEXT NOT NULL,
+    cwd TEXT,
+    timestamp TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    delivered INTEGER NOT NULL,
+    indexed_bytes INTEGER,
+    returned_bytes INTEGER,
+    input_bytes INTEGER,
+    tokens_indexed_est INTEGER,
+    tokens_returned_est INTEGER,
+    tokens_saved_est INTEGER,
+    tokens_preserved_est INTEGER,
+    estimate_method TEXT,
+    estimate_confidence REAL,
+    source_ref TEXT,
+    snapshot_ref TEXT,
+    metadata_json TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_context_savings_timestamp
+    ON context_savings_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_context_savings_provider_timestamp
+    ON context_savings_events(provider, timestamp);
+CREATE INDEX IF NOT EXISTS idx_context_savings_provider_session_timestamp
+    ON context_savings_events(provider, session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_context_savings_event_type_timestamp
+    ON context_savings_events(event_type, timestamp);
+CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
+    ON context_savings_events(cwd, timestamp);
+"#;
+const CONTEXT_SAVINGS_AGGREGATES_SQL: &str = r#"
+COUNT(*),
+COALESCE(SUM(CASE WHEN delivered != 0 THEN 1 ELSE 0 END), 0),
+COALESCE(SUM(COALESCE(indexed_bytes, 0)), 0),
+COALESCE(SUM(COALESCE(returned_bytes, 0)), 0),
+COALESCE(SUM(COALESCE(input_bytes, 0)), 0),
+COALESCE(SUM(COALESCE(tokens_indexed_est, (COALESCE(indexed_bytes, 0) + 3) / 4)), 0),
+COALESCE(SUM(COALESCE(tokens_returned_est, (COALESCE(returned_bytes, 0) + 3) / 4)), 0),
+COALESCE(SUM(COALESCE(
+    tokens_saved_est,
+    CASE
+        WHEN indexed_bytes IS NOT NULL OR input_bytes IS NOT NULL OR returned_bytes IS NOT NULL THEN
+            CASE
+                WHEN COALESCE(indexed_bytes, input_bytes, 0) > COALESCE(returned_bytes, 0) THEN
+                    (COALESCE(indexed_bytes, input_bytes, 0) - COALESCE(returned_bytes, 0) + 3) / 4
+                ELSE 0
+            END
+        ELSE 0
+    END
+)), 0),
+COALESCE(SUM(COALESCE(tokens_preserved_est, (COALESCE(indexed_bytes, 0) + 3) / 4)), 0)
+"#;
 
 fn insert_tool_actions(
     stmt: &mut rusqlite::CachedStatement<'_>,
@@ -349,6 +414,67 @@ fn range_to_duration(range: &str) -> TimeDelta {
     }
 }
 
+fn context_savings_from_timestamp(range: &str) -> String {
+    if range == "all" {
+        return "1970-01-01T00:00:00Z".to_string();
+    }
+
+    (Utc::now() - range_to_duration(range)).to_rfc3339()
+}
+
+fn context_savings_bucket_expr(range: &str) -> &'static str {
+    match range {
+        "1h" => "substr(timestamp, 1, 16) || ':00Z'",
+        "30d" | "all" => "substr(timestamp, 1, 10) || 'T00:00:00Z'",
+        _ => "substr(timestamp, 1, 13) || ':00:00Z'",
+    }
+}
+
+fn context_savings_summary_from_row_at(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<ContextSavingsSummary> {
+    Ok(ContextSavingsSummary {
+        event_count: row.get(offset)?,
+        delivered_count: row.get(offset + 1)?,
+        indexed_bytes: row.get(offset + 2)?,
+        returned_bytes: row.get(offset + 3)?,
+        input_bytes: row.get(offset + 4)?,
+        tokens_indexed_est: row.get(offset + 5)?,
+        tokens_returned_est: row.get(offset + 6)?,
+        tokens_saved_est: row.get(offset + 7)?,
+        tokens_preserved_est: row.get(offset + 8)?,
+    })
+}
+
+fn context_savings_breakdown_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ContextSavingsBreakdownItem> {
+    let summary = context_savings_summary_from_row_at(row, 1)?;
+    Ok(ContextSavingsBreakdownItem {
+        key: row.get(0)?,
+        event_count: summary.event_count,
+        delivered_count: summary.delivered_count,
+        indexed_bytes: summary.indexed_bytes,
+        returned_bytes: summary.returned_bytes,
+        input_bytes: summary.input_bytes,
+        tokens_indexed_est: summary.tokens_indexed_est,
+        tokens_returned_est: summary.tokens_returned_est,
+        tokens_saved_est: summary.tokens_saved_est,
+        tokens_preserved_est: summary.tokens_preserved_est,
+    })
+}
+
+fn parse_context_savings_provider(value: String) -> IntegrationProvider {
+    value
+        .parse::<IntegrationProvider>()
+        .unwrap_or(IntegrationProvider::Claude)
+}
+
+fn parse_context_savings_metadata(raw: Option<String>) -> Option<serde_json::Value> {
+    raw.and_then(|value| serde_json::from_str(&value).ok())
+}
+
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
         .is_ok()
@@ -395,6 +521,20 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
             "CREATE INDEX IF NOT EXISTS idx_tool_actions_category_timestamp ON tool_actions(category, timestamp);
              CREATE INDEX IF NOT EXISTS idx_tool_actions_category_provider_session ON tool_actions(category, provider, session_id);",
             "tool action query indexes",
+        ),
+        (
+            table_has_column(conn, "context_savings_events", "event_id"),
+            "CREATE INDEX IF NOT EXISTS idx_context_savings_timestamp
+                 ON context_savings_events(timestamp);
+             CREATE INDEX IF NOT EXISTS idx_context_savings_provider_timestamp
+                 ON context_savings_events(provider, timestamp);
+             CREATE INDEX IF NOT EXISTS idx_context_savings_provider_session_timestamp
+                 ON context_savings_events(provider, session_id, timestamp);
+             CREATE INDEX IF NOT EXISTS idx_context_savings_event_type_timestamp
+                 ON context_savings_events(event_type, timestamp);
+             CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
+                 ON context_savings_events(cwd, timestamp);",
+            "context savings indexes",
         ),
     ];
 
@@ -530,7 +670,46 @@ impl Storage {
                 provider_scope TEXT NOT NULL DEFAULT '["claude"]',
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
-            );"#,
+            );
+
+            CREATE TABLE IF NOT EXISTS context_savings_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL UNIQUE,
+                schema_version INTEGER NOT NULL,
+                provider TEXT NOT NULL,
+                session_id TEXT,
+                hostname TEXT NOT NULL,
+                cwd TEXT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                reason TEXT,
+                delivered INTEGER NOT NULL,
+                indexed_bytes INTEGER,
+                returned_bytes INTEGER,
+                input_bytes INTEGER,
+                tokens_indexed_est INTEGER,
+                tokens_returned_est INTEGER,
+                tokens_saved_est INTEGER,
+                tokens_preserved_est INTEGER,
+                estimate_method TEXT,
+                estimate_confidence REAL,
+                source_ref TEXT,
+                snapshot_ref TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_savings_timestamp
+                ON context_savings_events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_context_savings_provider_timestamp
+                ON context_savings_events(provider, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_context_savings_provider_session_timestamp
+                ON context_savings_events(provider, session_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_context_savings_event_type_timestamp
+                ON context_savings_events(event_type, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
+                ON context_savings_events(cwd, timestamp);"#,
         )
         .map_err(|e| format!("Failed to create tables: {e}"))?;
 
@@ -1120,6 +1299,14 @@ impl Storage {
 
             conn.execute("INSERT INTO schema_version (version) VALUES (15)", [])
                 .map_err(|e| format!("Failed to record migration 15: {e}"))?;
+        }
+
+        if current_version < 16 {
+            conn.execute_batch(CONTEXT_SAVINGS_EVENTS_SCHEMA)
+                .map_err(|e| format!("Migration 16 (context_savings_events): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (16)", [])
+                .map_err(|e| format!("Failed to record migration 16: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -1737,6 +1924,319 @@ impl Storage {
             })
         })
         .map_err(|e| format!("Query error: {e}"))
+    }
+
+    pub fn store_context_savings_events(
+        &self,
+        events: &[ContextSavingsEventPayload],
+    ) -> Result<ContextSavingsInsertResult, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Context savings transaction error: {e}"))?;
+
+        let mut inserted = 0i64;
+        let mut ignored = 0i64;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO context_savings_events (
+                         event_id,
+                         schema_version,
+                         provider,
+                         session_id,
+                         hostname,
+                         cwd,
+                         timestamp,
+                         event_type,
+                         source,
+                         decision,
+                         reason,
+                         delivered,
+                         indexed_bytes,
+                         returned_bytes,
+                         input_bytes,
+                         tokens_indexed_est,
+                         tokens_returned_est,
+                         tokens_saved_est,
+                         tokens_preserved_est,
+                         estimate_method,
+                         estimate_confidence,
+                         source_ref,
+                         snapshot_ref,
+                         metadata_json
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                )
+                .map_err(|e| format!("Prepare context savings insert error: {e}"))?;
+
+            for event in events {
+                let metadata_json = event
+                    .metadata_json
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| format!("Serialize context savings metadata error: {e}"))?;
+
+                let changed = stmt
+                    .execute(params![
+                        event.event_id,
+                        event.schema_version,
+                        event.provider.as_str(),
+                        event.session_id.as_deref(),
+                        event.hostname,
+                        event.cwd.as_deref(),
+                        event.timestamp,
+                        event.event_type,
+                        event.source,
+                        event.decision,
+                        event.reason.as_deref(),
+                        event.delivered as i32,
+                        event.indexed_bytes,
+                        event.returned_bytes,
+                        event.input_bytes,
+                        event.tokens_indexed_est,
+                        event.tokens_returned_est,
+                        event.tokens_saved_est,
+                        event.tokens_preserved_est,
+                        event.estimate_method.as_deref(),
+                        event.estimate_confidence,
+                        event.source_ref.as_deref(),
+                        event.snapshot_ref.as_deref(),
+                        metadata_json,
+                    ])
+                    .map_err(|e| format!("Insert context savings event error: {e}"))?;
+
+                if changed == 0 {
+                    ignored += 1;
+                } else {
+                    inserted += 1;
+                }
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Commit context savings events error: {e}"))?;
+
+        Ok(ContextSavingsInsertResult { inserted, ignored })
+    }
+
+    pub fn get_context_savings_analytics(
+        &self,
+        range: &str,
+        limit: Option<i64>,
+    ) -> Result<ContextSavingsAnalytics, String> {
+        let conn = self.conn.lock();
+        let from = context_savings_from_timestamp(range);
+        let recent_limit = limit.unwrap_or(50).clamp(1, 500);
+        let breakdown_limit = 20i64;
+
+        let summary_sql = format!(
+            "SELECT {CONTEXT_SAVINGS_AGGREGATES_SQL}
+             FROM context_savings_events
+             WHERE timestamp >= ?1"
+        );
+        let summary = conn
+            .query_row(&summary_sql, params![from], |row| {
+                context_savings_summary_from_row_at(row, 0)
+            })
+            .map_err(|e| format!("Query context savings summary error: {e}"))?;
+
+        let bucket_expr = context_savings_bucket_expr(range);
+        let timeseries_sql = format!(
+            "SELECT {bucket_expr} AS bucket, {CONTEXT_SAVINGS_AGGREGATES_SQL}
+             FROM context_savings_events
+             WHERE timestamp >= ?1
+             GROUP BY bucket
+             ORDER BY bucket ASC"
+        );
+        let mut timeseries_stmt = conn
+            .prepare(&timeseries_sql)
+            .map_err(|e| format!("Prepare context savings timeseries error: {e}"))?;
+        let timeseries_rows = timeseries_stmt
+            .query_map(params![from], |row| {
+                let summary = context_savings_summary_from_row_at(row, 1)?;
+                Ok(ContextSavingsTimeseriesPoint {
+                    timestamp: row.get(0)?,
+                    event_count: summary.event_count,
+                    delivered_count: summary.delivered_count,
+                    indexed_bytes: summary.indexed_bytes,
+                    returned_bytes: summary.returned_bytes,
+                    input_bytes: summary.input_bytes,
+                    tokens_indexed_est: summary.tokens_indexed_est,
+                    tokens_returned_est: summary.tokens_returned_est,
+                    tokens_saved_est: summary.tokens_saved_est,
+                    tokens_preserved_est: summary.tokens_preserved_est,
+                })
+            })
+            .map_err(|e| format!("Query context savings timeseries error: {e}"))?;
+
+        let mut timeseries = Vec::new();
+        for row in timeseries_rows {
+            timeseries.push(row.map_err(|e| format!("Context savings timeseries row error: {e}"))?);
+        }
+
+        let breakdowns = ContextSavingsBreakdowns {
+            by_provider: Self::get_context_savings_breakdown_with_conn(
+                &conn,
+                "provider",
+                &from,
+                breakdown_limit,
+            )?,
+            by_event_type: Self::get_context_savings_breakdown_with_conn(
+                &conn,
+                "event_type",
+                &from,
+                breakdown_limit,
+            )?,
+            by_source: Self::get_context_savings_breakdown_with_conn(
+                &conn,
+                "source",
+                &from,
+                breakdown_limit,
+            )?,
+            by_decision: Self::get_context_savings_breakdown_with_conn(
+                &conn,
+                "decision",
+                &from,
+                breakdown_limit,
+            )?,
+            by_cwd: Self::get_context_savings_breakdown_with_conn(
+                &conn,
+                "cwd",
+                &from,
+                breakdown_limit,
+            )?,
+        };
+
+        let recent_events =
+            Self::get_recent_context_savings_events_with_conn(&conn, &from, recent_limit)?;
+
+        Ok(ContextSavingsAnalytics {
+            summary,
+            timeseries,
+            breakdowns,
+            recent_events,
+        })
+    }
+
+    pub fn has_context_savings_events(&self) -> Result<bool, String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM context_savings_events LIMIT 1)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(|e| format!("Context savings existence query error: {e}"))
+    }
+
+    fn get_context_savings_breakdown_with_conn(
+        conn: &Connection,
+        dimension: &str,
+        from: &str,
+        limit: i64,
+    ) -> Result<Vec<ContextSavingsBreakdownItem>, String> {
+        let sql = format!(
+            "SELECT COALESCE(NULLIF({dimension}, ''), '(unknown)') AS key,
+                    {CONTEXT_SAVINGS_AGGREGATES_SQL}
+             FROM context_savings_events
+             WHERE timestamp >= ?1
+             GROUP BY key
+             ORDER BY 9 DESC, 2 DESC
+             LIMIT ?2"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Prepare context savings breakdown error: {e}"))?;
+        let rows = stmt
+            .query_map(params![from, limit], context_savings_breakdown_from_row)
+            .map_err(|e| format!("Query context savings breakdown error: {e}"))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| format!("Context savings breakdown row error: {e}"))?);
+        }
+        Ok(results)
+    }
+
+    fn get_recent_context_savings_events_with_conn(
+        conn: &Connection,
+        from: &str,
+        limit: i64,
+    ) -> Result<Vec<ContextSavingsEvent>, String> {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT
+                     event_id,
+                     schema_version,
+                     provider,
+                     session_id,
+                     hostname,
+                     cwd,
+                     timestamp,
+                     event_type,
+                     source,
+                     decision,
+                     reason,
+                     delivered,
+                     indexed_bytes,
+                     returned_bytes,
+                     input_bytes,
+                     tokens_indexed_est,
+                     tokens_returned_est,
+                     tokens_saved_est,
+                     tokens_preserved_est,
+                     estimate_method,
+                     estimate_confidence,
+                     source_ref,
+                     snapshot_ref,
+                     metadata_json,
+                     created_at
+                 FROM context_savings_events
+                 WHERE timestamp >= ?1
+                 ORDER BY timestamp DESC, created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("Prepare recent context savings events error: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![from, limit], |row| {
+                Ok(ContextSavingsEvent {
+                    event_id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    provider: parse_context_savings_provider(row.get(2)?),
+                    session_id: row.get(3)?,
+                    hostname: row.get(4)?,
+                    cwd: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    event_type: row.get(7)?,
+                    source: row.get(8)?,
+                    decision: row.get(9)?,
+                    reason: row.get(10)?,
+                    delivered: row.get::<_, i64>(11)? != 0,
+                    indexed_bytes: row.get(12)?,
+                    returned_bytes: row.get(13)?,
+                    input_bytes: row.get(14)?,
+                    tokens_indexed_est: row.get(15)?,
+                    tokens_returned_est: row.get(16)?,
+                    tokens_saved_est: row.get(17)?,
+                    tokens_preserved_est: row.get(18)?,
+                    estimate_method: row.get(19)?,
+                    estimate_confidence: row.get(20)?,
+                    source_ref: row.get(21)?,
+                    snapshot_ref: row.get(22)?,
+                    metadata_json: parse_context_savings_metadata(row.get(23)?),
+                    created_at: row.get(24)?,
+                })
+            })
+            .map_err(|e| format!("Query recent context savings events error: {e}"))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| format!("Recent context savings event row error: {e}"))?);
+        }
+        Ok(results)
     }
 
     pub fn get_token_hostnames(&self) -> Result<Vec<String>, String> {

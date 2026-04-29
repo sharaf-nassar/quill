@@ -1,7 +1,7 @@
 use crate::integrations::manifest::OwnedAssetManifest;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::Manager;
 
@@ -80,14 +80,26 @@ const MANAGED_COMMAND_FILES: [&str; 5] = [
     "quill-setup.md",
 ];
 
-const MANAGED_SCRIPT_FILES: [&str; 4] = [
+const BASE_MANAGED_SCRIPT_FILES: [&str; 4] = [
     "observe.cjs",
     "qbuild-guard.sh",
     "session-sync.cjs",
     "report-tokens.sh",
 ];
 
+const CONTEXT_MANAGED_SCRIPT_FILES: [&str; 3] = [
+    "context-router.cjs",
+    "context-capture.cjs",
+    "context-telemetry.cjs",
+];
+
 const MCP_SERVER_KEY: &str = "mcpServers.quill";
+
+fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
+    BASE_MANAGED_SCRIPT_FILES
+        .into_iter()
+        .chain(CONTEXT_MANAGED_SCRIPT_FILES)
+}
 
 fn build_owned_manifest() -> OwnedAssetManifest {
     let mut files: Vec<String> = MANAGED_COMMAND_FILES
@@ -95,8 +107,7 @@ fn build_owned_manifest() -> OwnedAssetManifest {
         .map(|name| commands_dir().join(name).to_string_lossy().to_string())
         .collect();
     files.extend(
-        MANAGED_SCRIPT_FILES
-            .into_iter()
+        all_managed_script_files()
             .map(|name| scripts_dir().join(name).to_string_lossy().to_string()),
     );
 
@@ -177,22 +188,29 @@ fn clean_quill_commands() -> Result<(), String> {
     Ok(())
 }
 
+fn shell_quote(path: &Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
+}
+
 pub(crate) fn owned_asset_manifest() -> OwnedAssetManifest {
     build_owned_manifest()
 }
 
-pub fn install_with_manifest(app: &tauri::AppHandle) -> Result<OwnedAssetManifest, String> {
-    deploy_files(app)?;
+pub fn install_with_manifest(
+    app: &tauri::AppHandle,
+    context_enabled: bool,
+) -> Result<OwnedAssetManifest, String> {
+    deploy_files(app, context_enabled)?;
 
     if let Err(err) = create_local_config() {
         log::error!("Failed to create local config: {err}");
     }
 
-    if let Err(err) = register_mcp_server() {
+    if let Err(err) = register_mcp_server(context_enabled) {
         log::error!("Failed to register MCP server: {err}");
     }
 
-    if let Err(err) = register_hooks() {
+    if let Err(err) = register_hooks(context_enabled) {
         log::error!("Failed to register hooks: {err}");
     }
 
@@ -204,10 +222,7 @@ pub fn install_with_manifest(app: &tauri::AppHandle) -> Result<OwnedAssetManifes
         log::error!("Failed to clean up legacy hooks: {err}");
     }
 
-    if let Err(err) = verify_mcp() {
-        log::error!("MCP server verification FAILED: {err}");
-        log::error!("The Quill MCP server may not work correctly until this is resolved");
-    }
+    verify(context_enabled)?;
 
     Ok(build_owned_manifest())
 }
@@ -426,7 +441,9 @@ fn cleanup_quill_hooks() -> Result<(), String> {
                 let before = arr.len();
                 arr.retain(|entry| {
                     let raw = entry.to_string();
-                    !raw.contains(HOOK_MARKER) && !raw.contains(&quill_scripts_path)
+                    !raw.contains(HOOK_MARKER)
+                        && !raw.contains(CONTEXT_HOOK_MARKER)
+                        && !raw.contains(&quill_scripts_path)
                 });
                 if arr.len() != before {
                     modified = true;
@@ -446,7 +463,7 @@ fn cleanup_quill_hooks() -> Result<(), String> {
 }
 
 /// Extract bundled resources from the app to managed directories.
-fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
+fn deploy_files(app: &tauri::AppHandle, context_enabled: bool) -> Result<(), String> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -474,10 +491,25 @@ fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
     clean_quill_commands()?;
 
     // Deploy each subdirectory to its target
-    copy_dir_recursive(&source.join("scripts"), &scripts_dir())?;
+    fs::create_dir_all(scripts_dir()).map_err(|e| format!("Failed to create scripts dir: {e}"))?;
+    copy_named_files(
+        &source.join("scripts"),
+        &scripts_dir(),
+        &BASE_MANAGED_SCRIPT_FILES,
+    )?;
+    if context_enabled {
+        copy_named_files(
+            &source.join("scripts"),
+            &scripts_dir(),
+            &CONTEXT_MANAGED_SCRIPT_FILES,
+        )?;
+    }
     copy_dir_recursive(&source.join("mcp"), &mcp_dir())?;
-    copy_dir_recursive(&source.join("templates"), &templates_dir())?;
     copy_dir_recursive(&source.join("commands"), &commands_dir())?;
+    deploy_template(&source.join("templates"), context_enabled)?;
+    if !context_enabled {
+        remove_context_mcp_tool()?;
+    }
 
     // Make shell scripts executable on Unix
     #[cfg(unix)]
@@ -497,6 +529,59 @@ fn deploy_files(app: &tauri::AppHandle) -> Result<(), String> {
         "Deployed claude-integration files from {}",
         source.display()
     );
+    Ok(())
+}
+
+fn copy_named_files(src_dir: &Path, dst_dir: &Path, file_names: &[&str]) -> Result<(), String> {
+    fs::create_dir_all(dst_dir)
+        .map_err(|err| format!("Failed to create directory {}: {err}", dst_dir.display()))?;
+
+    for file_name in file_names {
+        let source = src_dir.join(file_name);
+        if !source.exists() {
+            return Err(format!("Bundled file missing at {}", source.display()));
+        }
+
+        let target = dst_dir.join(file_name);
+        fs::copy(&source, &target).map_err(|err| {
+            format!(
+                "Failed to copy {} -> {}: {err}",
+                source.display(),
+                target.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn deploy_template(src_dir: &Path, context_enabled: bool) -> Result<(), String> {
+    fs::create_dir_all(templates_dir())
+        .map_err(|err| format!("Failed to create templates dir: {err}"))?;
+    let template_name = if context_enabled {
+        "claude-md-section.md"
+    } else {
+        "claude-md-section-base.md"
+    };
+    let source = src_dir.join(template_name);
+    if !source.exists() {
+        return Err(format!("Bundled template missing at {}", source.display()));
+    }
+    fs::copy(source, templates_dir().join("claude-md-section.md"))
+        .map_err(|err| format!("Failed to deploy Claude template: {err}"))?;
+    Ok(())
+}
+
+fn remove_context_mcp_tool() -> Result<(), String> {
+    let context_tool = mcp_dir().join("tools").join("context.py");
+    if context_tool.exists() {
+        fs::remove_file(&context_tool).map_err(|err| {
+            format!(
+                "Failed to remove context MCP tool {}: {err}",
+                context_tool.display()
+            )
+        })?;
+    }
     Ok(())
 }
 
@@ -757,7 +842,7 @@ fn migrate_legacy_section(content: &str, block_content: &str) -> String {
 // ── MCP server registration ──
 
 /// Merge a `quill` MCP server entry into ~/.claude.json.
-fn register_mcp_server() -> Result<(), String> {
+fn register_mcp_server(context_enabled: bool) -> Result<(), String> {
     let claude_json_path = dirs::home_dir()
         .ok_or("Cannot determine home directory")?
         .join(".claude.json");
@@ -775,7 +860,11 @@ fn register_mcp_server() -> Result<(), String> {
 
     let quill_entry = serde_json::json!({
         "command": "uv",
-        "args": ["run", "--directory", mcp_path_str, "python", "server.py"]
+        "args": ["run", "--directory", mcp_path_str, "python", "server.py"],
+        "env": {
+            "QUILL_PROVIDER": "claude",
+            "QUILL_CONTEXT_PRESERVATION": if context_enabled { "1" } else { "0" }
+        }
     });
 
     let mcp_servers = root
@@ -802,9 +891,10 @@ fn register_mcp_server() -> Result<(), String> {
 // ── Hook registration ──
 
 const HOOK_MARKER: &str = "quill-setup";
+const CONTEXT_HOOK_MARKER: &str = "quill-context-preservation";
 
 /// Merge all Quill hooks into ~/.claude/settings.json.
-fn register_hooks() -> Result<(), String> {
+fn register_hooks(context_enabled: bool) -> Result<(), String> {
     let settings_path = dirs::home_dir()
         .ok_or("Cannot determine home directory")?
         .join(".claude")
@@ -840,10 +930,14 @@ fn register_hooks() -> Result<(), String> {
         .ok_or("hooks field is not an object")?;
 
     let sd = scripts_dir();
-    let sd_str = sd.to_string_lossy();
+    let observe_command = format!("node {}", shell_quote(&sd.join("observe.cjs")));
+    let context_router_command = format!("node {}", shell_quote(&sd.join("context-router.cjs")));
+    let context_capture_command = format!("node {}", shell_quote(&sd.join("context-capture.cjs")));
+    let qbuild_guard_command = shell_quote(&sd.join("qbuild-guard.sh"));
+    let report_tokens_command = shell_quote(&sd.join("report-tokens.sh"));
+    let session_sync_command = format!("node {}", shell_quote(&sd.join("session-sync.cjs")));
 
-    // Define hook entries — no SessionStart needed (setup is handled by the widget).
-    let hook_defs: Vec<(&str, &str, serde_json::Value)> = vec![
+    let mut hook_defs: Vec<(&str, &str, serde_json::Value)> = vec![
         (
             "PreToolUse",
             "*",
@@ -852,7 +946,7 @@ fn register_hooks() -> Result<(), String> {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": format!("node {}/observe.cjs", sd_str),
+                        "command": observe_command.clone(),
                         "timeout": 3
                     }
                 ]
@@ -866,7 +960,7 @@ fn register_hooks() -> Result<(), String> {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": format!("{}/qbuild-guard.sh", sd_str),
+                        "command": qbuild_guard_command,
                         "timeout": 5
                     }
                 ]
@@ -880,7 +974,7 @@ fn register_hooks() -> Result<(), String> {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": format!("node {}/observe.cjs", sd_str),
+                        "command": observe_command.clone(),
                         "timeout": 3
                     }
                 ]
@@ -894,11 +988,11 @@ fn register_hooks() -> Result<(), String> {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": format!("{}/report-tokens.sh", sd_str)
+                        "command": report_tokens_command
                     },
                     {
                         "type": "command",
-                        "command": format!("node {}/session-sync.cjs", sd_str),
+                        "command": session_sync_command,
                         "timeout": 3
                     }
                 ]
@@ -906,15 +1000,92 @@ fn register_hooks() -> Result<(), String> {
         ),
     ];
 
+    if context_enabled {
+        hook_defs.extend([
+            (
+                "SessionStart",
+                "",
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "PreToolUse",
+                "*",
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_router_command,
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "UserPromptSubmit",
+                "",
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "PreCompact",
+                "",
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+            (
+                "Stop",
+                "",
+                serde_json::json!({
+                    "_source": CONTEXT_HOOK_MARKER,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": context_capture_command,
+                            "timeout": 5
+                        }
+                    ]
+                }),
+            ),
+        ]);
+    }
+
     // First pass: remove ALL existing Quill entries across all events.
     // Matches both marked entries (_source: "quill-setup") AND unmarked legacy entries
     // that reference our scripts directory (from before the marker was introduced).
-    let quill_scripts_path = sd_str.to_string();
+    let quill_scripts_path = sd.to_string_lossy().to_string();
     for (_event, entries) in hooks_obj.iter_mut() {
         if let Some(arr) = entries.as_array_mut() {
             arr.retain(|entry| {
                 let s = entry.to_string();
-                !s.contains(HOOK_MARKER) && !s.contains(&quill_scripts_path)
+                !s.contains(HOOK_MARKER)
+                    && !s.contains(CONTEXT_HOOK_MARKER)
+                    && !s.contains(&quill_scripts_path)
             });
         }
     }
@@ -947,13 +1118,119 @@ fn register_hooks() -> Result<(), String> {
 
 // ── MCP verification ──
 
+pub fn verify(context_enabled: bool) -> Result<(), String> {
+    let mut missing = Vec::new();
+
+    for script in BASE_MANAGED_SCRIPT_FILES {
+        if !scripts_dir().join(script).exists() {
+            missing.push(script.to_string());
+        }
+    }
+    if context_enabled {
+        for script in CONTEXT_MANAGED_SCRIPT_FILES {
+            if !scripts_dir().join(script).exists() {
+                missing.push(script.to_string());
+            }
+        }
+    } else if let Some(script) = CONTEXT_MANAGED_SCRIPT_FILES
+        .into_iter()
+        .find(|script| scripts_dir().join(script).exists())
+    {
+        return Err(format!(
+            "Claude context preservation script is still installed: {script}"
+        ));
+    }
+    if !mcp_dir().join("server.py").exists() {
+        missing.push("mcp/server.py".to_string());
+    }
+    if !templates_dir().join("claude-md-section.md").exists() {
+        missing.push("templates/claude-md-section.md".to_string());
+    }
+
+    if !missing.is_empty() {
+        return Err(format!(
+            "Claude integration assets missing after install: {}",
+            missing.join(", ")
+        ));
+    }
+
+    let settings_path = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".claude")
+        .join("settings.json");
+    let settings_content = fs::read_to_string(&settings_path).unwrap_or_default();
+    if !settings_content.contains(HOOK_MARKER) {
+        return Err("Claude hooks were not written to settings.json".to_string());
+    }
+    if !settings_content.contains("observe.cjs") || !settings_content.contains("report-tokens.sh") {
+        return Err("Claude base hooks were not written to settings.json".to_string());
+    }
+
+    let has_context_hook = settings_content.contains("context-router.cjs")
+        || settings_content.contains("context-capture.cjs");
+    if context_enabled && !has_context_hook {
+        return Err(
+            "Claude context preservation hooks were not written to settings.json".to_string(),
+        );
+    }
+    if !context_enabled && has_context_hook {
+        return Err("Claude context preservation hooks are still installed".to_string());
+    }
+
+    let claude_json_path = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".claude.json");
+    let claude_json_content = fs::read_to_string(&claude_json_path).unwrap_or_default();
+    if !claude_json_content.contains("\"mcpServers\"") || !claude_json_content.contains("\"quill\"")
+    {
+        return Err(".claude.json does not contain a Quill MCP server entry".to_string());
+    }
+    if !claude_json_content.contains("\"QUILL_PROVIDER\"")
+        || !claude_json_content.contains("\"claude\"")
+    {
+        return Err(".claude.json does not set QUILL_PROVIDER for Quill MCP".to_string());
+    }
+    if context_enabled && !claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"") {
+        return Err(".claude.json does not enable Quill context preservation".to_string());
+    }
+    if !context_enabled && claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"") {
+        return Err(".claude.json still enables Quill context preservation".to_string());
+    }
+
+    let context_tool = mcp_dir().join("tools").join("context.py");
+    if context_enabled && !context_tool.exists() {
+        return Err("Claude context MCP tool is missing".to_string());
+    }
+    if !context_enabled && context_tool.exists() {
+        return Err("Claude context MCP tool is still installed".to_string());
+    }
+
+    let claude_md_path = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".claude")
+        .join("CLAUDE.md");
+    let claude_md_content = fs::read_to_string(&claude_md_path).unwrap_or_default();
+    if !claude_md_content.contains(BLOCK_START) {
+        return Err("CLAUDE.md does not contain the Quill managed block".to_string());
+    }
+
+    verify_mcp(context_enabled)?;
+
+    Ok(())
+}
+
 /// Check that the MCP server can run.
-fn verify_mcp() -> Result<(), String> {
-    // Check if uv is on PATH
-    let uv_check = Command::new("uv")
+fn verify_mcp(context_enabled: bool) -> Result<(), String> {
+    let Some(uv_path) = crate::config::resolve_command_path("uv") else {
+        return Err("uv is not available on PATH".to_string());
+    };
+    let uv_path_env = crate::config::path_for_resolved_command(&uv_path);
+
+    let uv_check = Command::new(&uv_path)
         .arg("--version")
+        .env("PATH", &uv_path_env)
         .output()
-        .map_err(|e| format!("uv is not available on PATH: {e}"))?;
+        .map_err(|e| format!("Failed to run uv --version: {e}"))?;
 
     if !uv_check.status.success() {
         return Err("uv --version exited with non-zero status".to_string());
@@ -963,7 +1240,7 @@ fn verify_mcp() -> Result<(), String> {
     let mcp_path = mcp_dir();
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
 
-    let verify = Command::new("uv")
+    let verify = Command::new(&uv_path)
         .args([
             "run",
             "--directory",
@@ -972,6 +1249,12 @@ fn verify_mcp() -> Result<(), String> {
             "-c",
             "from server import mcp; print('ok')",
         ])
+        .env("PATH", uv_path_env)
+        .env("QUILL_PROVIDER", "claude")
+        .env(
+            "QUILL_CONTEXT_PRESERVATION",
+            if context_enabled { "1" } else { "0" },
+        )
         .output()
         .map_err(|e| format!("Failed to run MCP verification: {e}"))?;
 
@@ -1062,5 +1345,5 @@ fn cleanup_legacy_hooks() -> Result<(), String> {
 /// Called on widget startup.
 #[allow(dead_code)]
 pub fn setup_local(app: &tauri::AppHandle) -> Result<(), String> {
-    install_with_manifest(app).map(|_| ())
+    install_with_manifest(app, false).map(|_| ())
 }

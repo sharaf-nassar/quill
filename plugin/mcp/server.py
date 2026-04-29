@@ -19,9 +19,10 @@ mcp = FastMCP(
     name="Quill",
     instructions="""\
 Quill indexes all Claude Code session history into a searchable database.
-ALWAYS use these tools instead of reading raw JSONL session logs from
-~/.claude/projects/. The Quill index is faster, pre-processed, and returns
-structured results — raw logs are large, unindexed, and waste context window.
+It also stores large working-context output in a local searchable context
+store. ALWAYS use Quill tools instead of reading raw JSONL session logs from
+~/.claude/projects/ or dumping large command/web/file output into the
+conversation. Quill returns focused snippets and stable refs instead.
 
 ## When to use Quill
 
@@ -31,29 +32,40 @@ structured results — raw logs are large, unindexed, and waste context window.
 - User asks about token usage, costs, or session analytics
 - You need to find which sessions touched a specific file or branch
 - User asks what files were edited, what commands were run, or what tools were used
+- You need to analyze large command output, files, fetched web pages, or generated logs
+- A Quill hook provides a `<quill_continuity>` directive with recent task/decision context
 
-## What Quill indexes
+## What Quill Indexes
 
-Quill doesn't just index conversation text. Every message is enriched with:
+Session history is enriched with:
 
 - **code_changes** — summaries of Edit and Write tool calls (file path + what changed)
 - **commands_run** — Bash commands and their truncated output
 - **tool_details** — Read, Grep, Glob, and Agent tool calls with paths/queries
 - **tool_actions** — full tool input/output stored in SQLite for deep inspection
 
-All of these are full-text searchable. Searching for "edit server.py" finds
-messages where server.py was edited. Searching for "cargo build" finds
-messages where that command was run. Searching for "grep auth" finds
-messages where auth-related searches happened.
+Working context is indexed separately by the `quill_*` tools:
+
+- **quill_index_context** — index large text or files
+- **quill_execute / quill_execute_file / quill_batch_execute** — run bounded analysis
+  and index large output
+- **quill_fetch_and_index** — fetch web content into Quill context storage
+- **quill_search_context / quill_get_context_source** — retrieve focused chunks by ref
+- **quill_record_continuity_event / quill_create_compaction_snapshot** — preserve
+  decisions, tasks, and compact resume snapshots
 
 ## Workflow: progressive disclosure (cheap → expensive)
 
-1. **Browse** — `list_projects` or `list_sessions` to orient
-2. **Search** — `search_history` to find messages by content, edits, commands, or tool use
-3. **Cross-reference** — `get_file_history` for all actions on a file across sessions,
+1. **Working context** — use `quill_index_context`, `quill_execute`,
+   `quill_batch_execute`, or `quill_fetch_and_index` when output may be large
+2. **Focused retrieval** — use `quill_search_context` and `quill_get_context_source`
+   to bring back only relevant chunks
+3. **Browse history** — `list_projects` or `list_sessions` to orient
+4. **Search history** — `search_history` to find messages by content, edits, commands, or tool use
+5. **Cross-reference** — `get_file_history` for all actions on a file across sessions,
    `get_branch_activity` for work on a git branch, `find_related_sessions` for sessions
    that touched the same files
-4. **Drill down** — `get_session_context` for surrounding messages,
+6. **Drill down** — `get_session_context` for surrounding messages,
    `get_tool_details` for full tool input/output (the raw data)
 
 ## Search result fields
@@ -65,13 +77,14 @@ Use these fields to answer questions without needing to drill deeper.
 ## Do NOT
 
 - Read files from ~/.claude/projects/*/*.jsonl directly — use Quill instead
+- Dump full web pages, broad grep/read output, or large build logs into the transcript
 - Fetch all sessions at once — use filters (project, date, branch) to narrow
 - Return raw tool output to the user — summarize the relevant findings
 """,
     lifespan=lifespan,
 )
 
-from tools import analytics, details, discovery, search  # noqa: E402, F401
+from tools import analytics, context, details, discovery, search  # noqa: E402, F401
 
 if __name__ == "__main__":
     mcp.run()

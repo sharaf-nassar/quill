@@ -1,6 +1,6 @@
 # Features
 
-Quill provides six major features: live usage monitoring, analytics, behavioral learning, session search, plugin management, and instance restart orchestration.
+Quill provides live usage monitoring, analytics, behavioral learning, session search, working-context preservation, plugin management, memory optimization, and restart orchestration.
 
 ## Live Usage View
 
@@ -20,9 +20,11 @@ The shared workload rail lives in [[src/components/live/LiveSummaryModule.tsx]],
 
 ## Analytics Dashboard
 
-Three-tab analytics view in the main window's right pane, powered by [[frontend#Custom Hooks]] and Recharts.
+Four-tab analytics view in the main window's right pane, powered by [[frontend#Custom Hooks]] and Recharts.
 
 All analytics data is aggregated across all LLM providers — there is no per-bucket or per-provider filtering.
+
+Each tab opens at its smallest available timeframe toggle by default: Now and Context default to `1h`, Trends defaults to `7d` (its smallest because week-over-week comparison requires at least a week), and Charts defaults to `1h` when no localStorage preference is saved (`quill-charts-range`).
 
 ### Now Tab
 
@@ -41,6 +43,14 @@ Week-over-week comparison charts for token usage trends, code velocity, and cach
 Composite Recharts visualization with three synchronized charts: tokens, code changes, and cache efficiency.
 
 Crosshair context synchronizes tooltip position across chart components. Lazy-loaded with React Suspense to reduce initial bundle size.
+
+### Context Tab
+
+Context savings analytics show how much large working context Quill kept out of active LLM transcripts.
+
+The tab appears in the Analytics tab bar only while context preservation is enabled or historical context-savings events exist. It stays available even before token snapshots exist, because context telemetry is independent of provider token polling.
+
+`src/components/analytics/ContextSavingsTab.tsx` renders a compact 1h/24h/7d/30d view with a four-column stats strip (saved, indexed, returned, routing) over a stacked-bar trend chart, a single-line breakdown table where each row places a category dot, the event-type label, an inline provider tag, the source name, and right-aligned numeric columns over a relative-magnitude background fill scaled to the largest event count, and a single-line event log where each entry shows time, provider, source, reason, a directional byte indicator (→ indexed, ← returned, · input), and the token estimate. The magnitude fill is implemented as a `::before` pseudo-element driven by `--bar-width` and `--bar-bg` custom properties, which keeps the bar from competing with grid items for track sizing. Confidence is hidden when the estimate is exact (the deterministic `ceil(bytes / 4)` case) and surfaced only when the source reports lower confidence. `src/hooks/useContextSavingsStats.ts` listens for the `context-savings-updated` event and invokes [[src-tauri/src/lib.rs#get_context_savings_analytics]].
 
 ## Learning System
 
@@ -103,6 +113,44 @@ Results show ranked hits with snippets, tools used, files modified, and code cha
 ### Batch Code Stats
 
 `useSessionCodeStats` hook lazily fetches LOC stats for visible search results using a ref-based cache to avoid redundant IPC calls.
+
+## Working Context Preservation
+
+Quill preserves large transient context as searchable refs so assistants can keep the conversation compact while still recovering details.
+
+### Feature Toggle
+
+Context preservation is controlled by a global default-off setting in Quill.
+
+The QUILL menu exposes a `Context Preservation` section backed by `context_preservation.enabled` in the settings table. Enabling installs the local context scripts, context MCP tool, context-aware instruction templates, and hooks for currently enabled Claude Code and Codex providers; future Claude or Codex provider enables inherit the setting. Disabling redeploys only the base Quill integration for those providers, removing context hooks and local context assets while preserving historical context stores and analytics rows. Toggle sync runs when an enabled provider home exists, even if the provider CLI is temporarily unavailable, so disable cleanup can still remove local feature assets.
+
+### Context MCP Tools
+
+The Quill MCP server exposes context tools beside the existing session-history tools.
+
+Tools in [[src-tauri/claude-integration/mcp/tools/context.py]] and [[plugin/mcp/tools/context.py]] can index text or files, fetch and cache web pages, run bounded commands, search indexed chunks, retrieve focused sources, record continuity events, create compact snapshots, inspect stats, and purge stored context. File-based tools resolve paths under the selected working directory before reading or preserving content.
+
+Large execution and batch outputs are stored as `source:N` and `chunk:N` refs. Responses return previews and snippets by default, while [[src-tauri/claude-integration/mcp/tools/context.py#quill_get_context_source]] retrieves bounded chunks when the model needs exact details.
+
+### Routing Hooks
+
+Provider hooks steer high-volume operations toward Quill context tools before they flood the active transcript.
+
+`src-tauri/claude-integration/scripts/context-router.cjs` and `src-tauri/codex-integration/scripts/context-router.cjs` block raw WebFetch or noisy `curl`/`wget` dumps and nudge broad Bash, Read, Grep, build, and test output toward `quill_*` MCP tools. Per-session marker files under `~/.config/quill/context/markers/` keep guidance from repeating.
+
+### Continuity Capture
+
+Continuity hooks record small task and decision hints without writing to provider memory paths.
+
+`src-tauri/claude-integration/scripts/context-capture.cjs` and `src-tauri/codex-integration/scripts/context-capture.cjs` write compact JSONL events under `~/.config/quill/context/continuity/`, capture prompts and simple decision/task hints, store PreCompact or Stop snapshots when available, and emit a short `<quill_continuity>` directive on SessionStart when recent continuity exists.
+
+### Context Savings Telemetry
+
+Context savings telemetry forwards compact measurements to Quill without copying large context into the main analytics database.
+
+The MCP tools and context hooks send best-effort batches to `/api/v1/context-savings/events` through `context-telemetry.cjs` or the Python telemetry helper in [[src-tauri/claude-integration/mcp/tools/context.py]]. Events record exact bytes when available, refs such as `source:N` or `snapshot:N`, and approximate token estimates using `ceil(bytes / 4)`. The local MCP context database remains the source of large stored content.
+
+`tokensSavedEst` is computed as `ceil(max(0, baseline - returnedBytes) / 4)` where the baseline is `indexedBytes` when present (preferring what Quill actually preserved over the small input summary) and falls back to `inputBytes`; a missing `returnedBytes` is treated as 0 so write-only events (capture.event, capture.snapshot) still attribute savings. The same fallback runs in the [[src-tauri/src/storage.rs]] aggregate SQL when `tokens_saved_est` is NULL on a row.
 
 ## Plugin Manager
 

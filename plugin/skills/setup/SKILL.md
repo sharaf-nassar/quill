@@ -7,10 +7,11 @@ You are configuring the Quill plugin for a **remote host setup** — where Claud
 
 > **Note**: If the Quill app runs on the same machine as Claude Code, you don't need this plugin or this setup. The app automatically configures hooks, MCP, and config on startup. This setup is for remote connections only.
 
-This plugin has two components:
+This plugin has three components:
 
 1. **Usage hook** — reports per-turn token usage to the Quill desktop widget over HTTP
 2. **MCP server** — lets you query session history, search past conversations, and analyze usage patterns
+3. **Context hooks** — route large context-heavy tool use and preserve compact session continuity locally
 
 The widget server requires a bearer secret for authentication. The secret is stored at `~/Library/Application Support/com.quilltoolkit.app/auth_secret` on macOS or `~/.local/share/com.quilltoolkit.app/auth_secret` on Linux, on the machine running the Quill app.
 
@@ -77,7 +78,7 @@ Follow these steps exactly:
 
 8. Verify the MCP server can start:
    - Run: `uv run --directory ${CLAUDE_PLUGIN_ROOT}/mcp python -c "from server import mcp; print('ok')"`
-   - If it succeeds, tell the user: "The Quill MCP server is ready. It provides 12 tools for querying your session history, searching past conversations, and analyzing usage patterns. The MCP server starts automatically — no additional configuration needed."
+   - If it succeeds, tell the user: "The Quill MCP server is ready. It provides session-history and context-preservation tools for searching past conversations, indexing large context, and analyzing usage patterns. The MCP server starts automatically — no additional configuration needed."
    - If it fails, show the error and suggest: "Try running `uv sync --directory ${CLAUDE_PLUGIN_ROOT}/mcp` to install dependencies, then re-run `/quill:setup`."
 
 ## Part 3: CLAUDE.md MCP Instructions
@@ -97,6 +98,15 @@ Follow these steps exactly:
      content, code changes, commands run, and tool usage.
 
    - **MCP Tools** (use these directly):
+     - `mcp__quill__quill_index_context` — Index large text, files, or command output into Quill context storage
+     - `mcp__quill__quill_search_context` — Search indexed Quill context without dumping raw content
+     - `mcp__quill__quill_get_context_source` — Retrieve a focused indexed context source or chunk
+     - `mcp__quill__quill_execute` / `mcp__quill__quill_execute_file` — Run analysis while returning only compact results
+     - `mcp__quill__quill_batch_execute` — Run multiple labeled commands and index large outputs
+     - `mcp__quill__quill_fetch_and_index` — Fetch web content into Quill context storage instead of dumping pages
+     - `mcp__quill__quill_context_stats` — Inspect Quill context storage usage
+     - `mcp__quill__quill_record_continuity_event` — Record a compact task/decision continuity event
+     - `mcp__quill__quill_create_compaction_snapshot` / `mcp__quill__quill_get_compaction_snapshot` — Save or retrieve compact resume snapshots
      - `mcp__quill__list_projects` — List all projects with session counts
      - `mcp__quill__list_sessions` — List sessions with metadata (filter by project, date)
      - `mcp__quill__get_session_overview` — Preview a session (first message, tools, files)
@@ -110,9 +120,19 @@ Follow these steps exactly:
      - `mcp__quill__get_tool_details` — Full tool input/output for a specific message
      - `mcp__quill__get_index_status` — Index and database health stats
 
-   - **Workflow**: Use progressive disclosure — browse (`list_projects`/`list_sessions`) → search
-     (`search_history`) → cross-reference (`get_file_history`/`get_branch_activity`) → drill down
-     (`get_session_context`/`get_tool_details`).
+   - **Workflow**: For large current-context work, index or execute with the `quill_*` context tools,
+     then search/retrieve focused chunks. For session history, browse (`list_projects`/`list_sessions`)
+     → search (`search_history`) → cross-reference (`get_file_history`/`get_branch_activity`) → drill
+     down (`get_session_context`/`get_tool_details`).
+
+   - **Context Preservation**: Quill hooks may provide a compact `<quill_continuity>` directive
+     at session start with recent prompts, decisions, tasks, and the best Quill MCP tools to use.
+     Treat it as resume context; continue the current task when it is relevant.
+
+   - **Routing Behavior**: Prefer Quill MCP tools for prior work, transcript details, token usage,
+     file/session history, web fetches, and large command/file analysis. Avoid raw transcript reads,
+     broad Read/Grep dumps, WebFetch page dumps, and unbounded `curl`/`wget`; summarize large
+     shell/build output before bringing it into context.
 
    - **Use When**: User asks about past sessions, previous work, conversation history, "what did we do",
      token usage/costs, or which sessions touched a specific file or branch.
@@ -129,10 +149,15 @@ Follow these steps exactly:
    Setup complete!
 
    Hook:      Reports token usage to <url> as "<hostname>"
-   MCP:       12 tools for querying session history (auto-starts with Claude Code)
+   MCP:       Session-history and context-preservation tools (auto-starts with Claude Code)
+   Context:   Routes large output and stores continuity under ~/.config/quill/context/continuity
    CLAUDE.md: MCP usage instructions added to ~/.claude/CLAUDE.md
 
    Available MCP tools:
+   - quill_index_context / quill_search_context / quill_get_context_source — index and retrieve large context
+   - quill_execute / quill_execute_file / quill_batch_execute — run compact analysis without dumping output
+   - quill_fetch_and_index — fetch web content into Quill context storage
+   - quill_record_continuity_event / quill_create_compaction_snapshot / quill_get_compaction_snapshot — preserve continuity
    - list_projects / list_sessions / get_session_overview — browse sessions
    - search_history / get_session_context — search and drill into conversations
    - get_file_history / get_branch_activity / find_related_sessions — cross-reference

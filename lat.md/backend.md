@@ -26,17 +26,19 @@ Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 |----------|-------|
 | General | 100 req/min |
 | Observations | 500 req/min |
+| Context savings | 500 req/min |
 | Session notify | 500 req/min |
 | Session messages | 100 req/min |
 
 ### Endpoints
 
-The HTTP API exposes 13 endpoints for token ingestion, learning observations, and session indexing across Claude Code and Codex.
+The HTTP API exposes 14 endpoints for token ingestion, context savings, learning observations, and session indexing across Claude Code and Codex.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
 | GET | `/api/v1/health` | Health check |
 | POST | `/api/v1/tokens` | Record token usage from hook scripts |
+| POST | `/api/v1/context-savings/events` | Store context savings events from hooks and MCP tools |
 | POST | `/api/v1/learning/observations` | Store tool-use observations |
 | GET | `/api/v1/learning/observations` | Retrieve unanalyzed observations |
 | GET | `/api/v1/learning/status` | Learning system status |
@@ -53,7 +55,7 @@ Each endpoint validates input (length limits, range checks, type validation) bef
 
 ## Database
 
-[[src-tauri/src/storage.rs]] (3,393 lines) manages a SQLite database with WAL mode and 5-second busy timeout. The largest backend module.
+[[src-tauri/src/storage.rs]] manages a SQLite database with WAL mode and 5-second busy timeout. The largest backend module.
 
 ### Location
 
@@ -64,7 +66,7 @@ The SQLite database file path varies by operating system.
 
 ### Schema
 
-The database has 16 tables across 14 migration versions.
+The database schema is versioned through migration 16 and includes usage, token, context savings, learning, session indexing, memory optimizer, code, runtime, and metadata tables.
 
 #### Usage Tracking
 
@@ -103,6 +105,22 @@ Stores detailed tool invocation and response-time data for MCP-powered session s
 - **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output). Indexed on provider/session, message_id, file_path, and category. Startup and notify-driven reindexing batch these inserts per extracted message set so analytics queries do not wait behind one transaction per message.
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs). Unique on (provider, session_id, timestamp).
 
+#### Working Context Store
+
+The MCP context store keeps large transient context out of the analytics database.
+
+The Python MCP tools in [[src-tauri/claude-integration/mcp/tools/context.py]] create `~/.config/quill/context/context.db` with `sources`, `chunks`, `executions`, `continuity_events`, `compaction_snapshots`, and `fetch_cache` tables. SQLite FTS5 is used when available, with a LIKE fallback so older SQLite builds still search indexed chunks.
+
+The remote plugin mirrors the same implementation in [[plugin/mcp/tools/context.py]]. Context data stays on the machine running the MCP server; remote plugin continuity files are local to the remote Claude host unless a tool explicitly sends telemetry to the widget HTTP API.
+
+#### Context Savings Events
+
+The main analytics database stores compact context-savings telemetry from local and remote providers.
+
+- **context_savings_events** — Append-only event records keyed by `event_id`, with provider, session, host, cwd, event type, source, decision, byte counts, approximate token estimates, refs, and bounded metadata.
+
+The HTTP server accepts batches from context hooks and MCP tools, deduplicates with `INSERT OR IGNORE`, and emits `context-savings-updated`. Analytics queries aggregate by time bucket, provider, event type, source, decision, and cwd for the Context tab while leaving large source content in the MCP context store.
+
 #### Memory Optimizer
 
 Tables for tracking memory files, optimization runs, and actionable suggestions with lifecycle management.
@@ -124,15 +142,15 @@ Tables for tracking per-turn LLM response latency and caching git commit history
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v14).
+- **schema_version** — Migration version tracking (currently v16).
 
 ## Tauri IPC Commands
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
-### Usage and Token Commands (10)
+### Usage and Token Commands (11)
 
-`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`.
+`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_context_savings_analytics`.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
 
@@ -141,6 +159,8 @@ Codex live usage now comes from `codex app-server` `account/rateLimits/read` ins
 MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-tauri/src/fetcher.rs#fetch_minimax_usage]]. It reads the API key from the SQLite settings table and parses the `model_remains` array into 5-hour and weekly `UsageBucket` entries, filtering out models with zero quota.
 
 `get_session_breakdown` now accepts optional provider and limit arguments so Codex live views can request a provider-scoped active set without being crowded out by Claude sessions.
+
+`get_context_savings_analytics` returns range-scoped summary totals, timeseries buckets, grouped breakdowns, and recent append-only events for the Analytics Context tab. Token values are approximate `ceil(bytes / 4)` estimates, while byte counts and event counts are exact where producers can measure them.
 
 ### Indicator Commands (3)
 
@@ -152,13 +172,17 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 
 `get_project_tokens`, `get_session_stats`, `get_project_breakdown`, `delete_project_data`, `rename_project`, `delete_host_data`, `delete_session_data`.
 
-### Integration Commands (3)
+### Integration Commands (5)
 
 Commands for detecting providers and running install/uninstall flows.
 
-Provider setup state is persisted through the settings table using key `integration.providers.v1` to survive app restarts. The `confirm_enable_provider` command accepts an optional `api_key` parameter used by service-only providers like MiniMax.
+Provider setup state is persisted through the settings table using key `integration.providers.v1` to survive app restarts. The `context_preservation.enabled` setting defaults to false and controls whether Claude and Codex provider install/repair deploy local context-preservation hooks, context MCP tools, and context-aware instruction templates.
 
-`get_provider_statuses`, `confirm_enable_provider`, `confirm_disable_provider`.
+The `confirm_enable_provider` command accepts an optional `api_key` parameter used by service-only providers like MiniMax. `get_context_preservation_status` also reports whether historical context-savings events exist so the Analytics Context tab can remain visible after the feature is disabled.
+
+`get_provider_statuses`, `confirm_enable_provider`, `confirm_disable_provider`, `get_context_preservation_status`, `set_context_preservation_enabled`.
+
+At startup, [[src-tauri/src/integrations/manager.rs]] verifies enabled, detected Claude and Codex providers against the stored context-preservation setting. Missing or stale Quill-managed hooks, MCP assets, templates, or unexpectedly present context assets trigger an idempotent reinstall of either the base-only or context-enabled asset set; repair failures leave the provider enabled but persist `last_error` and an error setup state.
 
 ### Learning Commands (12)
 
@@ -207,9 +231,11 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 [[src-tauri/src/lib.rs#install_app_update]] re-checks the configured updater from Rust, downloads and installs the release, logs the resolved relaunch binary, and then requests restart so the titlebar update button shares the backend-owned restart boundary with the tray updater.
 
-### Integration Commands (2)
+### Integration Commands (5)
 
-`get_provider_statuses` and `confirm_enable_provider` expose provider detection and enable state.
+Integration IPC exposes provider detection, provider enablement, and the global context-preservation toggle.
+
+`get_provider_statuses`, `confirm_enable_provider`, `confirm_disable_provider`, and `get_context_preservation_status` expose provider state and the context-preservation setting. `set_context_preservation_enabled` installs or removes local context-preservation assets for currently enabled Claude and Codex providers without deleting historical context data.
 
 `get_provider_statuses` returns the last saved provider statuses from storage rather than re-running detection. Fresh detection happens once at startup via the background `startup_refresh` task, which saves results and emits `integrations-updated`. This avoids redundant subprocess calls and eliminates the visible "Checking integrations..." loading state on the main window.
 
@@ -222,6 +248,7 @@ The backend pushes real-time updates to the frontend via Tauri's emit system.
 | Event | Source | Payload | Trigger |
 |-------|--------|---------|---------|
 | `tokens-updated` | server.rs | `()` | Token snapshot stored |
+| `context-savings-updated` | server.rs | `()` | Context savings events stored |
 | `learning-log` | learning.rs | `{run_id, message}` | Real-time analysis progress |
 | `learning-updated` | lib.rs | `()` | Rules changed |
 | `plugin-changed` | lib.rs | `()` | Plugin or marketplace mutation completed |
@@ -230,6 +257,7 @@ The backend pushes real-time updates to the frontend via Tauri's emit system.
 | `provider-status-updated` | integrations | `Vec<ProviderStatus>` | Startup provider detection refresh |
 | `restart-status-changed` | restart.rs | `RestartStatus` | Restart phase change |
 | `integrations-updated` | integrations/manager.rs | `ProviderStatus[]` | Startup refresh or provider enable/disable completed |
+| `context-preservation-updated` | integrations/manager.rs | `ContextPreservationStatus` | Global context-preservation toggle changed |
 | `indicator-updated` | lib.rs | `StatusIndicatorState` | Shared usage refresh or primary-provider change recomputed indicator state |
 | `memory-optimizer-log` | memory_optimizer.rs | `{message}` | Optimization run progress |
 | `memory-optimizer-updated` | memory_optimizer.rs | `{run_id, status}` | Run completed |

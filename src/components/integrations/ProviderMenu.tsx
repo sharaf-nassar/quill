@@ -1,4 +1,5 @@
 import type {
+  ContextPreservationStatus,
   IndicatorPrimaryProvider,
   IntegrationProvider,
   LayoutMode,
@@ -11,11 +12,14 @@ interface ProviderMenuProps {
   loading: boolean;
   error: string | null;
   inFlightProviders: ReadonlySet<IntegrationProvider>;
+  contextPreservation: ContextPreservationStatus;
+  contextPreservationInFlight: boolean;
   indicatorPrimaryProvider: IndicatorPrimaryProvider;
   onRequestToggle: (
     provider: IntegrationProvider,
     nextEnabled: boolean,
   ) => void;
+  onContextPreservationToggle: (enabled: boolean) => void;
   onIndicatorPrimaryProviderChange: (provider: IndicatorPrimaryProvider) => void;
   layoutMode?: LayoutMode;
   onLayoutModeChange?: (mode: LayoutMode) => void;
@@ -56,8 +60,11 @@ function ProviderMenu({
   loading,
   error,
   inFlightProviders,
+  contextPreservation,
+  contextPreservationInFlight,
   indicatorPrimaryProvider,
   onRequestToggle,
+  onContextPreservationToggle,
   onIndicatorPrimaryProviderChange,
   layoutMode,
   onLayoutModeChange,
@@ -140,6 +147,31 @@ function ProviderMenu({
             </option>
           ))}
         </select>
+      </div>
+      <div className="provider-menu-section-divider" />
+      <div className="provider-menu-header">Context Preservation</div>
+      <div className="provider-menu-row">
+        <div className="provider-menu-copy">
+          <div className="provider-menu-title-row">
+            <span className="provider-menu-title">Working context</span>
+            <span
+              className={`provider-menu-badge${contextPreservation.enabled ? " provider-menu-badge--enabled" : ""}`}
+            >
+              {contextPreservation.enabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
+        </div>
+        <button
+          className={`provider-menu-action${contextPreservation.enabled ? " provider-menu-action--destructive" : ""}`}
+          disabled={loading || contextPreservationInFlight}
+          onClick={() => onContextPreservationToggle(!contextPreservation.enabled)}
+        >
+          {contextPreservationInFlight
+            ? "Working..."
+            : contextPreservation.enabled
+              ? "Disable"
+              : "Enable"}
+        </button>
       </div>
       <div className="provider-menu-section-divider" />
       <div className="provider-menu-header">Integrations</div>

@@ -152,6 +152,166 @@ pub struct SessionBreakdown {
     pub project: Option<String>,
 }
 
+// --- Context savings telemetry models ---
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsEventPayload {
+    pub event_id: String,
+    pub schema_version: i64,
+    pub provider: IntegrationProvider,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub hostname: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub timestamp: String,
+    pub event_type: String,
+    pub source: String,
+    pub decision: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub delivered: bool,
+    #[serde(default)]
+    pub indexed_bytes: Option<i64>,
+    #[serde(default)]
+    pub returned_bytes: Option<i64>,
+    #[serde(default)]
+    pub input_bytes: Option<i64>,
+    #[serde(default)]
+    pub tokens_indexed_est: Option<i64>,
+    #[serde(default)]
+    pub tokens_returned_est: Option<i64>,
+    #[serde(default)]
+    pub tokens_saved_est: Option<i64>,
+    #[serde(default)]
+    pub tokens_preserved_est: Option<i64>,
+    #[serde(default)]
+    pub estimate_method: Option<String>,
+    #[serde(default)]
+    pub estimate_confidence: Option<f64>,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub snapshot_ref: Option<String>,
+    #[serde(default, alias = "metadata")]
+    pub metadata_json: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsEventsBatchPayload {
+    #[serde(default)]
+    pub events: Vec<ContextSavingsEventPayload>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsInsertResult {
+    pub inserted: i64,
+    pub ignored: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsSummary {
+    pub event_count: i64,
+    pub delivered_count: i64,
+    pub indexed_bytes: i64,
+    pub returned_bytes: i64,
+    pub input_bytes: i64,
+    pub tokens_indexed_est: i64,
+    pub tokens_returned_est: i64,
+    pub tokens_saved_est: i64,
+    pub tokens_preserved_est: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsTimeseriesPoint {
+    pub timestamp: String,
+    pub event_count: i64,
+    pub delivered_count: i64,
+    pub indexed_bytes: i64,
+    pub returned_bytes: i64,
+    pub input_bytes: i64,
+    pub tokens_indexed_est: i64,
+    pub tokens_returned_est: i64,
+    pub tokens_saved_est: i64,
+    pub tokens_preserved_est: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsBreakdownItem {
+    pub key: String,
+    pub event_count: i64,
+    pub delivered_count: i64,
+    pub indexed_bytes: i64,
+    pub returned_bytes: i64,
+    pub input_bytes: i64,
+    pub tokens_indexed_est: i64,
+    pub tokens_returned_est: i64,
+    pub tokens_saved_est: i64,
+    pub tokens_preserved_est: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsBreakdowns {
+    pub by_provider: Vec<ContextSavingsBreakdownItem>,
+    pub by_event_type: Vec<ContextSavingsBreakdownItem>,
+    pub by_source: Vec<ContextSavingsBreakdownItem>,
+    pub by_decision: Vec<ContextSavingsBreakdownItem>,
+    pub by_cwd: Vec<ContextSavingsBreakdownItem>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsEvent {
+    pub event_id: String,
+    pub schema_version: i64,
+    pub provider: IntegrationProvider,
+    pub session_id: Option<String>,
+    pub hostname: String,
+    pub cwd: Option<String>,
+    pub timestamp: String,
+    pub event_type: String,
+    pub source: String,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub delivered: bool,
+    pub indexed_bytes: Option<i64>,
+    pub returned_bytes: Option<i64>,
+    pub input_bytes: Option<i64>,
+    pub tokens_indexed_est: Option<i64>,
+    pub tokens_returned_est: Option<i64>,
+    pub tokens_saved_est: Option<i64>,
+    pub tokens_preserved_est: Option<i64>,
+    pub estimate_method: Option<String>,
+    pub estimate_confidence: Option<f64>,
+    pub source_ref: Option<String>,
+    pub snapshot_ref: Option<String>,
+    pub metadata_json: Option<serde_json::Value>,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSavingsAnalytics {
+    pub summary: ContextSavingsSummary,
+    pub timeseries: Vec<ContextSavingsTimeseriesPoint>,
+    pub breakdowns: ContextSavingsBreakdowns,
+    pub recent_events: Vec<ContextSavingsEvent>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextPreservationStatus {
+    pub enabled: bool,
+    pub has_context_savings_events: bool,
+}
+
 // Project-level token breakdown (grouped by cwd + hostname)
 #[derive(Serialize, Clone, Debug)]
 pub struct ProjectBreakdown {

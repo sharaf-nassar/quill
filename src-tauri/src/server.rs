@@ -17,8 +17,9 @@ use tauri::Emitter;
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{
-    LearnedRulePayload, LearningRunPayload, ObservationPayload, SessionMessagesPayload,
-    SessionNotifyPayload, TokenReportPayload,
+    ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
+    LearningRunPayload, ObservationPayload, SessionMessagesPayload, SessionNotifyPayload,
+    TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -32,6 +33,12 @@ const MAX_TOKEN_VALUE: i64 = 100_000_000;
 const MAX_TOOL_DATA_LEN: usize = 2048;
 
 const MAX_OBS_REQUESTS: usize = 500;
+const MAX_CONTEXT_SAVINGS_REQUESTS: usize = 500;
+const MAX_CONTEXT_SAVINGS_EVENTS_PER_BATCH: usize = 200;
+const MAX_CONTEXT_COUNTER_VALUE: i64 = 1_000_000_000_000;
+const MAX_CONTEXT_REASON_LEN: usize = 2048;
+const MAX_CONTEXT_REF_LEN: usize = 1024;
+const MAX_CONTEXT_METADATA_LEN: usize = 16 * 1024;
 const MAX_SESSION_NOTIFY_REQUESTS: usize = 500;
 const MAX_SESSION_MSG_REQUESTS: usize = 100;
 const MAX_PATH_LEN: usize = 4096;
@@ -50,6 +57,7 @@ struct ServerState {
     secret: String,
     rate_limiter: Mutex<VecDeque<Instant>>,
     obs_rate_limiter: Mutex<VecDeque<Instant>>,
+    context_savings_rate_limiter: Mutex<VecDeque<Instant>>,
     session_rate_limiter: Mutex<VecDeque<Instant>>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     app_handle: tauri::AppHandle,
@@ -104,6 +112,7 @@ pub async fn start_server(
         secret,
         rate_limiter: Mutex::new(VecDeque::new()),
         obs_rate_limiter: Mutex::new(VecDeque::new()),
+        context_savings_rate_limiter: Mutex::new(VecDeque::new()),
         session_rate_limiter: Mutex::new(VecDeque::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
         app_handle,
@@ -119,6 +128,10 @@ pub async fn start_server(
         .route("/api/v1/learning/runs", post(post_learning_run))
         .route("/api/v1/learning/runs", get(get_learning_runs))
         .route("/api/v1/learning/rules", post(post_learned_rule))
+        .route(
+            "/api/v1/context-savings/events",
+            post(post_context_savings_events),
+        )
         .route("/api/v1/sessions/notify", post(post_session_notify))
         .route("/api/v1/sessions/messages", post(post_session_messages))
         .route("/api/v1/sessions/search", get(get_session_search))
@@ -675,6 +688,150 @@ async fn post_learned_rule(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal server error".to_string(),
+            )
+        }
+    }
+}
+
+// --- Context savings telemetry endpoints ---
+
+fn validate_context_optional_string(
+    value: &Option<String>,
+    max_len: usize,
+    label: &str,
+) -> Result<(), String> {
+    if let Some(value) = value {
+        if value.is_empty() {
+            return Err(format!("{label} must not be empty when provided"));
+        }
+        if value.len() > max_len {
+            return Err(format!("{label} too long"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_context_counter(value: Option<i64>, label: &str) -> Result<(), String> {
+    if let Some(value) = value {
+        if value < 0 {
+            return Err(format!("{label} must be non-negative"));
+        }
+        if value > MAX_CONTEXT_COUNTER_VALUE {
+            return Err(format!("{label} exceeds maximum allowed value"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_context_savings_event(event: &ContextSavingsEventPayload) -> Result<(), String> {
+    if event.event_id.is_empty() || event.event_id.len() > MAX_STRING_LEN {
+        return Err("Invalid eventId".to_string());
+    }
+    if event.schema_version <= 0 || event.schema_version > 1000 {
+        return Err("Invalid schemaVersion".to_string());
+    }
+    validate_context_optional_string(&event.session_id, MAX_STRING_LEN, "sessionId")?;
+    if event.hostname.is_empty() || event.hostname.len() > MAX_STRING_LEN {
+        return Err("Invalid hostname".to_string());
+    }
+    validate_context_optional_string(&event.cwd, MAX_CWD_LEN, "cwd")?;
+    if event.timestamp.is_empty() || event.timestamp.len() > MAX_STRING_LEN {
+        return Err("Invalid timestamp".to_string());
+    }
+    chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+        .map_err(|_| "timestamp must be RFC3339".to_string())?;
+    if event.event_type.is_empty() || event.event_type.len() > MAX_STRING_LEN {
+        return Err("Invalid eventType".to_string());
+    }
+    if event.source.is_empty() || event.source.len() > MAX_STRING_LEN {
+        return Err("Invalid source".to_string());
+    }
+    if event.decision.is_empty() || event.decision.len() > MAX_STRING_LEN {
+        return Err("Invalid decision".to_string());
+    }
+    validate_context_optional_string(&event.reason, MAX_CONTEXT_REASON_LEN, "reason")?;
+    validate_context_counter(event.indexed_bytes, "indexedBytes")?;
+    validate_context_counter(event.returned_bytes, "returnedBytes")?;
+    validate_context_counter(event.input_bytes, "inputBytes")?;
+    validate_context_counter(event.tokens_indexed_est, "tokensIndexedEst")?;
+    validate_context_counter(event.tokens_returned_est, "tokensReturnedEst")?;
+    validate_context_counter(event.tokens_saved_est, "tokensSavedEst")?;
+    validate_context_counter(event.tokens_preserved_est, "tokensPreservedEst")?;
+    validate_context_optional_string(&event.estimate_method, MAX_STRING_LEN, "estimateMethod")?;
+    if let Some(confidence) = event.estimate_confidence
+        && (!confidence.is_finite() || !(0.0..=1.0).contains(&confidence))
+    {
+        return Err("estimateConfidence must be between 0 and 1".to_string());
+    }
+    validate_context_optional_string(&event.source_ref, MAX_CONTEXT_REF_LEN, "sourceRef")?;
+    validate_context_optional_string(&event.snapshot_ref, MAX_CONTEXT_REF_LEN, "snapshotRef")?;
+    if let Some(metadata) = &event.metadata_json {
+        let encoded = serde_json::to_string(metadata)
+            .map_err(|_| "metadataJson must be valid JSON".to_string())?;
+        if encoded.len() > MAX_CONTEXT_METADATA_LEN {
+            return Err("metadataJson too long".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_context_savings_batch(
+    payload: &ContextSavingsEventsBatchPayload,
+) -> Result<(), String> {
+    if payload.events.is_empty() {
+        return Err("events must not be empty".to_string());
+    }
+    if payload.events.len() > MAX_CONTEXT_SAVINGS_EVENTS_PER_BATCH {
+        return Err(format!(
+            "Too many events (max {MAX_CONTEXT_SAVINGS_EVENTS_PER_BATCH})"
+        ));
+    }
+
+    for event in &payload.events {
+        validate_context_savings_event(event)?;
+    }
+
+    Ok(())
+}
+
+async fn post_context_savings_events(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<ContextSavingsEventsBatchPayload>,
+) -> impl IntoResponse {
+    if !check_auth(&headers, &state.secret) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        );
+    }
+    if !check_rate_limit_with_max(
+        &state.context_savings_rate_limiter,
+        MAX_CONTEXT_SAVINGS_REQUESTS,
+    ) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "Rate limit exceeded"})),
+        );
+    }
+    if let Err(error) = validate_context_savings_batch(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        );
+    }
+
+    match state.storage.store_context_savings_events(&payload.events) {
+        Ok(result) => {
+            let _ = state.app_handle.emit("context-savings-updated", ());
+            (StatusCode::OK, Json(serde_json::json!(result)))
+        }
+        Err(error) => {
+            log::error!("Failed to store context savings events: {error}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Internal server error"})),
             )
         }
     }

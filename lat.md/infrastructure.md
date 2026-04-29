@@ -16,7 +16,7 @@ Production builds target ES2020 with esbuild minification and sourcemaps. TypeSc
 
 Rust edition 2024. Crate types: `lib`, `cdylib`, `staticlib`. `build.rs` calls `tauri_build::build()`.
 
-The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system dependency issues. Tauri bundles `claude-integration/**/*` as app resources.
+The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system dependency issues. Tauri bundles Claude and Codex integration assets as app resources.
 
 ### Tauri Configuration
 
@@ -116,7 +116,7 @@ Utility scripts for development, testing, and documentation tasks.
 
 ### Dummy Data Seeder
 
-`scripts/populate_dummy_data.py` seeds the SQLite database with deterministic sample data (seed 42) across all 16 tables.
+`scripts/populate_dummy_data.py` seeds the SQLite database with deterministic sample data (seed 42) across the app's analytics tables.
 
 Checks that Quill is not running before modifying the DB to prevent WAL corruption. Creates a backup before seeding. Populates observations, rules, memory files, tool actions, and writes sample rule files to `~/.claude/rules/learned/`.
 
@@ -147,14 +147,16 @@ Files and directories created during first-launch auto-deployment.
 
 | Target | Content |
 |--------|---------|
-| `~/.config/quill/scripts/` | Hook scripts: token reporting, observation capture, and session sync |
-| `~/.config/quill/mcp/` | Python MCP server for session querying tools |
+| `~/.config/quill/scripts/` | Base hook scripts for token reporting, observation capture, session sync, and qbuild edit guarding; context routing, continuity capture, and context-savings telemetry only when context preservation is enabled |
+| `~/.config/quill/mcp/` | Python MCP server for session querying; working-context tools only when context preservation is enabled |
 | `~/.claude/commands/` | Custom CLI commands (if applicable) |
 | `~/.claude/settings.json` | Hook registrations (marked with `_source: "quill-setup"`) |
 | `~/.claude.json` | MCP server registration |
 | `~/.claude/CLAUDE.md` | Quill MCP usage instructions injected as a managed block between `<!-- quill-managed:claude:start -->` / `<!-- quill-managed:claude:end -->` markers |
 
-Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching. Deployed `observe.cjs` and `session-sync.cjs` hooks cap HTTP waits at 500ms for localhost widgets and 2s for remote widget URLs so provider CLIs fail open instead of timing out on Quill stalls.
+Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching. Deployed `observe.cjs`, `session-sync.cjs`, and optional `context-telemetry.cjs` calls cap HTTP waits so provider CLIs fail open instead of timing out on Quill stalls.
+
+Claude always installs base PreToolUse, PostToolUse, and Stop hooks for Quill observation, token reports, session sync, and qbuild edit guarding. When the context preservation toggle is enabled, it also installs SessionStart, UserPromptSubmit, PreCompact, PreToolUse, and Stop context hooks. Context hooks call `src-tauri/claude-integration/scripts/context-router.cjs` and `src-tauri/claude-integration/scripts/context-capture.cjs`, both of which load `context-telemetry.cjs` for context-savings events. Startup repair in [[src-tauri/src/integrations/manager.rs]] verifies the enabled context setting and redeploys either the base-only or context-enabled asset set for already-enabled providers.
 
 ## Codex Integration Deployment
 
@@ -162,18 +164,22 @@ Codex integration lives in [[src-tauri/src/integrations/codex.rs]] and deploys p
 
 ### Deployed Assets
 
-Files and config entries created when the Codex provider is enabled. Deployment is allowlisted to the observation, token, sync, and learning scripts; the Claude-only `qbuild-guard.sh` is never copied into Codex assets.
+Files and config entries created when the Codex provider is enabled.
+
+Deployment is allowlisted to observation, token, and sync scripts by default; context routing and continuity scripts are deployed only when context preservation is enabled. The Claude-only `qbuild-guard.sh` is never copied into Codex assets.
 
 | Target | Content |
 |--------|---------|
-| `~/.config/quill/codex/scripts/` | Hook scripts for observations, token reporting, and session sync |
-| `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets |
+| `~/.config/quill/codex/scripts/` | Base hook scripts for observations, token reporting, and session sync; context routing, continuity capture, and context-savings telemetry only when context preservation is enabled |
+| `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets; working-context tools only when context preservation is enabled |
 | `~/.config/quill/codex/templates/` | Managed AGENTS template block |
 | `~/.codex/hooks.json` | Hook registrations marked with `_source: "quill-codex-setup"` |
 | `~/.codex/config.toml` | `codex_hooks = true` plus a Quill-managed `mcp_servers.quill` block when no manual entry exists |
 | `~/.codex/AGENTS.md` | Managed Quill session-history guidance block |
 
 Codex uninstall removes only Quill-marked hooks, config blocks, AGENTS blocks, and the provider-owned asset directories. Codex deploys the same bounded-wait observation and session-sync behavior as Claude so a slow local widget cannot hold Codex hooks open until the host kills them.
+
+Codex installs SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop hooks. Because the current local Codex installer does not rely on PreCompact support, continuity snapshots are created from Stop events and from the MCP snapshot tool instead.
 
 Quill resolves the Codex CLI before running provider checks or `codex app-server`, then augments the child process `PATH` with launcher and symlink-target directories so Homebrew and npm installs work from macOS app launches with stripped inherited environments.
 
@@ -189,7 +195,7 @@ The `plugin/` directory contains a Claude Code plugin for remote host connectivi
 
 `plugin/mcp/server.py` runs a FastMCP server (via `uv`) with session query tools mirroring the local MCP.
 
-Provides search_history, list_sessions, get_session_context, get_branch_activity, get_token_usage, and more. Communicates back to the desktop widget's HTTP server.
+Provides search_history, list_sessions, get_session_context, get_branch_activity, get_token_usage, working-context indexing/search, bounded execution, fetch caching, continuity events, and compaction snapshots. Communicates back to the desktop widget's HTTP server for HTTP-backed tools while keeping plugin-local context under `~/.config/quill/context/`.
 
 ## Dependencies
 

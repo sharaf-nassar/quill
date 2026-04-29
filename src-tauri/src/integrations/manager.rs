@@ -1,7 +1,11 @@
 use super::{claude, codex, minimax};
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
+use crate::models::ContextPreservationStatus;
 use crate::storage::Storage;
+use chrono::Utc;
 use tauri::{AppHandle, Emitter};
+
+const CONTEXT_PRESERVATION_ENABLED_KEY: &str = "context_preservation.enabled";
 
 pub fn detect_all() -> Result<Vec<ProviderStatus>, String> {
     let storage = Storage::init()?;
@@ -37,13 +41,14 @@ pub fn confirm_enable_with_key(
     api_key: Option<String>,
 ) -> Result<ProviderStatus, String> {
     let storage = Storage::init()?;
+    let context_enabled = context_preservation_enabled(&storage)?;
 
     match provider {
         IntegrationProvider::Claude => {
-            claude::install(app)?;
+            claude::install(app, context_enabled)?;
         }
         IntegrationProvider::Codex => {
-            codex::install(app)?;
+            codex::install(app, context_enabled)?;
         }
         IntegrationProvider::MiniMax => {
             let key = api_key
@@ -122,7 +127,8 @@ pub fn confirm_disable(
 
 pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
     let storage = Storage::init()?;
-    let statuses = detect_all_with_storage(&storage)?;
+    let mut statuses = detect_all_with_storage(&storage)?;
+    repair_enabled_providers(app, &storage, &mut statuses);
     save_statuses(&storage, &statuses)?;
     log_statuses(&statuses);
     emit_statuses(app, &statuses);
@@ -132,6 +138,42 @@ pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
 
 pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
     load_saved_statuses(storage)
+}
+
+pub fn get_context_preservation_status(
+    storage: &Storage,
+) -> Result<ContextPreservationStatus, String> {
+    Ok(ContextPreservationStatus {
+        enabled: context_preservation_enabled(storage)?,
+        has_context_savings_events: storage.has_context_savings_events()?,
+    })
+}
+
+pub fn set_context_preservation_enabled(
+    app: &AppHandle,
+    enabled: bool,
+) -> Result<ContextPreservationStatus, String> {
+    let storage = Storage::init()?;
+    let mut statuses = detect_all_with_storage(&storage)?;
+
+    sync_context_preservation_for_enabled_providers(app, enabled, &mut statuses)?;
+    storage.set_setting(
+        CONTEXT_PRESERVATION_ENABLED_KEY,
+        if enabled { "true" } else { "false" },
+    )?;
+
+    save_statuses(&storage, &statuses)?;
+    emit_statuses(app, &statuses);
+
+    let status = get_context_preservation_status(&storage)?;
+    emit_context_preservation_status(app, &status);
+    Ok(status)
+}
+
+fn context_preservation_enabled(storage: &Storage) -> Result<bool, String> {
+    Ok(storage
+        .get_setting(CONTEXT_PRESERVATION_ENABLED_KEY)?
+        .is_some_and(|value| value == "true"))
 }
 
 fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
@@ -152,6 +194,126 @@ fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, Stri
         IntegrationProvider::Codex => codex::detect(),
         IntegrationProvider::MiniMax => minimax::detect(),
     }
+}
+
+fn repair_enabled_providers(app: &AppHandle, storage: &Storage, statuses: &mut [ProviderStatus]) {
+    let context_enabled = match context_preservation_enabled(storage) {
+        Ok(enabled) => enabled,
+        Err(err) => {
+            log::warn!("Failed to read context preservation setting during startup repair: {err}");
+            false
+        }
+    };
+
+    for status in statuses.iter_mut() {
+        if !should_repair_provider(status) {
+            continue;
+        }
+
+        let verified_at = Utc::now().to_rfc3339();
+        match repair_provider(app, status.provider, context_enabled) {
+            Ok(()) => {
+                status.setup_state = ProviderSetupState::Installed;
+                status.last_error = None;
+                status.last_verified_at = Some(verified_at);
+                log::info!(
+                    "Integration startup repair passed for provider={:?}",
+                    status.provider
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "Integration startup repair failed for provider={:?}: {err}",
+                    status.provider
+                );
+                status.setup_state = ProviderSetupState::Error;
+                status.last_error = Some(err);
+                status.last_verified_at = Some(verified_at);
+            }
+        }
+    }
+}
+
+fn should_repair_provider(status: &ProviderStatus) -> bool {
+    status.enabled
+        && status.detected_cli
+        && status.detected_home
+        && matches!(
+            status.provider,
+            IntegrationProvider::Claude | IntegrationProvider::Codex
+        )
+}
+
+fn should_sync_context_assets(status: &ProviderStatus) -> bool {
+    status.enabled
+        && status.detected_home
+        && matches!(
+            status.provider,
+            IntegrationProvider::Claude | IntegrationProvider::Codex
+        )
+}
+
+fn repair_provider(
+    app: &AppHandle,
+    provider: IntegrationProvider,
+    context_enabled: bool,
+) -> Result<(), String> {
+    match provider {
+        IntegrationProvider::Claude => {
+            if crate::claude_setup::verify(context_enabled).is_ok() {
+                return Ok(());
+            }
+            claude::install(app, context_enabled)?;
+            crate::claude_setup::verify(context_enabled)
+        }
+        IntegrationProvider::Codex => {
+            if codex::verify(context_enabled).is_ok() {
+                return Ok(());
+            }
+            codex::install(app, context_enabled)?;
+            codex::verify(context_enabled)
+        }
+        IntegrationProvider::MiniMax => Ok(()),
+    }
+}
+
+fn sync_context_preservation_for_enabled_providers(
+    app: &AppHandle,
+    context_enabled: bool,
+    statuses: &mut [ProviderStatus],
+) -> Result<(), String> {
+    for status in statuses.iter_mut() {
+        if !should_sync_context_assets(status) {
+            continue;
+        }
+
+        let verified_at = Utc::now().to_rfc3339();
+        let result = match status.provider {
+            IntegrationProvider::Claude => claude::install(app, context_enabled).map(|_| ()),
+            IntegrationProvider::Codex => codex::install(app, context_enabled).map(|_| ()),
+            IntegrationProvider::MiniMax => Ok(()),
+        };
+
+        match result {
+            Ok(()) => {
+                status.setup_state = if status.detected_cli {
+                    ProviderSetupState::Installed
+                } else {
+                    ProviderSetupState::Missing
+                };
+                status.last_error = None;
+                status.last_verified_at = Some(verified_at);
+            }
+            Err(err) => {
+                status.setup_state = ProviderSetupState::Error;
+                status.last_error = Some(err.clone());
+                status.last_verified_at = Some(verified_at);
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn merge_saved_statuses(
@@ -214,5 +376,11 @@ fn log_statuses(statuses: &[ProviderStatus]) {
 fn emit_statuses(app: &AppHandle, statuses: &[ProviderStatus]) {
     if let Err(err) = app.emit("integrations-updated", statuses) {
         log::warn!("Failed to emit integrations-updated event: {err}");
+    }
+}
+
+fn emit_context_preservation_status(app: &AppHandle, status: &ContextPreservationStatus) {
+    if let Err(err) = app.emit("context-preservation-updated", status) {
+        log::warn!("Failed to emit context-preservation-updated event: {err}");
     }
 }

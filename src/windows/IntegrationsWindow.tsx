@@ -61,7 +61,10 @@ function IntegrationsWindowView() {
     loading,
     error,
     inFlightProviders,
+    contextPreservation,
+    contextPreservationInFlight,
     saveIndicatorPrimaryProvider,
+    setContextPreservationEnabled,
     enableProvider,
     disableProvider,
   } = useIntegrations();
@@ -124,6 +127,20 @@ function IntegrationsWindowView() {
     }
   }, [apiKeyInput, currentWindow, disableProvider, enableProvider, pendingProviderAction, toast]);
 
+  const handleContextPreservationToggle = useCallback(
+    async (enabled: boolean) => {
+      try {
+        await setContextPreservationEnabled(enabled);
+      } catch (error) {
+        toast(
+          "error",
+          `${enabled ? "Enable" : "Disable"} failed for context preservation: ${String(error)}`,
+        );
+      }
+    },
+    [setContextPreservationEnabled, toast],
+  );
+
   const confirmCopy = useMemo(
     () =>
       pendingProviderAction ? providerActionCopy(pendingProviderAction) : null,
@@ -143,8 +160,13 @@ function IntegrationsWindowView() {
           loading={loading}
           error={error}
           inFlightProviders={inFlightProviders}
+          contextPreservation={contextPreservation}
+          contextPreservationInFlight={contextPreservationInFlight}
           indicatorPrimaryProvider={indicatorPrimaryProvider}
           onRequestToggle={handleRequestToggle}
+          onContextPreservationToggle={(enabled) => {
+            void handleContextPreservationToggle(enabled);
+          }}
           onIndicatorPrimaryProviderChange={(provider) => {
             void saveIndicatorPrimaryProvider(provider);
           }}
