@@ -285,9 +285,11 @@ The HTTP API also accepts provider-tagged notify and direct message ingestion. L
 
 ## AI Client
 
-[[src-tauri/src/ai_client.rs]] (118 lines) wraps the Anthropic API via rig-core SDK.
+[[src-tauri/src/ai_client.rs]] wraps the Anthropic API via rig-core SDK.
 
 Uses OAuth Bearer token authentication (`sk-ant-oat01-...` prefix). Model routing: Haiku for pattern extraction (fast, cheap), Sonnet for synthesis (deeper reasoning). Supports generic typed analysis with any `JsonSchema`-compatible output type via `schemars`.
+
+The shared client retries short Anthropic 429 responses using the provider `retry-after` header when available. Longer or exhausted rate limits return a clear analysis error instead of repeatedly hammering the API.
 
 ## Git Analysis
 
