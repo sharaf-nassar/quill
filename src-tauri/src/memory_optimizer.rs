@@ -882,6 +882,94 @@ pub async fn run_optimization_with_run(
     Ok(run_id)
 }
 
+/// Compress the prose body of every project memory file via the caveman-compress
+/// pipeline. Skips instruction files (CLAUDE.md / AGENTS.md), files that fail
+/// the sensitive-path denylist, and files that already have a `.original.md`
+/// backup. Reuses the existing AI client so auth + rate-limit retry are shared
+/// with the rest of the Memory Optimizer.
+///
+/// Returns the number of files successfully compressed.
+pub async fn run_prose_compression(
+    storage: &'static Storage,
+    project_path: &str,
+    provider: Option<IntegrationProvider>,
+    app: &tauri::AppHandle,
+) -> Result<usize, String> {
+    let emit_log = |msg: &str| {
+        log::info!("[memory-optimizer:compress] {msg}");
+        let _ = app.emit(
+            "memory-optimizer-log",
+            MemoryOptimizerLogEvent {
+                message: msg.to_string(),
+            },
+        );
+    };
+
+    emit_log("Compress prose: scanning memory files...");
+    let memory_files = scan_memory_files(storage, project_path, provider)?;
+
+    let candidates: Vec<&MemoryFile> = memory_files
+        .iter()
+        .filter(|f| !is_instruction_memory_type(f.memory_type.as_deref()))
+        .filter(|f| !f.file_name.ends_with(".original.md"))
+        .collect();
+
+    if candidates.is_empty() {
+        emit_log("Compress prose: no eligible memory files");
+        return Ok(0);
+    }
+
+    let preamble = "You are a caveman-compress assistant. \
+        Compress prose only. Preserve code, URLs, paths, and headings exactly.";
+
+    let mut compressed_count = 0usize;
+    for file in candidates {
+        let path = std::path::PathBuf::from(&file.file_path);
+        emit_log(&format!("Compressing {}", file.file_name));
+
+        let call_llm = move |prompt: String| {
+            let preamble = preamble.to_string();
+            Box::pin(async move {
+                ai_client::complete_text(&prompt, &preamble, ai_client::MODEL_HAIKU, 8192).await
+            }) as futures::future::BoxFuture<'_, Result<String, String>>
+        };
+
+        match crate::compress_prose::compress_file(&path, &call_llm).await {
+            Ok(crate::compress_prose::CompressOutcome::Compressed) => {
+                compressed_count += 1;
+                emit_log(&format!("  ok: {}", file.file_name));
+                let _ = app.emit(
+                    "memory-files-updated",
+                    MemoryFilesUpdatedEvent {
+                        project_path: project_path.to_string(),
+                    },
+                );
+            }
+            Ok(crate::compress_prose::CompressOutcome::Skipped { reason }) => {
+                emit_log(&format!("  skipped {}: {}", file.file_name, reason));
+            }
+            Ok(crate::compress_prose::CompressOutcome::Failed { errors }) => {
+                emit_log(&format!(
+                    "  failed {} after {} attempts: {}",
+                    file.file_name,
+                    crate::compress_prose::MAX_RETRIES,
+                    errors.join("; ")
+                ));
+            }
+            Err(err) => {
+                emit_log(&format!("  error {}: {}", file.file_name, err));
+            }
+        }
+    }
+
+    emit_log(&format!(
+        "Compress prose: rewrote {} of {} candidates",
+        compressed_count,
+        memory_files.len()
+    ));
+    Ok(compressed_count)
+}
+
 /// Resolve a target file path with path traversal protection.
 /// Instruction files get special handling; all other targets are validated
 /// to stay within the memory directory.

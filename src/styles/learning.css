@@ -359,6 +359,76 @@
   cursor: default;
 }
 
+/* Compress-prose toggle (sits next to the analyze button) */
+.learning-compress-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.35);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.learning-compress-toggle:hover {
+  color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.learning-compress-toggle--active {
+  color: #22C55E;
+}
+
+.learning-compress-toggle--active:hover {
+  color: #22C55E;
+  background: rgba(34, 197, 94, 0.1);
+}
+
+.learning-compress-toggle--disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.learning-compress-toggle--disabled:hover {
+  background: transparent;
+}
+
+.learning-compress-toggle input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 10px;
+  height: 10px;
+  margin: 0;
+  border-radius: 2px;
+  border: 1px solid currentColor;
+  background: transparent;
+  cursor: inherit;
+  position: relative;
+  flex-shrink: 0;
+}
+
+.learning-compress-toggle input[type="checkbox"]:checked {
+  background: #22C55E;
+  border-color: #22C55E;
+}
+
+.learning-compress-toggle input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: -1px;
+  width: 3px;
+  height: 6px;
+  border: solid #1e1e24;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+
 /* Section headers */
 .learning-section {
   margin-top: 8px;

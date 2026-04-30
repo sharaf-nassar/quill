@@ -1,7 +1,9 @@
 #[allow(dead_code)] // Used by learning.rs in upcoming tasks
 mod ai_client;
 mod auth;
+mod brevity;
 mod claude_setup;
+mod compress_prose;
 mod config;
 mod fetcher;
 mod git_analysis;
@@ -917,6 +919,16 @@ async fn confirm_disable_provider(
     Ok(status)
 }
 
+#[tauri::command]
+async fn set_provider_brevity_enabled(
+    provider: integrations::IntegrationProvider,
+    enabled: bool,
+    app: tauri::AppHandle,
+) -> Result<ProviderStatus, String> {
+    let app_handle = app.clone();
+    run_blocking(move || integrations::set_brevity_enabled(&app_handle, provider, enabled))
+}
+
 // --- Learning IPC commands ---
 
 fn normalize_learning_trigger_mode(trigger_mode: &str) -> &'static str {
@@ -1112,6 +1124,7 @@ async fn get_memory_files(
 async fn trigger_memory_optimization(
     project_path: String,
     provider: Option<integrations::IntegrationProvider>,
+    compress_prose: Option<bool>,
     app: tauri::AppHandle,
 ) -> Result<i64, String> {
     let storage = get_storage()?;
@@ -1125,7 +1138,16 @@ async fn trigger_memory_optimization(
     };
     let run_id = storage.create_optimization_run(&project_path, "manual", &provider_scope)?;
     let project = project_path.clone();
+    let compress = compress_prose.unwrap_or(false);
     tauri::async_runtime::spawn(async move {
+        if compress {
+            match memory_optimizer::run_prose_compression(storage, &project, provider, &app).await {
+                Ok(count) => log::info!(
+                    "Prose compression completed for run {run_id}: {count} files rewritten"
+                ),
+                Err(e) => log::error!("Prose compression failed: {e}"),
+            }
+        }
         match memory_optimizer::run_optimization_with_run(storage, &project, run_id, provider, &app)
             .await
         {
@@ -1969,6 +1991,7 @@ pub fn run() {
             get_provider_statuses,
             confirm_enable_provider,
             confirm_disable_provider,
+            set_provider_brevity_enabled,
             get_learning_settings,
             set_learning_settings,
             get_learned_rules,

@@ -63,10 +63,12 @@ function IntegrationsWindowView() {
     inFlightProviders,
     contextPreservation,
     contextPreservationInFlight,
+    brevityInFlightProviders,
     saveIndicatorPrimaryProvider,
     setContextPreservationEnabled,
     enableProvider,
     disableProvider,
+    setBrevityEnabled,
   } = useIntegrations();
   const [pendingProviderAction, setPendingProviderAction] =
     useState<PendingProviderAction | null>(null);
@@ -162,10 +164,16 @@ function IntegrationsWindowView() {
           inFlightProviders={inFlightProviders}
           contextPreservation={contextPreservation}
           contextPreservationInFlight={contextPreservationInFlight}
+          brevityInFlightProviders={brevityInFlightProviders}
           indicatorPrimaryProvider={indicatorPrimaryProvider}
           onRequestToggle={handleRequestToggle}
           onContextPreservationToggle={(enabled) => {
             void handleContextPreservationToggle(enabled);
+          }}
+          onBrevityToggle={(provider, enabled) => {
+            void setBrevityEnabled(provider, enabled).catch((e) => {
+              toast("warning", String(e));
+            });
           }}
           onIndicatorPrimaryProviderChange={(provider) => {
             void saveIndicatorPrimaryProvider(provider);

@@ -362,8 +362,11 @@ fn remove_claude_md_sections(_blocks: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&claude_md_path)
+    let original = fs::read_to_string(&claude_md_path)
         .map_err(|err| format!("Failed to read CLAUDE.md: {err}"))?;
+
+    // Brevity block lifecycle is owned by `crate::brevity`; do not touch it here.
+    let content = original.clone();
 
     // Try block markers first (new style), then fall back to legacy heading
     let updated = if content.contains(BLOCK_START) && content.contains(BLOCK_END) {
@@ -406,10 +409,11 @@ fn remove_claude_md_sections(_blocks: &[String]) -> Result<(), String> {
         }
         result
     } else {
-        return Ok(());
+        // No main block to strip — leave the file as-is.
+        content.clone()
     };
 
-    if updated != content {
+    if updated != original {
         fs::write(&claude_md_path, updated)
             .map_err(|err| format!("Failed to write CLAUDE.md: {err}"))?;
     }

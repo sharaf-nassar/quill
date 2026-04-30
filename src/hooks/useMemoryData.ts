@@ -263,27 +263,31 @@ export function useMemoryData(providerFilter: ProviderFilter = "all") {
     };
   }, [refresh, updateActiveRunIds]);
 
-  const triggerOptimization = useCallback(async () => {
-    if (!selectedProject || optimizing) return;
-    setStartingOptimization(true);
-    setLogs([]);
-    try {
-      const runId = await invoke<number>("trigger_memory_optimization", {
-        projectPath: selectedProject,
-        provider: filterToProvider(providerFilter),
-      });
-      updateActiveRunIds((prev) => {
-        if (prev.has(runId)) return prev;
-        const next = new Set(prev);
-        next.add(runId);
-        return next;
-      });
-    } catch (e) {
-      toast("warning", String(e));
-    } finally {
-      setStartingOptimization(false);
-    }
-  }, [providerFilter, selectedProject, optimizing, toast, updateActiveRunIds]);
+  const triggerOptimization = useCallback(
+    async (options?: { compressProse?: boolean }) => {
+      if (!selectedProject || optimizing) return;
+      setStartingOptimization(true);
+      setLogs([]);
+      try {
+        const runId = await invoke<number>("trigger_memory_optimization", {
+          projectPath: selectedProject,
+          provider: filterToProvider(providerFilter),
+          compressProse: options?.compressProse ?? false,
+        });
+        updateActiveRunIds((prev) => {
+          if (prev.has(runId)) return prev;
+          const next = new Set(prev);
+          next.add(runId);
+          return next;
+        });
+      } catch (e) {
+        toast("warning", String(e));
+      } finally {
+        setStartingOptimization(false);
+      }
+    },
+    [providerFilter, selectedProject, optimizing, toast, updateActiveRunIds],
+  );
 
   const approveSuggestion = useCallback(
     async (id: number) => {

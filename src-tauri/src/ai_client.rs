@@ -1,5 +1,5 @@
 use rig::client::CompletionClient;
-use rig::completion::TypedPrompt;
+use rig::completion::{Prompt, TypedPrompt};
 use rig::providers::anthropic;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
@@ -81,6 +81,32 @@ where
 
     let result: T = agent
         .prompt_typed(prompt)
+        .await
+        .map_err(|e| format!("Anthropic API error: {e}"))?;
+
+    Ok(result)
+}
+
+/// Plain-text completion using the Anthropic API via Rig. Used by the
+/// caveman-compress prose pipeline where the output is free-form markdown,
+/// not a JSON-schema-shaped struct.
+pub async fn complete_text(
+    prompt: &str,
+    preamble: &str,
+    model: &str,
+    max_tokens: u64,
+) -> Result<String, String> {
+    let token = config::read_access_token()?;
+    let client = build_oauth_client(&token)?;
+
+    let agent = client
+        .agent(model)
+        .preamble(preamble)
+        .max_tokens(max_tokens)
+        .build();
+
+    let result = agent
+        .prompt(prompt)
         .await
         .map_err(|e| format!("Anthropic API error: {e}"))?;
 

@@ -174,6 +174,7 @@ export interface ProviderStatus {
   userHasMadeChoice: boolean;
   lastError: string | null;
   lastVerifiedAt: string | null;
+  brevityEnabled: boolean;
 }
 
 export interface ContextPreservationStatus {

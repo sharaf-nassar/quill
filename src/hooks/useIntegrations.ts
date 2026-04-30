@@ -38,12 +38,17 @@ export interface UseIntegrationsResult {
   error: string | null;
   inFlightProviders: ReadonlySet<IntegrationProvider>;
   contextPreservationInFlight: boolean;
+  brevityInFlightProviders: ReadonlySet<IntegrationProvider>;
   hasEnabledProvider: boolean;
   refresh: () => Promise<void>;
   saveIndicatorPrimaryProvider: (provider: IndicatorPrimaryProvider) => Promise<void>;
   setContextPreservationEnabled: (enabled: boolean) => Promise<ContextPreservationStatus>;
   enableProvider: (provider: IntegrationProvider, apiKey?: string) => Promise<ProviderStatus>;
   disableProvider: (provider: IntegrationProvider) => Promise<ProviderStatus>;
+  setBrevityEnabled: (
+    provider: IntegrationProvider,
+    enabled: boolean,
+  ) => Promise<ProviderStatus>;
 }
 
 export function useIntegrations(): UseIntegrationsResult {
@@ -61,6 +66,9 @@ export function useIntegrations(): UseIntegrationsResult {
     new Set(),
   );
   const [contextPreservationInFlight, setContextPreservationInFlight] = useState(false);
+  const [brevityInFlightProviders, setBrevityInFlightProviders] = useState<
+    Set<IntegrationProvider>
+  >(new Set());
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -205,6 +213,32 @@ export function useIntegrations(): UseIntegrationsResult {
     [runProviderCommand],
   );
 
+  const setBrevityEnabled = useCallback(
+    async (provider: IntegrationProvider, enabled: boolean) => {
+      setBrevityInFlightProviders((prev) => new Set(prev).add(provider));
+      try {
+        const updated = await invoke<ProviderStatus>(
+          "set_provider_brevity_enabled",
+          { provider, enabled },
+        );
+        setStatuses((prev) => upsertStatus(prev, updated));
+        setError(null);
+        return updated;
+      } catch (e) {
+        const message = String(e);
+        setError(message);
+        throw new Error(message);
+      } finally {
+        setBrevityInFlightProviders((prev) => {
+          const next = new Set(prev);
+          next.delete(provider);
+          return next;
+        });
+      }
+    },
+    [],
+  );
+
   const hasEnabledProvider = useMemo(
     () => statuses.some((status) => status.enabled),
     [statuses],
@@ -218,11 +252,13 @@ export function useIntegrations(): UseIntegrationsResult {
     error,
     inFlightProviders,
     contextPreservationInFlight,
+    brevityInFlightProviders,
     hasEnabledProvider,
     refresh,
     saveIndicatorPrimaryProvider,
     setContextPreservationEnabled,
     enableProvider,
     disableProvider,
+    setBrevityEnabled,
   };
 }
