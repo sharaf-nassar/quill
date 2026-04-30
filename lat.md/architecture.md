@@ -17,13 +17,13 @@ Each major feature runs in its own Tauri window, routed via URL query parameter 
 
 The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], and [[features#Restart Orchestrator]], with [[src/main.tsx]] blocking provider-dependent windows when no provider is enabled.
 
-The QUILL titlebar trigger opens an inline popover for provider enable/disable actions, rendered inside the main window with a backdrop overlay for click-outside dismissal.
+The titlebar's right-side cogwheel button opens an inline `ProviderMenu` popover for layout, status, context preservation, brevity, and provider enable/disable actions, rendered inside the main window with a backdrop overlay for click-outside dismissal. Hovering any row shows a portal-rendered tooltip with the section's full feature description.
 
 ### Window Configuration
 
 The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `runs`, `sessions`, `learning`, `plugins`, `restart`, and `integrations`.
 
-The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls plus the centered QUILL trigger that opens an inline integrations popover.
+The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls, a centered static `QUILL` brand label, and a right-aligned cluster with a cogwheel settings button (left of the version) that opens the inline `ProviderMenu` popover, followed by the version and close controls.
 
 ## Module Map
 

@@ -52,6 +52,14 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 - Approval-based workflow — review each suggestion with a diff preview before applying
 - Undo any applied change to restore the original file
 - Batched "optimize all" to review and apply suggestions across an entire project
+- Optional **Compress prose** pre-pass — rewrites every eligible memory file in caveman style via Anthropic Haiku before the optimizer runs. Skips instruction files, files over 500 KB, files on the secrets denylist, and files that already have an `.original.md` backup. Validates that headings, code blocks, URLs, file paths, and bullets are preserved; on failure restores the original. Successful rewrites leave a `<file>.original.md` backup next to the compressed file so the change is reversible.
+
+### Brevity profile
+- Per-provider toggle (Claude Code and Codex) in the **QUILL** menu and the dedicated Integrations window
+- Injects a managed "Quill Brevity Profile" instruction block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex), asking the assistant to write in a compressed caveman style for its own prose responses while preserving code blocks, file paths, URLs, library names, command names, numbers, env vars, and markdown structure exactly
+- Symlink-aware — when `AGENTS.md` is a symlink to `CLAUDE.md`, only one block is written so the same instructions are not duplicated
+- Toggling off strips just the managed block; the rest of the agent file is left untouched
+- MiniMax does not have a managed agent file, so brevity is unavailable for it
 
 ### Working context preservation
 - Optional, default-off feature toggled from the QUILL menu in the titlebar — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
@@ -385,7 +393,7 @@ cargo tauri dev
 
 - **Drag the title bar** to move the window
 - **Drag any edge or corner** to resize
-- **QUILL** title in the titlebar opens the provider menu (layout, indicator provider, context preservation toggle, and Claude Code / Codex / MiniMax integration controls)
+- **QUILL** title in the titlebar opens the provider menu (layout, indicator provider, context preservation toggle, per-provider brevity profile toggle, and Claude Code / Codex / MiniMax integration controls)
 - **Live tab** to toggle the live usage view
 - **Analytics tab** to toggle the analytics view
 - **Brain icon (🧠)** to open the learning window

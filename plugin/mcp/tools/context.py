@@ -176,9 +176,13 @@ def _context_savings_event(
     returned_bytes = _nullable_int(returned_bytes)
     input_bytes = _nullable_int(input_bytes)
     has_byte_estimate = indexed_bytes is not None or returned_bytes is not None or input_bytes is not None
-    saved_bytes = None
-    if input_bytes is not None and returned_bytes is not None:
-        saved_bytes = max(0, input_bytes - returned_bytes)
+    # Saved = bytes Quill preserved but did NOT return to the LLM transcript.
+    # Prefer indexed_bytes (what Quill actually keeps) over input_bytes, and treat
+    # a missing returned_bytes as 0 so write-only events still attribute savings.
+    saved_baseline = indexed_bytes if indexed_bytes is not None else input_bytes
+    saved_bytes = (
+        max(0, saved_baseline - (returned_bytes or 0)) if saved_baseline is not None else None
+    )
 
     event = {
         "eventId": "",
@@ -287,8 +291,9 @@ def _attach_context_savings(response: dict, **event_kwargs: Any) -> dict:
             break
         event["returnedBytes"] = returned_bytes
         event["tokensReturnedEst"] = _tokens_from_bytes(returned_bytes)
-        if event["inputBytes"] is not None:
-            event["tokensSavedEst"] = _tokens_from_bytes(max(0, event["inputBytes"] - returned_bytes))
+        baseline = event.get("indexedBytes") if event.get("indexedBytes") is not None else event.get("inputBytes")
+        if baseline is not None:
+            event["tokensSavedEst"] = _tokens_from_bytes(max(0, baseline - returned_bytes))
         else:
             event["tokensSavedEst"] = 0
         event["estimateMethod"] = "ceil_bytes_div_4"

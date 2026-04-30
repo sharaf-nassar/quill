@@ -98,10 +98,12 @@ function TitleBar({
     inFlightProviders,
     contextPreservation,
     contextPreservationInFlight,
+    brevityInFlightProviders,
     saveIndicatorPrimaryProvider,
     setContextPreservationEnabled,
     enableProvider,
     disableProvider,
+    setBrevityEnabled,
   } = integrations;
 
   useEffect(() => {
@@ -339,45 +341,9 @@ function TitleBar({
         </div>
       </div>
       <div className="titlebar-center" data-tauri-drag-region>
-        <div className="titlebar-menu-anchor">
-          <button
-            className="titlebar-title-trigger"
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            onClick={handleToggleMenu}
-          >
-            QUILL
-          </button>
-          {menuOpen && (
-            <>
-              <div
-                className="provider-menu-backdrop"
-                onMouseDown={() => {
-                  setPendingProviderAction(null);
-                  setMenuOpen(false);
-                }}
-              />
-              <ProviderMenu
-                statuses={statuses}
-                loading={providersLoading}
-                error={providerError}
-                inFlightProviders={inFlightProviders}
-                contextPreservation={contextPreservation}
-                contextPreservationInFlight={contextPreservationInFlight}
-                indicatorPrimaryProvider={indicatorPrimaryProvider}
-                onRequestToggle={handleRequestToggle}
-                onContextPreservationToggle={(enabled) => {
-                  void handleContextPreservationToggle(enabled);
-                }}
-                onIndicatorPrimaryProviderChange={(provider) => {
-                  void saveIndicatorPrimaryProvider(provider);
-                }}
-                layoutMode={layoutMode}
-                onLayoutModeChange={onLayoutModeChange}
-              />
-            </>
-          )}
-        </div>
+        <span className="titlebar-title" data-tauri-drag-region>
+          QUILL
+        </span>
       </div>
       {pendingProviderAction && confirmCopy && (
         <ConfirmDialog
@@ -417,6 +383,54 @@ function TitleBar({
             {updating ? "Updating..." : `Update ${pendingUpdate.version}`}
           </button>
         )}
+        <div className="titlebar-cog-anchor">
+          <button
+            className="titlebar-cog"
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            aria-label="Quill settings"
+            title="Quill settings"
+            onClick={handleToggleMenu}
+          >
+            &#9881;
+          </button>
+          {menuOpen && (
+            <>
+              <div
+                className="provider-menu-backdrop"
+                onMouseDown={() => {
+                  setPendingProviderAction(null);
+                  setMenuOpen(false);
+                }}
+              />
+              <ProviderMenu
+                className="provider-menu--right"
+                statuses={statuses}
+                loading={providersLoading}
+                error={providerError}
+                inFlightProviders={inFlightProviders}
+                contextPreservation={contextPreservation}
+                contextPreservationInFlight={contextPreservationInFlight}
+                brevityInFlightProviders={brevityInFlightProviders}
+                indicatorPrimaryProvider={indicatorPrimaryProvider}
+                onRequestToggle={handleRequestToggle}
+                onContextPreservationToggle={(enabled) => {
+                  void handleContextPreservationToggle(enabled);
+                }}
+                onBrevityToggle={(provider, enabled) => {
+                  void setBrevityEnabled(provider, enabled).catch((e) => {
+                    toast("warning", String(e));
+                  });
+                }}
+                onIndicatorPrimaryProviderChange={(provider) => {
+                  void saveIndicatorPrimaryProvider(provider);
+                }}
+                layoutMode={layoutMode}
+                onLayoutModeChange={onLayoutModeChange}
+              />
+            </>
+          )}
+        </div>
         {version && <span className="titlebar-version">v{version}</span>}
         <button
           className="titlebar-close"

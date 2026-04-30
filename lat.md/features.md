@@ -150,7 +150,23 @@ Context savings telemetry forwards compact measurements to Quill without copying
 
 The MCP tools and context hooks send best-effort batches to `/api/v1/context-savings/events` through `context-telemetry.cjs` or the Python telemetry helper in [[src-tauri/claude-integration/mcp/tools/context.py]]. Events record exact bytes when available, refs such as `source:N` or `snapshot:N`, and approximate token estimates using `ceil(bytes / 4)`. The local MCP context database remains the source of large stored content.
 
-`tokensSavedEst` is computed as `ceil(max(0, baseline - returnedBytes) / 4)` where the baseline is `indexedBytes` when present (preferring what Quill actually preserved over the small input summary) and falls back to `inputBytes`; a missing `returnedBytes` is treated as 0 so write-only events (capture.event, capture.snapshot) still attribute savings. The same fallback runs in the [[src-tauri/src/storage.rs]] aggregate SQL when `tokens_saved_est` is NULL on a row.
+`tokensSavedEst` is computed as `ceil(max(0, baseline - returnedBytes) / 4)` where the baseline is `indexedBytes` when present (preferring what Quill actually preserved over the small input summary) and falls back to `inputBytes`; a missing `returnedBytes` is treated as 0 so write-only events (capture.event, capture.snapshot) still attribute savings. All JS and Python producers use the same formula before posting, while [[src-tauri/src/storage.rs]] backfills and recomputes missing or legacy explicit-zero indexed write-event estimates.
+
+## Brevity Profile
+
+Per-provider toggle that injects a managed instruction block to compress assistant prose responses without altering code, paths, URLs, or other structural content.
+
+### Feature Toggle
+
+Brevity is controlled by per-provider settings (`provider.<id>.brevity_enabled`) surfaced in the QUILL menu and the standalone Integrations window.
+
+[[src-tauri/src/integrations/manager.rs#set_brevity_enabled]] persists the flag and delegates to [[src-tauri/src/brevity.rs#apply_block]], which writes a `<!-- quill-managed:brevity:start --> ... <!-- quill-managed:brevity:end -->` block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex). The block describes the caveman compression style and lists what the assistant must preserve verbatim: code blocks, inline code, URLs, file paths, command names, library and proper-noun names, numbers, env vars, and markdown structure. Disabling strips just the managed block while leaving the rest of the file intact.
+
+### Symlink Awareness
+
+The writer canonicalizes the target path before each write so a single underlying file is never edited twice.
+
+When `AGENTS.md` is a symlink to `CLAUDE.md`, the writer detects the shared canonical path and skips the second write so the same brevity block is not duplicated inside the resolved file. MiniMax does not have a managed agent file; `set_brevity_enabled` rejects it with an error before any disk write.
 
 ## Plugin Manager
 
@@ -207,6 +223,12 @@ Approved suggestions are executed (file written/deleted/merged), with original c
 The Memories tab in the Learning window shows a project selector, provider filter, instruction and memory file browser with content preview, and suggestion cards with actions.
 
 Supports custom project management, bulk operations, provider badges on files and suggestions, and approve/deny/undo per suggestion. The project selector opens on `All Projects` so the first view is the aggregated memory browser. The manage panel bulk delete acts on the current Memories selection, including aggregated deletion across `All Projects`, while still leaving instruction files untouched. Background learning refreshes update in place so the current project selection and expanded memory view do not snap back to the default project during polling. Bulk `Optimize All` runs keep the panel in a stable in-place state instead of flashing the all-projects browser as individual runs finish.
+
+### Prose Compression
+
+Optional caveman-compress pre-pass run from the Memories panel before the regular optimizer.
+
+[[src-tauri/src/memory_optimizer.rs#run_prose_compression]] drives the orchestrator in [[src-tauri/src/compress_prose.rs]], which rewrites every eligible memory file via Anthropic Haiku, validates the rewrite preserves headings, code blocks, URLs, file paths, and bullets, retries up to twice on validation or LLM error, and either commits the rewrite (leaving a `<file>.original.md` backup next to the compressed file) or restores the original. Skip rules in `compress_prose/detect.rs` exclude instruction files, files over 500 KB, files on the secrets denylist (paths under `.ssh`/`.aws`/`.gnupg`/`.kube`/`.docker`, basenames such as `.netrc`/`authorized_keys`/`known_hosts`, basenames containing `secret`/`credential`/`apikey`/`privatekey`, and `.env*` prefixes), files with non-prose extensions (code, config, markup, lock files), and files that already have an `.original.md` backup so a second pass is a no-op. The `trigger_memory_optimization` Tauri command takes an optional `compress_prose: bool` flag plumbed from the Memories panel checkbox, and progress streams over the existing `memory-optimizer-log` event.
 
 ## Restart Orchestrator
 

@@ -79,8 +79,12 @@ function buildContextSavingsEvent(input, fields) {
   const returnedBytes = nullableInteger(fields.returnedBytes);
   const inputBytes = nullableInteger(fields.inputBytes);
   const hasByteEstimate = indexedBytes !== null || returnedBytes !== null || inputBytes !== null;
-  const savedBytes = inputBytes !== null && returnedBytes !== null
-    ? Math.max(0, inputBytes - returnedBytes)
+  // Saved = bytes Quill preserved but did NOT return to the LLM transcript.
+  // Prefer indexedBytes (what Quill actually keeps) over inputBytes (a summary), and
+  // treat a null returnedBytes as 0 so write-only events still attribute savings.
+  const savedBaseline = indexedBytes !== null ? indexedBytes : inputBytes;
+  const savedBytes = savedBaseline !== null
+    ? Math.max(0, savedBaseline - (returnedBytes ?? 0))
     : null;
 
   const event = {

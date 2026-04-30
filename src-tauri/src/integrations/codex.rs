@@ -16,6 +16,7 @@ const MCP_BLOCK_START: &str = "# quill-managed:codex:mcp:start";
 const MCP_BLOCK_END: &str = "# quill-managed:codex:mcp:end";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:codex:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
+
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
 
@@ -54,6 +55,7 @@ pub fn detect() -> Result<ProviderStatus, String> {
         user_has_made_choice: false,
         last_error: None,
         last_verified_at: Some(Utc::now().to_rfc3339()),
+        brevity_enabled: false,
     })
 }
 
@@ -872,6 +874,7 @@ fn remove_agents_block() -> Result<(), String> {
 
     let content =
         fs::read_to_string(&path).map_err(|err| format!("Failed to read AGENTS.md: {err}"))?;
+    // Brevity block lifecycle is owned by `crate::brevity`; do not touch it here.
     let updated = strip_block(&content, AGENTS_BLOCK_START, AGENTS_BLOCK_END);
     fs::write(&path, updated).map_err(|err| format!("Failed to write AGENTS.md: {err}"))?;
     Ok(())

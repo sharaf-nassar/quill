@@ -275,6 +275,7 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
     { type: "file"; path: string; name: string; projectPath?: string } | { type: "project"; path: string } | null
   >(null);
   const [showEmpty, setShowEmpty] = useState(false);
+  const [compressProse, setCompressProse] = useState(false);
 
   // Filter projects: only show those with memories unless toggled
   const visibleProjects = showEmpty
@@ -624,10 +625,33 @@ export function MemoriesPanel({ providerFilter }: MemoriesPanelProps) {
             <button
               className="learning-analyze-btn"
               disabled={optimizing || !selectedProject}
-              onClick={triggerOptimization}
+              onClick={() => triggerOptimization({ compressProse })}
+              title={
+                compressProse
+                  ? "Caveman-compress prose in scanned memory files, then run the optimizer"
+                  : "Run the memory optimizer"
+              }
             >
-              {optimizing ? "Optimizing..." : "Optimize"}
+              {optimizing
+                ? "Optimizing..."
+                : compressProse
+                  ? "Compress + Optimize"
+                  : "Optimize"}
             </button>
+            <label
+              className={`learning-compress-toggle${
+                compressProse ? " learning-compress-toggle--active" : ""
+              }${optimizing ? " learning-compress-toggle--disabled" : ""}`}
+              title="Run caveman-compress on scanned memory files before the optimizer pass. Backs up each file as <name>.original.md."
+            >
+              <input
+                type="checkbox"
+                checked={compressProse}
+                disabled={optimizing}
+                onChange={(e) => setCompressProse(e.target.checked)}
+              />
+              Compress prose
+            </label>
             {runs.length > 0 && (
               <button
                 className={`learning-runs-btn${showHistory ? " learning-runs-btn--active" : ""}`}

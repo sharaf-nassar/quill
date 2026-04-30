@@ -67,9 +67,15 @@ COALESCE(SUM(COALESCE(returned_bytes, 0)), 0),
 COALESCE(SUM(COALESCE(input_bytes, 0)), 0),
 COALESCE(SUM(COALESCE(tokens_indexed_est, (COALESCE(indexed_bytes, 0) + 3) / 4)), 0),
 COALESCE(SUM(COALESCE(tokens_returned_est, (COALESCE(returned_bytes, 0) + 3) / 4)), 0),
-COALESCE(SUM(COALESCE(
-    tokens_saved_est,
+COALESCE(SUM(
     CASE
+        WHEN tokens_saved_est IS NOT NULL
+            AND NOT (
+                tokens_saved_est = 0
+                AND delivered = 0
+                AND indexed_bytes IS NOT NULL
+                AND returned_bytes IS NULL
+            ) THEN tokens_saved_est
         WHEN indexed_bytes IS NOT NULL OR input_bytes IS NOT NULL OR returned_bytes IS NOT NULL THEN
             CASE
                 WHEN COALESCE(indexed_bytes, input_bytes, 0) > COALESCE(returned_bytes, 0) THEN
@@ -78,7 +84,7 @@ COALESCE(SUM(COALESCE(
             END
         ELSE 0
     END
-)), 0),
+), 0),
 COALESCE(SUM(COALESCE(tokens_preserved_est, (COALESCE(indexed_bytes, 0) + 3) / 4)), 0)
 "#;
 
@@ -1309,6 +1315,24 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 16: {e}"))?;
         }
 
+        if current_version < 17 {
+            conn.execute(
+                "UPDATE context_savings_events
+                 SET tokens_saved_est =
+                     (COALESCE(indexed_bytes, input_bytes, 0) - COALESCE(returned_bytes, 0) + 3) / 4
+                 WHERE tokens_saved_est = 0
+                   AND delivered = 0
+                   AND indexed_bytes IS NOT NULL
+                   AND returned_bytes IS NULL
+                   AND COALESCE(indexed_bytes, input_bytes, 0) > COALESCE(returned_bytes, 0)",
+                [],
+            )
+            .map_err(|e| format!("Migration 17 (context savings saved estimate backfill): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (17)", [])
+                .map_err(|e| format!("Failed to record migration 17: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -2185,7 +2209,22 @@ impl Storage {
                      input_bytes,
                      tokens_indexed_est,
                      tokens_returned_est,
-                     tokens_saved_est,
+                     CASE
+                         WHEN tokens_saved_est IS NOT NULL
+                             AND NOT (
+                                 tokens_saved_est = 0
+                                 AND delivered = 0
+                                 AND indexed_bytes IS NOT NULL
+                                 AND returned_bytes IS NULL
+                             ) THEN tokens_saved_est
+                         WHEN indexed_bytes IS NOT NULL OR input_bytes IS NOT NULL OR returned_bytes IS NOT NULL THEN
+                             CASE
+                                 WHEN COALESCE(indexed_bytes, input_bytes, 0) > COALESCE(returned_bytes, 0) THEN
+                                     (COALESCE(indexed_bytes, input_bytes, 0) - COALESCE(returned_bytes, 0) + 3) / 4
+                                 ELSE 0
+                             END
+                         ELSE 0
+                     END AS tokens_saved_est,
                      tokens_preserved_est,
                      estimate_method,
                      estimate_confidence,
