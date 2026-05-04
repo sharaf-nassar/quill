@@ -203,7 +203,7 @@ Key runtime and dev dependencies for both frontend and backend.
 
 ### Frontend Runtime
 
-React 19, React DOM, Tauri API v2, Tauri plugins (updater, window-state, process), Recharts 3.7, DOMPurify 3.3.
+React 19, React DOM, Tauri API v2, Tauri plugins (updater, window-state, process), Recharts 3.7, DOMPurify 3.4, and Marked 18.
 
 ### Frontend Dev
 

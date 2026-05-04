@@ -212,6 +212,26 @@ function TitleBar({
     });
   }, []);
 
+  const handleOpenReleaseNotes = useCallback(async () => {
+    const existing = await WebviewWindow.getByLabel("release-notes");
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    new WebviewWindow("release-notes", {
+      url: "/?view=release-notes",
+      title: "Release Notes",
+      width: 560,
+      height: 600,
+      minWidth: 380,
+      minHeight: 360,
+      decorations: false,
+      transparent: true,
+      resizable: true,
+    });
+  }, []);
+
   const handleToggleMenu = useCallback(() => {
     setMenuOpen((prev) => {
       if (prev) {
@@ -431,7 +451,17 @@ function TitleBar({
             </>
           )}
         </div>
-        {version && <span className="titlebar-version">v{version}</span>}
+        {version && (
+          <button
+            type="button"
+            className="titlebar-version"
+            onClick={() => void handleOpenReleaseNotes()}
+            aria-label={`Quill version ${version}, view release notes`}
+            title="View release notes"
+          >
+            v{version}
+          </button>
+        )}
         <button
           className="titlebar-close"
           onClick={() => void handleCloseWindow()}

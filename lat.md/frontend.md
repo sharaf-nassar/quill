@@ -10,7 +10,7 @@ Each window gets its own Suspense boundary with a fallback. Per-window zoom pers
 
 ### Window Routes
 
-Seven Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary.
+Eight Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary.
 
 | Route | Component | Purpose |
 |-------|-----------|---------|
@@ -21,6 +21,9 @@ Seven Tauri windows are routed by the `?view=` URL parameter, each with its own 
 | `?view=restart` | `RestartWindowView` | Claude Code instance restart |
 | `?view=runs` | `RunsWindowView` | Learning run history details |
 | `?view=integrations` | `IntegrationsWindowView` | Standalone provider enable/disable (unused since inline popover migration) |
+| `?view=release-notes` | `ReleaseNotesWindow` | Browse published GitHub release notes |
+
+The `release-notes` route is the only secondary window not gated on having an enabled provider; it stays reachable so users can read changelog history regardless of integration state.
 
 ## Main Window Layout
 
@@ -46,7 +49,8 @@ Components are organized by feature domain under `src/components/`.
 
 Top-level UI chrome and live rate limit display shared across the main window.
 
-- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered static `QUILL` brand label, and a right-aligned cluster containing a cogwheel settings trigger (immediately left of the version) that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, followed by version and close controls. The popover uses the `provider-menu--right` modifier so it right-anchors to the cogwheel inside the narrow main window. When the frontend's periodic updater check finds a release, it also shows an `Update x.y.z` action that installs via [[src-tauri/src/lib.rs#install_app_update]] so the backend owns the restart handoff. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
+- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered static `QUILL` brand label, and a right-aligned cluster containing a cogwheel settings trigger (immediately left of the version) that opens an inline `ProviderMenu` popover with backdrop-based click-outside dismissal, followed by version and close controls. The popover uses the `provider-menu--right` modifier so it right-anchors to the cogwheel inside the narrow main window. When the frontend's periodic updater check finds a release, it also shows an `Update x.y.z` action that installs via [[src-tauri/src/lib.rs#install_app_update]] so the backend owns the restart handoff. The version label is rendered as a button that opens the `release-notes` window via [[src/windows/ReleaseNotesWindow.tsx]]. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
+- **ReleaseNotesWindow** (`src/windows/ReleaseNotesWindow.tsx`) — Standalone window that fetches published GitHub releases through the [[src-tauri/src/lib.rs#get_release_notes]] command, shows the latest first, and places Previous/Next navigation plus the selectable release URL in a top toolbar below the titlebar. Centers the release tag between the release counter and publish date, renders release bodies as sanitized GitHub-flavored Markdown that fills the scroll area, surfaces loading, empty, and error states with a Retry control, and supports Escape plus Left/Right arrow keyboard navigation.
 - **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel rendered as a compact terminal-utility list of 22 px rows separated by 1 px hairlines. Inline rows for Layout (stacked/side-by-side icon toggle), Status (compact `<select>` for the indicator primary provider), and Context (working-context preservation toggle) come first, followed by `Brevity` and `Integrations` group headers and their per-provider rows for Claude Code, Codex, and MiniMax. Each toggle is a single 36 px-min `pmenu-toggle` pill that resolves to one of `ON` / `OFF` / `N/A` / `SETUP` / `…` / `—` depending on `inFlightProviders`, `setupState`, `detectedCli`, and per-provider `enabled` flags, with semantic colors drawn from [[lat.md/frontend#Frontend#Styling#Color System]] (green = on, dim = off, red = unavailable, yellow = needs setup, blue = busy). Hovering any row in a section instantly shows a detailed `pmenu-tooltip` (one of `layout`, `status`, `context`, `brevity`, `integrations`) rendered via `react-dom/createPortal` into `document.body` to escape the popover's `overflow-y: auto`; the tooltip is positioned `fixed` to the left of the menu by default and falls back below the popover when there is no horizontal room for the 252 px panel, with a small CSS-rotated diamond pointing back at the source row. Tooltip copy lines support inline `<code>` rendering via a backtick parser. The portal layer dismisses on `mouseleave`, window resize, or menu scroll. Layout props remain optional for backward compatibility with the legacy `IntegrationsWindowView`.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
 - **IntegrationsWindowView** (`src/windows/IntegrationsWindow.tsx`) — Legacy standalone window host for `ProviderMenu` (unused since inline popover migration).

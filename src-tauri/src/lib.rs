@@ -14,6 +14,7 @@ mod memory_optimizer;
 mod models;
 mod plugins;
 mod prompt_utils;
+mod releases;
 mod restart;
 mod rule_watcher;
 mod server;
@@ -1559,6 +1560,11 @@ async fn quit_app(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
+async fn get_release_notes(limit: Option<u32>) -> Result<Vec<releases::ReleaseNote>, String> {
+    releases::fetch_release_notes(limit).await
+}
+
+#[tauri::command]
 async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
     let updater = app
         .updater()
@@ -2052,6 +2058,7 @@ pub fn run() {
             hide_window,
             quit_app,
             install_app_update,
+            get_release_notes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

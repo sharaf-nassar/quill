@@ -225,11 +225,13 @@ Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git 
 
 Restart commands expose a shared provider-aware row model across Claude and Codex. Hook install/check commands accept an optional provider parameter so restart setup can be applied per provider.
 
-### UI Commands (3)
+### UI Commands (4)
 
-`hide_window`, `quit_app`, `install_app_update`.
+`hide_window`, `quit_app`, `install_app_update`, `get_release_notes`.
 
 [[src-tauri/src/lib.rs#install_app_update]] re-checks the configured updater from Rust, downloads and installs the release, logs the resolved relaunch binary, and then requests restart so the titlebar update button shares the backend-owned restart boundary with the tray updater.
+
+[[src-tauri/src/lib.rs#get_release_notes]] proxies the public GitHub releases API for `sharaf-nassar/quill` via [[src-tauri/src/releases.rs#fetch_release_notes]], drops drafts and prereleases, and returns a normalized `ReleaseNote` list (tag, name, body, html url, published_at) that the [[frontend#Frontend#Components]] release-notes window paginates with Previous/Next. The command takes an optional `limit` (clamped to 1-100, default 30) so the frontend can request a small newest-first window without exposing GitHub pagination details. Unauthenticated requests are used because the repository is public; rate-limit and HTTP errors are surfaced as `Result::Err` strings rather than swallowed.
 
 ### Integration Commands (5)
 

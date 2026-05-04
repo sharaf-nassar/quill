@@ -23,6 +23,9 @@ const RestartWindowView = React.lazy(
 const IntegrationsWindowView = React.lazy(
   () => import("./windows/IntegrationsWindow"),
 );
+const ReleaseNotesWindowView = React.lazy(
+  () => import("./windows/ReleaseNotesWindow"),
+);
 
 // Zoom with Ctrl+Plus / Ctrl+Minus / Ctrl+0 (per-window, persisted)
 {
@@ -158,7 +161,7 @@ function ProviderRoutedView() {
   );
   const windowTitle = blockedWindowTitle(view);
 
-  if (view && view !== "main" && view !== "integrations") {
+  if (view && view !== "main" && view !== "integrations" && view !== "release-notes") {
     if (integrations.loading) {
       return (
         <BlockedWindow
@@ -195,6 +198,8 @@ function ProviderRoutedView() {
     <RestartWindowView />
   ) : view === "integrations" ? (
     <IntegrationsWindowView />
+  ) : view === "release-notes" ? (
+    <ReleaseNotesWindowView />
   ) : (
     <App integrations={integrations} />
   );
