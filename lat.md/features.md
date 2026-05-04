@@ -142,7 +142,7 @@ Provider hooks steer high-volume operations toward Quill context tools before th
 
 Continuity hooks record small task and decision hints without writing to provider memory paths.
 
-`src-tauri/claude-integration/scripts/context-capture.cjs` and `src-tauri/codex-integration/scripts/context-capture.cjs` write compact JSONL events under `~/.config/quill/context/continuity/`, capture prompts and simple decision/task hints, store PreCompact or Stop snapshots when available, and emit a short `<quill_continuity>` directive on SessionStart when recent continuity exists.
+`src-tauri/claude-integration/scripts/context-capture.cjs`, `src-tauri/codex-integration/scripts/context-capture.cjs`, and `plugin/scripts/context-capture.cjs` write compact JSONL events under `~/.config/quill/context/continuity/`, capture prompts and simple decision/task hints, and store PreCompact or Stop snapshots when available. SessionStart guidance is scoped by provider and project key, where the project key is the nearest git root for the current `cwd` or the normalized `cwd` when no git root is found, so recent work from another project cannot leak into a new session.
 
 ### Context Savings Telemetry
 

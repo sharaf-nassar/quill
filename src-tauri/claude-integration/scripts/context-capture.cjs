@@ -35,6 +35,8 @@ function continuityDir() {
   return path.join(homeDir(), ".config", "quill", "context", "continuity");
 }
 
+const projectKeyCache = new Map();
+
 function safeName(value) {
   return String(value || "unknown").replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
 }
@@ -52,6 +54,42 @@ function compactText(value, maxLen) {
   const text = String(value).replace(/\s+/g, " ").trim();
   if (!text) return null;
   return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
+}
+
+function cwdValue(input) {
+  return input.cwd || process.cwd();
+}
+
+function normalizedCwd(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  return path.resolve(text);
+}
+
+function projectKey(value) {
+  const cwd = normalizedCwd(value);
+  if (!cwd) return null;
+  if (projectKeyCache.has(cwd)) return projectKeyCache.get(cwd);
+
+  let dir = cwd;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(dir, ".git"))) {
+        projectKeyCache.set(cwd, dir);
+        return dir;
+      }
+    } catch (_) {
+      break;
+    }
+
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  projectKeyCache.set(cwd, cwd);
+  return cwd;
 }
 
 function promptText(input) {
@@ -170,7 +208,7 @@ function buildEvent(input) {
     timestamp: new Date().toISOString(),
     provider,
     session_id: sessionId(input),
-    cwd: input.cwd || process.cwd(),
+    cwd: cwdValue(input),
     hook_event: eventName(input),
     source: input.source || null,
     prompt_summary: promptSummary,
@@ -180,8 +218,13 @@ function buildEvent(input) {
 }
 
 function buildSnapshot(input, currentEvent) {
+  const currentProject = projectKey(currentEvent.cwd);
   const records = recentRecords()
-    .filter((record) => record.session_id === currentEvent.session_id)
+    .filter((record) =>
+      record.session_id === currentEvent.session_id &&
+      (!record.provider || record.provider === currentEvent.provider) &&
+      (!currentProject || !record.cwd || projectKey(record.cwd) === currentProject),
+    )
     .slice(0, 12);
   const prompts = unique(records.map((record) => record.prompt_summary).filter(Boolean), 4);
   if (currentEvent.prompt_summary) prompts.unshift(currentEvent.prompt_summary);
@@ -250,17 +293,30 @@ function appendEventAndMaybeSnapshot(input) {
   return event;
 }
 
-function buildDirective(provider) {
-  const records = recentRecords().filter((record) =>
-    record.hook_event !== "SessionStart" && (!record.provider || record.provider === provider),
-  );
+function scopedRecentRecords(input, provider) {
+  const currentProject = projectKey(cwdValue(input));
+  const currentSessionId = sessionId(input);
+
+  return recentRecords().filter((record) => {
+    if (record.hook_event === "SessionStart") return false;
+    if (record.provider && record.provider !== provider) return false;
+
+    const recordProject = projectKey(record.cwd);
+    if (currentProject && recordProject) return recordProject === currentProject;
+
+    return Boolean(currentSessionId && record.session_id === currentSessionId);
+  });
+}
+
+function buildDirective(input, provider) {
+  const records = scopedRecentRecords(input, provider);
   if (records.length === 0) return null;
 
   const lastPrompt = records.find((record) => record.prompt_summary)?.prompt_summary ||
     records.find((record) => Array.isArray(record.prompt_summaries) && record.prompt_summaries[0])?.prompt_summaries[0];
   const tasks = unique(records.flatMap((record) => record.tasks || record.hints?.tasks || []), 3);
   const decisions = unique(records.flatMap((record) => record.decisions || record.hints?.decisions || []), 3);
-  const cwd = records.find((record) => record.cwd)?.cwd;
+  const cwd = cwdValue(input) || records.find((record) => record.cwd)?.cwd;
 
   const lines = [
     "<quill_continuity>",
@@ -280,7 +336,7 @@ function buildDirective(provider) {
 
 function outputSessionStartDirective(input) {
   const provider = inferProvider(input);
-  const directive = buildDirective(provider);
+  const directive = buildDirective(input, provider);
   if (!directive) return;
   postContextSavingsEvents([
     buildContextSavingsEvent(input, {
