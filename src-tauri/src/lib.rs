@@ -884,6 +884,25 @@ async fn get_provider_statuses() -> Result<Vec<ProviderStatus>, String> {
 }
 
 #[tauri::command]
+async fn rescan_integrations(app: tauri::AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    let statuses = {
+        let app_handle = app.clone();
+        run_blocking(move || integrations::force_rescan(&app_handle))
+    }?;
+
+    // A successful rescan can flip a provider from N/A to detected (or
+    // vice-versa). The usage cache is keyed on the enabled-provider set, so
+    // refresh it to match the new detection state — matching the pattern in
+    // confirm_enable_provider / confirm_disable_provider.
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after rescan failed: {error}");
+    }
+
+    Ok(statuses)
+}
+
+#[tauri::command]
 async fn confirm_enable_provider(
     provider: integrations::IntegrationProvider,
     api_key: Option<String>,
@@ -1995,6 +2014,7 @@ pub fn run() {
             get_context_preservation_status,
             set_context_preservation_enabled,
             get_provider_statuses,
+            rescan_integrations,
             confirm_enable_provider,
             confirm_disable_provider,
             set_provider_brevity_enabled,

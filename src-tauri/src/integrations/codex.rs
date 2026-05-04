@@ -38,7 +38,7 @@ fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
 }
 
 pub fn detect() -> Result<ProviderStatus, String> {
-    let detected_cli = detect_codex_cli();
+    let (detected_cli, attempts) = detect_codex_cli();
     let detected_home = detect_codex_home()?;
     let setup_state = match (detected_cli, detected_home) {
         (true, true) => ProviderSetupState::Installed,
@@ -56,6 +56,7 @@ pub fn detect() -> Result<ProviderStatus, String> {
         last_error: None,
         last_verified_at: Some(Utc::now().to_rfc3339()),
         brevity_enabled: false,
+        last_detection_attempts: if detected_cli { Vec::new() } else { attempts },
     })
 }
 
@@ -215,20 +216,8 @@ fn verify_mcp(context_enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn detect_codex_cli() -> bool {
-    let Some(codex_path) = crate::config::resolve_command_path("codex") else {
-        return false;
-    };
-
-    Command::new(&codex_path)
-        .arg("--version")
-        .env(
-            "PATH",
-            crate::config::path_for_resolved_command(&codex_path),
-        )
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+fn detect_codex_cli() -> (bool, Vec<String>) {
+    crate::config::detect_provider_cli("codex")
 }
 
 fn detect_codex_home() -> Result<bool, String> {

@@ -3,11 +3,10 @@
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use chrono::Utc;
-use std::process::Command;
 use tauri::AppHandle;
 
 pub fn detect() -> Result<ProviderStatus, String> {
-    let detected_cli = detect_claude_cli();
+    let (detected_cli, attempts) = detect_claude_cli();
     let detected_home = detect_claude_home()?;
     let setup_state = match (detected_cli, detected_home) {
         (true, true) => ProviderSetupState::Installed,
@@ -25,6 +24,7 @@ pub fn detect() -> Result<ProviderStatus, String> {
         last_error: None,
         last_verified_at: Some(Utc::now().to_rfc3339()),
         brevity_enabled: false,
+        last_detection_attempts: if detected_cli { Vec::new() } else { attempts },
     })
 }
 
@@ -38,17 +38,8 @@ pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
     crate::restart::uninstall_claude_restart_assets(remove_shared_restart_assets)
 }
 
-fn detect_claude_cli() -> bool {
-    let Some(claude_path) = crate::config::resolve_command_path("claude") else {
-        return false;
-    };
-
-    Command::new(claude_path)
-        .arg("--version")
-        .env("PATH", crate::config::shell_path())
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+fn detect_claude_cli() -> (bool, Vec<String>) {
+    crate::config::detect_provider_cli("claude")
 }
 
 fn detect_claude_home() -> Result<bool, String> {

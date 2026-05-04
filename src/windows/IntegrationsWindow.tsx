@@ -64,11 +64,13 @@ function IntegrationsWindowView() {
     contextPreservation,
     contextPreservationInFlight,
     brevityInFlightProviders,
+    rescanInFlight,
     saveIndicatorPrimaryProvider,
     setContextPreservationEnabled,
     enableProvider,
     disableProvider,
     setBrevityEnabled,
+    rescan,
   } = useIntegrations();
   const [pendingProviderAction, setPendingProviderAction] =
     useState<PendingProviderAction | null>(null);
@@ -178,6 +180,12 @@ function IntegrationsWindowView() {
           onIndicatorPrimaryProviderChange={(provider) => {
             void saveIndicatorPrimaryProvider(provider);
           }}
+          onRescan={() => {
+            void rescan().catch((e) => {
+              toast("warning", String(e));
+            });
+          }}
+          rescanning={rescanInFlight}
         />
       </div>
       {pendingProviderAction && confirmCopy && (

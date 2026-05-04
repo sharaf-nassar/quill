@@ -99,11 +99,13 @@ function TitleBar({
     contextPreservation,
     contextPreservationInFlight,
     brevityInFlightProviders,
+    rescanInFlight,
     saveIndicatorPrimaryProvider,
     setContextPreservationEnabled,
     enableProvider,
     disableProvider,
     setBrevityEnabled,
+    rescan,
   } = integrations;
 
   useEffect(() => {
@@ -447,6 +449,12 @@ function TitleBar({
                 }}
                 layoutMode={layoutMode}
                 onLayoutModeChange={onLayoutModeChange}
+                onRescan={() => {
+                  void rescan().catch((e) => {
+                    toast("warning", String(e));
+                  });
+                }}
+                rescanning={rescanInFlight}
               />
             </>
           )}

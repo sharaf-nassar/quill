@@ -201,6 +201,15 @@ pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
     Ok(statuses)
 }
 
+/// Drop the cached login-shell PATH and re-run provider detection. Triggered
+/// by the "Rescan" button in the integrations UI when a user has just edited
+/// their shell config or installed a CLI and wants Quill to pick it up
+/// without restarting.
+pub fn force_rescan(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    crate::config::refresh_shell_path();
+    startup_refresh(app)
+}
+
 pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
     load_saved_statuses(storage)
 }

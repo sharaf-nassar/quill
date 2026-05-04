@@ -84,4 +84,9 @@ pub struct ProviderStatus {
     pub last_verified_at: Option<String>,
     #[serde(default)]
     pub brevity_enabled: bool,
+    /// Paths inspected during the last CLI detection attempt. Populated only
+    /// when detection failed so the UI can explain why a provider shows N/A
+    /// despite being installed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub last_detection_attempts: Vec<String>,
 }

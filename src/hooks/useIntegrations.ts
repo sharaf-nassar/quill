@@ -39,8 +39,10 @@ export interface UseIntegrationsResult {
   inFlightProviders: ReadonlySet<IntegrationProvider>;
   contextPreservationInFlight: boolean;
   brevityInFlightProviders: ReadonlySet<IntegrationProvider>;
+  rescanInFlight: boolean;
   hasEnabledProvider: boolean;
   refresh: () => Promise<void>;
+  rescan: () => Promise<void>;
   saveIndicatorPrimaryProvider: (provider: IndicatorPrimaryProvider) => Promise<void>;
   setContextPreservationEnabled: (enabled: boolean) => Promise<ContextPreservationStatus>;
   enableProvider: (provider: IntegrationProvider, apiKey?: string) => Promise<ProviderStatus>;
@@ -69,6 +71,7 @@ export function useIntegrations(): UseIntegrationsResult {
   const [brevityInFlightProviders, setBrevityInFlightProviders] = useState<
     Set<IntegrationProvider>
   >(new Set());
+  const [rescanInFlight, setRescanInFlight] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -239,6 +242,24 @@ export function useIntegrations(): UseIntegrationsResult {
     [],
   );
 
+  const rescan = useCallback(async () => {
+    setRescanInFlight(true);
+    try {
+      // Backend emits `integrations-updated` so the existing event listener
+      // updates `statuses`. We still await the IPC so the in-flight indicator
+      // covers the full backend round-trip and so we can surface errors.
+      const updated = await invoke<ProviderStatus[]>("rescan_integrations");
+      setStatuses(sortStatuses(updated));
+      setError(null);
+    } catch (e) {
+      const message = String(e);
+      setError(message);
+      throw new Error(message);
+    } finally {
+      setRescanInFlight(false);
+    }
+  }, []);
+
   const hasEnabledProvider = useMemo(
     () => statuses.some((status) => status.enabled),
     [statuses],
@@ -253,8 +274,10 @@ export function useIntegrations(): UseIntegrationsResult {
     inFlightProviders,
     contextPreservationInFlight,
     brevityInFlightProviders,
+    rescanInFlight,
     hasEnabledProvider,
     refresh,
+    rescan,
     saveIndicatorPrimaryProvider,
     setContextPreservationEnabled,
     enableProvider,

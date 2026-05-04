@@ -175,6 +175,12 @@ export interface ProviderStatus {
   lastError: string | null;
   lastVerifiedAt: string | null;
   brevityEnabled: boolean;
+  /**
+   * Filesystem locations Quill checked when trying to find this provider's
+   * CLI. Populated only when `detectedCli` is false so the integrations menu
+   * can explain why the provider shows N/A despite being installed.
+   */
+  lastDetectionAttempts?: string[];
 }
 
 export interface ContextPreservationStatus {

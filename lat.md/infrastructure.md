@@ -183,6 +183,22 @@ Codex installs SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, and Stop
 
 Quill resolves the Codex CLI before running provider checks or `codex app-server`, then augments the child process `PATH` with launcher and symlink-target directories so Homebrew and npm installs work from macOS app launches with stripped inherited environments.
 
+## Provider CLI Detection
+
+Claude and Codex CLI detection runs through [[src-tauri/src/config.rs#resolve_command_path]] with an invalidatable login-shell PATH cache so the integrations menu's "Rescan PATH" action can pick up new installs without restarting Quill.
+
+Detection layers a login-shell `command -v` lookup with a static fallback list and dynamic per-package-manager prefix queries. The cache lives in an `RwLock` and is cleared via [[src-tauri/src/config.rs#refresh_shell_path]] when the UI calls [[src-tauri/src/integrations/manager.rs#force_rescan]].
+
+The static fallback list covers per-user package managers that frequently aren't in the login-shell PATH because users add them only to interactive shell config (`~/.zshrc`, `~/.bashrc`) which `zsh -lc` does not source: `~/.bun/bin`, `~/.cargo/bin`, `~/.deno/bin`, `~/.volta/bin`, `~/.local/bin`, `~/.local/share/pnpm`, `~/.npm-global/bin`, `~/n/bin`, `~/.yarn/bin`, `~/.config/yarn/global/node_modules/.bin`, `~/.nix-profile/bin`, `~/.asdf/shims`, `~/.nodenv/shims`, `~/.local/share/mise/shims`, plus Anthropic's `claude migrate-installer` target `~/.claude/local/{,node_modules/.bin/}` and the symmetric `~/.codex/local/{,bin/}`. macOS additionally checks `~/Library/pnpm` (the macOS pnpm default), `/opt/homebrew/bin`, `/usr/local/bin`, and `/opt/local/bin` (MacPorts); Linux additionally checks `/usr/local/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/opt/homebrew/bin`, `/snap/bin`, `/run/current-system/sw/bin` (NixOS system profile), and `/nix/var/nix/profiles/default/bin` (multi-user Nix).
+
+Version-managed Node installers can't be matched by a single static path, so [[src-tauri/src/config.rs#versioned_node_bin_candidates]] walks `~/.nvm/versions/node/*/bin/` (NVM), `~/.local/share/fnm/node-versions/*/installation/bin/` (fnm), and `~/.nodenv/versions/*/bin/` (nodenv) at detection time and emits one candidate per installed version. Without this, version-manager users get a false N/A because their init scripts only run from `~/.zshrc`/`~/.bashrc`.
+
+Windows is not covered: detection assumes a Unix shell (`bash -lc`/`zsh -lc`) and POSIX file extensions, so on Windows the login-shell lookup returns nothing and the static-path checks miss `.exe`/`.cmd`/`.ps1` shims. Provider CLI integration on Windows is intentionally unsupported until the architecture grows a Windows-native code path.
+
+After the static list, `resolve_command_path_with_attempts` queries `npm config get prefix`, `bun pm bin -g`, and `yarn global bin` through the login shell to pick up custom global-install prefixes. Results are cached and invalidated alongside the shell PATH. Returned bin dirs are validated against a trusted-roots allow-list (`$HOME`, `/usr`, `/opt`, `/Library`, `/snap`, `/nix`, `/run/current-system`, Linuxbrew, flatpak); a malicious npm/bun config that points the prefix elsewhere is dropped before Quill could later execute the binary as a trusted CLI. Failed detections record every path inspected on `ProviderStatus.lastDetectionAttempts` (omitted from JSON when empty) with the user's home directory redacted to `~/...` so the persisted/emitted blob does not leak the local username; the integrations menu's per-row diagnostic tooltip renders the redacted paths as inline `<code>` so they read distinctly from the surrounding prose.
+
+Both Claude and Codex detection share [[src-tauri/src/config.rs#detect_provider_cli]], which calls `resolve_command_path_with_attempts`, runs `--version` with `path_for_resolved_command`'s symlink-aware PATH augmentation, and returns the success bool plus the (already-redacted) attempts list.
+
 ## Remote Plugin
 
 The `plugin/` directory contains a Claude Code plugin for remote host connectivity.

@@ -33,6 +33,8 @@ interface ProviderMenuProps {
   onIndicatorPrimaryProviderChange: (provider: IndicatorPrimaryProvider) => void;
   layoutMode?: LayoutMode;
   onLayoutModeChange?: (mode: LayoutMode) => void;
+  onRescan?: () => void;
+  rescanning?: boolean;
 }
 
 const BREVITY_PROVIDERS: ReadonlyArray<IntegrationProvider> = ["claude", "codex"];
@@ -179,6 +181,8 @@ function ProviderMenu({
   onIndicatorPrimaryProviderChange,
   layoutMode,
   onLayoutModeChange,
+  onRescan,
+  rescanning = false,
 }: ProviderMenuProps) {
   const enabledProviders = statuses
     .filter((status) => status.enabled)
@@ -196,6 +200,7 @@ function ProviderMenu({
   const [tooltip, setTooltip] = useState<{
     section: SectionKey;
     pos: TooltipPos;
+    override?: { title: string; body: string[] };
   } | null>(null);
 
   const measure = useCallback(
@@ -227,6 +232,15 @@ function ProviderMenu({
       (event: React.MouseEvent<HTMLElement>) => {
         const pos = measure(event.currentTarget);
         setTooltip({ section, pos });
+      },
+    [measure],
+  );
+
+  const handleEnterOverride = useCallback(
+    (override: { title: string; body: string[] }) =>
+      (event: React.MouseEvent<HTMLElement>) => {
+        const pos = measure(event.currentTarget);
+        setTooltip({ section: "integrations", pos, override });
       },
     [measure],
   );
@@ -333,6 +347,76 @@ function ProviderMenu({
           </button>
         </div>
 
+        <div className="pmenu-group" {...sectionProps("integrations")}>
+          Integrations
+        </div>
+        {onRescan ? (
+          <div className="pmenu-row" {...sectionProps("integrations")}>
+            <span className="pmenu-name">Rescan PATH</span>
+            <button
+              className={`pmenu-toggle pmenu-toggle--${rescanning ? "busy" : "off"}`}
+              disabled={rescanning || loading}
+              onClick={() => onRescan()}
+              aria-label="Rescan installed CLIs"
+              title="Re-search PATH for claude / codex"
+            >
+              {rescanning ? "..." : "RUN"}
+            </button>
+          </div>
+        ) : null}
+        {loading ? (
+          <div className="pmenu-empty" {...sectionProps("integrations")}>
+            checking…
+          </div>
+        ) : error ? (
+          <div
+            className="pmenu-empty pmenu-empty--error"
+            {...sectionProps("integrations")}
+          >
+            {error}
+          </div>
+        ) : (
+          statuses.map((status) => {
+            const busy = inFlightProviders.has(status.provider);
+            const state = integrationToggleState(status, busy);
+            const attempts = status.lastDetectionAttempts ?? [];
+            const showDiagnostic = state.tone === "na" && attempts.length > 0;
+            const rowProps = showDiagnostic
+              ? {
+                  onMouseEnter: handleEnterOverride({
+                    title: `${providerLabel(status.provider)} CLI not found`,
+                    body: [
+                      "Quill checked these locations and didn't find the CLI:",
+                      // Wrap each path in backticks so the existing
+                      // renderInlineCode parser styles it as <code>, separating
+                      // path lines visually from the surrounding prose.
+                      ...attempts.map((path) => `\`${path}\``),
+                      "Install the CLI in any of these locations, or update your shell PATH and click Rescan PATH above.",
+                    ],
+                  }),
+                  onMouseLeave: handleLeave,
+                }
+              : sectionProps("integrations");
+            return (
+              <div
+                key={status.provider}
+                className="pmenu-row"
+                {...rowProps}
+              >
+                <span className="pmenu-name">{providerLabel(status.provider)}</span>
+                <button
+                  className={`pmenu-toggle pmenu-toggle--${state.tone}`}
+                  disabled={state.disabled}
+                  onClick={() => onRequestToggle(status.provider, !status.enabled)}
+                  aria-pressed={status.enabled}
+                >
+                  {state.label}
+                </button>
+              </div>
+            );
+          })
+        )}
+
         <div className="pmenu-group" {...sectionProps("brevity")}>
           Brevity
         </div>
@@ -360,44 +444,6 @@ function ProviderMenu({
             </div>
           );
         })}
-
-        <div className="pmenu-group" {...sectionProps("integrations")}>
-          Integrations
-        </div>
-        {loading ? (
-          <div className="pmenu-empty" {...sectionProps("integrations")}>
-            checking…
-          </div>
-        ) : error ? (
-          <div
-            className="pmenu-empty pmenu-empty--error"
-            {...sectionProps("integrations")}
-          >
-            {error}
-          </div>
-        ) : (
-          statuses.map((status) => {
-            const busy = inFlightProviders.has(status.provider);
-            const state = integrationToggleState(status, busy);
-            return (
-              <div
-                key={status.provider}
-                className="pmenu-row"
-                {...sectionProps("integrations")}
-              >
-                <span className="pmenu-name">{providerLabel(status.provider)}</span>
-                <button
-                  className={`pmenu-toggle pmenu-toggle--${state.tone}`}
-                  disabled={state.disabled}
-                  onClick={() => onRequestToggle(status.provider, !status.enabled)}
-                  aria-pressed={status.enabled}
-                >
-                  {state.label}
-                </button>
-              </div>
-            );
-          })
-        )}
       </div>
 
       {tooltip
@@ -412,12 +458,19 @@ function ProviderMenu({
               }}
             >
               <div className="pmenu-tooltip-title">
-                {SECTION_INFO[tooltip.section].title}
+                {tooltip.override
+                  ? tooltip.override.title
+                  : SECTION_INFO[tooltip.section].title}
               </div>
-              <div className="pmenu-tooltip-blurb">
-                {SECTION_INFO[tooltip.section].blurb}
-              </div>
-              {SECTION_INFO[tooltip.section].body.map((line, idx) => (
+              {tooltip.override ? null : (
+                <div className="pmenu-tooltip-blurb">
+                  {SECTION_INFO[tooltip.section].blurb}
+                </div>
+              )}
+              {(tooltip.override
+                ? tooltip.override.body
+                : SECTION_INFO[tooltip.section].body
+              ).map((line, idx) => (
                 <p key={idx} className="pmenu-tooltip-body">
                   {renderInlineCode(line)}
                 </p>
