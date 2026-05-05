@@ -106,8 +106,13 @@ COALESCE(SUM(
 "#;
 
 // Category-scoped totals returned alongside the legacy aggregate.  Each
-// CASE picks tokens from exactly one category, so the four numbers partition
-// the active range cleanly without double-counting.
+// token CASE picks from exactly one category, so the three numbers partition
+// the active range cleanly without double-counting.  Routing and telemetry
+// also expose their own event counts because the `routerEventCount` field
+// derived from the breakdown only sees `router.*` event-type strings, while
+// the routing *category* additionally includes `mcp.search`, bounded
+// `mcp.execute` results, and `capture.guidance` — so the headline token
+// total and the supporting subtitle stay aligned.
 const CONTEXT_SAVINGS_CATEGORY_TOTALS_SQL: &str = r#"
 COALESCE(SUM(
     CASE WHEN category = 'preservation'
@@ -127,7 +132,8 @@ COALESCE(SUM(
         ELSE 0
     END
 ), 0),
-COALESCE(SUM(CASE WHEN category = 'telemetry' THEN 1 ELSE 0 END), 0)
+COALESCE(SUM(CASE WHEN category = 'telemetry' THEN 1 ELSE 0 END), 0),
+COALESCE(SUM(CASE WHEN category = 'routing' THEN 1 ELSE 0 END), 0)
 "#;
 
 // Per-source efficiency: distinct source_refs that were preserved within the
@@ -520,6 +526,7 @@ fn context_savings_summary_from_row_at(
         tokens_retrieved: 0,
         tokens_routing: 0,
         telemetry_event_count: 0,
+        routing_event_count: 0,
         sources_preserved: 0,
         sources_retrieved: 0,
         retention_ratio: 0.0,
@@ -536,13 +543,14 @@ fn apply_category_totals(
          FROM context_savings_events
          WHERE timestamp >= ?1"
     );
-    let (preserved, retrieved, routing, telemetry) = conn
+    let (preserved, retrieved, routing, telemetry, routing_events) = conn
         .query_row(&sql, params![from], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|e| format!("Query context savings category totals error: {e}"))?;
@@ -550,6 +558,7 @@ fn apply_category_totals(
     summary.tokens_retrieved = retrieved;
     summary.tokens_routing = routing;
     summary.telemetry_event_count = telemetry;
+    summary.routing_event_count = routing_events;
     Ok(())
 }
 
@@ -607,33 +616,18 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
 }
 
 fn backfill_context_event_categories(conn: &Connection) -> Result<(), String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, event_type, decision FROM context_savings_events
-             WHERE category = 'unknown' OR category IS NULL OR category = ''",
-        )
-        .map_err(|e| format!("Prepare category backfill scan error: {e}"))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|e| format!("Query category backfill rows error: {e}"))?;
-
-    let mut update = conn
-        .prepare("UPDATE context_savings_events SET category = ?1 WHERE id = ?2")
-        .map_err(|e| format!("Prepare category update error: {e}"))?;
-    for row in rows {
-        let (id, event_type, decision) =
-            row.map_err(|e| format!("Read category backfill row error: {e}"))?;
-        let category = crate::context_category::derive_category(&event_type, &decision);
-        update
-            .execute(params![category, id])
-            .map_err(|e| format!("Update category for event {id}: {e}"))?;
-    }
+    // Single bulk UPDATE driven by the SQL CASE mirror of `derive_category`.
+    // Replaces an earlier per-row UPDATE loop that scaled poorly on tables
+    // with millions of historical events.  The CASE expression is unit-
+    // tested against `derive_category` in [`crate::context_category`].
+    let sql = format!(
+        "UPDATE context_savings_events
+         SET category = ({case})
+         WHERE category = 'unknown' OR category IS NULL OR category = ''",
+        case = crate::context_category::DERIVE_CATEGORY_CASE_SQL,
+    );
+    conn.execute(&sql, [])
+        .map_err(|e| format!("Bulk backfill context savings categories error: {e}"))?;
     Ok(())
 }
 

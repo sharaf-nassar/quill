@@ -42,6 +42,28 @@ pub fn derive_category(event_type: &str, decision: &str) -> &'static str {
     }
 }
 
+/// SQL CASE expression that mirrors [`derive_category`] for use in bulk
+/// `UPDATE` statements. Kept as a sibling const so reviewers can scan both
+/// the Rust match arms and the SQL together when adding new event types;
+/// the `derive_category_sql_matches_function` test asserts both stay in
+/// agreement for every case the unit tests cover.
+pub const DERIVE_CATEGORY_CASE_SQL: &str = "
+CASE
+    WHEN event_type IN ('mcp.index', 'mcp.fetch') THEN 'preservation'
+    WHEN event_type = 'mcp.execute' AND decision = 'indexed' THEN 'preservation'
+    WHEN event_type = 'mcp.execute' THEN 'routing'
+    WHEN event_type = 'mcp.search' THEN 'routing'
+    WHEN event_type = 'mcp.source_read' THEN 'retrieval'
+    WHEN event_type = 'mcp.snapshot' AND decision = 'created' THEN 'preservation'
+    WHEN event_type = 'mcp.snapshot' THEN 'retrieval'
+    WHEN event_type = 'mcp.continuity' THEN 'telemetry'
+    WHEN event_type IN ('router.guidance', 'router.denial') THEN 'routing'
+    WHEN event_type IN ('capture.event', 'capture.snapshot') THEN 'telemetry'
+    WHEN event_type = 'capture.guidance' THEN 'routing'
+    ELSE 'unknown'
+END
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +106,66 @@ mod tests {
     #[test]
     fn unknown_for_unmapped_types() {
         assert_eq!(derive_category("future.event", "x"), UNKNOWN);
+    }
+
+    /// Every (event_type, decision) pair the unit tests cover, paired with
+    /// the expected category. Shared between the function-level tests and
+    /// the SQL-equivalence test below so a future contributor adding a case
+    /// to one place automatically extends both.
+    const TEST_CASES: &[(&str, &str, &str)] = &[
+        ("mcp.index", "recorded", PRESERVATION),
+        ("mcp.fetch", "indexed", PRESERVATION),
+        ("mcp.fetch", "cache_hit", PRESERVATION),
+        ("mcp.execute", "indexed", PRESERVATION),
+        ("mcp.execute", "returned", ROUTING),
+        ("mcp.search", "returned", ROUTING),
+        ("mcp.source_read", "chunk", RETRIEVAL),
+        ("mcp.source_read", "source", RETRIEVAL),
+        ("mcp.snapshot", "created", PRESERVATION),
+        ("mcp.snapshot", "returned", RETRIEVAL),
+        ("mcp.continuity", "recorded", TELEMETRY),
+        ("router.guidance", "guide", ROUTING),
+        ("router.denial", "deny", ROUTING),
+        ("capture.event", "recorded", TELEMETRY),
+        ("capture.snapshot", "recorded", TELEMETRY),
+        ("capture.guidance", "session-start-directive", ROUTING),
+        ("future.event", "x", UNKNOWN),
+    ];
+
+    #[test]
+    fn derive_category_sql_matches_function() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (event_type TEXT NOT NULL, decision TEXT NOT NULL)")
+            .unwrap();
+        let mut insert = conn
+            .prepare("INSERT INTO t (event_type, decision) VALUES (?1, ?2)")
+            .unwrap();
+        for (event_type, decision, _) in TEST_CASES {
+            insert
+                .execute(rusqlite::params![event_type, decision])
+                .unwrap();
+        }
+        let sql =
+            format!("SELECT event_type, decision, ({DERIVE_CATEGORY_CASE_SQL}) AS category FROM t");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let rows: Vec<(String, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for (event_type, decision, sql_category) in &rows {
+            let function_category = derive_category(event_type, decision);
+            assert_eq!(
+                sql_category, function_category,
+                "SQL CASE disagrees with derive_category for ({event_type}, {decision})"
+            );
+        }
+        for (event_type, decision, expected) in TEST_CASES {
+            let row = rows
+                .iter()
+                .find(|(et, dec, _)| et == event_type && dec == decision)
+                .expect("seeded row missing");
+            assert_eq!(row.2, *expected, "{event_type}/{decision}");
+        }
     }
 }

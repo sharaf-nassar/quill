@@ -126,7 +126,10 @@ function primaryBytes(event: ContextSavingsEvent): {
 }
 
 function preservedTokens(summary: ContextSavingsSummary): number {
-	return summary.tokensPreserved ?? summary.tokensPreservedEst;
+	// Intentionally does NOT fall back to tokensPreservedEst — that legacy
+	// column included telemetry events and is the value this fix removes
+	// from the headline. A stale backend should display 0 until upgraded.
+	return summary.tokensPreserved ?? 0;
 }
 
 function retrievedTokens(summary: ContextSavingsSummary): number {
@@ -135,6 +138,13 @@ function retrievedTokens(summary: ContextSavingsSummary): number {
 
 function routingTokens(summary: ContextSavingsSummary): number {
 	return summary.tokensRouting ?? 0;
+}
+
+function routingEventCount(summary: ContextSavingsSummary): number {
+	// Prefer the category-scoped count (router + capture.guidance + search +
+	// bounded mcp.execute results) so it matches the headline tokens.  Fall
+	// back to the event-type-only routerEventCount for older backends.
+	return summary.routingEventCount ?? summary.routerEventCount;
 }
 
 function formatRetention(summary: ContextSavingsSummary): string {
@@ -437,7 +447,7 @@ function ContextSavingsTab({ range, onRangeChange }: ContextSavingsTabProps) {
 						<ContextStat
 							label="Routing cost"
 							value={formatTokens(routingTokens(summary))}
-							subtitle={`${formatCompact(summary.routerEventCount)} guidance events`}
+							subtitle={`${formatCompact(routingEventCount(summary))} guidance events`}
 							accent="#fbbf24"
 						/>
 						<ContextStat

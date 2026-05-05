@@ -240,6 +240,13 @@ pub struct ContextSavingsSummary {
     /// mcp.continuity).  Not a token metric.
     #[serde(default)]
     pub telemetry_event_count: i64,
+    /// Count of events whose `category` is `routing` (router guidance,
+    /// router denials, capture-time session-start directives, search
+    /// snippets, bounded `mcp.execute` results).  Distinct from
+    /// `routerEventCount`, which the frontend derives by string-matching
+    /// `router.*` event-type names and therefore undercounts categories.
+    #[serde(default)]
+    pub routing_event_count: i64,
     /// Distinct `source_ref` values written by preservation events in the range.
     #[serde(default)]
     pub sources_preserved: i64,

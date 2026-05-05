@@ -446,12 +446,15 @@ export interface ContextSavingsSummary {
 	tokensReturnedEst: number;
 	tokensSavedEst: number;
 	tokensPreservedEst: number;
-	// Category-scoped totals from backend.  Falls back to 0 when backend is
-	// older than schema v18 and has not been redeployed yet.
+	// Category-scoped totals from backend.  Older backends omit these
+	// fields entirely; consumers MUST default to 0 (not the legacy
+	// tokens*Est columns) so a stale backend does not silently re-surface
+	// the pre-fix inflated headline that this taxonomy was added to remove.
 	tokensPreserved?: number;
 	tokensRetrieved?: number;
 	tokensRouting?: number;
 	telemetryEventCount?: number;
+	routingEventCount?: number;
 	sourcesPreserved?: number;
 	sourcesRetrieved?: number;
 	retentionRatio?: number;

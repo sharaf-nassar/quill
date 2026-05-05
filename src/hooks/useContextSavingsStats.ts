@@ -52,10 +52,14 @@ function normalizeSummary(
 			summary.routerEventCount ?? derivedEventCount(breakdowns, isRouterEvent),
 		continuityEventCount:
 			summary.continuityEventCount ?? derivedEventCount(breakdowns, isContinuityEvent),
-		tokensPreserved: summary.tokensPreserved ?? summary.tokensPreservedEst,
+		// Old backends do not categorize events.  Fall back to 0 — never to
+		// tokensPreservedEst — so a stale backend does not silently re-surface
+		// the pre-fix inflated headline.
+		tokensPreserved: summary.tokensPreserved ?? 0,
 		tokensRetrieved: summary.tokensRetrieved ?? 0,
 		tokensRouting: summary.tokensRouting ?? 0,
 		telemetryEventCount: summary.telemetryEventCount ?? 0,
+		routingEventCount: summary.routingEventCount ?? 0,
 		sourcesPreserved,
 		sourcesRetrieved,
 		retentionRatio,
