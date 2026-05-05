@@ -73,17 +73,49 @@ function stableEventId(event) {
   return `ctx_${crypto.createHash("sha256").update(JSON.stringify(event)).digest("hex").slice(0, 32)}`;
 }
 
+// Canonical taxonomy: keep in sync with src-tauri/src/context_category.rs
+// and src-tauri/claude-integration/mcp/tools/context.py.
+function deriveCategory(eventType, decision) {
+  switch (eventType) {
+    case "mcp.index":
+    case "mcp.fetch":
+      return "preservation";
+    case "mcp.execute":
+      return decision === "indexed" ? "preservation" : "routing";
+    case "mcp.search":
+      return "routing";
+    case "mcp.source_read":
+      return "retrieval";
+    case "mcp.snapshot":
+      return decision === "created" ? "preservation" : "retrieval";
+    case "mcp.continuity":
+      return "telemetry";
+    case "router.guidance":
+    case "router.denial":
+      return "routing";
+    case "capture.event":
+    case "capture.snapshot":
+      return "telemetry";
+    case "capture.guidance":
+      return "routing";
+    default:
+      return "unknown";
+  }
+}
+
 function buildContextSavingsEvent(input, fields) {
   const config = readConfig();
   const indexedBytes = nullableInteger(fields.indexedBytes);
   const returnedBytes = nullableInteger(fields.returnedBytes);
   const inputBytes = nullableInteger(fields.inputBytes);
   const hasByteEstimate = indexedBytes !== null || returnedBytes !== null || inputBytes !== null;
-  // Saved = bytes Quill preserved but did NOT return to the LLM transcript.
-  // Prefer indexedBytes (what Quill actually keeps) over inputBytes (a summary), and
-  // treat a null returnedBytes as 0 so write-only events still attribute savings.
+  const category = fields.category || deriveCategory(fields.eventType, fields.decision || "recorded");
+  // Only preservation/retrieval events default tokensSaved/tokensPreserved from indexedBytes.
+  // Routing and telemetry events default to 0 unless the caller passes explicit values, so
+  // hook payloads (capture.event, router.guidance, etc.) no longer inflate the savings metric.
+  const tokenScope = category === "preservation" || category === "retrieval";
   const savedBaseline = indexedBytes !== null ? indexedBytes : inputBytes;
-  const savedBytes = savedBaseline !== null
+  const savedBytes = tokenScope && savedBaseline !== null
     ? Math.max(0, savedBaseline - (returnedBytes ?? 0))
     : null;
 
@@ -98,6 +130,7 @@ function buildContextSavingsEvent(input, fields) {
     eventType: fields.eventType,
     source: fields.source || "context",
     decision: fields.decision || "recorded",
+    category,
     reason: fields.reason || null,
     delivered: fields.delivered === undefined ? true : Boolean(fields.delivered),
     indexedBytes,
@@ -105,8 +138,8 @@ function buildContextSavingsEvent(input, fields) {
     inputBytes,
     tokensIndexedEst: fields.tokensIndexedEst ?? tokensFromBytes(indexedBytes),
     tokensReturnedEst: fields.tokensReturnedEst ?? tokensFromBytes(returnedBytes),
-    tokensSavedEst: fields.tokensSavedEst ?? tokensFromBytes(savedBytes),
-    tokensPreservedEst: fields.tokensPreservedEst ?? tokensFromBytes(indexedBytes),
+    tokensSavedEst: fields.tokensSavedEst ?? (tokenScope ? tokensFromBytes(savedBytes) : 0),
+    tokensPreservedEst: fields.tokensPreservedEst ?? (tokenScope ? tokensFromBytes(indexedBytes) : 0),
     estimateMethod: fields.estimateMethod || (hasByteEstimate ? "ceil_bytes_div_4" : "none"),
     estimateConfidence: fields.estimateConfidence ?? (hasByteEstimate ? 1 : 0),
     sourceRef: fields.sourceRef || null,
@@ -184,6 +217,7 @@ function postContextSavingsEvents(events, label = "context-telemetry") {
 module.exports = {
   buildContextSavingsEvent,
   byteLength,
+  deriveCategory,
   postContextSavingsEvents,
   tokensFromBytes,
 };

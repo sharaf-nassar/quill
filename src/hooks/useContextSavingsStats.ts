@@ -41,12 +41,24 @@ function normalizeSummary(
 	summary: ContextSavingsSummary,
 	breakdowns: ContextSavingsBreakdownsResponse | undefined,
 ): ContextSavingsSummary {
+	const sourcesPreserved = summary.sourcesPreserved ?? 0;
+	const sourcesRetrieved = summary.sourcesRetrieved ?? 0;
+	const retentionRatio =
+		summary.retentionRatio ??
+		(sourcesPreserved > 0 ? sourcesRetrieved / sourcesPreserved : 0);
 	return {
 		...summary,
 		routerEventCount:
 			summary.routerEventCount ?? derivedEventCount(breakdowns, isRouterEvent),
 		continuityEventCount:
 			summary.continuityEventCount ?? derivedEventCount(breakdowns, isContinuityEvent),
+		tokensPreserved: summary.tokensPreserved ?? summary.tokensPreservedEst,
+		tokensRetrieved: summary.tokensRetrieved ?? 0,
+		tokensRouting: summary.tokensRouting ?? 0,
+		telemetryEventCount: summary.telemetryEventCount ?? 0,
+		sourcesPreserved,
+		sourcesRetrieved,
+		retentionRatio,
 	};
 }
 

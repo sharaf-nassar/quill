@@ -66,7 +66,7 @@ The SQLite database file path varies by operating system.
 
 ### Schema
 
-The database schema is versioned through migration 16 and includes usage, token, context savings, learning, session indexing, memory optimizer, code, runtime, and metadata tables.
+The database schema is versioned through migration 18 and includes usage, token, context savings, learning, session indexing, memory optimizer, code, runtime, and metadata tables.
 
 #### Usage Tracking
 
@@ -117,9 +117,11 @@ The remote plugin mirrors the same implementation in [[plugin/mcp/tools/context.
 
 The main analytics database stores compact context-savings telemetry from local and remote providers.
 
-- **context_savings_events** — Append-only event records keyed by `event_id`, with provider, session, host, cwd, event type, source, decision, byte counts, approximate token estimates, refs, and bounded metadata.
+- **context_savings_events** — Append-only event records keyed by `event_id`, with provider, session, host, cwd, event type, source, decision, **category**, byte counts, approximate token estimates, refs, and bounded metadata.
 
-The HTTP server accepts batches from context hooks and MCP tools, deduplicates with `INSERT OR IGNORE`, and emits `context-savings-updated`. Analytics queries aggregate by time bucket, provider, event type, source, decision, and cwd for the Context tab while leaving large source content in the MCP context store.
+Every event carries a `category` from a closed taxonomy: `preservation` (content written to the MCP context store and kept out of the LLM transcript), `retrieval` (LLM pulled preserved content back via `quill_get_context_source` or compaction snapshot read), `routing` (text injected into the transcript by router/capture guidance, search snippets, or bounded `quill_execute` results — these are *transcript cost*, not savings), and `telemetry` (hook observations like `capture.event` and `capture.snapshot` that record session activity but neither leave nor enter the transcript). The canonical mapping lives in [[src-tauri/src/context_category.rs#derive_category]] and is mirrored by `deriveCategory` in `src-tauri/claude-integration/scripts/context-telemetry.cjs` and `_derive_category` in [[src-tauri/claude-integration/mcp/tools/context.py]]; producers set `category` explicitly per call site, the server derives it from `(eventType, decision)` only as a fallback for legacy callers via [[src-tauri/src/context_category.rs#derive_category]], and [[src-tauri/src/storage.rs#backfill_context_event_categories]] applies the same mapping to historical rows during migration 18.
+
+The HTTP server accepts batches from context hooks and MCP tools, deduplicates with `INSERT OR IGNORE`, and emits `context-savings-updated`. Analytics queries aggregate by time bucket, provider, category, event type, source, decision, and cwd for the Context tab while leaving large source content in the MCP context store. The shared `CONTEXT_SAVINGS_AGGREGATES_SQL` fragment sums byte and token-indexed/returned columns across every event so breakdown rows still surface router and telemetry traffic, but the saved and preserved token columns inside the same fragment are gated to `category IN ('preservation', 'retrieval')` so capture-hook telemetry contributes zero. The summary path additionally runs `CONTEXT_SAVINGS_CATEGORY_TOTALS_SQL` for the four headline figures (preserved, retrieved, routing, telemetry-event-count) and `CONTEXT_SAVINGS_RETENTION_SQL` to compute `retention_ratio = sources_retrieved / sources_preserved` over distinct `source_ref` values that fall in the active window — both events must be in-window so the ratio stays bounded in `[0, 1]` and reflects engagement rather than pre-window leftovers.
 
 #### Memory Optimizer
 
@@ -142,7 +144,7 @@ Tables for tracking per-turn LLM response latency and caching git commit history
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v16).
+- **schema_version** — Migration version tracking (currently v18).
 
 ## Tauri IPC Commands
 

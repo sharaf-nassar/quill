@@ -446,6 +446,15 @@ export interface ContextSavingsSummary {
 	tokensReturnedEst: number;
 	tokensSavedEst: number;
 	tokensPreservedEst: number;
+	// Category-scoped totals from backend.  Falls back to 0 when backend is
+	// older than schema v18 and has not been redeployed yet.
+	tokensPreserved?: number;
+	tokensRetrieved?: number;
+	tokensRouting?: number;
+	telemetryEventCount?: number;
+	sourcesPreserved?: number;
+	sourcesRetrieved?: number;
+	retentionRatio?: number;
 }
 
 export interface ContextSavingsTimeSeriesPoint {

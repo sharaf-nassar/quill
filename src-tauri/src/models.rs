@@ -170,6 +170,8 @@ pub struct ContextSavingsEventPayload {
     pub source: String,
     pub decision: String,
     #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
     pub reason: Option<String>,
     pub delivered: bool,
     #[serde(default)]
@@ -224,6 +226,30 @@ pub struct ContextSavingsSummary {
     pub tokens_returned_est: i64,
     pub tokens_saved_est: i64,
     pub tokens_preserved_est: i64,
+    /// Tokens written to the context store by `category = 'preservation'` events.
+    #[serde(default)]
+    pub tokens_preserved: i64,
+    /// Tokens pulled back into the transcript via `quill_get_context_source`.
+    #[serde(default)]
+    pub tokens_retrieved: i64,
+    /// Transcript-cost tokens injected by router/capture guidance and search
+    /// snippets — the overhead the preservation feature pays.
+    #[serde(default)]
+    pub tokens_routing: i64,
+    /// Count of telemetry observations (capture.event, capture.snapshot,
+    /// mcp.continuity).  Not a token metric.
+    #[serde(default)]
+    pub telemetry_event_count: i64,
+    /// Distinct `source_ref` values written by preservation events in the range.
+    #[serde(default)]
+    pub sources_preserved: i64,
+    /// Subset of `sources_preserved` that were also retrieved in the range.
+    #[serde(default)]
+    pub sources_retrieved: i64,
+    /// `sources_retrieved / sources_preserved`, clamped to `[0, 1]`. Zero when
+    /// nothing was preserved in-window.
+    #[serde(default)]
+    pub retention_ratio: f64,
 }
 
 #[derive(Serialize, Clone, Debug)]

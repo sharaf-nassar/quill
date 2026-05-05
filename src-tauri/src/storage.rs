@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS context_savings_events (
     event_type TEXT NOT NULL,
     source TEXT NOT NULL,
     decision TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'unknown',
     reason TEXT,
     delivered INTEGER NOT NULL,
     indexed_bytes INTEGER,
@@ -58,7 +59,16 @@ CREATE INDEX IF NOT EXISTS idx_context_savings_event_type_timestamp
     ON context_savings_events(event_type, timestamp);
 CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
     ON context_savings_events(cwd, timestamp);
+CREATE INDEX IF NOT EXISTS idx_context_savings_category_timestamp
+    ON context_savings_events(category, timestamp);
 "#;
+// Aggregate fragment shared by summary, timeseries, and breakdowns.
+//
+// Byte and token-indexed/returned columns sum every event so breakdown rows
+// still surface router/telemetry traffic accurately.  The saved and preserved
+// token columns are filtered to `category IN ('preservation', 'retrieval')`
+// so capture-hook telemetry no longer pollutes the headline metric — rows
+// outside that scope contribute zero to those two columns.
 const CONTEXT_SAVINGS_AGGREGATES_SQL: &str = r#"
 COUNT(*),
 COALESCE(SUM(CASE WHEN delivered != 0 THEN 1 ELSE 0 END), 0),
@@ -68,24 +78,78 @@ COALESCE(SUM(COALESCE(input_bytes, 0)), 0),
 COALESCE(SUM(COALESCE(tokens_indexed_est, (COALESCE(indexed_bytes, 0) + 3) / 4)), 0),
 COALESCE(SUM(COALESCE(tokens_returned_est, (COALESCE(returned_bytes, 0) + 3) / 4)), 0),
 COALESCE(SUM(
-    CASE
-        WHEN tokens_saved_est IS NOT NULL
-            AND NOT (
-                tokens_saved_est = 0
-                AND delivered = 0
-                AND indexed_bytes IS NOT NULL
-                AND returned_bytes IS NULL
-            ) THEN tokens_saved_est
-        WHEN indexed_bytes IS NOT NULL OR input_bytes IS NOT NULL OR returned_bytes IS NOT NULL THEN
-            CASE
-                WHEN COALESCE(indexed_bytes, input_bytes, 0) > COALESCE(returned_bytes, 0) THEN
-                    (COALESCE(indexed_bytes, input_bytes, 0) - COALESCE(returned_bytes, 0) + 3) / 4
-                ELSE 0
-            END
+    CASE WHEN category IN ('preservation', 'retrieval') THEN
+        CASE
+            WHEN tokens_saved_est IS NOT NULL
+                AND NOT (
+                    tokens_saved_est = 0
+                    AND delivered = 0
+                    AND indexed_bytes IS NOT NULL
+                    AND returned_bytes IS NULL
+                ) THEN tokens_saved_est
+            WHEN indexed_bytes IS NOT NULL OR input_bytes IS NOT NULL OR returned_bytes IS NOT NULL THEN
+                CASE
+                    WHEN COALESCE(indexed_bytes, input_bytes, 0) > COALESCE(returned_bytes, 0) THEN
+                        (COALESCE(indexed_bytes, input_bytes, 0) - COALESCE(returned_bytes, 0) + 3) / 4
+                    ELSE 0
+                END
+            ELSE 0
+        END
+    ELSE 0 END
+), 0),
+COALESCE(SUM(
+    CASE WHEN category IN ('preservation', 'retrieval')
+        THEN COALESCE(tokens_preserved_est, (COALESCE(indexed_bytes, 0) + 3) / 4)
+        ELSE 0
+    END
+), 0)
+"#;
+
+// Category-scoped totals returned alongside the legacy aggregate.  Each
+// CASE picks tokens from exactly one category, so the four numbers partition
+// the active range cleanly without double-counting.
+const CONTEXT_SAVINGS_CATEGORY_TOTALS_SQL: &str = r#"
+COALESCE(SUM(
+    CASE WHEN category = 'preservation'
+        THEN COALESCE(tokens_preserved_est, (COALESCE(indexed_bytes, 0) + 3) / 4)
         ELSE 0
     END
 ), 0),
-COALESCE(SUM(COALESCE(tokens_preserved_est, (COALESCE(indexed_bytes, 0) + 3) / 4)), 0)
+COALESCE(SUM(
+    CASE WHEN category = 'retrieval'
+        THEN COALESCE(tokens_returned_est, (COALESCE(returned_bytes, 0) + 3) / 4)
+        ELSE 0
+    END
+), 0),
+COALESCE(SUM(
+    CASE WHEN category = 'routing'
+        THEN COALESCE(tokens_returned_est, (COALESCE(returned_bytes, 0) + 3) / 4)
+        ELSE 0
+    END
+), 0),
+COALESCE(SUM(CASE WHEN category = 'telemetry' THEN 1 ELSE 0 END), 0)
+"#;
+
+// Per-source efficiency: distinct source_refs that were preserved within the
+// window, and the subset that were also retrieved within the window.  We
+// require both events to fall in-window so the ratio stays bounded in [0, 1]
+// and reflects actual engagement, not pre-window leftovers.
+const CONTEXT_SAVINGS_RETENTION_SQL: &str = r#"
+WITH source_activity AS (
+    SELECT source_ref,
+        MAX(CASE WHEN category = 'preservation' THEN 1 ELSE 0 END) AS was_preserved,
+        MAX(CASE WHEN category = 'retrieval'   THEN 1 ELSE 0 END) AS was_retrieved
+    FROM context_savings_events
+    WHERE timestamp >= ?1
+      AND source_ref IS NOT NULL
+      AND source_ref != ''
+      AND category IN ('preservation', 'retrieval')
+    GROUP BY source_ref
+)
+SELECT
+    COALESCE(SUM(was_preserved), 0),
+    COALESCE(SUM(CASE WHEN was_preserved = 1 AND was_retrieved = 1 THEN 1 ELSE 0 END), 0)
+FROM source_activity
 "#;
 
 fn insert_tool_actions(
@@ -450,7 +514,63 @@ fn context_savings_summary_from_row_at(
         tokens_returned_est: row.get(offset + 6)?,
         tokens_saved_est: row.get(offset + 7)?,
         tokens_preserved_est: row.get(offset + 8)?,
+        // New category-scoped fields default to zero; populated by the summary
+        // path via [`apply_category_totals`] and [`apply_retention_metrics`].
+        tokens_preserved: 0,
+        tokens_retrieved: 0,
+        tokens_routing: 0,
+        telemetry_event_count: 0,
+        sources_preserved: 0,
+        sources_retrieved: 0,
+        retention_ratio: 0.0,
     })
+}
+
+fn apply_category_totals(
+    summary: &mut ContextSavingsSummary,
+    conn: &Connection,
+    from: &str,
+) -> Result<(), String> {
+    let sql = format!(
+        "SELECT {CONTEXT_SAVINGS_CATEGORY_TOTALS_SQL}
+         FROM context_savings_events
+         WHERE timestamp >= ?1"
+    );
+    let (preserved, retrieved, routing, telemetry) = conn
+        .query_row(&sql, params![from], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| format!("Query context savings category totals error: {e}"))?;
+    summary.tokens_preserved = preserved;
+    summary.tokens_retrieved = retrieved;
+    summary.tokens_routing = routing;
+    summary.telemetry_event_count = telemetry;
+    Ok(())
+}
+
+fn apply_retention_metrics(
+    summary: &mut ContextSavingsSummary,
+    conn: &Connection,
+    from: &str,
+) -> Result<(), String> {
+    let (preserved, retrieved) = conn
+        .query_row(CONTEXT_SAVINGS_RETENTION_SQL, params![from], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|e| format!("Query context savings retention error: {e}"))?;
+    summary.sources_preserved = preserved;
+    summary.sources_retrieved = retrieved;
+    summary.retention_ratio = if preserved > 0 {
+        (retrieved as f64 / preserved as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Ok(())
 }
 
 fn context_savings_breakdown_from_row(
@@ -484,6 +604,37 @@ fn parse_context_savings_metadata(raw: Option<String>) -> Option<serde_json::Val
 fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
     conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 0"))
         .is_ok()
+}
+
+fn backfill_context_event_categories(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, event_type, decision FROM context_savings_events
+             WHERE category = 'unknown' OR category IS NULL OR category = ''",
+        )
+        .map_err(|e| format!("Prepare category backfill scan error: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| format!("Query category backfill rows error: {e}"))?;
+
+    let mut update = conn
+        .prepare("UPDATE context_savings_events SET category = ?1 WHERE id = ?2")
+        .map_err(|e| format!("Prepare category update error: {e}"))?;
+    for row in rows {
+        let (id, event_type, decision) =
+            row.map_err(|e| format!("Read category backfill row error: {e}"))?;
+        let category = crate::context_category::derive_category(&event_type, &decision);
+        update
+            .execute(params![category, id])
+            .map_err(|e| format!("Update category for event {id}: {e}"))?;
+    }
+    Ok(())
 }
 
 fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
@@ -690,6 +841,7 @@ impl Storage {
                 event_type TEXT NOT NULL,
                 source TEXT NOT NULL,
                 decision TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT 'unknown',
                 reason TEXT,
                 delivered INTEGER NOT NULL,
                 indexed_bytes INTEGER,
@@ -715,7 +867,9 @@ impl Storage {
             CREATE INDEX IF NOT EXISTS idx_context_savings_event_type_timestamp
                 ON context_savings_events(event_type, timestamp);
             CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
-                ON context_savings_events(cwd, timestamp);"#,
+                ON context_savings_events(cwd, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_context_savings_category_timestamp
+                ON context_savings_events(category, timestamp);"#,
         )
         .map_err(|e| format!("Failed to create tables: {e}"))?;
 
@@ -1331,6 +1485,29 @@ impl Storage {
 
             conn.execute("INSERT INTO schema_version (version) VALUES (17)", [])
                 .map_err(|e| format!("Failed to record migration 17: {e}"))?;
+        }
+
+        if current_version < 18 {
+            if !table_has_column(&conn, "context_savings_events", "category") {
+                conn.execute(
+                    "ALTER TABLE context_savings_events
+                         ADD COLUMN category TEXT NOT NULL DEFAULT 'unknown'",
+                    [],
+                )
+                .map_err(|e| format!("Migration 18 (add category column): {e}"))?;
+            }
+
+            backfill_context_event_categories(&conn)?;
+
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_context_savings_category_timestamp
+                     ON context_savings_events(category, timestamp)",
+                [],
+            )
+            .map_err(|e| format!("Migration 18 (category index): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (18)", [])
+                .map_err(|e| format!("Failed to record migration 18: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -1975,6 +2152,7 @@ impl Storage {
                          event_type,
                          source,
                          decision,
+                         category,
                          reason,
                          delivered,
                          indexed_bytes,
@@ -1990,7 +2168,7 @@ impl Storage {
                          snapshot_ref,
                          metadata_json
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
                 )
                 .map_err(|e| format!("Prepare context savings insert error: {e}"))?;
 
@@ -2001,6 +2179,16 @@ impl Storage {
                     .map(serde_json::to_string)
                     .transpose()
                     .map_err(|e| format!("Serialize context savings metadata error: {e}"))?;
+
+                let category = event
+                    .category
+                    .as_deref()
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        crate::context_category::derive_category(&event.event_type, &event.decision)
+                            .to_string()
+                    });
 
                 let changed = stmt
                     .execute(params![
@@ -2014,6 +2202,7 @@ impl Storage {
                         event.event_type,
                         event.source,
                         event.decision,
+                        category,
                         event.reason.as_deref(),
                         event.delivered as i32,
                         event.indexed_bytes,
@@ -2060,11 +2249,13 @@ impl Storage {
              FROM context_savings_events
              WHERE timestamp >= ?1"
         );
-        let summary = conn
+        let mut summary = conn
             .query_row(&summary_sql, params![from], |row| {
                 context_savings_summary_from_row_at(row, 0)
             })
             .map_err(|e| format!("Query context savings summary error: {e}"))?;
+        apply_category_totals(&mut summary, &conn, &from)?;
+        apply_retention_metrics(&mut summary, &conn, &from)?;
 
         let bucket_expr = context_savings_bucket_expr(range);
         let timeseries_sql = format!(

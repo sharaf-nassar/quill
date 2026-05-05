@@ -125,8 +125,25 @@ function primaryBytes(event: ContextSavingsEvent): {
 	return { value: null, dir: "·" };
 }
 
-function totalEstimated(summary: ContextSavingsSummary): number {
-	return summary.tokensSavedEst;
+function preservedTokens(summary: ContextSavingsSummary): number {
+	return summary.tokensPreserved ?? summary.tokensPreservedEst;
+}
+
+function retrievedTokens(summary: ContextSavingsSummary): number {
+	return summary.tokensRetrieved ?? 0;
+}
+
+function routingTokens(summary: ContextSavingsSummary): number {
+	return summary.tokensRouting ?? 0;
+}
+
+function formatRetention(summary: ContextSavingsSummary): string {
+	const sourcesPreserved = summary.sourcesPreserved ?? 0;
+	const sourcesRetrieved = summary.sourcesRetrieved ?? 0;
+	if (sourcesPreserved === 0) return "no sources yet";
+	const ratio = summary.retentionRatio ?? sourcesRetrieved / sourcesPreserved;
+	const pct = Math.round(ratio * 100);
+	return `${pct}% reused · ${formatCompact(sourcesRetrieved)}/${formatCompact(sourcesPreserved)} sources`;
 }
 
 function ContextStat({ label, value, subtitle, accent }: ContextStatProps) {
@@ -148,10 +165,13 @@ function ContextStat({ label, value, subtitle, accent }: ContextStatProps) {
 
 function ContextTrend({ points }: { points: ContextSavingsTimeSeriesPoint[] }) {
 	const visiblePoints = points.slice(-36);
+	// Preserved is the superset; Saved is the in-window subset that has not
+	// yet been retrieved.  Use max(preserved, returned) as the bar scale so
+	// retrieval-heavy buckets stay visible alongside write-heavy ones.
 	const maxValue = Math.max(
 		1,
 		...visiblePoints.map(
-			(point) => point.tokensSavedEst + point.tokensPreservedEst,
+			(point) => Math.max(point.tokensPreservedEst, point.tokensReturnedEst),
 		),
 	);
 
@@ -164,18 +184,24 @@ function ContextTrend({ points }: { points: ContextSavingsTimeSeriesPoint[] }) {
 			<div className="context-section-header">
 				<span className="section-title">Trend</span>
 				<div className="context-trend-legend">
-					<span><i className="context-legend-saved" />Saved</span>
 					<span><i className="context-legend-preserved" />Preserved</span>
+					<span><i className="context-legend-saved" />Still saved</span>
 					<span><i className="context-legend-returned" />Returned</span>
 				</div>
 			</div>
 			<div className="context-trend-bars" aria-label="Context savings trend">
 				{visiblePoints.map((point) => {
-					const saved = point.tokensSavedEst;
 					const preserved = point.tokensPreservedEst;
+					const saved = Math.min(point.tokensSavedEst, preserved);
+					const returnedFromPreserved = Math.max(0, preserved - saved);
 					const returned = point.tokensReturnedEst;
-					const savedHeight = Math.max(2, (saved / maxValue) * 100);
 					const preservedHeight = Math.max(0, (preserved / maxValue) * 100);
+					const savedHeight = preserved > 0
+						? (saved / preserved) * preservedHeight
+						: 0;
+					const returnedFromPreservedHeight = preserved > 0
+						? (returnedFromPreserved / preserved) * preservedHeight
+						: 0;
 					const returnedHeight = Math.max(2, (returned / maxValue) * 100);
 					const key = `${point.timestamp}-${point.eventCount}`;
 
@@ -183,12 +209,12 @@ function ContextTrend({ points }: { points: ContextSavingsTimeSeriesPoint[] }) {
 						<div
 							key={key}
 							className="context-trend-column"
-							title={`${formatTime(point.timestamp)}: ${formatTokens(saved + preserved)} estimated, ${formatTokens(returned)} returned`}
+							title={`${formatTime(point.timestamp)}: ${formatTokens(preserved)} preserved (${formatTokens(saved)} still saved), ${formatTokens(returned)} returned`}
 						>
 							<div className="context-trend-stack">
 								<div
 									className="context-trend-segment context-trend-segment--preserved"
-									style={{ height: `${preservedHeight}%` }}
+									style={{ height: `${returnedFromPreservedHeight}%` }}
 								/>
 								<div
 									className="context-trend-segment context-trend-segment--saved"
@@ -397,27 +423,29 @@ function ContextSavingsTab({ range, onRangeChange }: ContextSavingsTabProps) {
 				<>
 					<div className="context-stats-strip">
 						<ContextStat
-							label="Saved"
-							value={formatTokens(totalEstimated(summary))}
-							subtitle={`${formatTokens(summary.tokensPreservedEst)} preserved`}
+							label="Preserved"
+							value={formatTokens(preservedTokens(summary))}
+							subtitle={formatRetention(summary)}
 							accent="#34d399"
 						/>
 						<ContextStat
-							label="Indexed"
-							value={formatTokens(summary.tokensIndexedEst)}
-							subtitle={formatBytes(summary.indexedBytes)}
+							label="Retrieved"
+							value={formatTokens(retrievedTokens(summary))}
+							subtitle={`${formatBytes(summary.returnedBytes)} returned`}
 							accent="#58a6ff"
 						/>
 						<ContextStat
-							label="Returned"
-							value={formatTokens(summary.tokensReturnedEst)}
-							subtitle={formatBytes(summary.returnedBytes)}
+							label="Routing cost"
+							value={formatTokens(routingTokens(summary))}
+							subtitle={`${formatCompact(summary.routerEventCount)} guidance events`}
 							accent="#fbbf24"
 						/>
 						<ContextStat
-							label="Routing"
-							value={`${formatCompact(summary.routerEventCount)} / ${formatCompact(summary.continuityEventCount)}`}
-							subtitle={`${formatCompact(summary.eventCount)} events`}
+							label="Telemetry"
+							value={formatCompact(
+								summary.telemetryEventCount ?? summary.continuityEventCount,
+							)}
+							subtitle={`${formatCompact(summary.eventCount)} total events`}
 							accent="#a78bfa"
 						/>
 					</div>

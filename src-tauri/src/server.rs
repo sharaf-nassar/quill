@@ -749,6 +749,13 @@ fn validate_context_savings_event(event: &ContextSavingsEventPayload) -> Result<
     if event.decision.is_empty() || event.decision.len() > MAX_STRING_LEN {
         return Err("Invalid decision".to_string());
     }
+    if let Some(category) = &event.category
+        && !category.is_empty()
+        && !crate::context_category::is_known(category)
+        && category != crate::context_category::UNKNOWN
+    {
+        return Err(format!("Invalid category: {category}"));
+    }
     validate_context_optional_string(&event.reason, MAX_CONTEXT_REASON_LEN, "reason")?;
     validate_context_counter(event.indexed_bytes, "indexedBytes")?;
     validate_context_counter(event.returned_bytes, "returnedBytes")?;

@@ -154,11 +154,36 @@ def _context_savings_event_id(event: dict) -> str:
     return "ctx_" + hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:32]
 
 
+# Canonical taxonomy: keep in sync with src-tauri/src/context_category.rs and
+# src-tauri/claude-integration/scripts/context-telemetry.cjs.
+def _derive_category(event_type: str, decision: str) -> str:
+    if event_type in ("mcp.index", "mcp.fetch"):
+        return "preservation"
+    if event_type == "mcp.execute":
+        return "preservation" if decision == "indexed" else "routing"
+    if event_type == "mcp.search":
+        return "routing"
+    if event_type == "mcp.source_read":
+        return "retrieval"
+    if event_type == "mcp.snapshot":
+        return "preservation" if decision == "created" else "retrieval"
+    if event_type == "mcp.continuity":
+        return "telemetry"
+    if event_type in ("router.guidance", "router.denial"):
+        return "routing"
+    if event_type in ("capture.event", "capture.snapshot"):
+        return "telemetry"
+    if event_type == "capture.guidance":
+        return "routing"
+    return "unknown"
+
+
 def _context_savings_event(
     *,
     event_type: str,
     source: str,
     decision: str | None = None,
+    category: str | None = None,
     reason: str | None = None,
     delivered: bool | None = None,
     indexed_bytes: int | None = None,
@@ -176,12 +201,16 @@ def _context_savings_event(
     returned_bytes = _nullable_int(returned_bytes)
     input_bytes = _nullable_int(input_bytes)
     has_byte_estimate = indexed_bytes is not None or returned_bytes is not None or input_bytes is not None
-    # Saved = bytes Quill preserved but did NOT return to the LLM transcript.
-    # Prefer indexed_bytes (what Quill actually keeps) over input_bytes, and treat
-    # a missing returned_bytes as 0 so write-only events still attribute savings.
+    decision_value = decision or "recorded"
+    resolved_category = category or _derive_category(event_type, decision_value)
+    # Only preservation/retrieval events default tokensSaved/tokensPreserved from indexed_bytes.
+    # Routing and telemetry events default to 0 unless the caller passes explicit values.
+    token_scope = resolved_category in ("preservation", "retrieval")
     saved_baseline = indexed_bytes if indexed_bytes is not None else input_bytes
     saved_bytes = (
-        max(0, saved_baseline - (returned_bytes or 0)) if saved_baseline is not None else None
+        max(0, saved_baseline - (returned_bytes or 0))
+        if token_scope and saved_baseline is not None
+        else None
     )
 
     event = {
@@ -194,7 +223,8 @@ def _context_savings_event(
         "timestamp": _now(),
         "eventType": event_type,
         "source": source or "context",
-        "decision": decision or "recorded",
+        "decision": decision_value,
+        "category": resolved_category,
         "reason": reason,
         "delivered": True if delivered is None else delivered,
         "indexedBytes": indexed_bytes,
@@ -202,9 +232,15 @@ def _context_savings_event(
         "inputBytes": input_bytes,
         "tokensIndexedEst": _tokens_from_bytes(indexed_bytes),
         "tokensReturnedEst": _tokens_from_bytes(returned_bytes),
-        "tokensSavedEst": tokens_saved_est if tokens_saved_est is not None else _tokens_from_bytes(saved_bytes),
+        "tokensSavedEst": (
+            tokens_saved_est
+            if tokens_saved_est is not None
+            else (_tokens_from_bytes(saved_bytes) if token_scope else 0)
+        ),
         "tokensPreservedEst": (
-            tokens_preserved_est if tokens_preserved_est is not None else _tokens_from_bytes(indexed_bytes)
+            tokens_preserved_est
+            if tokens_preserved_est is not None
+            else (_tokens_from_bytes(indexed_bytes) if token_scope else 0)
         ),
         "estimateMethod": "ceil_bytes_div_4" if has_byte_estimate else "none",
         "estimateConfidence": 1 if has_byte_estimate else 0,
@@ -220,6 +256,7 @@ def _context_savings_summary(event: dict) -> dict:
     keys = (
         "eventId",
         "eventType",
+        "category",
         "indexedBytes",
         "returnedBytes",
         "inputBytes",
@@ -284,6 +321,7 @@ def _attach_context_savings(response: dict, **event_kwargs: Any) -> dict:
         if os.environ.get("QUILL_DEBUG"):
             print(f"context-savings event error: {err}", file=sys.stderr)
         return response
+    token_scope = event.get("category") in ("preservation", "retrieval")
     for _ in range(4):
         response["context_savings"] = _context_savings_summary(event)
         returned_bytes = _json_bytes(response)
@@ -291,11 +329,18 @@ def _attach_context_savings(response: dict, **event_kwargs: Any) -> dict:
             break
         event["returnedBytes"] = returned_bytes
         event["tokensReturnedEst"] = _tokens_from_bytes(returned_bytes)
-        baseline = event.get("indexedBytes") if event.get("indexedBytes") is not None else event.get("inputBytes")
-        if baseline is not None:
-            event["tokensSavedEst"] = _tokens_from_bytes(max(0, baseline - returned_bytes))
-        else:
-            event["tokensSavedEst"] = 0
+        # Recompute tokensSavedEst only when the event represents preservation
+        # or retrieval; for routing and telemetry the saved metric is always 0.
+        if token_scope:
+            baseline = (
+                event.get("indexedBytes")
+                if event.get("indexedBytes") is not None
+                else event.get("inputBytes")
+            )
+            if baseline is not None:
+                event["tokensSavedEst"] = _tokens_from_bytes(max(0, baseline - returned_bytes))
+            else:
+                event["tokensSavedEst"] = 0
         event["estimateMethod"] = "ceil_bytes_div_4"
         event["estimateConfidence"] = 1
     response["context_savings"] = _context_savings_summary(event)

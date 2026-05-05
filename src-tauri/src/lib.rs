@@ -5,6 +5,7 @@ mod brevity;
 mod claude_setup;
 mod compress_prose;
 mod config;
+mod context_category;
 mod fetcher;
 mod git_analysis;
 mod indicator;
