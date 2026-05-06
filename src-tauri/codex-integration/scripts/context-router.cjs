@@ -4,11 +4,16 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const {
-  buildContextSavingsEvent,
-  byteLength,
-  postContextSavingsEvents,
-} = require("./context-telemetry.cjs");
+let telemetry = {};
+try {
+  telemetry = require("./context-telemetry.cjs");
+} catch (_) {
+  telemetry = {};
+}
+
+const buildContextSavingsEvent = telemetry.buildContextSavingsEvent || (() => null);
+const postContextSavingsEvents = telemetry.postContextSavingsEvents || (() => {});
+const byteLength = telemetry.byteLength || fallbackByteLength;
 
 const TOOL_ALIASES = {
   shell: "Bash",
@@ -37,8 +42,18 @@ const CONTEXT_TOOLS = [
   "mcp__quill__search_history",
 ];
 
+const MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 function homeDir() {
   return process.env.HOME || process.env.USERPROFILE || os.homedir();
+}
+
+function fallbackByteLength(value) {
+  if (value === undefined || value === null) return 0;
+  if (Buffer.isBuffer(value)) return value.length;
+  if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
 function inferProvider(input) {
@@ -60,6 +75,50 @@ function markerDir(provider, sessionId) {
     "markers",
     `${safeName(provider)}-${safeName(sessionId || process.ppid)}`,
   );
+}
+
+function markerRoot() {
+  return path.join(homeDir(), ".config", "quill", "context", "markers");
+}
+
+function markerCleanupStatePath() {
+  return path.join(markerRoot(), ".cleanup-state.json");
+}
+
+function shouldCleanupMarkers() {
+  const statePath = markerCleanupStatePath();
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const lastCleanup = Date.parse(state.lastCleanup || 0);
+    return !Number.isFinite(lastCleanup) || Date.now() - lastCleanup > CLEANUP_INTERVAL_MS;
+  } catch (_) {
+    return true;
+  }
+}
+
+function writeMarkerCleanupState() {
+  const statePath = markerCleanupStatePath();
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify({ lastCleanup: new Date().toISOString() }), "utf8");
+}
+
+function maybeCleanupMarkers() {
+  if (!shouldCleanupMarkers()) return;
+  const root = markerRoot();
+  const cutoffMs = Date.now() - MARKER_RETENTION_MS;
+  try {
+    if (fs.existsSync(root)) {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const entryPath = path.join(root, entry.name);
+        const stat = fs.statSync(entryPath);
+        if (stat.mtimeMs < cutoffMs) fs.rmSync(entryPath, { recursive: true, force: true });
+      }
+    }
+    writeMarkerCleanupState();
+  } catch (_) {
+    // Cleanup is opportunistic; routing must keep working.
+  }
 }
 
 function once(provider, sessionId, key) {
@@ -233,6 +292,7 @@ function additionalContext(input, provider, sessionId, tool, message, guidanceTy
 
 function route(input) {
   if (!input || input.hook_event_name !== "PreToolUse") return null;
+  maybeCleanupMarkers();
 
   const provider = inferProvider(input);
   const sessionId = input.session_id || input.conversation_id || input.id || process.ppid;

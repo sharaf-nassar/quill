@@ -1,0 +1,425 @@
+/* ─── Settings window ─── */
+.settings-window {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: #121216;
+  color: #d4d4d4;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+}
+
+.settings-window-titlebar {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 4px 10px;
+  background: #121216;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.settings-window-title {
+  flex: 1;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+
+.settings-window-close {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 4px 8px;
+  min-width: 28px;
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.settings-window-close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.7);
+}
+
+/* ─── Tabs ─── */
+.settings-tabs {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 2px;
+  padding: 8px 12px 0;
+  background: #121216;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.settings-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: rgba(255, 255, 255, 0.55);
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+
+.settings-tab:hover {
+  color: #d4d4d4;
+}
+
+.settings-tab--active {
+  color: #34d399;
+  border-bottom-color: #34d399;
+}
+
+/* ─── Content area ─── */
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px 24px;
+}
+
+/* Custom-styled scrollbar mirrors the Sessions / Plugins windows.
+ * On Linux WebKitGTK, the default native scrollbar's mouse capture
+ * does not release cleanly on transparent borderless Tauri windows
+ * — the thumb sticks to the cursor after mouseup. Styling
+ * ::-webkit-scrollbar promotes the scrollbar to a DOM element with
+ * regular event handling, which avoids the issue. */
+.settings-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+.settings-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-content::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+}
+
+.settings-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.settings-section-header {
+  margin-top: 16px;
+  margin-bottom: 4px;
+  padding: 0 4px;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+}
+
+.settings-section-header:first-child {
+  margin-top: 0;
+}
+
+/* ─── Setting row ─── */
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  min-height: 40px;
+}
+
+.settings-row:last-child {
+  border-bottom: none;
+}
+
+.settings-row-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #e4e4e4;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.settings-row-badge {
+  display: inline-block;
+  padding: 1px 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.6);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.settings-row-description {
+  margin-top: 2px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.settings-row-control {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ─── Toggle pill (shared with provider menu visual language) ─── */
+.settings-toggle {
+  min-width: 48px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+.settings-toggle:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.16);
+  color: #d4d4d4;
+}
+
+.settings-toggle:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.settings-toggle--on {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.32);
+}
+
+.settings-toggle--on:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.18);
+  border-color: rgba(52, 211, 153, 0.5);
+  color: #6ee7b7;
+}
+
+.settings-toggle--na {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.08);
+  border-color: rgba(248, 113, 113, 0.22);
+}
+
+.settings-toggle--setup {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border-color: rgba(251, 191, 36, 0.32);
+}
+
+.settings-toggle--setup:hover:not(:disabled) {
+  background: rgba(251, 191, 36, 0.18);
+  border-color: rgba(251, 191, 36, 0.5);
+}
+
+.settings-toggle--busy {
+  color: #60a5fa;
+  background: rgba(96, 165, 250, 0.1);
+  border-color: rgba(96, 165, 250, 0.28);
+  animation: settings-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes settings-pulse {
+  0%, 100% { opacity: 0.7; }
+  50% { opacity: 1; }
+}
+
+/* ─── Segmented control (Layout / Time mode / Trigger mode) ─── */
+.settings-segmented {
+  display: inline-flex;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.settings-segment {
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.55);
+  padding: 4px 10px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: capitalize;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.settings-segment + .settings-segment {
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.settings-segment:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: #d4d4d4;
+}
+
+.settings-segment--active {
+  background: rgba(52, 211, 153, 0.14);
+  color: #34d399;
+}
+
+/* ─── Inputs / selects ─── */
+.settings-select,
+.settings-input {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: #d4d4d4;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-family: inherit;
+}
+
+.settings-select {
+  min-width: 120px;
+}
+
+.settings-input--narrow {
+  width: 80px;
+}
+
+.settings-input:focus,
+.settings-select:focus {
+  outline: none;
+  border-color: rgba(52, 211, 153, 0.5);
+}
+
+.settings-input:disabled,
+.settings-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ─── Buttons ─── */
+.settings-button {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  color: #d4d4d4;
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+
+.settings-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.settings-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.settings-button--primary {
+  color: #34d399;
+  background: rgba(52, 211, 153, 0.12);
+  border-color: rgba(52, 211, 153, 0.32);
+}
+
+.settings-button--primary:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.18);
+  border-color: rgba(52, 211, 153, 0.5);
+}
+
+.settings-button--danger {
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.32);
+}
+
+.settings-button--danger:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.18);
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+/* ─── Inline form (MiniMax key edit) ─── */
+.settings-inline-form {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-inline-form .settings-input {
+  width: 180px;
+}
+
+/* ─── Prose blocks (descriptive copy in tabs) ─── */
+.settings-prose {
+  margin: 12px 4px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 4px;
+}
+
+.settings-prose p {
+  margin: 0;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-prose p + p {
+  margin-top: 6px;
+}
+
+.settings-prose code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #d4d4d4;
+}
+
+/* ─── Empty / error states ─── */
+.settings-empty {
+  padding: 16px 4px;
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.settings-empty--error {
+  color: #f87171;
+}

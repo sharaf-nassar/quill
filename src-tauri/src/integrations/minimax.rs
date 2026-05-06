@@ -16,7 +16,6 @@ pub fn detect() -> Result<ProviderStatus, String> {
         user_has_made_choice: false,
         last_error: None,
         last_verified_at: Some(Utc::now().to_rfc3339()),
-        brevity_enabled: false,
         last_detection_attempts: Vec::new(),
     })
 }

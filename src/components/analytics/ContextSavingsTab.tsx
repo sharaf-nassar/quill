@@ -27,6 +27,7 @@ interface ContextStatProps {
 	value: string;
 	subtitle: string;
 	accent: string;
+	description: string;
 }
 
 function labelize(value: string | null | undefined): string {
@@ -113,6 +114,23 @@ function primaryBytes(event: ContextSavingsEvent): {
 	value: number | null;
 	dir: "→" | "←" | "·";
 } {
+	if (
+		(event.category === "retrieval" || event.category === "routing") &&
+		event.returnedBytes &&
+		event.returnedBytes > 0
+	) {
+		return {
+			value: event.returnedBytes,
+			dir: event.category === "retrieval" ? "←" : "·",
+		};
+	}
+	if (
+		event.category === "telemetry" &&
+		event.inputBytes &&
+		event.inputBytes > 0
+	) {
+		return { value: event.inputBytes, dir: "·" };
+	}
 	if (event.indexedBytes && event.indexedBytes > 0) {
 		return { value: event.indexedBytes, dir: "→" };
 	}
@@ -123,6 +141,18 @@ function primaryBytes(event: ContextSavingsEvent): {
 		return { value: event.inputBytes, dir: "·" };
 	}
 	return { value: null, dir: "·" };
+}
+
+function eventTokenEstimate(event: ContextSavingsEvent): number | null {
+	switch (event.category) {
+		case "preservation":
+			return event.tokensPreservedEst ?? event.tokensIndexedEst ?? null;
+		case "retrieval":
+		case "routing":
+			return event.tokensReturnedEst ?? null;
+		default:
+			return null;
+	}
 }
 
 function preservedTokens(summary: ContextSavingsSummary): number {
@@ -156,9 +186,22 @@ function formatRetention(summary: ContextSavingsSummary): string {
 	return `${pct}% reused · ${formatCompact(sourcesRetrieved)}/${formatCompact(sourcesPreserved)} sources`;
 }
 
-function ContextStat({ label, value, subtitle, accent }: ContextStatProps) {
+function ContextStat({
+	label,
+	value,
+	subtitle,
+	accent,
+	description,
+}: ContextStatProps) {
 	return (
 		<div className="context-stat">
+			<button
+				type="button"
+				className="context-stat-help"
+				aria-label={`About ${label}: ${description}`}
+			>
+				?
+			</button>
 			<div className="context-stat-label">
 				<span
 					className="context-stat-swatch"
@@ -169,6 +212,9 @@ function ContextStat({ label, value, subtitle, accent }: ContextStatProps) {
 			</div>
 			<div className="context-stat-value">{value}</div>
 			<div className="context-stat-subtitle">{subtitle}</div>
+			<span className="context-stat-tooltip" role="tooltip" aria-hidden="true">
+				{description}
+			</span>
 		</div>
 	);
 }
@@ -332,8 +378,7 @@ function RecentEventFeed({ events }: { events: ContextSavingsEvent[] }) {
 			</div>
 			<div className="context-event-feed">
 				{events.map((event) => {
-					const estimate =
-						(event.tokensSavedEst ?? 0) + (event.tokensPreservedEst ?? 0);
+					const estimate = eventTokenEstimate(event);
 					const reason = event.reason ?? event.decision ?? event.eventType;
 					const ref = event.sourceRef ?? event.snapshotRef;
 					const accent = categoryColor(event.eventType);
@@ -437,18 +482,21 @@ function ContextSavingsTab({ range, onRangeChange }: ContextSavingsTabProps) {
 							value={formatTokens(preservedTokens(summary))}
 							subtitle={formatRetention(summary)}
 							accent="#34d399"
+							description="Tokens written to local Quill storage instead of staying in the live LLM transcript. The subtitle shows source retention — how many indexed sources were later read back at least once."
 						/>
 						<ContextStat
 							label="Retrieved"
 							value={formatTokens(retrievedTokens(summary))}
 							subtitle={`${formatBytes(summary.returnedBytes)} returned`}
 							accent="#58a6ff"
+							description="Tokens read back from the context store on demand via quill_get_context_source. Bytes returned reflects the raw payload size of those reads."
 						/>
 						<ContextStat
 							label="Routing cost"
 							value={formatTokens(routingTokens(summary))}
 							subtitle={`${formatCompact(routingEventCount(summary))} guidance events`}
 							accent="#fbbf24"
+							description="Transcript tokens spent on router nudges, capture guidance, search snippets, and bounded MCP results — the overhead Quill adds to keep larger payloads out of the live transcript."
 						/>
 						<ContextStat
 							label="Telemetry"
@@ -457,6 +505,7 @@ function ContextSavingsTab({ range, onRangeChange }: ContextSavingsTabProps) {
 							)}
 							subtitle={`${formatCompact(summary.eventCount)} total events`}
 							accent="#a78bfa"
+							description="Hook observation events that record local-only metadata (event type, byte counts, refs — never the actual content). The subtitle counts every context event across all categories combined."
 						/>
 					</div>
 

@@ -11,6 +11,19 @@ use crate::storage::Storage;
 
 const DEBOUNCE_MS: u64 = 300;
 
+// Read once when the watcher starts; runtime toggles take effect on the next
+// app launch. A live disable would require tearing down the OS handle held by
+// the `notify` crate, which is more complex than the user-visible behavior
+// difference warrants. Disabling stops the watcher after restart.
+fn rule_watcher_enabled(storage: &Storage) -> bool {
+    storage
+        .get_setting("rule_watcher.enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(true)
+}
+
 fn rule_directories() -> Vec<PathBuf> {
     vec![
         learned_rules_dir_for_scope(&[IntegrationProvider::Claude]),
@@ -34,6 +47,10 @@ fn is_relevant_event(kind: &EventKind) -> bool {
 }
 
 pub fn start(app: AppHandle, storage: &'static Storage) {
+    if !rule_watcher_enabled(storage) {
+        log::info!("Rule watcher disabled by user setting; skipping start");
+        return;
+    }
     std::thread::spawn(move || {
         if let Err(e) = run_watcher(app, storage) {
             log::warn!("Rule watcher failed to start, falling back to polling: {e}");

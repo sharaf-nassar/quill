@@ -519,7 +519,13 @@ impl SessionIndex {
                 .filter(|project| !project.is_empty())
                 .unwrap_or_else(|| discovered.default_project.clone());
 
-            if known_mtime.is_some() && !extracted.session_id.is_empty() {
+            // Always delete-then-reinsert per session, even on first sight of a
+            // file. Hook-driven /sessions/notify may have already indexed this
+            // session before the mtime sweep first sees the file; gating delete
+            // on known_mtime would let those docs stack up on top of fresh
+            // inserts. delete_query is a no-op when no docs match, so this is
+            // safe for genuinely new files.
+            if !extracted.session_id.is_empty() {
                 if let Err(e) = self.delete_session_docs_with_writer(
                     &writer,
                     discovered.provider,
@@ -623,7 +629,6 @@ impl SessionIndex {
         let searcher = self.searcher();
         let f = &self.fields;
 
-        // Build query parser targeting content, tools_used, files_modified, and new fields
         let mut parser = QueryParser::for_index(
             &self.index,
             vec![
@@ -637,11 +642,27 @@ impl SessionIndex {
             ],
         );
         parser.set_conjunction_by_default();
+        // Boost concrete artifact fields so they outrank prose noise; equal
+        // weighting plus BM25 length-normalization otherwise lets long fields
+        // smother short selective ones. display_text is a derived superset of
+        // content+code_changes+commands_run+tool_details — kept in the field
+        // set with a tiny boost only so SnippetGenerator (which filters terms
+        // by field) can still highlight matches against it.
+        parser.set_field_boost(f.files_modified, 4.0);
+        parser.set_field_boost(f.code_changes, 2.5);
+        parser.set_field_boost(f.commands_run, 2.5);
+        parser.set_field_boost(f.tool_details, 1.5);
+        parser.set_field_boost(f.content, 1.0);
+        parser.set_field_boost(f.tools_used, 0.5);
+        parser.set_field_boost(f.display_text, 0.1);
 
         let text_query: Box<dyn tantivy::query::Query> = if query.trim().is_empty() {
             Box::new(tantivy::query::AllQuery)
         } else {
-            let (parsed, _errors) = parser.parse_query_lenient(query);
+            let (parsed, errors) = parser.parse_query_lenient(query);
+            if !errors.is_empty() {
+                log::debug!("Session search parse errors for {query:?}: {errors:?}");
+            }
             parsed
         };
 
@@ -1997,7 +2018,7 @@ pub async fn get_search_facets(
 }
 
 #[tauri::command]
-pub async fn rebuild_search_index(
+pub async fn sync_search_index(
     app: tauri::AppHandle,
     state: tauri::State<'_, SessionIndexState>,
 ) -> Result<usize, String> {

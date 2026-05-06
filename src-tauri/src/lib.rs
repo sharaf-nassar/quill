@@ -27,9 +27,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
     ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
-    LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, SessionBreakdown,
-    SessionCodeStats, SessionRef, SessionStats, StatusIndicatorState, TokenDataPoint, TokenStats,
-    ToolCount, UsageBucket, UsageData, UsageProviderError,
+    LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, RuntimeSettings,
+    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, StatusIndicatorState,
+    TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -50,11 +50,27 @@ static USAGE_CACHE: OnceLock<Mutex<Option<UsageCacheEntry>>> = OnceLock::new();
 static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static USAGE_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
+// Holds the tray's "Always on Top" CheckMenuItem so the Settings window can
+// keep the tray checkmark and the window state in sync after a toggle.
+static TRAY_ON_TOP_ITEM: OnceLock<CheckMenuItem<tauri::Wry>> = OnceLock::new();
 const LIVE_USAGE_REFRESH_INTERVAL_SECS: i64 = 3 * 60;
 const CLAUDE_USAGE_LAST_ATTEMPT_KEY: &str = "usage.claude.last_attempt_at";
 const CLAUDE_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.claude.cooldown_until";
 const CLAUDE_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
 const TRAY_ID: &str = "main";
+
+// RuntimeSettings storage keys
+const LIVE_USAGE_ENABLED_KEY: &str = "live_usage.enabled";
+const LIVE_USAGE_INTERVAL_KEY: &str = "live_usage.interval_seconds";
+const PLUGIN_UPDATES_ENABLED_KEY: &str = "plugin_updates.enabled";
+const PLUGIN_UPDATES_INTERVAL_KEY: &str = "plugin_updates.interval_hours";
+const RULE_WATCHER_ENABLED_KEY: &str = "rule_watcher.enabled";
+const ALWAYS_ON_TOP_KEY: &str = "always_on_top";
+
+const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
+const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
+const PLUGIN_UPDATES_INTERVAL_MIN_HOURS: i64 = 1;
+const PLUGIN_UPDATES_INTERVAL_MAX_HOURS: i64 = 24;
 
 #[derive(Clone, Debug)]
 struct UsageCacheEntry {
@@ -879,6 +895,30 @@ async fn set_context_preservation_enabled(
 }
 
 #[tauri::command]
+async fn get_integration_features() -> Result<models::IntegrationFeatures, String> {
+    let storage = get_storage()?;
+    integrations::get_integration_features(storage)
+}
+
+#[tauri::command]
+async fn set_activity_tracking_enabled(
+    enabled: bool,
+    app: tauri::AppHandle,
+) -> Result<models::IntegrationFeatures, String> {
+    let app_handle = app.clone();
+    run_blocking(move || integrations::set_activity_tracking_enabled(&app_handle, enabled))
+}
+
+#[tauri::command]
+async fn set_context_telemetry_enabled(
+    enabled: bool,
+    app: tauri::AppHandle,
+) -> Result<models::IntegrationFeatures, String> {
+    let app_handle = app.clone();
+    run_blocking(move || integrations::set_context_telemetry_enabled(&app_handle, enabled))
+}
+
+#[tauri::command]
 async fn get_provider_statuses() -> Result<Vec<ProviderStatus>, String> {
     let storage = get_storage()?;
     integrations::load_statuses(storage)
@@ -941,13 +981,12 @@ async fn confirm_disable_provider(
 }
 
 #[tauri::command]
-async fn set_provider_brevity_enabled(
-    provider: integrations::IntegrationProvider,
+async fn set_brevity_enabled(
     enabled: bool,
     app: tauri::AppHandle,
-) -> Result<ProviderStatus, String> {
+) -> Result<models::IntegrationFeatures, String> {
     let app_handle = app.clone();
-    run_blocking(move || integrations::set_brevity_enabled(&app_handle, provider, enabled))
+    run_blocking(move || integrations::set_brevity_enabled(&app_handle, enabled))
 }
 
 // --- Learning IPC commands ---
@@ -1017,6 +1056,150 @@ async fn set_learning_settings(settings: LearningSettings) -> Result<(), String>
         &settings.min_confidence.to_string(),
     )?;
     Ok(())
+}
+
+// --- Runtime feature toggle commands ---
+
+fn read_bool_setting(storage: &Storage, key: &str, default: bool) -> bool {
+    storage
+        .get_setting(key)
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(default)
+}
+
+fn read_i64_setting(storage: &Storage, key: &str, default: i64) -> i64 {
+    storage
+        .get_setting(key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn load_runtime_settings(storage: &Storage) -> RuntimeSettings {
+    let defaults = RuntimeSettings::default();
+    let live_interval = read_i64_setting(
+        storage,
+        LIVE_USAGE_INTERVAL_KEY,
+        defaults.live_usage_interval_seconds,
+    )
+    .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
+    let plugin_interval = read_i64_setting(
+        storage,
+        PLUGIN_UPDATES_INTERVAL_KEY,
+        defaults.plugin_updates_interval_hours,
+    )
+    .clamp(
+        PLUGIN_UPDATES_INTERVAL_MIN_HOURS,
+        PLUGIN_UPDATES_INTERVAL_MAX_HOURS,
+    );
+    RuntimeSettings {
+        live_usage_enabled: read_bool_setting(
+            storage,
+            LIVE_USAGE_ENABLED_KEY,
+            defaults.live_usage_enabled,
+        ),
+        live_usage_interval_seconds: live_interval,
+        plugin_updates_enabled: read_bool_setting(
+            storage,
+            PLUGIN_UPDATES_ENABLED_KEY,
+            defaults.plugin_updates_enabled,
+        ),
+        plugin_updates_interval_hours: plugin_interval,
+        rule_watcher_enabled: read_bool_setting(
+            storage,
+            RULE_WATCHER_ENABLED_KEY,
+            defaults.rule_watcher_enabled,
+        ),
+        always_on_top: read_bool_setting(storage, ALWAYS_ON_TOP_KEY, defaults.always_on_top),
+    }
+}
+
+#[tauri::command]
+async fn get_runtime_settings() -> Result<RuntimeSettings, String> {
+    let storage = get_storage()?;
+    Ok(load_runtime_settings(storage))
+}
+
+#[tauri::command]
+async fn set_runtime_settings(
+    settings: RuntimeSettings,
+    app: tauri::AppHandle,
+) -> Result<RuntimeSettings, String> {
+    let storage = get_storage()?;
+    let live_interval = settings
+        .live_usage_interval_seconds
+        .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
+    let plugin_interval = settings.plugin_updates_interval_hours.clamp(
+        PLUGIN_UPDATES_INTERVAL_MIN_HOURS,
+        PLUGIN_UPDATES_INTERVAL_MAX_HOURS,
+    );
+
+    storage.set_setting(
+        LIVE_USAGE_ENABLED_KEY,
+        if settings.live_usage_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    storage.set_setting(LIVE_USAGE_INTERVAL_KEY, &live_interval.to_string())?;
+    storage.set_setting(
+        PLUGIN_UPDATES_ENABLED_KEY,
+        if settings.plugin_updates_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    storage.set_setting(PLUGIN_UPDATES_INTERVAL_KEY, &plugin_interval.to_string())?;
+    storage.set_setting(
+        RULE_WATCHER_ENABLED_KEY,
+        if settings.rule_watcher_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+    storage.set_setting(
+        ALWAYS_ON_TOP_KEY,
+        if settings.always_on_top {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_always_on_top(settings.always_on_top);
+    }
+    if let Some(item) = TRAY_ON_TOP_ITEM.get() {
+        let _ = item.set_checked(settings.always_on_top);
+    }
+
+    let resolved = load_runtime_settings(storage);
+    let _ = app.emit("runtime-settings-updated", &resolved);
+    Ok(resolved)
+}
+
+#[tauri::command]
+async fn set_minimax_api_key(
+    api_key: String,
+    app: tauri::AppHandle,
+) -> Result<ProviderStatus, String> {
+    let status = {
+        let app_handle = app.clone();
+        run_blocking(move || integrations::set_minimax_api_key(&app_handle, &api_key))
+    }?;
+
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after MiniMax key update failed: {error}");
+    }
+
+    Ok(status)
 }
 
 #[tauri::command]
@@ -1777,12 +1960,16 @@ pub fn run() {
                 rule_watcher::start(app.handle().clone(), storage);
             }
 
-            // Plugin update checker (every 4 hours)
+            // Plugin update checker. Interval and enable flag are read from
+            // the settings table on every tick so the Settings window can
+            // adjust both without a restart.
             {
                 let update_state = std::sync::Arc::new(plugins::UpdateCheckerState::new());
                 app.manage(update_state.clone());
                 let update_handle = app.handle().clone();
-                plugins::spawn_update_checker(update_state, update_handle);
+                if let Some(storage) = STORAGE.get() {
+                    plugins::spawn_update_checker(update_state, update_handle, storage);
+                }
             }
 
             // Initialize restart state and run startup cleanup
@@ -1795,16 +1982,24 @@ pub fn run() {
             // startup_refresh is merged into the tray summary spawn below
             // to avoid redundant detect_all calls.
 
-            // Refresh live usage in the background on the same 3-minute interval as the widget.
+            // Refresh live usage in the background. Interval and enable flag come
+            // from RuntimeSettings so the Settings window can adjust both at runtime.
             {
                 let usage_refresh_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-                        LIVE_USAGE_REFRESH_INTERVAL_SECS as u64,
-                    ));
-                    interval.tick().await;
                     loop {
-                        interval.tick().await;
+                        let (enabled, interval_secs) = STORAGE
+                            .get()
+                            .map(|s| {
+                                let cfg = load_runtime_settings(s);
+                                (cfg.live_usage_enabled, cfg.live_usage_interval_seconds)
+                            })
+                            .unwrap_or((true, LIVE_USAGE_REFRESH_INTERVAL_SECS));
+                        let sleep_secs = interval_secs.max(LIVE_USAGE_INTERVAL_MIN_SECS) as u64;
+                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                        if !enabled {
+                            continue;
+                        }
                         if let Err(error) = refresh_usage_cache(Some(&usage_refresh_handle)).await {
                             log::warn!("Periodic usage refresh failed: {error}");
                         }
@@ -1847,6 +2042,9 @@ pub fn run() {
                 on_top_enabled,
                 None::<&str>,
             )?;
+            // Share the handle so set_runtime_settings can keep the
+            // tray checkmark in sync when the user toggles from Settings.
+            let _ = TRAY_ON_TOP_ITEM.set(on_top.clone());
             let update =
                 MenuItem::with_id(app, "check_update", "Check for Update", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -2014,11 +2212,17 @@ pub fn run() {
             get_context_savings_analytics,
             get_context_preservation_status,
             set_context_preservation_enabled,
+            get_integration_features,
+            set_activity_tracking_enabled,
+            set_context_telemetry_enabled,
             get_provider_statuses,
             rescan_integrations,
             confirm_enable_provider,
             confirm_disable_provider,
-            set_provider_brevity_enabled,
+            set_brevity_enabled,
+            set_minimax_api_key,
+            get_runtime_settings,
+            set_runtime_settings,
             get_learning_settings,
             set_learning_settings,
             get_learned_rules,
@@ -2068,7 +2272,7 @@ pub fn run() {
             sessions::search_sessions,
             sessions::get_session_context,
             sessions::get_search_facets,
-            sessions::rebuild_search_index,
+            sessions::sync_search_index,
             restart::discover_restart_instances,
             restart::discover_claude_instances,
             restart::request_restart,

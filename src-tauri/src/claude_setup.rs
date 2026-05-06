@@ -1,4 +1,5 @@
 use crate::integrations::manifest::OwnedAssetManifest;
+use crate::models::IntegrationFeatures;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,25 +81,48 @@ const MANAGED_COMMAND_FILES: [&str; 5] = [
     "quill-setup.md",
 ];
 
-const BASE_MANAGED_SCRIPT_FILES: [&str; 4] = [
+// Every script the Claude installer can deploy. We always clean these up on
+// reinstall regardless of which features are currently enabled so a user who
+// flips activity-tracking or context-telemetry off does not leave the script
+// orphaned in `~/.config/quill/scripts/`.
+const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
     "observe.cjs",
     "qbuild-guard.sh",
     "session-sync.cjs",
     "report-tokens.sh",
-];
-
-const CONTEXT_MANAGED_SCRIPT_FILES: [&str; 3] = [
     "context-router.cjs",
     "context-capture.cjs",
     "context-telemetry.cjs",
 ];
 
+// Per-feature subsets of the script list used to decide which files to deploy
+// for the current `IntegrationFeatures`. observe.cjs rides with activity
+// tracking; context-* scripts ride with context preservation; context
+// telemetry can be disabled while context preservation stays on.
+fn base_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
+    let mut scripts: Vec<&'static str> =
+        vec!["qbuild-guard.sh", "session-sync.cjs", "report-tokens.sh"];
+    if features.activity_tracking {
+        scripts.push("observe.cjs");
+    }
+    scripts
+}
+
+fn context_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
+    if !features.context_preservation {
+        return Vec::new();
+    }
+    let mut scripts: Vec<&'static str> = vec!["context-router.cjs", "context-capture.cjs"];
+    if features.context_telemetry {
+        scripts.push("context-telemetry.cjs");
+    }
+    scripts
+}
+
 const MCP_SERVER_KEY: &str = "mcpServers.quill";
 
 fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
-    BASE_MANAGED_SCRIPT_FILES
-        .into_iter()
-        .chain(CONTEXT_MANAGED_SCRIPT_FILES)
+    ALL_MANAGED_SCRIPT_FILES.into_iter()
 }
 
 fn build_owned_manifest() -> OwnedAssetManifest {
@@ -198,19 +222,19 @@ pub(crate) fn owned_asset_manifest() -> OwnedAssetManifest {
 
 pub fn install_with_manifest(
     app: &tauri::AppHandle,
-    context_enabled: bool,
+    features: IntegrationFeatures,
 ) -> Result<OwnedAssetManifest, String> {
-    deploy_files(app, context_enabled)?;
+    deploy_files(app, features)?;
 
     if let Err(err) = create_local_config() {
         log::error!("Failed to create local config: {err}");
     }
 
-    if let Err(err) = register_mcp_server(context_enabled) {
+    if let Err(err) = register_mcp_server(features) {
         log::error!("Failed to register MCP server: {err}");
     }
 
-    if let Err(err) = register_hooks(context_enabled) {
+    if let Err(err) = register_hooks(features) {
         log::error!("Failed to register hooks: {err}");
     }
 
@@ -222,7 +246,7 @@ pub fn install_with_manifest(
         log::error!("Failed to clean up legacy hooks: {err}");
     }
 
-    verify(context_enabled)?;
+    verify(features)?;
 
     Ok(build_owned_manifest())
 }
@@ -467,7 +491,7 @@ fn cleanup_quill_hooks() -> Result<(), String> {
 }
 
 /// Extract bundled resources from the app to managed directories.
-fn deploy_files(app: &tauri::AppHandle, context_enabled: bool) -> Result<(), String> {
+fn deploy_files(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -494,24 +518,21 @@ fn deploy_files(app: &tauri::AppHandle, context_enabled: bool) -> Result<(), Str
     // Clean only our commands from the shared ~/.claude/commands/ directory
     clean_quill_commands()?;
 
-    // Deploy each subdirectory to its target
+    // Deploy each subdirectory to its target.
+    // Script lists are computed dynamically from `features` so disabling
+    // activity tracking skips observe.cjs and disabling context telemetry
+    // (while context preservation stays on) skips context-telemetry.cjs.
     fs::create_dir_all(scripts_dir()).map_err(|e| format!("Failed to create scripts dir: {e}"))?;
-    copy_named_files(
-        &source.join("scripts"),
-        &scripts_dir(),
-        &BASE_MANAGED_SCRIPT_FILES,
-    )?;
-    if context_enabled {
-        copy_named_files(
-            &source.join("scripts"),
-            &scripts_dir(),
-            &CONTEXT_MANAGED_SCRIPT_FILES,
-        )?;
+    let base_scripts = base_scripts_for(features);
+    copy_named_files(&source.join("scripts"), &scripts_dir(), &base_scripts)?;
+    let context_scripts = context_scripts_for(features);
+    if !context_scripts.is_empty() {
+        copy_named_files(&source.join("scripts"), &scripts_dir(), &context_scripts)?;
     }
     copy_dir_recursive(&source.join("mcp"), &mcp_dir())?;
     copy_dir_recursive(&source.join("commands"), &commands_dir())?;
-    deploy_template(&source.join("templates"), context_enabled)?;
-    if !context_enabled {
+    deploy_template(&source.join("templates"), features)?;
+    if !features.context_preservation {
         remove_context_mcp_tool()?;
     }
 
@@ -536,11 +557,16 @@ fn deploy_files(app: &tauri::AppHandle, context_enabled: bool) -> Result<(), Str
     Ok(())
 }
 
-fn copy_named_files(src_dir: &Path, dst_dir: &Path, file_names: &[&str]) -> Result<(), String> {
+fn copy_named_files<S: AsRef<str>>(
+    src_dir: &Path,
+    dst_dir: &Path,
+    file_names: &[S],
+) -> Result<(), String> {
     fs::create_dir_all(dst_dir)
         .map_err(|err| format!("Failed to create directory {}: {err}", dst_dir.display()))?;
 
     for file_name in file_names {
+        let file_name = file_name.as_ref();
         let source = src_dir.join(file_name);
         if !source.exists() {
             return Err(format!("Bundled file missing at {}", source.display()));
@@ -559,10 +585,10 @@ fn copy_named_files(src_dir: &Path, dst_dir: &Path, file_names: &[&str]) -> Resu
     Ok(())
 }
 
-fn deploy_template(src_dir: &Path, context_enabled: bool) -> Result<(), String> {
+fn deploy_template(src_dir: &Path, features: IntegrationFeatures) -> Result<(), String> {
     fs::create_dir_all(templates_dir())
         .map_err(|err| format!("Failed to create templates dir: {err}"))?;
-    let template_name = if context_enabled {
+    let template_name = if features.context_preservation {
         "claude-md-section.md"
     } else {
         "claude-md-section-base.md"
@@ -846,7 +872,7 @@ fn migrate_legacy_section(content: &str, block_content: &str) -> String {
 // ── MCP server registration ──
 
 /// Merge a `quill` MCP server entry into ~/.claude.json.
-fn register_mcp_server(context_enabled: bool) -> Result<(), String> {
+fn register_mcp_server(features: IntegrationFeatures) -> Result<(), String> {
     let claude_json_path = dirs::home_dir()
         .ok_or("Cannot determine home directory")?
         .join(".claude.json");
@@ -867,7 +893,7 @@ fn register_mcp_server(context_enabled: bool) -> Result<(), String> {
         "args": ["run", "--directory", mcp_path_str, "python", "server.py"],
         "env": {
             "QUILL_PROVIDER": "claude",
-            "QUILL_CONTEXT_PRESERVATION": if context_enabled { "1" } else { "0" }
+            "QUILL_CONTEXT_PRESERVATION": if features.context_preservation { "1" } else { "0" }
         }
     });
 
@@ -898,7 +924,7 @@ const HOOK_MARKER: &str = "quill-setup";
 const CONTEXT_HOOK_MARKER: &str = "quill-context-preservation";
 
 /// Merge all Quill hooks into ~/.claude/settings.json.
-fn register_hooks(context_enabled: bool) -> Result<(), String> {
+fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
     let settings_path = dirs::home_dir()
         .ok_or("Cannot determine home directory")?
         .join(".claude")
@@ -941,8 +967,13 @@ fn register_hooks(context_enabled: bool) -> Result<(), String> {
     let report_tokens_command = shell_quote(&sd.join("report-tokens.sh"));
     let session_sync_command = format!("node {}", shell_quote(&sd.join("session-sync.cjs")));
 
-    let mut hook_defs: Vec<(&str, &str, serde_json::Value)> = vec![
-        (
+    let mut hook_defs: Vec<(&str, &str, serde_json::Value)> = Vec::new();
+
+    // Activity-tracking observe.cjs hooks are gated on the feature flag so
+    // privacy-conscious users can keep token reporting and session sync but
+    // skip the live tool-call telemetry.
+    if features.activity_tracking {
+        hook_defs.push((
             "PreToolUse",
             "*",
             serde_json::json!({
@@ -955,22 +986,26 @@ fn register_hooks(context_enabled: bool) -> Result<(), String> {
                     }
                 ]
             }),
-        ),
-        (
-            "PreToolUse",
-            "Edit|Write|MultiEdit|NotebookEdit",
-            serde_json::json!({
-                "_source": HOOK_MARKER,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": qbuild_guard_command,
-                        "timeout": 5
-                    }
-                ]
-            }),
-        ),
-        (
+        ));
+    }
+
+    hook_defs.push((
+        "PreToolUse",
+        "Edit|Write|MultiEdit|NotebookEdit",
+        serde_json::json!({
+            "_source": HOOK_MARKER,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": qbuild_guard_command,
+                    "timeout": 5
+                }
+            ]
+        }),
+    ));
+
+    if features.activity_tracking {
+        hook_defs.push((
             "PostToolUse",
             "*",
             serde_json::json!({
@@ -983,28 +1018,29 @@ fn register_hooks(context_enabled: bool) -> Result<(), String> {
                     }
                 ]
             }),
-        ),
-        (
-            "Stop",
-            "",
-            serde_json::json!({
-                "_source": HOOK_MARKER,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": report_tokens_command
-                    },
-                    {
-                        "type": "command",
-                        "command": session_sync_command,
-                        "timeout": 3
-                    }
-                ]
-            }),
-        ),
-    ];
+        ));
+    }
 
-    if context_enabled {
+    hook_defs.push((
+        "Stop",
+        "",
+        serde_json::json!({
+            "_source": HOOK_MARKER,
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": report_tokens_command
+                },
+                {
+                    "type": "command",
+                    "command": session_sync_command,
+                    "timeout": 3
+                }
+            ]
+        }),
+    ));
+
+    if features.context_preservation {
         hook_defs.extend([
             (
                 "SessionStart",
@@ -1122,27 +1158,30 @@ fn register_hooks(context_enabled: bool) -> Result<(), String> {
 
 // ── MCP verification ──
 
-pub fn verify(context_enabled: bool) -> Result<(), String> {
+pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
     let mut missing = Vec::new();
 
-    for script in BASE_MANAGED_SCRIPT_FILES {
+    let expected_base = base_scripts_for(features);
+    for script in &expected_base {
         if !scripts_dir().join(script).exists() {
-            missing.push(script.to_string());
+            missing.push((*script).to_string());
         }
     }
-    if context_enabled {
-        for script in CONTEXT_MANAGED_SCRIPT_FILES {
-            if !scripts_dir().join(script).exists() {
-                missing.push(script.to_string());
-            }
+    let expected_context = context_scripts_for(features);
+    for script in &expected_context {
+        if !scripts_dir().join(script).exists() {
+            missing.push((*script).to_string());
         }
-    } else if let Some(script) = CONTEXT_MANAGED_SCRIPT_FILES
-        .into_iter()
-        .find(|script| scripts_dir().join(script).exists())
-    {
-        return Err(format!(
-            "Claude context preservation script is still installed: {script}"
-        ));
+    }
+    // Any managed script not in the expected set must NOT be present so a
+    // recent toggle-off cleanly removes the orphaned file.
+    for script in ALL_MANAGED_SCRIPT_FILES {
+        let still_expected = expected_base.contains(&script) || expected_context.contains(&script);
+        if !still_expected && scripts_dir().join(script).exists() {
+            return Err(format!(
+                "Claude managed script is still installed but not expected: {script}"
+            ));
+        }
     }
     if !mcp_dir().join("server.py").exists() {
         missing.push("mcp/server.py".to_string());
@@ -1166,18 +1205,25 @@ pub fn verify(context_enabled: bool) -> Result<(), String> {
     if !settings_content.contains(HOOK_MARKER) {
         return Err("Claude hooks were not written to settings.json".to_string());
     }
-    if !settings_content.contains("observe.cjs") || !settings_content.contains("report-tokens.sh") {
+    if !settings_content.contains("report-tokens.sh") {
         return Err("Claude base hooks were not written to settings.json".to_string());
+    }
+    let has_observe_hook = settings_content.contains("observe.cjs");
+    if features.activity_tracking && !has_observe_hook {
+        return Err("Claude activity tracking hooks were not written to settings.json".to_string());
+    }
+    if !features.activity_tracking && has_observe_hook {
+        return Err("Claude activity tracking hooks are still installed".to_string());
     }
 
     let has_context_hook = settings_content.contains("context-router.cjs")
         || settings_content.contains("context-capture.cjs");
-    if context_enabled && !has_context_hook {
+    if features.context_preservation && !has_context_hook {
         return Err(
             "Claude context preservation hooks were not written to settings.json".to_string(),
         );
     }
-    if !context_enabled && has_context_hook {
+    if !features.context_preservation && has_context_hook {
         return Err("Claude context preservation hooks are still installed".to_string());
     }
 
@@ -1194,18 +1240,22 @@ pub fn verify(context_enabled: bool) -> Result<(), String> {
     {
         return Err(".claude.json does not set QUILL_PROVIDER for Quill MCP".to_string());
     }
-    if context_enabled && !claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"") {
+    if features.context_preservation
+        && !claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"")
+    {
         return Err(".claude.json does not enable Quill context preservation".to_string());
     }
-    if !context_enabled && claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"") {
+    if !features.context_preservation
+        && claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"")
+    {
         return Err(".claude.json still enables Quill context preservation".to_string());
     }
 
     let context_tool = mcp_dir().join("tools").join("context.py");
-    if context_enabled && !context_tool.exists() {
+    if features.context_preservation && !context_tool.exists() {
         return Err("Claude context MCP tool is missing".to_string());
     }
-    if !context_enabled && context_tool.exists() {
+    if !features.context_preservation && context_tool.exists() {
         return Err("Claude context MCP tool is still installed".to_string());
     }
 
@@ -1218,13 +1268,13 @@ pub fn verify(context_enabled: bool) -> Result<(), String> {
         return Err("CLAUDE.md does not contain the Quill managed block".to_string());
     }
 
-    verify_mcp(context_enabled)?;
+    verify_mcp(features)?;
 
     Ok(())
 }
 
 /// Check that the MCP server can run.
-fn verify_mcp(context_enabled: bool) -> Result<(), String> {
+fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     let Some(uv_path) = crate::config::resolve_command_path("uv") else {
         return Err("uv is not available on PATH".to_string());
     };
@@ -1257,7 +1307,11 @@ fn verify_mcp(context_enabled: bool) -> Result<(), String> {
         .env("QUILL_PROVIDER", "claude")
         .env(
             "QUILL_CONTEXT_PRESERVATION",
-            if context_enabled { "1" } else { "0" },
+            if features.context_preservation {
+                "1"
+            } else {
+                "0"
+            },
         )
         .output()
         .map_err(|e| format!("Failed to run MCP verification: {e}"))?;
@@ -1349,5 +1403,5 @@ fn cleanup_legacy_hooks() -> Result<(), String> {
 /// Called on widget startup.
 #[allow(dead_code)]
 pub fn setup_local(app: &tauri::AppHandle) -> Result<(), String> {
-    install_with_manifest(app, false).map(|_| ())
+    install_with_manifest(app, IntegrationFeatures::default()).map(|_| ())
 }

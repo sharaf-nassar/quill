@@ -1,66 +1,15 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import ConfirmDialog from "./ConfirmDialog";
-import ProviderMenu from "./integrations/ProviderMenu";
 import type { UseIntegrationsResult } from "../hooks/useIntegrations";
-import { useToast } from "../hooks/useToast";
-import type { IntegrationProvider, LayoutMode, PendingUpdate } from "../types";
-
-interface PendingProviderAction {
-  provider: IntegrationProvider;
-  nextEnabled: boolean;
-}
-
-function providerLabel(provider: IntegrationProvider): string {
-  if (provider === "claude") return "Claude Code";
-  if (provider === "codex") return "Codex";
-  return "MiniMax";
-}
-
-function providerActionCopy(action: PendingProviderAction) {
-  const label = providerLabel(action.provider);
-  if (action.nextEnabled) {
-    if (action.provider === "mini_max") {
-      return {
-        title: `Enable ${label}?`,
-        description:
-          "Enter your MiniMax API key to track subscription usage. Your key is stored locally and never sent anywhere except the MiniMax API.",
-        confirmLabel: `Enable ${label}`,
-        destructive: false,
-        needsApiKey: true,
-      };
-    }
-    return {
-      title: `Enable ${label}?`,
-      description:
-        `Quill will install its ${label} integration assets, including hooks, commands, MCP configuration, and managed instruction blocks.`,
-      confirmLabel: `Enable ${label}`,
-      destructive: false,
-      needsApiKey: false,
-    };
-  }
-
-  return {
-    title: `Disable ${label}?`,
-    description:
-      action.provider === "mini_max"
-        ? "Quill will remove your stored MiniMax API key and stop tracking subscription usage. Historical data stays in the app."
-        : `Quill will remove every ${label} integration asset it installed, including hooks, commands, MCP entries, and managed instruction blocks. Historical Quill data stays in the app.`,
-    confirmLabel: `Disable ${label}`,
-    destructive: true,
-    needsApiKey: false,
-  };
-}
+import type { PendingUpdate } from "../types";
 
 interface TitleBarProps {
   showLive: boolean;
   showAnalytics: boolean;
   onToggleLive: (on: boolean) => void;
   onToggleAnalytics: (on: boolean) => void;
-  layoutMode: LayoutMode;
-  onLayoutModeChange: (mode: LayoutMode) => void;
   onClose: () => void;
   pendingUpdate: PendingUpdate | null;
   updating: boolean;
@@ -73,40 +22,16 @@ function TitleBar({
   showAnalytics,
   onToggleLive,
   onToggleAnalytics,
-  layoutMode,
-  onLayoutModeChange,
   onClose,
   pendingUpdate,
   updating,
   onUpdate,
   integrations,
 }: TitleBarProps) {
-  const { toast } = useToast();
   const [version, setVersion] = useState("");
   const [pluginUpdateCount, setPluginUpdateCount] = useState(0);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [pendingProviderAction, setPendingProviderAction] =
-    useState<PendingProviderAction | null>(null);
-  const [apiKeyInput, setApiKeyInput] = useState("");
 
-  const {
-    statuses,
-    indicatorPrimaryProvider,
-    loading: providersLoading,
-    error: providerError,
-    hasEnabledProvider,
-    inFlightProviders,
-    contextPreservation,
-    contextPreservationInFlight,
-    brevityInFlightProviders,
-    rescanInFlight,
-    saveIndicatorPrimaryProvider,
-    setContextPreservationEnabled,
-    enableProvider,
-    disableProvider,
-    setBrevityEnabled,
-    rescan,
-  } = integrations;
+  const { hasEnabledProvider, loading: providersLoading } = integrations;
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
@@ -120,17 +45,6 @@ function TitleBar({
       unlisten.then((fn) => fn());
     };
   }, []);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !pendingProviderAction) {
-        setMenuOpen(false);
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [menuOpen, pendingProviderAction]);
 
   const featuresDisabled = providersLoading || !hasEnabledProvider;
 
@@ -234,72 +148,31 @@ function TitleBar({
     });
   }, []);
 
-  const handleToggleMenu = useCallback(() => {
-    setMenuOpen((prev) => {
-      if (prev) {
-        setPendingProviderAction(null);
-      }
-      return !prev;
+  const handleOpenSettings = useCallback(async () => {
+    const existing = await WebviewWindow.getByLabel("settings");
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    new WebviewWindow("settings", {
+      url: "/?view=settings",
+      title: "Settings",
+      // Default width matches minWidth so the five top tabs (General …
+      // Performance) always fit on a single row without horizontal
+      // scroll or flex wrap on first launch, with a small buffer past
+      // the last tab.
+      width: 540,
+      height: 620,
+      minWidth: 540,
+      minHeight: 480,
+      decorations: false,
+      transparent: true,
+      resizable: true,
     });
   }, []);
 
-  const handleRequestToggle = useCallback(
-    (provider: IntegrationProvider, nextEnabled: boolean) => {
-      setPendingProviderAction({ provider, nextEnabled });
-      setApiKeyInput("");
-    },
-    [],
-  );
-
-  const handleContextPreservationToggle = useCallback(
-    async (enabled: boolean) => {
-      try {
-        await setContextPreservationEnabled(enabled);
-      } catch (err) {
-        toast(
-          "error",
-          `${enabled ? "Enable" : "Disable"} failed for context preservation: ${String(err)}`,
-        );
-      }
-    },
-    [setContextPreservationEnabled, toast],
-  );
-
-  const handleConfirmProviderAction = useCallback(async () => {
-    if (!pendingProviderAction) return;
-
-    const { provider, nextEnabled } = pendingProviderAction;
-    const label = providerLabel(provider);
-
-    try {
-      if (nextEnabled) {
-        await enableProvider(provider, provider === "mini_max" ? apiKeyInput : undefined);
-      } else {
-        await disableProvider(provider);
-      }
-      setPendingProviderAction(null);
-      setMenuOpen(false);
-      setApiKeyInput("");
-    } catch (err) {
-      toast(
-        "error",
-        `${nextEnabled ? "Enable" : "Disable"} failed for ${label}: ${String(err)}`,
-      );
-    }
-  }, [apiKeyInput, disableProvider, enableProvider, pendingProviderAction, toast]);
-
-  const confirmCopy = useMemo(
-    () =>
-      pendingProviderAction ? providerActionCopy(pendingProviderAction) : null,
-    [pendingProviderAction],
-  );
-
-  const busyConfirmProvider = pendingProviderAction
-    ? inFlightProviders.has(pendingProviderAction.provider)
-    : false;
-
   const handleCloseWindow = useCallback(async () => {
-    setMenuOpen(false);
     await onClose();
   }, [onClose]);
 
@@ -367,33 +240,6 @@ function TitleBar({
           QUILL
         </span>
       </div>
-      {pendingProviderAction && confirmCopy && (
-        <ConfirmDialog
-          open
-          title={confirmCopy.title}
-          description={confirmCopy.description}
-          confirmLabel={confirmCopy.confirmLabel}
-          destructive={confirmCopy.destructive}
-          busy={busyConfirmProvider}
-          confirmDisabled={confirmCopy.needsApiKey && !apiKeyInput.trim()}
-          onCancel={() => {
-            setPendingProviderAction(null);
-            setApiKeyInput("");
-          }}
-          onConfirm={handleConfirmProviderAction}
-        >
-          {confirmCopy.needsApiKey && (
-            <input
-              type="password"
-              className="confirm-dialog-input"
-              placeholder="sk-cp-..."
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              autoFocus
-            />
-          )}
-        </ConfirmDialog>
-      )}
       <div className="titlebar-right">
         {pendingUpdate && (
           <button
@@ -405,60 +251,14 @@ function TitleBar({
             {updating ? "Updating..." : `Update ${pendingUpdate.version}`}
           </button>
         )}
-        <div className="titlebar-cog-anchor">
-          <button
-            className="titlebar-cog"
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            aria-label="Quill settings"
-            title="Quill settings"
-            onClick={handleToggleMenu}
-          >
-            &#9881;
-          </button>
-          {menuOpen && (
-            <>
-              <div
-                className="provider-menu-backdrop"
-                onMouseDown={() => {
-                  setPendingProviderAction(null);
-                  setMenuOpen(false);
-                }}
-              />
-              <ProviderMenu
-                className="provider-menu--right"
-                statuses={statuses}
-                loading={providersLoading}
-                error={providerError}
-                inFlightProviders={inFlightProviders}
-                contextPreservation={contextPreservation}
-                contextPreservationInFlight={contextPreservationInFlight}
-                brevityInFlightProviders={brevityInFlightProviders}
-                indicatorPrimaryProvider={indicatorPrimaryProvider}
-                onRequestToggle={handleRequestToggle}
-                onContextPreservationToggle={(enabled) => {
-                  void handleContextPreservationToggle(enabled);
-                }}
-                onBrevityToggle={(provider, enabled) => {
-                  void setBrevityEnabled(provider, enabled).catch((e) => {
-                    toast("warning", String(e));
-                  });
-                }}
-                onIndicatorPrimaryProviderChange={(provider) => {
-                  void saveIndicatorPrimaryProvider(provider);
-                }}
-                layoutMode={layoutMode}
-                onLayoutModeChange={onLayoutModeChange}
-                onRescan={() => {
-                  void rescan().catch((e) => {
-                    toast("warning", String(e));
-                  });
-                }}
-                rescanning={rescanInFlight}
-              />
-            </>
-          )}
-        </div>
+        <button
+          className="titlebar-cog"
+          aria-label="Open settings"
+          title="Open settings"
+          onClick={() => void handleOpenSettings()}
+        >
+          &#9881;
+        </button>
         {version && (
           <button
             type="button"

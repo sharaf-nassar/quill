@@ -7,6 +7,7 @@ interface InsightCardProps {
 	trend: InsightTrend | null;
 	sparkline?: SparklinePoint[];
 	accentColor?: string;
+	description?: string;
 }
 
 function trendColor(trend: InsightTrend): string {
@@ -46,6 +47,7 @@ function InsightCard({
 	trend,
 	sparkline,
 	accentColor = "#58a6ff",
+	description,
 }: InsightCardProps) {
 	const maxVal = sparkline
 		? Math.max(...sparkline.map((p) => p.value), 1)
@@ -53,6 +55,24 @@ function InsightCard({
 
 	return (
 		<div className="insight-card">
+			{description && (
+				<>
+					<button
+						type="button"
+						className="insight-card-help"
+						aria-label={`About ${label}: ${description}`}
+					>
+						?
+					</button>
+					<span
+						className="insight-card-tooltip"
+						role="tooltip"
+						aria-hidden="true"
+					>
+						{description}
+					</span>
+				</>
+			)}
 			<div className="insight-card-header">
 				<span className="insight-card-label">{label}</span>
 				{trend && (

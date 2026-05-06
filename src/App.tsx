@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { check } from "@tauri-apps/plugin-updater";
 import TitleBar from "./components/TitleBar";
@@ -8,6 +9,11 @@ import UsageDisplay from "./components/UsageDisplay";
 import AnalyticsView from "./components/analytics/AnalyticsView";
 import type { UseIntegrationsResult } from "./hooks/useIntegrations";
 import { useToast } from "./hooks/useToast";
+import {
+  UI_PREFS_EVENT,
+  readUiPrefs,
+  type UiPrefs,
+} from "./hooks/useUiPrefs";
 import type { UsageData, TimeMode, LayoutMode, PendingUpdate } from "./types";
 
 const BASE_WIDTH = 260;
@@ -215,10 +221,29 @@ function App({ integrations }: AppProps) {
 		try { localStorage.setItem(TIME_MODE_KEY, mode); } catch { /* ignore */ }
 	}, []);
 
-	const handleLayoutModeChange = useCallback((mode: LayoutMode) => {
-		setLayoutMode(mode);
-		layoutModeRef.current = mode;
-		try { localStorage.setItem(LAYOUT_MODE_KEY, mode); } catch { /* ignore */ }
+	// Cross-window UI-prefs sync. The Settings window writes localStorage and
+	// emits this event; the main window re-applies state without reloading.
+	useEffect(() => {
+		const unlistenPromise = listen<UiPrefs>(UI_PREFS_EVENT, (event) => {
+			const next = event.payload;
+			setLayoutMode(next.layoutMode);
+			layoutModeRef.current = next.layoutMode;
+			setTimeMode(next.timeMode);
+			void switchLayout(next.showLive, next.showAnalytics);
+		});
+		return () => {
+			unlistenPromise.then((fn) => fn());
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
+
+	// On mount, re-sync from localStorage in case the user changed prefs in
+	// another window before this one finished hydrating.
+	useEffect(() => {
+		const stored = readUiPrefs();
+		setLayoutMode(stored.layoutMode);
+		layoutModeRef.current = stored.layoutMode;
+		setTimeMode(stored.timeMode);
 	}, []);
 
 	const isSplit = showLive && showAnalytics;
@@ -567,8 +592,6 @@ function App({ integrations }: AppProps) {
 				showAnalytics={showAnalytics}
 				onToggleLive={handleToggleLive}
 				onToggleAnalytics={handleToggleAnalytics}
-				layoutMode={layoutMode}
-				onLayoutModeChange={handleLayoutModeChange}
 				onClose={handleClose}
 				pendingUpdate={pendingUpdate}
 				updating={updating}

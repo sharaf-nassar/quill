@@ -30,7 +30,7 @@ Each tab opens at its smallest available timeframe toggle by default: Now and Co
 
 Real-time metrics dashboard with configurable time range (1h, 24h, 7d, 30d).
 
-Six insight cards: **Session Health** (avg duration, tokens, sessions/day with trend), **LLM Runtime** (cumulative response time, session count, turn count, avg per turn), **Project Focus** (top project breakdown), **Learning Progress** (rule counts, confidence distribution), **Efficiency** (tokens-per-LOC ratio), **Velocity** (LOC-per-hour). Below the cards: a 24-hour activity heatmap and a sortable breakdown panel switchable between hosts, projects, and sessions.
+A two-column CSS Grid (`.insight-cards-row`) renders six insight cards in three row-pairs: row 1 pairs **LLM Runtime** (cumulative response time, session count, turn count, avg per turn) with **Preserved** (context tokens written to local storage), row 2 pairs **Efficiency** (tokens-per-LOC ratio with trend and sparkline) with **Retrieved** (context tokens read back), row 3 pairs **Velocity** (LOC-per-hour with trend and sparkline) with **Routing cost** (transcript overhead from router/capture/search/MCP guidance). Cards are placed directly in the grid in interleaved source order (`L1, R1, L2, R2, L3, R3`) so the default `grid-auto-flow: row` plus implicit `align-items: stretch` makes both cards in each row share the height of the taller card — keeping the two visual columns aligned even though only the left column has sparklines. Right-column cards source values from [[src/hooks/useContextSavingsStats.ts]] (the same hook that powers the [[features#Analytics Dashboard#Context Tab]] minus Telemetry) and each carries a `?` help button that reveals an `.insight-card-tooltip` describing that metric. Tooltip anchoring is position-based: `:nth-child(odd)` cards anchor `left: 0` (left column extends right), and the default `right: 0` covers the right column. The grid collapses to a single column at container width below 360px. Below the grid: a sortable breakdown panel switchable between hosts, projects, and sessions.
 
 When a session row is selected, the breakdown stores both provider and session id, which keeps token history, compact token stats, and delete-session actions aligned with the right Claude or Codex transcript.
 
@@ -50,7 +50,7 @@ Context savings analytics show how much large working context Quill kept out of 
 
 The tab appears in the Analytics tab bar only while context preservation is enabled or historical context-savings events exist. It stays available even before token snapshots exist, because context telemetry is independent of provider token polling.
 
-`src/components/analytics/ContextSavingsTab.tsx` renders a compact 1h/24h/7d/30d view with a four-column stats strip whose semantics map to the event taxonomy: **Preserved** (tokens written to the context store, with a retention subtitle showing `X% reused · N/M sources`), **Retrieved** (tokens pulled back via `quill_get_context_source`), **Routing cost** (transcript tokens injected by router/capture guidance and search snippets), and **Telemetry** (count of hook observation events). The retention ratio is `sources_retrieved / sources_preserved` over distinct `source_ref` values within the selected window, clamped to `[0, 1]`, computed in [[src-tauri/src/storage.rs#apply_retention_metrics]] from the `CONTEXT_SAVINGS_RETENTION_SQL` CTE. The trend chart stacks the still-saved portion of preserved tokens against the already-returned portion in the same column so each bar's height represents the per-bucket preservation throughput rather than a sum that double-counts. The breakdown table places a category dot, the event-type label, an inline provider tag, the source name, and right-aligned numeric columns over a relative-magnitude background fill scaled to the largest event count, and a single-line event log where each entry shows time, provider, source, reason, a directional byte indicator (→ indexed, ← returned, · input), and the token estimate. The magnitude fill is implemented as a `::before` pseudo-element driven by `--bar-width` and `--bar-bg` custom properties, which keeps the bar from competing with grid items for track sizing. Confidence is hidden when the estimate is exact (the deterministic `ceil(bytes / 4)` case) and surfaced only when the source reports lower confidence. `src/hooks/useContextSavingsStats.ts` listens for the `context-savings-updated` event and invokes [[src-tauri/src/lib.rs#get_context_savings_analytics]].
+`src/components/analytics/ContextSavingsTab.tsx` renders a compact 1h/24h/7d/30d view with a four-column stats strip whose semantics map to the event taxonomy: **Preserved** (tokens written to the context store, with a retention subtitle showing `X% reused · N/M sources`), **Retrieved** (tokens pulled back via `quill_get_context_source`), **Routing cost** (transcript tokens injected by router/capture guidance and search snippets), and **Telemetry** (count of hook observation events). Each headline card has a small `?` help button (`.context-stat-help`) absolutely positioned in its top-right corner; hovering or focusing the button reveals a sibling `<span class="context-stat-tooltip">` that explains that card's slice of the event taxonomy. The strip drops `overflow: hidden` so the tooltip can escape its rounded clip, and edge cards anchor the tooltip to `left: 0` / `right: 0` (with parallel `nth-child(odd|even)` rules in the 2-column container query) so they stay inside `analytics-content`'s horizontal clip. Visibility is driven by the CSS adjacent-sibling selector `.context-stat-help:hover ~ .context-stat-tooltip`, which works in every webview without `:has()`. The retention ratio is `sources_retrieved / sources_preserved` over distinct `source_ref` values within the selected window, clamped to `[0, 1]`, computed in [[src-tauri/src/storage.rs#apply_retention_metrics]] from the `CONTEXT_SAVINGS_RETENTION_SQL` CTE. The trend chart stacks the still-saved portion of preserved tokens against the already-returned portion in the same column so each bar's height represents the per-bucket preservation throughput rather than a sum that double-counts. The breakdown table places a category dot, the event-type label, an inline provider tag, the source name, and right-aligned numeric columns over a relative-magnitude background fill scaled to the largest event count, and a single-line event log where each entry shows time, provider, source, reason, a directional byte indicator (→ indexed, ← returned, · input), and the token estimate. The magnitude fill is implemented as a `::before` pseudo-element driven by `--bar-width` and `--bar-bg` custom properties, which keeps the bar from competing with grid items for track sizing. Confidence is hidden when the estimate is exact (the deterministic `ceil(bytes / 4)` case) and surfaced only when the source reports lower confidence. `src/hooks/useContextSavingsStats.ts` listens for the `context-savings-updated` event and invokes [[src-tauri/src/lib.rs#get_context_savings_analytics]].
 
 ## Learning System
 
@@ -122,7 +122,7 @@ Quill preserves large transient context as searchable refs so assistants can kee
 
 Context preservation is controlled by a global default-off setting in Quill.
 
-The QUILL menu exposes a `Context Preservation` section backed by `context_preservation.enabled` in the settings table. Enabling installs the local context scripts, context MCP tool, context-aware instruction templates, and hooks for currently enabled Claude Code and Codex providers; future Claude or Codex provider enables inherit the setting. Disabling redeploys only the base Quill integration for those providers, removing context hooks and local context assets while preserving historical context stores and analytics rows. Toggle sync runs when an enabled provider home exists, even if the provider CLI is temporarily unavailable, so disable cleanup can still remove local feature assets.
+The [[features#Settings Window]] exposes a `Context` tab backed by `context_preservation.enabled` in the settings table. Enabling installs the local context scripts, context MCP tool, context-aware instruction templates, and hooks for currently enabled Claude Code and Codex providers; future Claude or Codex provider enables inherit the setting. Disabling redeploys only the base Quill integration for those providers, removing context hooks and local context assets while preserving historical context stores and analytics rows. Toggle sync runs when an enabled provider home exists, even if the provider CLI is temporarily unavailable, so disable cleanup can still remove local feature assets.
 
 ### Context MCP Tools
 
@@ -136,37 +136,43 @@ Large execution and batch outputs are stored as `source:N` and `chunk:N` refs. R
 
 Provider hooks steer high-volume operations toward Quill context tools before they flood the active transcript.
 
-`src-tauri/claude-integration/scripts/context-router.cjs` and `src-tauri/codex-integration/scripts/context-router.cjs` block raw WebFetch or noisy `curl`/`wget` dumps and nudge broad Bash, Read, Grep, build, and test output toward `quill_*` MCP tools. Per-session marker files under `~/.config/quill/context/markers/` keep guidance from repeating.
+`src-tauri/claude-integration/scripts/context-router.cjs` and `src-tauri/codex-integration/scripts/context-router.cjs` block raw WebFetch or noisy `curl`/`wget` dumps and nudge broad Bash, Read, Grep, build, and test output toward `quill_*` MCP tools. Per-session marker files under `~/.config/quill/context/markers/` keep guidance from repeating, and the scripts prune marker directories older than 30 days at most once per day.
 
 ### Continuity Capture
 
 Continuity hooks record small task and decision hints without writing to provider memory paths.
 
-`src-tauri/claude-integration/scripts/context-capture.cjs`, `src-tauri/codex-integration/scripts/context-capture.cjs`, and `plugin/scripts/context-capture.cjs` write compact JSONL events under `~/.config/quill/context/continuity/`, capture prompts and simple decision/task hints, and store PreCompact or Stop snapshots when available. SessionStart guidance is scoped by provider and project key, where the project key is the nearest git root for the current `cwd` or the normalized `cwd` when no git root is found, so recent work from another project cannot leak into a new session.
+`src-tauri/claude-integration/scripts/context-capture.cjs`, `src-tauri/codex-integration/scripts/context-capture.cjs`, and `plugin/scripts/context-capture.cjs` write compact JSONL events under `~/.config/quill/context/continuity/`, capture prompts and simple decision/task hints, and store PreCompact or Stop snapshots when available. SessionStart guidance is scoped by provider and project key, where the project key is the nearest git root for the current `cwd` or the normalized `cwd` when no git root is found, so recent work from another project cannot leak into a new session. Continuity JSONL and per-session files are pruned to a 30-day retention window at most once per day.
 
 ### Context Savings Telemetry
 
 Context savings telemetry forwards compact measurements to Quill without copying large context into the main analytics database.
 
-The MCP tools and context hooks send best-effort batches to `/api/v1/context-savings/events` through `context-telemetry.cjs` or the Python telemetry helper in [[src-tauri/claude-integration/mcp/tools/context.py]]. Events record exact bytes when available, refs such as `source:N` or `snapshot:N`, and approximate token estimates using `ceil(bytes / 4)`. The local MCP context database remains the source of large stored content.
+The MCP tools and context hooks send best-effort batches to `/api/v1/context-savings/events` through `context-telemetry.cjs` or the Python telemetry helper in [[src-tauri/claude-integration/mcp/tools/context.py]]. Events record exact bytes when available, refs such as `source:N` or `snapshot:N`, and approximate token estimates using `ceil(bytes / 4)`. The local MCP context database remains the source of large stored content. The `feature.context_telemetry.enabled` flag (see [[features#Settings Window#Integration Features]]) gates whether `context-telemetry.cjs` is deployed at all; the router and capture scripts try to load it and fail open when it is absent so context preservation keeps working without any telemetry side effects.
 
-Each event carries an explicit `category` (`preservation`, `retrieval`, `routing`, or `telemetry`) set at the call site by the producer. Token estimates are only auto-defaulted from byte counts for `preservation` and `retrieval` events; `routing` and `telemetry` events default `tokensSavedEst` and `tokensPreservedEst` to 0 unless the producer passes explicit values, so capture-hook payloads no longer inflate the savings metric. The Rust ingestion layer derives `category` from `(eventType, decision)` only as a safety net for legacy callers via [[src-tauri/src/context_category.rs#derive_category]] and rejects unknown category strings outside the closed taxonomy. The Python `_attach_context_savings` wrapper in [[src-tauri/claude-integration/mcp/tools/context.py]] also gates its post-response `tokensSavedEst` recomputation loop on `category in ('preservation', 'retrieval')` so routing tools like `quill_search_context` never accumulate phantom savings from JSON response sizing.
+Each event carries an explicit `category` (`preservation`, `retrieval`, `routing`, or `telemetry`) set at the call site by the producer. Token estimates are only auto-defaulted from byte counts for `preservation` and `retrieval` events; `routing` and `telemetry` events default `tokensSavedEst` and `tokensPreservedEst` to 0, and Rust ingestion normalizes those two fields back to 0 for any non-preservation/retrieval category so stale producers cannot inflate savings. The Rust ingestion layer derives `category` from `(eventType, decision)` only as a safety net for legacy callers via [[src-tauri/src/context_category.rs#derive_category]] and rejects unknown category strings outside the closed taxonomy. The Python `_attach_context_savings` wrapper in [[src-tauri/claude-integration/mcp/tools/context.py]] also gates its post-response `tokensSavedEst` recomputation loop on `category in ('preservation', 'retrieval')` so routing tools like `quill_search_context` never accumulate phantom savings from JSON response sizing.
 
 ## Brevity Profile
 
-Per-provider toggle that injects a managed instruction block to compress assistant prose responses without altering code, paths, URLs, or other structural content.
+Single global toggle that injects a managed instruction block into every enabled Claude/Codex provider's agent file to compress assistant prose without altering code, paths, URLs, or other structural content.
 
 ### Feature Toggle
 
-Brevity is controlled by per-provider settings (`provider.<id>.brevity_enabled`) surfaced in the QUILL menu and the standalone Integrations window.
+Brevity is one of the [[features#Settings Window#Integration Features]] flags (`feature.brevity.enabled`) surfaced inside the [[features#Settings Window]]'s Context tab.
 
-[[src-tauri/src/integrations/manager.rs#set_brevity_enabled]] persists the flag and delegates to [[src-tauri/src/brevity.rs#apply_block]], which writes a `<!-- quill-managed:brevity:start --> ... <!-- quill-managed:brevity:end -->` block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex). The block describes the caveman compression style and lists what the assistant must preserve verbatim: code blocks, inline code, URLs, file paths, command names, library and proper-noun names, numbers, env vars, and markdown structure. Disabling strips just the managed block while leaving the rest of the file intact.
+[[src-tauri/src/integrations/manager.rs#set_brevity_enabled]] persists the flag and routes through `set_feature_flag`, which calls `apply_features_to_enabled_providers` to reinstall every enabled Claude/Codex provider and then runs `sync_brevity_blocks` to write or strip a `<!-- quill-managed:brevity:start --> ... <!-- quill-managed:brevity:end -->` block in each provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex). The block describes the caveman compression style and lists what the assistant must preserve verbatim: code blocks, inline code, URLs, file paths, command names, library and proper-noun names, numbers, env vars, and markdown structure. Disabling strips just the managed block while leaving the rest of the file intact. Newly-enabled providers inherit the current global setting through `confirm_enable_with_key`, which calls the same sync helper after install; disabling a provider strips that provider's block via `confirm_disable`.
+
+### Migration
+
+Existing installs that used per-provider brevity keys are migrated to the new global flag on first read of `IntegrationFeatures`.
+
+[[src-tauri/src/integrations/manager.rs#load_integration_features]] calls `read_brevity_setting`, which unions the two legacy values (`provider.claude.brevity_enabled`, `provider.codex.brevity_enabled`) — if either was `true`, the new global flag is initialized `true` so the user does not silently lose the setting — then deletes the legacy keys.
 
 ### Symlink Awareness
 
 The writer canonicalizes the target path before each write so a single underlying file is never edited twice.
 
-When `AGENTS.md` is a symlink to `CLAUDE.md`, the writer detects the shared canonical path and skips the second write so the same brevity block is not duplicated inside the resolved file. MiniMax does not have a managed agent file; `set_brevity_enabled` rejects it with an error before any disk write.
+When `AGENTS.md` is a symlink to `CLAUDE.md`, [[src-tauri/src/brevity.rs#apply_block]] takes the list of providers that should keep the block and uses canonical-path comparison so stripping one provider's block does not clobber a shared canonical file another still-enabled provider wants. MiniMax does not have a managed agent file; `apply_block` rejects it with an error before any disk write.
 
 ## Plugin Manager
 
@@ -259,3 +265,49 @@ Force restart skips the idle-wait phase.
 Restart hook actions are provider-aware.
 
 Claude install writes Quill hook scripts into `~/.claude/settings.json` plus shell integration. Codex restart setup currently installs shell integration only, while Codex integration installs only telemetry/session hooks; the `qbuild-guard.sh` edit guard remains Claude-only because Codex hook coverage does not intercept `apply patch` edits. The shared shell integration is only removed when the last restart-capable provider is disabled, and the restart window groups instances by provider with setup banners per provider when integration is missing.
+
+## Settings Window
+
+Standalone Tauri window opened by the titlebar cogwheel button that exposes every user-configurable feature toggle in one comprehensive surface, replacing the previous inline `ProviderMenu` popover.
+
+### Window Routing
+
+Registered as `?view=settings` in [[src/main.tsx]] and listed in `src-tauri/capabilities/default.json`.
+
+The window is intentionally NOT provider-gated so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]] and follows the same custom-titlebar pattern as the Sessions and Plugins windows (transparent, decorations off, default and min 540x620 with min height 480). The default width matches the min width so the five top tabs always fit on a single row on first launch with a small buffer past the last tab, and the `.settings-tabs` flex container uses `nowrap` so tabs never collapse onto a second row even if the user pushes the window narrower.
+
+### Tab Layout
+
+Top-tabs navigation hosts five panels: General, Integrations, Context, Learning, and Performance.
+
+| Tab | Panel | Settings |
+|-----|-------|----------|
+| General | [[src/components/settings/GeneralTab.tsx]] | Layout (stacked / side-by-side), time visualization mode, Live and Analytics panel visibility, always-on-top toggle, plus a bottom Advanced section with the current-config summary and "Reset to defaults" button covering runtime, learning, and UI prefs |
+| Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form |
+| Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
+| Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
+| Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), plugin update checker enable + interval (1–24h) |
+
+### Integration Features
+
+Four global feature flags decide which optional Quill assets get deployed into Claude Code and Codex when those providers are enabled, modeled by the [[src-tauri/src/models.rs#IntegrationFeatures]] struct.
+
+`context_preservation` (default off), `activity_tracking` (default on), `context_telemetry` (default on, gated on `context_preservation`), and `brevity` (default off) are each persisted as `feature.<name>.enabled` keys in the SQLite settings table. The Settings window writes them via `set_context_preservation_enabled`, `set_activity_tracking_enabled`, `set_context_telemetry_enabled`, and `set_brevity_enabled` IPC commands; each setter saves the key, calls [[src-tauri/src/integrations/manager.rs#apply_features_to_enabled_providers]] to reinstall every currently-enabled provider with the merged feature set (and re-sync brevity blocks via `sync_brevity_blocks`), and emits `integration-features-updated` with the full struct so any open Settings window observes the resolved values without a re-fetch. Newly-enabled providers inherit the current feature set automatically — `confirm_enable_with_key` reads `IntegrationFeatures` from storage and threads it to the installer plus the brevity sync. Activity tracking gates the `observe.cjs` PreToolUse / PostToolUse hooks; context telemetry gates the `context-telemetry.cjs` script; context preservation gates the full context asset bundle (router, capture, MCP tool, full instruction template); brevity gates the `<!-- quill-managed:brevity -->` block in each enabled provider's primary agent file.
+
+### Cross-Window UI Sync
+
+UI preferences stored in `localStorage` (layout mode, time mode, Live/Analytics panel visibility) are shared across Tauri webviews but require an explicit notify so other windows update without reloading.
+
+The [[src/hooks/useUiPrefs.ts#useUiPrefs]] hook writes localStorage and emits a `ui-prefs-updated` Tauri event. The main window's [[src/App.tsx]] subscribes to this event and re-applies layout, time mode, and panel visibility without a reload. The same event drives the "Reset to defaults" button in the Advanced section at the bottom of the General tab.
+
+### Runtime Settings IPC
+
+Always-on background tasks expose enable/interval toggles through a single `RuntimeSettings` IPC pair.
+
+[[src-tauri/src/lib.rs#get_runtime_settings]] and [[src-tauri/src/lib.rs#set_runtime_settings]] persist `live_usage.enabled`, `live_usage.interval_seconds`, `plugin_updates.enabled`, `plugin_updates.interval_hours`, `rule_watcher.enabled`, and `always_on_top` in the SQLite settings table. Live values are read on every iteration of the live-usage loop and the plugin-update checker so changes take effect on the next tick. The rule watcher reads its flag once at startup since `notify` holds an OS handle. Setting `always_on_top` immediately calls `WebviewWindow::set_always_on_top` on the main window. After every save the backend emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] keeps any open Settings windows in sync.
+
+### MiniMax API Key Update
+
+The Integrations tab can update a stored MiniMax API key without disabling and re-enabling the integration.
+
+[[src-tauri/src/lib.rs#set_minimax_api_key]] delegates to [[src-tauri/src/integrations/manager.rs#set_minimax_api_key]] which trims the key, persists it via [[src-tauri/src/integrations/minimax.rs#save_api_key]], refreshes provider statuses, and emits `integrations-updated`. The frontend renders an inline `Save` / `Cancel` form; the dialog-based first-enable flow stays unchanged.

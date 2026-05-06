@@ -1158,36 +1158,65 @@ impl UpdateCheckerState {
     }
 }
 
-pub fn spawn_update_checker(state: Arc<UpdateCheckerState>, app: tauri::AppHandle) {
-    use tauri::Emitter;
+// Reads `plugin_updates.enabled` and `plugin_updates.interval_hours` from the
+// shared Storage singleton each tick so the Settings window can toggle/retune
+// at runtime without restart. Returns (enabled, interval_seconds). Defaults
+// match `RuntimeSettings::default()`.
+fn read_update_checker_config(storage: &crate::storage::Storage) -> (bool, u64) {
+    let enabled = storage
+        .get_setting("plugin_updates.enabled")
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(true);
+    let hours: i64 = storage
+        .get_setting("plugin_updates.interval_hours")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .clamp(1, 24);
+    (enabled, (hours as u64) * 60 * 60)
+}
 
-    let interval_secs: u64 = 4 * 60 * 60;
+pub fn spawn_update_checker(
+    state: Arc<UpdateCheckerState>,
+    app: tauri::AppHandle,
+    storage: &'static crate::storage::Storage,
+) {
+    use tauri::Emitter;
 
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
         let mut last_count: usize = 0;
         loop {
-            let result =
-                tokio::task::block_in_place(|| get_available_updates(IntegrationProvider::Claude));
+            let (enabled, interval_secs) = read_update_checker_config(storage);
 
-            if let Ok(updates) = result {
-                let count = updates.len();
-                let now = chrono::Utc::now().to_rfc3339();
-                let next = (chrono::Utc::now() + chrono::Duration::seconds(interval_secs as i64))
+            if enabled {
+                let result = tokio::task::block_in_place(|| {
+                    get_available_updates(IntegrationProvider::Claude)
+                });
+
+                if let Ok(updates) = result {
+                    let count = updates.len();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let next = (chrono::Utc::now()
+                        + chrono::Duration::seconds(interval_secs as i64))
                     .to_rfc3339();
 
-                let check_result = UpdateCheckResult {
-                    plugin_updates: updates,
-                    last_checked: Some(now),
-                    next_check: Some(next),
-                };
+                    let check_result = UpdateCheckResult {
+                        plugin_updates: updates,
+                        last_checked: Some(now),
+                        next_check: Some(next),
+                    };
 
-                *state.last_result.lock() = check_result;
+                    *state.last_result.lock() = check_result;
 
-                if count != last_count {
-                    let _ = app.emit("plugin-updates-available", count);
-                    last_count = count;
+                    if count != last_count {
+                        let _ = app.emit("plugin-updates-available", count);
+                        last_count = count;
+                    }
                 }
             }
 

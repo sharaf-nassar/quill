@@ -312,6 +312,7 @@ pub struct ContextSavingsEvent {
     pub event_type: String,
     pub source: String,
     pub decision: String,
+    pub category: String,
     pub reason: Option<String>,
     pub delivered: bool,
     pub indexed_bytes: Option<i64>,
@@ -501,6 +502,57 @@ impl Default for LearningSettings {
             periodic_minutes: 180,
             min_observations: 50,
             min_confidence: 0.95,
+        }
+    }
+}
+
+// Per-installation feature toggles that decide which optional Quill assets
+// get deployed into Claude Code and Codex when those providers are enabled.
+// Defaults preserve pre-Settings-window behavior: context preservation OFF
+// (the user has to opt in), activity tracking and context telemetry ON,
+// brevity OFF (caveman compression is opt-in).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct IntegrationFeatures {
+    pub context_preservation: bool,
+    pub activity_tracking: bool,
+    pub context_telemetry: bool,
+    pub brevity: bool,
+}
+
+impl Default for IntegrationFeatures {
+    fn default() -> Self {
+        Self {
+            context_preservation: false,
+            activity_tracking: true,
+            context_telemetry: true,
+            brevity: false,
+        }
+    }
+}
+
+// Runtime feature toggles for currently always-on background tasks.
+// Defaults preserve pre-Settings-window behavior (everything on).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSettings {
+    pub live_usage_enabled: bool,
+    pub live_usage_interval_seconds: i64,
+    pub plugin_updates_enabled: bool,
+    pub plugin_updates_interval_hours: i64,
+    pub rule_watcher_enabled: bool,
+    pub always_on_top: bool,
+}
+
+impl Default for RuntimeSettings {
+    fn default() -> Self {
+        Self {
+            live_usage_enabled: true,
+            live_usage_interval_seconds: 180,
+            plugin_updates_enabled: true,
+            plugin_updates_interval_hours: 4,
+            rule_watcher_enabled: true,
+            always_on_top: false,
         }
     }
 }

@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capabilities for Quill widget",
-  "windows": ["main", "runs", "sessions", "learning", "plugins", "restart", "integrations", "release-notes"],
+  "windows": ["main", "runs", "sessions", "learning", "plugins", "restart", "settings", "release-notes"],
   "permissions": [
     "core:default",
     "core:window:default",

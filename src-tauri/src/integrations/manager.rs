@@ -1,12 +1,78 @@
 use super::{claude, codex, minimax};
 use crate::brevity;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
-use crate::models::ContextPreservationStatus;
+use crate::models::{ContextPreservationStatus, IntegrationFeatures};
 use crate::storage::Storage;
 use chrono::Utc;
 use tauri::{AppHandle, Emitter};
 
 const CONTEXT_PRESERVATION_ENABLED_KEY: &str = "context_preservation.enabled";
+const ACTIVITY_TRACKING_ENABLED_KEY: &str = "feature.activity_tracking.enabled";
+const CONTEXT_TELEMETRY_ENABLED_KEY: &str = "feature.context_telemetry.enabled";
+const BREVITY_ENABLED_KEY: &str = "feature.brevity.enabled";
+
+// Legacy per-provider brevity keys that pre-date the consolidated global flag.
+// On first read after upgrade, any value of `true` here promotes the global
+// brevity feature to ON so existing users do not silently lose their setting.
+const LEGACY_BREVITY_KEY_CLAUDE: &str = "provider.claude.brevity_enabled";
+const LEGACY_BREVITY_KEY_CODEX: &str = "provider.codex.brevity_enabled";
+
+fn read_bool_setting(storage: &Storage, key: &str, default: bool) -> Result<bool, String> {
+    Ok(storage
+        .get_setting(key)?
+        .map(|value| value == "true")
+        .unwrap_or(default))
+}
+
+fn read_brevity_setting(storage: &Storage, default: bool) -> Result<bool, String> {
+    if let Some(value) = storage.get_setting(BREVITY_ENABLED_KEY)? {
+        return Ok(value == "true");
+    }
+    let legacy_on = [LEGACY_BREVITY_KEY_CLAUDE, LEGACY_BREVITY_KEY_CODEX]
+        .iter()
+        .any(|key| {
+            storage
+                .get_setting(key)
+                .ok()
+                .flatten()
+                .is_some_and(|value| value == "true")
+        });
+    let resolved = legacy_on || default;
+    storage.set_setting(BREVITY_ENABLED_KEY, if resolved { "true" } else { "false" })?;
+    let _ = storage.delete_setting(LEGACY_BREVITY_KEY_CLAUDE);
+    let _ = storage.delete_setting(LEGACY_BREVITY_KEY_CODEX);
+    Ok(resolved)
+}
+
+pub fn load_integration_features(storage: &Storage) -> Result<IntegrationFeatures, String> {
+    let defaults = IntegrationFeatures::default();
+    Ok(IntegrationFeatures {
+        context_preservation: read_bool_setting(
+            storage,
+            CONTEXT_PRESERVATION_ENABLED_KEY,
+            defaults.context_preservation,
+        )?,
+        activity_tracking: read_bool_setting(
+            storage,
+            ACTIVITY_TRACKING_ENABLED_KEY,
+            defaults.activity_tracking,
+        )?,
+        context_telemetry: read_bool_setting(
+            storage,
+            CONTEXT_TELEMETRY_ENABLED_KEY,
+            defaults.context_telemetry,
+        )?,
+        brevity: read_brevity_setting(storage, defaults.brevity)?,
+    })
+}
+
+pub fn get_integration_features(storage: &Storage) -> Result<IntegrationFeatures, String> {
+    load_integration_features(storage)
+}
+
+fn emit_features(app: &AppHandle, features: &IntegrationFeatures) {
+    let _ = app.emit("integration-features-updated", features);
+}
 
 pub fn detect_all() -> Result<Vec<ProviderStatus>, String> {
     let storage = Storage::init()?;
@@ -42,14 +108,14 @@ pub fn confirm_enable_with_key(
     api_key: Option<String>,
 ) -> Result<ProviderStatus, String> {
     let storage = Storage::init()?;
-    let context_enabled = context_preservation_enabled(&storage)?;
+    let features = load_integration_features(&storage)?;
 
     match provider {
         IntegrationProvider::Claude => {
-            claude::install(app, context_enabled)?;
+            claude::install(app, features)?;
         }
         IntegrationProvider::Codex => {
-            codex::install(app, context_enabled)?;
+            codex::install(app, features)?;
         }
         IntegrationProvider::MiniMax => {
             let key = api_key
@@ -60,75 +126,64 @@ pub fn confirm_enable_with_key(
         }
     }
 
-    // Re-apply any persisted per-provider brevity preference so reinstalling a
-    // provider does not silently drop its brevity block.
-    if matches!(
-        provider,
-        IntegrationProvider::Claude | IntegrationProvider::Codex
-    ) {
-        let brevity_enabled = brevity::read_persisted(&storage, provider).unwrap_or(false);
-        if let Err(err) = brevity::apply_block(&storage, provider, brevity_enabled) {
-            log::warn!("Failed to apply brevity block for {provider:?}: {err}");
-        }
-    }
-
     let mut statuses = detect_all_with_storage(&storage)?;
-    let status = statuses
-        .iter_mut()
-        .find(|status| status.provider == provider)
-        .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
+    let status = {
+        let entry = statuses
+            .iter_mut()
+            .find(|status| status.provider == provider)
+            .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
 
-    status.enabled = true;
-    status.user_has_made_choice = true;
-    status.last_error = None;
-    status.setup_state = match (status.detected_cli, status.detected_home) {
-        (true, true) => ProviderSetupState::Installed,
-        (false, false) => ProviderSetupState::NotInstalled,
-        _ => ProviderSetupState::Missing,
+        entry.enabled = true;
+        entry.user_has_made_choice = true;
+        entry.last_error = None;
+        entry.setup_state = match (entry.detected_cli, entry.detected_home) {
+            (true, true) => ProviderSetupState::Installed,
+            (false, false) => ProviderSetupState::NotInstalled,
+            _ => ProviderSetupState::Missing,
+        };
+        entry.clone()
     };
 
-    let status = status.clone();
+    // Re-apply the global brevity block to every still-enabled Claude/Codex
+    // provider so a freshly-enabled provider inherits the current setting and
+    // a reinstalled provider's instruction file is not silently left without
+    // its block.
+    if let Err(err) = sync_brevity_blocks(&statuses, features) {
+        log::warn!("Failed to sync brevity blocks after enabling {provider:?}: {err}");
+    }
+
     save_statuses(&storage, &statuses)?;
     emit_statuses(app, &statuses);
 
     Ok(status)
 }
 
-pub fn set_brevity_enabled(
-    app: &AppHandle,
-    provider: IntegrationProvider,
-    enabled: bool,
-) -> Result<ProviderStatus, String> {
-    if !matches!(
-        provider,
-        IntegrationProvider::Claude | IntegrationProvider::Codex
-    ) {
-        return Err(format!(
-            "Brevity profile is not supported for provider {provider:?}."
-        ));
+pub fn set_minimax_api_key(app: &AppHandle, api_key: &str) -> Result<ProviderStatus, String> {
+    let trimmed = api_key.trim();
+    if trimmed.is_empty() {
+        return Err("API key is required.".to_string());
     }
-
     let storage = Storage::init()?;
-    brevity::write_persisted(&storage, provider, enabled)?;
-
-    if let Err(err) = brevity::apply_block(&storage, provider, enabled) {
-        // Persisted state already updated; surface the failure but do not
-        // unwind so that a partial filesystem error stays visible to the user.
-        log::warn!("Failed to apply brevity block for {provider:?}: {err}");
-        return Err(err);
-    }
+    minimax::save_api_key(&storage, trimmed)?;
 
     let mut statuses = detect_all_with_storage(&storage)?;
     let status = statuses
         .iter_mut()
-        .find(|status| status.provider == provider)
-        .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
-    status.brevity_enabled = enabled;
+        .find(|status| status.provider == IntegrationProvider::MiniMax)
+        .ok_or_else(|| "MiniMax provider not found.".to_string())?;
+    status.enabled = true;
+    status.user_has_made_choice = true;
+    status.last_error = None;
+    status.setup_state = ProviderSetupState::Installed;
+
     let status = status.clone();
     save_statuses(&storage, &statuses)?;
     emit_statuses(app, &statuses);
-
     Ok(status)
+}
+
+pub fn set_brevity_enabled(app: &AppHandle, enabled: bool) -> Result<IntegrationFeatures, String> {
+    set_feature_flag(app, BREVITY_ENABLED_KEY, enabled)
 }
 
 pub fn confirm_disable(
@@ -136,23 +191,24 @@ pub fn confirm_disable(
     provider: IntegrationProvider,
 ) -> Result<ProviderStatus, String> {
     let storage = Storage::init()?;
-    let existing_statuses = detect_all_with_storage(&storage)?;
+    let features = load_integration_features(&storage)?;
+    let mut existing_statuses = detect_all_with_storage(&storage)?;
     let remove_shared_restart_assets = !existing_statuses
         .iter()
         .any(|status| status.provider != provider && status.enabled);
 
-    // Strip this provider's brevity block first (with cross-provider sharing
-    // awareness) before the provider uninstall touches the file. Then clear
-    // the persisted flag so reinstalling does not silently re-inject a block
-    // the user no longer wants.
-    if matches!(
-        provider,
-        IntegrationProvider::Claude | IntegrationProvider::Codex
-    ) {
-        if let Err(err) = brevity::apply_block(&storage, provider, false) {
-            log::warn!("Failed to strip brevity block for {provider:?} on disable: {err}");
-        }
-        let _ = brevity::write_persisted(&storage, provider, false);
+    // Strip this provider's brevity block before the provider uninstall
+    // touches the file, but mark it disabled in the working status list first
+    // so `sync_brevity_blocks` knows not to re-write a block to a canonical
+    // file shared with another still-enabled provider.
+    if let Some(status) = existing_statuses
+        .iter_mut()
+        .find(|s| s.provider == provider)
+    {
+        status.enabled = false;
+    }
+    if let Err(err) = sync_brevity_blocks(&existing_statuses, features) {
+        log::warn!("Failed to sync brevity blocks during disable of {provider:?}: {err}");
     }
 
     match provider {
@@ -174,7 +230,6 @@ pub fn confirm_disable(
         .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
 
     status.enabled = false;
-    status.brevity_enabled = false;
     status.user_has_made_choice = true;
     status.last_error = None;
     status.setup_state = match (status.detected_cli, status.detected_home) {
@@ -218,7 +273,7 @@ pub fn get_context_preservation_status(
     storage: &Storage,
 ) -> Result<ContextPreservationStatus, String> {
     Ok(ContextPreservationStatus {
-        enabled: context_preservation_enabled(storage)?,
+        enabled: load_integration_features(storage)?.context_preservation,
         has_context_savings_events: storage.has_context_savings_events()?,
     })
 }
@@ -228,26 +283,90 @@ pub fn set_context_preservation_enabled(
     enabled: bool,
 ) -> Result<ContextPreservationStatus, String> {
     let storage = Storage::init()?;
-    let mut statuses = detect_all_with_storage(&storage)?;
-
-    sync_context_preservation_for_enabled_providers(app, enabled, &mut statuses)?;
     storage.set_setting(
         CONTEXT_PRESERVATION_ENABLED_KEY,
         if enabled { "true" } else { "false" },
     )?;
-
-    save_statuses(&storage, &statuses)?;
-    emit_statuses(app, &statuses);
+    apply_features_to_enabled_providers(app, &storage)?;
 
     let status = get_context_preservation_status(&storage)?;
     emit_context_preservation_status(app, &status);
     Ok(status)
 }
 
-fn context_preservation_enabled(storage: &Storage) -> Result<bool, String> {
-    Ok(storage
-        .get_setting(CONTEXT_PRESERVATION_ENABLED_KEY)?
-        .is_some_and(|value| value == "true"))
+pub fn set_activity_tracking_enabled(
+    app: &AppHandle,
+    enabled: bool,
+) -> Result<IntegrationFeatures, String> {
+    set_feature_flag(app, ACTIVITY_TRACKING_ENABLED_KEY, enabled)
+}
+
+pub fn set_context_telemetry_enabled(
+    app: &AppHandle,
+    enabled: bool,
+) -> Result<IntegrationFeatures, String> {
+    set_feature_flag(app, CONTEXT_TELEMETRY_ENABLED_KEY, enabled)
+}
+
+fn set_feature_flag(
+    app: &AppHandle,
+    key: &str,
+    enabled: bool,
+) -> Result<IntegrationFeatures, String> {
+    let storage = Storage::init()?;
+    storage.set_setting(key, if enabled { "true" } else { "false" })?;
+    apply_features_to_enabled_providers(app, &storage)?;
+    let features = load_integration_features(&storage)?;
+    emit_features(app, &features);
+    Ok(features)
+}
+
+// Reinstalls every currently-enabled Claude/Codex provider with the
+// up-to-date `IntegrationFeatures` read from storage. Used by every feature
+// toggle so a single user action propagates to all enabled providers without
+// the caller having to track state.
+fn apply_features_to_enabled_providers(app: &AppHandle, storage: &Storage) -> Result<(), String> {
+    let mut statuses = detect_all_with_storage(storage)?;
+    let features = load_integration_features(storage)?;
+    sync_features_for_enabled_providers(app, features, &mut statuses)?;
+    if let Err(err) = sync_brevity_blocks(&statuses, features) {
+        log::warn!("Failed to sync brevity blocks after feature update: {err}");
+    }
+    save_statuses(storage, &statuses)?;
+    emit_statuses(app, &statuses);
+    Ok(())
+}
+
+// Re-applies the global brevity block to each Claude/Codex instruction file
+// based on the current per-provider enabled state plus the global
+// `features.brevity` flag. A provider's file gets a block iff the provider is
+// enabled AND brevity is on globally; symlink-shared canonical paths are
+// resolved by `brevity::apply_block`.
+fn sync_brevity_blocks(
+    statuses: &[ProviderStatus],
+    features: IntegrationFeatures,
+) -> Result<(), String> {
+    let providers_with_block: Vec<IntegrationProvider> = statuses
+        .iter()
+        .filter(|status| {
+            features.brevity
+                && status.enabled
+                && matches!(
+                    status.provider,
+                    IntegrationProvider::Claude | IntegrationProvider::Codex
+                )
+        })
+        .map(|status| status.provider)
+        .collect();
+
+    for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
+        let present = providers_with_block.contains(&provider);
+        if let Err(err) = brevity::apply_block(provider, present, &providers_with_block) {
+            log::warn!("Failed to sync brevity block for {provider:?}: {err}");
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
@@ -271,11 +390,11 @@ fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, Stri
 }
 
 fn repair_enabled_providers(app: &AppHandle, storage: &Storage, statuses: &mut [ProviderStatus]) {
-    let context_enabled = match context_preservation_enabled(storage) {
-        Ok(enabled) => enabled,
+    let features = match load_integration_features(storage) {
+        Ok(features) => features,
         Err(err) => {
-            log::warn!("Failed to read context preservation setting during startup repair: {err}");
-            false
+            log::warn!("Failed to read integration features during startup repair: {err}");
+            IntegrationFeatures::default()
         }
     };
 
@@ -285,7 +404,7 @@ fn repair_enabled_providers(app: &AppHandle, storage: &Storage, statuses: &mut [
         }
 
         let verified_at = Utc::now().to_rfc3339();
-        match repair_provider(app, status.provider, context_enabled) {
+        match repair_provider(app, status.provider, features) {
             Ok(()) => {
                 status.setup_state = ProviderSetupState::Installed;
                 status.last_error = None;
@@ -330,30 +449,30 @@ fn should_sync_context_assets(status: &ProviderStatus) -> bool {
 fn repair_provider(
     app: &AppHandle,
     provider: IntegrationProvider,
-    context_enabled: bool,
+    features: IntegrationFeatures,
 ) -> Result<(), String> {
     match provider {
         IntegrationProvider::Claude => {
-            if crate::claude_setup::verify(context_enabled).is_ok() {
+            if crate::claude_setup::verify(features).is_ok() {
                 return Ok(());
             }
-            claude::install(app, context_enabled)?;
-            crate::claude_setup::verify(context_enabled)
+            claude::install(app, features)?;
+            crate::claude_setup::verify(features)
         }
         IntegrationProvider::Codex => {
-            if codex::verify(context_enabled).is_ok() {
+            if codex::verify(features).is_ok() {
                 return Ok(());
             }
-            codex::install(app, context_enabled)?;
-            codex::verify(context_enabled)
+            codex::install(app, features)?;
+            codex::verify(features)
         }
         IntegrationProvider::MiniMax => Ok(()),
     }
 }
 
-fn sync_context_preservation_for_enabled_providers(
+fn sync_features_for_enabled_providers(
     app: &AppHandle,
-    context_enabled: bool,
+    features: IntegrationFeatures,
     statuses: &mut [ProviderStatus],
 ) -> Result<(), String> {
     for status in statuses.iter_mut() {
@@ -363,8 +482,8 @@ fn sync_context_preservation_for_enabled_providers(
 
         let verified_at = Utc::now().to_rfc3339();
         let result = match status.provider {
-            IntegrationProvider::Claude => claude::install(app, context_enabled).map(|_| ()),
-            IntegrationProvider::Codex => codex::install(app, context_enabled).map(|_| ()),
+            IntegrationProvider::Claude => claude::install(app, features).map(|_| ()),
+            IntegrationProvider::Codex => codex::install(app, features).map(|_| ()),
             IntegrationProvider::MiniMax => Ok(()),
         };
 
@@ -406,16 +525,10 @@ fn merge_saved_statuses(
                 status.enabled = saved.enabled;
                 status.user_has_made_choice = saved.user_has_made_choice;
                 status.last_error = saved.last_error.clone();
-                status.brevity_enabled = saved.brevity_enabled;
                 if status.enabled && !status.detected_cli && !status.detected_home {
                     status.setup_state = ProviderSetupState::Missing;
                 }
             }
-            // Dedicated settings key wins over the JSON blob so the value stays
-            // in sync if it was toggled directly via set_brevity_enabled before
-            // any other field was rewritten.
-            status.brevity_enabled =
-                brevity::read_persisted(storage, status.provider).unwrap_or(status.brevity_enabled);
             status
         })
         .collect())

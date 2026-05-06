@@ -82,8 +82,6 @@ pub struct ProviderStatus {
     pub user_has_made_choice: bool,
     pub last_error: Option<String>,
     pub last_verified_at: Option<String>,
-    #[serde(default)]
-    pub brevity_enabled: bool,
     /// Paths inspected during the last CLI detection attempt. Populated only
     /// when detection failed so the UI can explain why a provider shows N/A
     /// despite being installed.

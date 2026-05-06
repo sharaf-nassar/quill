@@ -15,15 +15,15 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 Each major feature runs in its own Tauri window, routed via URL query parameter in [[src/main.tsx]].
 
-The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], and [[features#Restart Orchestrator]], with [[src/main.tsx]] blocking provider-dependent windows when no provider is enabled.
+The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. Secondary windows open for [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], [[features#Restart Orchestrator]], and [[features#Settings Window]], with [[src/main.tsx]] blocking provider-dependent windows when no provider is enabled.
 
-The titlebar's right-side cogwheel button opens an inline `ProviderMenu` popover for layout, status, context preservation, brevity, and provider enable/disable actions, rendered inside the main window with a backdrop overlay for click-outside dismissal. Hovering any row shows a portal-rendered tooltip with the section's full feature description.
+The titlebar's right-side cogwheel button opens the standalone Settings window via `?view=settings`. The previous inline `ProviderMenu` popover has been removed in favor of the dedicated window so all toggles and runtime preferences live in one comprehensive surface.
 
 ### Window Configuration
 
-The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `runs`, `sessions`, `learning`, `plugins`, `restart`, and `integrations`.
+The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `runs`, `sessions`, `learning`, `plugins`, `restart`, `settings`, and `release-notes`.
 
-The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls, a centered static `QUILL` brand label, and a right-aligned cluster with a cogwheel settings button (left of the version) that opens the inline `ProviderMenu` popover, followed by the version and close controls.
+The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls, a centered static `QUILL` brand label, and a right-aligned cluster with a cogwheel button that opens the Settings window, followed by the version and close controls.
 
 ## Module Map
 
@@ -97,9 +97,10 @@ All tasks that touch the database or network MUST be spawned async — never blo
 
 - **Hourly cleanup**: Aggregates snapshots into hourly tables, prunes old data, compresses observations
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
-- **Plugin update checker**: Polls marketplaces every 4 hours for available updates
+- **Plugin update checker**: Polls marketplaces for available updates. Both the master enable flag (`plugin_updates.enabled`) and the interval (`plugin_updates.interval_hours`, 1–24, default 4) are read from the settings table on every tick so the [[features#Settings Window]] can adjust both at runtime without a restart.
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
-- **Live usage refresh**: Reuses one shared 3-minute refresh path to update the main widget and tray summary rows
+- **Live usage refresh**: Background loop that updates the main widget and tray summary rows. The enable flag (`live_usage.enabled`) and refresh interval (`live_usage.interval_seconds`, 60–600, default 180) are read from the settings table on every iteration so the [[features#Settings Window]] can adjust both at runtime.
+- **Rule filesystem watcher**: Optional. The `rule_watcher.enabled` setting (default true) is checked at startup; disabling skips the `notify` watcher entirely. Live re-toggling takes effect after the next app launch since the watcher holds an OS handle.
 - **Tray "Check for Update"**: Manual trigger via system tray menu. Uses `tauri-plugin-dialog` to show a native OS confirmation dialog when an update is found (Install / Not Now), or an info dialog when already up to date. The frontend still performs its own 4-hour availability check via `@tauri-apps/plugin-updater`, but the titlebar install action now delegates to [[src-tauri/src/lib.rs#install_app_update]] so Rust owns the install-and-restart boundary.
 
 ## Single Instance

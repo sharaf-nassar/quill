@@ -59,8 +59,11 @@ CREATE INDEX IF NOT EXISTS idx_context_savings_event_type_timestamp
     ON context_savings_events(event_type, timestamp);
 CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
     ON context_savings_events(cwd, timestamp);
-CREATE INDEX IF NOT EXISTS idx_context_savings_category_timestamp
-    ON context_savings_events(category, timestamp);
+-- The `idx_context_savings_category_timestamp` index is created in
+-- migration 18, after the `category` column has been added via ALTER
+-- TABLE. Keeping it here would fail on databases that were created
+-- before migration 18 because the column does not yet exist when this
+-- batch runs (the early init batch executes before migrations).
 "#;
 // Aggregate fragment shared by summary, timeseries, and breakdowns.
 //
@@ -631,6 +634,20 @@ fn backfill_context_event_categories(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_context_event_token_estimates(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "UPDATE context_savings_events
+         SET tokens_saved_est = 0,
+             tokens_preserved_est = 0
+         WHERE category NOT IN ('preservation', 'retrieval')
+           AND (COALESCE(tokens_saved_est, 0) != 0
+                OR COALESCE(tokens_preserved_est, 0) != 0)",
+        [],
+    )
+    .map_err(|e| format!("Normalize context savings token estimates error: {e}"))?;
+    Ok(())
+}
+
 fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
     let conditional_indexes = [
         (
@@ -862,8 +879,11 @@ impl Storage {
                 ON context_savings_events(event_type, timestamp);
             CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
                 ON context_savings_events(cwd, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_context_savings_category_timestamp
-                ON context_savings_events(category, timestamp);"#,
+            -- The category index is created by migration 18 after ALTER
+            -- TABLE adds the column.  Keeping it here would crash startup
+            -- for any database created before migration 18 because the
+            -- column does not exist when this batch runs.
+            "#,
         )
         .map_err(|e| format!("Failed to create tables: {e}"))?;
 
@@ -1502,6 +1522,14 @@ impl Storage {
 
             conn.execute("INSERT INTO schema_version (version) VALUES (18)", [])
                 .map_err(|e| format!("Failed to record migration 18: {e}"))?;
+        }
+
+        if current_version < 19 {
+            backfill_context_event_categories(&conn)?;
+            normalize_context_event_token_estimates(&conn)?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (19)", [])
+                .map_err(|e| format!("Failed to record migration 19: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -2183,6 +2211,17 @@ impl Storage {
                         crate::context_category::derive_category(&event.event_type, &event.decision)
                             .to_string()
                     });
+                let token_scope = matches!(category.as_str(), "preservation" | "retrieval");
+                let tokens_saved_est = if token_scope {
+                    event.tokens_saved_est
+                } else {
+                    Some(0)
+                };
+                let tokens_preserved_est = if token_scope {
+                    event.tokens_preserved_est
+                } else {
+                    Some(0)
+                };
 
                 let changed = stmt
                     .execute(params![
@@ -2204,8 +2243,8 @@ impl Storage {
                         event.input_bytes,
                         event.tokens_indexed_est,
                         event.tokens_returned_est,
-                        event.tokens_saved_est,
-                        event.tokens_preserved_est,
+                        tokens_saved_est,
+                        tokens_preserved_est,
                         event.estimate_method.as_deref(),
                         event.estimate_confidence,
                         event.source_ref.as_deref(),
@@ -2387,6 +2426,7 @@ impl Storage {
                      event_type,
                      source,
                      decision,
+                     category,
                      reason,
                      delivered,
                      indexed_bytes,
@@ -2395,6 +2435,7 @@ impl Storage {
                      tokens_indexed_est,
                      tokens_returned_est,
                      CASE
+                         WHEN category NOT IN ('preservation', 'retrieval') THEN 0
                          WHEN tokens_saved_est IS NOT NULL
                              AND NOT (
                                  tokens_saved_est = 0
@@ -2410,7 +2451,11 @@ impl Storage {
                              END
                          ELSE 0
                      END AS tokens_saved_est,
-                     tokens_preserved_est,
+                     CASE
+                         WHEN category IN ('preservation', 'retrieval')
+                             THEN tokens_preserved_est
+                         ELSE 0
+                     END AS tokens_preserved_est,
                      estimate_method,
                      estimate_confidence,
                      source_ref,
@@ -2437,21 +2482,22 @@ impl Storage {
                     event_type: row.get(7)?,
                     source: row.get(8)?,
                     decision: row.get(9)?,
-                    reason: row.get(10)?,
-                    delivered: row.get::<_, i64>(11)? != 0,
-                    indexed_bytes: row.get(12)?,
-                    returned_bytes: row.get(13)?,
-                    input_bytes: row.get(14)?,
-                    tokens_indexed_est: row.get(15)?,
-                    tokens_returned_est: row.get(16)?,
-                    tokens_saved_est: row.get(17)?,
-                    tokens_preserved_est: row.get(18)?,
-                    estimate_method: row.get(19)?,
-                    estimate_confidence: row.get(20)?,
-                    source_ref: row.get(21)?,
-                    snapshot_ref: row.get(22)?,
-                    metadata_json: parse_context_savings_metadata(row.get(23)?),
-                    created_at: row.get(24)?,
+                    category: row.get(10)?,
+                    reason: row.get(11)?,
+                    delivered: row.get::<_, i64>(12)? != 0,
+                    indexed_bytes: row.get(13)?,
+                    returned_bytes: row.get(14)?,
+                    input_bytes: row.get(15)?,
+                    tokens_indexed_est: row.get(16)?,
+                    tokens_returned_est: row.get(17)?,
+                    tokens_saved_est: row.get(18)?,
+                    tokens_preserved_est: row.get(19)?,
+                    estimate_method: row.get(20)?,
+                    estimate_confidence: row.get(21)?,
+                    source_ref: row.get(22)?,
+                    snapshot_ref: row.get(23)?,
+                    metadata_json: parse_context_savings_metadata(row.get(24)?),
+                    created_at: row.get(25)?,
                 })
             })
             .map_err(|e| format!("Query recent context savings events error: {e}"))?;

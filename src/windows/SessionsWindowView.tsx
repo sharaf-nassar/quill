@@ -65,7 +65,7 @@ function SessionsWindowView() {
 			setSyncError(null);
 
 			try {
-				await invoke<number>("rebuild_search_index");
+				await invoke<number>("sync_search_index");
 			} catch (error) {
 				if (!cancelled) {
 					setSyncError(String(error));

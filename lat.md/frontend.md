@@ -20,10 +20,10 @@ Eight Tauri windows are routed by the `?view=` URL parameter, each with its own 
 | `?view=plugins` | `PluginsWindowView` | Plugin management |
 | `?view=restart` | `RestartWindowView` | Claude Code instance restart |
 | `?view=runs` | `RunsWindowView` | Learning run history details |
-| `?view=integrations` | `IntegrationsWindowView` | Standalone provider enable/disable (unused since inline popover migration) |
+| `?view=settings` | `SettingsWindowView` | Comprehensive feature toggle and runtime configuration surface |
 | `?view=release-notes` | `ReleaseNotesWindow` | Browse published GitHub release notes |
 
-The `release-notes` route is the only secondary window not gated on having an enabled provider; it stays reachable so users can read changelog history regardless of integration state.
+The `settings` and `release-notes` routes are not gated on having an enabled provider; both stay reachable so users can manage integrations and browse changelog history regardless of integration state.
 
 ## Main Window Layout
 
@@ -39,7 +39,7 @@ The shared `.content` class centers its children for full-pane loading and empty
 
 The main window nests `TitleBar` at the top, `UsageDisplay` and `AnalyticsView` in the panels area.
 
-`TitleBar` has feature buttons on the left, a centered static `QUILL` brand label, and a right-side cluster with a cogwheel settings button (immediately left of the version) that opens the inline `ProviderMenu` popover containing Layout, Status, Context, Integrations, and Brevity sections, followed by the version and close controls. `UsageDisplay` shows live rate limit buckets. `AnalyticsView` renders tabbed analytics. In stacked mode, Live is above Analytics; in side-by-side mode, Live is on the left and Analytics on the right.
+`TitleBar` has feature buttons on the left, a centered static `QUILL` brand label, and a right-side cluster with a cogwheel button (immediately left of the version) that opens the standalone [[features#Settings Window]], followed by the version and close controls. `UsageDisplay` shows live rate limit buckets. `AnalyticsView` renders tabbed analytics. In stacked mode, Live is above Analytics; in side-by-side mode, Live is on the left and Analytics on the right.
 
 ## Components
 
@@ -71,7 +71,7 @@ Recharts-based analytics in `src/components/analytics/` with Now, Trends, Charts
 - **ContextSavingsTab** — Context preservation analytics with a four-column stats strip (saved, indexed, returned, routing) over a stacked trend chart, breakdown table, and recent events feed. Breakdown rows render a relative-magnitude bar fill behind each row scaled to the largest event count, and recent events use a single-line log format with category swatches and a directional byte arrow (→ indexed, ← returned). Confidence is hidden for exact estimates. `AnalyticsView` shows this tab only when context preservation is enabled or historical context-savings events exist.
 - **UsageChart** (456 lines) — `ComposedChart` with Area, Line, and custom Tooltip. Uses `ChartCrosshairContext` for tooltip synchronization.
 - **BreakdownPanel** (504 lines) — Sortable table showing hosts, projects, or sessions with token counts and turn counts. Session rows display provider badges and use provider-safe composite keys for selection.
-- **Insight cards**: `InsightCard` (generic), `SessionHealthCard`, `ProjectFocusCard`, `LearningProgressCard` — each shows a metric with trend arrow and sparkline.
+- **Insight cards**: `InsightCard` (generic), `SessionHealthCard`, `ProjectFocusCard`, `LearningProgressCard` — each shows a metric with trend arrow and sparkline. `InsightCard` also accepts an optional `description` prop that renders a top-right `?` help button and a sibling `.insight-card-tooltip` span; the [[features#Analytics Dashboard#Now Tab]] right-column context-savings cards opt into this for in-place metric explanations.
 - **Sparklines**: `TokenSparkline`, `CodeSparkline`, `MiniChart` — small inline Recharts charts.
 - **Utility**: `TabBar`, `TogglePills` (range selector), `ActivityHeatmap`, `CompactStatsRow`, `shared.tsx` (getColor, TrendArrow).
 
@@ -119,7 +119,20 @@ All data hooks use Tauri `invoke()` for request-response and `listen()` for push
 
 `useIntegrations` in [[src/hooks/useIntegrations.ts]] loads provider statuses plus the persisted indicator primary provider, listens for `integrations-updated` and `indicator-updated`, and tracks per-provider in-flight actions.
 
-It drives the inline integrations popover in TitleBar, the standalone integrations window, and blocked-window gating. The `enableProvider` function accepts an optional `apiKey` argument used by service-only providers like MiniMax, while `saveIndicatorPrimaryProvider` persists the status-indicator preference without introducing a separate frontend polling path. `rescan` invokes the `rescan_integrations` IPC and tracks `rescanInFlight` so the menu's "Rescan PATH" toggle can spin while the backend re-derives the login-shell PATH and re-runs detection.
+It drives the [[features#Settings Window]]'s Integrations tab and blocked-window gating. The `enableProvider` function accepts an optional `apiKey` argument used by service-only providers like MiniMax, while `saveIndicatorPrimaryProvider` persists the status-indicator preference without introducing a separate frontend polling path. `rescan` invokes the `rescan_integrations` IPC and tracks `rescanInFlight` so the "Rescan PATH" row can spin while the backend re-derives the login-shell PATH and re-runs detection.
+
+### Settings Hooks
+
+Four hooks back the [[features#Settings Window]]: each owns one slice of state, calls Tauri IPC for mutations, and subscribes to the matching push event so multiple open Settings windows stay in sync.
+
+| Hook | File | Source of truth | Listens for |
+|------|------|-----------------|-------------|
+| `useIntegrationFeatures` | [[src/hooks/useIntegrationFeatures.ts]] | `IntegrationFeatures` global flags (context preservation, activity tracking, context telemetry) | `integration-features-updated` |
+| `useRuntimeSettings` | [[src/hooks/useRuntimeSettings.ts]] | `RuntimeSettings` background-task tunings (live-usage interval, plugin-update interval, rule watcher, always-on-top) | `runtime-settings-updated` |
+| `useLearningSettings` | [[src/hooks/useLearningSettings.ts]] | `LearningSettings` (trigger mode, periodic interval, thresholds) | None — read on mount and after save |
+| `useUiPrefs` | [[src/hooks/useUiPrefs.ts]] | `UiPrefs` localStorage values (layout mode, time mode, panel visibility) | `ui-prefs-updated` (frontend-emitted across windows) |
+
+`useIntegrationFeatures` exposes typed setters per flag that each invoke a dedicated `set_*_enabled` IPC, while `useRuntimeSettings` and `useLearningSettings` save the whole struct in one call. `useUiPrefs.update(patch)` writes localStorage and emits `ui-prefs-updated` so the main window's [[src/App.tsx]] re-applies layout / time-mode / panel-visibility without a reload.
 
 ### Data Fetching Hooks
 
@@ -143,6 +156,7 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useSessionCodeStats` | Batch LOC stats per session (ref-cached) | `get_batch_session_code_stats` |
 | `usePluginData` | Installed plugins, marketplaces, updates | Multiple plugin commands |
 | `useCacheEfficiency` | Cache hit rate (derived from token history) | None (derived) |
+| `useContextSavingsStats` | Context savings summary, time series, breakdowns, and recent events; subscribes to `context-savings-updated`. Powers both the [[features#Analytics Dashboard#Context Tab]] strip and the right column of [[features#Analytics Dashboard#Now Tab]]. | `get_context_savings_analytics` |
 
 `useLiveSummaryData` fetches provider-filtered token and session history on demand so the top workload rail can aggregate `Sessions`, `Projects`, and range-scoped `Tokens` across whichever providers are enabled, while the grouped row sections continue to consume the already-fetched `UsageData` snapshot from `fetch_usage_data`.
 

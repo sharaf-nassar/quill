@@ -4,13 +4,20 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const {
-  buildContextSavingsEvent,
-  byteLength,
-  postContextSavingsEvents,
-} = require("./context-telemetry.cjs");
+let telemetry = {};
+try {
+  telemetry = require("./context-telemetry.cjs");
+} catch (_) {
+  telemetry = {};
+}
+
+const buildContextSavingsEvent = telemetry.buildContextSavingsEvent || (() => null);
+const postContextSavingsEvents = telemetry.postContextSavingsEvents || (() => {});
+const byteLength = telemetry.byteLength || fallbackByteLength;
 
 const RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const CONTINUITY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MAX_READ_BYTES = 256 * 1024;
 const CONTEXT_TOOLS = [
   "mcp__quill__quill_search_context",
@@ -33,6 +40,82 @@ function inferProvider(input) {
 
 function continuityDir() {
   return path.join(homeDir(), ".config", "quill", "context", "continuity");
+}
+
+function fallbackByteLength(value) {
+  if (value === undefined || value === null) return 0;
+  if (Buffer.isBuffer(value)) return value.length;
+  if (typeof value === "string") return Buffer.byteLength(value, "utf8");
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function cleanupStatePath() {
+  return path.join(continuityDir(), ".cleanup-state.json");
+}
+
+function shouldCleanup() {
+  const statePath = cleanupStatePath();
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const lastCleanup = Date.parse(state.lastCleanup || 0);
+    return !Number.isFinite(lastCleanup) || Date.now() - lastCleanup > CLEANUP_INTERVAL_MS;
+  } catch (_) {
+    return true;
+  }
+}
+
+function writeCleanupState() {
+  const statePath = cleanupStatePath();
+  fs.mkdirSync(path.dirname(statePath), { recursive: true });
+  fs.writeFileSync(statePath, JSON.stringify({ lastCleanup: new Date().toISOString() }), "utf8");
+}
+
+function recordTimestamp(record) {
+  return Date.parse(record?.timestamp || record?.ts || 0);
+}
+
+function pruneJsonlFile(filePath, sinceMs) {
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const lines = fs.readFileSync(filePath, "utf8").split(/\n+/).filter(Boolean);
+    const kept = [];
+    for (const line of lines) {
+      try {
+        const record = JSON.parse(line);
+        if (recordTimestamp(record) >= sinceMs) kept.push(line);
+      } catch (_) {
+        // Drop malformed continuity lines during cleanup.
+      }
+    }
+    fs.writeFileSync(filePath, kept.length ? `${kept.join("\n")}\n` : "", "utf8");
+  } catch (_) {
+    // Cleanup is opportunistic; capture must keep working.
+  }
+}
+
+function pruneOldSessionFiles(dir, sinceMs) {
+  try {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      if (!entry.isFile()) continue;
+      const stat = fs.statSync(entryPath);
+      if (stat.mtimeMs < sinceMs) fs.unlinkSync(entryPath);
+    }
+  } catch (_) {
+    // Cleanup is opportunistic; capture must keep working.
+  }
+}
+
+function maybeCleanupContinuity() {
+  if (!shouldCleanup()) return;
+  const dir = continuityDir();
+  const sinceMs = Date.now() - CONTINUITY_RETENTION_MS;
+  fs.mkdirSync(dir, { recursive: true });
+  pruneJsonlFile(path.join(dir, "events.jsonl"), sinceMs);
+  pruneJsonlFile(path.join(dir, "snapshots.jsonl"), sinceMs);
+  pruneOldSessionFiles(path.join(dir, "sessions"), sinceMs);
+  writeCleanupState();
 }
 
 const projectKeyCache = new Map();
@@ -245,6 +328,7 @@ function buildSnapshot(input, currentEvent) {
 }
 
 function appendEventAndMaybeSnapshot(input) {
+  maybeCleanupContinuity();
   const dir = continuityDir();
   const event = buildEvent(input);
   const telemetryEvents = [

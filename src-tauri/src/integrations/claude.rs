@@ -23,13 +23,15 @@ pub fn detect() -> Result<ProviderStatus, String> {
         user_has_made_choice: false,
         last_error: None,
         last_verified_at: Some(Utc::now().to_rfc3339()),
-        brevity_enabled: false,
         last_detection_attempts: if detected_cli { Vec::new() } else { attempts },
     })
 }
 
-pub fn install(app: &AppHandle, context_enabled: bool) -> Result<OwnedAssetManifest, String> {
-    crate::claude_setup::install_with_manifest(app, context_enabled)
+pub fn install(
+    app: &AppHandle,
+    features: crate::models::IntegrationFeatures,
+) -> Result<OwnedAssetManifest, String> {
+    crate::claude_setup::install_with_manifest(app, features)
 }
 
 pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {

@@ -125,10 +125,10 @@ The main window polls enabled providers for live rate limit status and stores th
 10. `emit_usage_updates()` rebuilds the backend-owned indicator state, emits `indicator-updated`, and lets the tray listener update title text plus `Now`, `Resets`, and `Week` summary rows from the same payload
 ## Indicator Preference Pipeline
 
-The status indicator has one backend-owned provider preference shared across the tray and the integrations menu.
+The status indicator has one backend-owned provider preference shared across the tray and the [[features#Settings Window]]'s Integrations tab.
 
-1. `useIntegrations()` loads `get_indicator_primary_provider` alongside provider statuses so both the main titlebar menu and the standalone integrations window start from the persisted preference
-2. `ProviderMenu` renders an `Automatic` option plus enabled providers, and preserves a disabled unavailable option when a saved provider is temporarily missing
+1. `useIntegrations()` loads `get_indicator_primary_provider` alongside provider statuses so the Integrations tab starts from the persisted preference
+2. The Integrations tab renders an `Auto` option plus enabled providers, and preserves a disabled unavailable option when a saved provider is temporarily missing
 3. Changing the selector invokes `set_indicator_primary_provider`, which stores the configured provider in the settings table
 4. The backend recomputes `StatusIndicatorState`, emits `indicator-updated`, and updates the tray summary from that backend-owned payload
 5. `useIntegrations()` listens for `indicator-updated` to keep all mounted selector instances synchronized

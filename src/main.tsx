@@ -20,8 +20,8 @@ const PluginsWindowView = React.lazy(
 const RestartWindowView = React.lazy(
   () => import("./windows/RestartWindowView"),
 );
-const IntegrationsWindowView = React.lazy(
-  () => import("./windows/IntegrationsWindow"),
+const SettingsWindowView = React.lazy(
+  () => import("./windows/SettingsWindowView"),
 );
 const ReleaseNotesWindowView = React.lazy(
   () => import("./windows/ReleaseNotesWindow"),
@@ -95,8 +95,8 @@ function blockedWindowTitle(currentView: string | null): string {
       return "Plugin Manager";
     case "restart":
       return "Restart Sessions";
-    case "integrations":
-      return "Integrations";
+    case "settings":
+      return "Settings";
     default:
       return "Quill";
   }
@@ -161,7 +161,7 @@ function ProviderRoutedView() {
   );
   const windowTitle = blockedWindowTitle(view);
 
-  if (view && view !== "main" && view !== "integrations" && view !== "release-notes") {
+  if (view && view !== "main" && view !== "settings" && view !== "release-notes") {
     if (integrations.loading) {
       return (
         <BlockedWindow
@@ -196,8 +196,8 @@ function ProviderRoutedView() {
     <PluginsWindowView />
   ) : view === "restart" ? (
     <RestartWindowView />
-  ) : view === "integrations" ? (
-    <IntegrationsWindowView />
+  ) : view === "settings" ? (
+    <SettingsWindowView />
   ) : view === "release-notes" ? (
     <ReleaseNotesWindowView />
   ) : (

@@ -11,7 +11,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::integrations::types::IntegrationProvider;
-use crate::storage::Storage;
 
 pub const BREVITY_INSTRUCTIONS: &str = "## Quill Brevity Profile\n\
 \n\
@@ -40,39 +39,6 @@ Apply to your own prose responses. Do NOT rewrite user prompts, file contents, c
 pub const BREVITY_BLOCK_START: &str = "<!-- quill-managed:brevity:start -->";
 pub const BREVITY_BLOCK_END: &str = "<!-- quill-managed:brevity:end -->";
 
-const BREVITY_KEY_CLAUDE: &str = "provider.claude.brevity_enabled";
-const BREVITY_KEY_CODEX: &str = "provider.codex.brevity_enabled";
-
-fn key_for(provider: IntegrationProvider) -> Option<&'static str> {
-    match provider {
-        IntegrationProvider::Claude => Some(BREVITY_KEY_CLAUDE),
-        IntegrationProvider::Codex => Some(BREVITY_KEY_CODEX),
-        IntegrationProvider::MiniMax => None,
-    }
-}
-
-pub fn read_persisted(storage: &Storage, provider: IntegrationProvider) -> Result<bool, String> {
-    let Some(key) = key_for(provider) else {
-        return Ok(false);
-    };
-    Ok(storage
-        .get_setting(key)?
-        .is_some_and(|value| value == "true"))
-}
-
-pub fn write_persisted(
-    storage: &Storage,
-    provider: IntegrationProvider,
-    enabled: bool,
-) -> Result<(), String> {
-    let Some(key) = key_for(provider) else {
-        return Err(format!(
-            "Brevity profile is not supported for provider {provider:?}"
-        ));
-    };
-    storage.set_setting(key, if enabled { "true" } else { "false" })
-}
-
 pub fn target_path(provider: IntegrationProvider) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     match provider {
@@ -91,37 +57,17 @@ fn canonical(path: &Path) -> PathBuf {
     })
 }
 
-fn other_brevity_using_same_file(
-    storage: &Storage,
-    provider: IntegrationProvider,
-) -> Option<IntegrationProvider> {
-    let this_path = target_path(provider)?;
-    let this_canonical = canonical(&this_path);
-    for other in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
-        if other == provider {
-            continue;
-        }
-        if !read_persisted(storage, other).unwrap_or(false) {
-            continue;
-        }
-        let Some(other_path) = target_path(other) else {
-            continue;
-        };
-        if canonical(&other_path) == this_canonical {
-            return Some(other);
-        }
-    }
-    None
-}
-
 /// Apply the brevity block to the given provider's instruction file.
 ///
-/// Effective presence is `enabled || (other provider has brevity enabled and
-/// shares the same canonical file)`.
+/// `present` is the desired state for THIS provider's file.
+/// `also_present_providers` lists OTHER providers whose files should also keep
+/// the block — used to detect the AGENTS.md → CLAUDE.md symlink case where
+/// stripping for one provider would clobber a block another provider still
+/// wants.
 pub fn apply_block(
-    storage: &Storage,
     provider: IntegrationProvider,
-    enabled: bool,
+    present: bool,
+    also_present_providers: &[IntegrationProvider],
 ) -> Result<(), String> {
     if matches!(provider, IntegrationProvider::MiniMax) {
         return Err(
@@ -131,8 +77,26 @@ pub fn apply_block(
     let Some(path) = target_path(provider) else {
         return Err("Cannot determine brevity target path".into());
     };
-    let present = enabled || other_brevity_using_same_file(storage, provider).is_some();
-    write_brevity_block(&path, present)
+    let effective_present = present || shares_canonical_path(provider, also_present_providers);
+    write_brevity_block(&path, effective_present)
+}
+
+fn shares_canonical_path(
+    provider: IntegrationProvider,
+    also_present_providers: &[IntegrationProvider],
+) -> bool {
+    let Some(this_path) = target_path(provider) else {
+        return false;
+    };
+    let this_canonical = canonical(&this_path);
+    also_present_providers
+        .iter()
+        .filter(|other| **other != provider)
+        .any(|other| {
+            target_path(*other)
+                .map(|p| canonical(&p) == this_canonical)
+                .unwrap_or(false)
+        })
 }
 
 fn write_brevity_block(path: &Path, present: bool) -> Result<(), String> {

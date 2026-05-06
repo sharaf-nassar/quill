@@ -174,7 +174,6 @@ export interface ProviderStatus {
   userHasMadeChoice: boolean;
   lastError: string | null;
   lastVerifiedAt: string | null;
-  brevityEnabled: boolean;
   /**
    * Filesystem locations Quill checked when trying to find this provider's
    * CLI. Populated only when `detectedCli` is false so the integrations menu
@@ -264,6 +263,22 @@ export interface LearningSettings {
   periodic_minutes: number;
   min_observations: number;
   min_confidence: number;
+}
+
+export interface RuntimeSettings {
+  liveUsageEnabled: boolean;
+  liveUsageIntervalSeconds: number;
+  pluginUpdatesEnabled: boolean;
+  pluginUpdatesIntervalHours: number;
+  ruleWatcherEnabled: boolean;
+  alwaysOnTop: boolean;
+}
+
+export interface IntegrationFeatures {
+  contextPreservation: boolean;
+  activityTracking: boolean;
+  contextTelemetry: boolean;
+  brevity: boolean;
 }
 
 export interface LearnedRule {
@@ -520,11 +535,12 @@ export interface ContextSavingsEvent {
 	eventType: string;
 	source: string;
 	decision: string | null;
+	category: string;
 	reason: string | null;
 	delivered: boolean;
-	indexedBytes: number;
-	returnedBytes: number;
-	inputBytes: number;
+	indexedBytes: number | null;
+	returnedBytes: number | null;
+	inputBytes: number | null;
 	tokensIndexedEst: number | null;
 	tokensReturnedEst: number | null;
 	tokensSavedEst: number | null;

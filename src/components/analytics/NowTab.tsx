@@ -4,6 +4,7 @@ import { useTokenData } from "../../hooks/useTokenData";
 import { useCodeStats } from "../../hooks/useCodeStats";
 import { useCodeInsights } from "../../hooks/useCodeInsights";
 import { useLlmRuntimeStats } from "../../hooks/useLlmRuntimeStats";
+import { useContextSavingsStats } from "../../hooks/useContextSavingsStats";
 import { formatNumber, formatDurationSecs } from "../../utils/format";
 import InsightCard from "./InsightCard";
 import CompactStatsRow from "./CompactStatsRow";
@@ -13,6 +14,7 @@ import CodeSparkline from "./CodeSparkline";
 import type {
 	RangeType,
 	BreakdownSelection,
+	ContextSavingsSummary,
 } from "../../types";
 
 const RANGES: RangeType[] = ["1h", "24h", "7d", "30d"];
@@ -36,6 +38,44 @@ const DAYS_TO_RANGE: Record<number, RangeType> = {
 
 const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 
+function formatCompactTokens(value: number | null | undefined): string | null {
+	if (value === null || value === undefined) return null;
+	const compact = new Intl.NumberFormat("en-US", {
+		notation: "compact",
+		maximumFractionDigits: value >= 1000 ? 1 : 0,
+	}).format(value);
+	return `${compact} tok`;
+}
+
+function formatCompactCount(value: number | null | undefined): string {
+	if (value === null || value === undefined) return "—";
+	return new Intl.NumberFormat("en-US", {
+		notation: "compact",
+		maximumFractionDigits: value >= 1000 ? 1 : 0,
+	}).format(value);
+}
+
+function formatBytes(value: number | null | undefined): string {
+	if (value === null || value === undefined) return "—";
+	if (value < 1024) return `${value} B`;
+	const units = ["KB", "MB", "GB", "TB"];
+	let scaled = value / 1024;
+	let unitIndex = 0;
+	while (scaled >= 1024 && unitIndex < units.length - 1) {
+		scaled /= 1024;
+		unitIndex += 1;
+	}
+	return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[unitIndex]}`;
+}
+
+function preservedRetention(summary: ContextSavingsSummary): string {
+	const sourcesPreserved = summary.sourcesPreserved ?? 0;
+	const sourcesRetrieved = summary.sourcesRetrieved ?? 0;
+	if (sourcesPreserved === 0) return "no sources yet";
+	const ratio = summary.retentionRatio ?? sourcesRetrieved / sourcesPreserved;
+	const pct = Math.round(ratio * 100);
+	return `${pct}% reused · ${formatCompactCount(sourcesRetrieved)}/${formatCompactCount(sourcesPreserved)} sources`;
+}
 
 interface NowTabProps {
 	range: RangeType;
@@ -64,6 +104,8 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 	);
 
 	const runtimeStats = useLlmRuntimeStats(range);
+	const contextSavings = useContextSavingsStats(range, 1);
+	const contextSummary = contextSavings.data?.summary ?? null;
 
 	const tokenHostname =
 		breakdownSelection?.type === "host" ? breakdownSelection.key : null;
@@ -125,7 +167,12 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 				</>
 			) : (
 				<>
-					{/* Insight cards row */}
+					{/*
+					 * Insight cards grid \u2014 interleaved row-by-row so CSS Grid
+					 * stretches each row pair to equal height. Source order:
+					 * row 1 (LLM Runtime, Preserved), row 2 (Efficiency,
+					 * Retrieved), row 3 (Velocity, Routing cost).
+					 */}
 					<div className="insight-cards-row">
 						<InsightCard
 							label="LLM Runtime"
@@ -144,6 +191,18 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							accentColor="#34d399"
 						/>
 						<InsightCard
+							label="Preserved"
+							value={formatCompactTokens(contextSummary?.tokensPreserved)}
+							subtitle={
+								contextSummary
+									? preservedRetention(contextSummary)
+									: "no data"
+							}
+							trend={null}
+							accentColor="#34d399"
+							description="Tokens written to local Quill storage instead of staying in the live LLM transcript. Subtitle shows how many indexed sources were later read back at least once."
+						/>
+						<InsightCard
 							label="Efficiency"
 							value={
 								efficiencyStats.tokensPerLoc !== null
@@ -156,6 +215,18 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							accentColor="#58a6ff"
 						/>
 						<InsightCard
+							label="Retrieved"
+							value={formatCompactTokens(contextSummary?.tokensRetrieved)}
+							subtitle={
+								contextSummary
+									? `${formatBytes(contextSummary.returnedBytes)} returned`
+									: "no data"
+							}
+							trend={null}
+							accentColor="#58a6ff"
+							description="Tokens read back from the context store on demand via quill_get_context_source. Bytes returned reflects the raw payload size of those reads."
+						/>
+						<InsightCard
 							label="Velocity"
 							value={
 								velocityStats.locPerHour !== null
@@ -166,6 +237,18 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							trend={velocityStats.trend}
 							sparkline={velocityStats.sparkline}
 							accentColor="#a78bfa"
+						/>
+						<InsightCard
+							label="Routing cost"
+							value={formatCompactTokens(contextSummary?.tokensRouting)}
+							subtitle={
+								contextSummary
+									? `${formatCompactCount(contextSummary.routingEventCount ?? contextSummary.routerEventCount)} guidance events`
+									: "no data"
+							}
+							trend={null}
+							accentColor="#fbbf24"
+							description="Transcript tokens spent on router nudges, capture guidance, search snippets, and bounded MCP results \u2014 overhead Quill adds to keep larger payloads out of the live transcript."
 						/>
 					</div>
 
