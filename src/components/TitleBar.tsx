@@ -17,6 +17,61 @@ interface TitleBarProps {
   integrations: UseIntegrationsResult;
 }
 
+const SVG_PROPS = {
+  viewBox: "0 0 14 14",
+  width: 14,
+  height: 14,
+  fill: "none",
+  stroke: "currentColor",
+  strokeWidth: 1.5,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+  "aria-hidden": true,
+  focusable: false,
+};
+
+const SparkIcon = () => (
+  <svg {...SVG_PROPS}>
+    <path d="M7 1.5L8.4 5.6 12.5 7 8.4 8.4 7 12.5 5.6 8.4 1.5 7 5.6 5.6Z" />
+  </svg>
+);
+
+const SearchIcon = () => (
+  <svg {...SVG_PROPS}>
+    <circle cx="6" cy="6" r="3.4" />
+    <line x1="8.6" y1="8.6" x2="11.6" y2="11.6" />
+  </svg>
+);
+
+const PluginIcon = () => (
+  <svg {...SVG_PROPS}>
+    <rect x="2.5" y="2.5" width="3.6" height="3.6" rx="0.5" />
+    <rect x="7.9" y="2.5" width="3.6" height="3.6" rx="0.5" />
+    <rect x="2.5" y="7.9" width="3.6" height="3.6" rx="0.5" />
+    <rect x="7.9" y="7.9" width="3.6" height="3.6" rx="0.5" />
+  </svg>
+);
+
+const RefreshIcon = () => (
+  <svg {...SVG_PROPS}>
+    <path d="M11.5 6.6A4.5 4.5 0 1 0 11.7 8.6" />
+    <path d="M11.5 2.5V6.6H7.4" />
+  </svg>
+);
+
+const GearIcon = () => (
+  <svg {...SVG_PROPS}>
+    <circle cx="7" cy="7" r="2" />
+    <path d="M7 1.4V3M7 11V12.6M1.4 7H3M11 7H12.6M3.05 3.05L4.18 4.18M9.82 9.82L10.95 10.95M3.05 10.95L4.18 9.82M9.82 4.18L10.95 3.05" />
+  </svg>
+);
+
+const CloseIcon = () => (
+  <svg {...SVG_PROPS}>
+    <path d="M3.2 3.2L10.8 10.8M10.8 3.2L3.2 10.8" />
+  </svg>
+);
+
 function TitleBar({
   showLive,
   showAnalytics,
@@ -194,44 +249,45 @@ function TitleBar({
           >
             Analytics
           </button>
+          <span aria-hidden="true" className="view-tab-divider" />
           <button
-            className="view-tab view-tab--learning"
+            className="view-tab view-tab--icon"
             onClick={handleOpenLearning}
             aria-label="Open learning"
             title="Learning"
             disabled={featuresDisabled}
           >
-            &#x1F9E0;
+            <SparkIcon />
           </button>
           <button
-            className="view-tab view-tab--search"
+            className="view-tab view-tab--icon"
             onClick={handleOpenSessions}
             aria-label="Search sessions"
             title="Search sessions"
             disabled={featuresDisabled}
           >
-            &#8981;
+            <SearchIcon />
           </button>
           <button
-            className="view-tab view-tab--plugins"
+            className="view-tab view-tab--icon view-tab--plugins"
             onClick={handleOpenPlugins}
             aria-label="Plugin Manager"
             title="Plugin Manager"
             disabled={featuresDisabled}
           >
-            &#9881;
+            <PluginIcon />
             {pluginUpdateCount > 0 && (
               <span className="plugins-update-badge">{pluginUpdateCount}</span>
             )}
           </button>
           <button
-            className="view-tab view-tab--restart"
+            className="view-tab view-tab--icon"
             onClick={handleOpenRestart}
             aria-label="Restart sessions"
             title="Restart sessions"
             disabled={featuresDisabled}
           >
-            &#8635;
+            <RefreshIcon />
           </button>
         </div>
       </div>
@@ -257,7 +313,7 @@ function TitleBar({
           title="Open settings"
           onClick={() => void handleOpenSettings()}
         >
-          &#9881;
+          <GearIcon />
         </button>
         {version && (
           <button
@@ -270,12 +326,13 @@ function TitleBar({
             v{version}
           </button>
         )}
+        <span aria-hidden="true" className="titlebar-divider" />
         <button
           className="titlebar-close"
           onClick={() => void handleCloseWindow()}
           aria-label="Close window"
         >
-          &times;
+          <CloseIcon />
         </button>
       </div>
     </div>

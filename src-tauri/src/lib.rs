@@ -1129,6 +1129,7 @@ async fn set_runtime_settings(
     app: tauri::AppHandle,
 ) -> Result<RuntimeSettings, String> {
     let storage = get_storage()?;
+    let previous = load_runtime_settings(storage);
     let live_interval = settings
         .live_usage_interval_seconds
         .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
@@ -1172,7 +1173,9 @@ async fn set_runtime_settings(
         },
     )?;
 
-    if let Some(window) = app.get_webview_window("main") {
+    if previous.always_on_top != settings.always_on_top
+        && let Some(window) = app.get_webview_window("main")
+    {
         let _ = window.set_always_on_top(settings.always_on_top);
     }
     if let Some(item) = TRAY_ON_TOP_ITEM.get() {

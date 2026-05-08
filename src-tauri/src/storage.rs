@@ -2581,7 +2581,7 @@ impl Storage {
                  FROM token_snapshots
                  WHERE timestamp >= ?1 AND cwd IS NOT NULL
                  GROUP BY cwd, hostname
-                 ORDER BY total_tokens DESC
+                 ORDER BY last_active DESC
                  LIMIT 200",
             )
             .map_err(|e| format!("Prepare error: {e}"))?;
@@ -5121,8 +5121,11 @@ impl Storage {
             .map_err(|e| format!("Failed to query last assistant ts: {e}"))?
         };
 
-        // Build (user_ts, Option<prev_assistant_ts>) pairs
-        // We walk the sorted messages and track state
+        // Build (user_ts, assistant_ts, Option<prev_assistant_ts>) pairs.
+        // Claude transcripts alternate user/tool-result messages with assistant
+        // responses, while Codex keeps tool activity on assistant-side records.
+        // For Codex, treat the turn as ending at the last assistant/tool
+        // activity before the next user prompt.
         struct Turn {
             user_ts: String,
             assistant_ts: String,
@@ -5131,24 +5134,64 @@ impl Storage {
 
         let mut turns: Vec<Turn> = Vec::new();
         let mut prev_assistant: Option<String> = last_assistant_ts;
-        let mut pending_user: Option<String> = None;
 
-        for (role, timestamp) in &sorted {
-            match *role {
-                "user" => {
-                    pending_user = Some((*timestamp).to_string());
-                }
-                "assistant" => {
-                    if let Some(user_ts) = pending_user.take() {
-                        turns.push(Turn {
-                            user_ts,
-                            assistant_ts: (*timestamp).to_string(),
-                            prev_assistant_ts: prev_assistant.clone(),
-                        });
+        if provider == IntegrationProvider::Codex {
+            let mut pending_user: Option<String> = None;
+            let mut pending_assistant: Option<String> = None;
+
+            for (role, timestamp) in &sorted {
+                match *role {
+                    "user" => {
+                        if let (Some(user_ts), Some(assistant_ts)) =
+                            (pending_user.take(), pending_assistant.take())
+                        {
+                            turns.push(Turn {
+                                user_ts,
+                                assistant_ts: assistant_ts.clone(),
+                                prev_assistant_ts: prev_assistant.clone(),
+                            });
+                            prev_assistant = Some(assistant_ts);
+                        }
+                        pending_user = Some((*timestamp).to_string());
                     }
-                    prev_assistant = Some((*timestamp).to_string());
+                    "assistant" => {
+                        if pending_user.is_some() {
+                            pending_assistant = Some((*timestamp).to_string());
+                        } else {
+                            prev_assistant = Some((*timestamp).to_string());
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+
+            if let (Some(user_ts), Some(assistant_ts)) = (pending_user, pending_assistant) {
+                turns.push(Turn {
+                    user_ts,
+                    assistant_ts,
+                    prev_assistant_ts: prev_assistant,
+                });
+            }
+        } else {
+            let mut pending_user: Option<String> = None;
+
+            for (role, timestamp) in &sorted {
+                match *role {
+                    "user" => {
+                        pending_user = Some((*timestamp).to_string());
+                    }
+                    "assistant" => {
+                        if let Some(user_ts) = pending_user.take() {
+                            turns.push(Turn {
+                                user_ts,
+                                assistant_ts: (*timestamp).to_string(),
+                                prev_assistant_ts: prev_assistant.clone(),
+                            });
+                        }
+                        prev_assistant = Some((*timestamp).to_string());
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -5176,7 +5219,12 @@ impl Storage {
                     .as_deref()
                     .and_then(|prev| parse_ts_diff(&turn.user_ts, prev));
 
-                let response_val = response_secs.filter(|&s| s > 0.0 && s <= 600.0);
+                let response_max_secs = if provider == IntegrationProvider::Codex {
+                    6.0 * 60.0 * 60.0
+                } else {
+                    600.0
+                };
+                let response_val = response_secs.filter(|&s| s > 0.0 && s <= response_max_secs);
                 let idle_val = idle_secs.filter(|&s| s > 0.0 && s <= 600.0);
 
                 if response_val.is_none() && idle_val.is_none() {
@@ -5399,8 +5447,8 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
     }
 
     if parent_map.is_empty() {
-        // No merging needed — sort by total_tokens desc and return
-        rows.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        // No merging needed — sort by last_active desc and return
+        rows.sort_by(|a, b| b.last_active.cmp(&a.last_active));
         rows.truncate(50);
         return rows;
     }
@@ -5431,7 +5479,7 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
     }
 
     let mut results: Vec<ProjectBreakdown> = merged.into_values().collect();
-    results.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    results.sort_by(|a, b| b.last_active.cmp(&a.last_active));
     results.truncate(50);
     results
 }

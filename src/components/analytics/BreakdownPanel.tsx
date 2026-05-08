@@ -1,4 +1,4 @@
-import { useState, useMemo, useRef, useCallback } from "react";
+import { useState, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useBreakdownData } from "../../hooks/useBreakdownData";
 import { useToast } from "../../hooks/useToast";
@@ -43,13 +43,12 @@ function projectName(path: string | null | undefined): string | null {
   return segments.length > 0 ? segments[segments.length - 1] : null;
 }
 
-const MODES: BreakdownMode[] = ["hosts", "projects", "sessions"];
+const MODES: BreakdownMode[] = ["sessions", "projects", "hosts"];
 const MODE_LABELS: Record<BreakdownMode, string> = {
   hosts: "Hosts",
   projects: "Projects",
   sessions: "Sessions",
 };
-const PAGE_SIZE = 5;
 const CONFIRM_TIMEOUT_MS = 3000;
 
 function providerLabel(provider: SessionRef["provider"]): string {
@@ -107,8 +106,7 @@ interface BreakdownPanelProps {
 
 function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const { toast } = useToast();
-  const [mode, setMode] = useState<BreakdownMode>("hosts");
-  const [page, setPage] = useState(0);
+  const [mode, setMode] = useState<BreakdownMode>("sessions");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -117,16 +115,8 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { data, loading, error, refresh } = useBreakdownData(mode, days);
 
-  const totalPages = Math.max(1, Math.ceil(data.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages - 1);
-  const pageData = useMemo(
-    () => data.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE),
-    [data, currentPage],
-  );
-
   const handleModeChange = (m: BreakdownMode) => {
     setMode(m);
-    setPage(0);
     resetConfirm();
   };
 
@@ -301,29 +291,6 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
           </button>
         )}
         <div className="breakdown-header-right">
-          {data.length > PAGE_SIZE && (
-            <div className="breakdown-pagination">
-              <button
-                className="breakdown-page-btn"
-                disabled={currentPage === 0}
-                onClick={() => setPage((p) => p - 1)}
-                aria-label="Previous page"
-              >
-                &#9664;
-              </button>
-              <span className="breakdown-page-info">
-                {currentPage + 1}/{totalPages}
-              </span>
-              <button
-                className="breakdown-page-btn"
-                disabled={currentPage >= totalPages - 1}
-                onClick={() => setPage((p) => p + 1)}
-                aria-label="Next page"
-              >
-                &#9654;
-              </button>
-            </div>
-          )}
           {selection && selection.type === "project" && editingCwd === null && (
             <button
               className="breakdown-rename-btn"
@@ -376,7 +343,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
           aria-label={`${MODE_LABELS[mode]} breakdown`}
         >
           {mode === "hosts"
-            ? (pageData as HostBreakdown[]).map((row) => (
+            ? (data as HostBreakdown[]).map((row) => (
                 <div
                   key={row.hostname}
                   className={`breakdown-row${isSelected("host", row.hostname) ? " selected" : ""}`}
@@ -409,7 +376,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                 </div>
               ))
             : mode === "projects"
-              ? (pageData as ProjectBreakdown[]).map((row) => {
+              ? (data as ProjectBreakdown[]).map((row) => {
                   const isEditing = editingCwd !== null && isSelected("project", row.project);
                   return (
                   <div
@@ -489,7 +456,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                   </div>
                   );
                 })
-              : (pageData as SessionBreakdown[]).map((row) => (
+              : (data as SessionBreakdown[]).map((row) => (
                   <div
                     key={sessionRefKey({
                       provider: row.provider,

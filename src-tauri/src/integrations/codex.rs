@@ -459,7 +459,9 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
             .write_all(b"\n")
             .map_err(|err| format!("Failed to write newline to codex app-server: {err}"))?;
     }
-    drop(stdin);
+    stdin
+        .flush()
+        .map_err(|err| format!("Failed to flush codex app-server stdin: {err}"))?;
 
     let mut stderr = child.stderr.take();
     let reader = BufReader::new(stdout);

@@ -137,6 +137,8 @@ Tables for tracking per-turn LLM response latency and caching git commit history
 
 `get_llm_runtime_stats` groups consecutive rows into logical turns using `idle_secs` to detect tool-execution gaps, then measures each turn's full wall-clock span.
 
+Codex runtime ingestion treats a user prompt as one turn ending at the last assistant or tool-activity timestamp before the next user prompt, because Codex transcripts keep tool calls and outputs on assistant-side records.
+
 - **git_snapshots** — Cached git history per project (project unique, commit_hash, commit_count, raw_data).
 
 #### Metadata

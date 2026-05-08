@@ -180,6 +180,8 @@ Codex install and uninstall remove only Quill-owned legacy `hooks.json` commands
 
 Codex installs SessionStart, UserPromptSubmit, and Stop hooks unconditionally; PreToolUse and PostToolUse `observe.cjs` hooks ride with the activity tracking flag. When context preservation is enabled, Codex also installs SessionStart, UserPromptSubmit, PreToolUse, PreCompact, and Stop context hooks. The installer asks `codex app-server` for `hooks/list` metadata, then writes each Quill hook's `trusted_hash` through `config/batchWrite` so the trust state matches Codex's own hook-review model.
 
+The app-server request pipe is flushed but kept open until each response arrives. Closing stdin immediately after writing requests can make `hooks/list` return no response before trust hashes are written.
+
 Quill resolves the Codex CLI before running provider checks or `codex app-server`, then augments the child process `PATH` with launcher and symlink-target directories so Homebrew and npm installs work from macOS app launches with stripped inherited environments.
 
 ## Provider CLI Detection

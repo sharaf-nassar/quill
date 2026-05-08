@@ -3,6 +3,7 @@ import type { InsightTrend, SparklinePoint } from "../../types";
 interface InsightCardProps {
 	label: string;
 	value: string | null;
+	unit?: string;
 	subtitle: string;
 	trend: InsightTrend | null;
 	sparkline?: SparklinePoint[];
@@ -43,6 +44,7 @@ function trendLabel(trend: InsightTrend): string {
 function InsightCard({
 	label,
 	value,
+	unit,
 	subtitle,
 	trend,
 	sparkline,
@@ -89,6 +91,7 @@ function InsightCard({
 			</div>
 			<div className="insight-card-value" style={{ color: value ? accentColor : "#484f58" }}>
 				{value ?? "\u2014"}
+				{value && unit && <span className="insight-card-value-unit">{unit}</span>}
 			</div>
 			<div className="insight-card-subtitle">{subtitle}</div>
 			{sparkline && sparkline.length > 0 && (

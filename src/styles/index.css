@@ -70,29 +70,33 @@ body {
   align-items: center;
   justify-content: flex-end;
   flex-shrink: 0;
-  gap: 4px;
+  gap: 1px;
   z-index: 1;
 }
 
 .titlebar-cog {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.35);
-  font-size: 14px;
+  color: rgba(255, 255, 255, 0.40);
   cursor: pointer;
-  padding: 4px 6px;
-  min-width: 28px;
-  min-height: 28px;
+  padding: 0;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 4px;
-  line-height: 1;
+  border-radius: 2px;
+  transition: color 140ms ease, background-color 140ms ease;
 }
 
 .titlebar-cog:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.6);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.titlebar-cog svg {
+  display: block;
+  shape-rendering: geometricPrecision;
 }
 
 .titlebar-title {
@@ -110,66 +114,88 @@ body {
 }
 
 .titlebar-update-btn {
-  background: rgba(251, 191, 36, 0.15);
-  border: 1px solid rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.10);
+  border: 1px solid rgba(251, 191, 36, 0.32);
   color: #fbbf24;
   font-size: 9px;
   font-weight: 700;
-  letter-spacing: 0.5px;
-  padding: 2px 10px;
-  border-radius: 4px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 3px 9px;
+  border-radius: 2px;
   cursor: pointer;
   white-space: nowrap;
-  transition: background 0.15s ease, border-color 0.15s ease;
-  margin-right: 4px;
+  font-variant-numeric: tabular-nums;
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+  margin-right: 6px;
 }
 
 .titlebar-update-btn:hover {
-  background: rgba(251, 191, 36, 0.25);
-  border-color: rgba(251, 191, 36, 0.6);
+  background: rgba(251, 191, 36, 0.18);
+  border-color: rgba(251, 191, 36, 0.55);
+  color: #fcd34d;
 }
 
 .titlebar-update-btn:disabled {
-  opacity: 0.6;
+  opacity: 0.55;
   cursor: not-allowed;
 }
 
 .titlebar-version {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.30);
   font: inherit;
   font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
   font-variant-numeric: tabular-nums;
-  padding: 2px 4px;
-  border-radius: 4px;
+  padding: 0 7px;
+  height: 26px;
+  border-radius: 2px;
   cursor: pointer;
+  transition: color 140ms ease, background-color 140ms ease;
 }
 
 .titlebar-version:hover {
-  color: rgba(255, 255, 255, 0.7);
-  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.78);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Hairline divider before the close button — separates app
+   chrome (settings, version) from window chrome (close). */
+.titlebar-divider {
+  width: 1px;
+  height: 13px;
+  margin: 0 4px 0 4px;
+  background: rgba(255, 255, 255, 0.08);
+  align-self: center;
+  flex-shrink: 0;
 }
 
 .titlebar-close {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.4);
-  font-size: 16px;
+  color: rgba(255, 255, 255, 0.42);
   cursor: pointer;
-  padding: 4px 8px;
-  min-width: 28px;
-  min-height: 28px;
+  padding: 0;
+  width: 26px;
+  height: 26px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 4px;
-  line-height: 1;
+  border-radius: 2px;
+  transition: color 140ms ease, background-color 140ms ease;
 }
 
 .titlebar-close:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.7);
+  background: rgba(244, 63, 94, 0.16);
+  color: rgba(255, 245, 245, 0.96);
+}
+
+.titlebar-close svg {
+  display: block;
+  shape-rendering: geometricPrecision;
 }
 
 /* Cog settings menu */
@@ -795,91 +821,118 @@ body {
   margin: 4px 0;
 }
 
-/* view-toggle lives inside titlebar-left */
+/* === Chrome-bar view toggle =====================================
+   Flat strip — no pill container. Text tabs use a 1.5px underline
+   accent for active state; icon tabs share a single neutral palette
+   with a hairline divider separating the two groups.
+================================================================ */
 
 .view-toggle {
   display: flex;
-  background: rgba(255, 255, 255, 0.04);
-  border-radius: 4px;
-  padding: 1px;
+  align-items: center;
+  background: none;
+  border-radius: 0;
+  padding: 0;
   gap: 1px;
+  height: 26px;
 }
 
 .view-tab {
   background: none;
   border: none;
-  color: rgba(255, 255, 255, 0.45);
-  font-size: 9px;
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 10px;
   font-weight: 600;
-  letter-spacing: 1px;
+  letter-spacing: 1.6px;
   text-transform: uppercase;
-  padding: 4px 8px;
-  min-height: 26px;
-  border-radius: 3px;
+  padding: 0 11px;
+  height: 100%;
+  border-radius: 2px;
   cursor: pointer;
-  transition: color 0.15s ease, background 0.15s ease;
+  position: relative;
+  transition: color 140ms ease, background-color 140ms ease;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   white-space: nowrap;
 }
 
-.view-tab:hover {
-  color: rgba(255, 255, 255, 0.65);
+.view-tab::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 3px;
+  width: 0;
+  height: 1.5px;
+  background: rgba(255, 255, 255, 0.92);
+  transform: translateX(-50%);
+  transition: width 200ms cubic-bezier(0.32, 0.72, 0, 1);
+  pointer-events: none;
+  border-radius: 1px;
+}
+
+.view-tab.active {
+  color: rgba(255, 255, 255, 0.96);
+  background: none;
+}
+
+.view-tab.active::after {
+  width: calc(100% - 22px);
+}
+
+.view-tab:hover:not(:disabled):not(.active) {
+  color: rgba(255, 255, 255, 0.78);
 }
 
 .view-tab:disabled {
   cursor: not-allowed;
-  opacity: 0.35;
+  opacity: 0.32;
 }
 
 .view-tab:disabled:hover {
-  color: rgba(255, 255, 255, 0.45);
+  color: rgba(255, 255, 255, 0.42);
 }
 
-.view-tab.active {
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.85);
+.view-tab:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.20);
 }
 
-.view-tab--learning {
-  font-size: 14px;
+/* Icon variant — uniform neutral palette, no per-icon coloring.
+   Sits in its own column-cluster after the hairline divider. */
+.view-tab--icon {
+  width: 26px;
+  padding: 0;
+  color: rgba(255, 255, 255, 0.40);
+  letter-spacing: 0;
 }
 
-.view-tab--learning:hover {
-  opacity: 0.9;
+.view-tab--icon:hover:not(:disabled) {
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.05);
 }
 
-.view-tab--learning.active {
-  background: rgba(34, 197, 94, 0.12);
+.view-tab--icon::after {
+  display: none;
 }
 
-.view-tab--search {
-  color: rgba(96, 165, 250, 0.5);
-  font-size: 16px;
-}
-
-.view-tab--search:hover {
-  color: rgba(96, 165, 250, 0.8);
+.view-tab--icon svg {
+  display: block;
+  shape-rendering: geometricPrecision;
 }
 
 .view-tab--plugins {
-  color: rgba(122, 162, 247, 0.45);
-  font-size: 16px;
   position: relative;
 }
 
-.view-tab--plugins:hover {
-  color: rgba(122, 162, 247, 0.75);
-}
-
-.view-tab--restart {
-  color: rgba(244, 114, 182, 0.5);
-  font-size: 15px;
-}
-
-.view-tab--restart:hover {
-  color: rgba(244, 114, 182, 0.8);
+/* Hairline divider between text tabs and the icon cluster */
+.view-tab-divider {
+  width: 1px;
+  height: 13px;
+  margin: 0 6px 0 5px;
+  background: rgba(255, 255, 255, 0.10);
+  align-self: center;
+  flex-shrink: 0;
 }
 
 @media (max-width: 360px) {
@@ -1050,6 +1103,7 @@ body {
   flex-direction: column;
   gap: 12px;
   flex: 1;
+  min-height: 0;
   container-type: inline-size;
 }
 
@@ -1538,7 +1592,9 @@ body {
 .breakdown-collapsible {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   gap: 6px;
+  min-height: 0;
 }
 
 .breakdown-collapse-toggle {
@@ -1562,7 +1618,9 @@ body {
 .breakdown-panel {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   gap: 8px;
+  min-height: 0;
 }
 
 .breakdown-header {
@@ -1580,44 +1638,6 @@ body {
   align-items: center;
   gap: 4px;
   margin-left: auto;
-}
-
-.breakdown-pagination {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.breakdown-page-btn {
-  background: none;
-  border: none;
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 9px;
-  cursor: pointer;
-  padding: 4px 8px;
-  min-width: 28px;
-  min-height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 4px;
-  line-height: 1;
-}
-
-.breakdown-page-btn:hover:not(:disabled) {
-  color: rgba(255, 255, 255, 0.7);
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.breakdown-page-btn:disabled {
-  opacity: 0.3;
-  cursor: default;
-}
-
-.breakdown-page-info {
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
 }
 
 .breakdown-clear-btn {
@@ -1644,7 +1664,28 @@ body {
 .breakdown-list {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.breakdown-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.breakdown-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.breakdown-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+}
+
+.breakdown-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
 }
 
 .breakdown-row {
@@ -1935,7 +1976,10 @@ body {
 /* ─── Insight cards ─── */
 .insight-cards-row {
 	display: grid;
-	grid-template-columns: 1fr 1fr;
+	/* Left column is twice the right column — left cards carry sparklines
+	   and need the breathing room, right cards (Preserved/Retrieved/Routing)
+	   only show a label, value, and short description. */
+	grid-template-columns: 2fr 1fr;
 	gap: 8px;
 	/* default align-items: stretch — paired cards in the same grid row
 	   match height so the two columns stay aligned even when one card has
@@ -2047,16 +2091,48 @@ body {
 	letter-spacing: 0.5px;
 }
 
+/* Right-column cards (Preserved / Retrieved / Routing cost) live in
+   the narrower 1fr column — quieter label/value sizes match the
+   tighter footprint without touching the wider left-column cards. */
+.insight-cards-row > .insight-card:nth-child(2n) .insight-card-label {
+	font-size: 7px;
+	letter-spacing: 1px;
+	font-weight: 600;
+}
+
 .insight-card-trend {
 	font-size: 8px;
 	padding: 1px 6px;
 	border-radius: 8px;
 }
 
+/* When a card carries the absolute-positioned `?` help button, shift
+   the trend badge left so the two don't visually collide in the
+   top-right corner. Right-column cards have no trend, so this only
+   affects left-column cards (Efficiency, Velocity). */
+.insight-card:has(.insight-card-help) .insight-card-trend {
+	margin-right: 20px;
+}
+
 .insight-card-value {
 	font-size: 20px;
 	font-weight: 700;
 	line-height: 1;
+}
+
+.insight-cards-row > .insight-card:nth-child(2n) .insight-card-value {
+	font-size: 16px;
+}
+
+/* Unit suffix on values like "0 tok" / "1.8K tok" — em-relative so it
+   scales with the value's font-size, slightly muted to recede from the
+   number. */
+.insight-card-value-unit {
+	font-size: 0.6em;
+	font-weight: 600;
+	margin-left: 4px;
+	letter-spacing: 0.2px;
+	opacity: 0.72;
 }
 
 .insight-card-subtitle {

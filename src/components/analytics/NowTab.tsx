@@ -40,11 +40,10 @@ const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
 
 function formatCompactTokens(value: number | null | undefined): string | null {
 	if (value === null || value === undefined) return null;
-	const compact = new Intl.NumberFormat("en-US", {
+	return new Intl.NumberFormat("en-US", {
 		notation: "compact",
 		maximumFractionDigits: value >= 1000 ? 1 : 0,
 	}).format(value);
-	return `${compact} tok`;
 }
 
 function formatCompactCount(value: number | null | undefined): string {
@@ -189,10 +188,12 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							trend={null}
 							sparkline={runtimeStats.sparkline}
 							accentColor="#34d399"
+							description="Cumulative wall-clock time the LLM spent generating responses across every turn in this window. Subtitle breaks the total into session count, turn count, and average duration per turn."
 						/>
 						<InsightCard
 							label="Preserved"
 							value={formatCompactTokens(contextSummary?.tokensPreserved)}
+							unit="tok"
 							subtitle={
 								contextSummary
 									? preservedRetention(contextSummary)
@@ -213,10 +214,12 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							trend={efficiencyStats.trend}
 							sparkline={efficiencyStats.sparkline}
 							accentColor="#58a6ff"
+							description="Total input + output tokens divided by lines of code added or modified — lower is better. The percent badge compares this window to the prior equal-length window."
 						/>
 						<InsightCard
 							label="Retrieved"
 							value={formatCompactTokens(contextSummary?.tokensRetrieved)}
+							unit="tok"
 							subtitle={
 								contextSummary
 									? `${formatBytes(contextSummary.returnedBytes)} returned`
@@ -237,10 +240,12 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							trend={velocityStats.trend}
 							sparkline={velocityStats.sparkline}
 							accentColor="#a78bfa"
+							description="Lines of code added or modified per hour of wall-clock time in this window — higher is better. The percent badge compares this window to the prior equal-length window."
 						/>
 						<InsightCard
 							label="Routing cost"
 							value={formatCompactTokens(contextSummary?.tokensRouting)}
+							unit="tok"
 							subtitle={
 								contextSummary
 									? `${formatCompactCount(contextSummary.routingEventCount ?? contextSummary.routerEventCount)} guidance events`

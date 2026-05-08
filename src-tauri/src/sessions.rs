@@ -1891,6 +1891,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                         if let Some(entry) = tool_use_map.get(&call_id)
                             && let Some(message) = messages.get_mut(entry.message_idx)
                         {
+                            message.timestamp = timestamp.clone();
                             if let Some(action) = message.tool_actions.first_mut() {
                                 action.full_output = output.clone();
                             }

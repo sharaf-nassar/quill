@@ -192,7 +192,13 @@ jobs:
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
-          NOTES=$(git tag -l --format='%(body)' "$TAG_NAME")
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          if git rev-parse -q --verify "${TAG_NAME}^{tag}" >/dev/null; then
+            NOTES=$(git tag -l --format='%(body)' "$TAG_NAME")
+          else
+            NOTES=""
+          fi
+
           if [ -n "$NOTES" ]; then
             echo "$NOTES" > release_notes.md
             echo "Extracted release notes from tag annotation"
