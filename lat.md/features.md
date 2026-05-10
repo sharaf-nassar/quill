@@ -34,6 +34,8 @@ A two-column CSS Grid (`.insight-cards-row`) renders six insight cards in three 
 
 When a session row is selected, the breakdown stores both provider and session id, which keeps token history, compact token stats, and delete-session actions aligned with the right Claude or Codex transcript.
 
+Sessions tab rows whose backend rollup reports `has_subagents = true` render a chevron (▶ collapsed, ▼ expanded) at the start of the row. Clicking it expands an indented tree of sub-agent rows below the parent: 24px-per-depth indent, a `└─` unicode tree-line drawn in `breakdown-tree-guide`, a purple "AGENT" chip (`#c084fc`) to distinguish each child from the blue "CLAUDE" chip on the parent, the first 8 chars of the `agent_id`, and the same metric columns as the parent row (no status badge — sub-agents are point-in-time runs). Sub-agents are fetched lazily on first expand via [[src/hooks/useSessionSubagents.ts#useSessionSubagents]], which caches results per `(provider, session_id)` so collapse/re-expand never refetches. Rendering is recursive through [[src/components/analytics/BreakdownPanel.tsx#SubagentRow]] and depth-bounded by `SUBAGENT_MAX_DEPTH = 10` to defend against pathological `parent_uuid` cycles.
+
 ### Trends Tab
 
 Week-over-week comparison charts for token usage trends, code velocity, and cache efficiency.

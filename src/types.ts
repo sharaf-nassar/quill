@@ -106,6 +106,40 @@ export interface SessionBreakdown {
   first_seen: string;
   last_active: string;
   project: string | null;
+  /**
+   * True when this session has at least one sub-agent chain in its
+   * transcript. Drives the chevron + expansion affordance in the Sessions
+   * tab. Older backends may omit this; treat missing as `false`.
+   */
+  has_subagents?: boolean;
+  /**
+   * Distinct sub-agent count across token_snapshots ∪ response_times ∪
+   * tool_actions for this session. Older backends may omit this; treat
+   * missing as `0`.
+   */
+  subagent_count?: number;
+}
+
+/**
+ * One node in a session's sub-agent tree returned by
+ * `get_session_subagent_tree`. Today every chain originates from the parent
+ * transcript so depth-1 sub-agents always carry `parent_agent_id = null`,
+ * but the field is reserved for future depth-N chains.
+ */
+export interface SubagentNode {
+  agent_id: string;
+  parent_agent_id: string | null;
+  first_seen: string;
+  last_active: string;
+  turn_count: number;
+  total_tokens: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  tool_call_count: number;
+  /** Human-readable label. Null today; populated in a future wave. */
+  label: string | null;
 }
 
 export interface ProjectBreakdown {

@@ -12,8 +12,8 @@ use crate::models::{
     ContextSavingsTimeseriesPoint, DataPoint, GitSnapshot, HostBreakdown, LanguageBreakdown,
     LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload, LearningStatus,
     LlmRuntimeStats, ObservationPayload, ProjectBreakdown, ProjectTokens, SessionBreakdown,
-    SessionCodeStats, SessionRef, SessionStats, TokenDataPoint, TokenReportPayload, TokenStats,
-    ToolCount, UsageBucket,
+    SessionCodeStats, SessionRef, SessionStats, SubagentNode, TokenDataPoint, TokenReportPayload,
+    TokenStats, ToolCount, UsageBucket,
 };
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
@@ -161,12 +161,50 @@ SELECT
 FROM source_activity
 "#;
 
+/// One message borrowed for response-time ingestion. Carries the role and
+/// timestamp the turn detector needs, plus the per-message sub-agent
+/// attribution propagated onto the assistant row that closes the turn.
+#[derive(Clone, Copy)]
+pub struct ResponseTimeInput<'a> {
+    pub role: &'a str,
+    pub timestamp: &'a str,
+    pub is_sidechain: bool,
+    pub agent_id: Option<&'a str>,
+    pub parent_uuid: Option<&'a str>,
+}
+
+impl<'a> ResponseTimeInput<'a> {
+    /// Build an input from a (role, timestamp) tuple where no sub-agent
+    /// attribution is available (e.g., HTTP API pushes).
+    pub fn new(role: &'a str, timestamp: &'a str) -> Self {
+        Self {
+            role,
+            timestamp,
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: None,
+        }
+    }
+}
+
+/// Sub-agent attribution triple carried alongside a tool action row.
+/// Bundled into a struct to keep `insert_tool_actions` under clippy's
+/// `too_many_arguments` threshold and to mirror the `ResponseTimeInput`
+/// pattern used for the response-times pipeline.
+#[derive(Clone, Copy, Default)]
+struct ToolActionAttribution<'a> {
+    is_sidechain: bool,
+    agent_id: Option<&'a str>,
+    parent_uuid: Option<&'a str>,
+}
+
 fn insert_tool_actions(
     stmt: &mut rusqlite::CachedStatement<'_>,
     provider: IntegrationProvider,
     actions: &[crate::sessions::ToolAction],
     message_id: &str,
     session_id: &str,
+    attribution: ToolActionAttribution<'_>,
 ) -> Result<(), String> {
     for action in actions {
         stmt.execute(rusqlite::params![
@@ -180,6 +218,9 @@ fn insert_tool_actions(
             action.full_input,
             action.full_output,
             action.timestamp,
+            attribution.is_sidechain as i32,
+            attribution.agent_id,
+            attribution.parent_uuid,
         ])
         .map_err(|e| format!("Insert tool_action: {e}"))?;
     }
@@ -724,7 +765,8 @@ pub struct Storage {
 impl Storage {
     pub fn init() -> Result<Self, String> {
         let path = db_path()?;
-        let conn = Connection::open(&path).map_err(|e| format!("Failed to open database: {e}"))?;
+        let mut conn =
+            Connection::open(&path).map_err(|e| format!("Failed to open database: {e}"))?;
 
         #[cfg(unix)]
         {
@@ -1533,6 +1575,83 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 19: {e}"))?;
         }
 
+        // Migration 20: sub-agent attribution columns on response_times,
+        // tool_actions, and token_snapshots. Provider-agnostic — Codex extraction
+        // simply writes the defaults (is_sidechain=0, agent_id=NULL, parent_uuid=NULL).
+        if current_version < 20 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 20 transaction begin: {e}"))?;
+
+            let subagent_tables = ["response_times", "tool_actions", "token_snapshots"];
+            for table in subagent_tables {
+                if !table_has_column(&tx, table, "is_sidechain") {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0;"
+                    ))
+                    .map_err(|e| format!("Migration 20 ({table}.is_sidechain): {e}"))?;
+                }
+                if !table_has_column(&tx, table, "agent_id") {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN agent_id TEXT DEFAULT NULL;"
+                    ))
+                    .map_err(|e| format!("Migration 20 ({table}.agent_id): {e}"))?;
+                }
+                if !table_has_column(&tx, table, "parent_uuid") {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN parent_uuid TEXT DEFAULT NULL;"
+                    ))
+                    .map_err(|e| format!("Migration 20 ({table}.parent_uuid): {e}"))?;
+                }
+            }
+
+            // Rollup + tree indexes for each sub-agent-aware table.
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_rt_provider_session_sidechain
+                     ON response_times(provider, session_id, is_sidechain);
+                 CREATE INDEX IF NOT EXISTS idx_rt_provider_session_agent
+                     ON response_times(provider, session_id, agent_id);
+                 CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session_sidechain
+                     ON tool_actions(provider, session_id, is_sidechain);
+                 CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session_agent
+                     ON tool_actions(provider, session_id, agent_id);
+                 CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_sidechain
+                     ON token_snapshots(provider, session_id, is_sidechain);
+                 CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_agent
+                     ON token_snapshots(provider, session_id, agent_id);",
+            )
+            .map_err(|e| format!("Migration 20 (indexes): {e}"))?;
+
+            // Backfill strategy:
+            //  * response_times and tool_actions are derived from transcripts on
+            //    disk and are fully regenerable. Truncate them here; the next
+            //    startup_scan rebuilds them with the new columns populated.
+            //    `subagent_reingest_pending` flag tells SessionIndex to drop its
+            //    mtime cache so every file is re-extracted in this boot.
+            //  * token_snapshots come from hook-reported events that cannot be
+            //    regenerated. Existing rows stay tagged is_sidechain=0; they
+            //    appear in the parent's rolled-up totals correctly. New rows
+            //    coming in via store_token_snapshot will be tagged correctly.
+            //    TODO(wave-2+): expose a CLI repair util that walks
+            //    subagents/*.jsonl on disk and updates token_snapshots by
+            //    matching cwd + timestamp window for non-ambiguous cases.
+            tx.execute("DELETE FROM response_times", [])
+                .map_err(|e| format!("Migration 20 (clear response_times): {e}"))?;
+            tx.execute("DELETE FROM tool_actions", [])
+                .map_err(|e| format!("Migration 20 (clear tool_actions): {e}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["subagent_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 20 (set reingest flag): {e}"))?;
+
+            tx.execute("INSERT INTO schema_version (version) VALUES (20)", [])
+                .map_err(|e| format!("Failed to record migration 20: {e}"))?;
+
+            tx.commit()
+                .map_err(|e| format!("Migration 20 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -1885,8 +2004,8 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
-            "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 payload.provider.as_str(),
                 payload.session_id,
@@ -1896,7 +2015,10 @@ impl Storage {
                 payload.output_tokens,
                 payload.cache_creation_input_tokens,
                 payload.cache_read_input_tokens,
-                payload.cwd
+                payload.cwd,
+                payload.is_sidechain as i32,
+                payload.agent_id,
+                payload.parent_uuid,
             ],
         )
         .map_err(|e| format!("Insert token snapshot error: {e}"))?;
@@ -2622,38 +2744,96 @@ impl Storage {
         let conn = self.conn.lock();
         let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
 
+        // Sub-agent rollup (Wave 2). Each output row is keyed by
+        // `(provider, session_id, hostname)` — the same natural key as
+        // `token_snapshots`. A session that appears on multiple hostnames
+        // (e.g. desktop + laptop sync) produces one row per hostname; the
+        // rollup aggregates parent + sub-agent rows within each tuple, not
+        // across hostnames.
+        //
+        // * tokens / first_seen / last_active come from `token_snapshots`
+        //   (the only source of per-row token amounts).
+        // * turn_count comes from `response_times` because each sub-agent
+        //   turn produces its own user/assistant pair there — counting
+        //   token_snapshots rows would double-count snapshot heartbeats.
+        // * last_active is MAX across BOTH token_snapshots and
+        //   response_times so an active sub-agent turn keeps the parent's
+        //   active badge lit even if no token snapshot landed yet.
+        // * `has_subagents` reads token_snapshots (only sub-agent-aware
+        //   table that survived the Wave 1 reingest reset). Cheapest
+        //   reliable signal.
+        // * `subagent_count` is COUNT(DISTINCT agent_id) over the UNION of
+        //   all three sub-agent-aware tables — any one of them may carry
+        //   the agent first depending on extraction ordering.
+        //
+        // The `(provider, session_id, is_sidechain)` index added in
+        // migration 20 means each subquery is an index scan over the
+        // relevant slice, not a full-table scan.
         let mut sql = String::from(
-            "SELECT
-                 s.provider,
-                 s.session_id,
-                 s.hostname,
-                 SUM(s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens) as total_tokens,
-                 COUNT(*) as turn_count,
-                 MIN(s.timestamp) as first_seen,
-                 MAX(s.timestamp) as last_active,
+            "WITH tok AS (
+                 SELECT provider, session_id, hostname,
+                        SUM(input_tokens + output_tokens
+                            + cache_creation_input_tokens
+                            + cache_read_input_tokens) AS total_tokens,
+                        MIN(timestamp) AS first_seen,
+                        MAX(timestamp) AS last_active_tok,
+                        MAX(CASE WHEN is_sidechain = 1 THEN 1 ELSE 0 END) AS has_subagents
+                 FROM token_snapshots
+                 WHERE timestamp >= ?1
+                 GROUP BY provider, session_id, hostname
+             )
+             SELECT
+                 tok.provider,
+                 tok.session_id,
+                 tok.hostname,
+                 tok.total_tokens,
+                 COALESCE((SELECT COUNT(*) FROM response_times rt
+                           WHERE rt.provider = tok.provider
+                             AND rt.session_id = tok.session_id), 0) AS turn_count,
+                 tok.first_seen,
+                 COALESCE(
+                     (SELECT MAX(ts) FROM (
+                         SELECT MAX(timestamp) AS ts FROM token_snapshots
+                           WHERE provider = tok.provider AND session_id = tok.session_id
+                         UNION ALL
+                         SELECT MAX(timestamp) AS ts FROM response_times
+                           WHERE provider = tok.provider AND session_id = tok.session_id
+                     )), tok.last_active_tok) AS last_active,
                  (SELECT t.cwd FROM token_snapshots t
-                  WHERE t.provider = s.provider AND t.session_id = s.session_id AND t.cwd IS NOT NULL
-                  ORDER BY t.timestamp DESC LIMIT 1) as project
-             FROM token_snapshots s
-             WHERE s.timestamp >= ?1",
+                    WHERE t.provider = tok.provider AND t.session_id = tok.session_id
+                      AND t.cwd IS NOT NULL
+                    ORDER BY t.timestamp DESC LIMIT 1) AS project,
+                 tok.has_subagents,
+                 (SELECT COUNT(*) FROM (
+                     SELECT agent_id FROM token_snapshots
+                       WHERE provider = tok.provider AND session_id = tok.session_id
+                         AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM response_times
+                       WHERE provider = tok.provider AND session_id = tok.session_id
+                         AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM tool_actions
+                       WHERE provider = tok.provider AND session_id = tok.session_id
+                         AND agent_id IS NOT NULL
+                 )) AS subagent_count
+             FROM tok
+             WHERE 1=1",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from)];
         let hostname_param = if provider.is_some() { 3 } else { 2 };
 
         if let Some(provider) = provider {
-            sql.push_str(" AND s.provider = ?2");
+            sql.push_str(" AND tok.provider = ?2");
             params_vec.push(Box::new(provider.as_str().to_string()));
         }
 
         if let Some(host) = hostname {
-            sql.push_str(&format!(" AND s.hostname = ?{hostname_param}"));
+            sql.push_str(&format!(" AND tok.hostname = ?{hostname_param}"));
             params_vec.push(Box::new(host.to_string()));
         }
 
-        sql.push_str(
-            " GROUP BY s.provider, s.session_id, s.hostname
-              ORDER BY last_active DESC",
-        );
+        sql.push_str(" ORDER BY last_active DESC");
         sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = conn
@@ -2674,6 +2854,8 @@ impl Storage {
                     first_seen: row.get(5)?,
                     last_active: row.get(6)?,
                     project: row.get(7)?,
+                    has_subagents: row.get::<_, i64>(8)? != 0,
+                    subagent_count: row.get::<_, i64>(9)?.max(0) as u32,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -2683,6 +2865,193 @@ impl Storage {
             results.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
         Ok(results)
+    }
+
+    /// Return one row per distinct `agent_id` that belongs to
+    /// `(provider, session_id)`. Each row aggregates the agent's own rows
+    /// across `token_snapshots`, `response_times`, and `tool_actions`. The
+    /// `parent_agent_id` field supports future depth-2+ nesting; today every
+    /// chain originates from the parent transcript so it is None for all
+    /// real-world rows.
+    ///
+    /// Parent resolution (Wave 2 chose option (b)): the chain's earliest
+    /// `parent_uuid` is matched against `tool_actions.message_id` — if the
+    /// uuid is owned by some other agent's transcript, that agent becomes
+    /// `parent_agent_id`. When the uuid lives in the parent transcript the
+    /// owning row has `agent_id IS NULL`, so the lookup correctly returns
+    /// None and the node sorts under the session root in the UI.
+    pub fn get_session_subagent_tree(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<Vec<SubagentNode>, String> {
+        let conn = self.conn.lock();
+        let provider_str = provider.as_str();
+
+        // Discover the universe of agent_ids attached to this session across
+        // all three sub-agent-aware tables. UNION dedupes naturally.
+        let mut agents_stmt = conn
+            .prepare_cached(
+                "SELECT agent_id FROM (
+                     SELECT agent_id FROM token_snapshots
+                       WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM response_times
+                       WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM tool_actions
+                       WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
+                 )",
+            )
+            .map_err(|e| format!("Prepare agent universe: {e}"))?;
+        let agent_ids: Vec<String> = agents_stmt
+            .query_map(params![provider_str, session_id], |row| row.get(0))
+            .map_err(|e| format!("Query agent universe: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Collect agent universe: {e}"))?;
+        drop(agents_stmt);
+
+        let mut nodes: Vec<SubagentNode> = Vec::with_capacity(agent_ids.len());
+
+        // Per-agent aggregate query. Pulls tokens / first_seen / last_active
+        // from token_snapshots ∪ response_times, turn_count from
+        // response_times, tool_call_count from tool_actions. The chain's
+        // earliest parent_uuid (from response_times — assistant turn close)
+        // feeds the parent_agent_id resolver. The label is a best-effort
+        // 80-char crop of the first user-side timestamp's row id, kept None
+        // here because we don't store message bodies in response_times;
+        // Wave 3 can derive a richer label from sessions when needed.
+        let mut per_agent_stmt = conn
+            .prepare_cached(
+                "SELECT
+                     (SELECT MIN(ts) FROM (
+                         SELECT MIN(timestamp) AS ts FROM token_snapshots
+                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
+                         UNION ALL
+                         SELECT MIN(timestamp) AS ts FROM response_times
+                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
+                     )) AS first_seen,
+                     (SELECT MAX(ts) FROM (
+                         SELECT MAX(timestamp) AS ts FROM token_snapshots
+                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
+                         UNION ALL
+                         SELECT MAX(timestamp) AS ts FROM response_times
+                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
+                     )) AS last_active,
+                     (SELECT COUNT(*) FROM response_times
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3) AS turn_count,
+                     COALESCE((SELECT SUM(input_tokens) FROM token_snapshots
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS input_tokens,
+                     COALESCE((SELECT SUM(output_tokens) FROM token_snapshots
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS output_tokens,
+                     COALESCE((SELECT SUM(cache_creation_input_tokens) FROM token_snapshots
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS cache_creation_tokens,
+                     COALESCE((SELECT SUM(cache_read_input_tokens) FROM token_snapshots
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS cache_read_tokens,
+                     (SELECT COUNT(*) FROM tool_actions
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3) AS tool_call_count,
+                     -- Earliest parent_uuid for this agent (the chain root).
+                     (SELECT parent_uuid FROM response_times
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
+                          AND parent_uuid IS NOT NULL
+                        ORDER BY timestamp ASC LIMIT 1) AS chain_root_parent_uuid",
+            )
+            .map_err(|e| format!("Prepare per-agent: {e}"))?;
+
+        // Per-agent parent resolver — option (b). Returns the owning
+        // agent_id when `message_id` lives in another sub-agent's
+        // transcript, NULL when it lives in the parent transcript.
+        let mut parent_stmt = conn
+            .prepare_cached(
+                "SELECT agent_id FROM tool_actions
+                   WHERE provider = ?1 AND session_id = ?2 AND message_id = ?3
+                     AND agent_id IS NOT NULL
+                   LIMIT 1",
+            )
+            .map_err(|e| format!("Prepare parent resolver: {e}"))?;
+
+        for agent_id in &agent_ids {
+            let row = per_agent_stmt
+                .query_row(params![provider_str, session_id, agent_id], |row| {
+                    let first_seen: Option<String> = row.get(0)?;
+                    let last_active: Option<String> = row.get(1)?;
+                    let turn_count: i64 = row.get(2)?;
+                    let input_tokens: i64 = row.get(3)?;
+                    let output_tokens: i64 = row.get(4)?;
+                    let cache_creation_tokens: i64 = row.get(5)?;
+                    let cache_read_tokens: i64 = row.get(6)?;
+                    let tool_call_count: i64 = row.get(7)?;
+                    let chain_root_parent_uuid: Option<String> = row.get(8)?;
+                    Ok((
+                        first_seen,
+                        last_active,
+                        turn_count,
+                        input_tokens,
+                        output_tokens,
+                        cache_creation_tokens,
+                        cache_read_tokens,
+                        tool_call_count,
+                        chain_root_parent_uuid,
+                    ))
+                })
+                .map_err(|e| format!("Per-agent query error: {e}"))?;
+
+            let (
+                first_seen,
+                last_active,
+                turn_count,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                tool_call_count,
+                chain_root_parent_uuid,
+            ) = row;
+
+            // Resolve parent_agent_id only when we have a chain root uuid to
+            // hand off. NULL today for every depth-1 sub-agent (the uuid
+            // belongs to the parent transcript whose rows carry
+            // agent_id IS NULL — the resolver query filters those out).
+            let parent_agent_id: Option<String> = match chain_root_parent_uuid {
+                Some(uuid) => parent_stmt
+                    .query_row(params![provider_str, session_id, &uuid], |r| r.get(0))
+                    .optional()
+                    .map_err(|e| format!("Parent resolver: {e}"))?,
+                None => None,
+            };
+
+            // Sub-agents with no token snapshots and no response_times rows
+            // shouldn't realistically appear (the agent_id surfaced only in
+            // tool_actions), but guard against missing timestamps anyway.
+            let first_seen = first_seen.unwrap_or_default();
+            let last_active = last_active.unwrap_or_else(|| first_seen.clone());
+
+            nodes.push(SubagentNode {
+                agent_id: agent_id.clone(),
+                parent_agent_id,
+                first_seen,
+                last_active,
+                turn_count: turn_count.max(0) as u32,
+                total_tokens: input_tokens
+                    + output_tokens
+                    + cache_creation_tokens
+                    + cache_read_tokens,
+                input_tokens,
+                output_tokens,
+                cache_creation_tokens,
+                cache_read_tokens,
+                tool_call_count: tool_call_count.max(0) as u32,
+                // Best-effort label deferred to Wave 3: we don't store user
+                // message bodies in any sub-agent-aware table, so a useful
+                // label would require joining sessions/transcripts. Return
+                // None so the contract is honored without a fragile peek.
+                label: None,
+            });
+        }
+
+        // Spawn order — frontend renders the tree top-to-bottom in this order.
+        nodes.sort_by(|a, b| a.first_seen.cmp(&b.first_seen));
+        Ok(nodes)
     }
 
     pub fn get_project_tokens(&self, days: i32) -> Result<Vec<ProjectTokens>, String> {
@@ -4211,8 +4580,8 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category, file_path, summary, full_input, full_output, timestamp)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category, file_path, summary, full_input, full_output, timestamp, is_sidechain, agent_id, parent_uuid)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 )
                 .map_err(|e| format!("Prepare store_tool_actions batch: {e}"))?;
 
@@ -4227,6 +4596,11 @@ impl Storage {
                     &message.tool_actions,
                     &message.uuid,
                     &message.session_id,
+                    ToolActionAttribution {
+                        is_sidechain: message.is_sidechain,
+                        agent_id: message.agent_id.as_deref(),
+                        parent_uuid: message.parent_uuid.as_deref(),
+                    },
                 )?;
             }
         }
@@ -5098,15 +5472,15 @@ impl Storage {
         &self,
         provider: IntegrationProvider,
         session_id: &str,
-        messages: &[(&str, &str)],
+        messages: &[ResponseTimeInput<'_>],
     ) -> Result<(), String> {
         if messages.is_empty() {
             return Ok(());
         }
 
-        // Sort by timestamp
-        let mut sorted: Vec<(&str, &str)> = messages.to_vec();
-        sorted.sort_by(|a, b| a.1.cmp(b.1));
+        // Sort by timestamp without losing the per-message attribution fields.
+        let mut sorted: Vec<ResponseTimeInput<'_>> = messages.to_vec();
+        sorted.sort_by(|a, b| a.timestamp.cmp(b.timestamp));
 
         // Query last assistant timestamp for this session (for cross-batch continuity)
         let last_assistant_ts: Option<String> = {
@@ -5126,11 +5500,15 @@ impl Storage {
         // Claude transcripts alternate user/tool-result messages with assistant
         // responses, while Codex keeps tool activity on assistant-side records.
         // For Codex, treat the turn as ending at the last assistant/tool
-        // activity before the next user prompt.
+        // activity before the next user prompt. Sub-agent attribution from the
+        // assistant message that closes the turn flows into the row.
         struct Turn {
             user_ts: String,
             assistant_ts: String,
             prev_assistant_ts: Option<String>,
+            is_sidechain: bool,
+            agent_id: Option<String>,
+            parent_uuid: Option<String>,
         }
 
         let mut turns: Vec<Turn> = Vec::new();
@@ -5138,58 +5516,75 @@ impl Storage {
 
         if provider == IntegrationProvider::Codex {
             let mut pending_user: Option<String> = None;
-            let mut pending_assistant: Option<String> = None;
+            let mut pending_assistant: Option<(String, bool, Option<String>, Option<String>)> =
+                None;
 
-            for (role, timestamp) in &sorted {
-                match *role {
+            for msg in &sorted {
+                match msg.role {
                     "user" => {
-                        if let (Some(user_ts), Some(assistant_ts)) =
+                        if let (Some(user_ts), Some((assistant_ts, sc, aid, puuid))) =
                             (pending_user.take(), pending_assistant.take())
                         {
                             turns.push(Turn {
                                 user_ts,
                                 assistant_ts: assistant_ts.clone(),
                                 prev_assistant_ts: prev_assistant.clone(),
+                                is_sidechain: sc,
+                                agent_id: aid,
+                                parent_uuid: puuid,
                             });
                             prev_assistant = Some(assistant_ts);
                         }
-                        pending_user = Some((*timestamp).to_string());
+                        pending_user = Some(msg.timestamp.to_string());
                     }
                     "assistant" => {
                         if pending_user.is_some() {
-                            pending_assistant = Some((*timestamp).to_string());
+                            pending_assistant = Some((
+                                msg.timestamp.to_string(),
+                                msg.is_sidechain,
+                                msg.agent_id.map(|s| s.to_string()),
+                                msg.parent_uuid.map(|s| s.to_string()),
+                            ));
                         } else {
-                            prev_assistant = Some((*timestamp).to_string());
+                            prev_assistant = Some(msg.timestamp.to_string());
                         }
                     }
                     _ => {}
                 }
             }
 
-            if let (Some(user_ts), Some(assistant_ts)) = (pending_user, pending_assistant) {
+            if let (Some(user_ts), Some((assistant_ts, sc, aid, puuid))) =
+                (pending_user, pending_assistant)
+            {
                 turns.push(Turn {
                     user_ts,
                     assistant_ts,
                     prev_assistant_ts: prev_assistant,
+                    is_sidechain: sc,
+                    agent_id: aid,
+                    parent_uuid: puuid,
                 });
             }
         } else {
             let mut pending_user: Option<String> = None;
 
-            for (role, timestamp) in &sorted {
-                match *role {
+            for msg in &sorted {
+                match msg.role {
                     "user" => {
-                        pending_user = Some((*timestamp).to_string());
+                        pending_user = Some(msg.timestamp.to_string());
                     }
                     "assistant" => {
                         if let Some(user_ts) = pending_user.take() {
                             turns.push(Turn {
                                 user_ts,
-                                assistant_ts: (*timestamp).to_string(),
+                                assistant_ts: msg.timestamp.to_string(),
                                 prev_assistant_ts: prev_assistant.clone(),
+                                is_sidechain: msg.is_sidechain,
+                                agent_id: msg.agent_id.map(|s| s.to_string()),
+                                parent_uuid: msg.parent_uuid.map(|s| s.to_string()),
                             });
                         }
-                        prev_assistant = Some((*timestamp).to_string());
+                        prev_assistant = Some(msg.timestamp.to_string());
                     }
                     _ => {}
                 }
@@ -5208,8 +5603,8 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT OR IGNORE INTO response_times (provider, session_id, timestamp, response_secs, idle_secs)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT OR IGNORE INTO response_times (provider, session_id, timestamp, response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
@@ -5237,7 +5632,10 @@ impl Storage {
                     session_id,
                     turn.assistant_ts,
                     response_val,
-                    idle_val
+                    idle_val,
+                    turn.is_sidechain as i32,
+                    turn.agent_id,
+                    turn.parent_uuid,
                 ])
                 .map_err(|e| format!("Insert error: {e}"))?;
             }
@@ -5247,11 +5645,22 @@ impl Storage {
         Ok(())
     }
 
-    pub fn get_llm_runtime_stats(&self, range: &str) -> Result<LlmRuntimeStats, String> {
+    /// Compute LLM runtime stats. `scope` controls whether sub-agent
+    /// (`is_sidechain = 1`) rows are folded in:
+    /// * `None` or `Some("all")`: include parent + sub-agent rows (default,
+    ///   matches pre-Wave-2 behavior since sub-agent rows used to not exist).
+    /// * `Some("parent_only")`: filter out sub-agent rows for the legacy
+    ///   "parent transcript only" view.
+    pub fn get_llm_runtime_stats(
+        &self,
+        range: &str,
+        scope: Option<&str>,
+    ) -> Result<LlmRuntimeStats, String> {
         let conn = self.conn.lock();
         let now = Utc::now();
         let from = now - range_to_duration(range);
         let from_str = from.to_rfc3339();
+        let parent_only = matches!(scope, Some("parent_only"));
 
         let range_secs = range_to_duration(range).num_seconds() as f64;
         let bucket_secs = range_secs / 7.0;
@@ -5291,13 +5700,22 @@ impl Storage {
         };
 
         {
+            // Index hint: when parent_only filter is on, the
+            // `idx_rt_provider_session_sidechain` index covers the WHERE
+            // clause; otherwise the broader timestamp index is used.
+            let sql = if parent_only {
+                "SELECT timestamp, response_secs, idle_secs, provider, session_id
+                 FROM response_times
+                 WHERE timestamp >= ?1 AND response_secs IS NOT NULL AND is_sidechain = 0
+                 ORDER BY provider, session_id, timestamp"
+            } else {
+                "SELECT timestamp, response_secs, idle_secs, provider, session_id
+                 FROM response_times
+                 WHERE timestamp >= ?1 AND response_secs IS NOT NULL
+                 ORDER BY provider, session_id, timestamp"
+            };
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT timestamp, response_secs, idle_secs, provider, session_id
-                     FROM response_times
-                     WHERE timestamp >= ?1 AND response_secs IS NOT NULL
-                     ORDER BY provider, session_id, timestamp",
-                )
+                .prepare_cached(sql)
                 .map_err(|e| format!("Prepare runtime query: {e}"))?;
 
             let rows = stmt
@@ -5561,4 +5979,355 @@ fn downsample(points: Vec<DataPoint>, max: usize) -> Vec<DataPoint> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    /// Drive Storage::init against a temp directory by routing `db_path`
+    /// through the QUILL_DEMO_MODE path override. We own the env block under
+    /// #[serial] so concurrent tests do not race over these globals.
+    fn init_storage_in(_dir: &TempDir) -> Storage {
+        // SAFETY: env mutation; tests are serialized via `#[serial]`.
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", _dir.path());
+        }
+        let storage = Storage::init().expect("init storage");
+        // Leave the env set so any sibling lookups during the test continue
+        // to resolve into the temp dir. Test teardown reaps it.
+        storage
+    }
+
+    fn clear_env() {
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+            std::env::remove_var("QUILL_DATA_DIR");
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[ignore] // diagnostic only; prints schema for manual verification
+    fn dump_post_migration_schema() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let conn = storage.conn.lock();
+        for table in ["response_times", "tool_actions", "token_snapshots"] {
+            println!("\n--- {table} columns ---");
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("pragma");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i32>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i32>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect");
+            for r in rows {
+                println!("{r:?}");
+            }
+        }
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn migration_20_adds_subagent_columns() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        let conn = storage.conn.lock();
+        for table in ["response_times", "tool_actions", "token_snapshots"] {
+            assert!(
+                table_has_column(&conn, table, "is_sidechain"),
+                "{table}.is_sidechain missing after migration 20"
+            );
+            assert!(
+                table_has_column(&conn, table, "agent_id"),
+                "{table}.agent_id missing after migration 20"
+            );
+            assert!(
+                table_has_column(&conn, table, "parent_uuid"),
+                "{table}.parent_uuid missing after migration 20"
+            );
+        }
+        let version: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read schema_version");
+        assert!(
+            version >= 20,
+            "schema_version must advance to at least 20, got {version}"
+        );
+        drop(conn);
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn response_times_insert_round_trips_subagent_columns() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        // Two-turn mini transcript: one top-level turn, one sub-agent turn.
+        // Each turn = user+assistant pair sorted by timestamp.
+        let inputs = vec![
+            ResponseTimeInput::new("user", "2026-05-09T10:00:00Z"),
+            ResponseTimeInput::new("assistant", "2026-05-09T10:00:05Z"),
+            ResponseTimeInput {
+                role: "user",
+                timestamp: "2026-05-09T10:00:10Z",
+                is_sidechain: true,
+                agent_id: Some("aaaabbbbccccdddd"),
+                parent_uuid: Some("p2"),
+            },
+            ResponseTimeInput {
+                role: "assistant",
+                timestamp: "2026-05-09T10:00:15Z",
+                is_sidechain: true,
+                agent_id: Some("aaaabbbbccccdddd"),
+                parent_uuid: Some("s1"),
+            },
+        ];
+        storage
+            .ingest_response_times(IntegrationProvider::Claude, "test-session", &inputs)
+            .expect("insert response_times");
+
+        let conn = storage.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT timestamp, is_sidechain, agent_id, parent_uuid
+                 FROM response_times
+                 WHERE provider = 'claude' AND session_id = 'test-session'
+                 ORDER BY timestamp ASC",
+            )
+            .expect("prepare select");
+        let rows: Vec<(String, i32, Option<String>, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        assert_eq!(rows.len(), 2, "expected one row per turn, got {rows:?}");
+        assert_eq!(rows[0].1, 0, "top-level row defaults to is_sidechain=0");
+        assert!(rows[0].2.is_none(), "top-level row has NULL agent_id");
+        assert_eq!(rows[1].1, 1, "sub-agent row stores is_sidechain=1");
+        assert_eq!(rows[1].2.as_deref(), Some("aaaabbbbccccdddd"));
+        assert_eq!(rows[1].3.as_deref(), Some("s1"));
+        // stmt + conn drop at scope end; explicit drop would move-conflict.
+        clear_env();
+    }
+
+    /// Wave 2 rollup contract: get_session_breakdown must SUM tokens and
+    /// turns across the parent transcript plus every sub-agent chain, and
+    /// surface has_subagents / subagent_count for the Sessions UI to know
+    /// the row is expandable.
+    #[test]
+    #[serial]
+    fn get_session_breakdown_rolls_up_subagent_tokens() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        // Insert directly so timestamps are deterministic. store_token_snapshot
+        // overwrites timestamp with `now()`, which would make ordering
+        // assertions flaky.
+        let now = Utc::now();
+        let recent = now.to_rfc3339();
+        let earlier = (now - TimeDelta::minutes(10)).to_rfc3339();
+        let middle = (now - TimeDelta::minutes(5)).to_rfc3339();
+
+        {
+            let conn = storage.conn.lock();
+            // Parent row: 100 input + 50 output + 0 cache = 150 tokens.
+            conn.execute(
+                "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
+                     input_tokens, output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
+                 VALUES ('claude', 'sess-rollup', 'host1', ?1,
+                         100, 50, 0, 0, '/some/cwd', 0, NULL, NULL)",
+                params![&earlier],
+            )
+            .expect("insert parent snapshot");
+            // Sub-agent row: 200 input + 80 output + 10 + 5 = 295 tokens.
+            conn.execute(
+                "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
+                     input_tokens, output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
+                 VALUES ('claude', 'sess-rollup', 'host1', ?1,
+                         200, 80, 10, 5, '/some/cwd', 1, 'aaaabbbbccccdddd', 'pmsg1')",
+                params![&recent],
+            )
+            .expect("insert sub-agent snapshot");
+
+            // One parent turn + one sub-agent turn ⇒ rolled-up turn_count = 2.
+            conn.execute(
+                "INSERT INTO response_times (provider, session_id, timestamp,
+                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
+                 VALUES ('claude', 'sess-rollup', ?1, 5.0, NULL, 0, NULL, NULL)",
+                params![&earlier],
+            )
+            .expect("insert parent response_time");
+            conn.execute(
+                "INSERT INTO response_times (provider, session_id, timestamp,
+                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
+                 VALUES ('claude', 'sess-rollup', ?1, 4.5, NULL, 1, 'aaaabbbbccccdddd', 'pmsg1')",
+                params![&middle],
+            )
+            .expect("insert sub-agent response_time");
+        }
+
+        let rows = storage
+            .get_session_breakdown(7, None, None, Some(100))
+            .expect("get_session_breakdown");
+        let row = rows
+            .iter()
+            .find(|r| r.session_id == "sess-rollup")
+            .expect("session present in breakdown");
+
+        assert_eq!(
+            row.total_tokens, 445,
+            "tokens must sum parent (150) + sub-agent (295) = 445; got {row:?}"
+        );
+        assert_eq!(
+            row.turn_count, 2,
+            "turn_count must sum response_times rows (parent + sub-agent) = 2"
+        );
+        assert!(
+            row.has_subagents,
+            "has_subagents must be true when token_snapshots has is_sidechain=1 row"
+        );
+        assert_eq!(
+            row.subagent_count, 1,
+            "subagent_count must be 1 distinct agent_id across all three tables"
+        );
+        // last_active reflects the most recent row across both tables.
+        assert_eq!(
+            row.last_active, recent,
+            "last_active must equal MAX timestamp"
+        );
+
+        drop(rows);
+        clear_env();
+    }
+
+    /// Wave 2 tree contract: get_session_subagent_tree returns one node per
+    /// distinct agent_id under the session, ordered by first_seen ASC. Today
+    /// every depth-1 sub-agent has parent_agent_id = None because the chain
+    /// root parent_uuid points into the parent transcript whose rows carry
+    /// agent_id IS NULL (filtered out by the resolver query).
+    #[test]
+    #[serial]
+    fn get_session_subagent_tree_returns_one_node_per_agent() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        let now = Utc::now();
+        let t_a = (now - TimeDelta::minutes(30)).to_rfc3339();
+        let t_a_end = (now - TimeDelta::minutes(28)).to_rfc3339();
+        let t_b = (now - TimeDelta::minutes(20)).to_rfc3339();
+        let t_b_end = (now - TimeDelta::minutes(18)).to_rfc3339();
+
+        {
+            let conn = storage.conn.lock();
+            // Agent A — earlier, two response_times, one tool_action,
+            // one token_snapshot.
+            conn.execute_batch(&format!(
+                r#"
+                INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
+                    input_tokens, output_tokens, cache_creation_input_tokens,
+                    cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', 'h', '{t_a}',
+                          10, 20, 1, 2, NULL, 1, 'a11111111111aaaa', 'pmsg-A');
+
+                INSERT INTO response_times (provider, session_id, timestamp,
+                    response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', '{t_a}', 1.5, NULL, 1, 'a11111111111aaaa', 'pmsg-A');
+                INSERT INTO response_times (provider, session_id, timestamp,
+                    response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', '{t_a_end}', 2.5, 0.3, 1, 'a11111111111aaaa', 'msg-A2');
+
+                INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category,
+                    summary, timestamp, is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'msg-A2', 'sess-tree', 'Read', 'fs', 'read file',
+                          '{t_a_end}', 1, 'a11111111111aaaa', 'pmsg-A');
+
+                -- Agent B — later, simpler shape.
+                INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
+                    input_tokens, output_tokens, cache_creation_input_tokens,
+                    cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', 'h', '{t_b}',
+                          5, 5, 0, 0, NULL, 1, 'b22222222222bbbb', 'pmsg-B');
+
+                INSERT INTO response_times (provider, session_id, timestamp,
+                    response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', '{t_b_end}', 1.0, NULL, 1, 'b22222222222bbbb', 'pmsg-B');
+                "#
+            ))
+            .expect("seed tree fixtures");
+        }
+
+        let nodes = storage
+            .get_session_subagent_tree(IntegrationProvider::Claude, "sess-tree")
+            .expect("get_session_subagent_tree");
+
+        assert_eq!(
+            nodes.len(),
+            2,
+            "two distinct agents ⇒ two nodes; got {nodes:?}"
+        );
+
+        // Ordered by first_seen ASC: Agent A first.
+        assert_eq!(nodes[0].agent_id, "a11111111111aaaa");
+        assert_eq!(nodes[1].agent_id, "b22222222222bbbb");
+
+        // Depth-1 nesting: every node's parent uuid lives in the (unseeded)
+        // parent transcript, so the resolver returns None.
+        assert!(
+            nodes[0].parent_agent_id.is_none(),
+            "depth-1 sub-agent should have parent_agent_id = None"
+        );
+        assert!(
+            nodes[1].parent_agent_id.is_none(),
+            "depth-1 sub-agent should have parent_agent_id = None"
+        );
+
+        // Agent A's aggregates.
+        assert_eq!(nodes[0].turn_count, 2);
+        assert_eq!(nodes[0].input_tokens, 10);
+        assert_eq!(nodes[0].output_tokens, 20);
+        assert_eq!(nodes[0].cache_creation_tokens, 1);
+        assert_eq!(nodes[0].cache_read_tokens, 2);
+        assert_eq!(nodes[0].total_tokens, 33);
+        assert_eq!(nodes[0].tool_call_count, 1);
+        assert_eq!(nodes[0].first_seen, t_a);
+        assert_eq!(nodes[0].last_active, t_a_end);
+
+        // Agent B's aggregates.
+        assert_eq!(nodes[1].turn_count, 1);
+        assert_eq!(nodes[1].total_tokens, 10);
+        assert_eq!(nodes[1].tool_call_count, 0);
+
+        clear_env();
+    }
 }

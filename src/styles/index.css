@@ -1772,6 +1772,103 @@ body {
   background: rgba(245, 158, 11, 0.12);
 }
 
+.breakdown-provider-tag.agent {
+  color: #c084fc;
+  background: rgba(192, 132, 252, 0.14);
+}
+
+.breakdown-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  margin-right: 5px;
+  color: rgba(255, 255, 255, 0.55);
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.breakdown-chevron-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.breakdown-chevron-btn:hover {
+  color: rgba(255, 255, 255, 0.9);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.breakdown-chevron-spacer {
+  visibility: hidden;
+}
+
+.breakdown-row-subagent {
+  background: rgba(192, 132, 252, 0.04);
+  cursor: default;
+  contain-intrinsic-size: auto 30px;
+}
+
+.breakdown-row-subagent.has-children {
+  cursor: pointer;
+}
+
+.breakdown-row-subagent:hover {
+  background: rgba(192, 132, 252, 0.08);
+}
+
+.breakdown-name-subagent {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  color: rgba(255, 255, 255, 0.75);
+  font-weight: 500;
+}
+
+.breakdown-tree-guide {
+  display: inline-block;
+  color: rgba(255, 255, 255, 0.3);
+  margin-right: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  user-select: none;
+}
+
+.breakdown-subagent-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.7);
+  margin-right: 4px;
+}
+
+.breakdown-subagent-label {
+  margin-left: 6px;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.breakdown-row-subagent-status {
+  cursor: default;
+  background: transparent;
+}
+
+.breakdown-subagent-status-text {
+  color: rgba(255, 255, 255, 0.4);
+  font-style: italic;
+  font-weight: 400;
+}
+
+.breakdown-row-subagent-status.error .breakdown-subagent-status-text {
+  color: rgba(248, 113, 113, 0.85);
+  font-style: normal;
+}
+
 .breakdown-host-tag {
   margin-left: 5px;
   color: rgba(255, 255, 255, 0.45);

@@ -23,6 +23,16 @@ pub struct TokenReportPayload {
     pub cache_read_input_tokens: i64,
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Optional sub-agent attribution. Hook clients that don't know about
+    /// sub-agents simply omit these; the snapshot is treated as top-level
+    /// (is_sidechain=0, agent_id/parent_uuid NULL). Claude Code's hook
+    /// runner can pass these when it forwards a sub-agent's token tally.
+    #[serde(default)]
+    pub is_sidechain: bool,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub parent_uuid: Option<String>,
 }
 
 // Time-series point for token charts
@@ -140,6 +150,12 @@ pub struct SessionStats {
 }
 
 // Session-level token breakdown
+//
+// As of Wave 2 (sub-agent rollup) the totals here include rows from both the
+// parent transcript and any sub-agent chains (`is_sidechain=1`) belonging to
+// the same `(provider, session_id)` pair. The `has_subagents` and
+// `subagent_count` fields are additive — older TS callers ignore them; the
+// Sessions-tab tree (Wave 3) uses them to decide whether a row is expandable.
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionBreakdown {
     pub provider: String,
@@ -150,6 +166,39 @@ pub struct SessionBreakdown {
     pub first_seen: String,
     pub last_active: String,
     pub project: Option<String>,
+    /// True when at least one row in token_snapshots for this session is
+    /// tagged `is_sidechain=1`. Cheapest signal — chosen because
+    /// token_snapshots is the only sub-agent-aware table that retains rows
+    /// across the Wave 1 reingest reset (response_times / tool_actions were
+    /// truncated and may be empty for older sessions until the next walk).
+    #[serde(default)]
+    pub has_subagents: bool,
+    /// COUNT(DISTINCT agent_id) across token_snapshots ∪ response_times ∪
+    /// tool_actions for this session. UNION is used because any one of the
+    /// three tables may carry the agent_id depending on which side of the
+    /// extraction emitted the row first.
+    #[serde(default)]
+    pub subagent_count: u32,
+}
+
+/// One sub-agent node inside a parent session, returned by
+/// `get_session_subagent_tree`. Multi-level nesting is supported via
+/// `parent_agent_id`; today every chain originates from the parent
+/// transcript so depth-1 sub-agents always carry `parent_agent_id = None`.
+#[derive(Serialize, Clone, Debug)]
+pub struct SubagentNode {
+    pub agent_id: String,
+    pub parent_agent_id: Option<String>,
+    pub first_seen: String,
+    pub last_active: String,
+    pub turn_count: u32,
+    pub total_tokens: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub tool_call_count: u32,
+    pub label: Option<String>,
 }
 
 // --- Context savings telemetry models ---

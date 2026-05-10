@@ -419,13 +419,23 @@ impl SessionIndex {
 
     fn discover_claude_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
         let projects_dir = crate::data_paths::resolve_claude_projects_dir();
+        Self::discover_claude_session_files_in(&projects_dir)
+    }
 
+    /// Test-friendly variant: enumerate Claude transcripts (parent + sub-agent)
+    /// under the supplied `projects_dir`. Two explicit read_dir passes per
+    /// project: first picks up `<projectSlug>/*.jsonl` (parents), second
+    /// picks up `<projectSlug>/<session-uuid>/subagents/*.jsonl` (sub-agents).
+    /// We avoid walkdir so unrelated JSONLs nested elsewhere never sneak in.
+    fn discover_claude_session_files_in(
+        projects_dir: &Path,
+    ) -> Result<Vec<DiscoveredSessionFile>, String> {
         if !projects_dir.exists() {
             return Ok(Vec::new());
         }
 
         let mut files = Vec::new();
-        for project_entry in std::fs::read_dir(&projects_dir)
+        for project_entry in std::fs::read_dir(projects_dir)
             .map_err(|e| format!("Read projects dir: {e}"))?
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
@@ -437,6 +447,7 @@ impl SessionIndex {
                 .unwrap_or("unknown");
             let project_name = Self::project_display_name(project_dir_name);
 
+            // (1) Parent transcripts: <projectSlug>/*.jsonl
             for entry in std::fs::read_dir(&project_dir)
                 .map_err(|e| format!("Read project dir: {e}"))?
                 .filter_map(|e| e.ok())
@@ -446,7 +457,32 @@ impl SessionIndex {
                     provider: IntegrationProvider::Claude,
                     path: entry.path(),
                     default_project: project_name.clone(),
+                    is_subagent: false,
                 });
+            }
+
+            // (2) Sub-agent transcripts: <projectSlug>/<session-uuid>/subagents/*.jsonl
+            for session_entry in std::fs::read_dir(&project_dir)
+                .map_err(|e| format!("Read project dir: {e}"))?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+            {
+                let subagents_dir = session_entry.path().join("subagents");
+                if !subagents_dir.is_dir() {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&subagents_dir)
+                    .map_err(|e| format!("Read subagents dir: {e}"))?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+                {
+                    files.push(DiscoveredSessionFile {
+                        provider: IntegrationProvider::Claude,
+                        path: entry.path(),
+                        default_project: project_name.clone(),
+                        is_subagent: true,
+                    });
+                }
             }
         }
 
@@ -471,6 +507,7 @@ impl SessionIndex {
                 provider: IntegrationProvider::Codex,
                 path: entry.path().to_path_buf(),
                 default_project: "unknown".to_string(),
+                is_subagent: false,
             });
         }
 
@@ -491,6 +528,23 @@ impl SessionIndex {
         let mut state = self.state.lock();
         let hostname = Self::local_hostname();
         let mut writer = self.writer.lock();
+
+        // Migration 20 backfill hook: when storage signals a pending sub-agent
+        // re-ingest, drop the mtime cache so every transcript is re-extracted
+        // in this boot. The migration already truncated response_times /
+        // tool_actions; this re-scan repopulates them with the new
+        // is_sidechain / agent_id / parent_uuid columns set. The pending flag
+        // is cleared AFTER the scan loop completes successfully — if the scan
+        // errors out partway, the flag stays set so the next boot retries.
+        let subagent_reingest_pending = storage
+            .and_then(|s| s.get_setting("subagent_reingest_pending").ok().flatten())
+            .is_some();
+        if subagent_reingest_pending {
+            log::info!(
+                "Sub-agent attribution migration: clearing mtime cache to force full transcript re-ingest"
+            );
+            state.file_mtimes.clear();
+        }
 
         for discovered in Self::discover_session_files()? {
             let file_key = discovered.path.to_string_lossy().to_string();
@@ -570,10 +624,16 @@ impl SessionIndex {
                 && !extracted.session_id.is_empty()
                 && !extracted.messages.is_empty()
             {
-                let rt_pairs: Vec<(&str, &str)> = extracted
+                let rt_pairs: Vec<crate::storage::ResponseTimeInput<'_>> = extracted
                     .messages
                     .iter()
-                    .map(|msg| (msg.role.as_str(), msg.timestamp.as_str()))
+                    .map(|msg| crate::storage::ResponseTimeInput {
+                        role: msg.role.as_str(),
+                        timestamp: msg.timestamp.as_str(),
+                        is_sidechain: msg.is_sidechain,
+                        agent_id: msg.agent_id.as_deref(),
+                        parent_uuid: msg.parent_uuid.as_deref(),
+                    })
                     .collect();
                 if let Err(e) = storage.ingest_response_times(
                     discovered.provider,
@@ -591,6 +651,16 @@ impl SessionIndex {
         // Commit all changes
         if index_changed {
             writer.commit().map_err(|e| format!("Commit index: {e}"))?;
+        }
+
+        // Scan completed without bubbling an error — safe to clear the
+        // migration-20 backfill flag. If we errored above, the flag stays set
+        // so the next boot re-runs the full transcript re-ingest.
+        if subagent_reingest_pending
+            && let Some(storage) = storage
+            && let Err(e) = storage.delete_setting("subagent_reingest_pending")
+        {
+            log::warn!("Failed to clear subagent_reingest_pending flag: {e}");
         }
 
         drop(writer);
@@ -1062,10 +1132,18 @@ pub struct SessionContext {
     pub messages: Vec<ContextMessage>,
 }
 
+#[derive(Debug)]
 struct DiscoveredSessionFile {
     provider: IntegrationProvider,
     path: PathBuf,
     default_project: String,
+    /// True when this file lives under `<session>/subagents/agent-*.jsonl`.
+    /// Hints the extractor to expect every record to carry isSidechain=true
+    /// and lets the indexer treat sub-agent rows as part of the parent
+    /// session_id while still tagging them for tree roll-ups. Currently
+    /// informational — the per-record `isSidechain` field drives DB writes.
+    #[allow(dead_code)]
+    is_subagent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1100,6 +1178,11 @@ pub struct ExtractedMessage {
     // Tool actions for SQLite storage
     #[allow(dead_code)]
     pub tool_actions: Vec<ToolAction>,
+    /// Claude Code sub-agent attribution. Always false/None for Codex (no
+    /// sub-agent concept) and for top-level Claude messages.
+    pub is_sidechain: bool,
+    pub agent_id: Option<String>,
+    pub parent_uuid: Option<String>,
 }
 
 pub struct ExtractedSession {
@@ -1331,6 +1414,10 @@ fn make_tool_message(
         commands_run,
         tool_details,
         tool_actions: vec![action],
+        // Synthetic Codex tool message — no sub-agent attribution applies.
+        is_sidechain: false,
+        agent_id: None,
+        parent_uuid: None,
     }
 }
 
@@ -1422,6 +1509,25 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // Sub-agent attribution. isSidechain is the record's own assertion;
+        // parent transcripts emit `false` (or omit it), subagents/*.jsonl rows
+        // emit `true`. agentId only appears on sidechain rows. parentUuid is
+        // the prior message uuid in the same chain (NULL for the first
+        // message of a sub-agent transcript).
+        let is_sidechain = obj
+            .get("isSidechain")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let agent_id = obj
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let parent_uuid = obj
+            .get("parentUuid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
         let message = match obj.get("message") {
             Some(m) => m,
@@ -1619,6 +1725,9 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             commands_run,
             tool_details: tool_details_vec,
             tool_actions,
+            is_sidechain,
+            agent_id,
+            parent_uuid,
         });
     }
 
@@ -1634,7 +1743,17 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             .unwrap_or_default(),
         project_name: path
             .parent()
-            .and_then(|parent| parent.file_name())
+            // For sub-agent transcripts the immediate parent is the
+            // <session-uuid>/subagents/ directory. Walk up to <projectSlug>
+            // so project_display_name produces the correct human label.
+            .and_then(|parent| {
+                if parent.file_name().and_then(|n| n.to_str()) == Some("subagents") {
+                    parent.parent().and_then(|grand| grand.parent())
+                } else {
+                    Some(parent)
+                }
+            })
+            .and_then(|dir| dir.file_name())
             .and_then(|name| name.to_str())
             .map(SessionIndex::project_display_name),
         messages,
@@ -1738,6 +1857,10 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     commands_run: Vec::new(),
                     tool_details: Vec::new(),
                     tool_actions: Vec::new(),
+                    // Codex has no sub-agent concept; provider-agnostic NULLs.
+                    is_sidechain: false,
+                    agent_id: None,
+                    parent_uuid: None,
                 });
             }
             "response_item" => {
@@ -2017,4 +2140,156 @@ pub async fn sync_search_index(
     let idx = state.0.clone();
     let storage = crate::STORAGE.get();
     crate::run_blocking(move || idx.startup_scan(&app, storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Build a synthetic projects directory that mirrors Claude Code 2.x's
+    /// per-session layout: one parent transcript and one sub-agent transcript
+    /// living under `<session>/subagents/`.
+    fn make_fixture() -> TempDir {
+        let tmp = TempDir::new().expect("tempdir");
+        let project_dir = tmp.path().join("-home-test-proj");
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let subagents_dir = project_dir.join(session_id).join("subagents");
+        fs::create_dir_all(&subagents_dir).expect("mkdir subagents");
+
+        // Parent transcript record (no sidechain flag).
+        let parent_record = r#"{"type":"user","uuid":"p1","parentUuid":null,"sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-05-09T10:00:00Z","gitBranch":"main","message":{"role":"user","content":"hello"}}
+{"type":"assistant","uuid":"p2","parentUuid":"p1","sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-05-09T10:00:05Z","gitBranch":"main","message":{"role":"assistant","content":[{"type":"text","text":"hi back"}]}}
+"#;
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            parent_record,
+        )
+        .expect("write parent jsonl");
+
+        // Sub-agent transcript records (isSidechain=true everywhere, agentId
+        // matches filename stem suffix).
+        let agent_id = "aaaabbbbccccdddd";
+        let subagent_record = format!(
+            "{{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"{agent_id}\",\"parentUuid\":null,\"uuid\":\"s1\",\"sessionId\":\"{session_id}\",\"timestamp\":\"2026-05-09T10:00:10Z\",\"gitBranch\":\"main\",\"message\":{{\"role\":\"user\",\"content\":\"do task\"}}}}
+{{\"type\":\"assistant\",\"isSidechain\":true,\"agentId\":\"{agent_id}\",\"parentUuid\":\"s1\",\"uuid\":\"s2\",\"sessionId\":\"{session_id}\",\"timestamp\":\"2026-05-09T10:00:15Z\",\"gitBranch\":\"main\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}}}
+"
+        );
+        fs::write(
+            subagents_dir.join(format!("agent-{agent_id}.jsonl")),
+            subagent_record,
+        )
+        .expect("write subagent jsonl");
+
+        // Sibling meta.json must be ignored by the .jsonl filter.
+        fs::write(
+            subagents_dir.join(format!("agent-{agent_id}.meta.json")),
+            r#"{"agentType":"general-purpose","description":"test"}"#,
+        )
+        .expect("write meta");
+
+        tmp
+    }
+
+    #[test]
+    fn discover_finds_parent_and_subagent_jsonls() {
+        let fixture = make_fixture();
+        let files =
+            SessionIndex::discover_claude_session_files_in(fixture.path()).expect("discover ok");
+
+        assert_eq!(
+            files.len(),
+            2,
+            "expected one parent transcript and one sub-agent transcript, got {files:?}"
+        );
+
+        let parent = files
+            .iter()
+            .find(|f| !f.is_subagent)
+            .expect("missing parent entry");
+        let subagent = files
+            .iter()
+            .find(|f| f.is_subagent)
+            .expect("missing sub-agent entry");
+
+        assert_eq!(parent.provider, IntegrationProvider::Claude);
+        assert!(parent.path.to_string_lossy().ends_with(".jsonl"));
+        assert!(
+            !parent
+                .path
+                .components()
+                .any(|c| c.as_os_str() == "subagents"),
+            "parent path should not traverse subagents/"
+        );
+
+        assert_eq!(subagent.provider, IntegrationProvider::Claude);
+        assert!(
+            subagent
+                .path
+                .components()
+                .any(|c| c.as_os_str() == "subagents"),
+            "sub-agent path must traverse subagents/"
+        );
+        assert!(
+            !subagent.path.to_string_lossy().ends_with("meta.json"),
+            ".meta.json sidecars must be filtered out"
+        );
+        assert_eq!(
+            parent.default_project, subagent.default_project,
+            "sub-agent inherits its parent transcript's project name"
+        );
+    }
+
+    #[test]
+    fn extraction_tags_subagent_records_with_attribution() {
+        let fixture = make_fixture();
+        let files =
+            SessionIndex::discover_claude_session_files_in(fixture.path()).expect("discover ok");
+
+        let subagent_file = files
+            .iter()
+            .find(|f| f.is_subagent)
+            .expect("sub-agent file");
+        let extracted = extract_messages_from_jsonl(subagent_file.provider, &subagent_file.path);
+
+        assert!(
+            !extracted.messages.is_empty(),
+            "expected at least one extracted sub-agent message"
+        );
+        for msg in &extracted.messages {
+            assert!(
+                msg.is_sidechain,
+                "every record in a subagents/ transcript carries isSidechain=true"
+            );
+            assert_eq!(
+                msg.agent_id.as_deref(),
+                Some("aaaabbbbccccdddd"),
+                "agent_id must round-trip through extraction"
+            );
+            assert_eq!(
+                msg.session_id, "11111111-2222-3333-4444-555555555555",
+                "sub-agent session_id must equal the parent transcript's session_id"
+            );
+        }
+        // First message in the sub-agent chain has parentUuid=null; the second
+        // points at the first by uuid.
+        assert_eq!(extracted.messages[0].parent_uuid, None);
+        assert_eq!(
+            extracted.messages[1].parent_uuid.as_deref(),
+            Some("s1"),
+            "parent_uuid links sub-agent messages into a single chain"
+        );
+
+        // Sanity: parent transcript records remain top-level.
+        let parent_file = files.iter().find(|f| !f.is_subagent).expect("parent file");
+        let parent_extracted = extract_messages_from_jsonl(parent_file.provider, &parent_file.path);
+        for msg in &parent_extracted.messages {
+            assert!(
+                !msg.is_sidechain,
+                "parent transcript records must not be tagged sidechain"
+            );
+            assert!(msg.agent_id.is_none());
+        }
+    }
 }

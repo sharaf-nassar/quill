@@ -425,10 +425,16 @@ fn process_session_notify_payload(
         log::warn!("Failed to store tool actions: {err}");
     }
 
-    let rt_pairs: Vec<(&str, &str)> = extracted
+    let rt_pairs: Vec<crate::storage::ResponseTimeInput<'_>> = extracted
         .messages
         .iter()
-        .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+        .map(|m| crate::storage::ResponseTimeInput {
+            role: m.role.as_str(),
+            timestamp: m.timestamp.as_str(),
+            is_sidechain: m.is_sidechain,
+            agent_id: m.agent_id.as_deref(),
+            parent_uuid: m.parent_uuid.as_deref(),
+        })
         .collect();
     if let Err(err) = storage.ingest_response_times(payload.provider, &session_id, &rt_pairs) {
         log::warn!("Failed to store response times: {err}");
@@ -454,10 +460,17 @@ fn index_session_messages_in_background(
 
         match result {
             Ok(count) => {
-                let rt_pairs: Vec<(&str, &str)> = payload
+                // HTTP-pushed messages don't carry sub-agent attribution today;
+                // ResponseTimeInput::new defaults to is_sidechain=false / NULLs.
+                let rt_pairs: Vec<crate::storage::ResponseTimeInput<'_>> = payload
                     .messages
                     .iter()
-                    .map(|m| (m.role.as_str(), m.timestamp.as_str()))
+                    .map(|m| {
+                        crate::storage::ResponseTimeInput::new(
+                            m.role.as_str(),
+                            m.timestamp.as_str(),
+                        )
+                    })
                     .collect();
                 if let Err(err) =
                     storage.ingest_response_times(payload.provider, &payload.session_id, &rt_pairs)
@@ -932,7 +945,9 @@ async fn post_session_messages(
         }
     }
 
-    // Convert SessionMessagePayload items to ExtractedMessage structs
+    // Convert SessionMessagePayload items to ExtractedMessage structs.
+    // The HTTP message payload does not currently carry sub-agent attribution;
+    // fall back to defaults (top-level row, NULL agent/parent).
     let extracted: Vec<sessions::ExtractedMessage> = payload
         .messages
         .iter()
@@ -949,6 +964,9 @@ async fn post_session_messages(
             commands_run: Vec::new(),
             tool_details: Vec::new(),
             tool_actions: Vec::new(),
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: None,
         })
         .collect();
 

@@ -66,7 +66,7 @@ The SQLite database file path varies by operating system.
 
 ### Schema
 
-The database schema is versioned through migration 18 and includes usage, token, context savings, learning, session indexing, memory optimizer, code, runtime, and metadata tables.
+The database schema is versioned through migration 20 and includes usage, token, context savings, learning, session indexing, memory optimizer, code, runtime, and metadata tables.
 
 #### Usage Tracking
 
@@ -87,6 +87,8 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - **token_hourly** — Hourly aggregates per provider/host (total tokens, turn_count). Unique on (hour, hostname, provider).
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
+Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (11)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+
 #### Learning System
 
 Tables for the behavioral learning pipeline: observations, summaries, analysis runs, and discovered rules.
@@ -102,8 +104,8 @@ Startup also creates covering observation indexes for `(created_at, tool_name)` 
 
 Stores detailed tool invocation and response-time data for MCP-powered session search.
 
-- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output). Indexed on provider/session, message_id, file_path, and category. Startup and notify-driven reindexing batch these inserts per extracted message set so analytics queries do not wait behind one transaction per message.
-- **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs). Unique on (provider, session_id, timestamp).
+- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. Startup and notify-driven reindexing batch these inserts per extracted message set so analytics queries do not wait behind one transaction per message.
+- **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
 
 #### Working Context Store
 
@@ -139,6 +141,8 @@ Tables for tracking per-turn LLM response latency and caching git commit history
 
 Codex runtime ingestion treats a user prompt as one turn ending at the last assistant or tool-activity timestamp before the next user prompt, because Codex transcripts keep tool calls and outputs on assistant-side records.
 
+Migration 20 also added `is_sidechain`, `agent_id`, and `parent_uuid` to `response_times`. The `idle_secs` turn-grouping logic is unchanged, but each sub-agent forms its own chain of turns scoped by `(provider, session_id, agent_id)` — siblings spawned from the same parent message do not stitch together into a single timeline.
+
 - **git_snapshots** — Cached git history per project (project unique, commit_hash, commit_count, raw_data).
 
 #### Metadata
@@ -146,7 +150,7 @@ Codex runtime ingestion treats a user prompt as one turn ending at the last assi
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v18).
+- **schema_version** — Migration version tracking (currently v20). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; the next [[backend#Session Indexing]] sweep clears its `index_state.json` mtime cache so the indexer re-reads every JSONL to backfill the new sub-agent columns.
 
 ## Tauri IPC Commands
 
@@ -163,6 +167,8 @@ Codex live usage now comes from `codex app-server` `account/rateLimits/read` ins
 MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-tauri/src/fetcher.rs#fetch_minimax_usage]]. It reads the API key from the SQLite settings table and parses the `model_remains` array into 5-hour and weekly `UsageBucket` entries, filtering out models with zero quota.
 
 `get_session_breakdown` now accepts optional provider and limit arguments so Codex live views can request a provider-scoped active set without being crowded out by Claude sessions.
+
+`get_session_breakdown` is provider-agnostic at the row level and rolls up parent + all sub-agent rows for each session: `total_tokens`, `turn_count`, `last_active`, and the input/output/cache columns sum across `is_sidechain ∈ {0, 1}`, and each row carries two new fields — `has_subagents: bool` and `subagent_count: u32` (COUNT DISTINCT `agent_id`) — that gate the [[features#Analytics Dashboard#Now Tab]] expandable tree. The `(provider, session_id, is_sidechain)` index added in migration 20 keeps each `UNION`'d branch on an index scan.
 
 `get_context_savings_analytics` returns range-scoped summary totals, timeseries buckets, grouped breakdowns, and recent append-only events for the Analytics Context tab. Token values are approximate `ceil(bytes / 4)` estimates, while byte counts and event counts are exact where producers can measure them.
 
@@ -209,11 +215,15 @@ Read and trigger commands accept an optional provider filter so the UI can reque
 
 `get_top_tools` intentionally reads exact raw-observation windows instead of reusing `observation_summaries`, because summary rows are keyed by cleanup period rather than original event timestamps. The backend relies on the covering observation indexes above to keep that exact-window query responsive.
 
-### Code and Response Stats (4)
+### Code and Response Stats (5)
 
-`get_code_stats`, `get_code_stats_history`, `get_batch_session_code_stats`, `get_llm_runtime_stats`.
+`get_code_stats`, `get_code_stats_history`, `get_batch_session_code_stats`, `get_llm_runtime_stats`, `get_session_subagent_tree`.
 
 `get_batch_session_code_stats` fans out one SQL branch per `(provider, session_id)` pair with `UNION ALL` so SQLite can use the `tool_actions` provider/session index instead of falling back to a broad category scan across the entire code-change corpus.
+
+`get_llm_runtime_stats(range, scope)` accepts an optional `scope: "all" | "parent_only"` argument. `None` or `"all"` preserves the existing behavior across every row; `"parent_only"` adds `WHERE is_sidechain = 0` so the headline runtime card on the [[features#Analytics Dashboard#Now Tab]] can report parent-thread cost without sub-agent traffic inflating it. The `(provider, session_id, is_sidechain)` index covers the filter.
+
+`get_session_subagent_tree(provider, session_id) -> Vec<SubagentNode>` is lazy-fetched by the [[features#Analytics Dashboard#Now Tab]] only after a sub-agent-bearing session row is expanded. Implementation in [[src-tauri/src/storage.rs#Storage#get_session_subagent_tree]] returns one node per `agent_id` for the requested `(provider, session_id)`, carrying `parent_agent_id` (null at depth 1; populated when Claude later spawns depth-2+ sub-agents and rebuilt at query time from `parent_uuid` chains), `first_seen`/`last_active`, `turn_count`, the input/output/cache/total token breakdown, `tool_call_count`, and a reserved `label: Option<String>` (always `None` today).
 
 ### Memory Optimizer Commands (16)
 
@@ -305,6 +315,8 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
 
 When a transcript is reprocessed, Quill now coalesces repeated `notify` requests per session and applies each rewrite under one Tantivy writer lock with a single commit. This avoids overlapping delete-and-reindex batches while keeping SQLite `tool_actions` writes batched per extracted file or payload. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven `notify` ingestion that ran before the file was tracked in `index_state.json` cannot stack duplicate copies on top.
+
+The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript at `<projectSlug>/*.jsonl`, and each `DiscoveredSessionFile` carries an `is_subagent` flag so downstream extraction can tell the two apart. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid` from each JSON record; Codex extraction writes the provider-agnostic defaults (`is_sidechain=0`, `agent_id=NULL`, `parent_uuid=NULL`) so today's Codex CLI inherits the same code path the day OpenAI ships a sub-agent feature. Per-session sub-agent files live in one flat directory — multi-level hierarchy is reconstructed at query time via `parent_uuid` chains rather than nested filesystem layout.
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
 

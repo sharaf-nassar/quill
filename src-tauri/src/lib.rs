@@ -30,7 +30,8 @@ use models::{
     ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
     LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, RuntimeSettings,
     SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, StatusIndicatorState,
-    TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
+    SubagentNode, TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData,
+    UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -1307,9 +1308,21 @@ async fn get_batch_session_code_stats(
 }
 
 #[tauri::command]
-async fn get_llm_runtime_stats(range: String) -> Result<LlmRuntimeStats, String> {
+async fn get_llm_runtime_stats(
+    range: String,
+    scope: Option<String>,
+) -> Result<LlmRuntimeStats, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_llm_runtime_stats(&range))
+    run_blocking(move || storage.get_llm_runtime_stats(&range, scope.as_deref()))
+}
+
+#[tauri::command]
+async fn get_session_subagent_tree(
+    provider: integrations::IntegrationProvider,
+    session_id: String,
+) -> Result<Vec<SubagentNode>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_session_subagent_tree(provider, &session_id))
 }
 
 #[tauri::command]
@@ -2208,6 +2221,7 @@ pub fn run() {
             get_host_breakdown,
             get_project_breakdown,
             get_session_breakdown,
+            get_session_subagent_tree,
             get_session_stats,
             get_project_tokens,
             delete_host_data,

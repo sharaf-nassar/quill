@@ -21,6 +21,8 @@ That keeps combined analytics provider-safe while still sharing one token pipeli
 
 Analytics session drill-down uses the same provider plus session id pair when requesting token history, compact token stats, or session deletion, so identical ids from different providers stay isolated.
 
+Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (11)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the Now-tab card needs to exclude the sub-agent traffic instead.
+
 ## Learning Analysis Pipeline
 
 Tool-use observations and git history are analyzed by LLMs to discover reusable behavioral patterns.
@@ -62,6 +64,12 @@ Session transcripts are indexed for full-text search with enriched metadata, whi
 Each message is enriched during indexing by parsing tool call inputs and outputs.
 
 Claude Edit/Write tool calls become `code_changes`, Bash becomes `commands_run`, and Read/Grep/Glob become `tool_details`. Codex `apply_patch` calls become `code_changes`, `exec_command` and `write_stdin` become `commands_run`, and MCP or auxiliary tool calls become searchable `tool_details`.
+
+### Sub-Agent Transcripts
+
+The Claude file walker now picks up `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript so sub-agent activity flows through the same enrichment and storage path.
+
+Each sub-agent file becomes a separate ingest entry, but rows write the parent's `session_id` (matching the on-disk `sessionId` field) plus `is_sidechain=1` and the sub-agent's `agent_id`, while parent-transcript rows stay `is_sidechain=0`. Codex emits no sub-agent transcripts today, so its ingest path writes the same defaults (`is_sidechain=0`, `agent_id=NULL`, `parent_uuid=NULL`) and inherits the rollup behavior whenever the OpenAI CLI gains a sub-agent feature.
 
 ## Memory Optimization Pipeline
 
