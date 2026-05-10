@@ -43,6 +43,13 @@ fn provider_scope_label(provider_scope: &[IntegrationProvider]) -> String {
     }
 }
 
+fn demo_mode_active() -> bool {
+    std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1")
+}
+
+/// Production root for non-Claude learned rules: `~/.config/quill/learned-rules/`.
+/// Used only when demo mode is off; demo mode routes everything through
+/// `crate::data_paths::resolve_rules_dir()` instead.
 fn quill_rules_root() -> PathBuf {
     dirs::config_dir()
         .or_else(dirs::home_dir)
@@ -52,6 +59,21 @@ fn quill_rules_root() -> PathBuf {
 }
 
 pub fn learned_rules_dir_for_scope(provider_scope: &[IntegrationProvider]) -> PathBuf {
+    // Demo-mode: route every provider scope under the resolved rules root so a
+    // sandboxed Quill writes only into the override directory. Production
+    // semantics (when `QUILL_DEMO_MODE` is unset) are untouched below.
+    if demo_mode_active() {
+        let root = crate::data_paths::resolve_rules_dir();
+        let suffix = if provider_scope == [IntegrationProvider::Claude] {
+            "claude"
+        } else if provider_scope == [IntegrationProvider::Codex] {
+            "codex"
+        } else {
+            "shared"
+        };
+        return root.join(suffix);
+    }
+
     let only_claude = provider_scope == [IntegrationProvider::Claude];
     if only_claude {
         return dirs::home_dir()
@@ -70,6 +92,26 @@ pub fn learned_rules_dir_for_scope(provider_scope: &[IntegrationProvider]) -> Pa
 }
 
 fn rule_directories_for_scope(provider_scope: &[IntegrationProvider]) -> Vec<PathBuf> {
+    // Demo-mode mirrors learned_rules_dir_for_scope: every scope lives under
+    // the override root, so the candidate-directory list collapses to that
+    // override layout. The production branch below is unchanged.
+    if demo_mode_active() {
+        let root = crate::data_paths::resolve_rules_dir();
+        let mut dirs = Vec::new();
+        if provider_scope.contains(&IntegrationProvider::Claude) {
+            dirs.push(root.join("claude"));
+        }
+        if provider_scope.contains(&IntegrationProvider::Codex) {
+            dirs.push(root.join("codex"));
+        }
+        if provider_scope.contains(&IntegrationProvider::Claude)
+            || provider_scope.contains(&IntegrationProvider::Codex)
+        {
+            dirs.push(root.join("shared"));
+        }
+        return dirs;
+    }
+
     let mut dirs = Vec::new();
     if provider_scope.contains(&IntegrationProvider::Claude) {
         dirs.push(

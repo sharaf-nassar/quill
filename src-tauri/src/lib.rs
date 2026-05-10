@@ -6,6 +6,7 @@ mod claude_setup;
 mod compress_prose;
 mod config;
 mod context_category;
+pub mod data_paths;
 mod fetcher;
 mod git_analysis;
 mod indicator;
@@ -1845,7 +1846,7 @@ pub fn run() {
 
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
-                let index_dir = dirs::data_local_dir()
+                let default_app_dir = dirs::data_local_dir()
                     .or_else(|| {
                         dirs::home_dir().map(|h| {
                             if cfg!(target_os = "macos") {
@@ -1856,7 +1857,8 @@ pub fn run() {
                         })
                     })
                     .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("com.quilltoolkit.app")
+                    .join("com.quilltoolkit.app");
+                let index_dir = crate::data_paths::resolve_data_dir_with_default(default_app_dir)
                     .join("session-index");
 
                 match sessions::SessionIndex::open_or_create(&index_dir) {

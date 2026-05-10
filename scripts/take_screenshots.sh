@@ -9,11 +9,17 @@
 #   "Learning", "Session Search", "Plugin Manager"
 set -euo pipefail
 
-OUTDIR="$(cd "$(dirname "$0")/.." && pwd)/screenshots"
+OUTDIR="${OUTDIR:-$(cd "$(dirname "$0")/.." && pwd)/marketing-site/assets/screenshots}"
 mkdir -p "$OUTDIR"
 
 DELAY_SHORT=0.4   # seconds after a click before capturing
 DELAY_WINDOW=1.5  # seconds to wait for a new window to open
+
+# 2x device-pixel-ratio capture for HiDPI rendering on the marketing site (FR-021).
+# `import -density` doesn't change the captured pixel grid, so we resample to 2x
+# AFTER capture using ImageMagick `convert` for crisper rendering. Set RETINA=0 to
+# disable.
+RETINA="${RETINA:-1}"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -23,6 +29,10 @@ log() { echo "  $*"; }
 capture() {
 	local output="$1" wid="$2"
 	import -window "$wid" "$output"
+	if [[ "$RETINA" == "1" ]] && command -v convert >/dev/null 2>&1; then
+		# Upscale to 2x using catmull-rom for crisp HiDPI rendering on the marketing site.
+		convert "$output" -filter Catrom -resize 200% "$output"
+	fi
 	log "Saved: $output"
 }
 
@@ -99,35 +109,42 @@ BTN_SESSIONS=125
 BTN_PLUGINS=150
 # BTN_RESTART=175  # not captured as a screenshot currently
 
-# ── 1. Live view (default) ────────────────────────────────────────────────────
+# ── 1. Hero / Live view (default) ─────────────────────────────────────────────
+# In stacked mode (the default), the main window already shows Live above
+# Analytics. We capture this once and save under TWO canonical names
+# (hero.png is the dual-pane shot used by the marketing-site hero; live.png is
+# the same shot referenced by the #live feature section). Two filenames keep the
+# site's per-section mapping clean while avoiding a second capture round.
 
 echo ""
-echo "[1/6] live-view.png"
+echo "[1/7] hero.png + live.png"
 xdotool windowactivate --sync "$QUILL_WID"
 sleep 0.3
-# Click Live to ensure it is the active pane
+# Click Live to ensure it is the active pane.
 click_offset "$QUILL_WID" "$BTN_LIVE" "$TITLEBAR_Y"
 sleep 0.3
-capture "$OUTDIR/live-view.png" "$QUILL_WID"
+capture "$OUTDIR/hero.png" "$QUILL_WID"
+cp "$OUTDIR/hero.png" "$OUTDIR/live.png"
+log "Saved: $OUTDIR/live.png (copy of hero.png)"
 
 # ── 2. Analytics – Now tab ────────────────────────────────────────────────────
 
 echo ""
-echo "[2/6] analytics-view.png (Now tab)"
+echo "[2/7] analytics-now.png (Now tab)"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_ANALYTICS" "$TITLEBAR_Y"
 sleep "$DELAY_SHORT"
 # The Analytics view opens to the Now tab by default.
 # Give it a moment to load data, then capture.
 sleep 0.4
-capture "$OUTDIR/analytics-view.png" "$QUILL_WID"
+capture "$OUTDIR/analytics-now.png" "$QUILL_WID"
 
 # ── 3. Analytics – Charts tab ─────────────────────────────────────────────────
 
 echo ""
-echo "[3/6] analytics-charts.png (Charts tab)"
+echo "[3/7] analytics-charts.png (Charts tab)"
 # The tab bar sits below the titlebar (~50px from top).
-# Tab order: Now | Charts | Trends | Breakdown
+# Tab order: Now | Charts | Trends | Context (last; appears only when context preservation is on)
 # "Charts" tab is approximately the second pill (~25% from left of window).
 CHARTS_TAB_X=$(( WIN_W * 25 / 100 ))
 CHARTS_TAB_Y=55
@@ -135,39 +152,52 @@ click_offset "$QUILL_WID" "$CHARTS_TAB_X" "$CHARTS_TAB_Y"
 sleep 0.5
 capture "$OUTDIR/analytics-charts.png" "$QUILL_WID"
 
+# ── 4. Analytics – Context tab ────────────────────────────────────────────────
+
+echo ""
+echo "[4/7] analytics-context.png (Context tab)"
+# Context tab is rightmost in the Analytics tab bar. It is only present when
+# Working Context Preservation is enabled in Settings or historical events exist.
+# In the demo dataset both conditions hold, so the tab is reliably reachable.
+# Approximate position: ~78% from left.
+CONTEXT_TAB_X=$(( WIN_W * 78 / 100 ))
+click_offset "$QUILL_WID" "$CONTEXT_TAB_X" "$CHARTS_TAB_Y"
+sleep 0.5
+capture "$OUTDIR/analytics-context.png" "$QUILL_WID"
+
 # Return to Now tab so the analytics pane is in its default state
 NOW_TAB_X=$(( WIN_W * 8 / 100 ))
 click_offset "$QUILL_WID" "$NOW_TAB_X" "$CHARTS_TAB_Y"
 sleep 0.3
 
-# ── 4. Learning panel ─────────────────────────────────────────────────────────
+# ── 5. Learning panel ─────────────────────────────────────────────────────────
 
 echo ""
-echo "[4/6] learning-panel.png"
+echo "[5/7] learning.png"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_LEARNING" "$TITLEBAR_Y"
 LEARN_WID=$(wait_for_window "Learning" 8)
 xdotool windowactivate --sync "$LEARN_WID"
 sleep "$DELAY_WINDOW"
-capture "$OUTDIR/learning-panel.png" "$LEARN_WID"
+capture "$OUTDIR/learning.png" "$LEARN_WID"
 close_window_by_id "$LEARN_WID"
 
 # ── 5. Session Search ─────────────────────────────────────────────────────────
 
 echo ""
-echo "[5/6] session-search.png"
+echo "[6/7] sessions.png"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_SESSIONS" "$TITLEBAR_Y"
 SESSIONS_WID=$(wait_for_window "Session Search" 8)
 xdotool windowactivate --sync "$SESSIONS_WID"
 sleep "$DELAY_WINDOW"
-capture "$OUTDIR/session-search.png" "$SESSIONS_WID"
+capture "$OUTDIR/sessions.png" "$SESSIONS_WID"
 close_window_by_id "$SESSIONS_WID"
 
 # ── 6. Plugin Manager ─────────────────────────────────────────────────────────
 
 echo ""
-echo "[6/6] plugins.png"
+echo "[7/7] plugins.png"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_PLUGINS" "$TITLEBAR_Y"
 PLUGINS_WID=$(wait_for_window "Plugin Manager" 8)

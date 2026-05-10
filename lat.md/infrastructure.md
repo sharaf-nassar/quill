@@ -58,6 +58,12 @@ It retries the draft lookup for API eventual consistency, updates `latest.json` 
 
 `GITHUB_TOKEN`, `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
 
+### Pages Workflow
+
+`.github/workflows/pages.yml` deploys the marketing site to GitHub Pages using the official `actions/deploy-pages@v4` flow.
+
+Triggers on `push` to `main` with a paths filter on `marketing-site/**` and the workflow file itself, plus `workflow_dispatch` for manual redeploys (useful when only screenshots change). Two-job split: `build` checks out the repo, runs `actions/configure-pages@v5`, and uploads `marketing-site/` verbatim via `actions/upload-pages-artifact@v3` (no build step — the site is plain HTML/CSS/JS); `deploy` consumes the artifact and runs `actions/deploy-pages@v4` against the `github-pages` environment so the deployed URL surfaces in the Actions UI. Permissions follow the GitHub-recommended least-privilege template: `contents:read`, `pages:write`, `id-token:write`. The `pages` concurrency group is set to `cancel-in-progress: false` to match GitHub's recommendation that an in-flight Pages deploy not be killed mid-flight. Contract: `specs/001-marketing-site/contracts/pages-workflow.md`.
+
 ## Release Process
 
 `release.sh` automates version bumping, release note generation, and tagging.
@@ -112,13 +118,21 @@ Utility scripts for development, testing, and documentation tasks.
 
 ### Screenshot Capture
 
-`scripts/take_screenshots.sh` uses xdotool and ImageMagick to capture screenshots of all UI views for the README. Navigates between tabs and windows by clicking titlebar buttons, generating 6 PNG files.
+`scripts/take_screenshots.sh` uses xdotool and ImageMagick to capture screenshots of all UI views. Navigates between tabs and windows by clicking titlebar buttons, generating 7 canonical PNG files.
+
+Default output directory is `marketing-site/assets/screenshots/` (overridable via `OUTDIR=...`). Captures use ImageMagick `import` then upscale 2× via `convert -filter Catrom -resize 200%` for HiDPI rendering on the marketing site (override with `RETINA=0`). The first capture is saved under both `hero.png` and `live.png` since the dual-pane main window in stacked mode serves both the hero and the `#live` feature section. Additional captures: `analytics-now.png`, `analytics-charts.png`, `analytics-context.png` (Context tab — only reachable when context preservation is enabled and `context_savings_events` rows exist; the seeder populates both), `sessions.png` (Session Search), `learning.png` (Learning window). Capture filenames map 1:1 to the marketing site's anchored sections per `specs/001-marketing-site/data-model.md`.
 
 ### Dummy Data Seeder
 
-`scripts/populate_dummy_data.py` seeds the SQLite database with deterministic sample data (seed 42) across the app's analytics tables.
+`scripts/populate_dummy_data.py` seeds the SQLite database with deterministic sample data across the app's analytics tables.
 
-Checks that Quill is not running before modifying the DB to prevent WAL corruption. Creates a backup before seeding. Populates observations, rules, memory files, tool actions, and writes sample rule files to `~/.claude/rules/learned/`.
+By default, checks that Quill is not running before modifying the personal DB to prevent WAL corruption, creates a backup before seeding, and writes sample rule files to `~/.claude/rules/learned/`. Supports an optional sandbox mode for the marketing-site screenshot pipeline: `--data-dir PATH` redirects the SQLite file under `PATH/usage.db` and skips the running-Quill guard (a sandbox can coexist with a personal Quill since they target different files); `--rules-dir PATH` redirects the sample rule files; `--projects-dir PATH` writes fictional Claude session JSONL files (one project subdir per `PROJECTS` entry, two `<sessionId>.jsonl` files each) so Session Search has indexable content; `--no-projects` skips that step; `--no-backup` skips the existing-DB backup; `--seed INT` overrides the RNG seed (default `42`); `--quiet` suppresses per-step progress while keeping the final summary. Full CLI surface in `specs/001-marketing-site/contracts/seeder-cli.md`.
+
+### Demo Launcher
+
+`scripts/run_quill_demo.sh` (POSIX) and `scripts/run_quill_demo.ps1` (Windows) launch a sandboxed Quill instance against dummy data without touching the maintainer's personal Quill state.
+
+Each launcher creates a stable per-user sandbox directory (`/tmp/quill-demo-$USER` on POSIX, `%TEMP%\quill-demo-%USERNAME%` on Windows), exports `QUILL_DEMO_MODE=1` plus `QUILL_DATA_DIR=$SANDBOX/data`, `QUILL_RULES_DIR=$SANDBOX/rules`, and `QUILL_CLAUDE_PROJECTS_DIR=$SANDBOX/projects` (which engages the [[backend#Data Paths#Demo-mode path override]]), runs the seeder against the sandbox with `--no-backup --quiet`, then auto-discovers the Quill binary (override flag, `$PATH`, `target/release/quill`, `target/debug/quill`) and execs it. The Codex sessions resolver short-circuits to an empty `<TMP>/quill-demo-empty-codex-sessions/` placeholder when demo-mode is on without `QUILL_CODEX_SESSIONS_DIR` set, so the demo Quill never indexes the maintainer's real `~/.codex/sessions/` even though the launcher only seeds Claude. Flags: `--clean` / `-Clean` wipes the sandbox before launch, `--bin PATH` / `-Bin PATH` overrides binary discovery, `--keep-on-exit` / `-KeepOnExit` suppresses the teardown-command hint. Full CLI surface in `specs/001-marketing-site/contracts/launcher-cli.md`.
 
 ### macOS Bootstrap
 
@@ -235,5 +249,7 @@ Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 **Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-process 2, tauri-plugin-log 2.
 
 **Utilities**: serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix only).
+
+**Dev-only**: serial_test 3 — used by [[src-tauri/src/data_paths.rs]] tests to serialize global env-var mutation across the three behavioral cases for each resolver (data dir, rules dir, Claude projects dir, Codex sessions dir) so concurrent test threads don't race.
 
 **macOS-only**: objc2-app-kit 0.3, objc2-foundation 0.3, block2 0.6 — used by [[src-tauri/src/tray_keepalive.rs]] for the workaround that rebuilds the tray after sleep/wake and screen-parameter changes.

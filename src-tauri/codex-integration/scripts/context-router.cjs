@@ -320,7 +320,7 @@ function route(input) {
         provider,
         sessionId,
         tool,
-        "Quill context routing blocked a raw network fetch that can dump large content. Use mcp__quill__quill_fetch_and_index or fetch to a file quietly and summarize; do not stream full pages into the transcript.",
+        "Quill context routing blocked a raw network fetch that can dump large content. Use mcp__quill__quill_fetch_and_index for web content, then mcp__quill__quill_search_context for focused chunks. Only fetch to a file (e.g. `curl -sS -o path`) when you need a binary or artifact on disk.",
         { route: "raw-network-fetch", commandBytes: byteLength(command) },
       );
     }

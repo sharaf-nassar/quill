@@ -11,6 +11,7 @@ import type {
 type BreakdownRow = HostBreakdown | ProjectBreakdown | SessionBreakdown;
 
 const REFRESH_DEBOUNCE_MS = 1000;
+const SESSION_BREAKDOWN_LIMIT = 200;
 
 export function useBreakdownData(mode: BreakdownMode, days: number) {
   const [data, setData] = useState<BreakdownRow[]>([]);
@@ -39,6 +40,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number) {
         result = await invoke<SessionBreakdown[]>("get_session_breakdown", {
           days,
           hostname: null,
+          limit: SESSION_BREAKDOWN_LIMIT,
         });
       }
       // Only apply if mode hasn't changed during the fetch

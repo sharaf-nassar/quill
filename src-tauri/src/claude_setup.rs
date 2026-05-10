@@ -19,8 +19,13 @@ fn config_dir() -> PathBuf {
 /// Returns the platform-aware app data dir
 /// Linux: ~/.local/share/com.quilltoolkit.app/
 /// macOS: ~/Library/Application Support/com.quilltoolkit.app/
+///
+/// Routes through `crate::data_paths::resolve_data_dir_with_default` so the
+/// `QUILL_DEMO_MODE` opt-in env-var override applies uniformly. Production
+/// behavior (with no demo override) is byte-identical to the previous direct
+/// `dirs::data_local_dir()` lookup.
 fn app_data_dir() -> PathBuf {
-    dirs::data_local_dir()
+    let default = dirs::data_local_dir()
         .or_else(|| {
             dirs::home_dir().map(|h| {
                 if cfg!(target_os = "macos") {
@@ -31,7 +36,8 @@ fn app_data_dir() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("com.quilltoolkit.app")
+        .join("com.quilltoolkit.app");
+    crate::data_paths::resolve_data_dir_with_default(default)
 }
 
 /// Returns ~/.config/quill/scripts/

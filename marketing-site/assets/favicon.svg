@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+	<style>
+		:root { color-scheme: dark light; }
+		.bg   { fill: #121216; }
+		.fg   { fill: #d4d4d4; }
+		.acc  { fill: #34d399; }
+		@media (prefers-color-scheme: light) {
+			.bg { fill: #f5f5f5; }
+			.fg { fill: #1a1a1f; }
+		}
+	</style>
+	<rect class="bg" width="32" height="32" rx="3" />
+	<!-- Left "live indicator" bar — green pulse mirroring the app titlebar mark -->
+	<rect class="acc" x="5" y="6" width="2.5" height="20" rx="1" />
+	<!-- Q glyph in mono — square corners + tail -->
+	<rect class="fg" x="11" y="9" width="14" height="14" rx="2" fill="none" stroke="currentColor" />
+	<path class="fg" d="M11 9 h14 v14 h-14 z M19 19 l5 6" fill="none" stroke="#d4d4d4" stroke-width="2" stroke-linecap="square" />
+</svg>

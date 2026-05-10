@@ -1734,34 +1734,15 @@ body {
   white-space: nowrap;
 }
 
-.breakdown-tpt {
-  position: relative;
-  cursor: default;
-}
-
-.breakdown-tpt:hover::after {
-  content: "Average tokens per turn (your message + Claude's response)";
-  position: absolute;
-  bottom: calc(100% + 6px);
-  left: 50%;
-  transform: translateX(-50%);
-  background: #1e1e24;
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 11px;
-  padding: 5px 8px;
-  border-radius: 5px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
-  white-space: nowrap;
-  pointer-events: none;
-  z-index: 100;
-}
-
 .breakdown-time {
   color: rgba(255, 255, 255, 0.45);
   font-size: 10px;
   text-align: right;
   white-space: nowrap;
+}
+
+.breakdown-duration {
+  color: rgba(255, 255, 255, 0.3);
 }
 
 .breakdown-project-tag {

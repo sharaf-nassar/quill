@@ -418,10 +418,7 @@ impl SessionIndex {
     }
 
     fn discover_claude_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
-        let projects_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".claude")
-            .join("projects");
+        let projects_dir = crate::data_paths::resolve_claude_projects_dir();
 
         if !projects_dir.exists() {
             return Ok(Vec::new());
@@ -457,10 +454,7 @@ impl SessionIndex {
     }
 
     fn discover_codex_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
-        let sessions_dir = dirs::home_dir()
-            .ok_or("Cannot determine home directory")?
-            .join(".codex")
-            .join("sessions");
+        let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
 
         if !sessions_dir.exists() {
             return Ok(Vec::new());
@@ -1925,10 +1919,7 @@ fn find_session_path(
 ) -> Result<Option<PathBuf>, String> {
     match provider {
         IntegrationProvider::Claude => {
-            let projects_dir = dirs::home_dir()
-                .ok_or("Cannot determine home directory")?
-                .join(".claude")
-                .join("projects");
+            let projects_dir = crate::data_paths::resolve_claude_projects_dir();
 
             if !projects_dir.exists() {
                 return Ok(None);

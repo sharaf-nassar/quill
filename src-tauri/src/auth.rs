@@ -4,9 +4,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 fn secret_path() -> Result<PathBuf, String> {
-    let data_dir = dirs::data_local_dir()
-        .ok_or_else(|| "cannot determine local data directory".to_string())?;
-    Ok(data_dir.join("com.quilltoolkit.app").join("auth_secret"))
+    let default = dirs::data_local_dir()
+        .ok_or_else(|| "cannot determine local data directory".to_string())?
+        .join("com.quilltoolkit.app");
+    let data_dir = crate::data_paths::resolve_data_dir_with_default(default);
+    Ok(data_dir.join("auth_secret"))
 }
 
 fn create_secret_file(path: &std::path::Path) -> std::io::Result<fs::File> {

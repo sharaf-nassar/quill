@@ -366,9 +366,6 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                   </span>
                   <span className="breakdown-turns">
                     {row.turn_count} turns
-                    {row.turn_count > 0 && (
-                      <span className="breakdown-tpt"> · {formatTokenCount(Math.round(row.total_tokens / row.turn_count))}/t</span>
-                    )}
                   </span>
                   <span className="breakdown-time">
                     {formatRelativeTime(row.last_active)}
@@ -441,9 +438,6 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                         </span>
                         <span className="breakdown-turns">
                           {row.turn_count} turns
-                          {row.turn_count > 0 && (
-                            <span className="breakdown-tpt"> · {formatTokenCount(Math.round(row.total_tokens / row.turn_count))}/t</span>
-                          )}
                           <span className="breakdown-session-count">
                             {row.session_count} sess
                           </span>
@@ -503,14 +497,15 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                     </span>
                     <span className="breakdown-turns">
                       {row.turn_count} turns
-                      {row.turn_count > 0 && (
-                        <span className="breakdown-tpt"> · {formatTokenCount(Math.round(row.total_tokens / row.turn_count))}/t</span>
-                      )}
                     </span>
                     <span className="breakdown-time">
                       {Date.now() - new Date(row.last_active).getTime() < 300000
                         ? "active"
-                        : formatDuration(row.first_seen, row.last_active)}
+                        : formatRelativeTime(row.last_active)}
+                      <span className="breakdown-duration">
+                        {" · "}
+                        {formatDuration(row.first_seen, row.last_active)}
+                      </span>
                     </span>
                   </div>
                 ))}

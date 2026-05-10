@@ -364,3 +364,11 @@ Key filesystem locations used by the backend for storage, config, and caching.
 | `~/.config/quill/` | All | Deployed hooks, MCP server, scripts |
 | `~/.claude/` | All | Claude Code config, credentials |
 | `~/.cache/quill/` | All | Instance state files, restart flags |
+
+### Demo-mode path override
+
+All call-sites that previously hard-coded the data dir, learned-rules dir, or Claude projects dir now route through [[src-tauri/src/data_paths.rs#resolve_data_dir_with_default]], [[src-tauri/src/data_paths.rs#resolve_rules_dir_with_default]], and [[src-tauri/src/data_paths.rs#resolve_claude_projects_dir_with_default]] so a maintainer can launch a sandboxed Quill instance against dummy data without touching their personal state.
+
+The override is gated by an explicit opt-in: `QUILL_DEMO_MODE=1` is required, and `QUILL_DATA_DIR` / `QUILL_RULES_DIR` / `QUILL_CLAUDE_PROJECTS_DIR` are otherwise ignored even when set. With opt-in active and a per-variable override set, paths are canonicalized via `std::fs::canonicalize` (creating the directory first if missing); a canonicalize failure exits the process with code 2 so the demo never silently falls back to the real data dir under a confused launcher. A one-time `[quill-demo] data_dir=… rules_dir=…` banner prints to stderr on first resolver call so a demo run is impossible to confuse with a real one. With `QUILL_DEMO_MODE` unset, behavior is byte-identical to the production path table above.
+
+Used by the marketing-site screenshot-capture workflow (`scripts/run_quill_demo.sh` / `.ps1`); see [[infrastructure#Scripts#Demo Launcher]].

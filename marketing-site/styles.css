@@ -1,0 +1,886 @@
+/* ─────────────────────────────────────────────────────────────────────────────
+   Quill marketing site — Terminal Console direction.
+   Mirror of the desktop app's dark, dense, mono-utility aesthetic.
+   See specs/001-marketing-site/spec.md § Clarifications for the locked
+   visual direction.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* Tokens ───────────────────────────────────────────────────────────────────── */
+
+:root {
+	color-scheme: dark;
+
+	/* Operations-console palette — the marketing site reads like a
+	   desktop app's status panel rather than a SaaS landing page. */
+	--bg:       #08080c;       /* deeper near-black for that "panel" feel */
+	--bg-1:     #0e0e14;       /* page-level raised */
+	--bg-2:     #14141a;       /* card surface */
+	--bg-3:     #1c1c24;       /* nested surface */
+	--rule:     #1f1f27;       /* hairline rule */
+	--rule-2:   #2c2c36;       /* stronger rule */
+	--fg:       #e6e6ea;       /* primary text — high-contrast operations text */
+	--fg-dim:   #9a9aa6;       /* secondary text */
+
+	/* Status palette — used sparingly, only for status. */
+	--green:    #34d399;
+	--yellow:   #fbbf24;
+	--red:      #f87171;
+	--blue:     #60a5fa;
+	--accent:   #34d399;       /* the brand accent, same as the green pace marker */
+	--accent-glow: rgba(52, 211, 153, 0.32);
+
+	/* Typography — system fonts only (no remote font dependencies, no
+	   bundled Inter/Roboto). Mono is the design statement: huge mono
+	   display headlines pair with sans body for the operations-console
+	   aesthetic the desktop app already established. */
+	--font-sans:
+		ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+		"Segoe UI", "Helvetica Neue", sans-serif;
+	--font-mono:
+		ui-monospace, "JetBrains Mono", "Fira Code", "SF Mono",
+		Menlo, Consolas, "Liberation Mono", "DejaVu Sans Mono", monospace;
+
+	/* Larger, more confident type scale. Hero headlines are a real
+	   design element rather than a polite label. */
+	--fs-body:    15px;
+	--fs-small:   13px;
+	--fs-eyebrow: 11px;
+	--fs-h1:      clamp(40px, 7.2vw, 88px);
+	--fs-h2:      clamp(28px, 3.6vw, 44px);
+	--fs-h3:      18px;
+
+	--lh-body: 1.55;
+	--lh-tight: 1.02;
+	--lh-display: 0.96;
+
+	/* Spacing rhythm in 4px units. */
+	--sp-1: 4px;
+	--sp-2: 8px;
+	--sp-3: 12px;
+	--sp-4: 16px;
+	--sp-5: 24px;
+	--sp-6: 32px;
+	--sp-7: 48px;
+	--sp-8: 64px;
+	--sp-9: 96px;
+	--sp-10: 128px;
+
+	/* Layout */
+	--max-w:        1320px;
+	--gutter:       max(20px, 4vw);
+	--topbar-h:     56px;
+	--corner:       3px;
+
+	/* Motion */
+	--ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+/* Reset ────────────────────────────────────────────────────────────────────── */
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+html {
+	scroll-behavior: smooth;
+	scroll-padding-top: calc(var(--topbar-h) + var(--sp-4));
+}
+@media (prefers-reduced-motion: reduce) {
+	html { scroll-behavior: auto; }
+	*, *::before, *::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+	}
+}
+img { display: block; max-width: 100%; height: auto; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+a { color: inherit; }
+
+/* Page chrome ──────────────────────────────────────────────────────────────── */
+
+body {
+	background: var(--bg);
+	color: var(--fg);
+	font: 400 var(--fs-body)/var(--lh-body) var(--font-sans);
+	-webkit-font-smoothing: antialiased;
+	text-rendering: geometricPrecision;
+	min-height: 100vh;
+	overflow-x: clip;
+	max-width: 100vw;
+	position: relative;
+	isolation: isolate;
+}
+
+/* Atmospheric background — fixed radial accent + faint dot grid create
+   depth and a "screen" feel rather than the flat-black void of a default
+   dark page. The dot grid is a pure CSS background, no asset needed. */
+body::before {
+	content: "";
+	position: fixed;
+	inset: 0;
+	z-index: -2;
+	background:
+		radial-gradient(
+			ellipse 60% 50% at 75% 0%,
+			rgba(52, 211, 153, 0.08) 0%,
+			rgba(52, 211, 153, 0) 60%
+		),
+		radial-gradient(
+			ellipse 80% 40% at 0% 100%,
+			rgba(96, 165, 250, 0.05) 0%,
+			rgba(96, 165, 250, 0) 65%
+		);
+	pointer-events: none;
+}
+body::after {
+	content: "";
+	position: fixed;
+	inset: 0;
+	z-index: -1;
+	background-image:
+		radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.025) 1px, transparent 0);
+	background-size: 28px 28px;
+	background-position: 0 0;
+	pointer-events: none;
+	mask-image: linear-gradient(180deg, black 0%, black 70%, transparent 100%);
+}
+
+/* Defensive: every direct child of <main> respects viewport width.
+   Prevents stray children from forcing a horizontal scroll when nested
+   intrinsic sizes leak through grid `minmax(0, 1fr)` columns. */
+main > * { max-width: 100vw; }
+
+.skip-link {
+	position: absolute;
+	top: -40px;
+	left: var(--sp-3);
+	padding: var(--sp-2) var(--sp-3);
+	background: var(--bg-3);
+	color: var(--fg);
+	border: 1px solid var(--rule-2);
+	border-radius: var(--corner);
+	text-decoration: none;
+	z-index: 100;
+}
+.skip-link:focus { top: var(--sp-3); }
+
+/* Top bar — fixed, dense, terminal-prompt feel ───────────────────────────── */
+
+.topbar {
+	position: sticky;
+	top: 0;
+	z-index: 10;
+	display: flex;
+	align-items: center;
+	gap: var(--sp-6);
+	height: var(--topbar-h);
+	padding: 0 var(--gutter);
+	background: rgba(8, 8, 12, 0.72);
+	backdrop-filter: saturate(140%) blur(12px);
+	-webkit-backdrop-filter: saturate(140%) blur(12px);
+	border-bottom: 1px solid var(--rule);
+	font-size: var(--fs-eyebrow);
+	letter-spacing: 0.08em;
+	text-transform: lowercase;
+}
+.brand {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--sp-2);
+	color: var(--fg);
+	text-decoration: none;
+	font-family: var(--font-mono);
+	font-weight: 700;
+	font-size: 13px;
+	letter-spacing: 0.18em;
+	text-transform: uppercase;
+}
+.brand-mark {
+	color: var(--accent);
+	margin-right: 2px;
+	text-shadow: 0 0 8px var(--accent-glow);
+}
+.topnav {
+	display: flex;
+	gap: var(--sp-4);
+	flex: 1;
+	min-width: 0;
+	overflow-x: auto;
+	scrollbar-width: none;
+}
+.topnav::-webkit-scrollbar { display: none; }
+.topnav a {
+	color: var(--fg-dim);
+	text-decoration: none;
+	padding: var(--sp-2) 0;
+	border-bottom: 1px solid transparent;
+	transition: color 120ms var(--ease-out), border-color 120ms var(--ease-out);
+}
+.topnav a:hover,
+.topnav a:focus-visible {
+	color: var(--fg);
+	border-bottom-color: var(--blue);
+	outline: none;
+}
+.topbar-cta {
+	color: var(--fg-dim);
+	text-decoration: none;
+	white-space: nowrap;
+}
+.topbar-cta:hover,
+.topbar-cta:focus-visible {
+	color: var(--blue);
+	outline: none;
+}
+
+/* Hero ─────────────────────────────────────────────────────────────────────── */
+
+.hero {
+	display: grid;
+	grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr);
+	column-gap: var(--sp-9);
+	row-gap: var(--sp-7);
+	max-width: var(--max-w);
+	margin: 0 auto;
+	padding: var(--sp-9) var(--gutter) var(--sp-10);
+	align-items: center;
+}
+
+.hero-text { min-width: 0; width: 100%; }
+
+.eyebrow {
+	display: inline-flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: var(--sp-2);
+	margin: 0 0 var(--sp-7);
+	padding: 5px 10px 5px 8px;
+	color: var(--fg-dim);
+	background: rgba(255, 255, 255, 0.025);
+	border: 1px solid var(--rule);
+	border-radius: 999px;
+	font-family: var(--font-mono);
+	font-size: var(--fs-eyebrow);
+	letter-spacing: 0.14em;
+	text-transform: lowercase;
+}
+.eyebrow-dot {
+	width: 6px;
+	height: 6px;
+	background: var(--accent);
+	border-radius: 50%;
+	box-shadow:
+		0 0 0 3px rgba(52, 211, 153, 0.18),
+		0 0 8px var(--accent-glow);
+	animation: pulse 2.6s var(--ease-out) infinite;
+}
+@keyframes pulse {
+	0%, 60%, 100% { opacity: 1; transform: scale(1); }
+	75%           { opacity: 0.55; transform: scale(0.85); }
+}
+
+/* Hero headline — the design statement. Mono at huge scale gives the
+   page a terminal-precise voice without making the body unreadable. */
+.hero-headline {
+	margin: 0 0 var(--sp-6);
+	font-family: var(--font-mono);
+	font-size: var(--fs-h1);
+	font-weight: 700;
+	line-height: var(--lh-display);
+	letter-spacing: -0.025em;
+	color: var(--fg);
+	overflow-wrap: break-word;
+	word-break: normal;
+	hyphens: none;
+	min-width: 0;
+}
+/* The accent line: one phrase in the headline gets the brand green so
+   the eye has somewhere to land. */
+.hero-headline .accent { color: var(--accent); }
+
+/* Hero points — short, scannable benefit sentences in sans for prose
+   readability. No bullet symbols; the column structure carries it. */
+.hero-points {
+	margin: 0 0 var(--sp-7);
+	padding: 0;
+	list-style: none;
+	max-width: 52ch;
+	font-family: var(--font-sans);
+	font-size: 17px;
+	font-weight: 400;
+	line-height: 1.5;
+	color: var(--fg-dim);
+}
+.hero-points li {
+	position: relative;
+	padding: var(--sp-3) 0 var(--sp-3) 22px;
+	border-top: 1px solid var(--rule);
+}
+.hero-points li:last-child {
+	border-bottom: 1px solid var(--rule);
+}
+.hero-points li::before {
+	content: "";
+	position: absolute;
+	left: 0;
+	top: 50%;
+	width: 8px;
+	height: 1px;
+	background: var(--accent);
+	transform: translateY(-0.5px);
+}
+
+.cta-row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var(--sp-3);
+	margin: 0 0 var(--sp-6);
+}
+
+.cta {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--sp-2);
+	padding: 14px 22px;
+	border-radius: var(--corner);
+	border: 1px solid currentColor;
+	font-family: var(--font-mono);
+	font-size: 14px;
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-decoration: none;
+	transition:
+		background-color 160ms var(--ease-out),
+		color 160ms var(--ease-out),
+		border-color 160ms var(--ease-out),
+		box-shadow 200ms var(--ease-out),
+		transform 160ms var(--ease-out);
+}
+.cta:focus-visible {
+	outline: 2px solid var(--blue);
+	outline-offset: 3px;
+}
+.cta-glyph { font-size: 0.9em; }
+
+.cta--primary {
+	background: var(--accent);
+	color: #06140d;
+	border-color: var(--accent);
+	font-weight: 700;
+	box-shadow:
+		0 0 0 1px rgba(52, 211, 153, 0.35),
+		0 8px 28px -8px rgba(52, 211, 153, 0.55);
+}
+.cta--primary:hover {
+	background: #4ade9d;
+	transform: translateY(-1px);
+	box-shadow:
+		0 0 0 1px rgba(52, 211, 153, 0.55),
+		0 14px 40px -10px rgba(52, 211, 153, 0.7);
+}
+
+.cta--secondary {
+	color: var(--fg);
+	border-color: var(--rule-2);
+	background: rgba(255, 255, 255, 0.02);
+	backdrop-filter: blur(4px);
+}
+.cta--secondary:hover {
+	border-color: var(--fg-dim);
+	background: rgba(255, 255, 255, 0.04);
+	transform: translateY(-1px);
+}
+
+.pill {
+	display: inline-block;
+	padding: 1px 6px;
+	font-family: var(--font-mono);
+	font-size: 10px;
+	font-weight: 700;
+	letter-spacing: 0.08em;
+	border-radius: 2px;
+	border: 1px solid transparent;
+}
+.pill--ok   { color: var(--green);  border-color: var(--green);  background: rgba(52, 211, 153, 0.08); }
+.pill--warn { color: var(--yellow); border-color: var(--yellow); background: rgba(251, 191, 36, 0.08); }
+.pill--err  { color: var(--red);    border-color: var(--red);    background: rgba(248, 113, 113, 0.08); }
+
+/* Hero figure — frame with terminal title bar + screenshot + pace marker ─── */
+
+.hero-figure {
+	margin: 0;
+	min-width: 0;
+	width: 100%;
+	position: relative;
+}
+/* Accent halo behind the frame — gives the screenshot a "lit screen"
+   feel rather than a flat sticker. Sits behind the frame, sized larger
+   so the green glow bleeds out behind the frame edges. */
+.hero-figure::before {
+	content: "";
+	position: absolute;
+	inset: -8% -6%;
+	z-index: 0;
+	background:
+		radial-gradient(
+			ellipse 70% 60% at 50% 50%,
+			rgba(52, 211, 153, 0.18) 0%,
+			rgba(52, 211, 153, 0) 60%
+		);
+	filter: blur(40px);
+	pointer-events: none;
+}
+
+.hero-frame {
+	position: relative;
+	z-index: 1;
+	min-width: 0;
+	border: 1px solid var(--rule-2);
+	border-radius: 6px;
+	background: var(--bg-2);
+	overflow: hidden;
+	box-shadow:
+		0 0 0 1px rgba(255, 255, 255, 0.02) inset,
+		0 1px 0 rgba(255, 255, 255, 0.04) inset,
+		0 1px 24px rgba(52, 211, 153, 0.06),
+		0 30px 60px -20px rgba(0, 0, 0, 0.7),
+		0 60px 120px -30px rgba(0, 0, 0, 0.5);
+}
+.hero-frame-bar {
+	display: flex;
+	align-items: center;
+	gap: var(--sp-2);
+	height: 24px;
+	padding: 0 var(--sp-3);
+	background: var(--bg-3);
+	border-bottom: 1px solid var(--rule);
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--fg-dim);
+	letter-spacing: 0.06em;
+	text-transform: lowercase;
+}
+.frame-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+	background: var(--rule-2);
+}
+.frame-title {
+	margin-left: auto;
+	margin-right: auto;
+	padding-right: 36px;  /* visually centered, accounting for the 3 dots */
+	font-weight: 600;
+}
+.hero-image {
+	display: block;
+	width: 100%;
+	height: auto;
+	background: #000;
+}
+/* Pace marker is a full-parent-width container so translateX(100%) actually
+   means "100% of the hero frame" rather than 100% of a 1px line. The visible
+   1px beam is rendered as the marker's ::after at its right edge. */
+.hero-pace-marker {
+	position: absolute;
+	left: 0;
+	top: 26px;       /* just below the frame bar */
+	bottom: 0;
+	width: 100%;
+	pointer-events: none;
+	transform: translateX(-100%);
+	animation: pace 7s var(--ease-out) infinite;
+	will-change: transform;
+}
+.hero-pace-marker::after {
+	content: '';
+	position: absolute;
+	right: 0;
+	top: 0;
+	bottom: 0;
+	width: 1px;
+	background: var(--blue);
+	box-shadow: 0 0 12px 2px rgba(96, 165, 250, 0.5);
+}
+@keyframes pace {
+	0%, 92%, 100% { transform: translateX(-100%); opacity: 0; }
+	8%            { opacity: 0.85; }
+	75%           { transform: translateX(0);      opacity: 0.85; }
+	88%           { transform: translateX(0);      opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+	.hero-pace-marker { display: none; }
+	.eyebrow-dot      { animation: none; }
+}
+
+/* Feature sections — shared layout for #live, #analytics, #context, #search, #learning ─── */
+
+.feature-section {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+	gap: var(--sp-7);
+	max-width: var(--max-w);
+	margin: 0 auto;
+	padding: var(--sp-8) var(--gutter);
+	align-items: start;
+	border-top: 1px solid var(--rule);
+}
+
+/* Alternate which side the figure lives on so the page reads as
+   alternating content/figure rows — gives the page rhythm without
+   recreating the layout per section. */
+.feature-section--reverse .feature-text   { order: 2; }
+.feature-section--reverse .feature-figure { order: 1; }
+
+.feature-text   { min-width: 0; width: 100%; }
+.feature-figure { margin: 0; min-width: 0; width: 100%; position: sticky; top: calc(var(--topbar-h) + var(--sp-4)); }
+
+.section-tag {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--sp-3);
+	margin: 0 0 var(--sp-3);
+	padding: 0 0 var(--sp-2);
+	border-bottom: 1px solid var(--rule);
+	color: var(--fg-dim);
+	font-family: var(--font-mono);
+	font-size: var(--fs-eyebrow);
+	letter-spacing: 0.16em;
+	text-transform: lowercase;
+}
+.section-num {
+	display: inline-block;
+	min-width: 22px;
+	padding: 0 var(--sp-2);
+	border: 1px solid var(--rule-2);
+	border-radius: var(--corner);
+	color: var(--green);
+	font-weight: 700;
+	letter-spacing: 0;
+	font-size: 10px;
+	line-height: 1.6;
+	text-align: center;
+}
+
+.feature-heading {
+	margin: 0 0 var(--sp-4);
+	font-size: var(--fs-h2);
+	font-weight: 700;
+	line-height: var(--lh-tight);
+	letter-spacing: -0.012em;
+	color: var(--fg);
+	overflow-wrap: break-word;
+}
+@media (max-width: 480px) {
+	.feature-heading br { display: none; }
+}
+
+.feature-lede {
+	margin: 0 0 var(--sp-5);
+	max-width: 60ch;
+	color: var(--fg-dim);
+	font-size: var(--fs-body);
+	line-height: 1.62;
+	overflow-wrap: break-word;
+}
+.feature-lede code,
+.feature-bullets code,
+.analytics-item code {
+	padding: 1px 4px;
+	background: var(--bg-3);
+	border: 1px solid var(--rule);
+	border-radius: 2px;
+	font-size: 0.92em;
+	color: var(--fg);
+}
+
+.feature-bullets {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: var(--sp-3);
+	font-size: var(--fs-small);
+	color: var(--fg-dim);
+	max-width: 60ch;
+}
+.feature-bullets li {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: var(--sp-3);
+	align-items: baseline;
+	line-height: 1.55;
+}
+.feature-bullets strong { color: var(--fg); font-weight: 700; }
+
+/* Analytics 6-card grid — the FR-012 LLM-help narrative ───────────────────── */
+
+.analytics-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: var(--sp-3);
+	margin: 0 0 var(--sp-5);
+	padding: 0;
+}
+.analytics-item {
+	margin: 0;
+	padding: var(--sp-4);
+	background: var(--bg-2);
+	border: 1px solid var(--rule);
+	border-radius: var(--corner);
+}
+.analytics-item dt {
+	margin: 0 0 var(--sp-2);
+	font-size: var(--fs-small);
+	font-weight: 700;
+	color: var(--fg);
+	letter-spacing: 0.02em;
+	display: flex;
+	align-items: baseline;
+	gap: var(--sp-2);
+}
+.analytics-item .dt-num { color: var(--green); }
+.analytics-item dd {
+	margin: 0;
+	font-size: var(--fs-small);
+	color: var(--fg-dim);
+	line-height: 1.5;
+}
+
+/* Feature figure frame — same chrome aesthetic as hero, slightly subdued ── */
+
+.feature-frame {
+	position: relative;
+	border: 1px solid var(--rule);
+	border-radius: var(--corner);
+	background: var(--bg-2);
+	overflow: hidden;
+	min-width: 0;
+	box-shadow: 0 14px 36px -28px rgba(0, 0, 0, 0.55);
+}
+.feature-frame--secondary { margin-top: var(--sp-4); }
+.feature-frame-bar {
+	display: flex;
+	align-items: center;
+	gap: var(--sp-2);
+	height: 22px;
+	padding: 0 var(--sp-3);
+	background: var(--bg-3);
+	border-bottom: 1px solid var(--rule);
+	font-family: var(--font-mono);
+	font-size: 10px;
+	color: var(--fg-dim);
+	letter-spacing: 0.06em;
+	text-transform: lowercase;
+}
+.feature-frame .frame-dot {
+	width: 7px;
+	height: 7px;
+	border-radius: 50%;
+	background: var(--rule-2);
+}
+.feature-frame .frame-title {
+	margin-left: auto;
+	margin-right: auto;
+	padding-right: 32px;
+	font-weight: 600;
+}
+.feature-frame img {
+	display: block;
+	width: 100%;
+	height: auto;
+	background: #000;
+}
+.feature-figure figcaption {
+	margin-top: var(--sp-3);
+	font-size: var(--fs-small);
+	color: var(--fg-dim);
+	text-align: right;
+}
+
+/* Responsive feature sections ──────────────────────────────────────────── */
+
+@media (max-width: 960px) {
+	.feature-section,
+	.feature-section--reverse {
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--sp-5);
+		padding: var(--sp-7) var(--gutter);
+	}
+	.feature-section--reverse .feature-text,
+	.feature-section--reverse .feature-figure { order: initial; }
+	.feature-figure { position: static; }
+	.feature-figure figcaption { text-align: left; }
+}
+
+/* Install section — providers / platforms / links ───────────────────────── */
+
+.install-section {
+	max-width: var(--max-w);
+	margin: 0 auto;
+	padding: var(--sp-8) var(--gutter);
+	border-top: 1px solid var(--rule);
+}
+
+.install-header {
+	max-width: 64ch;
+	margin: 0 auto var(--sp-7);
+	text-align: center;
+}
+.install-header .section-tag {
+	margin-left: auto;
+	margin-right: auto;
+}
+.install-headline {
+	margin: 0 0 var(--sp-3);
+	font-size: var(--fs-h1);
+	font-weight: 700;
+	line-height: var(--lh-tight);
+	letter-spacing: -0.018em;
+	color: var(--fg);
+}
+.install-lede {
+	margin: 0 0 var(--sp-5);
+	color: var(--fg-dim);
+	font-size: var(--fs-h3);
+	line-height: 1.5;
+}
+.install-header .cta-row {
+	justify-content: center;
+	margin: 0;
+}
+
+.install-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+	gap: var(--sp-4);
+	margin: 0;
+}
+
+.install-card {
+	margin: 0;
+	padding: var(--sp-5);
+	background: var(--bg-2);
+	border: 1px solid var(--rule);
+	border-radius: var(--corner);
+}
+.install-card-title {
+	margin: 0 0 var(--sp-3);
+	padding: 0 0 var(--sp-2);
+	border-bottom: 1px solid var(--rule);
+	color: var(--fg);
+	font-size: var(--fs-eyebrow);
+	font-weight: 700;
+	letter-spacing: 0.16em;
+	text-transform: lowercase;
+}
+
+.install-list {
+	margin: 0;
+	display: flex;
+	flex-direction: column;
+	gap: var(--sp-3);
+}
+.install-row dt {
+	margin: 0 0 2px;
+	display: inline-flex;
+	align-items: baseline;
+	gap: var(--sp-2);
+	color: var(--fg);
+	font-weight: 700;
+	font-size: var(--fs-small);
+}
+.install-row dd {
+	margin: 0;
+	color: var(--fg-dim);
+	font-size: var(--fs-small);
+	line-height: 1.5;
+}
+
+.install-link-list {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+	display: flex;
+	flex-direction: column;
+	gap: var(--sp-2);
+	font-size: var(--fs-small);
+}
+.install-link-list a {
+	display: inline-flex;
+	align-items: baseline;
+	gap: var(--sp-2);
+	color: var(--fg-dim);
+	text-decoration: none;
+	border-bottom: 1px solid transparent;
+	transition: color 120ms var(--ease-out), border-color 120ms var(--ease-out);
+}
+.install-link-list a:hover,
+.install-link-list a:focus-visible {
+	color: var(--blue);
+	border-bottom-color: var(--blue);
+	outline: none;
+}
+.link-arrow { color: var(--green); }
+
+@media (max-width: 480px) {
+	.install-headline { font-size: var(--fs-h2); }
+	.install-header .cta { width: 100%; justify-content: center; }
+}
+
+/* Footer ───────────────────────────────────────────────────────────────────── */
+
+.page-footer {
+	max-width: var(--max-w);
+	margin: 0 auto;
+	padding: var(--sp-6) var(--gutter);
+	border-top: 1px solid var(--rule);
+	font-size: var(--fs-small);
+	color: var(--fg-dim);
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: space-between;
+	align-items: baseline;
+	gap: var(--sp-3);
+}
+.footer-brand   { margin: 0; color: var(--fg-dim); }
+.footer-brand .brand-mark { color: var(--green); margin-right: 4px; }
+.page-footer a {
+	color: var(--fg-dim);
+	text-decoration: none;
+	border-bottom: 1px solid transparent;
+}
+.page-footer a:hover,
+.page-footer a:focus-visible {
+	color: var(--fg);
+	border-bottom-color: var(--blue);
+	outline: none;
+}
+.footer-meta { margin: 0; }
+
+/* Responsive ───────────────────────────────────────────────────────────────── */
+
+@media (max-width: 960px) {
+	.hero {
+		grid-template-columns: minmax(0, 1fr);
+		gap: var(--sp-6);
+		padding-top: var(--sp-6);
+		padding-bottom: var(--sp-7);
+	}
+}
+
+@media (max-width: 640px) {
+	:root { --gutter: 16px; }
+	.topnav { display: none; }
+	.hero-headline { letter-spacing: -0.012em; }
+	.hero-lede     { font-size: var(--fs-body); }
+	.cta { width: 100%; justify-content: center; }
+	.page-footer { flex-direction: column; }
+}
+
+/* Print — opt-out from the dark theme so a print landing-page reads cleanly. */
+@media print {
+	body { background: white; color: black; }
+	.topbar, .hero-pace-marker { display: none; }
+	.hero-frame { border-color: #ccc; box-shadow: none; }
+}

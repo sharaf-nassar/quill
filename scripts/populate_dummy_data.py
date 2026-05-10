@@ -2,13 +2,20 @@
 """
 Seed Quill's SQLite DB with reproducible dummy data for screenshots.
 
-Usage:
+Default usage (writes to your real Quill DB after backing it up):
     python3 scripts/populate_dummy_data.py
 
-The real DB is backed up to usage.db.bak before any changes.
-Restore command is printed at the end.
+Sandboxed usage (writes only inside an arbitrary dir, no backup, no running-Quill guard):
+    python3 scripts/populate_dummy_data.py \\
+        --data-dir /tmp/quill-demo/data \\
+        --rules-dir /tmp/quill-demo/rules \\
+        --no-backup
+
+The CLI surface is documented in
+specs/001-marketing-site/contracts/seeder-cli.md.
 """
 
+import argparse
 import hashlib
 import json
 import os
@@ -19,10 +26,25 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-random.seed(42)
+DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "com.quilltoolkit.app"
+DEFAULT_RULES_DIR = Path.home() / ".claude" / "rules" / "learned"
+DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
-DB_PATH = Path.home() / ".local" / "share" / "com.quilltoolkit.app" / "usage.db"
-BAK_PATH = DB_PATH.with_suffix(".db.bak")
+# Module-level globals bound by main() after argparse so existing populate_* helpers
+# can read them without threading a config object through every signature.
+DB_PATH: Path = DEFAULT_DATA_DIR / "usage.db"
+BAK_PATH: Path = DB_PATH.with_suffix(".db.bak")
+PROJECTS_DIR: Path = DEFAULT_PROJECTS_DIR
+QUIET: bool = False
+NO_BACKUP: bool = False
+USING_OVERRIDE: bool = False  # True when --data-dir was passed; skips running-Quill guard
+SKIP_PROJECTS: bool = False   # True when --no-projects was passed
+
+
+def log(msg: str = "") -> None:
+    """Stage-progress output; suppressed under --quiet."""
+    if not QUIET:
+        print(msg)
 
 HOSTNAMES = ["macbook-pro", "dev-server", "workstation"]
 PROJECTS = [
@@ -44,7 +66,24 @@ NOW = datetime.now(timezone.utc)
 
 
 def ts(dt: datetime) -> str:
-	return dt.isoformat()
+	# Naive ISO (no offset). Use this for fields consumed by the
+	# `src/utils/time.ts::timeAgo` helper which UNCONDITIONALLY appends "Z"
+	# before parsing — a datetime with "+00:00" offset would produce
+	# "...+00:00Z" which parses to NaN ("last NaNd ago").
+	# Used by: learning_runs.created_at and any other field whose display
+	# path goes through that timeAgo helper.
+	return dt.replace(tzinfo=None).isoformat()
+
+
+def ts_tz(dt: datetime) -> str:
+	# Timezone-aware RFC3339 (`+00:00` suffix). Matches what production
+	# code writes via `chrono::Utc::now().to_rfc3339()`.
+	# Use this for fields whose READER calls `chrono::DateTime::parse_from_rfc3339`
+	# in Rust (which rejects naive ISO and falls back to epoch 0). Examples:
+	#   - response_times.timestamp (read by parse_ts_diff in get_llm_runtime_stats)
+	#   - JSONL session timestamp field (Tantivy session indexer)
+	dt_utc = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+	return dt_utc.isoformat()
 
 
 def rand_session() -> str:
@@ -272,6 +311,36 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			created_at   TEXT DEFAULT (datetime('now')),
 			UNIQUE(session_id, timestamp)
 		);
+
+		CREATE TABLE IF NOT EXISTS context_savings_events (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_id TEXT NOT NULL UNIQUE,
+			schema_version INTEGER NOT NULL,
+			provider TEXT NOT NULL,
+			session_id TEXT,
+			hostname TEXT NOT NULL,
+			cwd TEXT,
+			timestamp TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			source TEXT NOT NULL,
+			decision TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT 'unknown',
+			reason TEXT,
+			delivered INTEGER NOT NULL,
+			indexed_bytes INTEGER,
+			returned_bytes INTEGER,
+			input_bytes INTEGER,
+			tokens_indexed_est INTEGER,
+			tokens_returned_est INTEGER,
+			tokens_saved_est INTEGER,
+			tokens_preserved_est INTEGER,
+			estimate_method TEXT,
+			estimate_confidence REAL,
+			source_ref TEXT,
+			snapshot_ref TEXT,
+			metadata_json TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
 	""")
 
 
@@ -281,7 +350,7 @@ def clear_tables(conn: sqlite3.Connection) -> None:
 		"settings", "observations", "learning_runs", "learned_rules",
 		"schema_version", "observation_summaries", "tool_actions",
 		"memory_files", "optimization_runs", "optimization_suggestions",
-		"git_snapshots", "response_times",
+		"git_snapshots", "response_times", "context_savings_events",
 	]
 	for tbl in tables:
 		conn.execute(f"DELETE FROM {tbl}")
@@ -568,7 +637,7 @@ RULE_DEFS = [
 	},
 ]
 
-LEARNED_DIR = Path.home() / ".claude" / "rules" / "learned"
+LEARNED_DIR: Path = DEFAULT_RULES_DIR
 
 
 def populate_learned_rules(conn: sqlite3.Connection) -> None:
@@ -668,20 +737,56 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 
 	sessions = [rand_session() for _ in range(5)]
 	rows = []
+	# Sample line content for Edit/Write — keeps parse_code_change in
+	# storage.rs::get_code_stats happy by counting lines from real strings.
+	old_snippets = [
+		"if let Err(e) = result {\n    return Err(e.into());\n}",
+		"const TIMEOUT_MS: u64 = 5000;",
+		"pub fn handle(&self) -> Result<(), Error> {\n    self.inner.lock().unwrap().handle()\n}",
+		"return data.filter(x => x.active);",
+		"// TODO: refactor",
+	]
+	new_snippets = [
+		"result.map_err(|e| e.into())",
+		"const TIMEOUT_MS: u64 = 10_000;\nconst RETRY_MS: u64 = 250;",
+		"pub fn handle(&self) -> Result<(), Error> {\n    let guard = self.inner.lock()?;\n    guard.handle()\n}",
+		"return data.filter(item => item.active && !item.archived).map(format_row);",
+		"// Cleaned up in PR #142",
+	]
+
 	for i in range(50):
 		t = NOW - timedelta(hours=random.randint(0, 72))
 		session_id = random.choice(sessions)
 		tool_name = random.choice(TOOLS)
-		category = tool_category_map.get(tool_name, "command")
 		project = random.choice(PROJECTS)
-		file_path = f"{project}/src/module_{random.randint(1, 10)}.py"
 		message_id = rand_session()
+
+		# Edit/Write get category='code_change' with parseable input so
+		# get_code_stats (storage.rs) computes added/removed LOC. Other tools
+		# keep their category-map entry.
+		if tool_name == "Edit":
+			file_path = f"{project}/src/module_{random.randint(1, 10)}.rs"
+			category = "code_change"
+			old_s = random.choice(old_snippets)
+			new_s = random.choice(new_snippets)
+			full_input = json.dumps({"file_path": file_path, "old_string": old_s, "new_string": new_s})
+			full_output = json.dumps({"result": "ok"})
+		elif tool_name == "Write":
+			file_path = f"{project}/src/module_{random.randint(1, 10)}.rs"
+			category = "code_change"
+			content = "\n".join(random.choices(new_snippets, k=random.randint(8, 25)))
+			full_input = json.dumps({"file_path": file_path, "content": content})
+			full_output = json.dumps({"result": "ok"})
+		else:
+			file_path = f"{project}/src/module_{random.randint(1, 10)}.py"
+			category = tool_category_map.get(tool_name, "command")
+			full_input = json.dumps({"file_path": file_path, "command": "build"})
+			full_output = json.dumps({"result": "ok", "lines_changed": random.randint(1, 50)})
+
 		summary = f"{tool_name} on {os.path.basename(file_path)}"
-		full_input = json.dumps({"file_path": file_path, "command": "build"})
-		full_output = json.dumps({"result": "ok", "lines_changed": random.randint(1, 50)})
 		rows.append((
 			message_id, session_id, tool_name, category,
-			file_path, summary, full_input, full_output, ts(t),
+			file_path, summary, full_input, full_output, ts_tz(t),
 		))
 
 	conn.executemany(
@@ -844,7 +949,9 @@ def populate_response_times(conn: sqlite3.Connection) -> None:
 		num_turns = random.randint(5, 25)
 		t = start
 		for _ in range(num_turns):
-			ts_val = ts(t)
+			# response_times.timestamp is read by parse_ts_diff (chrono::parse_from_rfc3339);
+			# must be tz-aware or LLM RUNTIME aggregations silently return 0.
+			ts_val = ts_tz(t)
 			key = (session_id, ts_val)
 			if key not in seen:
 				seen.add(key)
@@ -865,36 +972,344 @@ def populate_response_times(conn: sqlite3.Connection) -> None:
 	print(f"  response_times: {len(rows)} rows")
 
 
+# ── 17. context_savings_events ────────────────────────────────────────────────
+
+def populate_context_savings_events(conn: sqlite3.Connection) -> None:
+	"""Populate the four context-savings categories so the Context tab renders.
+
+	Categories (closed taxonomy):
+	  - preservation: large content kept out of the LLM transcript via MCP store
+	  - retrieval: LLM pulled preserved content back via quill_get_context_source
+	  - routing: router/capture guidance text injected into the transcript
+	  - telemetry: hook observations recording session activity (no transcript cost)
+	"""
+	preservation_sources = [
+		"docs/quill-internal-runbook.md",
+		"https://docs.example.com/api-reference",
+		"npm run build (output)",
+		"rg 'thread-safety' src/",
+		"tests/integration/load_test.log",
+		"SELECT * FROM users WHERE last_seen > ...",
+		"https://research.example.com/throughput-benchmarks",
+		"cargo bench (output)",
+		"docs/architecture-decisions.md",
+		"k6 run scripts/loadtest.js (output)",
+	]
+
+	# Map event_type -> (category, decision, has_source_ref)
+	event_type_specs = {
+		"mcp.index": ("preservation", "indexed", True),
+		"mcp.fetch": ("preservation", "indexed", True),
+		"mcp.execute": ("preservation", "indexed", True),
+		"context.get_source": ("retrieval", "returned", False),
+		"compaction.snapshot.read": ("retrieval", "returned", False),
+		"router.guidance": ("routing", "injected", False),
+		"capture.event": ("telemetry", "observed", False),
+		"capture.snapshot": ("telemetry", "observed", False),
+	}
+
+	rows = []
+	for i in range(70):
+		event_type, (category, decision, has_indexed) = random.choice(list(event_type_specs.items()))
+		source_label = random.choice(preservation_sources)
+		hours_ago = random.uniform(0, 7 * 24)
+		when = NOW - timedelta(hours=hours_ago)
+
+		if category == "preservation":
+			indexed_b = random.randint(8_000, 350_000)
+			returned_b = 0
+			input_b = 0
+			tok_indexed = indexed_b // 4
+			tok_returned = 0
+			tok_saved = tok_indexed
+			tok_preserved = tok_indexed
+		elif category == "retrieval":
+			indexed_b = 0
+			returned_b = random.randint(2_000, 60_000)
+			input_b = 0
+			tok_indexed = 0
+			tok_returned = returned_b // 4
+			tok_saved = tok_returned
+			tok_preserved = 0
+		elif category == "routing":
+			indexed_b = 0
+			returned_b = 0
+			input_b = random.randint(150, 1_400)
+			tok_indexed = 0
+			tok_returned = 0
+			tok_saved = 0
+			tok_preserved = 0
+		else:  # telemetry
+			indexed_b = 0
+			returned_b = 0
+			input_b = 0
+			tok_indexed = 0
+			tok_returned = 0
+			tok_saved = 0
+			tok_preserved = 0
+
+		rows.append((
+			str(uuid.UUID(int=random.getrandbits(128))),
+			1,
+			random.choice(["claude", "codex"]),
+			rand_session(),
+			random.choice(HOSTNAMES),
+			random.choice(PROJECTS),
+			ts(when),
+			event_type,
+			source_label,
+			decision,
+			category,
+			f"auto-{category}",
+			1,
+			indexed_b,
+			returned_b,
+			input_b,
+			tok_indexed,
+			tok_returned,
+			tok_saved,
+			tok_preserved,
+			"byte_div_4",
+			0.92,
+			f"source:{i+1}" if has_indexed else None,
+			f"snapshot:{i+1}" if event_type == "compaction.snapshot.read" else None,
+			None,
+		))
+
+	conn.executemany(
+		"INSERT OR IGNORE INTO context_savings_events ("
+		"event_id, schema_version, provider, session_id, hostname, cwd, timestamp, "
+		"event_type, source, decision, category, reason, delivered, "
+		"indexed_bytes, returned_bytes, input_bytes, "
+		"tokens_indexed_est, tokens_returned_est, tokens_saved_est, tokens_preserved_est, "
+		"estimate_method, estimate_confidence, source_ref, snapshot_ref, metadata_json"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		rows,
+	)
+	print(f"  context_savings_events: {len(rows)} rows across 4 categories")
+
+
+# ── 18. claude session JSONL files ────────────────────────────────────────────
+
+def populate_session_jsonls() -> None:
+	"""Write fictional Claude-Code session JSONL files into PROJECTS_DIR.
+
+	Tantivy's session indexer scans `<HOME>/.claude/projects/<project_dir>/*.jsonl`
+	and indexes each message. Writing realistic-looking JSONL here lets the
+	Session Search window in the demo Quill instance show populated results
+	instead of an empty 'Refreshing session index...' placeholder.
+
+	Each project directory name is the Claude-Code-style slug of the cwd
+	(slashes converted to dashes). Each JSONL file is one session. Each line
+	is a `{type:"user"|"assistant", message: {...}}` record per the format
+	parsed in src-tauri/src/sessions.rs::extract_claude_messages_from_jsonl.
+	"""
+	if SKIP_PROJECTS:
+		log("  session_jsonls: skipped (--no-projects)")
+		return
+
+	prompts = [
+		"Why is the request handler timing out under load?",
+		"Refactor the auth middleware to use the new token format.",
+		"Add a flag to skip the cache when running benchmarks.",
+		"Fix the off-by-one in the rate limit reset countdown.",
+		"Explain why the migration is failing on the staging cluster.",
+		"Rewrite this loop to be allocation-free.",
+		"Add property tests for the date parser.",
+		"Why does this query plan a sequential scan instead of using the index?",
+	]
+	assistant_replies = [
+		"The handler is awaiting a single shared lock during peak traffic. Splitting it into a read-mostly RwLock should cut p99 substantially.",
+		"I'll switch the verifier to the new ed25519 path and update the test fixtures. Three files affected.",
+		"Adding a `--no-cache` flag and threading it through the bench harness now.",
+		"The countdown computes `reset_at - now` but reset_at is end-exclusive in this provider's API; off-by-one fixed.",
+		"Migration 0042 expects the old enum variant to exist. Staging was upgraded before the prep migration ran. Order fixed.",
+		"Replacing the per-iteration String allocation with a SmallVec<u8; 64> buffer keeps the hot path entirely on the stack.",
+		"Added 12 property tests covering leap years, DST boundaries, and timezone offsets at minute granularity.",
+		"The composite index doesn't include the predicate column. Adding (project, created_at) drops the cost from 12k to 80.",
+	]
+	tools_used_pool = ["Edit", "Write", "Read", "Bash", "Grep", "Glob", "Task"]
+	branches = ["main", "fix/auth-token-format", "perf/cache-skip-flag", "fix/rate-limit-off-by-one"]
+
+	PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
+	total_messages = 0
+	total_files = 0
+	for project_path in PROJECTS_DIR.iterdir() if False else PROJECTS:
+		# project_path is a string from the PROJECTS list (e.g. "/home/alex/projects/quill")
+		# Claude-Code dir-naming convention replaces slashes with dashes.
+		project_slug = project_path.replace("/", "-").lstrip("-")
+		project_dir = PROJECTS_DIR / project_slug
+		project_dir.mkdir(parents=True, exist_ok=True)
+
+		# Two sessions per project, with a few exchanges each.
+		for session_idx in range(2):
+			session_id = rand_session()
+			session_file = project_dir / f"{session_id}.jsonl"
+			lines = []
+			session_start = NOW - timedelta(hours=random.randint(1, 96))
+			branch = random.choice(branches)
+			turn_count = random.randint(2, 5)
+			for turn in range(turn_count):
+				turn_time = session_start + timedelta(minutes=turn * random.randint(2, 15))
+				prompt = random.choice(prompts)
+				reply = random.choice(assistant_replies)
+				tools_picked = random.sample(tools_used_pool, k=random.randint(1, 3))
+
+				# User message
+				lines.append(json.dumps({
+					"type": "user",
+					"uuid": str(uuid.UUID(int=random.getrandbits(128))),
+					"sessionId": session_id,
+					"timestamp": ts_tz(turn_time),
+					"cwd": project_path,
+					"gitBranch": branch,
+					"message": {
+						"role": "user",
+						"content": prompt,
+					},
+				}))
+
+				# Assistant message with tool_use blocks
+				assistant_blocks = [{"type": "text", "text": reply}]
+				for tool in tools_picked:
+					tool_id = "tu_" + rand_hex(16)
+					if tool == "Bash":
+						tool_input = {"command": random.choice([
+							"cargo test --workspace",
+							"npm run build",
+							"git diff --stat HEAD~1",
+						])}
+					elif tool in ("Edit", "Write"):
+						tool_input = {
+							"file_path": f"{project_path}/src/{random.choice(['handler', 'auth', 'cache', 'parser'])}.rs",
+							"old_string": "",
+							"new_string": "",
+						}
+					elif tool == "Read":
+						tool_input = {"file_path": f"{project_path}/{random.choice(['Cargo.toml', 'src/lib.rs', 'README.md'])}"}
+					else:
+						tool_input = {"pattern": "TODO"}
+					assistant_blocks.append({
+						"type": "tool_use",
+						"id": tool_id,
+						"name": tool,
+						"input": tool_input,
+					})
+
+				lines.append(json.dumps({
+					"type": "assistant",
+					"uuid": str(uuid.UUID(int=random.getrandbits(128))),
+					"sessionId": session_id,
+					"timestamp": ts_tz(turn_time + timedelta(seconds=random.randint(2, 30))),
+					"cwd": project_path,
+					"gitBranch": branch,
+					"message": {
+						"role": "assistant",
+						"content": assistant_blocks,
+					},
+				}))
+
+			session_file.write_text("\n".join(lines) + "\n")
+			total_files += 1
+			total_messages += len(lines)
+
+	print(f"  session_jsonls: {total_files} files, {total_messages} messages in {PROJECTS_DIR}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Seed Quill's SQLite DB with reproducible dummy data.",
+	)
+	parser.add_argument(
+		"--data-dir", type=Path, default=None,
+		help="Directory to write usage.db into. Default: platform app_data_dir for Quill.",
+	)
+	parser.add_argument(
+		"--rules-dir", type=Path, default=None,
+		help="Directory to write sample learned-rule .md files into. Default: ~/.claude/rules/learned/.",
+	)
+	parser.add_argument(
+		"--projects-dir", type=Path, default=None,
+		help="Directory to write fictional Claude session JSONL files into. Default: ~/.claude/projects/.",
+	)
+	parser.add_argument(
+		"--no-projects", action="store_true",
+		help="Skip writing session JSONL files (omits the Session Search demo data).",
+	)
+	parser.add_argument(
+		"--no-backup", action="store_true",
+		help="Skip the existing-DB backup step. Use this when seeding a fresh sandbox.",
+	)
+	parser.add_argument(
+		"--seed", type=int, default=42,
+		help="RNG seed for reproducibility (default: 42).",
+	)
+	parser.add_argument(
+		"--quiet", action="store_true",
+		help="Suppress per-step progress output; only emit the final summary.",
+	)
+	return parser.parse_args()
+
+
 def main() -> None:
-	print(f"\nQuill Dummy Data Seeder")
-	print(f"DB path: {DB_PATH}")
-	print()
+	global DB_PATH, BAK_PATH, LEARNED_DIR, PROJECTS_DIR, QUIET, NO_BACKUP, USING_OVERRIDE, SKIP_PROJECTS
 
-	print("Step 0: Checking Quill is not running...")
-	check_quill_not_running()
-	print("  OK — no Quill process found.")
-	print()
+	args = parse_args()
 
-	print("Step 1: Backing up database...")
-	backup_db()
-	print()
+	QUIET = args.quiet
+	NO_BACKUP = args.no_backup
+	USING_OVERRIDE = args.data_dir is not None
+	SKIP_PROJECTS = args.no_projects
+
+	data_dir = args.data_dir if args.data_dir is not None else DEFAULT_DATA_DIR
+	rules_dir = args.rules_dir if args.rules_dir is not None else DEFAULT_RULES_DIR
+	projects_dir = args.projects_dir if args.projects_dir is not None else DEFAULT_PROJECTS_DIR
+
+	DB_PATH = data_dir / "usage.db"
+	BAK_PATH = DB_PATH.with_suffix(".db.bak")
+	LEARNED_DIR = rules_dir
+	PROJECTS_DIR = projects_dir
+
+	random.seed(args.seed)
+
+	log(f"\nQuill Dummy Data Seeder")
+	log(f"DB path:    {DB_PATH}")
+	log(f"Rules path: {LEARNED_DIR}")
+	if USING_OVERRIDE:
+		log("Mode:       sandbox (--data-dir override; running-Quill guard skipped)")
+	log()
+
+	if not USING_OVERRIDE:
+		log("Step 0: Checking Quill is not running...")
+		check_quill_not_running()
+		log("  OK — no Quill process found.")
+		log()
+
+	if not NO_BACKUP:
+		log("Step 1: Backing up database...")
+		backup_db()
+		log()
+	else:
+		log("Step 1: Backup skipped (--no-backup).")
+		log()
 
 	DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 	conn = sqlite3.connect(str(DB_PATH))
 	conn.execute("PRAGMA foreign_keys = OFF")
 
 	try:
-		print("Step 2: Ensuring schema exists...")
+		log("Step 2: Ensuring schema exists...")
 		ensure_schema(conn)
-		print()
+		log()
 
-		print("Step 3: Clearing existing data...")
+		log("Step 3: Clearing existing data...")
 		clear_tables(conn)
-		print()
+		log()
 
-		print("Step 4: Populating tables...")
+		log("Step 4: Populating tables...")
 		populate_usage_snapshots(conn)
 		populate_usage_hourly(conn)
 		populate_token_snapshots(conn)
@@ -910,17 +1325,29 @@ def main() -> None:
 		populate_optimization(conn)
 		populate_git_snapshots(conn)
 		populate_response_times(conn)
-		print()
+		populate_context_savings_events(conn)
+		log()
 
 		conn.commit()
-		print("Done. All 16 tables populated.")
+		log("Done. All 17 tables populated.")
 	finally:
 		conn.execute("PRAGMA foreign_keys = ON")
 		conn.close()
 
+	# Session JSONL files (out of band — they live on the filesystem under
+	# PROJECTS_DIR, not in the SQLite DB).
+	populate_session_jsonls()
+
+	# Final summary always prints (not gated by --quiet) so the maintainer always sees it.
 	print()
 	print("─" * 60)
-	if BAK_PATH.exists():
+	if USING_OVERRIDE:
+		print(f"Sandbox seeded:")
+		print(f"  data:     {DB_PATH}")
+		print(f"  rules:    {LEARNED_DIR}")
+		if not SKIP_PROJECTS:
+			print(f"  projects: {PROJECTS_DIR}")
+	elif BAK_PATH.exists():
 		print("To restore the original DB, STOP QUILL FIRST then run:")
 		print(f"  pkill -f quill; sleep 1; cp {BAK_PATH} {DB_PATH}")
 	else:

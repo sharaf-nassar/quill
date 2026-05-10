@@ -235,7 +235,8 @@ fn db_path() -> Result<PathBuf, String> {
             })
         })
         .ok_or("Cannot determine data directory")?;
-    let app_dir = data_dir.join("com.quilltoolkit.app");
+    let default_app_dir = data_dir.join("com.quilltoolkit.app");
+    let app_dir = crate::data_paths::resolve_data_dir_with_default(default_app_dir);
     std::fs::create_dir_all(&app_dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
 
     #[cfg(unix)]
@@ -2582,7 +2583,7 @@ impl Storage {
                  WHERE timestamp >= ?1 AND cwd IS NOT NULL
                  GROUP BY cwd, hostname
                  ORDER BY last_active DESC
-                 LIMIT 200",
+                 LIMIT 100",
             )
             .map_err(|e| format!("Prepare error: {e}"))?;
 

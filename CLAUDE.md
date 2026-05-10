@@ -103,3 +103,14 @@ Details about this child topic.
 ```
 
 The second example is invalid because `Bad Section` has no leading paragraph. `lat check` validates this rule and reports errors for missing or overly long leading paragraphs.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+at `specs/001-marketing-site/plan.md`. Linked artifacts:
+- `specs/001-marketing-site/spec.md` — feature specification (clarified)
+- `specs/001-marketing-site/research.md` — Phase 0 decisions
+- `specs/001-marketing-site/data-model.md` — Phase 1 sandbox/asset/source layouts
+- `specs/001-marketing-site/contracts/` — site-anchors, env-vars, seeder-cli, launcher-cli, pages-workflow
+- `specs/001-marketing-site/quickstart.md` — Phase 1 maintainer walkthrough
+<!-- SPECKIT END -->

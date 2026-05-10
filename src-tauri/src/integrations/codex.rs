@@ -584,7 +584,7 @@ fn agents_path() -> PathBuf {
 }
 
 fn app_data_dir() -> PathBuf {
-    dirs::data_local_dir()
+    let default = dirs::data_local_dir()
         .or_else(|| {
             dirs::home_dir().map(|home| {
                 if cfg!(target_os = "macos") {
@@ -595,7 +595,8 @@ fn app_data_dir() -> PathBuf {
             })
         })
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("com.quilltoolkit.app")
+        .join("com.quilltoolkit.app");
+    crate::data_paths::resolve_data_dir_with_default(default)
 }
 
 fn get_hostname() -> String {
