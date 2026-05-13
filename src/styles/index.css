@@ -1633,6 +1633,47 @@ body {
   flex-shrink: 0;
 }
 
+.breakdown-skill-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.breakdown-skill-toggle,
+.breakdown-skill-provider {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(255, 255, 255, 0.58);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  min-height: 24px;
+  padding: 5px 7px;
+  white-space: nowrap;
+}
+
+.breakdown-skill-toggle:hover,
+.breakdown-skill-provider:hover {
+  color: rgba(255, 255, 255, 0.82);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.breakdown-skill-toggle.active,
+.breakdown-skill-provider.active {
+  color: #dbeafe;
+  background: rgba(96, 165, 250, 0.16);
+  border-color: rgba(96, 165, 250, 0.28);
+}
+
+.breakdown-skill-provider-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
 .breakdown-header-right {
   display: flex;
   align-items: center;
@@ -1704,6 +1745,10 @@ body {
 
 .breakdown-row:hover {
   background: rgba(255, 255, 255, 0.08);
+}
+
+.breakdown-row-skill {
+  cursor: default;
 }
 
 .breakdown-row.selected {
@@ -1880,6 +1925,13 @@ body {
   margin-left: 6px;
   color: rgba(255, 255, 255, 0.4);
   font-size: 9px;
+}
+
+.breakdown-skill-provider-counts {
+  margin-left: 6px;
+  color: rgba(255, 255, 255, 0.38);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
 }
 
 .breakdown-delete-btn {

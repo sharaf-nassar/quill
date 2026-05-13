@@ -12,6 +12,7 @@ import type {
   ProjectBreakdown,
   SessionBreakdown,
   SessionRef,
+  SkillBreakdown,
   SubagentNode,
 } from "../../types";
 import { sessionRefKey } from "../../types";
@@ -53,16 +54,33 @@ function projectName(path: string | null | undefined): string | null {
   return segments.length > 0 ? segments[segments.length - 1] : null;
 }
 
-const MODES: BreakdownMode[] = ["sessions", "projects", "hosts"];
+const MODES: BreakdownMode[] = ["sessions", "projects", "hosts", "skills"];
 const MODE_LABELS: Record<BreakdownMode, string> = {
   hosts: "Hosts",
   projects: "Projects",
   sessions: "Sessions",
+  skills: "Skills",
 };
 const CONFIRM_TIMEOUT_MS = 3000;
+type SkillProviderFilter = "all" | "claude" | "codex";
+const SKILL_PROVIDER_FILTERS: Array<{ value: SkillProviderFilter; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "codex", label: "Codex" },
+  { value: "claude", label: "CC" },
+];
 
 function providerLabel(provider: SessionRef["provider"]): string {
   return provider === "claude" ? "Claude" : "Codex";
+}
+
+function skillEmptyLabel(providerFilter: SkillProviderFilter, allTime: boolean): string {
+  const provider = providerFilter === "all"
+    ? "all providers"
+    : providerFilter === "codex"
+      ? "Codex"
+      : "Claude Code";
+  const scope = allTime ? "all time" : "this timeframe";
+  return `No ${provider} skill usage for ${scope}`;
 }
 
 interface TrashIconProps {
@@ -448,6 +466,8 @@ interface BreakdownPanelProps {
 function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const { toast } = useToast();
   const [mode, setMode] = useState<BreakdownMode>("sessions");
+  const [skillsAllTime, setSkillsAllTime] = useState(false);
+  const [skillsProvider, setSkillsProvider] = useState<SkillProviderFilter>("all");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -463,7 +483,12 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const { fetchTree: fetchSubagentTree, getState: getSubagentState } = useSessionSubagents();
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const { data, loading, error, refresh } = useBreakdownData(mode, days);
+  const skillProviderArg: IntegrationProvider | null =
+    skillsProvider === "all" ? null : skillsProvider;
+  const { data, loading, error, refresh } = useBreakdownData(mode, days, {
+    skillAllTime: skillsAllTime,
+    skillProvider: skillProviderArg,
+  });
 
   const handleModeChange = (m: BreakdownMode) => {
     setMode(m);
@@ -644,6 +669,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     (row) => "project" in row && (row as ProjectBreakdown).project === editingCwd.trim()
       && editingCwd.trim() !== selection?.key,
   );
+  const activeSelection = mode === "skills" ? null : selection;
 
   return (
     <div className="breakdown-panel">
@@ -660,7 +686,30 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
             </button>
           ))}
         </div>
-        {selection && (
+        {mode === "skills" && (
+          <div className="breakdown-skill-controls" aria-label="Skill breakdown controls">
+            <button
+              className={`breakdown-skill-toggle${skillsAllTime ? " active" : ""}`}
+              aria-pressed={skillsAllTime}
+              onClick={() => setSkillsAllTime((value) => !value)}
+            >
+              All time
+            </button>
+            <div className="breakdown-skill-provider-tabs" aria-label="Skill provider filter">
+              {SKILL_PROVIDER_FILTERS.map((filter) => (
+                <button
+                  key={filter.value}
+                  className={`breakdown-skill-provider${skillsProvider === filter.value ? " active" : ""}`}
+                  aria-pressed={skillsProvider === filter.value}
+                  onClick={() => setSkillsProvider(filter.value)}
+                >
+                  {filter.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {activeSelection && (
           <button
             className="breakdown-clear-btn"
             onClick={() => {
@@ -673,31 +722,31 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
           </button>
         )}
         <div className="breakdown-header-right">
-          {selection && selection.type === "project" && editingCwd === null && (
+          {activeSelection && activeSelection.type === "project" && editingCwd === null && (
             <button
               className="breakdown-rename-btn"
               onClick={handleRenameStart}
               disabled={renaming || deleting}
-              aria-label={`Rename project: ${selection.key}`}
+              aria-label={`Rename project: ${activeSelection.key}`}
               title="Rename project path"
             >
               <PencilIcon size={11} />
             </button>
           )}
-          {selection && (
+          {activeSelection && (
             <button
               className={`breakdown-delete-btn${confirmDelete ? " confirm" : ""}`}
               onClick={handleDeleteClick}
               disabled={deleting || renaming}
               aria-label={
                 confirmDelete
-                  ? `Confirm delete ${selection.type}: ${selection.key}`
-                  : `Delete ${selection.type}: ${selection.key}`
+                  ? `Confirm delete ${activeSelection.type}: ${activeSelection.key}`
+                  : `Delete ${activeSelection.type}: ${activeSelection.key}`
               }
               title={
                 confirmDelete
                   ? "Click again to confirm"
-                  : `Delete all data for this ${selection.type}`
+                  : `Delete all data for this ${activeSelection.type}`
               }
             >
               {deleting ? (
@@ -717,7 +766,11 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
       {loading ? (
         <div className="breakdown-empty">{"Loading\u2026"}</div>
       ) : data.length === 0 ? (
-        <div className="breakdown-empty">No {mode} data yet</div>
+        <div className="breakdown-empty">
+          {mode === "skills"
+            ? skillEmptyLabel(skillsProvider, skillsAllTime)
+            : `No ${mode} data yet`}
+        </div>
       ) : (
         <div
           className="breakdown-list"
@@ -832,7 +885,34 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                   </div>
                   );
                 })
-              : (data as SessionBreakdown[]).map((row) => {
+              : mode === "skills"
+                ? (data as SkillBreakdown[]).map((row) => (
+                    <div
+                      key={row.skill_name}
+                      className="breakdown-row breakdown-row-skill"
+                      role="listitem"
+                      aria-label={`${row.skill_name}: ${row.total_count} skill uses`}
+                    >
+                      <span className="breakdown-name" title={row.skill_name}>
+                        {row.skill_name}
+                      </span>
+                      <span className="breakdown-tokens">
+                        {row.total_count.toLocaleString()}
+                      </span>
+                      <span className="breakdown-turns">
+                        {row.total_count === 1 ? "use" : "uses"}
+                        {skillsProvider === "all" && (
+                          <span className="breakdown-skill-provider-counts">
+                            {row.codex_count} C · {row.claude_count} CC
+                          </span>
+                        )}
+                      </span>
+                      <span className="breakdown-time">
+                        {formatRelativeTime(row.last_used)}
+                      </span>
+                    </div>
+                  ))
+                : (data as SessionBreakdown[]).map((row) => {
                   const sessKey = sessionRefKey({
                     provider: row.provider,
                     session_id: row.session_id,

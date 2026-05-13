@@ -29,9 +29,9 @@ use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
     ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
     LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, RuntimeSettings,
-    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, StatusIndicatorState,
-    SubagentNode, TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData,
-    UsageProviderError,
+    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, SkillBreakdown,
+    StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats, ToolCount, UsageBucket,
+    UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -415,7 +415,6 @@ fn build_usage_data(
         provider_errors
             .first()
             .map(|provider_error| provider_error.message.clone())
-            .or_else(|| Some("No live usage data available.".to_string()))
     } else {
         None
     };
@@ -540,12 +539,6 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                     {
                         if let Some(mut buckets) = load_cached_usage_buckets(provider) {
                             display_buckets.append(&mut buckets);
-                        } else {
-                            provider_errors.push(UsageProviderError {
-                                provider,
-                                message: "Claude usage polling is temporarily paused after a recent 429 response."
-                                    .to_string(),
-                            });
                         }
                         continue;
                     }
@@ -559,16 +552,18 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                             live_buckets.append(&mut buckets);
                         }
                         Err(error) => {
-                            if let Some(retry_after_seconds) = error.retry_after_seconds {
+                            if matches!(error.kind, fetcher::ClaudeUsageErrorKind::RateLimited) {
+                                let retry_after_seconds = error
+                                    .retry_after_seconds
+                                    .unwrap_or(CLAUDE_USAGE_FALLBACK_BACKOFF_SECS);
                                 write_usage_setting_timestamp(
                                     CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
                                     now + TimeDelta::seconds(retry_after_seconds),
                                 );
-                            } else if error.message.contains("429") {
-                                write_usage_setting_timestamp(
-                                    CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
-                                    now + TimeDelta::seconds(CLAUDE_USAGE_FALLBACK_BACKOFF_SECS),
-                                );
+                                if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+                                    display_buckets.append(&mut buckets);
+                                }
+                                continue;
                             }
 
                             provider_errors.push(UsageProviderError {
@@ -834,6 +829,17 @@ async fn get_session_stats(days: i32) -> Result<SessionStats, String> {
 async fn get_project_breakdown(days: i32) -> Result<Vec<ProjectBreakdown>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_project_breakdown(days))
+}
+
+#[tauri::command]
+async fn get_skill_breakdown(
+    days: i32,
+    provider: Option<integrations::IntegrationProvider>,
+    all_time: bool,
+    limit: Option<i32>,
+) -> Result<Vec<SkillBreakdown>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_skill_breakdown(days, provider, all_time, limit))
 }
 
 #[tauri::command]
@@ -2220,6 +2226,7 @@ pub fn run() {
             get_token_hostnames,
             get_host_breakdown,
             get_project_breakdown,
+            get_skill_breakdown,
             get_session_breakdown,
             get_session_subagent_tree,
             get_session_stats,

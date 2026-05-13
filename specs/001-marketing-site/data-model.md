@@ -75,6 +75,7 @@ Captured PNGs land in `marketing-site/assets/screenshots/`. Each filename binds 
 | `sessions.png`            | Session Search window                      | `#search`       |
 | `learning.png`            | Learning window — Rules tab                | `#learning`     |
 | `og-image.png`            | Composite (hero screenshot + banner)       | `<head>` meta   |
+| `logo.png`                | Real Quill app icon, resized for web use   | header + favicon |
 
 **Capture conventions**:
 - 2× pixel density (FR-021): if the source window is 800×600 logical px, capture at 1600×1200 physical px. ImageMagick `import` honors X11 DPI; on macOS use `screencapture -R` with retina device.
@@ -87,21 +88,22 @@ The site is one HTML page with sibling CSS and assets. No subroutes.
 
 ```text
 marketing-site/
-├── index.html                  # The single page; references styles.css, scripts.js, /assets/*
-├── styles.css                  # Terminal Console theme; one file
-├── scripts.js                  # Optional, ≤ 5 KB; only present if a micro-animation needs JS
+├── index.html                  # The single page; references styles.css and /assets/*
+├── styles.css                  # Signal Theater theme; one file
+├── motion.js                   # Progressive GSAP motion and carousel controls
 ├── assets/
 │   ├── screenshots/            # Per § 3 above
+│   ├── logo.png                # Real Quill app icon used in header + favicon
 │   ├── og-image.png            # 1200x630 social-share preview
-│   └── favicon.svg             # SVG favicon, dark-mode-aware
+│   └── favicon.svg             # Legacy SVG fallback, cyan/dark scheme aware
 └── README.md                   # Maps the folder, links the spec, notes the deploy contract
 ```
 
 **Discipline**:
 - One HTML file. Splitting into multiple pages requires a new clarification round (Q2 was answered "single page").
 - One CSS file. No `@import` of remote stylesheets (FR-028 — no third-party loads).
-- `scripts.js` is OPTIONAL and exists only if CSS-only motion isn't sufficient for the chosen micro-animation; if added, it MUST gate behind `prefers-reduced-motion: no-preference` AND `'IntersectionObserver' in window` to satisfy FR-024 and FR-025.
-- All assets are local; no CDN URLs.
+- JavaScript is progressive only. Core content, anchors, links, and screenshots MUST stay readable without scripts, and motion MUST respect `prefers-reduced-motion`.
+- All durable assets are local. Third-party scripts are limited to the GSAP progressive-motion CDN; no tracking, analytics, or remote fonts are allowed.
 
 ## Relationships
 

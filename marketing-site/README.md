@@ -1,16 +1,18 @@
 # marketing-site
 
-Source for the [Quill](https://github.com/sharaf-nassar/quill) marketing site. Static HTML/CSS, no build step. Deployed to GitHub Pages by `.github/workflows/pages.yml` on every merge to `main` that touches files under this directory.
+Source for the [Quill](https://github.com/sharaf-nassar/quill) marketing site. Static HTML/CSS/JS, no build step. Deployed to GitHub Pages by `.github/workflows/pages.yml` on every merge to `main` that touches files under this directory.
 
 ## Layout
 
 ```text
 marketing-site/
 ├── index.html              Single page; seven anchored sections
-├── styles.css              Terminal Console theme; no framework, no web fonts
+├── styles.css              Signal Theater theme; no framework, no web fonts
+├── motion.js               Progressive GSAP motion and carousel controls
 ├── README.md               This file
 └── assets/
-    ├── favicon.svg         32×32 favicon (light/dark scheme aware)
+    ├── favicon.svg         Legacy SVG fallback; cyan/dark scheme aware
+    ├── logo.png            Real Quill app icon used in header + favicon
     ├── og-image.png        1200×630 social-share preview
     └── screenshots/        @2x captures from the dummy-data Quill instance
         ├── hero.png
@@ -38,7 +40,7 @@ Renaming or removing any of these is a breaking change.
 
 ## Visual direction
 
-[Terminal Console](../specs/001-marketing-site/spec.md#clarifications) — chosen 2026-05-08. Mirrors the desktop app's dark theme (`#121216` background, `#d4d4d4` text, semantic green/yellow/red status colors, blue accent). Monospace stack, no Inter, square-defaulting `≤6px` border radius.
+[Signal Theater](../specs/001-marketing-site/spec.md#clarifications) — revised 2026-05-12. The page reads like a premium desktop instrument panel for agent work: Quill's quiet dark app surface, the real quill logo mark, cyan/purple logo accents, clipped geometry, dense screenshot proof, GSAP-pinned scroll narrative, and no generic SaaS cards.
 
 ## Preview locally
 
@@ -73,9 +75,10 @@ The launcher uses env-var path overrides (`QUILL_DEMO_MODE=1`, `QUILL_DATA_DIR`,
 
 - Add or remove a feature section: edit `<section>` blocks in `index.html`. Anchor IDs above are stable.
 - Add or remove a screenshot: place the PNG under `assets/screenshots/`, reference it from the appropriate `<figure>`. Filenames map 1:1 to anchored sections.
-- Visual direction stays Terminal Console — see [spec.md § Clarifications](../specs/001-marketing-site/spec.md#clarifications). Avoid generic SaaS-landing-page conventions.
+- Change visual CSS: bump the `styles.css?v=...` query in `index.html` so local previews and Pages visitors do not keep stale cached styles.
+- Visual direction stays Signal Theater — see [spec.md § Clarifications](../specs/001-marketing-site/spec.md#clarifications). Avoid generic SaaS-landing-page conventions.
 - No tracking scripts, no third-party analytics, no remote fonts (FR-028, FR-007).
-- Page MUST stay readable with JavaScript disabled (FR-024). The site currently has zero `<script>` tags — keep it that way unless you have a specific reason.
+- Page MUST stay readable with JavaScript disabled (FR-024). GSAP loads from CDN as progressive motion enhancement only; core content, anchors, links, and screenshots must work when scripts fail or motion is reduced.
 
 ## Deploy
 

@@ -15,6 +15,18 @@
 - Q: How should the site publish to GitHub Pages? → A: **GitHub Actions workflow.** A `.github/workflows/pages.yml` builds (or copies) the site source from `marketing-site/` and deploys via the official `actions/deploy-pages` action on merges to the default branch. Site source lives under `marketing-site/` in this repo. This contract is portable across plain HTML and any future static-site-generator without re-architecting.
 - Q: How rich should the hero demo media be? → A: **Static screenshot + lightweight CSS micro-animation** — the hero anchors on a high-quality screenshot of the main window, augmented with a small CSS/SVG motion accent (e.g., a pace marker advancing across a faux usage row, or a sparkline drawing once on scroll-into-view). No `<video>` tag. Total motion overhead under ~5 KB. MUST gracefully degrade to the static screenshot under `prefers-reduced-motion: reduce` and with JavaScript disabled.
 
+### Session 2026-05-10
+
+- Q: The first shipped page looks insufficiently professional; how should the redesign evolve without becoming generic SaaS or AI slop? → A: **Instrument Dossier** — a light, editorial evidence-packet direction. The page uses warm technical paper, hard rules, serif display type, mono labels, cobalt action color, and dark product screenshots as the primary proof. It stays static, avoids third-party assets, and keeps the same seven anchored sections.
+
+### Session 2026-05-11
+
+- Q: The evidence-packet page still feels too flat and unimpressive; how should the page move further upmarket? → A: **Signal Theater** — a dark, cinematic desktop-instrument direction. The page keeps real Quill screenshots and stable anchors, but uses asymmetric hero composition, gapless screenshot bento, horizontal proof accordion, GSAP-pinned scroll narrative, scrubbed text reveal, and a focused install close. JavaScript is progressive enhancement only; content remains readable without it.
+
+### Session 2026-05-12
+
+- Q: The Signal Theater palette used lime/chartreuse that does not match the Quill app or real logo; what should the brand palette be? → A: **Logo-aligned dark Quill palette** — use the actual quill icon in the marketing header and favicon, keep the app's `#121216` dark base, use cyan and purple from the logo for brand accents, and reserve green/yellow/red for product status semantics.
+
 ## User Scenarios & Testing *(mandatory)*
 
 ### User Story 1 - First-time visitor evaluates Quill in under a minute (Priority: P1)
@@ -110,14 +122,14 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 
 #### Visual identity and theme
 
-- **FR-005**: The site's visual identity MUST adopt the **Terminal Console** direction (chosen 2026-05-08, refined 2026-05-09 to mono-paired typography per FR-007): the page reads as a sibling of the desktop app — dark near-black background, light neutral text, ASCII rule dividers, and inline `[OK]` / `[!]` / `[ERR]` style status pills. Color usage MUST follow the app's semantic palette (green for healthy, yellow for warning, red for critical, blue for interaction) and MUST be reserved for status, not decoration.
-- **FR-006**: The site MUST avoid generic SaaS-landing-page conventions (large rounded cards, glassmorphism, pastel gradients, hero-only-text with no product UI shown, oversized pill buttons, soft-shadow-heavy layout). Geometry MUST default to square or lightly rounded (≤6px corners) consistent with the Terminal Console direction.
-- **FR-007**: Typography MUST be deliberate and echo the desktop app: system sans-serif (`ui-sans-serif`/`system-ui` stack, never bundled Inter or Roboto) for prose (headlines, body, point lists), and the mono stack (`ui-monospace`, `JetBrains Mono`, …) for UI labels, frame chrome, metric pins, status pills, code samples, and section eyebrows where the monospace grid is doing visual work. The desktop app's 11px system-sans body informs the rhythm; marketing body sits in the 14–18px range to remain legible at viewing distance.
+- **FR-005**: The site's visual identity MUST adopt the **Signal Theater** direction (chosen 2026-05-11, palette corrected 2026-05-12): the page reads as a premium desktop instrument panel for AI coding telemetry. It uses the real Quill logo mark, the app's dark `#121216` surface, clipped geometry, dense screenshot proof, cyan/purple logo accents, and scroll-driven motion as progressive enhancement.
+- **FR-006**: The site MUST avoid generic SaaS-landing-page conventions (large rounded cards, glassmorphism, pastel gradients, hero-only-text with no product UI shown, oversized pill buttons, soft-shadow-heavy layout). Geometry MUST default to square or lightly rounded (≤6px corners) consistent with the Signal Theater direction.
+- **FR-007**: Typography MUST be deliberate and dependency-free: a Cabinet Grotesk-first display stack with local fallbacks for headlines, a readable local sans stack for prose, and a mono stack (`ui-monospace`, `JetBrains Mono`, `SF Mono`, etc.) for labels, frame chrome, metric pins, code samples, and section eyebrows. The site MUST NOT import remote fonts or bundled Inter/Roboto.
 - **FR-008**: Color contrast MUST meet WCAG 2.1 AA for body text, headlines, status pills, and call-to-action labels.
 
 #### Content structure
 
-- **FR-009**: The site MUST include a hero section with a headline, a one-line value proposition, a primary call-to-action, and a primary screenshot of the desktop app's main window. The screenshot MAY be augmented with a lightweight CSS/SVG micro-animation (e.g., a pace marker advancing across a faux usage row, a sparkline drawing once on scroll-into-view) totalling no more than ~5 KB of motion overhead. The hero MUST NOT use a `<video>` tag. The hero MUST degrade to a fully readable static screenshot when JavaScript is disabled or when `prefers-reduced-motion: reduce` is set.
+- **FR-009**: The site MUST include a hero section with a headline, a one-line value proposition, a primary call-to-action, and a primary screenshot of the desktop app's main window. The screenshot MAY be augmented with CSS/JS motion that is not required for comprehension. The hero MUST NOT use a `<video>` tag. The hero MUST degrade to a fully readable static screenshot when JavaScript is disabled, GSAP fails to load, or `prefers-reduced-motion: reduce` is set.
 - **FR-010**: The site MUST include dedicated feature sections for at least Live Usage, Analytics Dashboard (Now, Trends, Charts, Context tabs), Context Savings, Session Search, and Learning System.
 - **FR-011**: Each feature section MUST include a benefit-oriented heading, a short description, and at least one screenshot showing that feature in the actual UI.
 - **FR-012**: The Analytics section MUST explicitly explain *how analytics and insights help when working with an LLM* — covering at minimum: subscription-usage awareness (Pro/Max/Plus 5-hour and 7-day windows), latency visibility, token-efficiency feedback, context savings, code velocity, and routing-cost transparency.
@@ -187,7 +199,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 - The repository remains publicly hosted on GitHub and GitHub Pages for the repository is enabled (free tier is sufficient for v1).
 - The marketing site is a static deliverable; no server-side runtime is needed. Forms (waitlist, contact, newsletter) are out of scope for v1; if introduced later they will use a third-party endpoint, not a backend service.
 - A custom domain is not required for v1; the default `*.github.io` URL is acceptable. Custom domain support remains possible later without re-architecting.
-- The chosen visual direction matches the desktop app's dark, dense, terminal-utility aesthetic. A pivot to a generic SaaS landing-page style is explicitly not the goal.
+- The chosen visual direction is the 2026-05-11 Signal Theater redesign. It aligns the marketing page with the app's dark technical UI while keeping screenshots as the source of visual truth. A pivot to generic SaaS styling remains explicitly out of scope.
 - The site is single-page (or single-page-with-anchored-sections) for v1. A separate documentation site, blog, changelog page, or multi-page expansion is out of scope here and can be added later.
 - Localization is out of scope for v1; English-only content is acceptable.
 - User-tracking analytics on the marketing site are out of scope for v1 (privacy-respecting baseline). If introduced later, it will be a deliberate, opt-in decision with explicit copy.

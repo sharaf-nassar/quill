@@ -12,8 +12,8 @@ use crate::models::{
     ContextSavingsTimeseriesPoint, DataPoint, GitSnapshot, HostBreakdown, LanguageBreakdown,
     LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload, LearningStatus,
     LlmRuntimeStats, ObservationPayload, ProjectBreakdown, ProjectTokens, SessionBreakdown,
-    SessionCodeStats, SessionRef, SessionStats, SubagentNode, TokenDataPoint, TokenReportPayload,
-    TokenStats, ToolCount, UsageBucket,
+    SessionCodeStats, SessionRef, SessionStats, SkillBreakdown, SkillUsage, SubagentNode,
+    TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
@@ -731,6 +731,17 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
             "CREATE INDEX IF NOT EXISTS idx_tool_actions_category_timestamp ON tool_actions(category, timestamp);
              CREATE INDEX IF NOT EXISTS idx_tool_actions_category_provider_session ON tool_actions(category, provider, session_id);",
             "tool action query indexes",
+        ),
+        (
+            table_has_column(conn, "skill_usages", "provider")
+                && table_has_column(conn, "skill_usages", "timestamp"),
+            "CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_ts
+                 ON skill_usages(provider, timestamp);
+             CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_session
+                 ON skill_usages(provider, session_id);
+             CREATE INDEX IF NOT EXISTS idx_skill_usages_skill_ts
+                 ON skill_usages(skill_name, timestamp);",
+            "skill usage indexes",
         ),
         (
             table_has_column(conn, "context_savings_events", "event_id"),
@@ -1650,6 +1661,39 @@ impl Storage {
 
             tx.commit()
                 .map_err(|e| format!("Migration 20 commit: {e}"))?;
+        }
+
+        if current_version < 21 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS skill_usages (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider    TEXT NOT NULL,
+                    session_id  TEXT NOT NULL,
+                    message_id  TEXT NOT NULL,
+                    skill_name  TEXT NOT NULL,
+                    skill_path  TEXT NOT NULL,
+                    timestamp   TEXT NOT NULL,
+                    tool_name   TEXT,
+                    created_at  TEXT DEFAULT (datetime('now')),
+                    UNIQUE(provider, session_id, message_id, skill_name, skill_path, timestamp)
+                );
+                CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_ts
+                    ON skill_usages(provider, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_session
+                    ON skill_usages(provider, session_id);
+                CREATE INDEX IF NOT EXISTS idx_skill_usages_skill_ts
+                    ON skill_usages(skill_name, timestamp);",
+            )
+            .map_err(|e| format!("Migration 21 (skill_usages table): {e}"))?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["skill_usage_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 21 (set reingest flag): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (21)", [])
+                .map_err(|e| format!("Failed to record migration 21: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -2732,6 +2776,70 @@ impl Storage {
         Ok(merge_project_subdirs(raw))
     }
 
+    pub fn get_skill_breakdown(
+        &self,
+        days: i32,
+        provider: Option<IntegrationProvider>,
+        all_time: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<SkillBreakdown>, String> {
+        if provider == Some(IntegrationProvider::MiniMax) {
+            return Ok(Vec::new());
+        }
+
+        let days = days.clamp(1, 365);
+        let limit = limit.unwrap_or(100).clamp(1, 500);
+        let conn = self.conn.lock();
+        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+
+        let mut sql = String::from(
+            "SELECT
+                 skill_name,
+                 COUNT(*) AS total_count,
+                 COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
+                 COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
+                 MAX(timestamp) AS last_used
+             FROM skill_usages
+             WHERE provider IN ('claude', 'codex')",
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if !all_time {
+            params_vec.push(Box::new(from));
+            sql.push_str(" AND timestamp >= ?1");
+        }
+        if let Some(provider) = provider {
+            let next_param = params_vec.len() + 1;
+            sql.push_str(&format!(" AND provider = ?{next_param}"));
+            params_vec.push(Box::new(provider.as_str().to_string()));
+        }
+        sql.push_str(" GROUP BY skill_name ORDER BY total_count DESC, skill_name ASC");
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Prepare error: {e}"))?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(SkillBreakdown {
+                    skill_name: row.get(0)?,
+                    total_count: row.get(1)?,
+                    claude_count: row.get(2)?,
+                    codex_count: row.get(3)?,
+                    last_used: row.get(4)?,
+                })
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| format!("Row error: {e}"))?);
+        }
+        Ok(results)
+    }
+
     pub fn get_session_breakdown(
         &self,
         days: i32,
@@ -3234,16 +3342,29 @@ impl Storage {
         provider: IntegrationProvider,
         session_id: &str,
     ) -> Result<u64, String> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Delete session transaction error: {e}"))?;
 
-        let count = conn
+        let token_count = tx
             .execute(
                 "DELETE FROM token_snapshots WHERE provider = ?1 AND session_id = ?2",
                 params![provider.as_str(), session_id],
             )
-            .map_err(|e| format!("Delete error: {e}"))?;
+            .map_err(|e| format!("Delete token snapshots error: {e}"))?;
 
-        Ok(count as u64)
+        let skill_count = tx
+            .execute(
+                "DELETE FROM skill_usages WHERE provider = ?1 AND session_id = ?2",
+                params![provider.as_str(), session_id],
+            )
+            .map_err(|e| format!("Delete skill usages error: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("Delete session commit error: {e}"))?;
+
+        Ok((token_count + skill_count) as u64)
     }
 
     pub fn delete_project_data(&self, cwd: &str) -> Result<u64, String> {
@@ -4560,6 +4681,20 @@ impl Storage {
         Ok(())
     }
 
+    pub fn delete_skill_usages_for_session(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM skill_usages WHERE provider = ?1 AND session_id = ?2",
+            params![provider.as_str(), session_id],
+        )
+        .map_err(|e| format!("Delete skill_usages for session: {e}"))?;
+        Ok(())
+    }
+
     pub fn store_tool_actions_for_messages(
         &self,
         provider: IntegrationProvider,
@@ -4607,6 +4742,66 @@ impl Storage {
 
         tx.commit()
             .map_err(|e| format!("Commit tool_actions batch: {e}"))?;
+        Ok(())
+    }
+
+    pub fn store_skill_usages_for_messages(
+        &self,
+        provider: IntegrationProvider,
+        messages: &[crate::sessions::ExtractedMessage],
+    ) -> Result<(), String> {
+        let usages: Vec<SkillUsage> = messages
+            .iter()
+            .flat_map(|message| {
+                message.tool_actions.iter().flat_map(move |action| {
+                    crate::sessions::extract_skill_accesses_from_tool_action(action)
+                        .into_iter()
+                        .map(move |access| SkillUsage {
+                            session_id: message.session_id.clone(),
+                            message_id: message.uuid.clone(),
+                            skill_name: access.skill_name,
+                            skill_path: access.skill_path,
+                            timestamp: action.timestamp.clone(),
+                            tool_name: Some(action.tool_name.clone()),
+                        })
+                })
+            })
+            .collect();
+
+        if usages.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin skill_usages batch transaction: {e}"))?;
+
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO skill_usages
+                     (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| format!("Prepare store skill_usages batch: {e}"))?;
+
+            for usage in usages {
+                stmt.execute(params![
+                    provider.as_str(),
+                    usage.session_id,
+                    usage.message_id,
+                    usage.skill_name,
+                    usage.skill_path,
+                    usage.timestamp,
+                    usage.tool_name,
+                ])
+                .map_err(|e| format!("Insert skill_usage: {e}"))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Commit skill_usages batch: {e}"))?;
         Ok(())
     }
 

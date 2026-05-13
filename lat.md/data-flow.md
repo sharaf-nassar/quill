@@ -21,7 +21,7 @@ That keeps combined analytics provider-safe while still sharing one token pipeli
 
 Analytics session drill-down uses the same provider plus session id pair when requesting token history, compact token stats, or session deletion, so identical ids from different providers stay isolated.
 
-Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (11)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the Now-tab card needs to exclude the sub-agent traffic instead.
+Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (12)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the Now-tab card needs to exclude the sub-agent traffic instead.
 
 ## Learning Analysis Pipeline
 
@@ -128,7 +128,7 @@ The main window polls enabled providers for live rate limit status and stores th
 6. If the direct Codex app-server request fails, [[src-tauri/src/fetcher.rs]] falls back to the newest `token_count` transcript event in `~/.codex/sessions/**/*.jsonl` so older Codex installs can still populate base usage rows
 7. Successful live buckets are inserted into `usage_snapshots`, keyed by provider plus bucket key, and hourly cleanup aggregates them into `usage_hourly`
 8. If a provider poll fails, the command loads the last stored buckets for that provider and returns a provider-scoped error alongside the cached rows
-8a. Claude 429 responses also persist a cooldown timestamp in the settings store, and subsequent refreshes honor that cooldown before retrying the live API
+8a. Claude 429 responses persist a silent cooldown timestamp in the settings store, and subsequent refreshes honor that cooldown before retrying the live API. These rate limits are not returned as provider errors; Claude login guidance is reserved for missing credentials or 401 Unauthorized responses.
 9. Frontend live usage groups rows by provider, while analytics selects one concrete provider bucket for utilization history and stats
 10. `emit_usage_updates()` rebuilds the backend-owned indicator state, emits `indicator-updated`, and lets the tray listener update title text plus `Now`, `Resets`, and `Week` summary rows from the same payload
 ## Indicator Preference Pipeline

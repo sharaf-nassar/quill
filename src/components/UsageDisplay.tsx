@@ -89,9 +89,11 @@ function UsageDisplay({
 
   if (data.error) {
     console.error("Usage fetch error:", data.error);
-    const msg = data.error.includes("Credentials")
-      ? data.error
-      : "Failed to load usage data";
+    const lowerError = data.error.toLowerCase();
+    const msg =
+      lowerError.includes("credential") || lowerError.includes("claude /login")
+        ? data.error
+        : "Failed to load usage data";
     if (data.buckets.length === 0) {
       return (
         <div className="error-label" role="alert">

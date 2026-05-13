@@ -408,6 +408,9 @@ fn process_session_notify_payload(
     if let Err(err) = storage.delete_tool_actions_for_session(payload.provider, &session_id) {
         log::warn!("Failed to delete old tool_actions: {err}");
     }
+    if let Err(err) = storage.delete_skill_usages_for_session(payload.provider, &session_id) {
+        log::warn!("Failed to delete old skill_usages: {err}");
+    }
     if let Err(err) = storage.delete_response_times_for_session(payload.provider, &session_id) {
         log::warn!("Failed to delete old response_times: {err}");
     }
@@ -423,6 +426,10 @@ fn process_session_notify_payload(
     if let Err(err) = storage.store_tool_actions_for_messages(payload.provider, &extracted.messages)
     {
         log::warn!("Failed to store tool actions: {err}");
+    }
+    if let Err(err) = storage.store_skill_usages_for_messages(payload.provider, &extracted.messages)
+    {
+        log::warn!("Failed to store skill usages: {err}");
     }
 
     let rt_pairs: Vec<crate::storage::ResponseTimeInput<'_>> = extracted

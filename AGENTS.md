@@ -107,4 +107,10 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
+at `specs/002-track-session-skills/plan.md`. Linked artifacts:
+- `specs/002-track-session-skills/spec.md` — feature specification
+- `specs/002-track-session-skills/research.md` — Phase 0 decisions
+- `specs/002-track-session-skills/data-model.md` — Phase 1 skill-use data model
+- `specs/002-track-session-skills/contracts/skill-breakdown-command.md` — Tauri command contract
+- `specs/002-track-session-skills/quickstart.md` — Phase 1 maintainer walkthrough
 <!-- SPECKIT END -->

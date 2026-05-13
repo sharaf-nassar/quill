@@ -120,6 +120,14 @@ export interface SessionBreakdown {
   subagent_count?: number;
 }
 
+export interface SkillBreakdown {
+  skill_name: string;
+  total_count: number;
+  claude_count: number;
+  codex_count: number;
+  last_used: string;
+}
+
 /**
  * One node in a session's sub-agent tree returned by
  * `get_session_subagent_tree`. Today every chain originates from the parent
@@ -160,7 +168,7 @@ export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
 export type TrendType = "up" | "down" | "flat" | "unknown";
 
-export type BreakdownMode = "hosts" | "projects" | "sessions";
+export type BreakdownMode = "hosts" | "projects" | "sessions" | "skills";
 
 export type SortMode = "relevance" | "recency";
 

@@ -4,7 +4,7 @@ This document records the technical decisions made during planning, why each was
 
 ## R1. Static plain HTML/CSS vs. static-site generator
 
-**Decision**: Hand-written `index.html` + `styles.css` + a tiny optional `scripts.js`. No build step, no SSG, no framework.
+**Decision**: Hand-written `index.html` + `styles.css`. No build step, no SSG, no framework, no JavaScript for the shipped page.
 
 **Rationale**:
 - Q2 locked in a single page with seven anchored sections — total content is small enough to live in one HTML file without composability gymnastics.
@@ -20,24 +20,25 @@ This document records the technical decisions made during planning, why each was
 
 ## R2. Typography choice (FR-007 forbids Inter)
 
-**Decision**: System monospace stack, fronted by a high-quality system mono if present:
+**Decision**: Dependency-free local font stacks: a system serif stack for display headlines, a readable local sans stack for prose, and a system mono stack for labels and metric chrome:
 
 ```css
-font-family: ui-monospace, "JetBrains Mono", "Fira Code", "SF Mono",
-             Menlo, Consolas, "Liberation Mono", monospace;
+--font-display: "Cabinet Grotesk", "Arial Narrow", "Aptos Display", "Segoe UI", sans-serif;
+--font-body: "Geist", "Aptos", "Segoe UI", system-ui, sans-serif;
+--font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
 ```
 
-Body text uses this stack at an effective 12–13 px (matches the spec's 11–13 px target band). Headlines use the same stack at larger sizes with tight letter-spacing.
+Headlines use the Cabinet Grotesk-first stack for a dense instrument-panel feel. Mono stays reserved for navigation, frame chrome, metric labels, and technical tags.
 
 **Rationale**:
-- Honors FR-005 (terminal-utility aesthetic) and FR-007 (no Inter).
+- Honors FR-005 (Signal Theater aesthetic) and FR-007 (no Inter).
 - Zero web-font cost — keeps page weight low (FR-026) and works fully offline.
-- Each fallback is bundled with at least one mainstream OS, so most visitors see a pleasant local mono; the `monospace` keyword is the worst-case fallback.
+- Each fallback is bundled with at least one mainstream OS, so most visitors see a polished local font without loading third-party assets.
 
 **Alternatives considered**:
 - **Self-hosted JetBrains Mono via woff2**: Adds 60–80 KB per weight. Rejected for v1 to stay inside the perf budget; can be re-introduced if the system stack proves visually inconsistent across platforms.
 - **Inter / generic sans by default**: Explicitly forbidden by FR-007.
-- **Custom display-only font for headlines + system body**: More moving parts, more fonts to QA, more bytes. Rejected.
+- **Remote display font for headlines + system body**: More moving parts, more fonts to QA, more bytes, and violates the no-third-party-load baseline. Rejected.
 
 ## R3. Rust env-var override pattern
 
@@ -168,7 +169,7 @@ jobs:
 
 ## R7. OG / social-share preview
 
-**Decision**: Hand-built 1200×630 PNG (`marketing-site/assets/og-image.png`) composed of the hero screenshot with a "QUILL — live limits, analytics, search" banner along the bottom or right edge in the Terminal Console aesthetic. Referenced via `<meta property="og:image">`, `<meta name="twitter:card" content="summary_large_image">`, and `<meta name="twitter:image">`.
+**Decision**: Hand-built 1200×630 PNG (`marketing-site/assets/og-image.png`) composed of the hero screenshot and Signal Theater typography, with the headline "Quill gives agent work telemetry." Referenced via `<meta property="og:image">`, `<meta name="twitter:card" content="summary_large_image">`, and `<meta name="twitter:image">`.
 
 **Rationale**:
 - Meaningful preview > brand-only logo (per spec edge case "Social-share preview").
@@ -209,7 +210,7 @@ jobs:
 - Developers (the target audience) actively dislike buzzy copy; concrete and accurate beats grand and vague.
 
 **Alternatives considered**:
-- **Punchy SaaS-marketing voice**: Mismatched with the Terminal Console aesthetic and the README baseline. Rejected.
+- **Punchy SaaS-marketing voice**: Mismatched with the Signal Theater aesthetic and the README baseline. Rejected.
 
 ## R10. CI for the Rust env-var override change
 

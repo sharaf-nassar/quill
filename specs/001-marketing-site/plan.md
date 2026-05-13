@@ -5,19 +5,19 @@
 
 ## Summary
 
-Build a static, single-page marketing site for Quill, hosted at the project's GitHub Pages URL, with a **Terminal Console** visual identity that mirrors the desktop app (dark `#121216` background, monospace headlines, semantic green/yellow/red status pills, ASCII rules). The page deep-links to seven anchored sections (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`). All UI screenshots come from a sandboxed Quill instance pointed at temp directories via two new env vars (`QUILL_DATA_DIR`, `QUILL_RULES_DIR`) gated by an opt-in `QUILL_DEMO_MODE=1` flag, so a maintainer's personal Quill state is never touched. The existing seeder (`scripts/populate_dummy_data.py`) and screenshot driver (`scripts/take_screenshots.sh`) are extended; two new cross-platform launchers wire the sandbox together. A new GitHub Actions workflow (`.github/workflows/pages.yml`) deploys the site via `actions/deploy-pages`.
+Build a static, single-page marketing site for Quill, hosted at the project's GitHub Pages URL, with a **Signal Theater** visual identity: Quill's dark app surface, actual logo mark, clipped geometry, Cabinet Grotesk display stack, cyan/purple logo accents, progressive GSAP motion, and real dark product screenshots as the primary proof. The page deep-links to seven anchored sections (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`). All UI screenshots come from a sandboxed Quill instance pointed at temp directories via two new env vars (`QUILL_DATA_DIR`, `QUILL_RULES_DIR`) gated by an opt-in `QUILL_DEMO_MODE=1` flag, so a maintainer's personal Quill state is never touched. The existing seeder (`scripts/populate_dummy_data.py`) and screenshot driver (`scripts/take_screenshots.sh`) are extended; two new cross-platform launchers wire the sandbox together. A new GitHub Actions workflow (`.github/workflows/pages.yml`) deploys the site via `actions/deploy-pages`.
 
 ## Technical Context
 
-**Language/Version**: HTML5 + CSS3 + ES2022 vanilla JS for the site; Rust 2024 edition for the env-var override (existing toolchain); Python 3 for the seeder extension (existing).
-**Primary Dependencies**: None for the site (no framework, no build step). GitHub Actions: `actions/checkout@v4`, `actions/configure-pages@v5`, `actions/upload-pages-artifact@v3`, `actions/deploy-pages@v4`. App-side reuses existing crates (`tauri`, `directories` already pulled by Tauri).
+**Language/Version**: HTML5 + CSS3 + small progressive JavaScript for the site; Rust 2024 edition for the env-var override (existing toolchain); Python 3 for the seeder extension (existing).
+**Primary Dependencies**: GSAP from CDN for progressive marketing-page motion; no framework and no build step. GitHub Actions: `actions/checkout@v4`, `actions/configure-pages@v5`, `actions/upload-pages-artifact@v3`, `actions/deploy-pages@v4`. App-side reuses existing crates (`tauri`, `directories` already pulled by Tauri).
 **Storage**: N/A for the marketing site (static deliverable). Demo Quill instance writes its SQLite DB to `$QUILL_DATA_DIR/usage.db` instead of the platform default.
 **Testing**: Site — manual Lighthouse run (Chrome DevTools or `npx @lhci/cli`) before merge, manual cross-browser smoke (latest Chromium, Firefox, WebKit). App-side — one new unit test in `src-tauri/src/data_paths.rs` covering the env-var resolver under set / unset / demo-mode-off cases. Seeder — manual launcher round-trip on Linux at minimum.
 **Target Platform**: GitHub Pages (`https://*.github.io/quill/`) for the site. Demo Quill isolation works on Linux, macOS, and Windows.
 **Project Type**: Web (static site, single-page) + small backend changes (Rust path resolver) + scripting (Python seeder flag, two launchers, screenshot driver extension) + one CI workflow.
 **Performance Goals**: Lighthouse Performance ≥ 90 on mobile and desktop; Largest Contentful Paint < 2.0 s on simulated broadband; Cumulative Layout Shift < 0.1; total transferred page weight on first load < 500 KB (excluding any optional self-hosted font, kept off for v1 per FR-007 / FR-026).
 **Constraints**: Static-only (no server runtime); hero readable with JavaScript disabled (FR-024); honors `prefers-reduced-motion: reduce` (FR-025); WCAG 2.1 AA contrast (FR-008); usable from 320px to 2560px viewport (FR-023); no third-party tracking (FR-028); production builds MUST refuse env-var overrides without `QUILL_DEMO_MODE=1` (FR-018).
-**Scale/Scope**: One HTML page, ~7 anchored sections, ~6–10 screenshots, ~150–200 lines HTML + ~300–500 lines CSS + < 100 lines JS for the site. App-side: ~30–50 lines new Rust in `src-tauri/src/data_paths.rs` + ~5–10 call-site updates in `lib.rs`. Scripts: ~30 lines of new Python flag handling + ~40 lines × 2 launcher scripts + minor extension to `take_screenshots.sh`.
+**Scale/Scope**: One HTML page, ~7 anchored sections, ~6–10 screenshots, ~250–400 lines HTML + ~800–1,200 lines CSS and a small progressive motion script for the site. App-side: ~30–50 lines new Rust in `src-tauri/src/data_paths.rs` + ~5–10 call-site updates in `lib.rs`. Scripts: ~30 lines of new Python flag handling + ~40 lines × 2 launcher scripts + minor extension to `take_screenshots.sh`.
 
 ## Constitution Check
 
@@ -60,8 +60,8 @@ specs/001-marketing-site/
 ```text
 marketing-site/                              # NEW — site source root (FR-002)
 ├── index.html                               # Single page with seven anchored sections
-├── styles.css                               # Terminal Console theme; mono stack
-├── scripts.js                               # Optional, ≤ 5 KB micro-animation only
+├── styles.css                               # Signal Theater theme; no remote fonts
+├── motion.js                                # Progressive GSAP scroll + carousel behavior
 ├── assets/
 │   ├── screenshots/                         # @2x PNG captures from sandboxed Quill
 │   │   ├── hero.png
@@ -104,7 +104,7 @@ No constitution gate violations. Section intentionally empty.
 See [research.md](./research.md) for full Decision / Rationale / Alternatives entries. Topics resolved:
 
 1. Static plain-HTML/CSS vs static-site-generator → **plain HTML**
-2. Typography (FR-007 forbids Inter) → **system monospace stack**
+2. Typography (FR-007 forbids Inter) → **Cabinet Grotesk-first display stack + local sans/mono fallbacks**
 3. Rust env-var override pattern → **dedicated `data_paths.rs` module, opt-in via `QUILL_DEMO_MODE=1`**
 4. Cross-platform launcher shape → **`.sh` + `.ps1` pair, no Python launcher**
 5. Screenshot scope → **7 captures matching the seven anchored sections**

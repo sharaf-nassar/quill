@@ -181,6 +181,25 @@ pub struct SessionBreakdown {
     pub subagent_count: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct SkillUsage {
+    pub session_id: String,
+    pub message_id: String,
+    pub skill_name: String,
+    pub skill_path: String,
+    pub timestamp: String,
+    pub tool_name: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SkillBreakdown {
+    pub skill_name: String,
+    pub total_count: i64,
+    pub claude_count: i64,
+    pub codex_count: i64,
+    pub last_used: String,
+}
+
 /// One sub-agent node inside a parent session, returned by
 /// `get_session_subagent_tree`. Multi-level nesting is supported via
 /// `parent_agent_id`; today every chain originates from the parent

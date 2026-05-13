@@ -87,7 +87,7 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - **token_hourly** — Hourly aggregates per provider/host (total tokens, turn_count). Unique on (hour, hostname, provider).
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
-Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (11)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (12)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
 
 #### Learning System
 
@@ -150,15 +150,17 @@ Migration 20 also added `is_sidechain`, `agent_id`, and `parent_uuid` to `respon
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v20). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; the next [[backend#Session Indexing]] sweep clears its `index_state.json` mtime cache so the indexer re-reads every JSONL to backfill the new sub-agent columns.
+- **schema_version** — Migration version tracking (currently v21). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows.
 
 ## Tauri IPC Commands
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
-### Usage and Token Commands (11)
+### Usage and Token Commands (12)
 
-`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_context_savings_analytics`.
+Live usage and token analytics commands back provider quota, history, breakdown, and context-savings views.
+
+`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_context_savings_analytics`.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
 
@@ -169,6 +171,8 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 `get_session_breakdown` now accepts optional provider and limit arguments so Codex live views can request a provider-scoped active set without being crowded out by Claude sessions.
 
 `get_session_breakdown` is provider-agnostic at the row level and rolls up parent + all sub-agent rows for each session: `total_tokens`, `turn_count`, `last_active`, and the input/output/cache columns sum across `is_sidechain ∈ {0, 1}`, and each row carries two new fields — `has_subagents: bool` and `subagent_count: u32` (COUNT DISTINCT `agent_id`) — that gate the [[features#Analytics Dashboard#Now Tab]] expandable tree. The `(provider, session_id, is_sidechain)` index added in migration 20 keeps each `UNION`'d branch on an index scan.
+
+`get_skill_breakdown` returns recognized skill-use counts from the `skill_usages` table for the Analytics Now Skills tab. It accepts the active day range, optional Claude/Codex provider filter, all-time mode, and a capped limit; rows sort by `total_count DESC, skill_name ASC` and include provider sub-counts plus `last_used`.
 
 `get_context_savings_analytics` returns range-scoped summary totals, timeseries buckets, grouped breakdowns, and recent append-only events for the Analytics Context tab. Token values are approximate `ceil(bytes / 4)` estimates, while byte counts and event counts are exact where producers can measure them.
 
@@ -181,6 +185,8 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 ### Project and Session Management (7)
 
 `get_project_tokens`, `get_session_stats`, `get_project_breakdown`, `delete_project_data`, `rename_project`, `delete_host_data`, `delete_session_data`.
+
+`delete_session_data` deletes both token snapshots and skill-use rows for the selected `(provider, session_id)` pair so the Sessions and Skills breakdowns cannot retain different views of a deleted session.
 
 ### Integration Commands (12)
 
@@ -314,7 +320,9 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
 
-When a transcript is reprocessed, Quill now coalesces repeated `notify` requests per session and applies each rewrite under one Tantivy writer lock with a single commit. This avoids overlapping delete-and-reindex batches while keeping SQLite `tool_actions` writes batched per extracted file or payload. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven `notify` ingestion that ran before the file was tracked in `index_state.json` cannot stack duplicate copies on top.
+When a transcript is reprocessed, Quill now coalesces repeated `notify` requests per session and applies each rewrite under one Tantivy writer lock with a single commit. This avoids overlapping delete-and-reindex batches while keeping SQLite `tool_actions` and `skill_usages` writes batched per extracted file or payload. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven `notify` ingestion that ran before the file was tracked in `index_state.json` cannot stack duplicate copies on top.
+
+Skill usage is derived during the same extraction pass by [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]], which recognizes read-like loads of a `SKILL.md` file and derives the skill name from that file's parent directory. The indexer deletes and replaces `skill_usages` per `(provider, session_id)` so repeated transcript walks do not duplicate counts, and it does not infer skills from assistant prose, available-skill lists, or skill-file maintenance edits.
 
 The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript at `<projectSlug>/*.jsonl`, and each `DiscoveredSessionFile` carries an `is_subagent` flag so downstream extraction can tell the two apart. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid` from each JSON record; Codex extraction writes the provider-agnostic defaults (`is_sidechain=0`, `agent_id=NULL`, `parent_uuid=NULL`) so today's Codex CLI inherits the same code path the day OpenAI ships a sub-agent feature. Per-session sub-agent files live in one flat directory — multi-level hierarchy is reconstructed at query time via `parent_uuid` chains rather than nested filesystem layout.
 

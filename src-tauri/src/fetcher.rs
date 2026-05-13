@@ -23,8 +23,19 @@ const BUCKET_KEYS: &[(&str, &str)] = &[
     ("extra_usage", "Extra"),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeUsageErrorKind {
+    Credentials,
+    Unauthorized,
+    RateLimited,
+    Request,
+    Api,
+    Parse,
+}
+
 #[derive(Debug)]
 pub struct ClaudeUsageError {
+    pub kind: ClaudeUsageErrorKind,
     pub message: String,
     pub retry_after_seconds: Option<i64>,
 }
@@ -569,6 +580,7 @@ pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> 
         Ok(t) => t,
         Err(e) => {
             return Err(ClaudeUsageError {
+                kind: ClaudeUsageErrorKind::Credentials,
                 message: e,
                 retry_after_seconds: None,
             });
@@ -579,6 +591,7 @@ pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> 
         Ok(r) => r,
         Err(e) => {
             return Err(ClaudeUsageError {
+                kind: ClaudeUsageErrorKind::Request,
                 message: format!("Request failed: {e}"),
                 retry_after_seconds: None,
             });
@@ -587,23 +600,27 @@ pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> 
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         Err(ClaudeUsageError {
-            message: "Token expired or revoked. Please run: claude /login".into(),
+            kind: ClaudeUsageErrorKind::Unauthorized,
+            message: "Claude credentials are invalid or expired. Run: claude /login".into(),
             retry_after_seconds: None,
         })
-    } else if !resp.status().is_success() {
-        let retry_after_seconds = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            parse_retry_after_seconds(&resp)
-        } else {
-            None
-        };
+    } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         Err(ClaudeUsageError {
+            kind: ClaudeUsageErrorKind::RateLimited,
+            message: "Claude usage API rate limited.".into(),
+            retry_after_seconds: parse_retry_after_seconds(&resp),
+        })
+    } else if !resp.status().is_success() {
+        Err(ClaudeUsageError {
+            kind: ClaudeUsageErrorKind::Api,
             message: format!("API error: {}", resp.status()),
-            retry_after_seconds,
+            retry_after_seconds: None,
         })
     } else {
         match resp.json::<serde_json::Value>().await {
             Ok(data) => Ok(parse_buckets(&data)),
             Err(e) => Err(ClaudeUsageError {
+                kind: ClaudeUsageErrorKind::Parse,
                 message: format!("Parse error: {e}"),
                 retry_after_seconds: None,
             }),

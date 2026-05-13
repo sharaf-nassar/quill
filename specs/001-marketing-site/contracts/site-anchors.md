@@ -7,12 +7,12 @@ This contract declares the seven URL fragment identifiers the marketing site exp
 | Anchor        | Section heading (visible)                    | Content                                                                  |
 |---------------|----------------------------------------------|--------------------------------------------------------------------------|
 | `#hero`       | (no visible heading — top of page)           | Hero block: name, value-prop, primary CTA, primary screenshot           |
-| `#live`       | "Live usage"                                  | Description + `live.png` showing pace marker, summary rail              |
-| `#analytics`  | "Analytics that matter for LLMs"             | Description + `analytics-now.png` and `analytics-charts.png`            |
-| `#context`    | "Context savings"                             | Description + `analytics-context.png`                                    |
-| `#search`     | "Session search"                              | Description + `sessions.png`                                             |
-| `#learning`   | "Learning system"                             | Description + `learning.png`                                             |
-| `#install`    | "Get Quill"                                   | Provider/platform compatibility, links to repo and releases              |
+| `#live`       | "Know the cap before it cuts the run."       | Description + `live.png` showing pace marker, summary rail              |
+| `#analytics`  | "Session metrics that answer operational questions." | Description + `analytics-now.png` and `analytics-charts.png`            |
+| `#context`    | "Large content becomes a reference instead of a paste." | Description + context-savings proof                                      |
+| `#search`     | "Past runs become an index, not a memory test." | Description + `sessions.png`                                             |
+| `#learning`   | "Repeated behavior becomes a rule you can inspect." | Description + `learning.png`                                             |
+| `#install`    | "Put the instrument panel beside the agents you already use." | Provider/platform compatibility, links to repo and releases              |
 
 ## Behavioral guarantees
 

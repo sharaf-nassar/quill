@@ -62,7 +62,21 @@ It retries the draft lookup for API eventual consistency, updates `latest.json` 
 
 `.github/workflows/pages.yml` deploys the marketing site to GitHub Pages using the official `actions/deploy-pages@v4` flow.
 
-Triggers on `push` to `main` with a paths filter on `marketing-site/**` and the workflow file itself, plus `workflow_dispatch` for manual redeploys (useful when only screenshots change). Two-job split: `build` checks out the repo, runs `actions/configure-pages@v5`, and uploads `marketing-site/` verbatim via `actions/upload-pages-artifact@v3` (no build step — the site is plain HTML/CSS/JS); `deploy` consumes the artifact and runs `actions/deploy-pages@v4` against the `github-pages` environment so the deployed URL surfaces in the Actions UI. Permissions follow the GitHub-recommended least-privilege template: `contents:read`, `pages:write`, `id-token:write`. The `pages` concurrency group is set to `cancel-in-progress: false` to match GitHub's recommendation that an in-flight Pages deploy not be killed mid-flight. Contract: `specs/001-marketing-site/contracts/pages-workflow.md`.
+Triggers on `push` to `main` with a paths filter on `marketing-site/**` and the workflow file itself, plus `workflow_dispatch` for manual redeploys (useful when only screenshots change). Two-job split: `build` checks out the repo, runs `actions/configure-pages@v5`, and uploads `marketing-site/` verbatim via `actions/upload-pages-artifact@v3` (no build step — the site is plain static HTML/CSS/JS); `deploy` consumes the artifact and runs `actions/deploy-pages@v4` against the `github-pages` environment so the deployed URL surfaces in the Actions UI. Permissions follow the GitHub-recommended least-privilege template: `contents:read`, `pages:write`, `id-token:write`. The `pages` concurrency group is set to `cancel-in-progress: false` to match GitHub's recommendation that an in-flight Pages deploy not be killed mid-flight. Contract: `specs/001-marketing-site/contracts/pages-workflow.md`.
+
+### Marketing Site
+
+The marketing site is a static GitHub Pages deliverable that sells Quill through real product screenshots and stable anchored sections.
+
+`marketing-site/index.html` owns the single-page content and the public `#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, and `#install` fragments. `marketing-site/styles.css` owns the Signal Theater visual system: Quill's quiet dark app surface, actual logo mark, cyan/purple logo accents, clipped geometry, dense screenshot proof, and a gapless feature bento. `marketing-site/motion.js` adds progressive GSAP scroll pinning, scrubbed text reveals, and carousel controls; the content remains readable when JavaScript is disabled or the CDN motion library fails.
+
+The stylesheet link includes a version query so palette changes are not masked by stale browser caches during local preview or GitHub Pages deploys.
+
+The hero prioritizes the value proposition, install/source actions, an asymmetric screenshot stage, and inline screenshot typography. Standalone KPI strips are avoided because the screenshots and feature sections carry the evidence more credibly.
+
+Feature copy uses short claims, screenshot-backed bento cards, horizontal accordion panels, and a pinned proof narrative instead of long paragraphs. This keeps the page scannable while preserving the technical details developers need.
+
+The visual contract is documented in `marketing-site/README.md` and `specs/001-marketing-site/spec.md`; screenshot assets still come from the sandboxed demo workflow described under [[infrastructure#Scripts#Screenshot Capture]].
 
 ## Release Process
 

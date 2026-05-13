@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -539,9 +539,12 @@ impl SessionIndex {
         let subagent_reingest_pending = storage
             .and_then(|s| s.get_setting("subagent_reingest_pending").ok().flatten())
             .is_some();
-        if subagent_reingest_pending {
+        let skill_usage_reingest_pending = storage
+            .and_then(|s| s.get_setting("skill_usage_reingest_pending").ok().flatten())
+            .is_some();
+        if subagent_reingest_pending || skill_usage_reingest_pending {
             log::info!(
-                "Sub-agent attribution migration: clearing mtime cache to force full transcript re-ingest"
+                "Session derived-data migration: clearing mtime cache to force full transcript re-ingest"
             );
             state.file_mtimes.clear();
         }
@@ -590,6 +593,11 @@ impl SessionIndex {
                     {
                         log::warn!("Failed to delete old tool_actions: {e}");
                     }
+                    if let Err(e) = storage
+                        .delete_skill_usages_for_session(discovered.provider, &extracted.session_id)
+                    {
+                        log::warn!("Failed to delete old skill_usages: {e}");
+                    }
                     if let Err(e) = storage.delete_response_times_for_session(
                         discovered.provider,
                         &extracted.session_id,
@@ -618,6 +626,13 @@ impl SessionIndex {
                     .store_tool_actions_for_messages(discovered.provider, &extracted.messages)
             {
                 log::warn!("Failed to store tool actions: {e}");
+            }
+
+            if let Some(storage) = storage
+                && let Err(e) = storage
+                    .store_skill_usages_for_messages(discovered.provider, &extracted.messages)
+            {
+                log::warn!("Failed to store skill usages: {e}");
             }
 
             if let Some(storage) = storage
@@ -661,6 +676,12 @@ impl SessionIndex {
             && let Err(e) = storage.delete_setting("subagent_reingest_pending")
         {
             log::warn!("Failed to clear subagent_reingest_pending flag: {e}");
+        }
+        if skill_usage_reingest_pending
+            && let Some(storage) = storage
+            && let Err(e) = storage.delete_setting("skill_usage_reingest_pending")
+        {
+            log::warn!("Failed to clear skill_usage_reingest_pending flag: {e}");
         }
 
         drop(writer);
@@ -1162,6 +1183,12 @@ pub struct ToolAction {
     pub timestamp: String,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SkillAccess {
+    pub skill_name: String,
+    pub skill_path: String,
+}
+
 pub struct ExtractedMessage {
     pub uuid: String,
     pub session_id: String,
@@ -1371,6 +1398,157 @@ fn extract_apply_patch_files(patch: &str) -> Vec<String> {
     }
 
     files
+}
+
+pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<SkillAccess> {
+    let mut paths = Vec::new();
+
+    match action.tool_name.as_str() {
+        "Read" => {
+            if let Some(file_path) = action.file_path.as_deref() {
+                collect_skill_paths_from_text(file_path, &mut paths);
+            }
+            if let Some(file_path) =
+                extract_tool_input_string(action.full_input.as_deref(), &["file_path", "path"])
+            {
+                collect_skill_paths_from_text(&file_path, &mut paths);
+            }
+        }
+        "exec_command" => {
+            if let Some(command) =
+                extract_tool_input_string(action.full_input.as_deref(), &["cmd", "command"])
+                && command_reads_skill_file(&command)
+            {
+                collect_skill_paths_from_text(&command, &mut paths);
+            }
+        }
+        _ => {}
+    }
+
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter_map(|skill_path| {
+            let skill_name = skill_name_from_skill_path(&skill_path)?;
+            let access = SkillAccess {
+                skill_name,
+                skill_path,
+            };
+            if seen.insert(access.clone()) {
+                Some(access)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn extract_tool_input_string(input: Option<&str>, keys: &[&str]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(input?).ok()?;
+    let obj = value.as_object()?;
+    keys.iter()
+        .filter_map(|key| obj.get(*key).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn command_reads_skill_file(command: &str) -> bool {
+    if !command.contains("SKILL.md") {
+        return false;
+    }
+    if command_has_stdout_write_redirection(command) {
+        return false;
+    }
+
+    let Some(command_name) = command
+        .split_whitespace()
+        .next()
+        .and_then(|token| Path::new(token).file_name())
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+
+    if command_name == "sed" && sed_command_is_in_place(command) {
+        return false;
+    }
+
+    matches!(
+        command_name,
+        "bat" | "batcat" | "cat" | "head" | "less" | "more" | "nl" | "sed" | "tail"
+    )
+}
+
+fn command_has_stdout_write_redirection(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        matches!(token, ">" | ">>" | "1>" | "1>>")
+            || token.starts_with(">")
+            || token.starts_with("1>")
+    })
+}
+
+fn sed_command_is_in_place(command: &str) -> bool {
+    command.split_whitespace().skip(1).any(|token| {
+        token == "-i"
+            || token.starts_with("-i.")
+            || token == "--in-place"
+            || token.starts_with("--in-place=")
+    })
+}
+
+fn collect_skill_paths_from_text(text: &str, paths: &mut Vec<String>) {
+    let mut search_start = 0;
+    while let Some(offset) = text[search_start..].find("SKILL.md") {
+        let skill_start = search_start + offset;
+        let skill_end = skill_start + "SKILL.md".len();
+        let before = &text[..skill_start];
+        let path_start = before
+            .rfind(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ','
+                    )
+            })
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let candidate = text[path_start..skill_end]
+            .trim_matches(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        '"' | '\''
+                            | '`'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '<'
+                            | '>'
+                            | ','
+                            | ';'
+                    )
+            })
+            .to_string();
+        if candidate.ends_with("SKILL.md") {
+            paths.push(candidate);
+        }
+        search_start = skill_end;
+    }
+}
+
+fn skill_name_from_skill_path(path: &str) -> Option<String> {
+    let normalized = path.trim_end_matches('/');
+    let parent_path = normalized.strip_suffix("/SKILL.md")?;
+    parent_path
+        .rsplit('/')
+        .next()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn project_name_from_cwd(cwd: &str) -> Option<String> {
