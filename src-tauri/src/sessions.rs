@@ -391,7 +391,7 @@ impl SessionIndex {
         Ok(messages.len())
     }
 
-    fn local_hostname() -> String {
+    pub(crate) fn local_hostname() -> String {
         std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .or_else(|_| {
@@ -1210,6 +1210,10 @@ pub struct ExtractedMessage {
     pub is_sidechain: bool,
     pub agent_id: Option<String>,
     pub parent_uuid: Option<String>,
+    /// Working directory at the time of the message. Claude reads it from the
+    /// top-level `cwd` field on each JSONL row; Codex reads it once from
+    /// `session_meta.payload.cwd`. None if not present in the transcript.
+    pub cwd: Option<String>,
 }
 
 pub struct ExtractedSession {
@@ -1422,6 +1426,15 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
                 collect_skill_paths_from_text(&command, &mut paths);
             }
         }
+        "Skill" => {
+            if let Some(raw_skill) =
+                extract_tool_input_string(action.full_input.as_deref(), &["skill"])
+                && let Some(access) = skill_access_from_skill_tool_input(&raw_skill)
+            {
+                return vec![access];
+            }
+            return Vec::new();
+        }
         _ => {}
     }
 
@@ -1441,6 +1454,38 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
             }
         })
         .collect()
+}
+
+/// Build a [`SkillAccess`] from the `skill` field of a Claude Code `Skill`
+/// tool call.
+///
+/// `raw` is the verbatim identifier the model passed, e.g.
+/// `"superpowers:using-superpowers"` (plugin-prefixed) or `"speckit-tasks"`
+/// (bare). Codex stores the bare folder name derived from `.../SKILL.md`,
+/// so we strip the plugin prefix (everything up to and including the first
+/// `':'`) from the Claude name to let analytics merge counts across
+/// providers. The raw identifier is preserved in `skill_path` (prefixed
+/// with `"skill://"` to stay visually distinct from filesystem paths) so a
+/// future drilldown can still answer "which plugin loaded this skill?".
+///
+/// Returns `None` when the trimmed input or the stripped suffix is empty,
+/// so the caller skips junk rows instead of inserting `skill_name = ""`.
+fn skill_access_from_skill_tool_input(raw: &str) -> Option<SkillAccess> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let bare = match trimmed.split_once(':') {
+        Some((_, suffix)) => suffix.trim(),
+        None => trimmed,
+    };
+    if bare.is_empty() {
+        return None;
+    }
+    Some(SkillAccess {
+        skill_name: bare.to_string(),
+        skill_path: format!("skill://{trimmed}"),
+    })
 }
 
 fn extract_tool_input_string(input: Option<&str>, keys: &[&str]) -> Option<String> {
@@ -1564,6 +1609,7 @@ fn make_tool_message(
     session_id: String,
     git_branch: String,
     action: ToolAction,
+    cwd: Option<String>,
 ) -> ExtractedMessage {
     let mut code_changes = Vec::new();
     let mut commands_run = Vec::new();
@@ -1596,6 +1642,7 @@ fn make_tool_message(
         is_sidechain: false,
         agent_id: None,
         parent_uuid: None,
+        cwd,
     }
 }
 
@@ -1703,6 +1750,11 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             .map(|s| s.to_string());
         let parent_uuid = obj
             .get("parentUuid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        let cwd = obj
+            .get("cwd")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
@@ -1906,6 +1958,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             is_sidechain,
             agent_id,
             parent_uuid,
+            cwd: cwd.clone(),
         });
     }
 
@@ -2039,6 +2092,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     is_sidechain: false,
                     agent_id: None,
                     parent_uuid: None,
+                    cwd: cwd.clone(),
                 });
             }
             "response_item" => {
@@ -2093,6 +2147,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             session_id.clone(),
                             git_branch.clone(),
                             action,
+                            cwd.clone(),
                         ));
                         if !call_id.is_empty() {
                             tool_use_map.insert(
@@ -2152,6 +2207,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             session_id.clone(),
                             git_branch.clone(),
                             action,
+                            cwd.clone(),
                         ));
                         if !call_id.is_empty() {
                             tool_use_map.insert(

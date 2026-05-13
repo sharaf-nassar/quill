@@ -953,8 +953,9 @@ async fn post_session_messages(
     }
 
     // Convert SessionMessagePayload items to ExtractedMessage structs.
-    // The HTTP message payload does not currently carry sub-agent attribution;
-    // fall back to defaults (top-level row, NULL agent/parent).
+    // The HTTP message payload does not currently carry sub-agent attribution
+    // or per-message cwd; fall back to defaults (top-level row, NULL
+    // agent/parent/cwd).
     let extracted: Vec<sessions::ExtractedMessage> = payload
         .messages
         .iter()
@@ -974,6 +975,7 @@ async fn post_session_messages(
             is_sidechain: false,
             agent_id: None,
             parent_uuid: None,
+            cwd: None,
         })
         .collect();
 

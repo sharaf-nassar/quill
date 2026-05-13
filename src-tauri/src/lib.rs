@@ -30,8 +30,8 @@ use models::{
     ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
     LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, RuntimeSettings,
     SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, SkillBreakdown,
-    StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats, ToolCount, UsageBucket,
-    UsageData, UsageProviderError,
+    SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats,
+    ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -90,6 +90,52 @@ fn show_main_window(app: &tauri::AppHandle) {
         }
         let _ = w.set_focus();
     }
+}
+
+// Spawn a detached child that re-launches Quill after the current process has
+// released the single-instance lock. `AppHandle::restart()` spawns the new
+// binary BEFORE the current process exits, so the new instance reaches
+// `tauri-plugin-single-instance` init while the primary still owns the D-Bus
+// name / macOS distributed-notification port / Windows named mutex, is treated
+// as a duplicate launch, runs `show_main_window` inside the dying primary, and
+// exits, leaving no Quill instance running.
+//
+// On Unix we use the post-fork hook to detach the child (`setsid`) and sleep,
+// so the child only reaches single-instance init after the primary has fully
+// exited. On Windows the named mutex is released synchronously on parent
+// exit, so a fully-detached spawn is sufficient.
+fn spawn_delayed_relaunch(app: &tauri::AppHandle) -> Result<(), String> {
+    let env = app.env();
+    let binary = tauri::process::current_binary(&env)
+        .map_err(|e| format!("Failed to resolve relaunch binary: {e}"))?;
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(env.args_os.iter().skip(1));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs in the forked child before the new binary
+        // image is loaded. It only calls async-signal-safe operations
+        // (setsid, nanosleep via thread::sleep).
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid()
+                    .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
+                std::thread::sleep(std::time::Duration::from_millis(750));
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to spawn relaunch child: {e}"))
 }
 
 fn indicator_now_text(state: &StatusIndicatorState) -> String {
@@ -180,8 +226,14 @@ async fn check_for_update(app: &tauri::AppHandle) {
                                 .await
                             {
                                 Ok(()) => {
-                                    log::info!("Update {ver} installed, restarting...");
-                                    app_handle.restart();
+                                    log::info!("Update {ver} installed, relaunching...");
+                                    if let Err(error) = spawn_delayed_relaunch(&app_handle) {
+                                        log::error!(
+                                            "Failed to schedule relaunch after update {ver}: {error}"
+                                        );
+                                    } else {
+                                        app_handle.exit(0);
+                                    }
                                 }
                                 Err(e) => {
                                     log::error!("Failed to install update: {e}");
@@ -840,6 +892,20 @@ async fn get_skill_breakdown(
 ) -> Result<Vec<SkillBreakdown>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_skill_breakdown(days, provider, all_time, limit))
+}
+
+#[tauri::command]
+async fn get_skill_project_breakdown(
+    skill_name: String,
+    days: i32,
+    provider: Option<integrations::IntegrationProvider>,
+    all_time: bool,
+    limit: Option<i32>,
+) -> Result<Vec<SkillProjectBreakdown>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || {
+        storage.get_skill_project_breakdown(&skill_name, days, provider, all_time, limit)
+    })
 }
 
 #[tauri::command]
@@ -1825,11 +1891,10 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("Failed to install update {version}: {e}"))?;
 
-    log::info!("Update {version} installed; requesting restart");
+    log::info!("Update {version} installed; releasing single-instance lock and relaunching");
 
-    std::thread::spawn(move || {
-        app.restart();
-    });
+    spawn_delayed_relaunch(&app)?;
+    app.exit(0);
 
     Ok(())
 }
@@ -2227,6 +2292,7 @@ pub fn run() {
             get_host_breakdown,
             get_project_breakdown,
             get_skill_breakdown,
+            get_skill_project_breakdown,
             get_session_breakdown,
             get_session_subagent_tree,
             get_session_stats,

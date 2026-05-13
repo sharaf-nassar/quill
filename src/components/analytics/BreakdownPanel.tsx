@@ -1,8 +1,9 @@
-import { useCallback, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useBreakdownData } from "../../hooks/useBreakdownData";
 import { useToast } from "../../hooks/useToast";
 import { useSessionSubagents } from "../../hooks/useSessionSubagents";
+import { useSkillProjects } from "../../hooks/useSkillProjects";
 import { formatTokenCount } from "../../utils/tokens";
 import type {
   BreakdownMode,
@@ -13,6 +14,7 @@ import type {
   SessionBreakdown,
   SessionRef,
   SkillBreakdown,
+  SkillProjectBreakdown,
   SubagentNode,
 } from "../../types";
 import { sessionRefKey } from "../../types";
@@ -66,7 +68,7 @@ type SkillProviderFilter = "all" | "claude" | "codex";
 const SKILL_PROVIDER_FILTERS: Array<{ value: SkillProviderFilter; label: string }> = [
   { value: "all", label: "All" },
   { value: "codex", label: "Codex" },
-  { value: "claude", label: "CC" },
+  { value: "claude", label: "Claude" },
 ];
 
 function providerLabel(provider: SessionRef["provider"]): string {
@@ -457,6 +459,49 @@ function SessionTreeBranch({
   );
 }
 
+interface SkillProjectRowProps {
+  row: SkillProjectBreakdown;
+}
+
+/**
+ * Read-only sub-row rendered beneath an expanded skill row. Re-uses the
+ * sub-agent visual treatment (left tree guide, indent, muted background)
+ * so the parent–child relationship matches the Sessions tree pattern.
+ */
+function SkillProjectRow({ row }: SkillProjectRowProps) {
+  const label = projectName(row.project) ?? row.project;
+  return (
+    <div
+      className="breakdown-row breakdown-row-subagent breakdown-row-skill-project"
+      role="listitem"
+      aria-label={`${label}${row.hostname ? ` on ${row.hostname}` : ""}: ${row.total_count} skill uses`}
+      style={{ paddingLeft: `${10 + SUBAGENT_INDENT_PX}px` }}
+    >
+      <span
+        className="breakdown-name breakdown-name-subagent"
+        title={row.project}
+      >
+        <span className="breakdown-tree-guide" aria-hidden>
+          {"└─"}
+        </span>
+        {label}
+        {row.hostname && (
+          <span className="breakdown-host-tag">{row.hostname}</span>
+        )}
+      </span>
+      <span className="breakdown-tokens">
+        {row.total_count.toLocaleString()}
+      </span>
+      <span className="breakdown-turns">
+        {row.total_count === 1 ? "use" : "uses"}
+      </span>
+      <span className="breakdown-time">
+        {formatRelativeTime(row.last_used)}
+      </span>
+    </div>
+  );
+}
+
 interface BreakdownPanelProps {
   days: number;
   selection: BreakdownSelection | null;
@@ -466,7 +511,7 @@ interface BreakdownPanelProps {
 function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const { toast } = useToast();
   const [mode, setMode] = useState<BreakdownMode>("sessions");
-  const [skillsAllTime, setSkillsAllTime] = useState(false);
+  const [skillsAllTime, setSkillsAllTime] = useState(true);
   const [skillsProvider, setSkillsProvider] = useState<SkillProviderFilter>("all");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -480,7 +525,13 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   // backend node has a non-null `parent_agent_id`, but the recursive
   // renderer is ready for it.
   const [expandedAgents, setExpandedAgents] = useState<Record<string, boolean>>({});
+  // Set of expanded skill names. Stored as a plain object keyed on
+  // `skill_name` (the breakdown's natural primary key) so toggling a
+  // single skill never clones a large map.
+  const [expandedSkills, setExpandedSkills] = useState<Record<string, boolean>>({});
   const { fetchTree: fetchSubagentTree, getState: getSubagentState } = useSessionSubagents();
+  const { fetchProjects: fetchSkillProjects, stateFor: skillProjectsState } =
+    useSkillProjects();
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skillProviderArg: IntegrationProvider | null =
@@ -489,6 +540,10 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     skillAllTime: skillsAllTime,
     skillProvider: skillProviderArg,
   });
+  // Mirrors the cache key shape used by `useBreakdownData` so the
+  // per-skill project drilldown invalidates on the exact same filter
+  // axes (days / all-time / provider) that drive the parent rows.
+  const skillRequestKey = `${mode}:${days}:${skillsAllTime}:${skillProviderArg ?? "all"}`;
 
   const handleModeChange = (m: BreakdownMode) => {
     setMode(m);
@@ -567,6 +622,47 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
       return { ...prev, [agentId]: true };
     });
   }, []);
+
+  // When the filter axes change (days / all-time / provider) the cached
+  // sub-row data for the previous filter no longer applies, so collapse
+  // all expanded skill rows. Re-expanding triggers a fresh fetch under
+  // the new request key.
+  useEffect(() => {
+    setExpandedSkills({});
+  }, [skillRequestKey]);
+
+  const toggleSkillExpand = useCallback(
+    (skillName: string) => {
+      const willOpen = !expandedSkills[skillName];
+      if (willOpen) {
+        // Lazy-fetch on first expand. The hook short-circuits if already
+        // loaded or in-flight under the current request key. Fire BEFORE
+        // the state update so Strict Mode's double-invoked updater can't
+        // trigger duplicate fetches.
+        void fetchSkillProjects(skillName, skillRequestKey, {
+          days,
+          allTime: skillsAllTime,
+          provider: skillProviderArg,
+          limit: 50,
+        });
+      }
+      setExpandedSkills((prev) => {
+        if (willOpen) {
+          return { ...prev, [skillName]: true };
+        }
+        const { [skillName]: _omit, ...rest } = prev;
+        return rest;
+      });
+    },
+    [
+      expandedSkills,
+      fetchSkillProjects,
+      skillRequestKey,
+      days,
+      skillsAllTime,
+      skillProviderArg,
+    ],
+  );
 
   const isSelected = (type: BreakdownSelection["type"], key: string) =>
     selection?.type === type && selection?.key === key;
@@ -686,29 +782,6 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
             </button>
           ))}
         </div>
-        {mode === "skills" && (
-          <div className="breakdown-skill-controls" aria-label="Skill breakdown controls">
-            <button
-              className={`breakdown-skill-toggle${skillsAllTime ? " active" : ""}`}
-              aria-pressed={skillsAllTime}
-              onClick={() => setSkillsAllTime((value) => !value)}
-            >
-              All time
-            </button>
-            <div className="breakdown-skill-provider-tabs" aria-label="Skill provider filter">
-              {SKILL_PROVIDER_FILTERS.map((filter) => (
-                <button
-                  key={filter.value}
-                  className={`breakdown-skill-provider${skillsProvider === filter.value ? " active" : ""}`}
-                  aria-pressed={skillsProvider === filter.value}
-                  onClick={() => setSkillsProvider(filter.value)}
-                >
-                  {filter.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
         {activeSelection && (
           <button
             className="breakdown-clear-btn"
@@ -760,6 +833,35 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
           )}
         </div>
       </div>
+
+      {mode === "skills" && (
+        <div className="breakdown-skill-controls" aria-label="Skill breakdown controls">
+          <div className="breakdown-skill-provider-tabs" role="tablist" aria-label="Skill provider filter">
+            {SKILL_PROVIDER_FILTERS.map((filter) => (
+              <button
+                key={filter.value}
+                role="tab"
+                className={`breakdown-skill-provider${skillsProvider === filter.value ? " active" : ""}`}
+                aria-pressed={skillsProvider === filter.value}
+                aria-selected={skillsProvider === filter.value}
+                onClick={() => setSkillsProvider(filter.value)}
+              >
+                <span className="breakdown-skill-provider-label">{filter.label}</span>
+                <span className="breakdown-skill-provider-underline" aria-hidden />
+              </button>
+            ))}
+          </div>
+          <button
+            className={`breakdown-skill-toggle${skillsAllTime ? " active" : ""}`}
+            aria-pressed={skillsAllTime}
+            onClick={() => setSkillsAllTime((value) => !value)}
+            title={skillsAllTime ? "Showing all history. Click to scope to the active timeframe." : "Click to ignore the timeframe and count every recorded skill use."}
+          >
+            <span className="breakdown-skill-toggle-glyph" aria-hidden>&#8734;</span>
+            <span className="breakdown-skill-toggle-label">All time</span>
+          </button>
+        </div>
+      )}
 
       {error && <div className="analytics-error">{error}</div>}
 
@@ -886,32 +988,101 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                   );
                 })
               : mode === "skills"
-                ? (data as SkillBreakdown[]).map((row) => (
-                    <div
-                      key={row.skill_name}
-                      className="breakdown-row breakdown-row-skill"
-                      role="listitem"
-                      aria-label={`${row.skill_name}: ${row.total_count} skill uses`}
-                    >
-                      <span className="breakdown-name" title={row.skill_name}>
-                        {row.skill_name}
-                      </span>
-                      <span className="breakdown-tokens">
-                        {row.total_count.toLocaleString()}
-                      </span>
-                      <span className="breakdown-turns">
-                        {row.total_count === 1 ? "use" : "uses"}
-                        {skillsProvider === "all" && (
-                          <span className="breakdown-skill-provider-counts">
-                            {row.codex_count} C · {row.claude_count} CC
+                ? (data as SkillBreakdown[]).map((row) => {
+                    const hasProjects = row.project_count > 1;
+                    const isExpanded = hasProjects && !!expandedSkills[row.skill_name];
+                    const projectsState = hasProjects
+                      ? skillProjectsState(row.skill_name, skillRequestKey)
+                      : null;
+                    return (
+                      <Fragment key={row.skill_name}>
+                        <div
+                          className={`breakdown-row breakdown-row-skill${hasProjects ? " has-children" : ""}`}
+                          role="listitem"
+                          aria-expanded={hasProjects ? isExpanded : undefined}
+                          aria-label={`${row.skill_name}: ${row.total_count} skill uses${hasProjects ? `, ${row.project_count} projects` : ""}`}
+                        >
+                          <span className="breakdown-name" title={row.skill_name}>
+                            {hasProjects && (
+                              <button
+                                type="button"
+                                className="breakdown-chevron breakdown-chevron-btn"
+                                aria-label={isExpanded ? "Collapse projects" : "Expand projects"}
+                                aria-expanded={isExpanded}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  toggleSkillExpand(row.skill_name);
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" || e.key === " ") {
+                                    e.stopPropagation();
+                                  }
+                                }}
+                              >
+                                <ChevronIcon open={isExpanded} />
+                              </button>
+                            )}
+                            {row.skill_name}
                           </span>
+                          <span className="breakdown-tokens">
+                            {row.total_count.toLocaleString()}
+                          </span>
+                          <span className="breakdown-turns">
+                            {row.total_count === 1 ? "use" : "uses"}
+                          </span>
+                          <span className="breakdown-time">
+                            {formatRelativeTime(row.last_used)}
+                          </span>
+                        </div>
+                        {isExpanded && projectsState && projectsState.status === "loading" && (
+                          <div
+                            className="breakdown-row breakdown-row-subagent breakdown-row-subagent-status"
+                            role="listitem"
+                            aria-live="polite"
+                            style={{ paddingLeft: `${10 + SUBAGENT_INDENT_PX}px` }}
+                          >
+                            <span className="breakdown-name breakdown-subagent-status-text">
+                              Loading projects…
+                            </span>
+                          </div>
                         )}
-                      </span>
-                      <span className="breakdown-time">
-                        {formatRelativeTime(row.last_used)}
-                      </span>
-                    </div>
-                  ))
+                        {isExpanded && projectsState && projectsState.status === "error" && (
+                          <div
+                            className="breakdown-row breakdown-row-subagent breakdown-row-subagent-status error"
+                            role="listitem"
+                            style={{ paddingLeft: `${10 + SUBAGENT_INDENT_PX}px` }}
+                          >
+                            <span className="breakdown-name breakdown-subagent-status-text">
+                              {projectsState.message}
+                            </span>
+                          </div>
+                        )}
+                        {isExpanded &&
+                          projectsState &&
+                          projectsState.status === "loaded" &&
+                          projectsState.rows.length === 0 && (
+                            <div
+                              className="breakdown-row breakdown-row-subagent breakdown-row-subagent-status"
+                              role="listitem"
+                              style={{ paddingLeft: `${10 + SUBAGENT_INDENT_PX}px` }}
+                            >
+                              <span className="breakdown-name breakdown-subagent-status-text">
+                                No project data
+                              </span>
+                            </div>
+                          )}
+                        {isExpanded &&
+                          projectsState &&
+                          projectsState.status === "loaded" &&
+                          projectsState.rows.map((projectRow) => (
+                            <SkillProjectRow
+                              key={`${projectRow.project}::${projectRow.hostname ?? ""}`}
+                              row={projectRow}
+                            />
+                          ))}
+                      </Fragment>
+                    );
+                  })
                 : (data as SessionBreakdown[]).map((row) => {
                   const sessKey = sessionRefKey({
                     provider: row.provider,

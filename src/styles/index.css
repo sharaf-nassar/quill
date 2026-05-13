@@ -35,6 +35,83 @@ body {
   --s: 1;
 }
 
+.window-resize-handles {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+.window-resize-handle {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.window-resize-handle--north {
+  top: 0;
+  left: 12px;
+  right: 12px;
+  height: 5px;
+  cursor: n-resize;
+}
+
+.window-resize-handle--north-east {
+  top: 0;
+  right: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle--east {
+  top: 12px;
+  right: 0;
+  bottom: 12px;
+  width: 5px;
+  cursor: e-resize;
+}
+
+.window-resize-handle--south-east {
+  right: 0;
+  bottom: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+}
+
+.window-resize-handle--south {
+  right: 12px;
+  bottom: 0;
+  left: 12px;
+  height: 5px;
+  cursor: s-resize;
+}
+
+.window-resize-handle--south-west {
+  bottom: 0;
+  left: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle--west {
+  top: 12px;
+  bottom: 12px;
+  left: 0;
+  width: 5px;
+  cursor: w-resize;
+}
+
+.window-resize-handle--north-west {
+  top: 0;
+  left: 0;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+}
+
 /* Titlebar */
 .titlebar {
   display: flex;
@@ -1633,45 +1710,150 @@ body {
   flex-shrink: 0;
 }
 
+/* Secondary control bar for the Skills breakdown.
+   Three shape languages live here on purpose:
+   - top-level Sessions/Projects/Hosts/Skills tabs use `.range-tab` (chunky
+     container pills) for primary navigation,
+   - the provider filter is a text-only strip with an animated underline
+     indicator (editorial, low-weight),
+   - the All time toggle is an outlined uppercase chip prefixed with an
+     infinity glyph (telegraphs "ignore the timeframe").
+   The mix keeps each control reading as its own thing instead of three
+   stacked button rows. */
 .breakdown-skill-controls {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 16px;
   min-width: 0;
-}
-
-.breakdown-skill-toggle,
-.breakdown-skill-provider {
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.04);
-  color: rgba(255, 255, 255, 0.58);
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-  min-height: 24px;
-  padding: 5px 7px;
-  white-space: nowrap;
-}
-
-.breakdown-skill-toggle:hover,
-.breakdown-skill-provider:hover {
-  color: rgba(255, 255, 255, 0.82);
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.breakdown-skill-toggle.active,
-.breakdown-skill-provider.active {
-  color: #dbeafe;
-  background: rgba(96, 165, 250, 0.16);
-  border-color: rgba(96, 165, 250, 0.28);
 }
 
 .breakdown-skill-provider-tabs {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 18px;
+  min-width: 0;
+}
+
+.breakdown-skill-provider {
+  position: relative;
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  padding: 6px 1px 7px;
+  min-height: 24px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+
+.breakdown-skill-provider:hover {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.breakdown-skill-provider:focus-visible {
+  outline: none;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.breakdown-skill-provider.active {
+  color: #f4f7ff;
+  font-weight: 600;
+}
+
+.breakdown-skill-provider-label {
+  position: relative;
+  z-index: 1;
+}
+
+.breakdown-skill-provider-underline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: rgba(96, 165, 250, 0);
+  transform: scaleX(0.3);
+  transform-origin: center;
+  transition: background 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+
+.breakdown-skill-provider:hover .breakdown-skill-provider-underline {
+  background: rgba(255, 255, 255, 0.22);
+  transform: scaleX(0.8);
+}
+
+.breakdown-skill-provider.active .breakdown-skill-provider-underline {
+  background: rgba(96, 165, 250, 0.95);
+  transform: scaleX(1);
+}
+
+.breakdown-skill-provider.active:hover .breakdown-skill-provider-underline {
+  background: rgba(96, 165, 250, 1);
+}
+
+.breakdown-skill-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  line-height: 1;
+  min-height: 24px;
+  padding: 4px 9px 4px 8px;
+  border-radius: 2px;
+  text-transform: uppercase;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.breakdown-skill-toggle:hover {
+  color: rgba(255, 255, 255, 0.9);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.breakdown-skill-toggle:focus-visible {
+  outline: none;
+  border-color: rgba(96, 165, 250, 0.6);
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.breakdown-skill-toggle.active {
+  color: #0a0f1a;
+  background: rgba(96, 165, 250, 0.92);
+  border-color: rgba(96, 165, 250, 0.92);
+}
+
+.breakdown-skill-toggle.active:hover {
+  background: rgba(122, 184, 255, 1);
+  border-color: rgba(122, 184, 255, 1);
+}
+
+.breakdown-skill-toggle-glyph {
+  font-size: 13px;
+  line-height: 1;
+  letter-spacing: 0;
+  font-weight: 400;
+  display: inline-block;
+  transform: translateY(-0.5px);
+}
+
+.breakdown-skill-toggle.active .breakdown-skill-toggle-glyph {
+  font-weight: 500;
+}
+
+.breakdown-skill-toggle-label {
+  display: inline-block;
 }
 
 .breakdown-header-right {

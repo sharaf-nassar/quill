@@ -125,6 +125,17 @@ export interface SkillBreakdown {
   total_count: number;
   claude_count: number;
   codex_count: number;
+  project_count: number;
+  last_used: string;
+}
+
+export interface SkillProjectBreakdown {
+  skill_name: string;
+  project: string;
+  hostname: string | null;
+  total_count: number;
+  claude_count: number;
+  codex_count: number;
   last_used: string;
 }
 

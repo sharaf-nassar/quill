@@ -4,6 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
+import WindowResizeHandles from "./components/WindowResizeHandles";
 import "./styles/index.css";
 
 const App = React.lazy(() => import("./App"));
@@ -212,6 +213,7 @@ function RoutedView() {
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <ToastProvider>
+      <WindowResizeHandles />
       <Suspense fallback={<div className="loading">Loading...</div>}>
         <RoutedView />
       </Suspense>

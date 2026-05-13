@@ -87,7 +87,7 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - **token_hourly** — Hourly aggregates per provider/host (total tokens, turn_count). Unique on (hour, hostname, provider).
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
-Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (12)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
 
 #### Learning System
 
@@ -106,6 +106,16 @@ Stores detailed tool invocation and response-time data for MCP-powered session s
 
 - **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. Startup and notify-driven reindexing batch these inserts per extracted message set so analytics queries do not wait behind one transaction per message.
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
+
+#### Skill Usages
+
+Recognized `SKILL.md` loads derived during the same Session Indexing extraction pass, keyed for analytics drilldowns by skill, provider, project, and host.
+
+- **skill_usages** — One row per recognized skill load (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name, cwd, hostname). Unique on (provider, session_id, message_id, skill_name, skill_path, timestamp). Indexed on provider+timestamp, provider+session, skill+timestamp, and the migration-22 skill+cwd pair that powers per-project drilldowns. Migration 23 re-arms `skill_usage_reingest_pending` so historical sessions are replayed against the updated extractor without any schema change.
+
+[[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]] recognizes three ingest shapes: Codex `exec_command` calls that read a `SKILL.md` path with `cat`/`head`/`tail`/etc., Claude `Read` calls against a `SKILL.md` path, and Claude `Skill` tool calls. The `Skill` arm normalizes the `skill` input via [[src-tauri/src/sessions.rs#skill_access_from_skill_tool_input]] by stripping any `plugin:` prefix so Claude rows merge with Codex's bare folder names (e.g. Claude `superpowers:using-superpowers` collapses onto Codex `using-superpowers`), and synthesizes a `skill://<raw>` path that preserves the original identifier for forensic drilldowns without colliding with filesystem paths.
+
+`cwd` and `hostname` are populated at ingest from JSONL transcripts: Claude pulls `cwd` from each record's top-level field, Codex threads the session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and the hostname is captured once per batch via [[src-tauri/src/sessions.rs#SessionIndex#local_hostname]] inside [[src-tauri/src/storage.rs#Storage#store_skill_usages_for_messages]]. The HTTP message-ingest path leaves `cwd` null because the payload has no per-message cwd today.
 
 #### Working Context Store
 
@@ -150,17 +160,17 @@ Migration 20 also added `is_sidechain`, `agent_id`, and `parent_uuid` to `respon
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v21). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows.
+- **schema_version** — Migration version tracking (currently v22). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep.
 
 ## Tauri IPC Commands
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
-### Usage and Token Commands (12)
+### Usage and Token Commands (13)
 
 Live usage and token analytics commands back provider quota, history, breakdown, and context-savings views.
 
-`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_context_savings_analytics`.
+`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_context_savings_analytics`.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
 
@@ -172,7 +182,9 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 
 `get_session_breakdown` is provider-agnostic at the row level and rolls up parent + all sub-agent rows for each session: `total_tokens`, `turn_count`, `last_active`, and the input/output/cache columns sum across `is_sidechain ∈ {0, 1}`, and each row carries two new fields — `has_subagents: bool` and `subagent_count: u32` (COUNT DISTINCT `agent_id`) — that gate the [[features#Analytics Dashboard#Now Tab]] expandable tree. The `(provider, session_id, is_sidechain)` index added in migration 20 keeps each `UNION`'d branch on an index scan.
 
-`get_skill_breakdown` returns recognized skill-use counts from the `skill_usages` table for the Analytics Now Skills tab. It accepts the active day range, optional Claude/Codex provider filter, all-time mode, and a capped limit; rows sort by `total_count DESC, skill_name ASC` and include provider sub-counts plus `last_used`.
+`get_skill_breakdown` returns recognized skill-use counts from the `skill_usages` table for the Analytics Now Skills tab. It accepts the active day range, optional Claude/Codex provider filter, all-time mode, and a capped limit; rows sort by `total_count DESC, skill_name ASC` and include provider sub-counts plus `last_used` and a `project_count` (`COUNT(DISTINCT cwd)`) that gates the Skills expand affordance in the [[features#Analytics Dashboard#Now Tab]].
+
+`get_skill_project_breakdown` returns per-(project, hostname) counts for a single skill within the active analytics scope, used by the [[features#Analytics Dashboard#Now Tab]] Skills expand drilldown. It accepts `skill_name`, the active day range, optional Claude/Codex provider filter, all-time mode, and a capped limit; rows sort by `total_count DESC, last_used DESC, project ASC` after applying [[src-tauri/src/storage.rs#compute_subdir_parent_map]] subdir merge so `/a/b/c` folds into `/a/b` exactly like the Projects breakdown.
 
 `get_context_savings_analytics` returns range-scoped summary totals, timeseries buckets, grouped breakdowns, and recent append-only events for the Analytics Context tab. Token values are approximate `ceil(bytes / 4)` estimates, while byte counts and event counts are exact where producers can measure them.
 
@@ -263,7 +275,7 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 `hide_window`, `quit_app`, `install_app_update`, `get_release_notes`.
 
-[[src-tauri/src/lib.rs#install_app_update]] re-checks the configured updater from Rust, downloads and installs the release, logs the resolved relaunch binary, and then requests restart so the titlebar update button shares the backend-owned restart boundary with the tray updater.
+[[src-tauri/src/lib.rs#install_app_update]] re-checks the configured updater from Rust, downloads and installs the release, logs the resolved relaunch binary, then schedules a detached relaunch via [[src-tauri/src/lib.rs#spawn_delayed_relaunch]] and exits the primary so the titlebar update button shares the backend-owned install-and-relaunch boundary with the tray updater. The detached relaunch is required because `tauri-plugin-single-instance` would otherwise treat the new process as a duplicate launch (see [[architecture#Architecture#Single Instance]]).
 
 [[src-tauri/src/lib.rs#get_release_notes]] proxies the public GitHub releases API for `sharaf-nassar/quill` via [[src-tauri/src/releases.rs#fetch_release_notes]], drops drafts and prereleases, and returns a normalized `ReleaseNote` list (tag, name, body, html url, published_at) that the [[frontend#Frontend#Components]] release-notes window paginates with Previous/Next. The command takes an optional `limit` (clamped to 1-100, default 30) so the frontend can request a small newest-first window without exposing GitHub pagination details. Unauthenticated requests are used because the repository is public; rate-limit and HTTP errors are surfaced as `Result::Err` strings rather than swallowed.
 

@@ -12,8 +12,8 @@ use crate::models::{
     ContextSavingsTimeseriesPoint, DataPoint, GitSnapshot, HostBreakdown, LanguageBreakdown,
     LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload, LearningStatus,
     LlmRuntimeStats, ObservationPayload, ProjectBreakdown, ProjectTokens, SessionBreakdown,
-    SessionCodeStats, SessionRef, SessionStats, SkillBreakdown, SkillUsage, SubagentNode,
-    TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    SessionCodeStats, SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown, SkillUsage,
+    SubagentNode, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
@@ -1696,6 +1696,41 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 21: {e}"))?;
         }
 
+        if current_version < 22 {
+            conn.execute_batch(
+                "ALTER TABLE skill_usages ADD COLUMN cwd TEXT;
+                 ALTER TABLE skill_usages ADD COLUMN hostname TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_skill_usages_skill_cwd
+                     ON skill_usages(skill_name, cwd);",
+            )
+            .map_err(|e| format!("Migration 22 (skill_usages cwd/hostname): {e}"))?;
+
+            // Re-arm reingest so historical rows refill cwd/hostname from
+            // JSONL transcripts on the next session sweep.
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["skill_usage_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 22 (set reingest flag): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (22)", [])
+                .map_err(|e| format!("Failed to record migration 22: {e}"))?;
+        }
+
+        if current_version < 23 {
+            // No schema change. Re-arm reingest so the next session sweep
+            // replays Claude transcripts through the updated extractor,
+            // which now recognizes the `Skill` tool call.
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["skill_usage_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 23 (set reingest flag): {e}"))?;
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (23)", [])
+                .map_err(|e| format!("Failed to record migration 23: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -2798,6 +2833,7 @@ impl Storage {
                  COUNT(*) AS total_count,
                  COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
                  COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
+                 COUNT(DISTINCT cwd) AS project_count,
                  MAX(timestamp) AS last_used
              FROM skill_usages
              WHERE provider IN ('claude', 'codex')",
@@ -2828,7 +2864,8 @@ impl Storage {
                     total_count: row.get(1)?,
                     claude_count: row.get(2)?,
                     codex_count: row.get(3)?,
-                    last_used: row.get(4)?,
+                    project_count: row.get(4)?,
+                    last_used: row.get(5)?,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -2837,6 +2874,138 @@ impl Storage {
         for row in rows {
             results.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
+        Ok(results)
+    }
+
+    pub fn get_skill_project_breakdown(
+        &self,
+        skill_name: &str,
+        days: i32,
+        provider: Option<IntegrationProvider>,
+        all_time: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<SkillProjectBreakdown>, String> {
+        if provider == Some(IntegrationProvider::MiniMax) {
+            return Ok(Vec::new());
+        }
+
+        let days = days.clamp(1, 365);
+        let limit = limit.unwrap_or(50).clamp(1, 500);
+        let conn = self.conn.lock();
+        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+
+        let mut sql = String::from(
+            "SELECT
+                 cwd,
+                 hostname,
+                 COUNT(*) AS total_count,
+                 COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
+                 COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
+                 MAX(timestamp) AS last_used
+             FROM skill_usages
+             WHERE skill_name = ?1
+               AND cwd IS NOT NULL
+               AND provider IN ('claude', 'codex')",
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(skill_name.to_string()));
+        if !all_time {
+            let next_param = params_vec.len() + 1;
+            sql.push_str(&format!(" AND timestamp >= ?{next_param}"));
+            params_vec.push(Box::new(from));
+        }
+        if let Some(provider) = provider {
+            let next_param = params_vec.len() + 1;
+            sql.push_str(&format!(" AND provider = ?{next_param}"));
+            params_vec.push(Box::new(provider.as_str().to_string()));
+        }
+        sql.push_str(" GROUP BY cwd, hostname ORDER BY total_count DESC, last_used DESC, cwd ASC");
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Prepare error: {e}"))?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let cwd: String = row.get(0)?;
+                let hostname: Option<String> = row.get(1)?;
+                let total_count: i64 = row.get(2)?;
+                let claude_count: i64 = row.get(3)?;
+                let codex_count: i64 = row.get(4)?;
+                let last_used: String = row.get(5)?;
+                Ok(SkillProjectBreakdown {
+                    skill_name: skill_name.to_string(),
+                    project: cwd,
+                    hostname,
+                    total_count,
+                    claude_count,
+                    codex_count,
+                    last_used,
+                })
+            })
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        let mut raw: Vec<SkillProjectBreakdown> = Vec::new();
+        for row in rows {
+            raw.push(row.map_err(|e| format!("Row error: {e}"))?);
+        }
+
+        // Drop the connection lock before doing CPU-bound merging.
+        drop(stmt);
+        drop(conn);
+
+        // Collect distinct cwds for the subdir merge step.
+        let paths: Vec<String> = {
+            let mut p: Vec<String> = raw.iter().map(|r| r.project.clone()).collect();
+            p.sort();
+            p.dedup();
+            p
+        };
+
+        let parent_map = compute_subdir_parent_map(&paths);
+        if parent_map.is_empty() {
+            // Already sorted and truncated by the SQL query — return as-is.
+            return Ok(raw);
+        }
+
+        // Merge subdirs into their parent project root, keyed by
+        // (resolved_project, hostname). Mirrors merge_project_subdirs.
+        let mut merged: std::collections::HashMap<(String, Option<String>), SkillProjectBreakdown> =
+            std::collections::HashMap::new();
+        for row in raw {
+            let resolved = parent_map
+                .get(&row.project)
+                .cloned()
+                .unwrap_or_else(|| row.project.clone());
+            let key = (resolved.clone(), row.hostname.clone());
+            let entry = merged.entry(key).or_insert_with(|| SkillProjectBreakdown {
+                skill_name: row.skill_name.clone(),
+                project: resolved,
+                hostname: row.hostname.clone(),
+                total_count: 0,
+                claude_count: 0,
+                codex_count: 0,
+                last_used: String::new(),
+            });
+            entry.total_count += row.total_count;
+            entry.claude_count += row.claude_count;
+            entry.codex_count += row.codex_count;
+            if row.last_used > entry.last_used {
+                entry.last_used = row.last_used;
+            }
+        }
+
+        let mut results: Vec<SkillProjectBreakdown> = merged.into_values().collect();
+        results.sort_by(|a, b| {
+            b.total_count
+                .cmp(&a.total_count)
+                .then_with(|| b.last_used.cmp(&a.last_used))
+                .then_with(|| a.project.cmp(&b.project))
+        });
+        results.truncate(limit as usize);
         Ok(results)
     }
 
@@ -3368,13 +3537,23 @@ impl Storage {
     }
 
     pub fn delete_project_data(&self, cwd: &str) -> Result<u64, String> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin delete_project_data transaction: {e}"))?;
 
-        let count = conn
+        let token_count = tx
             .execute("DELETE FROM token_snapshots WHERE cwd = ?1", params![cwd])
-            .map_err(|e| format!("Delete error: {e}"))?;
+            .map_err(|e| format!("Delete token_snapshots error: {e}"))?;
 
-        Ok(count as u64)
+        let skill_count = tx
+            .execute("DELETE FROM skill_usages WHERE cwd = ?1", params![cwd])
+            .map_err(|e| format!("Delete skill_usages error: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("Commit delete_project_data: {e}"))?;
+
+        Ok((token_count + skill_count) as u64)
     }
 
     pub fn rename_project(&self, old_cwd: &str, new_cwd: &str) -> Result<u64, String> {
@@ -4750,10 +4929,15 @@ impl Storage {
         provider: IntegrationProvider,
         messages: &[crate::sessions::ExtractedMessage],
     ) -> Result<(), String> {
+        let hostname = Some(crate::sessions::SessionIndex::local_hostname());
         let usages: Vec<SkillUsage> = messages
             .iter()
             .flat_map(|message| {
+                let message_cwd = message.cwd.clone();
+                let hostname = hostname.clone();
                 message.tool_actions.iter().flat_map(move |action| {
+                    let cwd = message_cwd.clone();
+                    let hostname = hostname.clone();
                     crate::sessions::extract_skill_accesses_from_tool_action(action)
                         .into_iter()
                         .map(move |access| SkillUsage {
@@ -4763,6 +4947,8 @@ impl Storage {
                             skill_path: access.skill_path,
                             timestamp: action.timestamp.clone(),
                             tool_name: Some(action.tool_name.clone()),
+                            cwd: cwd.clone(),
+                            hostname: hostname.clone(),
                         })
                 })
             })
@@ -4781,8 +4967,8 @@ impl Storage {
             let mut stmt = tx
                 .prepare_cached(
                     "INSERT OR IGNORE INTO skill_usages
-                     (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name, cwd, hostname)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .map_err(|e| format!("Prepare store skill_usages batch: {e}"))?;
 
@@ -4795,6 +4981,8 @@ impl Storage {
                     usage.skill_path,
                     usage.timestamp,
                     usage.tool_name,
+                    usage.cwd,
+                    usage.hostname,
                 ])
                 .map_err(|e| format!("Insert skill_usage: {e}"))?;
             }
@@ -6001,25 +6189,10 @@ fn parse_ts_diff(end_ts: &str, start_ts: &str) -> Option<f64> {
     if diff < 0.0 { None } else { Some(diff) }
 }
 
-/// Merge project breakdown entries where one cwd is a subdirectory of another.
-/// For example, `/home/user/work/foo` and `/home/user/work/foo/bar` are merged
-/// into a single entry under `/home/user/work/foo`.
-fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdown> {
-    if rows.len() <= 1 {
-        return rows;
-    }
-
-    // Sort by path so parents come before children
-    rows.sort_by(|a, b| a.project.cmp(&b.project));
-
-    // Collect all unique project paths (across all hostnames)
-    let paths: Vec<String> = {
-        let mut p: Vec<String> = rows.iter().map(|r| r.project.clone()).collect();
-        p.sort();
-        p.dedup();
-        p
-    };
-
+/// Given a set of cwd paths, returns a map of child path -> resolved parent
+/// project root, skipping the home directory (it would absorb every project).
+/// Paths with no proper-prefix ancestor in the input are absent from the map.
+fn compute_subdir_parent_map(paths: &[String]) -> std::collections::HashMap<String, String> {
     // Home directories are too generic to act as merge parents.
     // A session run from ~ should stay its own row, not absorb every project.
     let home_dir = dirs::home_dir().map(|h| h.to_string_lossy().to_string());
@@ -6027,10 +6200,10 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
     // Build a mapping: child path → parent root
     let mut parent_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for path in &paths {
+    for path in paths {
         // Check if any other path is a proper prefix of this one
         let mut best_parent: Option<&str> = None;
-        for candidate in &paths {
+        for candidate in paths {
             if candidate == path {
                 continue;
             }
@@ -6059,6 +6232,30 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
             parent_map.insert(path.clone(), parent.to_string());
         }
     }
+
+    parent_map
+}
+
+/// Merge project breakdown entries where one cwd is a subdirectory of another.
+/// For example, `/home/user/work/foo` and `/home/user/work/foo/bar` are merged
+/// into a single entry under `/home/user/work/foo`.
+fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdown> {
+    if rows.len() <= 1 {
+        return rows;
+    }
+
+    // Sort by path so parents come before children
+    rows.sort_by(|a, b| a.project.cmp(&b.project));
+
+    // Collect all unique project paths (across all hostnames)
+    let paths: Vec<String> = {
+        let mut p: Vec<String> = rows.iter().map(|r| r.project.clone()).collect();
+        p.sort();
+        p.dedup();
+        p
+    };
+
+    let parent_map = compute_subdir_parent_map(&paths);
 
     if parent_map.is_empty() {
         // No merging needed — sort by last_active desc and return

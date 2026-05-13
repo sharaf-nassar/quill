@@ -100,6 +100,41 @@
 
 ---
 
+## Phase 7: User Story 4 - Drill Skills into Per-Project Counts (Priority: P2)
+
+**Goal**: Users can expand a multi-project skill row in the Skills breakdown to see per-(project, hostname) counts within the same time scope and provider filter.
+
+**Independent Test**: Use data with one skill used across two project roots, expand the skill row, and verify the indented sub-rows show one row per `(cwd, hostname)` with counts that sum to the parent row.
+
+### Implementation for User Story 4
+
+- [x] T024 [US4] Add migration 22 (cwd/hostname columns + idx_skill_usages_skill_cwd + reingest re-arm) in src-tauri/src/storage.rs
+- [x] T025 [US4] Thread `cwd` through the Claude and Codex extractors and `store_skill_usages_for_messages` (hostname via `SessionIndex::local_hostname()`) in src-tauri/src/sessions.rs and src-tauri/src/storage.rs
+- [x] T026 [US4] Add `project_count` to `SkillBreakdown` and `SkillProjectBreakdown` model in src-tauri/src/models.rs
+- [x] T027 [US4] Extract `compute_subdir_parent_map` helper from `merge_project_subdirs` so both project and skill-project callers share it in src-tauri/src/storage.rs
+- [x] T028 [US4] Implement `get_skill_project_breakdown` aggregate query with subdir merge in src-tauri/src/storage.rs
+- [x] T029 [US4] Add and register `get_skill_project_breakdown` Tauri command in src-tauri/src/lib.rs
+- [x] T030 [US4] Extend `delete_project_data` to also delete from `skill_usages` by cwd in src-tauri/src/storage.rs
+- [x] T031 [P] [US4] Add `SkillProjectBreakdown` interface and `project_count` to `SkillBreakdown` in src/types.ts
+- [x] T032 [P] [US4] Add lazy `useSkillProjects` hook keyed by `${skillName}|${requestKey}` in src/hooks/useSkillProjects.ts
+- [x] T033 [US4] Render conditional skill-row chevron, lazy-fetch projects on expand, and collapse all on filter change in src/components/analytics/BreakdownPanel.tsx
+
+**Checkpoint**: Multi-project skills expand into per-project sub-rows that respect the active time scope and provider filter.
+
+---
+
+## Phase 8: Documentation Sync (Cross-Cutting)
+
+**Purpose**: Keep `lat.md/` and the spec artifacts current with shipped behavior.
+
+- [x] T034 [P] Update lat.md/backend.md for migration 22, the `skill_usages` table layout, and the new `get_skill_project_breakdown` command
+- [x] T035 [P] Update lat.md/frontend.md for the BreakdownPanel skill-expand affordance and the `useSkillProjects` hook
+- [x] T036 [P] Update specs/002-track-session-skills/data-model.md with `cwd`/`hostname` fields on `SkillUsage` and the new `SkillProjectAggregate` section
+- [x] T037 [P] Append the `get_skill_project_breakdown` contract to specs/002-track-session-skills/contracts/skill-breakdown-command.md
+- [x] T038 Run `lat check`
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies

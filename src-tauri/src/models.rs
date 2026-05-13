@@ -189,11 +189,25 @@ pub struct SkillUsage {
     pub skill_path: String,
     pub timestamp: String,
     pub tool_name: Option<String>,
+    pub cwd: Option<String>,
+    pub hostname: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SkillBreakdown {
     pub skill_name: String,
+    pub total_count: i64,
+    pub claude_count: i64,
+    pub codex_count: i64,
+    pub project_count: i64,
+    pub last_used: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SkillProjectBreakdown {
+    pub skill_name: String,
+    pub project: String,
+    pub hostname: Option<String>,
     pub total_count: i64,
     pub claude_count: i64,
     pub codex_count: i64,

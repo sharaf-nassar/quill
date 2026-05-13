@@ -14,6 +14,8 @@ A durable record of one recognized skill use extracted from an indexed session t
 - `skill_path`: Full path or transcript path fragment that identified the skill file.
 - `timestamp`: Timestamp of the tool action or message that accessed the skill file.
 - `tool_name`: Tool/action name that produced the access, when available.
+- `cwd`: Working directory captured at ingest time from the transcript JSONL row (Claude per-message field) or session_meta payload (Codex). Optional because pre-migration-22 rows and HTTP-pushed rows lack it.
+- `hostname`: Local machine hostname captured at ingest via `SessionIndex::local_hostname()`. Optional under the same conditions as `cwd`.
 - `created_at`: Storage insertion timestamp.
 
 **Validation rules**:
@@ -71,3 +73,24 @@ The provider badge state for the Skills breakdown.
 - Default state is `all`.
 - Selecting a badge immediately refreshes or reuses the aggregate for that provider scope.
 - Empty states include the selected provider scope.
+
+## SkillProjectAggregate
+
+A row returned to the analytics UI for a single (project, hostname) pair under a parent skill, after applying time scope and provider filter.
+
+**Fields**:
+
+- `skill_name`: Echoes the parent skill name for the row.
+- `project`: Resolved project root after subdir merge.
+- `hostname`: Machine that produced the rows; null when not captured.
+- `total_count`: Recognized uses within the active scope.
+- `claude_count`: Recognized Claude Code uses in the active scope.
+- `codex_count`: Recognized Codex uses in the active scope.
+- `last_used`: Most recent recognized use timestamp in the active scope.
+
+**Validation rules**:
+
+- Rows exclude `cwd IS NULL`; pre-reingest skill uses do not appear.
+- After subdir merge, counts sum and `last_used` takes the maximum across folded rows.
+- Rows sort by `total_count` descending, then `last_used` descending, then `project` ascending.
+- Output is truncated to the caller-provided `limit` (default 50) after merge.
