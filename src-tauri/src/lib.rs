@@ -1,7 +1,7 @@
 #[allow(dead_code)] // Used by learning.rs in upcoming tasks
-mod ai_client;
 mod auth;
 mod brevity;
+mod cc_client;
 mod claude_setup;
 mod compress_prose;
 mod config;

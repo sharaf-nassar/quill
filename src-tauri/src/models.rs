@@ -206,7 +206,7 @@ pub struct SkillBreakdown {
 #[derive(Serialize, Clone, Debug)]
 pub struct SkillProjectBreakdown {
     pub skill_name: String,
-    pub project: String,
+    pub project: Option<String>,
     pub hostname: Option<String>,
     pub total_count: i64,
     pub claude_count: i64,
@@ -490,6 +490,12 @@ pub struct LearningRunPayload {
     pub phases: Option<String>,
     #[serde(default = "default_provider_scope")]
     pub provider_scope: Vec<IntegrationProvider>,
+    // JSON-encoded `Vec<cc_client::InferenceCallMetadata>` capturing the
+    // per-Claude-Code-invocation structured metadata for this run, in
+    // dispatch order. None means no inference calls were made or the
+    // record predates feature 003.
+    #[serde(default)]
+    pub inference_metadata: Option<String>,
 }
 
 // Payload to record learned rule metadata from /learn skill

@@ -26,6 +26,7 @@ import { sessionRefKey } from "../../types";
 const SUBAGENT_MAX_DEPTH = 10;
 // One indent step per depth level. 24px matches the visual mock.
 const SUBAGENT_INDENT_PX = 24;
+const NO_PROJECT_DATA_LABEL = "No project data";
 
 function formatRelativeTime(isoString: string, now: number = Date.now()): string {
   const then = new Date(isoString).getTime();
@@ -128,15 +129,16 @@ function TrashIcon({ size = 12 }: TrashIconProps) {
   );
 }
 
-function ChevronIcon({ open }: { open: boolean }) {
+function DisclosureIcon({ open }: { open: boolean }) {
   return (
     <svg
-      width={10}
-      height={10}
-      viewBox="0 0 10 10"
+      className="breakdown-disclosure-icon"
+      width={6}
+      height={6}
+      viewBox="0 0 6 6"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.6"
+      strokeWidth="1.15"
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden
@@ -145,7 +147,7 @@ function ChevronIcon({ open }: { open: boolean }) {
         transition: "transform 120ms ease",
       }}
     >
-      <path d="M3 1.5 L7 5 L3 8.5" />
+      <path d="M2.2 1.2 4 3 2.2 4.8" />
     </svg>
   );
 }
@@ -241,7 +243,7 @@ function SubagentRow({ node, depth, groups, expandedAgents, onToggle, visited }:
           </span>
           {hasChildren ? (
             <span className="breakdown-chevron" aria-hidden>
-              <ChevronIcon open={isOpen} />
+              <DisclosureIcon open={isOpen} />
             </span>
           ) : (
             <span className="breakdown-chevron breakdown-chevron-spacer" aria-hidden />
@@ -298,9 +300,9 @@ interface SessionTreeBranchProps {
 
 /**
  * One session row plus its (lazily fetched) sub-agent tree. Click on the
- * chevron toggles expansion; click anywhere else preserves the existing
- * selection / drill-down behaviour. Rows without sub-agents render with a
- * blank chevron spacer so token/turn columns stay aligned.
+ * disclosure control toggles expansion; click anywhere else preserves the existing
+ * selection / drill-down behaviour. Rows without sub-agents omit the disclosure
+ * slot so their session ids align with the normal row padding.
  */
 function SessionTreeBranch({
   row,
@@ -343,7 +345,7 @@ function SessionTreeBranch({
         }}
       >
         <span className="breakdown-name" title={row.session_id}>
-          {hasSubagents ? (
+          {hasSubagents && (
             <button
               type="button"
               className="breakdown-chevron breakdown-chevron-btn"
@@ -360,10 +362,8 @@ function SessionTreeBranch({
                 }
               }}
             >
-              <ChevronIcon open={isExpanded} />
+              <DisclosureIcon open={isExpanded} />
             </button>
-          ) : (
-            <span className="breakdown-chevron breakdown-chevron-spacer" aria-hidden />
           )}
           {row.session_id.slice(0, 8)}
           <span
@@ -469,7 +469,7 @@ interface SkillProjectRowProps {
  * so the parent–child relationship matches the Sessions tree pattern.
  */
 function SkillProjectRow({ row }: SkillProjectRowProps) {
-  const label = projectName(row.project) ?? row.project;
+  const label = projectName(row.project) ?? NO_PROJECT_DATA_LABEL;
   return (
     <div
       className="breakdown-row breakdown-row-subagent breakdown-row-skill-project"
@@ -479,7 +479,7 @@ function SkillProjectRow({ row }: SkillProjectRowProps) {
     >
       <span
         className="breakdown-name breakdown-name-subagent"
-        title={row.project}
+        title={row.project ?? NO_PROJECT_DATA_LABEL}
       >
         <span className="breakdown-tree-guide" aria-hidden>
           {"└─"}
@@ -989,39 +989,34 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                 })
               : mode === "skills"
                 ? (data as SkillBreakdown[]).map((row) => {
-                    const hasProjects = row.project_count > 1;
-                    const isExpanded = hasProjects && !!expandedSkills[row.skill_name];
-                    const projectsState = hasProjects
-                      ? skillProjectsState(row.skill_name, skillRequestKey)
-                      : null;
+                    const isExpanded = !!expandedSkills[row.skill_name];
+                    const projectsState = skillProjectsState(row.skill_name, skillRequestKey);
+                    const projectLabel =
+                      row.project_count === 1 ? "1 project" : `${row.project_count} projects`;
+                    const handleSkillToggle = () => {
+                      resetConfirm();
+                      toggleSkillExpand(row.skill_name);
+                    };
                     return (
                       <Fragment key={row.skill_name}>
                         <div
-                          className={`breakdown-row breakdown-row-skill${hasProjects ? " has-children" : ""}`}
+                          className="breakdown-row breakdown-row-skill has-children"
                           role="listitem"
-                          aria-expanded={hasProjects ? isExpanded : undefined}
-                          aria-label={`${row.skill_name}: ${row.total_count} skill uses${hasProjects ? `, ${row.project_count} projects` : ""}`}
+                          tabIndex={0}
+                          aria-expanded={isExpanded}
+                          aria-label={`${row.skill_name}: ${row.total_count} skill uses, ${projectLabel}`}
+                          onClick={handleSkillToggle}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              handleSkillToggle();
+                            }
+                          }}
                         >
                           <span className="breakdown-name" title={row.skill_name}>
-                            {hasProjects && (
-                              <button
-                                type="button"
-                                className="breakdown-chevron breakdown-chevron-btn"
-                                aria-label={isExpanded ? "Collapse projects" : "Expand projects"}
-                                aria-expanded={isExpanded}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  toggleSkillExpand(row.skill_name);
-                                }}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" || e.key === " ") {
-                                    e.stopPropagation();
-                                  }
-                                }}
-                              >
-                                <ChevronIcon open={isExpanded} />
-                              </button>
-                            )}
+                            <span className="breakdown-chevron" aria-hidden>
+                              <DisclosureIcon open={isExpanded} />
+                            </span>
                             {row.skill_name}
                           </span>
                           <span className="breakdown-tokens">
@@ -1034,7 +1029,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                             {formatRelativeTime(row.last_used)}
                           </span>
                         </div>
-                        {isExpanded && projectsState && projectsState.status === "loading" && (
+                        {isExpanded && projectsState.status === "loading" && (
                           <div
                             className="breakdown-row breakdown-row-subagent breakdown-row-subagent-status"
                             role="listitem"
@@ -1046,7 +1041,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                             </span>
                           </div>
                         )}
-                        {isExpanded && projectsState && projectsState.status === "error" && (
+                        {isExpanded && projectsState.status === "error" && (
                           <div
                             className="breakdown-row breakdown-row-subagent breakdown-row-subagent-status error"
                             role="listitem"
@@ -1058,7 +1053,6 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                           </div>
                         )}
                         {isExpanded &&
-                          projectsState &&
                           projectsState.status === "loaded" &&
                           projectsState.rows.length === 0 && (
                             <div
@@ -1072,11 +1066,10 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                             </div>
                           )}
                         {isExpanded &&
-                          projectsState &&
                           projectsState.status === "loaded" &&
                           projectsState.rows.map((projectRow) => (
                             <SkillProjectRow
-                              key={`${projectRow.project}::${projectRow.hostname ?? ""}`}
+                              key={`${projectRow.project ?? "__no_project_data__"}::${projectRow.hostname ?? ""}`}
                               row={projectRow}
                             />
                           ))}

@@ -81,7 +81,7 @@ A row returned to the analytics UI for a single (project, hostname) pair under a
 **Fields**:
 
 - `skill_name`: Echoes the parent skill name for the row.
-- `project`: Resolved project root after subdir merge.
+- `project`: Resolved project root after subdir merge; null when the recognized use has no captured `cwd`.
 - `hostname`: Machine that produced the rows; null when not captured.
 - `total_count`: Recognized uses within the active scope.
 - `claude_count`: Recognized Claude Code uses in the active scope.
@@ -90,7 +90,7 @@ A row returned to the analytics UI for a single (project, hostname) pair under a
 
 **Validation rules**:
 
-- Rows exclude `cwd IS NULL`; pre-reingest skill uses do not appear.
+- Rows include `cwd IS NULL` as a null-project bucket so drilldown counts sum to the parent skill total.
 - After subdir merge, counts sum and `last_used` takes the maximum across folded rows.
 - Rows sort by `total_count` descending, then `last_used` descending, then `project` ascending.
 - Output is truncated to the caller-provided `limit` (default 50) after merge.

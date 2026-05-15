@@ -1731,6 +1731,37 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 23: {e}"))?;
         }
 
+        if current_version < 24 {
+            // Add inference_metadata to learning_runs and optimization_runs so
+            // each run record can persist per-Claude-Code-invocation structured
+            // metadata (tokens, model, durations, cost, cache stats, stop
+            // reason, permission denials) returned by `claude -p --output-format
+            // json`. Storage-only in this feature; future features may surface
+            // it. See specs/003-cc-inference-migration/data-model.md.
+            let migration_checks = [
+                (
+                    "SELECT inference_metadata FROM learning_runs LIMIT 0",
+                    "ALTER TABLE learning_runs ADD COLUMN inference_metadata TEXT DEFAULT NULL;",
+                    "learning_runs inference_metadata",
+                ),
+                (
+                    "SELECT inference_metadata FROM optimization_runs LIMIT 0",
+                    "ALTER TABLE optimization_runs ADD COLUMN inference_metadata TEXT DEFAULT NULL;",
+                    "optimization_runs inference_metadata",
+                ),
+            ];
+            for (check_sql, migrate_sql, label) in migration_checks {
+                let has_column = conn.prepare(check_sql).is_ok();
+                if !has_column {
+                    conn.execute_batch(migrate_sql)
+                        .map_err(|e| format!("Migration 24 ({label}): {e}"))?;
+                }
+            }
+
+            conn.execute("INSERT INTO schema_version (version) VALUES (24)", [])
+                .map_err(|e| format!("Failed to record migration 24: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -2904,7 +2935,6 @@ impl Storage {
                  MAX(timestamp) AS last_used
              FROM skill_usages
              WHERE skill_name = ?1
-               AND cwd IS NOT NULL
                AND provider IN ('claude', 'codex')",
         );
 
@@ -2930,7 +2960,7 @@ impl Storage {
             params_vec.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
             .query_map(params_refs.as_slice(), |row| {
-                let cwd: String = row.get(0)?;
+                let cwd: Option<String> = row.get(0)?;
                 let hostname: Option<String> = row.get(1)?;
                 let total_count: i64 = row.get(2)?;
                 let claude_count: i64 = row.get(3)?;
@@ -2959,7 +2989,7 @@ impl Storage {
 
         // Collect distinct cwds for the subdir merge step.
         let paths: Vec<String> = {
-            let mut p: Vec<String> = raw.iter().map(|r| r.project.clone()).collect();
+            let mut p: Vec<String> = raw.iter().filter_map(|r| r.project.clone()).collect();
             p.sort();
             p.dedup();
             p
@@ -2973,17 +3003,21 @@ impl Storage {
 
         // Merge subdirs into their parent project root, keyed by
         // (resolved_project, hostname). Mirrors merge_project_subdirs.
-        let mut merged: std::collections::HashMap<(String, Option<String>), SkillProjectBreakdown> =
-            std::collections::HashMap::new();
+        let mut merged: std::collections::HashMap<
+            (Option<String>, Option<String>),
+            SkillProjectBreakdown,
+        > = std::collections::HashMap::new();
         for row in raw {
-            let resolved = parent_map
-                .get(&row.project)
-                .cloned()
-                .unwrap_or_else(|| row.project.clone());
+            let resolved = row.project.as_ref().map(|project| {
+                parent_map
+                    .get(project)
+                    .cloned()
+                    .unwrap_or_else(|| project.clone())
+            });
             let key = (resolved.clone(), row.hostname.clone());
             let entry = merged.entry(key).or_insert_with(|| SkillProjectBreakdown {
                 skill_name: row.skill_name.clone(),
-                project: resolved,
+                project: resolved.clone(),
                 hostname: row.hostname.clone(),
                 total_count: 0,
                 claude_count: 0,
@@ -3003,7 +3037,12 @@ impl Storage {
             b.total_count
                 .cmp(&a.total_count)
                 .then_with(|| b.last_used.cmp(&a.last_used))
-                .then_with(|| a.project.cmp(&b.project))
+                .then_with(|| {
+                    a.project
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(b.project.as_deref().unwrap_or(""))
+                })
         });
         results.truncate(limit as usize);
         Ok(results)
@@ -3934,8 +3973,8 @@ impl Storage {
     pub fn store_learning_run(&self, payload: &LearningRunPayload) -> Result<i64, String> {
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, phases, provider_scope)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, phases, provider_scope, inference_metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 payload.trigger_mode,
                 payload.observations_analyzed,
@@ -3947,6 +3986,7 @@ impl Storage {
                 payload.logs,
                 payload.phases,
                 provider_scope_json(&payload.provider_scope),
+                payload.inference_metadata,
             ],
         )
         .map_err(|e| format!("Insert learning run error: {e}"))?;
@@ -3972,7 +4012,8 @@ impl Storage {
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE learning_runs SET observations_analyzed=?2, rules_created=?3, rules_updated=?4,
-             duration_ms=?5, status=?6, error=?7, logs=?8, phases=?9, provider_scope=?10
+             duration_ms=?5, status=?6, error=?7, logs=?8, phases=?9, provider_scope=?10,
+             inference_metadata=?11
              WHERE id=?1",
             params![
                 id,
@@ -3985,6 +4026,7 @@ impl Storage {
                 payload.logs,
                 payload.phases,
                 provider_scope_json(&payload.provider_scope),
+                payload.inference_metadata,
             ],
         )
         .map_err(|e| format!("Update learning run error: {e}"))?;
@@ -5026,7 +5068,7 @@ impl Storage {
     }
 
     /// Update an optimization run with results.
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn update_optimization_run(
         &self,
         run_id: i64,
@@ -5035,12 +5077,14 @@ impl Storage {
         context_sources: &str,
         status: &str,
         error: Option<&str>,
+        inference_metadata: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE optimization_runs SET memories_scanned = ?1, suggestions_created = ?2,
-             context_sources = ?3, status = ?4, error = ?5, completed_at = ?6 WHERE id = ?7",
+             context_sources = ?3, status = ?4, error = ?5, completed_at = ?6,
+             inference_metadata = ?7 WHERE id = ?8",
             rusqlite::params![
                 memories_scanned,
                 suggestions_created,
@@ -5048,6 +5092,7 @@ impl Storage {
                 status,
                 error,
                 now,
+                inference_metadata,
                 run_id
             ],
         )

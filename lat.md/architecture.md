@@ -47,7 +47,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Indicator | [[src-tauri/src/indicator.rs]] | Primary-provider resolution, compact title text, and warnings for the tray summary |
 | Tray keep-alive | [[src-tauri/src/tray_keepalive.rs]] | macOS-only workaround that rebuilds the tray on sleep/wake and screen-parameter changes |
 | Models | [[src-tauri/src/models.rs]] | All shared data structures and serde types |
-| AI client | [[src-tauri/src/ai_client.rs]] | Anthropic API integration via rig-core |
+| CC inference client | [[src-tauri/src/cc_client.rs]] | Subprocess-based Claude Code invocation for all LLM inference (replaces the prior direct rig-core/Anthropic path) |
 | Git analysis | [[src-tauri/src/git_analysis.rs]] | Commit pattern extraction and hotspot analysis |
 | Fetcher | [[src-tauri/src/fetcher.rs]] | Claude API usage bucket fetching |
 | Auth | [[src-tauri/src/auth.rs]] | Bearer token generation and storage |

@@ -2,7 +2,6 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
-use crate::ai_client;
 use crate::integrations::IntegrationProvider;
 use crate::models::{
     ActionType, MemoryFile, MemoryFilesUpdatedEvent, MemoryOptimizerLogEvent,
@@ -628,12 +627,16 @@ pub async fn run_optimization_with_run(
         );
     };
 
+    // Accumulator for per-Claude-Code-invocation metadata, persisted on
+    // the optimization run record. See FR-016 and SC-009.
+    let mut inference_metadata_records: Vec<crate::cc_client::InferenceCallMetadata> = Vec::new();
+
     emit_log("Scanning memory files...");
     let _ = storage.cleanup_stale_suggestions(project_path);
     let memory_files = match scan_memory_files(storage, project_path, provider) {
         Ok(files) => files,
         Err(e) => {
-            storage.update_optimization_run(run_id, 0, 0, "{}", "failed", Some(&e))?;
+            storage.update_optimization_run(run_id, 0, 0, "{}", "failed", Some(&e), None)?;
             let _ = app.emit(
                 "memory-optimizer-updated",
                 MemoryOptimizerUpdatedEvent {
@@ -690,14 +693,33 @@ pub async fn run_optimization_with_run(
     let mem_refs: Vec<&MemoryFile> = actual_memory_files.into_iter().collect();
     let prompt = build_prompt(&mem_refs, &context, &denied);
 
-    emit_log("Calling Anthropic API for analysis...");
+    emit_log("Invoking Claude Code for analysis...");
     let preamble = "You are a memory optimization assistant. Respond with structured JSON matching the provided schema.";
+    let max_tokens: u64 = 8192;
     let result: OptimizationOutput =
-        match ai_client::analyze_typed(&prompt, preamble, ai_client::MODEL_HAIKU, 8192).await {
-            Ok(r) => r,
+        match crate::cc_client::invoke_typed::<OptimizationOutput>(crate::cc_client::InvokeArgs {
+            phase: crate::cc_client::Phase::MemoryOptimizer,
+            prompt,
+            preamble: preamble.to_string(),
+            model: crate::cc_client::Model::Haiku,
+            max_tokens,
+        })
+        .await
+        {
+            Ok(outcome) => {
+                inference_metadata_records.push(outcome.metadata);
+                outcome.value
+            }
             Err(e) => {
                 let msg = format!("API analysis failed: {e}");
                 emit_log(&msg);
+                inference_metadata_records.push(crate::cc_client::failed_metadata(
+                    crate::cc_client::Phase::MemoryOptimizer,
+                    max_tokens,
+                    &e,
+                ));
+                let inference_metadata_json =
+                    serde_json::to_string(&inference_metadata_records).ok();
                 storage.update_optimization_run(
                     run_id,
                     actual_count as i64,
@@ -705,6 +727,7 @@ pub async fn run_optimization_with_run(
                     &context_sources_json,
                     "failed",
                     Some(&msg),
+                    inference_metadata_json.as_deref(),
                 )?;
                 let _ = app.emit(
                     "memory-optimizer-updated",
@@ -861,6 +884,12 @@ pub async fn run_optimization_with_run(
     // Detect file-level conflicts and assign group IDs
     assign_conflict_groups(storage, &stored_suggestions)?;
 
+    let inference_metadata_json = if inference_metadata_records.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&inference_metadata_records).ok()
+    };
+
     storage.update_optimization_run(
         run_id,
         actual_count as i64,
@@ -868,6 +897,7 @@ pub async fn run_optimization_with_run(
         &context_sources_json,
         "completed",
         None,
+        inference_metadata_json.as_deref(),
     )?;
 
     emit_log("Optimization complete");
@@ -885,8 +915,8 @@ pub async fn run_optimization_with_run(
 /// Compress the prose body of every project memory file via the caveman-compress
 /// pipeline. Skips instruction files (CLAUDE.md / AGENTS.md), files that fail
 /// the sensitive-path denylist, and files that already have a `.original.md`
-/// backup. Reuses the existing AI client so auth + rate-limit retry are shared
-/// with the rest of the Memory Optimizer.
+/// backup. Each file's LLM call goes through the same `cc_client` invocation
+/// surface as the rest of the Memory Optimizer.
 ///
 /// Returns the number of files successfully compressed.
 pub async fn run_prose_compression(
@@ -927,10 +957,25 @@ pub async fn run_prose_compression(
         let path = std::path::PathBuf::from(&file.file_path);
         emit_log(&format!("Compressing {}", file.file_name));
 
+        // Each compress_file call may issue multiple LLM invocations
+        // (the inner compress_prose retry loop). Metadata for prose
+        // compression is not persisted because there is no per-file run
+        // record to attach it to (see FR-016 scope). Errors continue to
+        // surface through compress_file's existing return type.
         let call_llm = move |prompt: String| {
             let preamble = preamble.to_string();
             Box::pin(async move {
-                ai_client::complete_text(&prompt, &preamble, ai_client::MODEL_HAIKU, 8192).await
+                let max_tokens: u64 = 8192;
+                crate::cc_client::invoke_text(crate::cc_client::InvokeArgs {
+                    phase: crate::cc_client::Phase::ProseCompression,
+                    prompt,
+                    preamble,
+                    model: crate::cc_client::Model::Haiku,
+                    max_tokens,
+                })
+                .await
+                .map(|outcome| outcome.value)
+                .map_err(|e| e.to_string())
             }) as futures::future::BoxFuture<'_, Result<String, String>>
         };
 

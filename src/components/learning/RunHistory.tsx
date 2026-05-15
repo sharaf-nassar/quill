@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, type ReactNode } from "react";
 import type { LearningRun, RunPhase } from "../../types";
 import { providerScopeClass, providerScopeLabel } from "../../utils/providers";
 import { timeAgo } from "../../utils/time";
@@ -12,6 +12,24 @@ function formatDuration(ms: number | null): string {
   if (ms === null) return "\u2014";
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// Render an error message as a fragment, auto-linking any embedded https URLs
+// so installation guidance from cc_client error variants (e.g.
+// "Install from https://claude.com/claude-code/install") is one click away.
+function renderErrorMessage(message: string): ReactNode {
+  // split() with a capture-group regex returns alternating non-match / match
+  // parts, so URLs land on odd indices.
+  const parts = message.split(/(https?:\/\/[^\s)]+)/g);
+  return parts.map((part, idx) =>
+    idx % 2 === 1 ? (
+      <a key={idx} href={part} target="_blank" rel="noreferrer noopener">
+        {part}
+      </a>
+    ) : (
+      <span key={idx}>{part}</span>
+    ),
+  );
 }
 
 function statusIcon(status: string): { icon: string; className: string } {
@@ -169,7 +187,9 @@ function RunHistory({ runs, liveLogs }: RunHistoryProps) {
             </>
           )}
           {selected.error && (
-            <div className="learning-run-detail-error">{selected.error}</div>
+            <div className="learning-run-detail-error">
+              {renderErrorMessage(selected.error)}
+            </div>
           )}
           {selected.phases && (() => {
 						const phases: RunPhase[] = typeof selected.phases === "string"

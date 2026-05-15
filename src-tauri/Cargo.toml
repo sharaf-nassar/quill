@@ -22,7 +22,7 @@ dirs = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = "0.8"
-tokio = { version = "1", features = ["net", "sync"] }
+tokio = { version = "1", features = ["net", "sync", "process", "time", "io-util"] }
 tauri-plugin-updater = "2.10.0"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
@@ -33,9 +33,6 @@ hex = "0.4"
 subtle = "2"
 parking_lot = "0.12"
 tantivy = "0.25"
-rig-core = { version = "0.32", features = ["reqwest-middleware"] }
-reqwest-middleware = "0.5"
-http = "1"
 schemars = "1"
 futures = "0.3"
 sha2 = "0.10.9"

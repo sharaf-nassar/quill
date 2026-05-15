@@ -1931,6 +1931,11 @@ body {
 
 .breakdown-row-skill {
   cursor: default;
+  padding-left: 7px;
+}
+
+.breakdown-row-skill.has-children {
+  cursor: pointer;
 }
 
 .breakdown-row.selected {
@@ -2008,25 +2013,35 @@ body {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 12px;
-  height: 12px;
-  margin-right: 5px;
-  color: rgba(255, 255, 255, 0.55);
+  width: 6px;
+  height: 10px;
+  margin-right: 3px;
+  color: rgba(255, 255, 255, 0.38);
+  background: transparent;
+  border: 0;
   vertical-align: middle;
   flex-shrink: 0;
 }
 
 .breakdown-chevron-btn {
-  background: none;
-  border: none;
+  appearance: none;
   padding: 0;
   cursor: pointer;
-  border-radius: 2px;
+  font: inherit;
+}
+
+.breakdown-disclosure-icon {
+  display: block;
 }
 
 .breakdown-chevron-btn:hover {
-  color: rgba(255, 255, 255, 0.9);
-  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.72);
+  background: transparent;
+}
+
+.breakdown-chevron-btn:focus-visible {
+  outline: 1px solid rgba(96, 165, 250, 0.55);
+  outline-offset: 2px;
 }
 
 .breakdown-chevron-spacer {

@@ -108,7 +108,7 @@ export interface SessionBreakdown {
   project: string | null;
   /**
    * True when this session has at least one sub-agent chain in its
-   * transcript. Drives the chevron + expansion affordance in the Sessions
+   * transcript. Drives the disclosure + expansion affordance in the Sessions
    * tab. Older backends may omit this; treat missing as `false`.
    */
   has_subagents?: boolean;
@@ -131,7 +131,7 @@ export interface SkillBreakdown {
 
 export interface SkillProjectBreakdown {
   skill_name: string;
-  project: string;
+  project: string | null;
   hostname: string | null;
   total_count: number;
   claude_count: number;

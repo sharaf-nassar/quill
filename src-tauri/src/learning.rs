@@ -9,6 +9,26 @@ use crate::prompt_utils::{compress_observation, sanitize_for_prompt};
 use crate::storage::Storage;
 use tauri::Emitter;
 
+/// JSON-encode the run's accumulated per-Claude-Code-invocation metadata
+/// for storage in `learning_runs.inference_metadata`. Returns `None` if
+/// no Claude Code invocations were made during the run (so the column
+/// stays NULL rather than `[]`).
+fn encode_inference_metadata(
+    records: &[crate::cc_client::InferenceCallMetadata],
+) -> Option<String> {
+    if records.is_empty() {
+        return None;
+    }
+    // On the (practically unreachable) serialization failure — e.g. a
+    // non-finite f64 cost from a misbehaving Claude Code — return None
+    // rather than `Some("")`, so the column stays NULL instead of
+    // storing a junk empty string that downstream readers would treat
+    // as "present but empty".
+    serde_json::to_string(records)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 /// Returns true if the rule name is safe for use as a filename.
 /// Only allows lowercase ASCII letters, digits, and hyphens.
 pub fn is_safe_rule_name(name: &str) -> bool {
@@ -144,7 +164,11 @@ async fn analyze_observations_stream(
     existing_list: String,
     app: tauri::AppHandle,
     run_id: i64,
-) -> (Option<(StreamFindings, i64)>, Vec<String>) {
+) -> (
+    Option<(StreamFindings, i64)>,
+    Vec<String>,
+    Option<crate::cc_client::InferenceCallMetadata>,
+) {
     let mut logs: Vec<String> = Vec::new();
 
     macro_rules! stream_log {
@@ -166,7 +190,7 @@ async fn analyze_observations_stream(
         Ok(count) => count,
         Err(e) => {
             stream_log!("Stream A: failed to get observation count: {e}");
-            return (None, logs);
+            return (None, logs, None);
         }
     };
 
@@ -174,7 +198,7 @@ async fn analyze_observations_stream(
         stream_log!(
             "Stream A: only {unanalyzed} unanalyzed observations (need {min_obs}), skipping"
         );
-        return (None, logs);
+        return (None, logs, None);
     }
 
     stream_log!("Stream A: found {unanalyzed} unanalyzed observations");
@@ -183,7 +207,7 @@ async fn analyze_observations_stream(
         Ok(obs) => obs,
         Err(e) => {
             stream_log!("Stream A: failed to get observations: {e}");
-            return (None, logs);
+            return (None, logs, None);
         }
     };
 
@@ -285,25 +309,33 @@ async fn analyze_observations_stream(
     let preamble = "You are a behavioral pattern analyzer for agent tool-use observations. \
 	                Respond with structured JSON matching the provided schema.";
 
-    match crate::ai_client::analyze_typed::<StreamFindings>(
-        &prompt,
-        preamble,
-        crate::ai_client::MODEL_HAIKU,
-        4096,
-    )
+    let max_tokens: u64 = 4096;
+    match crate::cc_client::invoke_typed::<StreamFindings>(crate::cc_client::InvokeArgs {
+        phase: crate::cc_client::Phase::StreamA,
+        prompt,
+        preamble: preamble.to_string(),
+        model: crate::cc_client::Model::Haiku,
+        max_tokens,
+    })
     .await
     {
-        Ok(findings) => {
+        Ok(outcome) => {
             stream_log!(
                 "Stream A: extracted {} patterns, {} verdicts",
-                findings.patterns.len(),
-                findings.verdicts.len()
+                outcome.value.patterns.len(),
+                outcome.value.verdicts.len()
             );
-            (Some((findings, obs_count)), logs)
+            (
+                Some((outcome.value, obs_count)),
+                logs,
+                Some(outcome.metadata),
+            )
         }
         Err(e) => {
             stream_log!("Stream A: API call failed: {e}");
-            (None, logs)
+            let meta =
+                crate::cc_client::failed_metadata(crate::cc_client::Phase::StreamA, max_tokens, &e);
+            (None, logs, Some(meta))
         }
     }
 }
@@ -316,7 +348,11 @@ async fn analyze_git_stream(
     existing_rules_summary: String,
     app: tauri::AppHandle,
     run_id: i64,
-) -> (Option<StreamFindings>, Vec<String>) {
+) -> (
+    Option<StreamFindings>,
+    Vec<String>,
+    Option<crate::cc_client::InferenceCallMetadata>,
+) {
     let mut logs: Vec<String> = Vec::new();
 
     macro_rules! stream_log {
@@ -337,13 +373,13 @@ async fn analyze_git_stream(
         Ok(data) => data,
         Err(e) => {
             stream_log!("Stream B: git data collection failed: {e}");
-            return (None, logs);
+            return (None, logs, None);
         }
     };
 
     if git_data.is_empty() {
         stream_log!("Stream B: no git data available, skipping");
-        return (None, logs);
+        return (None, logs, None);
     }
 
     stream_log!("Stream B: collected {} chars of git data", git_data.len());
@@ -376,25 +412,29 @@ async fn analyze_git_stream(
     let preamble = "You are a git history pattern analyzer. \
 	                Respond with structured JSON matching the provided schema.";
 
-    match crate::ai_client::analyze_typed::<StreamFindings>(
-        &prompt,
-        preamble,
-        crate::ai_client::MODEL_HAIKU,
-        4096,
-    )
+    let max_tokens: u64 = 4096;
+    match crate::cc_client::invoke_typed::<StreamFindings>(crate::cc_client::InvokeArgs {
+        phase: crate::cc_client::Phase::StreamB,
+        prompt,
+        preamble: preamble.to_string(),
+        model: crate::cc_client::Model::Haiku,
+        max_tokens,
+    })
     .await
     {
-        Ok(findings) => {
+        Ok(outcome) => {
             stream_log!(
                 "Stream B: extracted {} patterns, {} verdicts",
-                findings.patterns.len(),
-                findings.verdicts.len()
+                outcome.value.patterns.len(),
+                outcome.value.verdicts.len()
             );
-            (Some(findings), logs)
+            (Some(outcome.value), logs, Some(outcome.metadata))
         }
         Err(e) => {
             stream_log!("Stream B: API call failed: {e}");
-            (None, logs)
+            let meta =
+                crate::cc_client::failed_metadata(crate::cc_client::Phase::StreamB, max_tokens, &e);
+            (None, logs, Some(meta))
         }
     }
 }
@@ -411,6 +451,7 @@ async fn synthesize_findings(
     instruction_context: &str,
     max_rules: usize,
     logs: &mut Vec<String>,
+    metadata_sink: &mut Vec<crate::cc_client::InferenceCallMetadata>,
     app: &tauri::AppHandle,
     run_id: i64,
 ) -> Result<AnalysisOutput, String> {
@@ -512,22 +553,37 @@ async fn synthesize_findings(
     let preamble = "You are a synthesis agent combining multi-source analysis into actionable rules. \
 	                Respond with structured JSON matching the provided schema.";
 
-    let result = crate::ai_client::analyze_typed::<AnalysisOutput>(
-        &prompt,
-        preamble,
-        crate::ai_client::MODEL_SONNET,
-        8192,
-    )
-    .await
-    .map_err(|e| format!("Synthesis API call failed: {e}"))?;
+    let max_tokens: u64 = 8192;
+    let outcome =
+        match crate::cc_client::invoke_typed::<AnalysisOutput>(crate::cc_client::InvokeArgs {
+            phase: crate::cc_client::Phase::Synthesis,
+            prompt,
+            preamble: preamble.to_string(),
+            model: crate::cc_client::Model::Sonnet,
+            max_tokens,
+        })
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                metadata_sink.push(crate::cc_client::failed_metadata(
+                    crate::cc_client::Phase::Synthesis,
+                    max_tokens,
+                    &e,
+                ));
+                return Err(format!("Synthesis API call failed: {e}"));
+            }
+        };
+
+    metadata_sink.push(outcome.metadata);
 
     synth_log!(
         "Synthesis: produced {} rules, {} verdicts",
-        result.new_rules.len(),
-        result.verdicts.len()
+        outcome.value.new_rules.len(),
+        outcome.value.verdicts.len()
     );
 
-    Ok(result)
+    Ok(outcome.value)
 }
 
 /// Spawns a background analysis using the multi-stream pipeline.
@@ -554,6 +610,12 @@ pub async fn spawn_analysis(
 
     let mut logs: Vec<String> = Vec::new();
     let mut phases: Vec<RunPhase> = Vec::new();
+    // Accumulator for per-Claude-Code-invocation metadata. Persisted on
+    // the run record as a JSON-encoded array; one element per call site
+    // that actually issued a `claude` subprocess (success or failure).
+    // Skipped streams (e.g. observation count below threshold) produce
+    // no entry. See specs/003-cc-inference-migration/data-model.md.
+    let mut inference_metadata_records: Vec<crate::cc_client::InferenceCallMetadata> = Vec::new();
 
     macro_rules! run_log {
         ($($arg:tt)*) => {{
@@ -716,7 +778,7 @@ pub async fn spawn_analysis(
         // Micro mode: only run Stream A, skip git and insights
         run_log!("Micro mode: running Stream A only");
 
-        let (obs_result, obs_logs) = analyze_observations_stream(
+        let (obs_result, obs_logs, obs_metadata) = analyze_observations_stream(
             storage,
             min_obs,
             max_rules,
@@ -728,6 +790,9 @@ pub async fn spawn_analysis(
         )
         .await;
         logs.extend(obs_logs);
+        if let Some(m) = obs_metadata {
+            inference_metadata_records.push(m);
+        }
 
         phases.push(RunPhase {
             name: "streams".to_string(),
@@ -764,6 +829,7 @@ pub async fn spawn_analysis(
                         logs: Some(logs.join("\n")),
                         phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
                         provider_scope: provider_scope.clone(),
+                        inference_metadata: encode_inference_metadata(&inference_metadata_records),
                     },
                 );
                 return Err(msg);
@@ -794,13 +860,19 @@ pub async fn spawn_analysis(
             gather_insights(provider, app.clone(), run_id),
         );
 
-        // Destructure and merge logs
-        let (obs_result, obs_logs) = obs_result;
-        let (git_result, git_logs) = git_result;
+        // Destructure and merge logs + per-call inference metadata
+        let (obs_result, obs_logs, obs_metadata) = obs_result;
+        let (git_result, git_logs, git_metadata) = git_result;
         let (insights_result, insights_logs) = insights_result;
         logs.extend(obs_logs);
         logs.extend(git_logs);
         logs.extend(insights_logs);
+        if let Some(m) = obs_metadata {
+            inference_metadata_records.push(m);
+        }
+        if let Some(m) = git_metadata {
+            inference_metadata_records.push(m);
+        }
 
         let obs_findings_count = obs_result
             .as_ref()
@@ -848,6 +920,7 @@ pub async fn spawn_analysis(
                 &instruction_context,
                 max_rules,
                 &mut logs,
+                &mut inference_metadata_records,
                 app,
                 run_id,
             )
@@ -867,6 +940,7 @@ pub async fn spawn_analysis(
                         logs: Some(logs.join("\n")),
                         phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
                         provider_scope: provider_scope.clone(),
+                        inference_metadata: encode_inference_metadata(&inference_metadata_records),
                     },
                 );
             })?;
@@ -905,6 +979,7 @@ pub async fn spawn_analysis(
                     logs: Some(logs.join("\n")),
                     phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
                     provider_scope: provider_scope.clone(),
+                    inference_metadata: encode_inference_metadata(&inference_metadata_records),
                 },
             );
             return Err(msg);
@@ -1054,6 +1129,7 @@ pub async fn spawn_analysis(
             logs: Some(logs.join("\n")),
             phases: Some(serde_json::to_string(&phases).unwrap_or_default()),
             provider_scope: provider_scope.clone(),
+            inference_metadata: encode_inference_metadata(&inference_metadata_records),
         },
     );
 
