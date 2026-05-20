@@ -334,6 +334,59 @@ export interface IntegrationFeatures {
   brevity: boolean;
 }
 
+/**
+ * Operator feedback verdict for a rule (feature 005 US3 / R-5). `accept` and
+ * `reject` carry the same trust level as promote/delete; `bad` is the
+ * strongest negative and writes a durable tombstone. The optional `note` is
+ * maintainer-only local metadata and is never fed to inference.
+ */
+export type OperatorFeedback = "accept" | "reject" | "bad";
+
+/**
+ * Rule lifecycle strings. `state` is a free-form string from the backend;
+ * these are the known values. US3 added `superseded`/`conflict_flagged` to the
+ * existing candidate/awaiting_review/active/rejected/suppressed/tombstoned set
+ * (plus legacy emerging/confirmed/stale/invalidated). Treat unknown strings
+ * tolerantly — render the raw value, never throw.
+ */
+export type RuleLifecycle =
+	| "candidate"
+	| "awaiting_review"
+	| "active"
+	| "rejected"
+	| "suppressed"
+	| "tombstoned"
+	| "superseded"
+	| "conflict_flagged"
+	// Legacy evidence states still emitted by older backends.
+	| "emerging"
+	| "confirmed"
+	| "stale"
+	| "invalidated"
+	| (string & {});
+
+/**
+ * Terminal / non-active lifecycle states. A rule in any of these MUST NOT be
+ * presented as an active on-disk rule even if it still has a `file_path`
+ * (feature 005 US3 — superseded/conflict_flagged/rejected/tombstoned).
+ */
+export const NON_ACTIVE_LIFECYCLES: ReadonlySet<string> = new Set([
+	"rejected",
+	"suppressed",
+	"tombstoned",
+	"superseded",
+	"conflict_flagged",
+	"invalidated",
+]);
+
+/**
+ * True when a rule should be treated as a live, active on-disk rule. Requires
+ * a written `.md` file AND a lifecycle that is not terminal/superseded.
+ */
+export function isActiveRule(rule: LearnedRule): boolean {
+	return rule.file_path.length > 0 && !NON_ACTIVE_LIFECYCLES.has(rule.state);
+}
+
 export interface LearnedRule {
   name: string;
   domain: string | null;
@@ -342,12 +395,18 @@ export interface LearnedRule {
   file_path: string;
   created_at: string;
   updated_at: string;
-  state: string;
+  state: RuleLifecycle;
   project: string | null;
   is_anti_pattern: boolean;
   source: string | null;
 	content: string | null;
   provider_scope: IntegrationProvider[];
+  /**
+   * Current operator feedback verdict, if the backend read model exposes it.
+   * The base `LearnedRule` Rust model does not carry it today, so consumers
+   * MUST treat it as optional and absent-by-default.
+   */
+  feedback?: OperatorFeedback | null;
 }
 
 export interface RunPhase {
@@ -355,6 +414,70 @@ export interface RunPhase {
 	status: string;
 	duration_ms: number | null;
 	findings_count: number;
+}
+
+/**
+ * One inference call recorded during a learning run (feature 005 R-7 / H-6).
+ * Field names are snake_case to match the serde JSON emitted by the Rust
+ * `RunInferenceCall` model decoded from `learning_runs.inference_metadata`.
+ * Legacy/micro runs carry no inference metadata at all (see
+ * `RunInferenceSummary` being optional on `LearningRun`).
+ */
+/**
+ * Honest per-call OS-confinement descriptor (feature 006 Follow-up A,
+ * R-A / C-A). `sandbox` is the recorded tag from the closed Rust
+ * `SandboxKind` vocabulary (`bwrap` | `process-only` | `sandbox-exec` |
+ * `job-object` | `none`). `fs_confined` is `true` only when that mechanism
+ * actually denies out-of-workspace filesystem read/write
+ * (`bwrap`/`sandbox-exec`); `process-only`/`job-object`/`none` ⇒ `false`.
+ * Field names are snake_case to match serde JSON.
+ */
+export interface RunInferenceConfinement {
+	sandbox: string;
+	fs_confined: boolean;
+}
+
+export interface RunInferenceCall {
+	phase: string;
+	model: string | null;
+	cost_usd: number;
+	duration_ms: number;
+	ttft_ms: number;
+	input_tokens: number;
+	output_tokens: number;
+	success: boolean;
+	failure_kind: string | null;
+	/**
+	 * Confinement actually applied to this call. Optional: absent on legacy
+	 * records that recorded no `sandbox` tag (the backend skips the field
+	 * when unknown), so consumers MUST treat it as optional.
+	 */
+	confinement?: RunInferenceConfinement;
+}
+
+/**
+ * Derived per-run inference rollup (feature 005 R-7 / H-6 / FR-024). Decoded
+ * tolerantly from the existing `learning_runs.inference_metadata` JSON — a
+ * NULL or parse-error column yields no summary, so this is optional/nullable
+ * on `LearningRun` and consumers MUST render gracefully (em-dash) when absent.
+ * `primary_model` is the cost-dominant model and may be null when no call
+ * carried attributable cost. Field names are snake_case to match serde JSON.
+ */
+export interface RunInferenceSummary {
+	total_cost_usd: number;
+	total_duration_ms: number;
+	primary_model: string | null;
+	call_count: number;
+	failed_call_count: number;
+	calls: RunInferenceCall[];
+	/**
+	 * Run-level confinement rollup (feature 006 Follow-up A, R-A / C-A):
+	 * `true` iff every call that recorded a `sandbox` tag was
+	 * filesystem-confined; `false` if any recorded call ran without
+	 * filesystem confinement. Optional/absent when no call carried a
+	 * `sandbox` tag (legacy records) — render unchanged when absent.
+	 */
+	all_fs_confined?: boolean;
 }
 
 export interface LearningRun {
@@ -370,6 +493,12 @@ export interface LearningRun {
   created_at: string;
   phases: RunPhase[] | null;
   provider_scope: IntegrationProvider[];
+  /**
+   * Derived inference rollup. Absent on legacy runs and runs whose
+   * `inference_metadata` was NULL or failed tolerant decode on the backend;
+   * consumers MUST treat it as optional and render an em-dash, never crash.
+   */
+  inference?: RunInferenceSummary | null;
 }
 
 export interface LearningLogEvent {

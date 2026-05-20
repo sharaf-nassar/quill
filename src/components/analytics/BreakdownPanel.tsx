@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useBreakdownData } from "../../hooks/useBreakdownData";
 import { useToast } from "../../hooks/useToast";
@@ -66,10 +66,22 @@ const MODE_LABELS: Record<BreakdownMode, string> = {
 };
 const CONFIRM_TIMEOUT_MS = 3000;
 type SkillProviderFilter = "all" | "claude" | "codex";
+type SkillSortKey = "name" | "uses" | "time";
+type SkillSortDirection = "asc" | "desc";
+interface SkillSortState {
+  key: SkillSortKey;
+  direction: SkillSortDirection;
+}
+
 const SKILL_PROVIDER_FILTERS: Array<{ value: SkillProviderFilter; label: string }> = [
   { value: "all", label: "All" },
   { value: "codex", label: "Codex" },
   { value: "claude", label: "Claude" },
+];
+const SKILL_SORT_COLUMNS: Array<{ key: SkillSortKey; label: string }> = [
+  { key: "name", label: "Skill" },
+  { key: "uses", label: "Uses" },
+  { key: "time", label: "Last used" },
 ];
 
 function providerLabel(provider: SessionRef["provider"]): string {
@@ -84,6 +96,10 @@ function skillEmptyLabel(providerFilter: SkillProviderFilter, allTime: boolean):
       : "Claude Code";
   const scope = allTime ? "all time" : "this timeframe";
   return `No ${provider} skill usage for ${scope}`;
+}
+
+function defaultSkillSortDirection(key: SkillSortKey): SkillSortDirection {
+  return key === "name" ? "asc" : "desc";
 }
 
 interface TrashIconProps {
@@ -513,6 +529,10 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const [mode, setMode] = useState<BreakdownMode>("sessions");
   const [skillsAllTime, setSkillsAllTime] = useState(true);
   const [skillsProvider, setSkillsProvider] = useState<SkillProviderFilter>("all");
+  const [skillSort, setSkillSort] = useState<SkillSortState>({
+    key: "uses",
+    direction: "desc",
+  });
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -544,11 +564,51 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   // per-skill project drilldown invalidates on the exact same filter
   // axes (days / all-time / provider) that drive the parent rows.
   const skillRequestKey = `${mode}:${days}:${skillsAllTime}:${skillProviderArg ?? "all"}`;
+  const sortedSkillRows = useMemo(() => {
+    if (mode !== "skills") {
+      return [];
+    }
+
+    const rows = [...(data as SkillBreakdown[])];
+    rows.sort((a, b) => {
+      let value = 0;
+      if (skillSort.key === "name") {
+        value = a.skill_name.localeCompare(b.skill_name);
+      } else if (skillSort.key === "uses") {
+        value = a.total_count - b.total_count;
+      } else {
+        const aTime = Date.parse(a.last_used);
+        const bTime = Date.parse(b.last_used);
+        value = (Number.isFinite(aTime) ? aTime : 0) - (Number.isFinite(bTime) ? bTime : 0);
+      }
+
+      if (value !== 0) {
+        return skillSort.direction === "asc" ? value : -value;
+      }
+      return a.skill_name.localeCompare(b.skill_name);
+    });
+    return rows;
+  }, [data, mode, skillSort]);
 
   const handleModeChange = (m: BreakdownMode) => {
     setMode(m);
     resetConfirm();
   };
+
+  const handleSkillSort = useCallback((key: SkillSortKey) => {
+    setSkillSort((prev) => {
+      if (prev.key === key) {
+        return {
+          key,
+          direction: prev.direction === "asc" ? "desc" : "asc",
+        };
+      }
+      return {
+        key,
+        direction: defaultSkillSortDirection(key),
+      };
+    });
+  }, []);
 
   const handleRowClick = (
     type: BreakdownSelection["type"],
@@ -874,11 +934,37 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
             : `No ${mode} data yet`}
         </div>
       ) : (
-        <div
-          className="breakdown-list"
-          role="list"
-          aria-label={`${MODE_LABELS[mode]} breakdown`}
-        >
+        <>
+          {mode === "skills" && (
+            <div className="breakdown-skill-sort-row" aria-label="Sort skills">
+              {SKILL_SORT_COLUMNS.map((column) => {
+                const active = skillSort.key === column.key;
+                const nextDirection = active
+                  ? skillSort.direction === "asc" ? "descending" : "ascending"
+                  : defaultSkillSortDirection(column.key) === "asc" ? "ascending" : "descending";
+                return (
+                  <button
+                    key={column.key}
+                    type="button"
+                    className={`breakdown-skill-sort breakdown-skill-sort-${column.key}${active ? " active" : ""}`}
+                    aria-pressed={active}
+                    aria-label={`Sort skills by ${column.label.toLowerCase()} ${nextDirection}`}
+                    onClick={() => handleSkillSort(column.key)}
+                  >
+                    <span>{column.label}</span>
+                    <span className="breakdown-skill-sort-indicator" aria-hidden>
+                      {active ? (skillSort.direction === "asc" ? "↑" : "↓") : ""}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          <div
+            className="breakdown-list"
+            role="list"
+            aria-label={`${MODE_LABELS[mode]} breakdown`}
+          >
           {mode === "hosts"
             ? (data as HostBreakdown[]).map((row) => (
                 <div
@@ -988,7 +1074,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                   );
                 })
               : mode === "skills"
-                ? (data as SkillBreakdown[]).map((row) => {
+                ? sortedSkillRows.map((row) => {
                     const isExpanded = !!expandedSkills[row.skill_name];
                     const projectsState = skillProjectsState(row.skill_name, skillRequestKey);
                     const projectLabel =
@@ -1106,7 +1192,8 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                     />
                   );
                 })}
-        </div>
+          </div>
+        </>
       )}
     </div>
   );

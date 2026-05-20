@@ -46,6 +46,18 @@ export function providerScopeClass(
   return providerBadgeClass(normalized[0]);
 }
 
+/**
+ * Verbatim provider-asymmetry disclosure for shared/combined-scope surfaces
+ * (feature 005 R-7 / M-6 / FR-028). Codex only emits Bash/shell hooks (a
+ * Codex platform limit, not equalizable), so any rule whose scope spans both
+ * providers is structurally weighted toward Claude tool usage. Shown ONLY on
+ * the shared/combined surface; copy is fixed — do not paraphrase.
+ */
+export const PROVIDER_ASYMMETRY_DISCLOSURE =
+  "Codex activity is captured for Bash/shell commands only (Codex platform " +
+  "limitation); Claude is captured across all tools — shared rules may be " +
+  "weighted toward Claude tool usage.";
+
 export function memoryTypeLabel(memoryType: string | null | undefined): string {
   switch (memoryType) {
     case "claude-md":

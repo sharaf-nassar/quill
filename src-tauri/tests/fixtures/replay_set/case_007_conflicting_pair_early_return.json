@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "36 observations editing a guard-heavy validation module. In 14 edits the agent refactored nested conditionals into early-return guard clauses; reviewers (visible in session insight notes) approved each, citing reduced nesting. No edit reintroduced an else-after-return.",
+    "existing_rules_summary": "3 active rules. No rule governs control-flow / early-return style yet. A sibling candidate 'avoid-early-returns-keep-single-exit' is under evaluation in the same run.",
+    "provider_scope": ["claude"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "prefer-early-return-guard-clauses",
+    "content": "Prefer early-return guard clauses for precondition checks instead of deeply nested conditionals. Validate and return at the top, keep the happy path unindented.",
+    "domain": "coding-style",
+    "claimed_confidence": 0.81
+  },
+  "expected_judgment": {
+    "verdict": "helps",
+    "rationale": "Consistently applied and reviewer-endorsed across 14 grounded edits with no counter-examples. This is the well-supported member of a directly conflicting pair (see the single-exit candidate); the harness should favor this one."
+  },
+  "tags": ["conflicting-pair", "coding-style", "well-grounded", "pair:control-flow", "archetype:conflicting"]
+}

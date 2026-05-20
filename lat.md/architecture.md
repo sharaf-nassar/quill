@@ -123,16 +123,8 @@ Workaround for [tauri-apps/tauri#12060](https://github.com/tauri-apps/tauri/issu
 
 A 500 ms time-based debounce coalesces wake-with-display-change events that fire both notifications nearly simultaneously. The block runs on `NSOperationQueue.mainQueue()` because tray-icon mutations require the main thread. The non-macOS [[src-tauri/src/tray_keepalive.rs#install]] is an empty stub. **Remove this module once the upstream issue ships a fix.**
 
-## Local vs Remote Architecture
-
-Quill supports both local single-machine and distributed multi-host setups.
-
-### Local Setup
+## Provider Setup
 
 On startup, [[src-tauri/src/integrations/manager.rs]] refreshes all provider state for the UI.
 
 CLI providers (Claude, Codex) run installers after explicit enable confirmation: Claude via [[src-tauri/src/claude_setup.rs]] and Codex via [[src-tauri/src/integrations/codex.rs]]. Service-only providers like MiniMax ([[src-tauri/src/integrations/minimax.rs]]) require only an API key, stored in the SQLite settings table.
-
-### Remote Setup
-
-A plugin (`plugin/`) can be installed on remote hosts via the marketplace. Running `/quill:setup` on the remote configures hooks to report back to the desktop widget's IP. The remote MCP server (`plugin/mcp/server.py`) provides session query tools.

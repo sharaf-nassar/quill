@@ -40,6 +40,11 @@ function statusIcon(status: string): { icon: string; className: string } {
       return { icon: "\u2713", className: "learning-run-icon--ok" };
     case "interrupted":
       return { icon: "\u2014", className: "learning-run-icon--interrupted" };
+    case "degraded":
+      // Run finished but with one or more failed inference calls (feature 005
+      // R-7 / L-3). Distinct amber warning glyph \u2014 must NOT fall through to
+      // the hard-fail \u2717 which previously masked partial-success runs.
+      return { icon: "\u26a0", className: "learning-run-icon--degraded" };
     default:
       return { icon: "\u2717", className: "learning-run-icon--fail" };
   }
@@ -53,11 +58,81 @@ function phaseStatusDot(status: string): { color: string; label: string } {
 			return { color: "#3B82F6", label: "\u25CF" };
 		case "skipped":
 			return { color: "#6B7280", label: "\u2014" };
+		case "degraded":
+			return { color: "#F59E0B", label: "\u26a0" };
 		case "failed":
 			return { color: "#EF4444", label: "\u2717" };
 		default:
 			return { color: "#9CA3AF", label: "\u25CB" };
 	}
+}
+
+// TODO(feature-006 T012): a `RunHistory` render assertion is required by the
+// plan (a not-FS-confined run shows the marker + the exact
+// `NO_FS_CONFINEMENT_HINT`; an FS-confined run and a legacy/no-inference run
+// do NOT). It is intentionally NOT added here: the repo has NO frontend test
+// infrastructure at all (no vitest/jest, no @testing-library, no jsdom/
+// happy-dom, no `test` script in package.json, zero `*.test.tsx`). Scaffolding
+// a framework is out of scope for this track and a per-track decision; T012
+// is BLOCKED on a test-infra decision (which runner + jsdom + RTL deps). Once
+// infra exists, assert against `isNotFsConfined` + `NO_FS_CONFINEMENT_HINT`
+// with three fixtures: all_fs_confined:false ⇒ marker+hint shown;
+// all_fs_confined:true ⇒ hidden; inference undefined ⇒ hidden.
+
+// Honest confinement disclosure (feature 006 Follow-up A, R-A / C-A5). A run
+// is "not filesystem-confined" when its inference rollup explicitly recorded
+// that at least one call ran without OS filesystem confinement
+// (`all_fs_confined === false`, e.g. the Linux `process-only` fallback when
+// `bwrap` is absent). `undefined` (legacy/micro runs that recorded no
+// `sandbox` tag, or no inference at all) is NOT a disclosure — render
+// unchanged, exactly as before feature 006. FS-confined runs (`true`) are
+// also unchanged.
+function isNotFsConfined(run: LearningRun): boolean {
+  return run.inference?.all_fs_confined === false;
+}
+
+// The actual not-filesystem-confined sandbox mechanism(s) this run used,
+// derived from the per-call confinement: `process-only` (Linux without
+// bwrap), `none` (no OS confinement available), or `job-object` (Windows).
+// Naming the real mechanism instead of assuming the Linux fallback keeps
+// the disclosure honest on every platform.
+function notFsConfinedLabel(run: LearningRun): string {
+  const tags = new Set<string>();
+  for (const call of run.inference?.calls ?? []) {
+    if (call.confinement && !call.confinement.fs_confined) {
+      tags.add(call.confinement.sandbox);
+    }
+  }
+  return tags.size > 0
+    ? `${[...tags].join(", ")} (no FS isolation)`
+    : "no FS isolation";
+}
+
+// Exact remediation copy required by the feature 006 contract (C-A5). Kept as
+// a single source of truth so the inline marker and the detail hint agree.
+const NO_FS_CONFINEMENT_HINT =
+  "No filesystem confinement on this host — install bwrap for full isolation";
+
+// Consecutive-failure detection (feature 005 R-7 / L-3). Purely derived from
+// the already-fetched runs list — NO new fetch, NO backend circuit-breaker.
+// "Terminal" excludes still-running runs (they have no verdict yet);
+// `interrupted` is a user/process abort, not an inference failure, so it
+// neither contributes to nor resets the streak. The banner fires only when
+// the most recent K terminal-with-verdict runs are ALL hard `failed`.
+const FAILURE_STREAK_K = 3;
+
+function consecutiveFailureCount(runs: LearningRun[]): number {
+  let streak = 0;
+  for (const run of runs) {
+    if (run.status === "running" || run.status === "interrupted") continue;
+    if (run.status === "failed") {
+      streak += 1;
+    } else {
+      // completed/degraded (or any other verdict) ends the streak.
+      break;
+    }
+  }
+  return streak;
 }
 
 function RunHistory({ runs, liveLogs }: RunHistoryProps) {
@@ -87,9 +162,24 @@ function RunHistory({ runs, liveLogs }: RunHistoryProps) {
 
   const selected = runs.find((r) => r.id === selectedId) ?? null;
 
+  // Presentational consecutive-failure signal (L-3): no circuit-breaker, just
+  // a hint to check the local `claude` CLI / sign-in when the last K terminal
+  // runs all hard-failed. Derived from the runs already in props.
+  const failureStreak = consecutiveFailureCount(runs);
+
   return (
     <div className="learning-section">
       <div className="learning-section-header">RECENT RUNS</div>
+
+      {failureStreak >= FAILURE_STREAK_K && (
+        <div className="learning-run-streak-banner" role="status">
+          <span className="learning-run-streak-icon">⚠</span>
+          <span>
+            {failureStreak} consecutive failed runs — check the{" "}
+            <code>claude</code> CLI / sign-in
+          </span>
+        </div>
+      )}
 
       {runs.length === 0 ? (
         <div className="learning-empty">No analysis runs yet</div>
@@ -125,8 +215,18 @@ function RunHistory({ runs, liveLogs }: RunHistoryProps) {
                       ? `+${run.rules_created} rule${run.rules_created !== 1 ? "s" : ""}`
                       : run.status === "interrupted"
                         ? "interrupted"
-                        : "failed"}
+                        : run.status === "degraded"
+                          ? `degraded \u00b7 +${run.rules_created} rule${run.rules_created !== 1 ? "s" : ""}`
+                          : "failed"}
                 </span>
+                {isNotFsConfined(run) && (
+                  <span
+                    className="learning-run-detail-degraded"
+                    title={NO_FS_CONFINEMENT_HINT}
+                  >
+                    {"\u26a0 no FS confinement"}
+                  </span>
+                )}
                 <span className="learning-run-time">
                   {run.status === "running" ? "now" : timeAgo(run.created_at)}
                 </span>
@@ -178,6 +278,68 @@ function RunHistory({ runs, liveLogs }: RunHistoryProps) {
                 <span className="learning-run-detail-label">Duration</span>
                 <span>{formatDuration(selected.duration_ms)}</span>
               </div>
+              {/* Derived inference rollup (feature 005 R-7 / H-6 / FR-024).
+                  Legacy/micro runs carry no `inference` — render em-dashes,
+                  never crash. Inference time is the summed model-call
+                  duration; the wall-clock Duration row above is kept. */}
+              <div className="learning-run-detail-row">
+                <span className="learning-run-detail-label">Model</span>
+                <span>{selected.inference?.primary_model ?? "—"}</span>
+              </div>
+              <div className="learning-run-detail-row">
+                <span className="learning-run-detail-label">Cost</span>
+                <span>
+                  {selected.inference
+                    ? `$${selected.inference.total_cost_usd.toFixed(4)}`
+                    : "—"}
+                </span>
+              </div>
+              <div className="learning-run-detail-row">
+                <span className="learning-run-detail-label">
+                  Inference time
+                </span>
+                <span>
+                  {selected.inference
+                    ? formatDuration(selected.inference.total_duration_ms)
+                    : "—"}
+                </span>
+              </div>
+              {selected.inference &&
+                selected.inference.failed_call_count > 0 && (
+                  <div className="learning-run-detail-row">
+                    <span className="learning-run-detail-label">
+                      Failed calls
+                    </span>
+                    <span className="learning-run-detail-degraded">
+                      {selected.inference.failed_call_count} /{" "}
+                      {selected.inference.call_count}
+                    </span>
+                  </div>
+                )}
+              {/* Honest confinement disclosure (feature 006 Follow-up A,
+                  R-A / C-A5). Surfaced only when the run explicitly recorded
+                  a not-FS-confined call; FS-confined and legacy/micro runs
+                  render exactly as before. Reuses the existing amber warn
+                  affordance (no new design system). */}
+              {isNotFsConfined(selected) && (
+                <>
+                  <div className="learning-run-detail-row">
+                    <span className="learning-run-detail-label">
+                      Confinement
+                    </span>
+                    <span className="learning-run-detail-degraded">
+                      {notFsConfinedLabel(selected)}
+                    </span>
+                  </div>
+                  <div
+                    className="learning-run-streak-banner"
+                    role="status"
+                  >
+                    <span className="learning-run-streak-icon">⚠</span>
+                    <span>{NO_FS_CONFINEMENT_HINT}</span>
+                  </div>
+                </>
+              )}
               <div className="learning-run-detail-row">
                 <span className="learning-run-detail-label">Time</span>
                 <span>

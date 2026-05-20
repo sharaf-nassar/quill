@@ -28,6 +28,14 @@ Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage and DEB. Au
 
 GitHub Actions workflow (`.github/workflows/release.yml`) triggers on `v*` tags or manual dispatch.
 
+### Backend CI Gate
+
+`.github/workflows/ci.yml` is the Rust backend gate (feature 005, FR-021 / SC-008) that also blocks release on failure.
+
+It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (warnings deny — hard gate), and `cargo test`. Its single job id `rust` is stable for reuse.
+
+`release.yml` calls it as a reusable workflow (`ci` job using `./.github/workflows/ci.yml`) and makes `create-release` `needs: ci`, so a failing learning-logic suite blocks the entire build/sign/notarize/publish chain (no OS/notarization matrix duplicated). Contract: `specs/005-learning-system-hardening/contracts/evaluation-harness.md`.
+
 ### Draft Release Pre-Creation
 
 A `create-release` job runs before all builds to create a single draft release. This prevents a race condition where parallel `tauri-action` instances each create their own draft, splitting assets across multiple releases and breaking the updater.
@@ -94,7 +102,7 @@ Available subcommands for the release script.
 
 Uses `codex` when installed, otherwise falls back to `claude`; `--ai claude` or `--ai codex` overrides the default selection.
 
-The Codex path pins `gpt-5.4`, `model_reasoning_effort="xhigh"`, and `service_tier="fast"` in non-interactive mode, forces `-C` to the git repo root, and leaves Claude on the existing Haiku-based path.
+The Codex path pins `gpt-5.4`, `model_reasoning_effort="xhigh"`, and `service_tier="fast"` in non-interactive mode, forces `-C` to the git repo root, and leaves Claude on its existing inference path.
 
 When release notes are generated through Codex in an interactive terminal, `release.sh` shows a live spinner plus a framed tail of the last 20 user-meaningful Codex progress lines. Internal hook, MCP, router, and sandbox-noise lines stay hidden unless the run fails.
 
@@ -227,20 +235,6 @@ Windows is not covered: detection assumes a Unix shell (`bash -lc`/`zsh -lc`) an
 After the static list, `resolve_command_path_with_attempts` queries `npm config get prefix`, `bun pm bin -g`, and `yarn global bin` through the login shell to pick up custom global-install prefixes. Results are cached and invalidated alongside the shell PATH. Returned bin dirs are validated against a trusted-roots allow-list (`$HOME`, `/usr`, `/opt`, `/Library`, `/snap`, `/nix`, `/run/current-system`, Linuxbrew, flatpak); a malicious npm/bun config that points the prefix elsewhere is dropped before Quill could later execute the binary as a trusted CLI. Failed detections record every path inspected on `ProviderStatus.lastDetectionAttempts` (omitted from JSON when empty) with the user's home directory redacted to `~/...` so the persisted/emitted blob does not leak the local username; the integrations menu's per-row diagnostic tooltip renders the redacted paths as inline `<code>` so they read distinctly from the surrounding prose.
 
 Both Claude and Codex detection share [[src-tauri/src/config.rs#detect_provider_cli]], which calls `resolve_command_path_with_attempts`, runs `--version` with `path_for_resolved_command`'s symlink-aware PATH augmentation, and returns the success bool plus the (already-redacted) attempts list.
-
-## Remote Plugin
-
-The `plugin/` directory contains a Claude Code plugin for remote host connectivity.
-
-### Plugin Manifest
-
-`plugin/.claude-plugin/plugin.json`: name "quill", version 2.0.0, provides `/quill:setup`, `/quill:learn`, `/quill:qbuild` commands. Installed via marketplace on remote machines.
-
-### Plugin MCP Server
-
-`plugin/mcp/server.py` runs a FastMCP server (via `uv`) with session query tools mirroring the local MCP.
-
-Provides search_history, list_sessions, get_session_context, get_branch_activity, get_token_usage, working-context indexing/search, bounded execution, fetch caching, continuity events, and compaction snapshots. Communicates back to the desktop widget's HTTP server for HTTP-backed tools while keeping plugin-local context under `~/.config/quill/context/`.
 
 ## Dependencies
 

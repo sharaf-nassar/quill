@@ -1,0 +1,25 @@
+{
+  "$schema_doc": "specs/005-learning-system-hardening/contracts/evaluation-harness.md",
+  "replay_set_version": 1,
+  "baseline_assistant_model": "claude-sonnet-4-6",
+  "frozen_at": "2026-05-18T00:00:00Z",
+  "schema_version": 1,
+  "staleness_days": 90,
+  "cases": [
+    "case_001_absolute_paths_positive",
+    "case_002_verify_before_commit_positive",
+    "case_003_overbroad_skip_tests_regresses",
+    "case_004_negative_transfer_python_to_rust",
+    "case_005_hallucinated_evidence",
+    "case_006_one_off_low_evidence",
+    "case_007_conflicting_pair_early_return",
+    "case_008_conflicting_pair_single_exit",
+    "case_009_suppressed_then_rederived",
+    "case_010_empty_no_signal",
+    "case_011_normal_friction_grep_before_edit",
+    "case_012_normal_friction_neutral_style_nit",
+    "case_013_stream_c_session_scope_positive",
+    "case_014_security_weakening_regresses"
+  ],
+  "_note": "Finalized in US4 task T050. 14 pre-redacted, synthetic, maintainer-labeled cases spanning the R-4 Decision 1 archetypes: clear-positive, clear-regressing/negative-transfer, hallucinated-evidence, one-off/low-evidence, conflicting-pair, suppressed-then-rederived, empty/no-signal, plus normal-friction. Baseline pinned to claude-sonnet-4-6; frozen_at re-stamped. Staleness: stale iff judge model != baseline_assistant_model OR age(frozen_at) > staleness_days."
+}

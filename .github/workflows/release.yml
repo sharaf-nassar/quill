@@ -7,7 +7,16 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Feature 005 / SC-008: a failing learning-logic suite must block release.
+  # Reuses the same fmt/clippy(-D warnings)/test gate enforced on PRs and main
+  # so bundles/signing only run if CI is green. No heavy OS matrix duplicated.
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   create-release:
+    needs: ci
     runs-on: ubuntu-latest
     permissions:
       contents: write

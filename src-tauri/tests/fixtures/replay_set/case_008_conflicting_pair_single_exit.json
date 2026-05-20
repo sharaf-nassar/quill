@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "Same 36-observation corpus as the early-return case. The single-exit style appears in only 2 incidental edits, neither reviewed; one was later reverted to a guard-clause form in a subsequent observation in the same corpus.",
+    "existing_rules_summary": "3 active rules. No control-flow rule yet. A sibling candidate 'prefer-early-return-guard-clauses' is under evaluation in the same run and is strongly supported.",
+    "provider_scope": ["claude"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "avoid-early-returns-keep-single-exit",
+    "content": "Avoid early returns. Every function should have a single exit point at the end so cleanup and post-conditions are centralized.",
+    "domain": "coding-style",
+    "claimed_confidence": 0.55
+  },
+  "expected_judgment": {
+    "verdict": "regresses",
+    "rationale": "Directly conflicts with the well-supported early-return rule from the same corpus, is backed by only 2 weak unreviewed edits (one reverted), and would force re-nesting the validation code the corpus deliberately flattened. The losing member of the conflicting pair."
+  },
+  "tags": ["conflicting-pair", "coding-style", "weak-evidence", "pair:control-flow", "archetype:conflicting"]
+}

@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "Stream C session-insight corpus from 18 indexed Python-project sessions: the agent consistently succeeded by mutating list arguments in place for performance. The replay scope under test is a Rust + TypeScript codebase whose project conventions (visible in 22 of its observations) require returning new values and never mutating shared inputs.",
+    "existing_rules_summary": "4 active rules. One is 'immutability-create-new-objects' (coding-style, confirmed) requiring new objects over in-place mutation in the Rust/TS project.",
+    "provider_scope": ["codex"],
+    "stream": "stream_c"
+  },
+  "rule_under_test": {
+    "name": "mutate-collections-in-place",
+    "content": "Modify lists and collections in place rather than allocating new ones. In-place mutation is faster and reduces allocations.",
+    "domain": "coding-style",
+    "claimed_confidence": 0.79
+  },
+  "expected_judgment": {
+    "verdict": "regresses",
+    "rationale": "Classic negative transfer: a pattern valid in the Python source sessions is misapplied to a Rust/TS target whose confirmed convention is the exact opposite. Applying it would induce shared-state bugs and contradict an existing rule."
+  },
+  "tags": ["clear-regressing", "negative-transfer", "coding-style", "cross-language", "archetype:negative-transfer"]
+}

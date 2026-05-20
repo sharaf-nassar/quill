@@ -525,6 +525,67 @@ fn default_confidence() -> f64 {
     0.5
 }
 
+// Feature 005 US5 T058 (R-7.1 / H-6 / FR-024) — derived per-call inference
+// record. One element of `RunInferenceSummary.calls`, decoded tolerantly
+// from a single `cc_client::InferenceCallMetadata` entry inside the JSON
+// array stored in `learning_runs.inference_metadata`. Field names mirror
+// the contract (`contracts/ipc-and-feedback.md` "Run history surfacing")
+// so the frontend can render Model / Cost / Inference-time per phase.
+#[derive(Serialize, Clone, Debug)]
+pub struct RunInferenceCall {
+    pub phase: String,
+    pub model: Option<String>,
+    pub cost_usd: f64,
+    pub duration_ms: u64,
+    pub ttft_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub success: bool,
+    pub failure_kind: Option<String>,
+    // Feature 006 Follow-up A (R-A / C-A) — honest OS-confinement disclosure
+    // for this call. `sandbox` is the recorded tag from the closed
+    // `cc_client::SandboxKind` vocabulary; `fs_confined` is `true` only when
+    // that mechanism actually denies out-of-workspace filesystem R/W
+    // (`bwrap`/`sandbox-exec`). `None` only on legacy records that recorded
+    // no `sandbox` tag (tolerant decode; never an error path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confinement: Option<RunInferenceConfinement>,
+}
+
+// Feature 006 Follow-up A (R-A / C-A) — per-call OS-confinement descriptor
+// projected onto `RunInferenceCall`/`RunInferenceSummary` so RunHistory can
+// visually distinguish a not-filesystem-confined run and show a remediation
+// hint. Derived (not stored): `fs_confined` is computed from the recorded
+// `sandbox` tag, via `cc_client::sandbox_tag_is_fs_confined`.
+#[derive(Serialize, Clone, Debug)]
+pub struct RunInferenceConfinement {
+    pub sandbox: String,
+    pub fs_confined: bool,
+}
+
+// Feature 005 US5 T058 (R-7.1 / H-6 / FR-024) — derived rollup over a run's
+// `inference_metadata` JSON array. Surfaced on `LearningRun` so RunHistory
+// can show per-run cost / model / inference time. `primary_model` is the
+// model with the highest total cost across calls. Decoded tolerantly:
+// NULL / parse-error / legacy / micro runs (no inference) ⇒ `None`.
+#[derive(Serialize, Clone, Debug)]
+pub struct RunInferenceSummary {
+    pub total_cost_usd: f64,
+    pub total_duration_ms: u64,
+    pub primary_model: Option<String>,
+    pub call_count: u32,
+    pub failed_call_count: u32,
+    pub calls: Vec<RunInferenceCall>,
+    // Feature 006 Follow-up A (R-A / C-A) — run-level confinement rollup so
+    // RunHistory can disclose reduced isolation once per run. `true` iff
+    // every call that recorded a `sandbox` tag was filesystem-confined
+    // (`bwrap`/`sandbox-exec`); `false` if any recorded call ran without
+    // filesystem confinement. `None` when no call carried a `sandbox` tag
+    // (legacy records) so consumers render unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_fs_confined: Option<bool>,
+}
+
 // Learning run record returned to frontend/API
 #[derive(Serialize, Clone, Debug)]
 pub struct LearningRun {
@@ -540,6 +601,11 @@ pub struct LearningRun {
     pub phases: Option<String>,
     pub created_at: String,
     pub provider_scope: Vec<IntegrationProvider>,
+    // Feature 005 US5 T058 (R-7.1 / H-6 / FR-024) — derived inference rollup
+    // decoded from `learning_runs.inference_metadata`. `None` for legacy /
+    // micro runs that recorded no per-call metadata.
+    #[serde(default)]
+    pub inference: Option<RunInferenceSummary>,
 }
 
 // Learned rule record returned to frontend
@@ -565,6 +631,25 @@ pub struct LearnedRule {
 pub struct ToolCount {
     pub tool_name: String,
     pub count: i64,
+}
+
+// Feature 005 US5 T062 (R-7.4 / M-1 / FR-027) — a row of the formerly
+// write-only `observation_summaries` table. This is the only post-retention
+// historical record of observation activity (raw `observations` rows are
+// pruned by `cleanup_old_observations`), so the analytics trend reads it as
+// the historical tail to survive retention. `period` is the cleanup date
+// (`%Y-%m-%d`) the summary was rolled up on; `tool_counts` is a JSON object
+// of per-tool counts; `error_count` now reflects the tightened structured
+// failure signal (no longer a bare `%error%` substring).
+#[derive(Serialize, Clone, Debug)]
+pub struct ObservationSummary {
+    pub period: String,
+    pub provider: String,
+    pub project: Option<String>,
+    pub tool_counts: String,
+    pub error_count: i64,
+    pub total_observations: i64,
+    pub created_at: String,
 }
 
 // Learning settings
@@ -704,6 +789,23 @@ pub struct SessionRef {
     pub session_id: String,
 }
 
+/// Feature 005 US3 T038 (H-1 / FR-015, research R-6 "Grounding"): a single
+/// machine-checkable citation an extracting/synthesizing model must attach to
+/// a candidate so the claim can be resolved back to real captured evidence.
+///
+/// `kind` is a per-stream namespace — `"observation"` (Stream A, `id` = the
+/// real `observations.id`), `"commit"` (Stream B, `id` = a git short-hash or
+/// the snapshot HEAD key), or `"session"` (Stream C, `id` = the indexed
+/// `session_id`). `id` is always carried as a string so a SHA, an integer
+/// observation id, and a session id share one shape. Resolution +
+/// zero-resolvable rejection happens in `learning::write_rule_files` via
+/// `Storage::resolve_evidence_refs` before a candidate is ever persisted.
+#[derive(Serialize, Deserialize, Clone, Debug, schemars::JsonSchema)]
+pub struct EvidenceRef {
+    pub kind: String,
+    pub id: String,
+}
+
 // Haiku analysis output item (parsed from JSON)
 #[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 pub struct AnalysisRule {
@@ -713,6 +815,13 @@ pub struct AnalysisRule {
     pub content: String,
     #[serde(default)]
     pub is_anti_pattern: bool,
+    /// H-1 grounding refs (feature 005 US3 T038). Carried from
+    /// `StreamPattern::evidence_refs` for single-stream output and emitted
+    /// directly by the synthesis model for the multi-stream path; schemars
+    /// auto-propagates this into the `invoke_typed` schema so the model is
+    /// instructed to populate it.
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 // Verdict on an existing rule from LLM analysis
@@ -757,6 +866,11 @@ pub struct StreamPattern {
     pub confidence: f64,
     #[serde(default)]
     pub is_anti_pattern: bool,
+    /// H-1 grounding refs (feature 005 US3 T038). The free-text `evidence`
+    /// field above is intentionally KEPT for human-readable context; these
+    /// are the machine-resolvable citations the eligibility gate enforces.
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 // Cached git history snapshot, one per project.
@@ -792,6 +906,11 @@ impl StreamFindings {
                     confidence: p.confidence,
                     content: format!("{}\n\nEvidence: {}", p.description, p.evidence),
                     is_anti_pattern: p.is_anti_pattern,
+                    // Feature 005 US3 T038 (H-1): carry the per-stream
+                    // grounding refs through the single-stream path so the
+                    // candidate the eligibility gate sees keeps its
+                    // citations (synthesis emits its own refs directly).
+                    evidence_refs: p.evidence_refs.clone(),
                 })
                 .collect(),
             verdicts: self.verdicts.clone(),

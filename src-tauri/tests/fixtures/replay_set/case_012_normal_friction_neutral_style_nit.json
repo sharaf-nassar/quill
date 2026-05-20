@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "38 observations. Twice the agent wrote a single-line if without braces and the project formatter immediately added braces on the next save with no error and no behavior change. The formatter is enforced in CI, so the style is auto-corrected regardless of how the agent writes it.",
+    "existing_rules_summary": "3 active rules. A 'respect-project-formatter' rule (tooling, confirmed) already says to let the configured formatter own style.",
+    "provider_scope": ["claude", "codex"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "always-write-braces-on-if",
+    "content": "Always write braces around single-line if bodies for clarity.",
+    "domain": "coding-style",
+    "claimed_confidence": 0.6
+  },
+  "expected_judgment": {
+    "verdict": "neutral",
+    "rationale": "The auto-formatter already enforces this deterministically, so the rule changes no outcome — it neither prevents a failure nor causes one, and it duplicates an existing formatter-deference rule. Harmless redundancy, not an improvement."
+  },
+  "tags": ["normal-friction", "coding-style", "redundant", "no-net-effect", "archetype:neutral"]
+}

@@ -25,7 +25,7 @@ Hook-reported tokens still flow into `token_snapshots` keyed by the parent `sess
 
 ## Learning Analysis Pipeline
 
-Tool-use observations and git history are analyzed by LLMs to discover reusable behavioral patterns.
+Tool-use observations, git history, and recent session history are analyzed by LLMs to discover reusable behavioral patterns.
 
 1. Provider hook script (`observe.cjs`) captures PreToolUse/PostToolUse events
 2. POSTs observation to `POST /api/v1/learning/observations`
@@ -34,12 +34,13 @@ Tool-use observations and git history are analyzed by LLMs to discover reusable 
 5. [[src-tauri/src/learning.rs]] spawns async analysis task scoped to Claude, Codex, or both providers
 6. **Stream A**: Fetch up to 100 unanalyzed observations, compress for LLM context
 7. **Stream B**: Fetch git history for project via [[src-tauri/src/git_analysis.rs]] (cached by HEAD hash)
-8. Haiku extracts patterns from each stream independently via [[src-tauri/src/cc_client.rs#invoke_typed]], which spawns the `claude` CLI in headless one-shot mode
-9. Sonnet synthesizes combined findings and applies verdicts on existing rules, also via [[src-tauri/src/cc_client.rs#invoke_typed]]
-10. Per-call metadata (tokens, model, durations, cost, cache stats, stop reason) is captured into `learning_runs.inference_metadata` as a JSON array
-11. New rules stored in `learned_rules` with `provider_scope` and written to Claude, Codex, or shared learned-rule directories
-12. Existing rule confidence updated using Wilson lower-bound scoring with freshness decay
-13. `learning-updated` event emitted; real-time `learning-log` events stream progress to UI
+8. **Stream C** ([[src-tauri/src/learning.rs#analyze_sessions_stream]]): select recent top-level sessions from Quill's own local session index (cross-project, provider-scoped, recency-capped) and assemble secret-redacted per-session digests via [[src-tauri/src/learning.rs#build_session_digests]] — no external `claude /insights` command
+9. Sonnet 4.6 extracts patterns from each of the three streams independently via [[src-tauri/src/cc_client.rs#invoke_typed]], which spawns the `claude` CLI in headless one-shot mode; all streams emit the same `StreamFindings` shape
+10. Synthesis decision is uniform over the three streams: 0 with findings → run fails; exactly 1 → its findings used directly (Sonnet skipped); ≥2 → Sonnet synthesizes combined findings and applies verdicts on existing rules, also via [[src-tauri/src/cc_client.rs#invoke_typed]]
+11. Per-call metadata (tokens, model, durations, cost, cache stats, stop reason) is captured into `learning_runs.inference_metadata` as a JSON array for every stream including `stream_c`
+12. New rules stored in `learned_rules` with `provider_scope` and written to Claude, Codex, or shared learned-rule directories
+13. Existing rule confidence updated using Wilson lower-bound scoring with freshness decay
+14. `learning-updated` event emitted; real-time `learning-log` events stream progress to UI
 
 ### Observation Compression
 
@@ -81,7 +82,7 @@ LLM analyzes project memory files to suggest consolidation, cleanup, and improve
 3. Filters: exclude denylisted directories, minified/compiled files, oversized content
 4. Compute dynamic budget allocation based on available section types
 5. Assemble LLM prompt: memory file contents + scoped `CLAUDE.md` or `AGENTS.md` instruction files + learned rules + instinct sections
-6. Call Haiku via [[src-tauri/src/cc_client.rs#invoke_typed]] (`claude` CLI headless mode) to generate structured optimization suggestions; per-call metadata is captured into `optimization_runs.inference_metadata`
+6. Call Sonnet 4.6 via [[src-tauri/src/cc_client.rs#invoke_typed]] (`claude` CLI headless mode) to generate structured optimization suggestions; per-call metadata is captured into `optimization_runs.inference_metadata`
 7. Backend validates suggestion shape before storage: malformed merges, missing content/targets, instruction-file merges, and other unsafe outputs are discarded instead of being surfaced in the UI
 8. Valid suggestions stored in `optimization_suggestions` with `provider_scope` and status=pending
 9. `memory-optimizer-updated` event notifies frontend

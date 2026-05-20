@@ -496,7 +496,7 @@ fn index_session_messages_in_background(
 async fn post_observation(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(payload): Json<ObservationPayload>,
+    Json(mut payload): Json<ObservationPayload>,
 ) -> impl IntoResponse {
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
@@ -535,6 +535,23 @@ async fn post_observation(
     }
     if payload.cwd.as_ref().is_some_and(|c| c.len() > MAX_CWD_LEN) {
         return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
+    }
+
+    // Redact secrets/PII at capture (R-1 / C-1): redact the free-text string
+    // fields BEFORE spawning the background store so no plaintext secret is
+    // ever persisted. This is a bounded transform (lengths already clamped to
+    // MAX_TOOL_DATA_LEN/MAX_CWD_LEN above) and stays on the synchronous path
+    // only up to this point — the 202 ACCEPTED is still returned immediately
+    // after, preserving the hook fast-ack contract. Non-sensitive fields
+    // (provider, session_id, hook_phase, tool_name) are left untouched.
+    if let Some(tool_input) = payload.tool_input.as_deref() {
+        payload.tool_input = Some(crate::redaction::redact(tool_input));
+    }
+    if let Some(tool_output) = payload.tool_output.as_deref() {
+        payload.tool_output = Some(crate::redaction::redact(tool_output));
+    }
+    if let Some(cwd) = payload.cwd.as_deref() {
+        payload.cwd = Some(crate::redaction::redact(cwd));
     }
 
     store_observation_in_background(state.storage, payload);
@@ -698,8 +715,25 @@ async fn post_learned_rule(
         return (StatusCode::BAD_REQUEST, "Invalid file_path".to_string());
     }
 
+    // Feature 005 US2 T034 (H-4 / FR-011, contracts/ipc-and-feedback.md
+    // "Authorization model"): the HTTP ingest path is CLAMPED to
+    // `lifecycle='candidate'` and is structurally incapable of producing
+    // `awaiting_review` or `active`. This is enforced by construction, not by
+    // a runtime branch:
+    //   1. `LearnedRulePayload` carries NO `lifecycle`/`state` field, so a
+    //      remote caller cannot request an elevated lifecycle.
+    //   2. `Storage::store_learned_rule` is the SOLE sink reached here; it
+    //      hardcodes `'candidate'` on INSERT and its `ON CONFLICT` clause
+    //      never assigns `awaiting_review`/`active` (promotion to those states
+    //      is reachable ONLY via the authorized `promote_learned_rule` IPC).
+    // This handler must keep calling `store_learned_rule` and nothing that can
+    // promote/approve; do not add a lifecycle/state parameter to the payload.
+    // Feature 006 Follow-up B: `store_learned_rule` now returns a
+    // `pending_changed` signal consumed only by the `write_rule_files` US2
+    // path. This clamped HTTP ingest only ever writes `lifecycle='candidate'`
+    // (never `awaiting_review`), so the signal is irrelevant here — discard.
     match state.storage.store_learned_rule(&payload) {
-        Ok(()) => {
+        Ok(_pending_changed) => {
             let _ = state.app_handle.emit("learning-updated", ());
             (StatusCode::OK, "ok".to_string())
         }

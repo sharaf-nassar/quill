@@ -53,8 +53,19 @@ pub async fn collect_git_data(
 
     // 3. Cache miss — collect fresh data
     log::debug!("Git cache miss for {project_path}, collecting data...");
-    let raw = run_git_commands(project_path, commit_limit).await?;
-    let compressed = compress_git_data(&raw, 4500);
+    let mut raw = run_git_commands(project_path, commit_limit).await?;
+
+    // Redact secrets/PII from every git-derived text field BEFORE it is
+    // compressed/truncated AND before it lands in the git_snapshots.raw_data
+    // cache, so neither the LLM prompt nor a cache hit can re-leak.
+    redact_raw_git_data(&mut raw);
+
+    // Snapshot HEAD short-hash fallback (T040/H-1): always resolvable via the
+    // `git_snapshots` cache key even if per-commit `%h` lines get truncated
+    // out of the prompt, so a single-commit-history or heavily-compressed
+    // repo can still ground a candidate.
+    let head_short: String = head_hash.chars().take(12).collect();
+    let compressed = compress_git_data(&raw, &head_short, 4500);
 
     // Count commits from cochange data (one entry per commit, not inflated by filenames)
     let commit_count = raw.cochange_commits.len() as i64;
@@ -78,13 +89,19 @@ async fn run_git_commands(project_path: &str, limit: usize) -> Result<RawGitData
     let limit_str = limit.to_string();
 
     // Run commands in parallel
+    // Feature 005 US3 T040 (H-1, research R-6 "Grounding"): prefix each
+    // commit header with its abbreviated hash (`%h`) so the model can cite
+    // `kind="commit", id="<shorthash>"` and `Storage::resolve_evidence_refs`
+    // can verify it with `git cat-file -e <hash>^{commit}`. The trailing
+    // `--name-only` file lines have no hash (resolution only matches the
+    // header tokens), and redaction still runs before compression.
     let args_messages = [
         "log",
         "--oneline",
         "-n",
         &limit_str,
         "--name-only",
-        "--format=%s",
+        "--format=%h %s",
     ];
     let args_hotspots = ["log", "-n", &limit_str, "--name-only", "--format="];
     let args_cochange = [
@@ -312,9 +329,28 @@ fn scan_folder_structure(project_path: &str) -> String {
     entries.join("\n")
 }
 
+/// Redact secrets/PII from all git-derived text fields in place.
+///
+/// Runs BEFORE `compress_git_data` truncates and BEFORE the result is written
+/// to the `git_snapshots.raw_data` cache, so the cached value and the prompt
+/// value are both redacted (a cache hit cannot re-leak). Covers commit
+/// subjects, file hotspots, diff stats, folder structure, and the per-commit
+/// co-change file lists.
+fn redact_raw_git_data(raw: &mut RawGitData) {
+    raw.commit_messages = crate::redaction::redact(&raw.commit_messages);
+    raw.hotspots = crate::redaction::redact(&raw.hotspots);
+    raw.diff_stats = crate::redaction::redact(&raw.diff_stats);
+    raw.folder_structure = crate::redaction::redact(&raw.folder_structure);
+    for commit in &mut raw.cochange_commits {
+        for file in commit.iter_mut() {
+            *file = crate::redaction::redact(file);
+        }
+    }
+}
+
 /// Compress raw git data into a prompt-friendly format within a byte budget.
 /// Priority: commit patterns > co-changes > folder structure > diff stats.
-fn compress_git_data(raw: &RawGitData, max_bytes: usize) -> String {
+fn compress_git_data(raw: &RawGitData, head_short: &str, max_bytes: usize) -> String {
     let cochange_text = extract_cochange_clusters(&raw.cochange_commits);
 
     let sections = [
@@ -325,8 +361,9 @@ fn compress_git_data(raw: &RawGitData, max_bytes: usize) -> String {
         ("DIFF STATS", &raw.diff_stats, 500),
     ];
 
-    let mut result = String::new();
-    let mut remaining = max_bytes;
+    // Always-present snapshot HEAD fallback citation key (T040/H-1).
+    let mut result = format!("[SNAPSHOT HEAD {head_short}]\n\n");
+    let mut remaining = max_bytes.saturating_sub(result.len());
 
     for (header, content, budget) in &sections {
         if remaining < 50 {

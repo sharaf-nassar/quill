@@ -44,6 +44,15 @@ const CONTEXT_TOOLS = [
 
 const MARKER_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const TAINTED_STATE_FILE = "tainted.json";
+const TAINTED_MAX_PATHS = 256;
+
+// Pure-reader commands that dump file content into the transcript when given a
+// path argument. Intentionally excludes interpreters (python/node/ruby/perl)
+// because those usually execute rather than print; including them would block
+// legitimate `bash /tmp/installer.sh` style fetch-and-run flows.
+const READER_COMMAND_PATTERN =
+  /\b(cat|bat|head|tail|less|more|view|od|xxd|strings|hexdump|sed|awk|grep|rg|ack|jq|yq|xq|xmllint)\b/i;
 
 function homeDir() {
   return process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -209,6 +218,107 @@ function isLikelyVerboseBash(command) {
     stripped.length > 220;
 }
 
+// --- Taint tracking ---------------------------------------------------------
+//
+// When curl/wget quietly writes to a file (`-o PATH`, `-O`, `--output-document`,
+// or `>`/`>>` redirect), record the destination so we can deny later reads of
+// that path. Without this, the model bypasses the network-fetch guard by
+// splitting `curl ... | jq .` into `curl -o /tmp/x` followed by `jq . /tmp/x`,
+// which dumps the same response into the transcript anyway.
+
+function taintedStatePath(provider, sessionId) {
+  return path.join(markerDir(provider, sessionId), TAINTED_STATE_FILE);
+}
+
+function loadTainted(provider, sessionId) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(taintedStatePath(provider, sessionId), "utf8"));
+    return new Set(Array.isArray(raw.paths) ? raw.paths : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function saveTainted(provider, sessionId, set) {
+  try {
+    const filePath = taintedStatePath(provider, sessionId);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const arr = Array.from(set);
+    const trimmed = arr.length > TAINTED_MAX_PATHS ? arr.slice(-TAINTED_MAX_PATHS) : arr;
+    fs.writeFileSync(filePath, JSON.stringify({ paths: trimmed }), "utf8");
+  } catch (_) {
+    // best-effort; routing must keep working
+  }
+}
+
+function resolveLiteralPath(p) {
+  if (!p) return p;
+  let out = p;
+  if (out.startsWith("~")) out = path.join(homeDir(), out.slice(1));
+  if (!path.isAbsolute(out)) {
+    try {
+      out = path.resolve(process.cwd(), out);
+    } catch (_) {
+      return p;
+    }
+  }
+  return out;
+}
+
+function extractFetchOutputPaths(command) {
+  const stripped = stripQuotedContent(command);
+  const out = [];
+  for (const segment of stripped.split(/\s*(?:&&|\|\||;)\s*/)) {
+    if (!/(^|\s)(curl|wget)\s/i.test(segment)) continue;
+    if (/\s(-I|--head)(\s|$)/.test(segment)) continue;
+    for (const m of segment.matchAll(/\s(?:-o|--output|-O|--output-document)\s+(\S+)/g)) {
+      const p = m[1];
+      if (p && p !== "-" && p !== "/dev/stdout" && p !== "/dev/null") out.push(p);
+    }
+    for (const m of segment.matchAll(/\s>>?\s*(\S+)/g)) {
+      const p = m[1];
+      if (p && p !== "/dev/null" && p !== "/dev/stdout") out.push(p);
+    }
+  }
+  return out;
+}
+
+function recordTainted(provider, sessionId, paths) {
+  if (!paths || paths.length === 0) return;
+  const set = loadTainted(provider, sessionId);
+  for (const p of paths) {
+    set.add(p);
+    const resolved = resolveLiteralPath(p);
+    if (resolved && resolved !== p) set.add(resolved);
+  }
+  saveTainted(provider, sessionId, set);
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function commandReadsTaintedPath(command, taintedSet) {
+  if (!command || taintedSet.size === 0) return null;
+  const stripped = stripQuotedContent(command);
+  if (!READER_COMMAND_PATTERN.test(stripped)) return null;
+  for (const p of taintedSet) {
+    const esc = escapeRegExp(p);
+    if (new RegExp(`(?:^|[\\s=])${esc}(?:[\\s)>;|&]|$)`).test(stripped)) return p;
+  }
+  return null;
+}
+
+function readTargetsTaintedPath(filePath, taintedSet) {
+  if (!filePath || taintedSet.size === 0) return null;
+  if (taintedSet.has(filePath)) return filePath;
+  const resolved = resolveLiteralPath(filePath);
+  if (resolved && taintedSet.has(resolved)) return resolved;
+  return null;
+}
+
+// --- Routing ----------------------------------------------------------------
+
 function guidance(type) {
   const tools = CONTEXT_TOOLS.join(", ");
   if (type === "read") {
@@ -221,6 +331,27 @@ function guidance(type) {
     return `Quill context: build/test commands can produce large logs. Capture logs to a file or tail failures only, and use ${tools} for prior debug context.`;
   }
   return `Quill context: keep Bash output short. For session history, prior work, or transcript details, prefer ${tools}; summarize broad shell output.`;
+}
+
+function fetchDenyReason() {
+  return [
+    "Quill context routing blocked a raw network fetch.",
+    "DO NOT bypass by fetching to a file and then reading it back (`curl -o X && cat X`, jq, grep, sed, awk, Read, etc.) — that defeats this guard and the path will be denied on the next read.",
+    "Use instead:",
+    "  - mcp__quill__quill_execute for `curl ... | jq` workflows (output is bounded + indexed automatically)",
+    "  - mcp__quill__quill_fetch_and_index for HTML / docs / web pages",
+    "  - mcp__quill__quill_search_context to retrieve focused chunks afterwards",
+    "Only use `curl -o path` / `wget -O path` for binary artifacts you will EXECUTE or INSTALL (tarballs, packages, images) — never to inspect content.",
+  ].join("\n");
+}
+
+function taintedReadDenyReason(tool, taintedPath) {
+  return [
+    `Quill context routing blocked ${tool} on ${taintedPath} because that path was written by an earlier curl/wget in this session.`,
+    "Reading freshly-fetched network content into the transcript defeats the fetch routing guard.",
+    "Use mcp__quill__quill_search_context if the response was already indexed, or mcp__quill__quill_execute to re-fetch with bounded output (e.g. `curl -sS URL | jq ...`).",
+    "If this file is genuinely not network content (you reused the path for a scratch artifact), choose a different filename for the fetch and try again.",
+  ].join("\n");
 }
 
 function emitRouterTelemetry(input, fields) {
@@ -305,7 +436,7 @@ function route(input) {
       provider,
       sessionId,
       tool,
-      "Quill context routing blocked WebFetch because full page dumps can exhaust context. Use mcp__quill__quill_fetch_and_index for web content, then mcp__quill__quill_search_context to retrieve focused results.",
+      "Quill context routing blocked WebFetch because full page dumps can exhaust context. Use mcp__quill__quill_fetch_and_index for web content, then mcp__quill__quill_search_context to retrieve focused chunks.",
       { route: "webfetch" },
     );
   }
@@ -320,10 +451,28 @@ function route(input) {
         provider,
         sessionId,
         tool,
-        "Quill context routing blocked a raw network fetch that can dump large content. Use mcp__quill__quill_fetch_and_index for web content, then mcp__quill__quill_search_context for focused chunks. Only fetch to a file (e.g. `curl -sS -o path`) when you need a binary or artifact on disk.",
+        fetchDenyReason(),
         { route: "raw-network-fetch", commandBytes: byteLength(command) },
       );
     }
+
+    const tainted = loadTainted(provider, sessionId);
+    if (tainted.size > 0) {
+      const hit = commandReadsTaintedPath(command, tainted);
+      if (hit) {
+        return deny(
+          input,
+          provider,
+          sessionId,
+          tool,
+          taintedReadDenyReason("Bash", hit),
+          { route: "tainted-read-bash", path: hit },
+        );
+      }
+    }
+
+    const outputs = extractFetchOutputPaths(command);
+    if (outputs.length > 0) recordTainted(provider, sessionId, outputs);
 
     if (isLargeBuildCommand(command) && once(provider, sessionId, "build")) {
       return additionalContext(input, provider, sessionId, tool, guidance("build"), "build");
@@ -336,8 +485,25 @@ function route(input) {
     return null;
   }
 
-  if (tool === "Read" && once(provider, sessionId, "read")) {
-    return additionalContext(input, provider, sessionId, tool, guidance("read"), "read");
+  if (tool === "Read") {
+    const tainted = loadTainted(provider, sessionId);
+    if (tainted.size > 0) {
+      const hit = readTargetsTaintedPath(String(toolInput.file_path || ""), tainted);
+      if (hit) {
+        return deny(
+          input,
+          provider,
+          sessionId,
+          tool,
+          taintedReadDenyReason("Read", hit),
+          { route: "tainted-read", path: hit },
+        );
+      }
+    }
+    if (once(provider, sessionId, "read")) {
+      return additionalContext(input, provider, sessionId, tool, guidance("read"), "read");
+    }
+    return null;
   }
 
   if (tool === "Grep" && once(provider, sessionId, "grep")) {
@@ -362,4 +528,15 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { route };
+module.exports = {
+  route,
+  hasRawNetworkDump,
+  isInlineNetworkFetch,
+  extractFetchOutputPaths,
+  commandReadsTaintedPath,
+  readTargetsTaintedPath,
+  loadTainted,
+  recordTainted,
+  fetchDenyReason,
+  taintedReadDenyReason,
+};

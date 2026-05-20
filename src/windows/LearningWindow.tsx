@@ -1,12 +1,14 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useLearningData } from "../hooks/useLearningData";
+import { normalizeProviderScope } from "../utils/providers";
 import StatusStrip from "../components/learning/StatusStrip";
 import RuleCard from "../components/learning/RuleCard";
 import DomainBreakdown from "../components/learning/DomainBreakdown";
 import FloatingRunsWindow from "../components/learning/FloatingRunsWindow";
 import { MemoriesPanel } from "../components/learning/MemoriesPanel";
 import type { LearningSettings, ProviderFilter } from "../types";
+import { isActiveRule } from "../types";
 import "../styles/learning.css";
 
 const TRIGGER_OPTIONS = [
@@ -128,12 +130,32 @@ function LearningPanel() {
     triggerAnalysis,
     deleteRule,
     promoteRule,
+    submitRuleFeedback,
   } = useLearningData(providerFilter);
 
   const [activeTab, setActiveTab] = useState<"rules" | "memories">("rules");
   const [showRuns, setShowRuns] = useState(false);
   const handleCloseRuns = useCallback(() => setShowRuns(false), []);
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // Per-provider contribution to shared-scope rules (feature 005 M-6 /
+  // FR-028), derived from the already-fetched `rules` — no extra fetch. A
+  // rule whose normalized scope spans >1 provider is "shared"; we count how
+  // many such rules each provider participates in so the asymmetry
+  // disclosure on the combined StatusStrip is concrete, not generic.
+  const sharedScope = useMemo(() => {
+    let claude = 0;
+    let codex = 0;
+    let sharedRuleCount = 0;
+    for (const rule of rules) {
+      const scope = normalizeProviderScope(rule.provider_scope);
+      if (scope.length <= 1) continue;
+      sharedRuleCount += 1;
+      if (scope.includes("claude")) claude += 1;
+      if (scope.includes("codex")) codex += 1;
+    }
+    return { claude, codex, sharedRuleCount };
+  }, [rules]);
 
   const handleToggleEnabled = (on: boolean) => {
     updateSettings({ ...settings, enabled: on });
@@ -237,10 +259,16 @@ function LearningPanel() {
               lastRun={runs[0]}
               analyzing={analyzing}
               onAnalyze={triggerAnalysis}
+              sharedScope={sharedScope}
             />
             {(() => {
-              const activeRules = rules.filter((r) => r.file_path.length > 0);
-              const discoveredRules = rules.filter((r) => r.file_path.length === 0);
+              // Active = written `.md` AND a non-terminal lifecycle. A rule
+              // that is superseded/conflict_flagged/rejected/tombstoned but
+              // still has a stale `.md` must NOT read as active (feature 005
+              // US3); it falls through to the discovered group so it stays
+              // visible with its lifecycle badge and remains actionable.
+              const activeRules = rules.filter(isActiveRule);
+              const discoveredRules = rules.filter((r) => !isActiveRule(r));
               return (
                 <>
                   <div className="learning-section">
@@ -254,7 +282,12 @@ function LearningPanel() {
                       </div>
                     ) : (
                       activeRules.map((rule) => (
-                        <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} />
+                        <RuleCard
+                          key={rule.name}
+                          rule={rule}
+                          onDelete={deleteRule}
+                          onSubmitFeedback={submitRuleFeedback}
+                        />
                       ))
                     )}
                   </div>
@@ -265,7 +298,13 @@ function LearningPanel() {
                         <span className="learning-section-count">{discoveredRules.length}</span>
                       </div>
                       {discoveredRules.map((rule) => (
-                        <RuleCard key={rule.name} rule={rule} onDelete={deleteRule} onPromote={promoteRule} />
+                        <RuleCard
+                          key={rule.name}
+                          rule={rule}
+                          onDelete={deleteRule}
+                          onPromote={rule.file_path.length === 0 ? promoteRule : undefined}
+                          onSubmitFeedback={submitRuleFeedback}
+                        />
                       ))}
                     </div>
                   )}

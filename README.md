@@ -38,7 +38,6 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 ### Token tracking
 - Per-turn input/output/cache token counts via Claude Code hook
-- **Multi-host support** — remote Claude Code instances can report usage over the network
 - Token sparkline in the live view and dual-axis chart overlay in analytics
 
 ### Learning
@@ -84,13 +83,7 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
   - **`get_learned_rules`** — retrieve learned coding patterns
   - **`get_tool_details`** — inspect full tool input/output for a specific action
 - Context tools (only when context preservation is enabled): see the Working context preservation section above
-- Automatically configured on local installs when the app starts — no plugin or manual setup needed
-- For remote hosts, available after installing the plugin and running `/quill:setup`
-
-### Build skill
-- `/quill:build` command orchestrates multi-agent feature implementation
-- Explores the codebase, creates wave-based implementation plans, and dispatches parallel agents
-- Available via the plugin on remote hosts
+- Automatically configured when the app starts — no manual setup needed
 
 ### Plugin manager
 - Browse, install, update, and remove Claude Code plugins from a marketplace
@@ -158,16 +151,9 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 graph TB
     subgraph Sources [" Claude Code Integration "]
-        direction LR
-        subgraph Local [" Local · automatic "]
-            CC(["Claude Code"])
-            BH(["Bundled Hooks"])
-            MS(["MCP Server"])
-        end
-        subgraph Remote [" Remote · plugin "]
-            RC(["Claude Code"])
-            PH(["Plugin Hooks"])
-        end
+        CC(["Claude Code"])
+        BH(["Bundled Hooks"])
+        MS(["MCP Server"])
     end
 
     subgraph Widget [" Quill · Tauri Desktop App "]
@@ -182,11 +168,9 @@ graph TB
 
     CC -- hooks --> BH
     CC <-->|protocol| MS
-    RC -. hooks .-> PH
 
     BH -- "tokens · sessions" --> BE
     MS -- queries --> BE
-    PH -. "tokens · sessions" .-> BE
 
     FE <-->|Tauri IPC| BE
     BE <--> DB
@@ -199,8 +183,6 @@ graph TB
     style CC fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px
     style BH fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px
     style MS fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px
-    style RC fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px,stroke-dasharray:5 5
-    style PH fill:#6366f1,stroke:#818cf8,color:#fff,stroke-width:2px,stroke-dasharray:5 5
     style FE fill:#3b82f6,stroke:#60a5fa,color:#fff,stroke-width:2px
     style BE fill:#3b82f6,stroke:#60a5fa,color:#fff,stroke-width:2px
     style DB fill:#8b5cf6,stroke:#a78bfa,color:#fff,stroke-width:2px
@@ -208,8 +190,6 @@ graph TB
     style API fill:#f59e0b,stroke:#fbbf24,color:#000,stroke-width:2px
     style GH fill:#f59e0b,stroke:#fbbf24,color:#000,stroke-width:2px
     style Sources fill:#0f172a,stroke:#334155,color:#94a3b8
-    style Local fill:#1e293b,stroke:#475569,color:#94a3b8
-    style Remote fill:#1e293b,stroke:#475569,color:#94a3b8,stroke-dasharray:5 5
     style Widget fill:#0f172a,stroke:#475569,color:#e2e8f0
 ```
 
@@ -324,37 +304,9 @@ When the Quill app runs on the same machine as Claude Code, **everything is conf
 
 Just install the app, launch it, and restart Claude Code. Token tracking, learning, session search, and MCP tools will all be active.
 
-### Remote setup (plugin required)
-
-When Claude Code runs on a different machine than the Quill app (e.g. a remote dev server), install the plugin on the remote machine to relay data over the network:
-
-1. Add the marketplace:
-
-```
-/plugin marketplace add sharaf-nassar/quill
-```
-
-2. Install the plugin:
-
-```
-/plugin install quill@sharaf-nassar/quill
-```
-
-3. **Restart** Claude Code, then run the setup skill:
-
-```
-/quill:setup
-```
-
-The setup skill will ask for the IP address of the machine running the Quill app and the bearer secret. After setup, every Claude Code turn on the remote machine will report token counts and tool observations to the widget over the network.
-
-### Multi-host setup
-
-Multiple remote machines can report to a single Quill app. Install the plugin on each remote machine and point them to the same widget IP during setup. Each machine's hostname appears in the widget for filtering.
-
 ### Using the learning panel
 
-Once observations are being collected (either via local auto-setup or remote plugin):
+Once observations are being collected:
 
 1. Click the **✦ button** in the titlebar to open the learning panel
 2. Toggle learning **ON** with the switch in the panel header
@@ -365,12 +317,6 @@ Once observations are being collected (either via local auto-setup or remote plu
    - **Combined** — both session-end and periodic enabled together
 4. Analysis extracts patterns from observations and creates rule files in `~/.claude/rules/learned/`
 5. Learned rules appear as cards in the panel with confidence scores and domain tags
-
-You can also trigger analysis from Claude Code by running the learn skill:
-
-```
-/quill:learn
-```
 
 ### Verify
 
@@ -534,36 +480,6 @@ src-tauri/                    # Rust backend
         context.py            # quill_index_context, quill_search_context, quill_execute, fetch_and_index, snapshots, etc.
   codex-integration/          # Parallel resources for Codex CLI (mirrors claude-integration scripts and tools)
   tauri.conf.json             # Tauri window and build configuration
-plugin/                       # Claude Code plugin (for remote host setups only)
-  .claude-plugin/
-    plugin.json               # Plugin manifest
-  hooks/
-    hooks.json                # PreToolUse, PostToolUse, and Stop hook config
-  scripts/
-    observe.cjs               # Captures tool observations (pre/post tool use)
-    report-tokens.sh          # Extracts tokens from transcript, POSTs to widget
-    session-sync.cjs          # Syncs session metadata and messages to widget
-    session-end-learn.cjs     # Triggers learning analysis on session end
-    qbuild-guard.sh           # Multi-agent feature coordination gating
-  skills/
-    setup/
-      SKILL.md                # Interactive setup wizard (remote host configuration)
-    learn/
-      SKILL.md                # Manual learning analysis trigger
-    qbuild/
-      SKILL.md                # Multi-agent feature coordinator
-  commands/
-    setup.md                  # Setup command documentation
-    learn.md                  # Learn command documentation
-    qbuild.md                 # Multi-agent feature build command
-  mcp/
-    server.py                 # FastMCP server for session history tools
-    dependencies.py           # Lifespan and shared state
-    tools/
-      search.py               # search_history, get_session_context, get_branch_activity
-      discovery.py            # list_projects, list_sessions, get_session_overview
-      analytics.py            # get_token_usage, get_learned_rules
-      details.py              # get_tool_details, get_file_history
 ```
 
 ## Releasing

@@ -660,6 +660,35 @@
   color: #4ADE80;
 }
 
+/* Provider-asymmetry disclosure marker on the shared scope badge (M-6 /
+   FR-028). Subtle inline hint; full copy in title/aria-label. */
+.learning-scope-disclosure {
+  margin-left: 3px;
+  font-size: 8px;
+  font-weight: 400;
+  opacity: 0.7;
+  cursor: help;
+}
+
+/* Quantified asymmetry disclosure on the combined-scope StatusStrip (M-6). */
+.learning-asymmetry-note {
+  align-items: flex-start;
+  gap: 5px;
+  margin-top: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: rgba(255, 255, 255, 0.4);
+}
+
+.learning-asymmetry-icon {
+  flex-shrink: 0;
+  color: rgba(255, 255, 255, 0.35);
+}
+
+.learning-asymmetry-quant {
+  color: rgba(255, 255, 255, 0.55);
+}
+
 /* Domain breakdown */
 .learning-domains {
   margin-top: 6px;
@@ -751,6 +780,42 @@
 
 .learning-run-icon--interrupted {
   color: var(--text-muted, #666);
+}
+
+.learning-run-icon--degraded {
+  color: #F59E0B;
+}
+
+/* Inference partial-failure callout inside the run detail rows (R-7 / L-3) */
+.learning-run-detail-degraded {
+  color: #F59E0B;
+}
+
+/* Derived consecutive-failure banner (R-7 / L-3). Presentational only — no
+   circuit-breaker. Muted amber, matches the flat status surfaces. */
+.learning-run-streak-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #FBBF24;
+}
+
+.learning-run-streak-icon {
+  flex-shrink: 0;
+  color: #F59E0B;
+}
+
+.learning-run-streak-banner code {
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 10px;
+  color: #FBBF24;
 }
 
 .learning-run-trigger {
@@ -877,6 +942,49 @@
 .learning-rule-state--stale { background: #EAB30820; color: #EAB308; }
 .learning-rule-state--invalidated { background: #EF444420; color: #EF4444; }
 .learning-rule-state--candidate { background: #8B5CF620; color: #A78BFA; }
+/* Feature 005 US3 lifecycle states. */
+.learning-rule-state--awaiting_review { background: #3B82F620; color: #60A5FA; }
+.learning-rule-state--active { background: #22C55E20; color: #22C55E; }
+.learning-rule-state--rejected { background: #EF444420; color: #EF4444; }
+.learning-rule-state--suppressed { background: #EF444420; color: #F87171; }
+.learning-rule-state--tombstoned { background: #6B728020; color: #9CA3AF; }
+.learning-rule-state--superseded { background: #6B728020; color: #9CA3AF; }
+.learning-rule-state--conflict_flagged { background: #F59E0B20; color: #FBBF24; }
+
+.learning-rule-feedback {
+	background: none;
+	border: none;
+	color: rgba(255, 255, 255, 0.25);
+	font-size: 12px;
+	cursor: pointer;
+	padding: 0 2px;
+	line-height: 1;
+}
+
+.learning-rule-feedback--accept:hover,
+.learning-rule-feedback--accept.is-active {
+	color: #22C55E;
+}
+
+.learning-rule-feedback--reject:hover,
+.learning-rule-feedback--reject.is-active {
+	color: #EAB308;
+}
+
+.learning-rule-feedback--bad:hover,
+.learning-rule-feedback--bad.is-active {
+	color: #EF4444;
+}
+
+.learning-rule-meta-tag--feedback {
+	text-transform: uppercase;
+	letter-spacing: 0.4px;
+	font-weight: 600;
+}
+
+.learning-rule-meta-tag--feedback-accept { color: rgba(34, 197, 94, 0.7); }
+.learning-rule-meta-tag--feedback-reject { color: rgba(234, 179, 8, 0.7); }
+.learning-rule-meta-tag--feedback-bad { color: rgba(239, 68, 68, 0.75); }
 
 .learning-rule-card--candidate {
   opacity: 0.7;

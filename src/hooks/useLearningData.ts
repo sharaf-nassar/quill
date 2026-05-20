@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useToast } from "./useToast";
@@ -8,6 +8,7 @@ import type {
   LearnedRule,
   LearningRun,
   LearningLogEvent,
+  OperatorFeedback,
   ProviderFilter,
   ToolCount,
 } from "../types";
@@ -107,6 +108,25 @@ export function useLearningData(providerFilter: ProviderFilter = "all") {
     };
   }, []);
 
+  // Ephemeral per-process capability token (feature 005 US2/US3). The backend
+  // hands it to the `learning` window only via `get_learning_capability` and
+  // every state-changing learning IPC now REQUIRES it. Fetch once and reuse
+  // for the process lifetime (a single in-flight promise is shared so
+  // concurrent mutations don't each round-trip).
+  const tokenPromiseRef = useRef<Promise<string> | null>(null);
+  const getCapabilityToken = useCallback(async (): Promise<string> => {
+    if (!tokenPromiseRef.current) {
+      tokenPromiseRef.current = invoke<string>(
+        "get_learning_capability",
+      ).catch((e) => {
+        // Reset so a transient failure can be retried on the next mutation.
+        tokenPromiseRef.current = null;
+        throw e;
+      });
+    }
+    return tokenPromiseRef.current;
+  }, []);
+
   const updateSettings = useCallback(
     async (next: LearningSettings) => {
       setSettings(next);
@@ -134,26 +154,41 @@ export function useLearningData(providerFilter: ProviderFilter = "all") {
   const deleteRule = useCallback(
     async (name: string) => {
       try {
-        await invoke("delete_learned_rule", { name });
+        const token = await getCapabilityToken();
+        await invoke("delete_learned_rule", { name, token });
         await refresh();
       } catch (e) {
         toast("error", `Failed to delete rule: ${e}`);
       }
     },
-    [refresh, toast],
+    [getCapabilityToken, refresh, toast],
   );
 
   const promoteRule = useCallback(
 	async (name: string) => {
 		try {
-			await invoke("promote_learned_rule", { name });
+			const token = await getCapabilityToken();
+			await invoke("promote_learned_rule", { name, token });
 			await refresh();
 		} catch (e) {
 			toast("error", `Failed to promote rule: ${e}`);
 		}
 	},
-	[refresh, toast],
+	[getCapabilityToken, refresh, toast],
 );
+
+  const submitRuleFeedback = useCallback(
+    async (name: string, feedback: OperatorFeedback, note?: string) => {
+      try {
+        const token = await getCapabilityToken();
+        await invoke("submit_rule_feedback", { name, feedback, note, token });
+        await refresh();
+      } catch (e) {
+        toast("error", `Failed to submit feedback: ${e}`);
+      }
+    },
+    [getCapabilityToken, refresh, toast],
+  );
 
   // Derive analyzing state from runs data
   const analyzing = runs.some((r) => r.status === "running");
@@ -173,6 +208,7 @@ export function useLearningData(providerFilter: ProviderFilter = "all") {
     triggerAnalysis,
     deleteRule,
     promoteRule,
+    submitRuleFeedback,
     refresh,
   };
 }

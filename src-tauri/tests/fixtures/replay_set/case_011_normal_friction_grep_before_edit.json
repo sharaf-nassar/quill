@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "44 observations. The agent edited a symbol's definition then hit 6 compile errors at call sites it had not searched for first. In 5 later cases it grep'd for all references before editing the definition and changed every call site in one pass with no follow-up errors.",
+    "existing_rules_summary": "3 active rules, none about pre-edit reference discovery.",
+    "provider_scope": ["claude"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "grep-references-before-renaming",
+    "content": "Before changing or renaming a symbol, search the codebase for all references so every call site is updated in the same change.",
+    "domain": "tooling",
+    "claimed_confidence": 0.8
+  },
+  "expected_judgment": {
+    "verdict": "helps",
+    "rationale": "A recurring, well-grounded friction pattern (edit-then-discover-call-sites) with observed successful recoveries that apply exactly this rule. Normal everyday positive."
+  },
+  "tags": ["normal-friction", "tooling", "well-grounded", "archetype:positive"]
+}

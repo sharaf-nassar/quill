@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "32 tool-use observations entirely about frontend component styling and CSS layout work. There are no database queries, no ORM calls, no migration files, and no SQL strings anywhere in the corpus.",
+    "existing_rules_summary": "2 active rules, both frontend/styling. No data-layer rules.",
+    "provider_scope": ["claude"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "always-use-parameterized-queries",
+    "content": "Always use parameterized SQL queries to prevent injection. The observations show repeated string-concatenated SQL that caused injection vulnerabilities and three production incidents.",
+    "domain": "security",
+    "claimed_confidence": 0.91
+  },
+  "expected_judgment": {
+    "verdict": "regresses",
+    "rationale": "The rule cites SQL injection incidents and concatenated queries that do not exist anywhere in this styling-only corpus. The justification is fabricated; an ungrounded rule (however sound in the abstract) must not be admitted from this evidence."
+  },
+  "tags": ["hallucinated-evidence", "ungrounded", "security", "fabricated-justification", "archetype:hallucinated"]
+}

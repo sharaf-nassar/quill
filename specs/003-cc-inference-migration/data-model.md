@@ -13,7 +13,7 @@ One record per `claude` subprocess invocation made during a run. Multiple record
 | Field | Type | Source | Description |
 |---|---|---|---|
 | `phase` | string | App-supplied | Synthetic tag identifying which call site fired this invocation: `stream_a`, `stream_b`, `stream_c`, `synthesis`, `memory_optimizer`, `prose_compression`. |
-| `model` | string | CC envelope `modelUsage` key | The Claude model id Claude Code actually used (e.g. `claude-haiku-4-5-20251001`, `claude-sonnet-4-5-20250929`). Captured because aliases can resolve to different concrete models over time. |
+| `model` | string | highest-cost entry of CC envelope `modelUsage` | The primary Claude model id Claude Code used. Agent-mode runs report several models (the requested model plus a cheap tool-loop model); the highest-cost entry is the main generator (e.g. `claude-sonnet-4-6`). Captured because aliases resolve to different concrete models over time. |
 | `duration_ms` | u64 | CC envelope `duration_ms` | Total wall-clock the invocation took, as reported by CC. |
 | `duration_api_ms` | u64 | CC envelope `duration_api_ms` | Of which time, how much was the API call to Anthropic. |
 | `ttft_ms` | u64 | CC envelope `ttft_ms` | Time-to-first-token. |

@@ -107,10 +107,11 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at `specs/003-cc-inference-migration/plan.md`. Linked artifacts:
-- `specs/003-cc-inference-migration/spec.md` — feature specification
-- `specs/003-cc-inference-migration/research.md` — Phase 0 decisions
-- `specs/003-cc-inference-migration/data-model.md` — Phase 1 data model
-- `specs/003-cc-inference-migration/contracts/cc-client.md` — internal cc_client module contract
-- `specs/003-cc-inference-migration/quickstart.md` — Phase 1 maintainer walkthrough
+at `specs/007-landlock-inference-sandbox/plan.md`. Linked artifacts:
+- `specs/007-landlock-inference-sandbox/spec.md` — feature specification
+- `specs/007-landlock-inference-sandbox/research.md` — Phase 0 design decisions (R-A..R-F)
+- `specs/007-landlock-inference-sandbox/data-model.md` — Phase 1 zero-migration data model
+- `specs/007-landlock-inference-sandbox/contracts/landlock-sandbox.md` — confinement-chain + diagnostic contract
+- `specs/007-landlock-inference-sandbox/quickstart.md` — Phase 1 maintainer verification walkthrough
+- Prior feature context: `specs/006-learning-hardening-followups/` (honest confinement disclosure, retired ProcessOnly), `specs/005-learning-system-hardening/` (R-7 confinement design, migration 25 data model)
 <!-- SPECKIT END -->

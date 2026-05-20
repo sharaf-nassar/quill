@@ -2270,7 +2270,10 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
     }
 }
 
-fn find_session_path(
+// `pub(crate)` so the learning pipeline's Stream C can resolve a
+// session's parent transcript path (sub-agent transcripts live under a
+// separate `<session>/subagents/` dir and are never matched here).
+pub(crate) fn find_session_path(
     provider: IntegrationProvider,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {

@@ -113,10 +113,10 @@ with:
 
 ### Output parsing
 
-On a `tokio::time::timeout` success path, stdout is parsed as the envelope shape declared in `research.md` R-9. The `result` field is:
+On a `tokio::time::timeout` success path, stdout is parsed as the envelope shape declared in `research.md` R-9. Typed and free-form calls read different envelope fields:
 
-- For `invoke_typed`: a JSON-encoded string that further deserializes into `T` via `serde_json::from_str::<T>(&envelope.result)`. A failure of this inner parse maps to `InferenceError::SchemaValidationFailed`.
-- For `invoke_text`: returned verbatim as `String`.
+- For `invoke_typed`: the JSON Schema is embedded in the prompt (not `--json-schema`, which the CLI does not enforce). The agent is granted a `Write`-only tool sandboxed to a per-call temp dir and writes the result to `out.json`; `T` is obtained via `serde_json::from_str::<T>` of that file. Missing/unreadable/un-deserializable file → `InferenceError::SchemaValidationFailed`. No app-side retry.
+- For `invoke_text`: `envelope.result` is returned verbatim as `String` (no schema call, so `structured_output` is absent).
 
 ### Error mapping (from research.md R-7)
 
@@ -129,7 +129,7 @@ On a `tokio::time::timeout` success path, stdout is parsed as the envelope shape
 | Envelope or stderr matches "Run: claude /login" / "not authenticated" | `NotSignedIn` |
 | Envelope's `is_error: true` with `subtype: "error"` and no more specific match | falls back to `RateLimited`/`Spawn` based on `api_error_status`; otherwise `BadEnvelope` |
 | Stdout fails JSON envelope parse | `BadEnvelope` |
-| `serde_json::from_str::<T>(envelope.result)` fails | `SchemaValidationFailed` |
+| The agent-written `out.json` artifact is missing/unreadable, or fails to deserialize into `T` | `SchemaValidationFailed` |
 | Other `std::io::Error` from `Command::spawn` | `Spawn(_)` |
 
 ### Success contract
@@ -138,7 +138,7 @@ On a `tokio::time::timeout` success path, stdout is parsed as the envelope shape
 
 - The subprocess exited zero AND
 - The stdout envelope parsed AND `is_error: false` AND
-- (for `invoke_typed`) `serde_json::from_str::<T>(envelope.result)` succeeded.
+- (for `invoke_typed`) `T` was obtained by deserializing the JSON artifact the agent wrote to the sandboxed `out.json`.
 
 In all other cases, an `Err(InferenceError::...)` is returned with no `InvokeOutcome`. Failed calls still produce a `InferenceCallMetadata` record via a separate `cc_client::failed_metadata(phase, err)` helper so callers can append it to the run's metadata blob without contorting the `Result` shape. (Convention: callers `.inspect_err(|e| metadata.push(failed_metadata(phase, e)))` next to the call.)
 
@@ -177,3 +177,7 @@ The module is unit-testable by injecting a mock `Spawner` trait (returning canne
 - UI surfacing of `InferenceCallMetadata` (deferred per FR-016)
 - Streaming / multi-turn input (one-shot only)
 - Cost limiting via `--max-budget-usd` (informational only; not enforced)
+
+## R-5 deviation (artifact-file typed inference, 2026-05-17)
+
+spec-003 R-5 specified total tool isolation (`--tools ""`). Typed inference now requires a narrow, bounded exception: `invoke_typed` grants `--allowedTools "Write"` (everything else `--disallowedTools`-denied), `--permission-mode acceptEdits`, and `--add-dir`/CWD confined to a unique per-call `tempfile::TempDir` destroyed unconditionally on drop. Rationale: the supported-CLI premise is non-negotiable but `--json-schema` is unenforced; a minimal sandboxed `Write` grant is the smallest capability that makes the supported path sound. R-6 env-scrub, `--no-session-persistence`, `--setting-sources ""`, `--exclude-dynamic-system-prompt-sections`, `kill_on_drop`, and the 300 s timeout are retained. `invoke_text` keeps full R-5 isolation.

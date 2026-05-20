@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "Stream B git analysis over 60 commits shows 9 commits whose immediate successor was a same-day fixup with a message like 'fix lint' or 'fix failing test', each touching only files changed in the parent commit. In the 12 commits where the agent ran the test/lint command before committing, no fixup followed.",
+    "existing_rules_summary": "2 active rules: 'prefer-absolute-paths-in-file-ops' (tooling, confirmed), 'small-focused-commits' (vcs, emerging). Nothing requires pre-commit verification.",
+    "provider_scope": ["claude", "codex"],
+    "stream": "stream_b"
+  },
+  "rule_under_test": {
+    "name": "run-checks-before-commit",
+    "content": "Run the project's test and lint commands and confirm they pass before creating a commit. Do not commit code that has not been verified locally.",
+    "domain": "vcs",
+    "claimed_confidence": 0.83
+  },
+  "expected_judgment": {
+    "verdict": "helps",
+    "rationale": "Commit-pair evidence cleanly separates verified vs unverified commits and the fixup churn maps exactly to the missing behavior. The rule targets the demonstrated cause and would have prevented the observed fixup commits."
+  },
+  "tags": ["clear-positive", "vcs", "well-grounded", "stream-b", "archetype:positive"]
+}

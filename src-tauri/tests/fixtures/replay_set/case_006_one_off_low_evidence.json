@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "A single observation in a 48-observation corpus: once, the agent set an environment variable QUILL_LOG_LEVEL=trace to debug one flaky test, then unset it. No other observation references this variable, log levels, or that test again. The remaining 47 observations are unrelated routine work.",
+    "existing_rules_summary": "3 active rules, none about logging configuration or env vars.",
+    "provider_scope": ["claude", "codex"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "always-set-trace-logging",
+    "content": "Always export QUILL_LOG_LEVEL=trace before running any test so failures are easier to diagnose.",
+    "domain": "tooling",
+    "claimed_confidence": 0.64
+  },
+  "expected_judgment": {
+    "verdict": "neutral",
+    "rationale": "A single non-recurring debugging action does not establish a durable behavioral pattern. There is no repeated signal and no contradiction; promoting it adds noise without demonstrated benefit, so it is neither helpful nor actively harmful."
+  },
+  "tags": ["one-off", "low-evidence", "tooling", "insufficient-support", "archetype:one-off"]
+}

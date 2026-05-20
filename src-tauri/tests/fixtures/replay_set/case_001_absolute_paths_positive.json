@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "Across 41 tool-use observations the agent repeatedly issued file reads and edits with bare relative paths from a working directory that changed between Bash calls, producing 7 file-not-found failures and 3 wrong-file edits. In every recovery the agent re-issued the same operation with an absolute path and it succeeded on the first retry.",
+    "existing_rules_summary": "1 active rule: 'prefer-structured-logging' (tooling, confirmed). No rule governs path style for file operations.",
+    "provider_scope": ["claude"],
+    "stream": "stream_a"
+  },
+  "rule_under_test": {
+    "name": "prefer-absolute-paths-in-file-ops",
+    "content": "Always use absolute paths for file read, write, and edit operations. The working directory can change between commands, so relative paths are unreliable.",
+    "domain": "tooling",
+    "claimed_confidence": 0.88
+  },
+  "expected_judgment": {
+    "verdict": "helps",
+    "rationale": "The corpus shows a direct, repeated failure mode (relative paths against a shifting CWD) that the rule eliminates; every observed recovery already applied exactly this fix. Strong, well-grounded positive."
+  },
+  "tags": ["clear-positive", "tooling", "well-grounded", "archetype:positive"]
+}

@@ -475,7 +475,8 @@ fn build_prompt(
     } else {
         let per_file_budget = memory_budget / memory_files.len().max(1);
         for mf in memory_files {
-            let escaped = escape_for_prompt(&mf.content);
+            let redacted = crate::redaction::redact(&mf.content);
+            let escaped = escape_for_prompt(&redacted);
             let content = safe_truncate(&escaped, per_file_budget);
             let mem_type = mf.memory_type.as_deref().unwrap_or("general");
             let changed = mf.changed_since_last_run;
@@ -494,7 +495,8 @@ fn build_prompt(
         prompt.push_str("<instruction-files>\n");
         let per_instruction_budget = instruction_budget / context.instruction_files.len().max(1);
         for instruction in &context.instruction_files {
-            let escaped = escape_for_prompt(&instruction.content);
+            let redacted = crate::redaction::redact(&instruction.content);
+            let escaped = escape_for_prompt(&redacted);
             let content = safe_truncate(&escaped, per_instruction_budget);
             prompt.push_str(&format!(
                 "<file provider=\"{}\" scope=\"{}\" name=\"{}\">{}</file>\n",
@@ -509,14 +511,16 @@ fn build_prompt(
 
     // Rules section
     if has_rules {
-        let escaped = escape_for_prompt(&context.rules);
+        let redacted = crate::redaction::redact(&context.rules);
+        let escaped = escape_for_prompt(&redacted);
         let content = safe_truncate(&escaped, rules_budget);
         prompt.push_str(&format!("<rules>{}</rules>\n", content));
     }
 
     // Instincts section
     if has_instincts {
-        let escaped = escape_for_prompt(&context.instincts);
+        let redacted = crate::redaction::redact(&context.instincts);
+        let escaped = escape_for_prompt(&redacted);
         let content = safe_truncate(&escaped, instincts_budget);
         prompt.push_str(&format!("<instincts>{}</instincts>\n", content));
     }
@@ -701,7 +705,7 @@ pub async fn run_optimization_with_run(
             phase: crate::cc_client::Phase::MemoryOptimizer,
             prompt,
             preamble: preamble.to_string(),
-            model: crate::cc_client::Model::Haiku,
+            model: crate::cc_client::Model::Sonnet46,
             max_tokens,
         })
         .await
@@ -970,7 +974,7 @@ pub async fn run_prose_compression(
                     phase: crate::cc_client::Phase::ProseCompression,
                     prompt,
                     preamble,
-                    model: crate::cc_client::Model::Haiku,
+                    model: crate::cc_client::Model::Sonnet46,
                     max_tokens,
                 })
                 .await

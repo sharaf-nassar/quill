@@ -7,6 +7,7 @@ mod compress_prose;
 mod config;
 mod context_category;
 pub mod data_paths;
+mod eval_harness;
 mod fetcher;
 mod git_analysis;
 mod indicator;
@@ -16,6 +17,7 @@ mod memory_optimizer;
 mod models;
 mod plugins;
 mod prompt_utils;
+mod redaction;
 mod releases;
 mod restart;
 mod rule_watcher;
@@ -40,6 +42,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 use storage::Storage;
+use subtle::ConstantTimeEq;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Listener, Manager, PhysicalPosition};
@@ -1279,6 +1282,91 @@ async fn set_minimax_api_key(
     Ok(status)
 }
 
+// --- Learning IPC authorization (feature 005 US2 T034 — H-4 / FR-011) ---
+//
+// See specs/005-learning-system-hardening/contracts/ipc-and-feedback.md
+// ("Authorization model") and research.md R-3 Decision 3. State-changing
+// learning IPCs are gated by an ephemeral per-process capability token plus a
+// calling-window-label assertion; read-only learning commands stay open.
+
+/// Windows allowed to obtain the capability token and invoke state-changing
+/// learning commands. The learning UI runs in the `WebviewWindow` whose label
+/// is `"learning"` (see `src/components/TitleBar.tsx`).
+const LEARNING_WINDOW_ALLOWLIST: &[&str] = &["learning"];
+
+/// Ephemeral, per-process capability token for state-changing learning IPC.
+///
+/// Generated once at startup from `OsRng` (same source as the HTTP auth
+/// secret in [`auth`]) and held only in Tauri managed state — never persisted
+/// to disk, never logged. A fresh value every launch means a leaked token
+/// cannot outlive the process.
+struct LearningCapability {
+    token: String,
+}
+
+impl LearningCapability {
+    fn generate() -> Self {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        Self {
+            token: hex::encode(bytes),
+        }
+    }
+}
+
+/// Assert the calling window is allowed to perform learning mutations.
+fn assert_learning_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+    if LEARNING_WINDOW_ALLOWLIST.contains(&window.label()) {
+        Ok(())
+    } else {
+        Err("Unauthorized: learning mutations are restricted to the learning window".to_string())
+    }
+}
+
+/// Single reusable guard for every STATE-CHANGING learning command.
+///
+/// Verifies (1) the caller presents the current per-process capability token,
+/// compared in constant time via the `subtle` crate (same primitive as
+/// `server::check_auth`), and (2) the invoking `WebviewWindow` label is in
+/// [`LEARNING_WINDOW_ALLOWLIST`]. Both must hold or the command must return
+/// `Err` BEFORE touching storage.
+///
+/// EXTENSION POINT (US3): the future feedback/governance commands
+/// `approve_rule`, `reject_rule`, `suppress_rule`, and the token-path of
+/// `submit_rule_feedback` (`feedback="bad"`) MUST call this same guard before
+/// any storage mutation. Read-only commands (`get_learned_rules`,
+/// `read_rule_content`, `get_learning_runs`, …) MUST NOT call it.
+fn guard_learning_mutation(
+    app: &tauri::AppHandle,
+    window: &tauri::WebviewWindow,
+    token: &str,
+) -> Result<(), String> {
+    assert_learning_window(window)?;
+    let capability = app.state::<LearningCapability>();
+    let presented = token.as_bytes();
+    let expected = capability.token.as_bytes();
+    let matches: bool = presented.ct_eq(expected).into();
+    if matches {
+        Ok(())
+    } else {
+        Err("Unauthorized: invalid learning capability token".to_string())
+    }
+}
+
+/// Hand the ephemeral capability token to the learning window only.
+///
+/// Label-gated: any other window (or a page navigated away from the learning
+/// view) receives `Err` and never sees the token. The learning frontend calls
+/// this once on mount and threads the value into every mutating `invoke`.
+#[tauri::command]
+async fn get_learning_capability(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    assert_learning_window(&window)?;
+    Ok(app.state::<LearningCapability>().token.clone())
+}
+
 #[tauri::command]
 async fn get_learned_rules(
     provider: Option<integrations::IntegrationProvider>,
@@ -1288,17 +1376,195 @@ async fn get_learned_rules(
 }
 
 #[tauri::command]
-async fn delete_learned_rule(name: String) -> Result<(), String> {
+async fn delete_learned_rule(
+    name: String,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    guard_learning_mutation(&app, &window, &token)?;
     let storage = get_storage()?;
-    run_blocking(move || storage.delete_learned_rule(&name))
+    run_blocking(move || storage.delete_learned_rule(&name))?;
+    let _ = app.emit("learning-updated", ());
+    Ok(())
 }
 
 #[tauri::command]
-async fn promote_learned_rule(name: String, app: tauri::AppHandle) -> Result<(), String> {
+async fn promote_learned_rule(
+    name: String,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    guard_learning_mutation(&app, &window, &token)?;
     let storage = get_storage()?;
     run_blocking(move || storage.promote_learned_rule(&name))?;
     let _ = app.emit("learning-updated", ());
     Ok(())
+}
+
+/// Forward-restore a rule to a prior immutable `rule_versions` snapshot and
+/// rewrite its on-disk `.md` in one transaction (feature 005 US2 T035 — see
+/// contracts/ipc-and-feedback.md). Authorized via the T034 guard.
+#[tauri::command]
+async fn rollback_rule(
+    name: String,
+    target_version: i64,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    guard_learning_mutation(&app, &window, &token)?;
+    let storage = get_storage()?;
+    run_blocking(move || storage.rollback_rule(&name, target_version))?;
+    let _ = app.emit("learning-updated", ());
+    Ok(())
+}
+
+/// Clear a rule's tombstone (records `reactivated_at/by`) and reset its
+/// lifecycle to `candidate` so it must re-earn review. Only path that
+/// un-blocks a tombstoned rule (feature 005 US2 T035). Authorized via the
+/// T034 guard.
+#[tauri::command]
+async fn reactivate_rule(
+    name: String,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    guard_learning_mutation(&app, &window, &token)?;
+    let storage = get_storage()?;
+    run_blocking(move || storage.reactivate_rule(&name))?;
+    let _ = app.emit("learning-updated", ());
+    Ok(())
+}
+
+/// Upsert operator feedback for a rule (feature 005 US3 T046 — see
+/// contracts/ipc-and-feedback.md / research.md R-5). All three values are
+/// authorized via the T034 guard: `bad` writes a durable tombstone and
+/// changes active state, while `accept`/`reject` carry the same trust level
+/// as promote/delete per the contract. `note` is maintainer-only local
+/// metadata and is never fed into any inference input.
+#[tauri::command]
+async fn submit_rule_feedback(
+    name: String,
+    feedback: String,
+    note: Option<String>,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    guard_learning_mutation(&app, &window, &token)?;
+    if !crate::learning::is_safe_rule_name(&name) {
+        return Err(format!(
+            "Invalid rule name: {}",
+            &name[..name.len().min(50)]
+        ));
+    }
+    if !matches!(feedback.as_str(), "accept" | "reject" | "bad") {
+        return Err(format!(
+            "Invalid feedback '{feedback}' — expected accept|reject|bad"
+        ));
+    }
+    let storage = get_storage()?;
+    run_blocking(move || storage.submit_rule_feedback(&name, &feedback, note.as_deref()))?;
+    let _ = app.emit("learning-updated", ());
+    Ok(())
+}
+
+/// Record an audited regression override for a rule (feature 005 US4 T053 —
+/// see contracts/evaluation-harness.md "Promotion coupling" / FR-020).
+/// `reason` is REQUIRED and validated non-empty by storage; the override
+/// becomes part of provenance and is the ONLY way to approve a rule whose
+/// latest counterfactual verdict regresses the replay set. Authorized via
+/// the T034 guard (state-changing learning mutation).
+#[tauri::command]
+async fn record_reviewer_override(
+    rule_name: String,
+    replay_set_version: i64,
+    reason: String,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    guard_learning_mutation(&app, &window, &token)?;
+    let storage = get_storage()?;
+    // `overridden_by` is the authorized learning window; the per-process
+    // capability token is never persisted, so attribute by window label.
+    let overridden_by = window.label().to_string();
+    run_blocking(move || {
+        storage.record_reviewer_override(&rule_name, replay_set_version, &overridden_by, &reason)
+    })?;
+    let _ = app.emit("learning-updated", ());
+    Ok(())
+}
+
+/// Compact summary returned to the maintainer/UI after a counterfactual
+/// evaluation (feature 005 US4 T053). Mirrors the blocking subset of
+/// `eval_harness::EvalOutcome` the promotion gate consults so the UI can
+/// show the verdict + the warn-not-block cautions.
+#[derive(serde::Serialize)]
+struct EvalRunSummary {
+    rule_name: String,
+    verdict: String,
+    regression: bool,
+    negative_transfer: bool,
+    judge_uncalibrated: bool,
+    replay_set_stale: bool,
+    replay_set_version: i64,
+    agreement_score: f64,
+    learning_run_id: Option<i64>,
+    persisted_row_id: i64,
+}
+
+/// Run the counterfactual evaluation harness for one rule and persist the
+/// verdict (feature 005 US4 T053, V5/FR-019 — see
+/// contracts/evaluation-harness.md). This is the in-app trigger that makes
+/// the otherwise-unreachable `eval_harness` usable: it loads the frozen
+/// replay set, runs the WITH/WITHOUT + judge arms, attributes the result to
+/// the latest `completed|degraded` run (or `None`), persists one
+/// `evaluation_results` row via T052, and returns a compact summary. The
+/// async harness call is NOT wrapped in `run_blocking` (it must drive the
+/// `cc_client` spawn); only the surrounding storage I/O is. Authorized via
+/// the T034 guard.
+#[tauri::command]
+async fn run_rule_evaluation(
+    name: String,
+    token: String,
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+) -> Result<EvalRunSummary, String> {
+    guard_learning_mutation(&app, &window, &token)?;
+    let storage = get_storage()?;
+
+    let lookup_name = name.clone();
+    let (mut rule, run_id) = run_blocking(move || storage.eval_inputs_for_rule(&lookup_name))?;
+    // Score the candidate as-named regardless of the per-case stub names.
+    rule.name = name.clone();
+
+    let mut outcome = eval_harness::run_evaluation(rule)
+        .await
+        .map_err(|e| format!("Evaluation failed: {e}"))?;
+    // The harness runs replay-set-only and leaves `learning_run_id` None;
+    // attribute it to the originating run for the persisted row.
+    outcome.learning_run_id = run_id;
+
+    let row = outcome.to_row();
+    let persisted_row_id = run_blocking(move || storage.persist_evaluation_result(&row))?;
+
+    let _ = app.emit("learning-updated", ());
+    Ok(EvalRunSummary {
+        rule_name: outcome.rule_name,
+        verdict: outcome.verdict.as_str().to_string(),
+        regression: outcome.regression,
+        negative_transfer: outcome.negative_transfer,
+        judge_uncalibrated: outcome.calibration.judge_uncalibrated,
+        replay_set_stale: outcome.staleness.stale,
+        replay_set_version: outcome.replay_set_version,
+        agreement_score: outcome.calibration.kappa,
+        learning_run_id: outcome.learning_run_id,
+        persisted_row_id,
+    })
 }
 
 #[tauri::command]
@@ -1928,6 +2194,12 @@ pub fn run() {
             cleanup_interrupted_learning_runs(storage);
             let secret = load_http_auth_secret();
 
+            // Feature 005 US2 T034 (H-4 / FR-011): mint the ephemeral
+            // per-process learning capability token before any window or the
+            // HTTP server starts, so a state-changing learning IPC can never
+            // race ahead of an initialized token.
+            app.manage(LearningCapability::generate());
+
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
                 let default_app_dir = dirs::data_local_dir()
@@ -2317,9 +2589,15 @@ pub fn run() {
             set_runtime_settings,
             get_learning_settings,
             set_learning_settings,
+            get_learning_capability,
             get_learned_rules,
             delete_learned_rule,
             promote_learned_rule,
+            rollback_rule,
+            reactivate_rule,
+            submit_rule_feedback,
+            record_reviewer_override,
+            run_rule_evaluation,
             get_learning_runs,
             trigger_analysis,
             get_observation_count,

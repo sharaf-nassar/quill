@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "Stream C corpus from 24 indexed sessions on this same project. In 16 sessions the agent burned 3+ turns rediscovering that long-running commands must be launched with the background runner instead of a blocking foreground call; sessions that used the background runner from the start finished the same task in markedly fewer turns.",
+    "existing_rules_summary": "4 active rules, none about background vs foreground command execution.",
+    "provider_scope": ["claude"],
+    "stream": "stream_c"
+  },
+  "rule_under_test": {
+    "name": "run-long-tasks-in-background",
+    "content": "Launch long-running or watch-style commands with the background runner rather than a blocking foreground call so the session is not stalled waiting on them.",
+    "domain": "tooling",
+    "claimed_confidence": 0.85
+  },
+  "expected_judgment": {
+    "verdict": "helps",
+    "rationale": "Strong recurring cross-session signal on the same project with a clear efficiency delta between sessions that did and did not follow the behavior. Well-grounded Stream-C positive."
+  },
+  "tags": ["clear-positive", "tooling", "stream-c", "well-grounded", "archetype:positive"]
+}

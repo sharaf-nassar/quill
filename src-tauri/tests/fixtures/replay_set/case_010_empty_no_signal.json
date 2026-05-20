@@ -1,0 +1,19 @@
+{
+  "inputs": {
+    "corpus": "11 observations, all routine successful no-op style work: reading a README, listing a directory, opening a file and closing it without edits, and a passing test run. No failures, no recoveries, no repeated friction, no decisions of consequence.",
+    "existing_rules_summary": "2 active rules, both unrelated to anything in this corpus.",
+    "provider_scope": ["codex"],
+    "stream": "stream_c"
+  },
+  "rule_under_test": {
+    "name": "read-the-readme-first",
+    "content": "Always read the README before doing anything else in a repository.",
+    "domain": "process",
+    "claimed_confidence": 0.5
+  },
+  "expected_judgment": {
+    "verdict": "neutral",
+    "rationale": "The corpus carries no friction signal that this rule would change — nothing failed and nothing was recovered. A plausible-but-unmotivated rule extracted from a no-signal corpus is neither demonstrably helpful nor harmful; it should not be promoted on this basis."
+  },
+  "tags": ["empty", "no-signal", "process", "insufficient-support", "archetype:empty"]
+}

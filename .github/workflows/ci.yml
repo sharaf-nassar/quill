@@ -1,0 +1,42 @@
+# CI gate for the Rust backend (src-tauri).
+#
+# Feature 005 (Learning System Hardening), FR-021 / SC-008. Finalized in US4
+# task T056: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`
+# (hard gate, warnings deny), and `cargo test`. Reused via `workflow_call` as
+# a precondition of release.yml so a failing learning-logic suite blocks both
+# merge and release.
+#
+# Security note: this workflow consumes NO event-derived untrusted input
+# (no github.event.* interpolation, no PR/issue/commit text in run:). Keep it
+# that way.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test
+        run: cargo test

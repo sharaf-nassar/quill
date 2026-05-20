@@ -1,1 +1,634 @@
-../../../plugin/commands/qbuild.md
+---
+description: (quill) Orchestrate multi-agent feature implementation from a description. Plans work in waves, dispatches parallel agents, verifies each wave, and reports results.
+argument-hint: "<feature description or intended change>"
+---
+
+# Build — Multi-Agent Feature Coordinator
+
+You are the **Coordinator**. You plan, delegate, and verify. You do NOT implement code yourself.
+Delegate ALL implementation to agents using the Agent tool. Your job is orchestration.
+
+⛔ **CRITICAL — WORKTREE REQUIRED**: You MUST create a git worktree (Phase 5) before ANY code changes. No agent may edit, write, or create files in the original project directory. If Phase 5 has not completed successfully, you MUST NOT proceed to Phase 6. This is non-negotiable.
+
+**Input**: `$ARGUMENTS` contains the feature description or intended change. If empty, ask the user to describe what they want to build before proceeding.
+
+**Related skills**: `superpowers:systematic-debugging` (basis for Fix Agent methodology), `superpowers:finishing-a-development-branch` (alternative branch completion workflows).
+
+## When NOT to Use
+
+- Pure knowledge questions with no code changes intended (e.g. "how does X work?", "explain this function") — use Explore agents directly instead
+
+**Every task that produces code changes MUST use the full worktree workflow — no exceptions, regardless of task size.** The worktree is a safety mechanism, not overhead. Codebase exploration as part of planning a change is expected and happens in Phase 1.
+
+---
+
+## Phase 1: Explore the Codebase
+
+**Goal**: Understand the codebase enough to clarify requirements and design approaches.
+
+Launch 2-4 explorer agents **in parallel** using `subagent_type: Explore`, `model: "haiku"`:
+
+**Agent 1 — Similar features**: Find existing features similar to the requested change. Trace through their implementation comprehensively. Return: architecture patterns, key abstractions, 5-10 important files with paths.
+
+**Agent 2 — Architecture & build**: Map the project's architecture for the area being changed. Identify entry points, data flow, abstractions, boundaries. **Also identify the project's dependency install, build, test, and lint commands.** Return: module structure, conventions, install/build/test/lint commands, 5-10 key files.
+
+**Agent 3** (only if UI involved) — **UI patterns**: Find design system, component library, CSS approach, tokens. Return: stack, component primitives, design tokens, 5-10 key files.
+
+**Agent 4 — Testing & extension points**: Identify how the project tests similar features — test framework, patterns, fixtures, coverage tools, and test commands. Find extension points, plugin interfaces, or hook systems relevant to the change. Return: test patterns, test commands, extension mechanisms, 5-10 key files.
+
+**Include the feature description (`$ARGUMENTS`) in every explorer prompt** so they focus on relevant areas. Constrain each: "Focus on areas relevant to the requested change. Limit to 5-10 key files. Complete within 5-10 tool calls."
+
+After agents return, **read the 5-8 most important files they identified**.
+
+### UI Change Detection
+
+After explorers return: if Agent 3 (UI patterns) was launched and returned results, set **HAS_UI_CHANGES=true**. Otherwise `HAS_UI_CHANGES=false`.
+
+If `HAS_UI_CHANGES=true`, read the visual companion guide: `skills/qbuild/visual-companion.md`
+
+---
+
+## Phase 2: Clarify Requirements
+
+**Goal**: Resolve all ambiguities before designing or planning. Do NOT skip this phase.
+
+### Actions
+
+1. Review the exploration findings alongside the original feature request (`$ARGUMENTS`)
+2. Identify underspecified aspects across these dimensions:
+   - **Edge cases**: What happens at boundaries? Empty states? Max limits?
+   - **Error handling**: How should failures behave? User-facing messages?
+   - **Integration points**: How does this interact with existing features?
+   - **Scope boundaries**: What is explicitly NOT included?
+   - **Design preferences**: Any UX, API shape, or naming preferences?
+   - **Backward compatibility**: Does this change existing behavior?
+   - **Performance**: Any latency, memory, or throughput constraints?
+3. **Present all questions to the user in a clear, organized list**
+4. **STOP. Wait for answers before proceeding to Phase 3.**
+
+### Handling Responses
+
+- If the user says "whatever you think is best" or "your call": provide your recommendation for each question with brief reasoning and get explicit confirmation before proceeding.
+- If the feature request is sufficiently detailed and exploration reveals no genuine ambiguities: state your assumptions clearly and give the user a chance to correct before moving on.
+- If only some questions are answered: re-ask the unanswered ones. Do not assume.
+
+---
+
+## Phase 3: Design & Plan
+
+**Goal**: Evaluate implementation approaches with different trade-offs, then break the chosen approach into waves of parallel tasks.
+
+### Step 1: Architecture Exploration
+
+Launch 2-3 `subagent_type: feature-dev:code-architect` agents **in parallel**, each with a different trade-off profile:
+
+**Architect A — Minimal change**: Smallest diff, maximum reuse of existing code. Prioritize speed and low risk. Where can we lean on what already exists?
+
+**Architect B — Clean architecture**: Best long-term maintainability, elegant abstractions. What would the ideal design look like if we're willing to touch more files?
+
+**Architect C — Pragmatic balance**: Best trade-off between speed and quality for this specific change. Where does extra investment pay off and where is it wasted?
+
+Include in each architect prompt: the feature description, clarified requirements from Phase 2, key files and patterns discovered in Phase 1.
+
+### Step 2: Synthesize & Recommend
+
+After architects return:
+1. Compare the approaches — identify where they agree (high confidence) and where they differ (genuine trade-offs)
+2. Form your recommendation with reasoning
+3. Include the comparison in the plan presentation (Phase 4) so the user sees alternatives
+
+### Step 2b: Visual Design Preview (HAS_UI_CHANGES only)
+
+If `HAS_UI_CHANGES=true`:
+
+1. Start the visual companion server:
+   `bash "${CLAUDE_PLUGIN_ROOT}/scripts/visual/start-server.sh" --project-dir "<PROJECT_DIR>"`
+   Save **VISUAL_SESSION_DIR**, **VISUAL_SCREEN_DIR**, **VISUAL_STATE_DIR**, **VISUAL_URL** from the JSON response.
+   If server fails to start, set `HAS_UI_CHANGES=false` and continue text-only.
+2. For each architect approach that proposes meaningfully different UI, write an HTML content fragment to `VISUAL_SCREEN_DIR` showing a wireframe comparison. Use the `.options` CSS class with one `.option` per approach. Follow the visual companion guide for content fragment format.
+3. Include the URL in Phase 4's plan presentation so the user can see the visual options.
+4. After user responds, read `VISUAL_STATE_DIR/events` to capture browser selections. Merge with terminal response.
+5. Push a waiting screen after design is confirmed:
+   ```html
+   <!-- waiting.html -->
+   <div style="display:flex;align-items:center;justify-content:center;min-height:60vh">
+     <p class="subtitle">Approach confirmed — executing implementation plan...</p>
+   </div>
+   ```
+
+Skip entirely if `HAS_UI_CHANGES=false`.
+
+### Step 3: Create the Wave Plan
+
+Using your recommended approach, create the detailed plan:
+
+```
+## Goal
+One sentence: the user-visible outcome.
+
+## Approach
+<Which architecture approach and why. Note key trade-offs vs alternatives.>
+
+## Build Command
+<discovered in Phase 1>
+
+## Tasks
+
+### Wave 1: <theme>
+- **Task 1.1**: <title>
+  - Scope: <files/areas>
+  - Definition of Done: <specific, testable>
+  - Verification: <exact commands>
+
+### Wave 2: <theme> (depends on Wave 1)
+- **Task 2.1**: <title> ...
+
+## Acceptance Criteria
+- [ ] <testable criterion>
+
+## Verification Plan
+- `<command>` — what it checks
+
+## Non-goals
+- What is explicitly out of scope
+```
+
+### Planning Rules
+
+1. **Group independent tasks into waves** — parallel within wave, sequential across waves
+2. **Keep tasks focused** — no file overlap between tasks in the same wave
+3. **Each task gets its own agent** — scope ~30 minutes of work
+4. **Acceptance criteria must be testable** — no vague language
+5. **Include verification commands** — tests, build, lint
+
+Use TaskCreate per task. Update with TaskUpdate as waves execute.
+
+---
+
+## Phase 4: Present and Get Approval
+
+Present the plan, including:
+1. **Approach comparison**: Brief summary of each architect's approach and the trade-offs between them
+2. **Your recommendation**: Which approach you chose and why
+3. **The detailed wave plan**: Built from the recommended approach
+
+End with:
+
+> **Please review and approve the plan above.** If you prefer a different approach, let me know and I'll revise the wave plan accordingly. I'll execute all waves autonomously once approved.
+
+**STOP. Do NOT proceed until the user explicitly approves.**
+
+If changes requested, update and re-present. If the user prefers a different architecture approach, revise the wave plan to match. If declined, stop.
+
+---
+
+## Phase 5: Setup Worktree (MANDATORY — GATE)
+
+⛔ **This phase is a hard gate. Phase 6 MUST NOT begin until the worktree exists and is verified.**
+
+**Goal**: Isolate changes in a dedicated git worktree. Only after user approves.
+
+### Pre-flight Checks
+
+1. **Uncommitted changes**: Run `git status --porcelain`. If output, **STOP** — present the dirty files to the user and ask how they want to handle them. **NEVER run `git stash` automatically.** Do not proceed until the working tree is clean.
+2. **Stale qbuild artifacts**: Run `git worktree list` and `git branch --list 'qbuild/*'`. If any exist, present to user — clean up or use different slug. Also check for orphaned worktree directories: `ls -d "../$(basename "$PWD")-qbuild-"* 2>/dev/null`. If directories exist that are NOT listed in `git worktree list`, they are orphaned remnants from a previous session whose cleanup failed. Report them to the user and offer to remove them with `rm -rf`.
+3. **Existing lock files**: Run `ls .qbuild-lock.* 2>/dev/null`. If any exist, **assume they belong to active Claude Code sessions**. Do NOT offer to remove them. Do NOT delete them. Report their existence to the user and proceed — multiple qbuild sessions can coexist because each uses a unique worktree and lock ID.
+
+### Create Worktree
+
+1. Record current branch: `git branch --show-current`
+2. Derive slug (lowercase, hyphens, max 30 chars)
+3. **Create lock file**: Generate a unique lock ID and create the lock: `LOCK_ID=$(date +%s)_$$ && touch ".qbuild-lock.$LOCK_ID"`. Store **LOCK_ID** alongside other state variables.
+4. Create: `git worktree add "../$(basename "$PWD")-qbuild-<slug>" -b "qbuild/<slug>"`
+5. Store: **SOURCE_BRANCH**, **WORKTREE_PATH** (absolute), **WORKTREE_BRANCH**, **ORIGINAL_DIR** (absolute), **LOCK_ID**
+6. **Install dependencies** in the worktree if the project requires it (e.g. `cd "<WORKTREE_PATH>" && npm install`, `pip install -r requirements.txt`, `cargo fetch`). Check what the project uses during Phase 1 exploration. Verify with the build command.
+7. **Verify worktree**: Run `git worktree list` and confirm WORKTREE_PATH appears. If it does not, remove the lock file (`rm -f "$ORIGINAL_DIR/.qbuild-lock.$LOCK_ID"`) and STOP — do not proceed to Phase 6.
+
+**All subsequent phases operate inside WORKTREE_PATH. The original project directory is READ-ONLY from this point forward.** A PreToolUse hook enforces this — Edit/Write/MultiEdit calls targeting the original project directory will be blocked while the lock file exists.
+
+---
+
+## Phase 6: Execute Waves
+
+**Execute fully autonomously after approval.**
+
+### Per-Wave Steps
+
+**Step 1 — Dispatch Implementors** (parallel): One agent per task in a single message. Use Implementor Agent Template (or UI variant for visual work). Set `model: "sonnet"` for standard tasks. **Save each agent's ID** from the return value — you need these for SendMessage in Step 5.
+
+For **Wave 2+**, include a `## Prior Wave Summary` section in each prompt from the summary recorded in Step 2 of the previous wave.
+
+**Step 2 — Collect Results & Record Summary**: Check each agent's returned **Status**:
+
+| Status | Action |
+|--------|--------|
+| DONE | Proceed normally |
+| DONE_WITH_CONCERNS | Note concerns for verifier, proceed |
+| BLOCKED | Resolve blocker, then **SendMessage** to same agent to continue |
+| NEEDS_CONTEXT | Provide context via **SendMessage**, let agent continue |
+
+After all agents complete, **record a wave summary**: 2-3 sentences of what changed, files modified, key decisions. Include in Wave 2+ agent prompts.
+
+**Step 2b — Visual Preview (HAS_UI_CHANGES only, UI waves only)**
+
+After collecting results from a wave that included UI Implementor agents, if `HAS_UI_CHANGES=true`:
+1. Check server alive: verify `VISUAL_STATE_DIR/server-info` exists. If not, restart server.
+2. Write a preview screen to `VISUAL_SCREEN_DIR/wave-N-preview.html` showing the implemented UI changes as a wireframe mockup.
+3. Tell the user: "Wave N UI changes are previewed at **{VISUAL_URL}**. Take a look and let me know if anything needs adjustment before I continue."
+4. Read events after user responds. This is informational — proceed to Step 3 (Build Gate) after user confirms.
+
+Skip if `HAS_UI_CHANGES=false` or if the wave had no UI tasks.
+
+**Step 3 — Build Gate**: Run `cd "<WORKTREE_PATH>" && <build_command>`. If fails, dispatch Fix Agent. Max 2 fix rounds — if still broken, check Fix Agent's report: if it signals a potential architectural issue (fixes revealing problems in different places, each fix creating new symptoms), escalate to user before continuing. Otherwise report and stop. If the project has no build command (e.g. pure scripting language), skip this step.
+
+**Step 4 — Verify**: Dispatch Verifier Agent.
+
+**Step 5 — Handle Verdict**:
+- **STATUS: APPROVED** → mark wave complete, proceed to next wave
+- **STATUS: NOT_APPROVED** → for each issue, **SendMessage** to the original implementor (by saved agent ID) that owns the failing files (preserves their context). Use Fix Agent only for build failures or cross-cutting issues spanning multiple agents. Re-verify after fixes. Max 2 fix rounds.
+
+**Architectural escalation**: If a Fix Agent reports that failures appear architectural (fixes revealing problems in different places, each fix creating new symptoms), **STOP and escalate to the user**:
+> **Fix Agent reports potential architectural issue.** The failures may indicate a design problem rather than implementation bugs.
+> Fix Agent's analysis: {investigation_report}
+> Options: **redesign** (revisit the approach from Phase 3), **continue** (try more fixes), or **abort**
+
+**Early abort**: If 2+ waves in a row end with unresolved verification failures (moved past after max fix rounds), **STOP execution**. The problems are compounding. Report all accumulated issues to the user and follow Abort & Cleanup. Do not continue piling up failures.
+
+**Step 6 — Commit Wave**: Commit the wave's changes in the worktree with a descriptive message:
+```bash
+cd "<WORKTREE_PATH>" && git add -A && git commit -m "qbuild wave N: <wave theme>"
+```
+This enables clean per-wave diffs for Fix Agents in subsequent waves (`git diff HEAD~1` shows only the current wave's changes).
+
+**Step 7 — Update Progress**: Mark tasks `completed`.
+
+---
+
+## Phase 7: Final Verification & Cleanup
+
+After all waves complete:
+
+1. **Multi-focus quality review**: Launch 3 review agents **in parallel**, each examining all changed files in the worktree through a different lens. Use the Quality Reviewer Agent template for each:
+
+   **Reviewer A — Simplicity & DRY**: Review for unnecessary complexity, duplicated logic, over-engineering, dead code, and opportunities to simplify. Focus: could this be simpler while achieving the same result?
+
+   **Reviewer B — Correctness & bugs**: Review for logic errors, off-by-one mistakes, unhandled edge cases, race conditions, and functional correctness against the acceptance criteria.
+
+   **Reviewer C — Conventions & integration**: Review for adherence to project conventions (naming, file organization, patterns), proper integration with existing code, and consistency with the codebase's style.
+
+2. **Consolidate review findings**: Merge all 3 reviewers' results. Prioritize by severity. If any CRITICAL or HIGH issues exist, present them to the user:
+
+   > **Quality review found N issues (X critical, Y high).** Here are the findings:
+   > [issues list]
+   > How to proceed? **fix** (address critical+high), **fix-all** (address all), or **skip** (proceed as-is)
+
+   **STOP and wait for user direction.** If user says fix/fix-all, dispatch targeted fixes via SendMessage to original implementors or Fix Agents. Re-run build after fixes.
+
+   If only MEDIUM/LOW issues exist, note them for the report and proceed.
+
+3. **Acceptance verification**: Launch a Verifier Agent checking all acceptance criteria, full verification plan, and cross-wave regressions. Fix issues (max 2 rounds).
+
+4. **Cleanup pass**: Launch a lightweight agent (`model: "haiku"`) to scan all changed files in the worktree and remove development artifacts only: debug statements (`console.log`, `print`, `dbg!`), commented-out code, TODO comments added during implementation, unused imports. NO functional changes. Run build command after to confirm nothing broke.
+
+---
+
+## Phase 8: Report
+
+```
+## Build Complete
+
+### What was built
+<1-3 sentences>
+
+### Approach
+<Which architecture approach was chosen, key trade-offs considered>
+
+### Acceptance Criteria
+- [x] <criterion> — verified by <evidence>
+- [ ] <criterion> — <why not met>
+
+### Quality Review Summary
+- Reviewers: simplicity, correctness, conventions
+- Issues found: <N> (<X> fixed, <Y> deferred)
+- Deferred items: <brief list if any>
+
+### Files Changed
+<grouped by purpose>
+
+### Verification Results
+- `<command>` → PASS/FAIL
+
+### Follow-ups (if any)
+- <non-blocking improvements>
+- <deferred review findings>
+```
+
+---
+
+## Phase 9: Merge & Cleanup
+
+**Ask the user** whether to squash. Present it as a question and WAIT for their answer:
+
+> **All work complete.** Changes on branch `{WORKTREE_BRANCH}` in `{WORKTREE_PATH}`.
+>
+> **Shall I squash all changes into a single commit on `{SOURCE_BRANCH}`?** Say **yes/squash** to proceed, or **skip** to leave the branch for manual handling.
+
+⛔ **STOP. This is a blocking question — do NOT proceed until the user answers.** Do not assume confirmation. Do not treat this as a status update.
+
+On **confirm** (user says yes, confirm, lg, go, squash, etc.):
+
+`cd "<ORIGINAL_DIR>" && rm -f ".qbuild-lock.$LOCK_ID" && git merge --squash "qbuild/<slug>" && git commit -m "<summary>" && git worktree remove "<WORKTREE_PATH>" && rm -rf "<WORKTREE_PATH>" && git branch -D "qbuild/<slug>"`
+
+On **skip**:
+
+`cd "<ORIGINAL_DIR>" && rm -f ".qbuild-lock.$LOCK_ID"` — leave worktree in place, provide path and commands for later.
+
+If `rm -rf` fails with permission errors (root-owned files from Docker/test processes), report:
+
+> Could not fully remove `<WORKTREE_PATH>` — some files are owned by root. Run:
+>
+> ```
+> sudo rm -rf <WORKTREE_PATH>
+> ```
+
+If `HAS_UI_CHANGES=true`, stop the visual server after confirm/skip: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/visual/stop-server.sh" "$VISUAL_SESSION_DIR"`
+
+**See also**: `superpowers:finishing-a-development-branch` for alternative branch completion workflows.
+
+---
+
+## Abort & Cleanup
+
+On user cancel or fatal error:
+
+1. Stop — no new agents.
+1b. **Stop visual companion** (if HAS_UI_CHANGES=true): `bash "${CLAUDE_PLUGIN_ROOT}/scripts/visual/stop-server.sh" "$VISUAL_SESSION_DIR"`
+2. **Remove lock file**: `rm -f "<ORIGINAL_DIR>/.qbuild-lock.$LOCK_ID"` (always, regardless of keep/remove choice).
+3. Report: "Build aborted. Changes on branch `{WORKTREE_BRANCH}` in `{WORKTREE_PATH}`. Keep or remove?"
+4. **Remove**: `cd "<ORIGINAL_DIR>" && git worktree remove "<WORKTREE_PATH>" --force; rm -rf "<WORKTREE_PATH>"; git branch -D "qbuild/<slug>"`. If `rm -rf` fails with permission errors (root-owned files from Docker/test processes), report:
+
+> Could not fully remove `<WORKTREE_PATH>` — some files are owned by root. Run:
+>
+> ```
+> sudo rm -rf <WORKTREE_PATH>
+> ```
+5. **Keep**: leave in place, provide path.
+6. Mark in-progress tasks as cancelled.
+
+Before Phase 5: only the lock file needs cleanup (`rm -f "<ORIGINAL_DIR>/.qbuild-lock.$LOCK_ID"`).
+
+---
+
+## Agent Templates
+
+Fill all `{placeholders}` with plan values. Include the Working Directory and Prior Wave Summary sections as shown. Set `subagent_type` and `model` as noted.
+
+### Implementor Agent
+
+`subagent_type: general-purpose` | `model: "sonnet"`
+
+> You are an Implementor. Implement the assigned task — nothing more, nothing less.
+> Produce minimal, clean changes that follow existing codebase patterns.
+>
+> ## Hard Rules
+> 1. **No scope creep** — only what the task asks. No unrelated refactoring.
+> 2. **No unnecessary changes** — no extra comments, docstrings, or type annotations.
+> 3. **Follow existing patterns** — match project conventions.
+> 4. **Self-verify** — run verification commands before finishing.
+>
+> ## Working Directory
+> All work MUST be done in: `{worktree_path}`
+> cd here before any file operations. Use absolute paths.
+>
+> ## Prior Wave Summary (Wave 2+ only, omit for Wave 1)
+> {wave_summary}
+>
+> ## Your Task: {task_title}
+> ### Scope
+> {task_scope}
+> ### Definition of Done
+> {task_definition_of_done}
+> ### Verification
+> {task_verification_commands}
+> ### Context
+> {relevant_context — key files, patterns, architecture}
+>
+> ## Completion
+> Return:
+> 1. **Status**: DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+> 2. What you implemented (1-3 sentences)
+> 3. Files changed (list)
+> 4. Verification results (commands + output)
+> 5. If DONE_WITH_CONCERNS: describe concerns
+> 6. If BLOCKED: what you need to proceed
+> 7. If NEEDS_CONTEXT: what specific context you need
+
+### UI Implementor Agent
+
+`subagent_type: general-purpose` | `model: "sonnet"`
+
+> You are a UI Implementor. Create accessible, production-ready interfaces
+> following the project's established design system.
+>
+> ## Before Writing Code
+> Search the codebase for: design tokens, component primitives, CSS approach, similar UI.
+> MUST use discovered patterns. NEVER introduce conflicting design systems.
+>
+> ## Hard Rules
+> 1. **No scope creep** — only what the task asks.
+> 2. **Accessibility**: 4.5:1 contrast, visible focus, semantic HTML.
+> 3. **Use existing tokens/components** — no hardcoded colors if tokens exist.
+> 4. **All interactive states**: default, hover, active, focus, disabled.
+> 5. **All UI states**: empty, loading, error, success.
+> 6. **Honor prefers-reduced-motion**.
+>
+> ## Working Directory
+> All work MUST be done in: `{worktree_path}`
+> cd here before any file operations. Use absolute paths.
+>
+> ## Prior Wave Summary (Wave 2+ only, omit for Wave 1)
+> {wave_summary}
+>
+> ## Your Task: {task_title}
+> ### Scope
+> {task_scope}
+> ### Definition of Done
+> {task_definition_of_done}
+> ### Verification
+> {task_verification_commands}
+> ### Context
+> {relevant_context — design system, components, key files}
+>
+> ## Completion
+> Return:
+> 1. **Status**: DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+> 2. What you implemented (1-3 sentences)
+> 3. Files changed (list)
+> 4. Accessibility checks performed
+> 5. Verification results
+> 6. If DONE_WITH_CONCERNS/BLOCKED/NEEDS_CONTEXT: details
+
+### Fix Agent
+
+`subagent_type: general-purpose` | `model: default`
+
+Use for build failures or cross-cutting issues spanning multiple agents. For single-agent verification failures, prefer **SendMessage** to the original implementor.
+
+Uses `superpowers:systematic-debugging` — the full skill, not a summary.
+
+> You are a Fix Agent. Diagnose and fix a specific issue. Root cause first — NO guessing.
+>
+> ## FIRST ACTION — Invoke Skill
+> Before doing ANYTHING else, invoke the `superpowers:systematic-debugging` skill using the Skill tool. Read and follow its full methodology — all four phases, the Iron Law, supporting techniques (root-cause-tracing, defense-in-depth, condition-based-waiting), and the common rationalizations table. The skill is your operating manual for this task.
+>
+> ## Hard Rules
+> 1. Invoke `superpowers:systematic-debugging` FIRST — before reading errors, before proposing fixes, before anything.
+> 2. Follow the skill's four phases in order. Do not skip phases.
+> 3. One fix at a time — never bundle multiple changes.
+> 4. Minimal diff — fix only what's broken.
+> 5. If 2 attempts fail — STOP. Report what you learned. Do NOT attempt fix #3.
+>
+> ## Working Directory
+> All work MUST be done in: `{worktree_path}`
+>
+> ## The Issue
+> ### What failed
+> {failure_description}
+> ### Failing command
+> `{failing_command}`
+> ### Files changed in this wave
+> {files_changed_list}
+> ### Context
+> {what was being implemented, constraints}
+>
+> ## Completion
+> Return:
+> 1. **Root cause** — what was wrong and why (with evidence from investigation)
+> 2. **Fix applied** — what you changed (and what hypothesis it addresses)
+> 3. **Files changed** (list)
+> 4. **Hardening** — any validation/guards added to prevent recurrence
+> 5. **Verification** — command + output proving fix works
+> 6. **Regression check** — build/test results
+> 7. If fix failed: **Investigation report** — hypotheses tested, evidence gathered, whether this appears architectural
+
+### Verifier Agent
+
+`subagent_type: feature-dev:code-reviewer` | `model: default`
+
+> You are a Verifier. Evidence-driven: no evidence, not verified.
+>
+> ## Hard Rules
+> 1. Acceptance Criteria is your checklist — no extra requirements.
+> 2. No evidence = not verified.
+> 3. No partial approvals — APPROVED only if every criterion passes.
+> 4. Run verification commands — if you can't, say so.
+>
+> ## Working Directory
+> All work MUST be done in: `{worktree_path}`
+>
+> ## What to Verify
+> ### Acceptance Criteria
+> {acceptance_criteria_list}
+> ### Verification Commands
+> {verification_commands}
+> ### Files Changed
+> {files_changed_by_implementors}
+>
+> ## Edge-Case Checks (only if relevant)
+> - APIs: backward compat, validation, error shapes
+> - UI: empty/loading/error states, keyboard focus, a11y
+> - Data models: migrations, nullability, serialization
+> - Concurrency: races, retries, idempotency
+> - Async/timing: verify conditions are met rather than assuming timing — if a feature involves async operations, check that the system waits for actual conditions (event fired, state changed, file exists) rather than arbitrary delays
+>
+> ## Output Format (REQUIRED)
+>
+> First line of your response MUST be exactly one of:
+> **STATUS: APPROVED** or **STATUS: NOT_APPROVED**
+>
+> Then provide:
+>
+> ### Confidence: High / Medium / Low
+>
+> ### Acceptance Criteria
+> Per criterion: VERIFIED (evidence) | DEVIATION (diff, impact, fix) | MISSING (what, impact, fix)
+>
+> ### Verification Commands
+> - `<command>` → PASS/FAIL
+>
+> ### Issues (if NOT_APPROVED)
+> Per issue: What, File (path:line), Fix (minimal), Re-verify (command)
+
+### Quality Reviewer Agent
+
+`subagent_type: feature-dev:code-reviewer` | `model: default`
+
+Used in Phase 7 for multi-focus quality review. Launch 3 instances with different focus areas.
+
+> You are a Quality Reviewer focused on **{review_focus}**. Review all changed files for issues through your specific lens.
+>
+> ## Hard Rules
+> 1. Stay in your lane — only flag issues relevant to your focus area.
+> 2. Severity matters — CRITICAL (will cause bugs/outages), HIGH (significant quality issue), MEDIUM (should fix), LOW (nitpick).
+> 3. Be specific — file path, line number, what's wrong, how to fix.
+> 4. No false positives — if you're unsure, note uncertainty rather than flagging.
+>
+> ## Working Directory
+> All work MUST be done in: `{worktree_path}`
+>
+> ## Your Focus: {review_focus}
+> {review_focus_description}
+>
+> ## Files to Review
+> {changed_files_list}
+>
+> ## Codebase Context
+> {project_conventions_and_patterns}
+>
+> ## Output Format (REQUIRED)
+>
+> ### Issues Found
+>
+> Per issue:
+> - **Severity**: CRITICAL | HIGH | MEDIUM | LOW
+> - **File**: `{path}:{line}`
+> - **What**: description of the issue
+> - **Why**: why this matters
+> - **Fix**: suggested minimal fix
+>
+> ### Summary
+> - Total issues: N (X critical, Y high, Z medium, W low)
+> - Overall assessment: 1-2 sentences
+
+---
+
+## Coordinator Rules
+
+1. ⛔ **Worktree discipline (NON-NEGOTIABLE)** — Phase 5 MUST complete before Phase 6. All agent prompts MUST include WORKTREE_PATH. Never modify original project directory. If worktree creation fails, STOP and report — do NOT fall back to working in the original directory. **Every qbuild invocation MUST create a worktree — no exceptions, regardless of task size.**
+2. **Never edit code yourself** — Implementors implement, Fix Agents fix.
+3. **Never skip clarification** — Phase 2 catches ambiguities that compound into costly rework. Skip only when the request is genuinely unambiguous.
+4. **Never skip verification** — every wave + final holistic check.
+5. **One task per agent** — clear scope, no overload.
+6. **Parallel dispatch** — same-wave tasks in one message. Architect agents in one message. Quality reviewers in one message.
+7. **Read before planning** — read key files from explorers first.
+8. **Track progress** — TaskUpdate: `in_progress` / `completed` / `cancelled`.
+9. **Max 2 fix rounds** — report and move on. If Fix Agent reports architectural concerns, escalate to user with redesign/continue/abort options.
+10. **Detect UI tasks** — use UI Implementor for visual work.
+11. **No auto-commits** — Phase 9 for merge confirmation.
+12. **Record wave summaries** — after each wave, write summary for Wave 2+ context.
+13. **Build before verify** — build gate after implementors, before verifier.
+14. **Honor abort** — Abort & Cleanup immediately on cancel.
+15. **Prefer SendMessage** — for verification failures, continue original implementor (preserves context). Fix Agent only for build failures or cross-cutting issues.
+16. **Route agent statuses** — handle BLOCKED and NEEDS_CONTEXT via SendMessage with resolution. Don't skip.
+17. **Save agent IDs** — store the agent ID from each Agent tool return so you can SendMessage to implementors later for fixes.
+18. **Commit per wave** — commit in the worktree after each wave passes verification so Fix Agents get clean per-wave diffs.
+19. **Early abort** — if 2+ consecutive waves have unresolved failures, stop and report rather than continuing to accumulate problems.
+20. **User checkpoints** — Phase 2 (clarification), Phase 4 (plan approval), Phase 7 (review findings), architectural escalation. Never skip these without user input.
+21. **Root cause before fixes** — Fix Agents MUST invoke `superpowers:systematic-debugging` as their first action. If a Fix Agent's report lacks root cause evidence or doesn't reference the skill's phases, SendMessage asking it to invoke the skill and restart investigation.
+22. **Escalate architectural failures** — when Fix Agent reports that fixes reveal problems in different places or create new symptoms, present the investigation report to the user with redesign/continue/abort options. Do not silently continue.
+23. ⛔ **Never stash (NON-NEGOTIABLE)** — NEVER run `git stash` automatically. If the working tree is dirty, STOP and present the dirty files to the user. Ask them how to proceed. Do not offer to stash on their behalf.
+24. **Stop on dirty git errors** — if any git operation fails due to uncommitted changes, unstaged files, or other dirty-state issues, STOP immediately and ask the user. Do not attempt to resolve dirty-git errors automatically.
+25. **Visual companion lifecycle** — start server in Phase 3 only when `HAS_UI_CHANGES=true`. Push waiting screens between visual questions. Stop server in Phase 9 and Abort. If server fails at any point, set `HAS_UI_CHANGES=false` and continue text-only.
+26. ⛔ **Lock file ownership (NON-NEGOTIABLE)** — ONLY delete the lock file matching the current session's `LOCK_ID` (`.qbuild-lock.$LOCK_ID`). NEVER delete, modify, or offer to remove lock files created by other sessions. Existing lock files always belong to active sessions until proven otherwise — and proving otherwise is NOT your job.
+
+ARGUMENTS: $ARGUMENTS

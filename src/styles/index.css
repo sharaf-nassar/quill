@@ -1884,6 +1884,73 @@ body {
   background: rgba(255, 255, 255, 0.06);
 }
 
+.breakdown-skill-sort-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 20px;
+  padding: 0 10px 0 7px;
+  flex: 0 0 auto;
+}
+
+.breakdown-skill-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 2px 0;
+  background: none;
+  border: 0;
+  color: rgba(255, 255, 255, 0.38);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+
+.breakdown-skill-sort:hover,
+.breakdown-skill-sort:focus-visible {
+  color: rgba(255, 255, 255, 0.76);
+}
+
+.breakdown-skill-sort:focus-visible {
+  outline: 1px solid rgba(96, 165, 250, 0.55);
+  outline-offset: 2px;
+}
+
+.breakdown-skill-sort.active {
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.breakdown-skill-sort-name {
+  grid-column: 1;
+  justify-self: start;
+  margin-left: 9px;
+}
+
+.breakdown-skill-sort-uses {
+  grid-column: 2 / span 2;
+  justify-self: end;
+}
+
+.breakdown-skill-sort-time {
+  grid-column: 4;
+  justify-self: end;
+}
+
+.breakdown-skill-sort-indicator {
+  display: inline-block;
+  min-width: 8px;
+  color: rgba(96, 165, 250, 0.9);
+  font-size: 9px;
+  line-height: 1;
+  text-align: left;
+}
+
 .breakdown-list {
   display: flex;
   flex-direction: column;
