@@ -67,6 +67,12 @@ Each message is enriched during indexing by parsing tool call inputs and outputs
 
 Claude Edit/Write tool calls become `code_changes`, Bash becomes `commands_run`, and Read/Grep/Glob become `tool_details`. Codex `apply_patch` calls become `code_changes`, `exec_command` and `write_stdin` become `commands_run`, and MCP or auxiliary tool calls become searchable `tool_details`.
 
+### Dual Emission for Runtime Tracking
+
+The same parse pass that produces `ExtractedMessage` for the search index also produces `ExtractedEvent` for the [[backend#Database#Schema#Code and Runtime Metrics]] `session_events` table.
+
+The search index keeps its existing filter (it drops `tool_result`-only user messages and empty assistant blocks), while the event stream carries every non-meta `user`/`assistant` line with a non-empty timestamp — classified by content shape into `user_text`, `user_tool_result`, `asst_text`, `asst_thinking`, or `asst_tool_use`. This dual emission keeps the search corpus lean while letting the runtime metric reconstruct full agent-loop active intervals.
+
 ### Sub-Agent Transcripts
 
 The Claude file walker now picks up `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript so sub-agent activity flows through the same enrichment and storage path.

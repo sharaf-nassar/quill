@@ -107,11 +107,12 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at `specs/007-landlock-inference-sandbox/plan.md`. Linked artifacts:
-- `specs/007-landlock-inference-sandbox/spec.md` — feature specification
-- `specs/007-landlock-inference-sandbox/research.md` — Phase 0 design decisions (R-A..R-F)
-- `specs/007-landlock-inference-sandbox/data-model.md` — Phase 1 zero-migration data model
-- `specs/007-landlock-inference-sandbox/contracts/landlock-sandbox.md` — confinement-chain + diagnostic contract
-- `specs/007-landlock-inference-sandbox/quickstart.md` — Phase 1 maintainer verification walkthrough
-- Prior feature context: `specs/006-learning-hardening-followups/` (honest confinement disclosure, retired ProcessOnly), `specs/005-learning-system-hardening/` (R-7 confinement design, migration 25 data model)
+at `specs/008-runtime-redesign/plan.md`. Linked artifacts:
+- `specs/008-runtime-redesign/spec.md` — feature specification
+- `specs/008-runtime-redesign/research.md` — Phase 0 design decisions (R-A..R-F)
+- `specs/008-runtime-redesign/data-model.md` — Phase 1 session_events schema + migration 26
+- `specs/008-runtime-redesign/contracts/session-events.md` — extractor + ingest contract
+- `specs/008-runtime-redesign/contracts/llm-runtime-stats.md` — IPC + active-interval computation contract
+- `specs/008-runtime-redesign/quickstart.md` — Phase 1 maintainer verification walkthrough
+- Prior feature context: `specs/007-landlock-inference-sandbox/` (in-app learning loop with Landlock-confined CLI inference), `specs/006-learning-hardening-followups/` (honest confinement disclosure), `specs/005-learning-system-hardening/` (R-7 confinement design, migration 25 data model)
 <!-- SPECKIT END -->

@@ -147,13 +147,14 @@ Tables for tracking memory files, optimization runs, and actionable suggestions 
 
 #### Code and Runtime Metrics
 
-Tables for tracking per-turn LLM response latency and caching git commit history per project.
+Tables for tracking active LLM session time, per-turn response latency, and cached git commit history per project.
 
-`get_llm_runtime_stats` groups consecutive rows into logical turns using `idle_secs` to detect tool-execution gaps, then measures each turn's full wall-clock span.
+- **session_events** — One row per non-meta `user`/`assistant` JSONL line from CC and Codex transcripts (provider, session_id, agent_id, is_sidechain, timestamp, kind, uuid, parent_uuid). `kind` is one of `user_text`, `user_tool_result`, `asst_text`, `asst_thinking`, `asst_tool_use`. A unique index over `(provider, session_id, COALESCE(agent_id,''), timestamp, kind)` makes ingestion idempotent under `INSERT OR IGNORE`. Added by migration 26 and populated by the same session indexer pass that fills `tool_actions` and `response_times`.
+- **response_times** (legacy for runtime card; still consumed by Sessions breakdown and sub-agent tree) — Per-turn assistant response latency keyed by (provider, session_id, timestamp) with `is_sidechain`/`agent_id`/`parent_uuid` from migration 20.
 
-Codex runtime ingestion treats a user prompt as one turn ending at the last assistant or tool-activity timestamp before the next user prompt, because Codex transcripts keep tool calls and outputs on assistant-side records.
+`get_llm_runtime_stats(range, scope)` sources from `session_events`. It walks events ordered by `(provider, session_id, COALESCE(agent_id,''), timestamp)` and sums per-chain logical turns. A gap between an `asst_tool_use` and the next `user_tool_result` always counts as active time (clamped at 6 hours); any other gap above 300 seconds splits the current turn. Each sub-agent forms its own chain so siblings spawned from the same parent message do not stitch together into a single timeline. The `parent_only` scope adds `WHERE is_sidechain = 0` so the headline card can show parent-thread cost without sub-agent inflation.
 
-Migration 20 also added `is_sidechain`, `agent_id`, and `parent_uuid` to `response_times`. The `idle_secs` turn-grouping logic is unchanged, but each sub-agent forms its own chain of turns scoped by `(provider, session_id, agent_id)` — siblings spawned from the same parent message do not stitch together into a single timeline.
+Codex transcripts emit only `user_text` and `asst_text` events because Codex keeps tool activity on assistant-side records; the existing `tool_actions` enrichment pipeline is unaffected.
 
 - **git_snapshots** — Cached git history per project (project unique, commit_hash, commit_count, raw_data).
 
@@ -162,7 +163,7 @@ Migration 20 also added `is_sidechain`, `agent_id`, and `parent_uuid` to `respon
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v25). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep.
+- **schema_version** — Migration version tracking (currently v26). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts.
 
 ## Tauri IPC Commands
 
@@ -243,7 +244,7 @@ State-changing learning commands are authorized (feature 005 US2 — H-4 / FR-01
 
 `get_batch_session_code_stats` fans out one SQL branch per `(provider, session_id)` pair with `UNION ALL` so SQLite can use the `tool_actions` provider/session index instead of falling back to a broad category scan across the entire code-change corpus.
 
-`get_llm_runtime_stats(range, scope)` accepts an optional `scope: "all" | "parent_only"` argument. `None` or `"all"` preserves the existing behavior across every row; `"parent_only"` adds `WHERE is_sidechain = 0` so the headline runtime card on the [[features#Analytics Dashboard#Now Tab]] can report parent-thread cost without sub-agent traffic inflating it. The `(provider, session_id, is_sidechain)` index covers the filter.
+`get_llm_runtime_stats(range, scope)` accepts an optional `scope: "all" | "parent_only"` argument and sources from the `session_events` table (see [[backend#Database#Schema#Code and Runtime Metrics]] for the gap-classification rules and the 5-minute idle threshold / 6-hour tool-wait ceiling). `None` or `"all"` preserves the existing behavior across every chain; `"parent_only"` adds `WHERE is_sidechain = 0` so the headline runtime card on the [[features#Analytics Dashboard#Now Tab]] can report parent-thread cost without sub-agent traffic inflating it. The `idx_se_provider_session_sidechain` index covers the filter. The IPC return shape (`LlmRuntimeStats { total_runtime_secs, turn_count, session_count, avg_per_turn_secs, sparkline }`) is unchanged from migration 25's contract.
 
 `get_session_subagent_tree(provider, session_id) -> Vec<SubagentNode>` is lazy-fetched by the [[features#Analytics Dashboard#Now Tab]] only after a sub-agent-bearing session row is expanded. Implementation in [[src-tauri/src/storage.rs#Storage#get_session_subagent_tree]] returns one node per `agent_id` for the requested `(provider, session_id)`, carrying `parent_agent_id` (null at depth 1; populated when Claude later spawns depth-2+ sub-agents and rebuilt at query time from `parent_uuid` chains), `first_seen`/`last_active`, `turn_count`, the input/output/cache/total token breakdown, `tool_call_count`, and a reserved `label: Option<String>` (always `None` today).
 

@@ -542,7 +542,21 @@ impl SessionIndex {
         let skill_usage_reingest_pending = storage
             .and_then(|s| s.get_setting("skill_usage_reingest_pending").ok().flatten())
             .is_some();
-        if subagent_reingest_pending || skill_usage_reingest_pending {
+        // Feature 008: migration 26 sets `runtime_event_reingest_pending`
+        // so the next mtime sweep re-runs `process_discovered_file` for
+        // every transcript and populates `session_events`. Same shape as
+        // the migration-20 / 21 backfill handlers.
+        let runtime_event_reingest_pending = storage
+            .and_then(|s| {
+                s.get_setting("runtime_event_reingest_pending")
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+        if subagent_reingest_pending
+            || skill_usage_reingest_pending
+            || runtime_event_reingest_pending
+        {
             log::info!(
                 "Session derived-data migration: clearing mtime cache to force full transcript re-ingest"
             );
@@ -659,6 +673,40 @@ impl SessionIndex {
                 }
             }
 
+            // Feature 008: dual-emit per-event rows into `session_events`.
+            // Delete-then-insert per session matches the pattern used for
+            // tool_actions / skill_usages / response_times above. See
+            // specs/008-runtime-redesign/contracts/session-events.md
+            // (IDX-1, IDX-2).
+            if let Some(storage) = storage
+                && !extracted.session_id.is_empty()
+            {
+                let rt_events: Vec<crate::storage::SessionEventInput<'_>> = extracted
+                    .events
+                    .iter()
+                    .map(|ev| crate::storage::SessionEventInput {
+                        timestamp: ev.timestamp.as_str(),
+                        kind: ev.kind,
+                        is_sidechain: ev.is_sidechain,
+                        agent_id: ev.agent_id.as_deref(),
+                        uuid: ev.uuid.as_deref(),
+                        parent_uuid: ev.parent_uuid.as_deref(),
+                    })
+                    .collect();
+                if let Err(e) = storage
+                    .delete_session_events_for_session(discovered.provider, &extracted.session_id)
+                {
+                    log::warn!("Failed to delete old session_events: {e}");
+                }
+                if let Err(e) = storage.ingest_session_events(
+                    discovered.provider,
+                    &extracted.session_id,
+                    &rt_events,
+                ) {
+                    log::warn!("Failed to store session_events: {e}");
+                }
+            }
+
             total_indexed += extracted.messages.len();
             state.file_mtimes.insert(file_key, mtime);
         }
@@ -682,6 +730,16 @@ impl SessionIndex {
             && let Err(e) = storage.delete_setting("skill_usage_reingest_pending")
         {
             log::warn!("Failed to clear skill_usage_reingest_pending flag: {e}");
+        }
+        // Feature 008: clear the migration-26 backfill flag once the
+        // sweep completes successfully. If we bubbled an error above, the
+        // flag stays set so the next boot retries the catch-up scan.
+        // @lat: [[data-flow#Session Indexing Pipeline]]
+        if runtime_event_reingest_pending
+            && let Some(storage) = storage
+            && let Err(e) = storage.delete_setting("runtime_event_reingest_pending")
+        {
+            log::warn!("Failed to clear runtime_event_reingest_pending flag: {e}");
         }
 
         drop(writer);
@@ -1189,6 +1247,48 @@ pub struct SkillAccess {
     pub skill_path: String,
 }
 
+/// Event-kind classification used by the runtime-event pipeline. Five
+/// variants matching specs/008-runtime-redesign/contracts/session-events.md
+/// (EVT-CL-2..EVT-CL-5 and EVT-CX-1). Used by both extractor and storage
+/// ingest paths so the conversion between [`ExtractedEvent`] and
+/// [`crate::storage::SessionEventInput`] is a plain field map.
+// @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEventKind {
+    UserText,
+    UserToolResult,
+    AsstText,
+    AsstThinking,
+    AsstToolUse,
+}
+
+impl SessionEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionEventKind::UserText => "user_text",
+            SessionEventKind::UserToolResult => "user_tool_result",
+            SessionEventKind::AsstText => "asst_text",
+            SessionEventKind::AsstThinking => "asst_thinking",
+            SessionEventKind::AsstToolUse => "asst_tool_use",
+        }
+    }
+}
+
+/// One non-meta `user` or `assistant` JSONL line lifted into a discrete
+/// timestamped event for the active-interval computation in
+/// [`crate::storage::Storage::get_llm_runtime_stats`]. Built alongside
+/// [`ExtractedMessage`] during the same parse pass — see
+/// specs/008-runtime-redesign/contracts/session-events.md (EVT-CL-*).
+// @lat: [[data-flow#Session Indexing Pipeline#Dual Emission for Runtime Tracking]]
+pub struct ExtractedEvent {
+    pub timestamp: String,
+    pub kind: SessionEventKind,
+    pub is_sidechain: bool,
+    pub agent_id: Option<String>,
+    pub uuid: Option<String>,
+    pub parent_uuid: Option<String>,
+}
+
 pub struct ExtractedMessage {
     pub uuid: String,
     pub session_id: String,
@@ -1220,6 +1320,11 @@ pub struct ExtractedSession {
     pub session_id: String,
     pub project_name: Option<String>,
     pub messages: Vec<ExtractedMessage>,
+    /// Per-event timeline emitted alongside [`messages`] for the active-
+    /// interval runtime pipeline (feature 008). Populated by
+    /// [`extract_claude_messages_from_jsonl`] and
+    /// [`extract_codex_messages_from_jsonl`] in the same parse pass.
+    pub events: Vec<ExtractedEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1687,11 +1792,13 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .and_then(|name| name.to_str())
                     .map(SessionIndex::project_display_name),
                 messages: Vec::new(),
+                events: Vec::new(),
             };
         }
     };
 
     let mut messages: Vec<ExtractedMessage> = Vec::new();
+    let mut events: Vec<ExtractedEvent> = Vec::new();
     // Maps tool_use block id -> entry for cross-message correlation
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
 
@@ -1778,10 +1885,22 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
         let mut commands_run: Vec<String> = Vec::new();
         let mut tool_details_vec: Vec<String> = Vec::new();
         let mut tool_actions: Vec<ToolAction> = Vec::new();
+        // Feature 008: track content-block shape so we can classify the
+        // line into one of five SessionEventKind variants per
+        // specs/008-runtime-redesign/contracts/session-events.md
+        // (EVT-CL-2..EVT-CL-5). content_is_string captures the
+        // plain-string case; the boolean flags below capture array-block
+        // presence after non-empty text filtering.
+        let mut content_is_string: bool = false;
+        let mut has_nonempty_text_block: bool = false;
+        let mut has_tool_use_block: bool = false;
+        let mut has_tool_result_block: bool = false;
+        let mut has_thinking_block: bool = false;
 
         match content_val {
             // Content is a plain string
             Some(serde_json::Value::String(s)) => {
+                content_is_string = true;
                 text_parts.push(s.clone());
             }
             // Content is an array of blocks
@@ -1791,10 +1910,14 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     match block_type {
                         "text" => {
                             if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                                if !text.trim().is_empty() {
+                                    has_nonempty_text_block = true;
+                                }
                                 text_parts.push(text.to_string());
                             }
                         }
                         "tool_use" => {
+                            has_tool_use_block = true;
                             let tool_id = block
                                 .get("id")
                                 .and_then(|v| v.as_str())
@@ -1868,6 +1991,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             }
                         }
                         "tool_result" => {
+                            has_tool_result_block = true;
                             let tool_use_id = block
                                 .get("tool_use_id")
                                 .and_then(|v| v.as_str())
@@ -1928,13 +2052,61 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                                 }
                             }
                         }
-                        // Skip thinking, image blocks
-                        "thinking" | "image" => {}
+                        // Track thinking blocks for runtime-event classification
+                        // (EVT-CL-5). Image blocks are ignored for both messages
+                        // and events.
+                        "thinking" => {
+                            has_thinking_block = true;
+                        }
+                        "image" => {}
                         _ => {}
                     }
                 }
             }
             _ => continue,
+        }
+
+        // Feature 008: emit a SessionEvent for every non-meta user/assistant
+        // line with a non-empty timestamp, classified per EVT-CL-2..EVT-CL-5
+        // (contracts/session-events.md). This happens BEFORE the empty-content
+        // filter that gates messages.push — the runtime pipeline needs every
+        // timestamped line, even tool-result-only user lines that the search
+        // index discards.
+        if !timestamp.is_empty() {
+            let event_kind = if msg_type == "user" {
+                if content_is_string || has_nonempty_text_block {
+                    Some(SessionEventKind::UserText)
+                } else if has_tool_result_block {
+                    Some(SessionEventKind::UserToolResult)
+                } else {
+                    None
+                }
+            } else {
+                // msg_type == "assistant"
+                if content_is_string || has_nonempty_text_block {
+                    Some(SessionEventKind::AsstText)
+                } else if has_tool_use_block {
+                    Some(SessionEventKind::AsstToolUse)
+                } else if has_thinking_block {
+                    Some(SessionEventKind::AsstThinking)
+                } else {
+                    None
+                }
+            };
+            if let Some(kind) = event_kind {
+                events.push(ExtractedEvent {
+                    timestamp: timestamp.clone(),
+                    kind,
+                    is_sidechain,
+                    agent_id: agent_id.clone(),
+                    uuid: if uuid.is_empty() {
+                        None
+                    } else {
+                        Some(uuid.clone())
+                    },
+                    parent_uuid: parent_uuid.clone(),
+                });
+            }
         }
 
         let content = text_parts.join("\n");
@@ -1988,6 +2160,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             .and_then(|name| name.to_str())
             .map(SessionIndex::project_display_name),
         messages,
+        events,
     }
 }
 
@@ -2000,11 +2173,13 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                 session_id: String::new(),
                 project_name: None,
                 messages: Vec::new(),
+                events: Vec::new(),
             };
         }
     };
 
     let mut messages: Vec<ExtractedMessage> = Vec::new();
+    let mut events: Vec<ExtractedEvent> = Vec::new();
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
     let mut session_id = path
         .file_stem()
@@ -2072,6 +2247,25 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .and_then(|value| value.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Feature 008: emit a SessionEvent for every kept user /
+                // assistant line. Codex transcripts only have user_text and
+                // asst_text per EVT-CX-1. We push the event BEFORE the
+                // empty-content filter that gates messages.push so the
+                // active-interval pipeline sees every timestamped line.
+                if !timestamp.is_empty() {
+                    let kind = match role {
+                        "user" => SessionEventKind::UserText,
+                        _ => SessionEventKind::AsstText,
+                    };
+                    events.push(ExtractedEvent {
+                        timestamp: timestamp.clone(),
+                        kind,
+                        is_sidechain: false,
+                        agent_id: None,
+                        uuid: None,
+                        parent_uuid: None,
+                    });
+                }
                 if content.trim().is_empty() {
                     continue;
                 }
@@ -2267,6 +2461,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
         session_id,
         project_name: cwd.as_deref().and_then(project_name_from_cwd),
         messages,
+        events,
     }
 }
 

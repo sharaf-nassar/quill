@@ -188,7 +188,7 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							trend={null}
 							sparkline={runtimeStats.sparkline}
 							accentColor="#34d399"
-							description="Cumulative wall-clock time the LLM spent generating responses across every turn in this window. Subtitle breaks the total into session count, turn count, and average duration per turn."
+							description="Total active time across CC and Codex sessions in this window — model generation, reasoning, and tool execution counted together. User-idle gaps over 5 minutes are excluded; tool waits are not."
 						/>
 						<InsightCard
 							label="Preserved"

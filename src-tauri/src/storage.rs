@@ -224,6 +224,22 @@ impl<'a> ResponseTimeInput<'a> {
     }
 }
 
+/// One non-meta `user` or `assistant` JSONL line borrowed for the
+/// `session_events` ingest pipeline (feature 008). Mirrors
+/// [`ResponseTimeInput`] lifetime conventions so the
+/// `process_discovered_file` site can build both vectors in the same
+/// loop. See specs/008-runtime-redesign/contracts/session-events.md.
+// @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+#[derive(Clone, Copy)]
+pub struct SessionEventInput<'a> {
+    pub timestamp: &'a str,
+    pub kind: crate::sessions::SessionEventKind,
+    pub is_sidechain: bool,
+    pub agent_id: Option<&'a str>,
+    pub uuid: Option<&'a str>,
+    pub parent_uuid: Option<&'a str>,
+}
+
 /// Sub-agent attribution triple carried alongside a tool action row.
 /// Bundled into a struct to keep `insert_tool_actions` under clippy's
 /// `too_many_arguments` threshold and to mirror the `ResponseTimeInput`
@@ -2243,6 +2259,58 @@ impl Storage {
                 .map_err(|e| format!("Migration 25 commit: {e}"))?;
         }
 
+        // Migration 26: per-event runtime tracking (feature 008).
+        // Introduces `session_events`, the per-JSONL-line timeline the
+        // redesigned LLM Runtime card reads. Sets a one-shot reingest flag
+        // (matching migrations 20-22) so the existing mtime sweep
+        // backfills every transcript on the next boot. See
+        // specs/008-runtime-redesign/data-model.md and
+        // specs/008-runtime-redesign/contracts/session-events.md.
+        if current_version < 26 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 26 transaction begin: {e}"))?;
+            // SQLite rejects expressions in table-level PRIMARY KEY / UNIQUE
+            // constraints (the COALESCE in the contract's PK shape). The
+            // idempotency contract (ING-4: INSERT OR IGNORE byte-identical
+            // re-walk) is preserved by a UNIQUE expression index instead —
+            // SQLite resolves INSERT OR IGNORE against unique indices the
+            // same as it would against a table-level PRIMARY KEY.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_events (
+                    provider     TEXT NOT NULL,
+                    session_id   TEXT NOT NULL,
+                    agent_id     TEXT,
+                    is_sidechain INTEGER NOT NULL DEFAULT 0,
+                    timestamp    TEXT NOT NULL,
+                    kind         TEXT NOT NULL,
+                    uuid         TEXT,
+                    parent_uuid  TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_identity
+                    ON session_events(provider, session_id, COALESCE(agent_id, ''), timestamp, kind);
+                CREATE INDEX IF NOT EXISTS idx_se_timestamp
+                    ON session_events(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_se_chain
+                    ON session_events(provider, session_id, agent_id, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_se_provider_session_sidechain
+                    ON session_events(provider, session_id, is_sidechain, timestamp);",
+            )
+            .map_err(|e| format!("Migration 26 (session_events table): {e}"))?;
+
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["runtime_event_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 26 (set reingest flag): {e}"))?;
+
+            tx.execute("INSERT INTO schema_version (version) VALUES (26)", [])
+                .map_err(|e| format!("Failed to record migration 26: {e}"))?;
+
+            tx.commit()
+                .map_err(|e| format!("Migration 26 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -4023,10 +4091,31 @@ impl Storage {
 
     pub fn delete_host_data(&self, hostname: &str) -> Result<u64, String> {
         let mut conn = self.conn.lock();
-
         let tx = conn
             .transaction()
             .map_err(|e| format!("Transaction error: {e}"))?;
+
+        // Feature 008: cascade session_events for every session that lived
+        // on this host. session_events keys on (provider, session_id), so
+        // we resolve the set via a subquery against `token_snapshots`
+        // (the authoritative source for "what sessions ran on this host").
+        // The subquery is evaluated inside the same transaction as the
+        // deletes — no separate lock acquisition — so a concurrent indexer
+        // run cannot slip new session_events rows past us, and the order
+        // (session_events delete BEFORE token_snapshots delete) ensures
+        // the subquery still sees the pre-delete state. See
+        // specs/008-runtime-redesign/contracts/session-events.md.
+        let event_count = tx
+            .execute(
+                "DELETE FROM session_events
+                 WHERE (provider, session_id) IN (
+                     SELECT DISTINCT provider, session_id
+                     FROM token_snapshots
+                     WHERE hostname = ?1
+                 )",
+                params![hostname],
+            )
+            .map_err(|e| format!("Delete session_events cascade error: {e}"))?;
 
         let snap_count = tx
             .execute(
@@ -4044,7 +4133,7 @@ impl Storage {
 
         tx.commit().map_err(|e| format!("Commit error: {e}"))?;
 
-        Ok((snap_count + hourly_count) as u64)
+        Ok((snap_count + hourly_count + event_count) as u64)
     }
 
     pub fn delete_session_data(
@@ -4071,10 +4160,19 @@ impl Storage {
             )
             .map_err(|e| format!("Delete skill usages error: {e}"))?;
 
+        // Feature 008: cascade session_events for this session. See
+        // specs/008-runtime-redesign/contracts/session-events.md (FR-012).
+        let event_count = tx
+            .execute(
+                "DELETE FROM session_events WHERE provider = ?1 AND session_id = ?2",
+                params![provider.as_str(), session_id],
+            )
+            .map_err(|e| format!("Delete session_events error: {e}"))?;
+
         tx.commit()
             .map_err(|e| format!("Delete session commit error: {e}"))?;
 
-        Ok((token_count + skill_count) as u64)
+        Ok((token_count + skill_count + event_count) as u64)
     }
 
     pub fn delete_project_data(&self, cwd: &str) -> Result<u64, String> {
@@ -4082,6 +4180,24 @@ impl Storage {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Begin delete_project_data transaction: {e}"))?;
+
+        // Feature 008: cascade session_events for every session that lived
+        // under this cwd. As in `delete_host_data`, the subquery resolving
+        // (provider, session_id) runs inside the same transaction as the
+        // deletes so concurrent indexer writes cannot race us, and the
+        // session_events delete is sequenced BEFORE the token_snapshots
+        // delete so the subquery still observes the source rows.
+        let event_count = tx
+            .execute(
+                "DELETE FROM session_events
+                 WHERE (provider, session_id) IN (
+                     SELECT DISTINCT provider, session_id
+                     FROM token_snapshots
+                     WHERE cwd = ?1
+                 )",
+                params![cwd],
+            )
+            .map_err(|e| format!("Delete session_events cascade error: {e}"))?;
 
         let token_count = tx
             .execute("DELETE FROM token_snapshots WHERE cwd = ?1", params![cwd])
@@ -4094,7 +4210,7 @@ impl Storage {
         tx.commit()
             .map_err(|e| format!("Commit delete_project_data: {e}"))?;
 
-        Ok((token_count + skill_count) as u64)
+        Ok((token_count + skill_count + event_count) as u64)
     }
 
     pub fn rename_project(&self, old_cwd: &str, new_cwd: &str) -> Result<u64, String> {
@@ -8733,17 +8849,112 @@ impl Storage {
         Ok(())
     }
 
+    /// Bulk-insert per-event rows for the active-interval runtime
+    /// pipeline (feature 008). Idempotent — uses `INSERT OR IGNORE`
+    /// against the `(provider, session_id, COALESCE(agent_id, ''),
+    /// timestamp, kind)` primary key. See
+    /// specs/008-runtime-redesign/contracts/session-events.md
+    /// (ING-1..ING-5).
+    // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+    pub fn ingest_session_events(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+        events: &[SessionEventInput<'_>],
+    ) -> Result<(), String> {
+        // ING-1: empty input short-circuits without touching the DB.
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // ING-2: defend against extractor ordering bugs / clock skew.
+        let mut sorted: Vec<SessionEventInput<'_>> = events.to_vec();
+        sorted.sort_by(|a, b| a.timestamp.cmp(b.timestamp));
+
+        // ING-3: single transaction for one (provider, session_id) batch.
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("session_events transaction: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO session_events
+                     (provider, session_id, agent_id, is_sidechain, timestamp, kind, uuid, parent_uuid)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )
+                .map_err(|e| format!("session_events prepare: {e}"))?;
+
+            for ev in &sorted {
+                // ING-5: skip rows whose timestamp does not parse as RFC3339.
+                if DateTime::parse_from_rfc3339(ev.timestamp).is_err() {
+                    log::warn!(
+                        "session_events: dropping row with unparseable timestamp {}",
+                        ev.timestamp
+                    );
+                    continue;
+                }
+                stmt.execute(params![
+                    provider.as_str(),
+                    session_id,
+                    ev.agent_id,
+                    ev.is_sidechain as i64,
+                    ev.timestamp,
+                    ev.kind.as_str(),
+                    ev.uuid,
+                    ev.parent_uuid,
+                ])
+                .map_err(|e| format!("session_events insert: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("session_events commit: {e}"))?;
+        Ok(())
+    }
+
+    /// Drop every `session_events` row for one `(provider, session_id)`.
+    /// Called from `process_discovered_file` before re-ingest and from
+    /// the `delete_session_data` / `delete_host_data` /
+    /// `delete_project_data` cascades. See
+    /// specs/008-runtime-redesign/contracts/session-events.md.
+    // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+    pub fn delete_session_events_for_session(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM session_events WHERE provider = ?1 AND session_id = ?2",
+            params![provider.as_str(), session_id],
+        )
+        .map_err(|e| format!("Failed to delete session_events for session: {e}"))?;
+        Ok(())
+    }
+
     /// Compute LLM runtime stats. `scope` controls whether sub-agent
     /// (`is_sidechain = 1`) rows are folded in:
     /// * `None` or `Some("all")`: include parent + sub-agent rows (default,
     ///   matches pre-Wave-2 behavior since sub-agent rows used to not exist).
     /// * `Some("parent_only")`: filter out sub-agent rows for the legacy
     ///   "parent transcript only" view.
+    ///
+    /// Feature 008 rewrites this to source from `session_events` and to
+    /// implement the active-interval semantics specified in
+    /// specs/008-runtime-redesign/contracts/llm-runtime-stats.md
+    /// (STAT-1..STAT-7). A "logical turn" is a contiguous run of events
+    /// on a single chain `(provider, session_id, agent_id)` where every
+    /// between-event gap is either <= IDLE_THRESHOLD_SECS or a tool-loop
+    /// gap (asst_tool_use -> user_tool_result) up to TOOL_WAIT_MAX_SECS.
+    // @lat: [[backend#Tauri IPC Commands#Code and Response Stats (5)]]
     pub fn get_llm_runtime_stats(
         &self,
         range: &str,
         scope: Option<&str>,
     ) -> Result<LlmRuntimeStats, String> {
+        const IDLE_THRESHOLD_SECS: f64 = 300.0; // 5 minutes (R-B)
+        const TOOL_WAIT_MAX_SECS: f64 = 21_600.0; // 6 hours (R-B safety ceiling)
+
         let conn = self.conn.lock();
         let now = Utc::now();
         let from = now - range_to_duration(range);
@@ -8752,24 +8963,36 @@ impl Storage {
 
         let range_secs = range_to_duration(range).num_seconds() as f64;
         let bucket_secs = range_secs / 7.0;
-        let from_epoch = from.timestamp_millis() as f64;
+        let from_epoch_ms = from.timestamp_millis() as f64;
+        // STAT-4 + R-B: tool-wait gaps realize at most up to `now`. The
+        // ceiling is the smaller of `prev_ms + TOOL_WAIT_MAX_SECS` and
+        // `now_ms`, so a realized turn never credits wall-clock time that
+        // has not elapsed yet (e.g., when prev_ms is < 6h before now).
+        let now_ms = now.timestamp_millis() as f64;
 
-        // Logical turn grouping: consecutive rows in the same session where
-        // idle_secs is present (gap <= 600s) belong to the same working cycle
-        // (tool execution between LLM calls). A new logical turn starts when
-        // idle_secs is NULL (first turn or gap > 600s) or the session changes.
-        // Each logical turn's duration = last assistant_ts - first user_ts,
-        // capturing full working time including tool execution.
         let mut total_runtime_secs: f64 = 0.0;
         let mut turn_count: i64 = 0;
         let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut bucket_sums: [f64; 7] = [0.0; 7];
 
-        // Current logical turn state
-        let mut cur_session: Option<String> = None;
-        let mut turn_start_ms: f64 = 0.0; // first user_ts in logical turn
-        let mut turn_end_ms: f64 = 0.0; // last assistant_ts in logical turn
+        // Walker state: a "chain" is (provider, session_id, agent_id).
+        // We track its parts separately so that detecting a chain change
+        // does not require formatting a composite key on every row — a hot
+        // path on multi-thousand-event queries.
+        // turn_start_ms holds the first event in the current logical turn;
+        // prev_ms / prev_kind capture the most recent event on the chain.
+        let mut cur_provider: Option<String> = None;
+        let mut cur_session_id: Option<String> = None;
+        let mut cur_agent_id: Option<String> = None;
+        let mut turn_start_ms: f64 = 0.0;
+        let mut prev_ms: f64 = 0.0;
+        let mut prev_kind: Option<String> = None;
 
+        // STAT-5: flush a finalized turn into the aggregates, distributing
+        // its duration into a single sparkline bucket keyed off the turn's
+        // start. (Whole-turn assignment matches the prior implementation;
+        // bucket overlap proration is reserved for a future enhancement
+        // once we have multi-bucket coverage tests.)
         let flush_turn = |start_ms: f64,
                           end_ms: f64,
                           total: &mut f64,
@@ -8777,98 +9000,141 @@ impl Storage {
                           buckets: &mut [f64; 7],
                           from_ep: f64,
                           bkt_secs: f64| {
-            let dur = (end_ms - start_ms) / 1000.0;
+            let dur = ((end_ms - start_ms) / 1000.0).max(0.0);
             if dur > 0.0 {
                 *total += dur;
                 *count += 1;
                 let offset_ms = start_ms - from_ep;
-                let bucket = ((offset_ms / 1000.0) / bkt_secs) as usize;
+                let bucket = ((offset_ms / 1000.0) / bkt_secs).max(0.0) as usize;
                 buckets[bucket.min(6)] += dur;
             }
         };
 
         {
-            // Index hint: when parent_only filter is on, the
-            // `idx_rt_provider_session_sidechain` index covers the WHERE
-            // clause; otherwise the broader timestamp index is used.
+            // STAT-2: parent_only adds `is_sidechain = 0` to the WHERE.
+            // Order matches the chain key so the walker can process each
+            // (provider, session_id, agent_id) chain contiguously.
             let sql = if parent_only {
-                "SELECT timestamp, response_secs, idle_secs, provider, session_id
-                 FROM response_times
-                 WHERE timestamp >= ?1 AND response_secs IS NOT NULL AND is_sidechain = 0
-                 ORDER BY provider, session_id, timestamp"
+                "SELECT timestamp, kind, provider, session_id, agent_id, is_sidechain
+                 FROM session_events
+                 WHERE timestamp >= ?1 AND is_sidechain = 0
+                 ORDER BY provider, session_id, COALESCE(agent_id, ''), timestamp"
             } else {
-                "SELECT timestamp, response_secs, idle_secs, provider, session_id
-                 FROM response_times
-                 WHERE timestamp >= ?1 AND response_secs IS NOT NULL
-                 ORDER BY provider, session_id, timestamp"
+                "SELECT timestamp, kind, provider, session_id, agent_id, is_sidechain
+                 FROM session_events
+                 WHERE timestamp >= ?1
+                 ORDER BY provider, session_id, COALESCE(agent_id, ''), timestamp"
             };
             let mut stmt = conn
                 .prepare_cached(sql)
                 .map_err(|e| format!("Prepare runtime query: {e}"))?;
-
             let rows = stmt
                 .query_map(params![from_str], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, f64>(1)?,
-                        row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 })
                 .map_err(|e| format!("Runtime query error: {e}"))?;
 
             for row in rows.flatten() {
-                let (ts_str, response_secs, idle_secs, provider, session_id) = row;
+                let (ts_str, kind, provider, session_id, agent_id, _is_sc) = row;
                 let ts = match DateTime::parse_from_rfc3339(&ts_str) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
+                let ms = ts.timestamp_millis() as f64;
+                // STAT-3: chain identity is (provider, session_id, agent_id).
+                // Compare slices first to avoid allocating a composite key
+                // on every row; the borrow ends before we move the owned
+                // strings into the trackers below.
+                let chain_changed = cur_provider.as_deref() != Some(provider.as_str())
+                    || cur_session_id.as_deref() != Some(session_id.as_str())
+                    || cur_agent_id.as_deref() != agent_id.as_deref();
 
-                let assistant_ms = ts.timestamp_millis() as f64;
-                let user_ms = assistant_ms - (response_secs * 1000.0);
-                let session_key = format!("{provider}:{session_id}");
-
-                sessions.insert(session_key.clone());
-
-                // New logical turn if: different session, or idle_secs is NULL
-                // (first turn / gap > 600s)
-                let is_new = cur_session.as_ref() != Some(&session_key) || idle_secs.is_none();
-
-                if is_new {
-                    // Flush previous logical turn
-                    if cur_session.is_some() {
+                if chain_changed {
+                    if cur_provider.is_some() {
                         flush_turn(
                             turn_start_ms,
-                            turn_end_ms,
+                            prev_ms,
                             &mut total_runtime_secs,
                             &mut turn_count,
                             &mut bucket_sums,
-                            from_epoch,
+                            from_epoch_ms,
                             bucket_secs,
                         );
                     }
-                    cur_session = Some(session_key);
-                    turn_start_ms = user_ms;
+                    // STAT-6: session_count is keyed on (provider,
+                    // session_id) only, so a parent and its sub-agents
+                    // count as one session. Inserting at chain-change
+                    // boundaries (instead of every row) caps allocations
+                    // at O(distinct chains).
+                    sessions.insert(format!("{provider}|{session_id}"));
+                    cur_provider = Some(provider);
+                    cur_session_id = Some(session_id);
+                    cur_agent_id = agent_id;
+                    turn_start_ms = ms;
+                } else {
+                    // STAT-4: classify the gap from the previous event.
+                    let gap = (ms - prev_ms) / 1000.0;
+                    let is_tool_loop_gap = matches!(prev_kind.as_deref(), Some("asst_tool_use"))
+                        && kind == "user_tool_result";
+                    let counts_as_active = if is_tool_loop_gap {
+                        // Tool-loop gaps count up to the safety ceiling.
+                        gap <= TOOL_WAIT_MAX_SECS
+                    } else {
+                        // Non-tool-loop gaps count only when <= idle threshold.
+                        gap <= IDLE_THRESHOLD_SECS
+                    };
+
+                    if !counts_as_active {
+                        // User-idle (or tool-loop over ceiling) gap exceeds
+                        // threshold: end the current turn at prev_ms and
+                        // begin a new one at the current row.
+                        let clamped_end_ms = if is_tool_loop_gap {
+                            // STAT-4 / R-B: realize up to the ceiling so
+                            // the long wait still contributes its bounded
+                            // share, but never past `now` — we cannot
+                            // credit wall-clock time that has not elapsed.
+                            (prev_ms + TOOL_WAIT_MAX_SECS * 1000.0).min(now_ms)
+                        } else {
+                            prev_ms
+                        };
+                        flush_turn(
+                            turn_start_ms,
+                            clamped_end_ms,
+                            &mut total_runtime_secs,
+                            &mut turn_count,
+                            &mut bucket_sums,
+                            from_epoch_ms,
+                            bucket_secs,
+                        );
+                        turn_start_ms = ms;
+                    }
+                    // else: the gap counts; current turn continues with
+                    // turn_start_ms unchanged.
                 }
-
-                turn_end_ms = assistant_ms;
+                prev_ms = ms;
+                prev_kind = Some(kind);
             }
-
-            // Flush last logical turn
-            if cur_session.is_some() {
+            if cur_provider.is_some() {
                 flush_turn(
                     turn_start_ms,
-                    turn_end_ms,
+                    prev_ms,
                     &mut total_runtime_secs,
                     &mut turn_count,
                     &mut bucket_sums,
-                    from_epoch,
+                    from_epoch_ms,
                     bucket_secs,
                 );
             }
         }
 
+        // STAT-7: avg = total / count, 0 when empty window.
         let avg_per_turn_secs = if turn_count > 0 {
             total_runtime_secs / turn_count as f64
         } else {
@@ -9262,9 +9528,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read schema_version");
-        assert_eq!(
-            version, 25,
-            "schema_version must be exactly 25, got {version}"
+        assert!(
+            version >= 25,
+            "schema_version must advance to at least 25, got {version}"
         );
 
         drop(conn);
@@ -9288,7 +9554,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("read schema_version");
-            assert_eq!(v, 25);
+            assert!(v >= 25, "schema_version must reach 25, got {v}");
 
             // Replay the migration-25 DDL directly against the already-
             // migrated DB. Every ALTER is `table_has_column`-guarded and
@@ -9331,7 +9597,7 @@ mod tests {
 
         // Re-init against the same data dir reopens the same DB; the
         // version-gated migration loop must skip migration 25 (no error) and
-        // leave the version at exactly 25.
+        // leave at least migration 25's row in place.
         let storage2 = init_storage_in(&dir);
         let conn = storage2.conn.lock();
         let version: i64 = conn
@@ -9341,9 +9607,9 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read schema_version");
-        assert_eq!(
-            version, 25,
-            "re-running migrations must keep schema_version at 25, got {version}"
+        assert!(
+            version >= 25,
+            "re-running migrations must keep schema_version >= 25, got {version}"
         );
         // Exactly one schema_version=25 row — the gate did not re-enter.
         let count_25: i64 = conn
@@ -9354,6 +9620,108 @@ mod tests {
             )
             .expect("count v25 rows");
         assert_eq!(count_25, 1, "migration 25 recorded more than once");
+
+        drop(conn);
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn migration_26_is_idempotent() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+
+        // First init applies migration 26.
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock();
+            let v: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read schema_version");
+            assert!(v >= 26, "schema_version must reach 26, got {v}");
+
+            // The session_events table and its unique-identity index must
+            // exist after the migration runs.
+            let has_table: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='table' AND name='session_events'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master for table");
+            assert_eq!(
+                has_table, 1,
+                "session_events table missing after migration 26"
+            );
+            let has_unique_idx: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type='index' AND name='uidx_se_identity'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("query sqlite_master for unique index");
+            assert_eq!(
+                has_unique_idx, 1,
+                "uidx_se_identity missing after migration 26"
+            );
+
+            // Replay the migration-26 DDL directly against the already-
+            // migrated DB. Every CREATE is `IF NOT EXISTS`, so this must
+            // be a clean no-op.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS session_events (
+                    provider     TEXT NOT NULL,
+                    session_id   TEXT NOT NULL,
+                    agent_id     TEXT,
+                    is_sidechain INTEGER NOT NULL DEFAULT 0,
+                    timestamp    TEXT NOT NULL,
+                    kind         TEXT NOT NULL,
+                    uuid         TEXT,
+                    parent_uuid  TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_identity
+                    ON session_events(provider, session_id, COALESCE(agent_id, ''), timestamp, kind);
+                CREATE INDEX IF NOT EXISTS idx_se_timestamp
+                    ON session_events(timestamp);
+                CREATE INDEX IF NOT EXISTS idx_se_chain
+                    ON session_events(provider, session_id, agent_id, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_se_provider_session_sidechain
+                    ON session_events(provider, session_id, is_sidechain, timestamp);",
+            )
+            .expect("replayed migration-26 DDL must be a clean no-op");
+        }
+        drop(storage);
+
+        // Re-init against the same data dir reopens the same DB; the
+        // version-gated migration loop must skip migration 26 (no error)
+        // and leave exactly one v=26 row in `schema_version`.
+        let storage2 = init_storage_in(&dir);
+        let conn = storage2.conn.lock();
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read schema_version");
+        assert!(
+            version >= 26,
+            "re-running migrations must keep schema_version >= 26, got {version}"
+        );
+        let count_26: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version = 26",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count v26 rows");
+        assert_eq!(count_26, 1, "migration 26 recorded more than once");
 
         drop(conn);
         clear_env();
@@ -12498,6 +12866,137 @@ mod tests {
             "FR-011: eligibility is unchanged by an unchanged re-derivation"
         );
 
+        clear_env();
+    }
+
+    /// Feature 008 / US2: two sub-agent chains sharing the same parent
+    /// session_id but different agent_id must produce two independent
+    /// turns rather than one merged turn. Verifies STAT-3 from
+    /// specs/008-runtime-redesign/contracts/llm-runtime-stats.md and the
+    /// agent_id inclusion in the chain key.
+    #[test]
+    #[serial]
+    fn session_events_sibling_subagents_form_independent_turns() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let events_a = vec![
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:00.000Z",
+                kind: crate::sessions::SessionEventKind::UserText,
+                is_sidechain: true,
+                agent_id: Some("agent-a"),
+                uuid: None,
+                parent_uuid: None,
+            },
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:30.000Z",
+                kind: crate::sessions::SessionEventKind::AsstText,
+                is_sidechain: true,
+                agent_id: Some("agent-a"),
+                uuid: None,
+                parent_uuid: None,
+            },
+        ];
+        let events_b = vec![
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:05.000Z",
+                kind: crate::sessions::SessionEventKind::UserText,
+                is_sidechain: true,
+                agent_id: Some("agent-b"),
+                uuid: None,
+                parent_uuid: None,
+            },
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:40.000Z",
+                kind: crate::sessions::SessionEventKind::AsstText,
+                is_sidechain: true,
+                agent_id: Some("agent-b"),
+                uuid: None,
+                parent_uuid: None,
+            },
+        ];
+        storage
+            .ingest_session_events(IntegrationProvider::Claude, "sess-1", &events_a)
+            .expect("ingest a");
+        storage
+            .ingest_session_events(IntegrationProvider::Claude, "sess-1", &events_b)
+            .expect("ingest b");
+        // Wide range avoids clock-skew flake across the test cutoff.
+        let stats = storage.get_llm_runtime_stats("30d", None).expect("stats");
+        assert_eq!(
+            stats.turn_count, 2,
+            "two sibling sub-agent chains should produce two turns, got {}",
+            stats.turn_count
+        );
+        clear_env();
+    }
+
+    /// Feature 008 / US2: `scope = parent_only` must select
+    /// `WHERE is_sidechain = 0` so the total excludes sub-agent rows.
+    /// Verifies the STAT-2 bracket clause.
+    #[test]
+    #[serial]
+    fn session_events_parent_only_excludes_sidechain() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let mut all_events = vec![
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:00.000Z",
+                kind: crate::sessions::SessionEventKind::UserText,
+                is_sidechain: false,
+                agent_id: None,
+                uuid: None,
+                parent_uuid: None,
+            },
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:10.000Z",
+                kind: crate::sessions::SessionEventKind::AsstText,
+                is_sidechain: false,
+                agent_id: None,
+                uuid: None,
+                parent_uuid: None,
+            },
+        ];
+        let subagent = vec![
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:20.000Z",
+                kind: crate::sessions::SessionEventKind::UserText,
+                is_sidechain: true,
+                agent_id: Some("agent-x"),
+                uuid: None,
+                parent_uuid: None,
+            },
+            crate::storage::SessionEventInput {
+                timestamp: "2026-05-20T10:00:50.000Z",
+                kind: crate::sessions::SessionEventKind::AsstText,
+                is_sidechain: true,
+                agent_id: Some("agent-x"),
+                uuid: None,
+                parent_uuid: None,
+            },
+        ];
+        all_events.extend(subagent);
+        storage
+            .ingest_session_events(IntegrationProvider::Claude, "sess-1", &all_events)
+            .expect("ingest");
+        let all = storage
+            .get_llm_runtime_stats("30d", None)
+            .expect("stats all");
+        let parent = storage
+            .get_llm_runtime_stats("30d", Some("parent_only"))
+            .expect("stats parent");
+        assert!(
+            parent.total_runtime_secs < all.total_runtime_secs,
+            "parent_only ({} s) must be strictly less than all ({} s)",
+            parent.total_runtime_secs,
+            all.total_runtime_secs
+        );
+        assert!(
+            parent.total_runtime_secs > 0.0,
+            "parent_only must still register parent activity"
+        );
         clear_env();
     }
 }
