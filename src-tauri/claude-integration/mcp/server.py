@@ -19,43 +19,20 @@ from dependencies import lifespan
 CONTEXT_PRESERVATION_ENABLED = os.environ.get("QUILL_CONTEXT_PRESERVATION") == "1"
 
 BASE_INSTRUCTIONS = """\
-Quill indexes all Claude Code and Codex session history into a searchable
-database. ALWAYS use Quill tools instead of reading raw JSONL session logs from
-~/.claude/projects/ or ~/.codex/sessions/ directly. Quill returns focused
-snippets and stable session references.
+Quill indexes Claude Code and Codex session history into a searchable database.
+Use `search_history` to find prior conversation content, code changes, commands,
+or tool calls — do not read raw JSONL session logs from ~/.claude/projects/ or
+~/.codex/sessions/ directly.
 
-## When to use Quill
+## When to use search_history
 
 - User asks about past sessions, previous work, or conversation history
 - User asks "what did I/we do" or "when did I/we" questions
 - You need context from a prior session, such as how something was implemented
-- User asks about token usage, costs, or session analytics
-- You need to find which sessions touched a specific file or branch
-- User asks what files were edited, what commands were run, or what tools were used
+- You need to find which sessions touched a specific file, command, or error
 
-## What Quill Indexes
-
-Session history is enriched with:
-
-- code_changes: summaries of Edit and Write tool calls
-- commands_run: Bash commands and truncated output
-- tool_details: Read, Grep, Glob, and Agent tool calls with paths/queries
-- tool_actions: full tool input/output stored in SQLite for deep inspection
-
-## Workflow: progressive disclosure
-
-1. Browse history with list_projects or list_sessions to orient
-2. Search history with search_history to find messages by content, edits,
-   commands, or tool use
-3. Cross-reference with get_file_history, get_branch_activity, or
-   find_related_sessions
-4. Drill down with get_session_context or get_tool_details only when needed
-
-## Do NOT
-
-- Read raw session logs directly when Quill is available
-- Fetch all sessions at once; use filters such as project, date, and branch
-- Return raw tool output to the user; summarize the relevant findings
+Filter with `project`, `git_branch`, `role`, or date range to narrow results.
+Summarize hits rather than returning raw output to the user.
 """
 
 CONTEXT_INSTRUCTIONS = """\
@@ -85,7 +62,7 @@ mcp = FastMCP(
     lifespan=lifespan,
 )
 
-from tools import analytics, details, discovery, search  # noqa: E402, F401
+from tools import search  # noqa: E402, F401
 
 if CONTEXT_PRESERVATION_ENABLED:
     from tools import context  # noqa: E402, F401

@@ -333,16 +333,90 @@ function guidance(type) {
   return `Quill context: keep Bash output short. For session history, prior work, or transcript details, prefer ${tools}; summarize broad shell output.`;
 }
 
-function fetchDenyReason() {
-  return [
-    "Quill context routing blocked a raw network fetch.",
-    "DO NOT bypass by fetching to a file and then reading it back (`curl -o X && cat X`, jq, grep, sed, awk, Read, etc.) — that defeats this guard and the path will be denied on the next read.",
-    "Use instead:",
-    "  - mcp__quill__quill_execute for `curl ... | jq` workflows (output is bounded + indexed automatically)",
-    "  - mcp__quill__quill_fetch_and_index for HTML / docs / web pages",
-    "  - mcp__quill__quill_search_context to retrieve focused chunks afterwards",
-    "Only use `curl -o path` / `wget -O path` for binary artifacts you will EXECUTE or INSTALL (tarballs, packages, images) — never to inspect content.",
-  ].join("\n");
+// Extract HTTP/HTTPS URL targets from a curl/wget command line. Returns the
+// first 1–2 distinct URLs so the deny message can pre-fill a tool call. We
+// strip heredocs (which can be enormous and rarely contain the intended URL)
+// but NOT quotes — `curl 'https://…'`, `fetch("https://…")`, and
+// `requests.get("https://…")` are common cases to surface.
+function extractFetchUrls(commandLine) {
+  if (!commandLine) return [];
+  const stripped = stripHeredocs(commandLine);
+  const out = [];
+  const seen = new Set();
+  // Token boundary: any whitespace, `<>|` shell redirect/pipe chars, or a
+  // backtick (subshell start). We allow `"`, `'`, `)`, and `(` inside URLs;
+  // trailing closing punctuation is handled below.
+  const re = /https?:\/\/[^\s<>|`]+/gi;
+  let m;
+  while ((m = re.exec(stripped)) !== null) {
+    let url = m[0];
+    // The regex deliberately doesn't exclude `"` or `'` so `curl "URL"` and
+    // `fetch("URL")` are reachable; trim at the first embedded quote (which
+    // means we left the quoted-arg context). This handles both `URL"` (end
+    // of curl arg) and `URL").then(...)` (inline fetch trailing JS code).
+    const quoteIdx = url.search(/["']/);
+    if (quoteIdx >= 0) url = url.slice(0, quoteIdx);
+    // Strip control whitespace — `%0a`/`%0d`/`%09` are not touched by the
+    // regex but ensure no literal CR/LF/tab sneaks through and becomes a
+    // fake instruction line in the prose deny message.
+    url = url.replace(/[\r\n\t]+/g, "");
+    // Strip trailing shell punctuation. For `)`, only strip when unbalanced
+    // (more `)` than `(`) so Wikipedia-style `Foo_(bar)` URLs keep their tail.
+    url = url.replace(/[.,;:!?\]]+$/g, "");
+    while (url.endsWith(")")) {
+      const opens = (url.match(/\(/g) || []).length;
+      const closes = (url.match(/\)/g) || []).length;
+      if (closes <= opens) break;
+      url = url.slice(0, -1);
+    }
+    if (!url || !/^https?:\/\//i.test(url)) continue;
+    if (!seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+      if (out.length >= 2) break;
+    }
+  }
+  return out;
+}
+
+// Binary-artifact extensions that defeat `| jq .` even when the host looks
+// API-ish — keep them on `quill_fetch_and_index` (which bounds output and
+// stores the source ref) rather than recommending a jq pipeline that will
+// produce garbage.
+const BINARY_URL_EXT_RE =
+  /\.(tar\.gz|tgz|tar\.bz2|tar\.xz|tar|zip|gz|bz2|xz|7z|rar|pdf|png|jpg|jpeg|gif|svg|webp|ico|woff2?|ttf|eot|mp3|mp4|mov|webm|wasm|exe|dmg|deb|rpm|whl)(\?|$)/i;
+
+function looksLikeApiJson(url) {
+  if (BINARY_URL_EXT_RE.test(url)) return false;
+  return /^https?:\/\/api\./i.test(url) ||
+    /[?&]format=json|\.json(\?|$)|\/api\//i.test(url);
+}
+
+function fetchDenyReason(commandLine) {
+  const urls = extractFetchUrls(commandLine || "");
+  const lines = ["Quill context routing blocked a raw network fetch."];
+
+  if (urls.length > 0) {
+    lines.push("");
+    lines.push("Run this instead — it's a near-drop-in replacement:");
+    for (const url of urls) {
+      if (looksLikeApiJson(url)) {
+        const arg = JSON.stringify(`curl -sS ${url} | jq .`);
+        lines.push(`  mcp__quill__quill_execute(command=${arg})`);
+      } else {
+        lines.push(`  mcp__quill__quill_fetch_and_index(url=${JSON.stringify(url)})`);
+      }
+    }
+    lines.push("");
+    lines.push("After fetch+index, use mcp__quill__quill_search_context to pull focused chunks.");
+  } else {
+    lines.push("Use mcp__quill__quill_execute for `curl … | jq` workflows, or mcp__quill__quill_fetch_and_index for HTML/docs/pages.");
+  }
+
+  lines.push("");
+  lines.push("DO NOT bypass by fetching to a file and reading it back (`curl -o X && cat X`, jq, grep, sed, awk, Read, etc.) — that path will be denied on the next read.");
+  lines.push("Only use `curl -o path` / `wget -O path` for binary artifacts you will run or install (tarballs, packages, images) — never to inspect content.");
+  return lines.join("\n");
 }
 
 function taintedReadDenyReason(tool, taintedPath) {
@@ -451,7 +525,7 @@ function route(input) {
         provider,
         sessionId,
         tool,
-        fetchDenyReason(),
+        fetchDenyReason(command),
         { route: "raw-network-fetch", commandBytes: byteLength(command) },
       );
     }
@@ -533,6 +607,7 @@ module.exports = {
   hasRawNetworkDump,
   isInlineNetworkFetch,
   extractFetchOutputPaths,
+  extractFetchUrls,
   commandReadsTaintedPath,
   readTargetsTaintedPath,
   loadTainted,

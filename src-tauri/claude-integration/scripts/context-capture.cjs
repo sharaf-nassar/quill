@@ -400,6 +400,12 @@ function buildDirective(input, provider) {
     records.find((record) => Array.isArray(record.prompt_summaries) && record.prompt_summaries[0])?.prompt_summaries[0];
   const tasks = unique(records.flatMap((record) => record.tasks || record.hints?.tasks || []), 3);
   const decisions = unique(records.flatMap((record) => record.decisions || record.hints?.decisions || []), 3);
+
+  // Skip the directive when it would carry no actual continuity content. Empty
+  // injects (just cwd + tool list + reminder line) were ~free for the model
+  // to ignore, so they only crowded the system prompt.
+  if (!lastPrompt && tasks.length === 0 && decisions.length === 0) return null;
+
   const cwd = cwdValue(input) || records.find((record) => record.cwd)?.cwd;
 
   const lines = [

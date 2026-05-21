@@ -142,9 +142,11 @@ The [[features#Settings Window]] exposes a `Context` tab backed by `context_pres
 
 ### Context MCP Tools
 
-The Quill MCP server exposes context tools beside the existing session-history tools.
+The Quill MCP server exposes context tools beside the single `search_history` session-history MCP tool.
 
 Tools in [[src-tauri/claude-integration/mcp/tools/context.py]] can index text or files, fetch and cache web pages, run bounded commands, search indexed chunks, retrieve focused sources, record continuity events, create compact snapshots, inspect stats, and purge stored context. File-based tools resolve paths under the selected working directory before reading or preserving content.
+
+The session-history surface in [[src-tauri/claude-integration/mcp/tools/search.py]] is intentionally narrow: only `search_history` remains, after a 30-day usage audit showed the discovery, analytics, and drill-down tools (`list_projects`, `list_sessions`, `get_session_overview`, `get_session_context`, `get_file_history`, `get_branch_activity`, `find_related_sessions`, `get_token_usage`, `get_learned_rules`, `get_tool_details`, `get_index_status`) were called ≤20 times across all sessions tracked. Trimming the surface keeps the tool listing legible and reduces low-value tool-selection noise.
 
 Large execution and batch outputs are stored as `source:N` and `chunk:N` refs. Responses return previews and snippets by default, while [[src-tauri/claude-integration/mcp/tools/context.py#quill_get_context_source]] retrieves bounded chunks when the model needs exact details.
 
@@ -153,6 +155,8 @@ Large execution and batch outputs are stored as `source:N` and `chunk:N` refs. R
 Provider hooks steer high-volume operations toward Quill context tools before they flood the active transcript and track fetched-to-disk paths so the fetch-then-read bypass is closed.
 
 `src-tauri/claude-integration/scripts/context-router.cjs` and `src-tauri/codex-integration/scripts/context-router.cjs` are byte-identical copies that block raw WebFetch or noisy `curl`/`wget` dumps, nudge broad Bash, Read, Grep, build, and test output toward `quill_*` MCP tools, and surface `mcp__quill__quill_execute` as the right alternative for `curl ... | jq` workflows (the previous deny message implicitly invited the workaround by suggesting `curl -sS -o path` as the only mitigation).
+
+When the router denies a raw `curl`/`wget`, it parses the command line via the `extractFetchUrls` helper in `src-tauri/claude-integration/scripts/context-router.cjs` and embeds the first 1–2 distinct URLs into a ready-to-paste tool call inside the deny reason: `mcp__quill__quill_execute(command="curl -sS <URL> | jq .")` for API-shaped URLs (`/api/`, `.json`, `format=json`, or `api.` host) and `mcp__quill__quill_fetch_and_index(url=<URL>)` for HTML/docs/pages. The detection deliberately reads the heredoc-stripped command without stripping quoted args so `curl 'https://…'`, `fetch("https://…")`, and `requests.get("https://…")` all surface; the extractor trims at the first embedded quote, balances trailing `)`, and strips control whitespace (`\r`/`\n`/`\t`) so an attacker-authored URL with a literal newline cannot inject a fake instruction line into the prose deny message. The `looksLikeApiJson` heuristic bails out on binary-artifact extensions (`.tar.gz`, `.zip`, `.pdf`, images, fonts, media, `.wasm`, `.exe`, `.whl`, etc.) before the `api.` host check so binary downloads on `api.*` hosts route to `quill_fetch_and_index` instead of a `jq` pipeline that would mangle them. The previous generic deny gave the model the right tool names but not a copy-paste replacement; a 30-day audit showed only 0.7% of denied sessions ever followed up with a `quill_*` MCP call, so the actionable deny is the smallest change that closes that gap without adding new HTTP infrastructure.
 
 When `curl`/`wget` does pass the network-dump check by writing quietly to a file (e.g. `curl -sS -o /tmp/x.json URL`), the router records the destination path under `~/.config/quill/context/markers/<provider>-<session>/tainted.json` and denies any subsequent Read, or Bash invocation of a pure-reader (`cat`, `bat`, `head`, `tail`, `less`, `more`, `view`, `od`, `xxd`, `strings`, `hexdump`, `sed`, `awk`, `grep`, `rg`, `ack`, `jq`, `yq`, `xq`, `xmllint`), targeting that path. Interpreter execution (`bash /tmp/x.sh`, `python /tmp/x.py`) and removal (`rm /tmp/x.json`) remain allowed so fetch-and-install flows are unaffected. The taint set is capped at 256 paths per session.
 
@@ -163,6 +167,8 @@ Per-session marker files under `~/.config/quill/context/markers/` keep guidance 
 Continuity hooks record small task and decision hints without writing to provider memory paths.
 
 `src-tauri/claude-integration/scripts/context-capture.cjs` and `src-tauri/codex-integration/scripts/context-capture.cjs` write compact JSONL events under `~/.config/quill/context/continuity/`, capture prompts and simple decision/task hints, and store PreCompact or Stop snapshots when available. SessionStart guidance is scoped by provider and project key, where the project key is the nearest git root for the current `cwd` or the normalized `cwd` when no git root is found, so recent work from another project cannot leak into a new session. Continuity JSONL and per-session files are pruned to a 30-day retention window at most once per day.
+
+The SessionStart `<quill_continuity>` directive only injects when at least one of `last_prompt`, `task_hints`, or `decision_hints` is non-empty for the scoped records (the `buildDirective` helper in `src-tauri/claude-integration/scripts/context-capture.cjs` returns `null` otherwise). Earlier the directive always rendered as long as any record existed, which produced empty injects (just `cwd:` + tool list + reminder line) that crowded the system prompt without carrying any actual continuity content.
 
 ### Context Savings Telemetry
 

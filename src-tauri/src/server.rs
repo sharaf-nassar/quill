@@ -414,6 +414,12 @@ fn process_session_notify_payload(
     if let Err(err) = storage.delete_response_times_for_session(payload.provider, &session_id) {
         log::warn!("Failed to delete old response_times: {err}");
     }
+    // Feature 008: session_events follows the same delete-then-rebuild
+    // pattern as response_times so a re-notify of the same transcript
+    // ends up byte-identical.
+    if let Err(err) = storage.delete_session_events_for_session(payload.provider, &session_id) {
+        log::warn!("Failed to delete old session_events: {err}");
+    }
 
     let count = session_index.replace_session_docs_batch(
         payload.provider,
@@ -445,6 +451,24 @@ fn process_session_notify_payload(
         .collect();
     if let Err(err) = storage.ingest_response_times(payload.provider, &session_id, &rt_pairs) {
         log::warn!("Failed to store response times: {err}");
+    }
+    // Feature 008: ingest per-event timeline for the LLM Runtime card.
+    // The extractor already populated `extracted.events` in the same
+    // parse pass; this just plumbs them through.
+    let rt_events: Vec<crate::storage::SessionEventInput<'_>> = extracted
+        .events
+        .iter()
+        .map(|ev| crate::storage::SessionEventInput {
+            timestamp: ev.timestamp.as_str(),
+            kind: ev.kind,
+            is_sidechain: ev.is_sidechain,
+            agent_id: ev.agent_id.as_deref(),
+            uuid: ev.uuid.as_deref(),
+            parent_uuid: ev.parent_uuid.as_deref(),
+        })
+        .collect();
+    if let Err(err) = storage.ingest_session_events(payload.provider, &session_id, &rt_events) {
+        log::warn!("Failed to store session_events: {err}");
     }
     let _ = app_handle.emit("sessions-index-updated", count);
 
@@ -483,6 +507,50 @@ fn index_session_messages_in_background(
                     storage.ingest_response_times(payload.provider, &payload.session_id, &rt_pairs)
                 {
                     log::warn!("Failed to store response times: {err}");
+                }
+                // Feature 008: per-event timeline. The wire payload only
+                // carries flattened ExtractedMessage rows (no preserved
+                // content-block shape), so classify heuristically from
+                // role + content + tools_used. The canonical EVT-CL-*
+                // classifier runs at the JSONL extraction site (Site A
+                // above); this is the fallback for remote message
+                // pushes where the JSONL file isn't on the local disk.
+                let rt_events: Vec<crate::storage::SessionEventInput<'_>> = extracted
+                    .iter()
+                    .filter_map(|m| {
+                        let kind = match m.role.as_str() {
+                            "user" => {
+                                if m.content.trim().is_empty() {
+                                    sessions::SessionEventKind::UserToolResult
+                                } else {
+                                    sessions::SessionEventKind::UserText
+                                }
+                            }
+                            "assistant" => {
+                                if !m.content.trim().is_empty() {
+                                    sessions::SessionEventKind::AsstText
+                                } else if !m.tools_used.is_empty() {
+                                    sessions::SessionEventKind::AsstToolUse
+                                } else {
+                                    sessions::SessionEventKind::AsstThinking
+                                }
+                            }
+                            _ => return None,
+                        };
+                        Some(crate::storage::SessionEventInput {
+                            timestamp: m.timestamp.as_str(),
+                            kind,
+                            is_sidechain: false,
+                            agent_id: None,
+                            uuid: Some(m.uuid.as_str()).filter(|s| !s.is_empty()),
+                            parent_uuid: None,
+                        })
+                    })
+                    .collect();
+                if let Err(err) =
+                    storage.ingest_session_events(payload.provider, &payload.session_id, &rt_events)
+                {
+                    log::warn!("Failed to store session_events: {err}");
                 }
                 let _ = app_handle.emit("sessions-index-updated", count);
             }

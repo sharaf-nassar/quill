@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import sys
-import threading
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -52,31 +50,12 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-_db_conn: sqlite3.Connection | None = None
-_db_lock = threading.Lock()
-
-
-def get_db() -> sqlite3.Connection:
-    global _db_conn
-    with _db_lock:
-        if _db_conn is None:
-            db_path = get_app_data_dir() / "usage.db"
-            _db_conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True, check_same_thread=False
-            )
-            _db_conn.row_factory = sqlite3.Row
-    return _db_conn
-
-
 @asynccontextmanager
 async def lifespan(app):
     try:
         yield
     finally:
-        global _http_client, _db_conn
+        global _http_client
         if _http_client is not None:
             await _http_client.aclose()
             _http_client = None
-        if _db_conn is not None:
-            _db_conn.close()
-            _db_conn = None

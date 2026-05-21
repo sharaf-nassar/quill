@@ -72,6 +72,19 @@ function main() {
     const LOW_SIGNAL_PRE = ["Read", "Glob", "Grep", "Bash", "LS", "WebSearch", "WebFetch", "Agent"];
     if (hookPhase === "pre" && LOW_SIGNAL_PRE.includes(input.tool_name)) return;
 
+    // Post-phase only records tools whose outcome teaches the learner something —
+    // edits, writes, and shell commands. Reads, lookups, MCP calls, and meta tools
+    // generate ~50% of observations with no behavioral signal; the audit showed
+    // 26k observations/7d but only ~10 useful tool kinds.
+    const HIGH_SIGNAL_POST = new Set([
+      "Bash",
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit",
+    ]);
+    if (hookPhase === "post" && !HIGH_SIGNAL_POST.has(input.tool_name)) return;
+
     const configPath = path.join(
       process.env.HOME || process.env.USERPROFILE,
       ".config",

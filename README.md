@@ -73,15 +73,8 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 ### MCP server
 - Gives Claude Code (and Codex) direct access to your indexed session history and — when context preservation is enabled — the working context store
-- Session-history tools:
-  - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use
-  - **`list_projects`** / **`list_sessions`** — browse projects and sessions
-  - **`get_session_context`** — retrieve surrounding messages for a search hit
-  - **`get_branch_activity`** — see all work done on a git branch
-  - **`get_file_history`** / **`find_related_sessions`** — track changes to a file or sessions that share files
-  - **`get_token_usage`** — query token usage and cost analytics
-  - **`get_learned_rules`** — retrieve learned coding patterns
-  - **`get_tool_details`** — inspect full tool input/output for a specific action
+- Session-history tool:
+  - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use (filter by project, git branch, role, date)
 - Context tools (only when context preservation is enabled): see the Working context preservation section above
 - Automatically configured when the app starts — no manual setup needed
 
@@ -473,10 +466,7 @@ src-tauri/                    # Rust backend
       server.py               # FastMCP server for session history (and context) tools
       dependencies.py         # Lifespan and shared state
       tools/
-        search.py             # search_history, get_session_context, get_branch_activity
-        discovery.py          # list_projects, list_sessions, get_session_overview
-        analytics.py          # get_token_usage, get_learned_rules
-        details.py            # get_tool_details, get_file_history
+        search.py             # search_history
         context.py            # quill_index_context, quill_search_context, quill_execute, fetch_and_index, snapshots, etc.
   codex-integration/          # Parallel resources for Codex CLI (mirrors claude-integration scripts and tools)
   tauri.conf.json             # Tauri window and build configuration

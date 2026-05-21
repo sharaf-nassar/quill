@@ -27,7 +27,7 @@ Hook-reported tokens still flow into `token_snapshots` keyed by the parent `sess
 
 Tool-use observations, git history, and recent session history are analyzed by LLMs to discover reusable behavioral patterns.
 
-1. Provider hook script (`observe.cjs`) captures PreToolUse/PostToolUse events
+1. Provider hook script (`observe.cjs`) captures PreToolUse/PostToolUse events. The Claude script applies a low-signal pre-tool skip list (`Read`, `Glob`, `Grep`, `Bash`, `LS`, `WebSearch`, `WebFetch`, `Agent` — post-phase still records outcomes for those) and a high-signal post-tool allowlist (`Bash`, `Edit`, `Write`, `MultiEdit`, `NotebookEdit`); other post-tool calls — Read/Grep/Glob, `mcp__quill__*`, `mcp__lat__*`, `ToolSearch`, `Skill`, `AskUserQuestion`, etc. — return early because their outcomes carry no behavioral signal for the rule learner. The Codex script captures only `exec_command` (Bash). A 30-day audit showed the unfiltered post-tool firehose contributed ~50% of `observations` rows with zero downstream value
 2. POSTs observation to `POST /api/v1/learning/observations`
 3. Server validates and fast-acknowledges the hook request, then stores the observation in `observations` with provider provenance and `analyzed = false`
 4. Trigger fires from the on-demand UI action or periodic timer with optional provider scope from the UI
@@ -71,7 +71,7 @@ Claude Edit/Write tool calls become `code_changes`, Bash becomes `commands_run`,
 
 The same parse pass that produces `ExtractedMessage` for the search index also produces `ExtractedEvent` for the [[backend#Database#Schema#Code and Runtime Metrics]] `session_events` table.
 
-The search index keeps its existing filter (it drops `tool_result`-only user messages and empty assistant blocks), while the event stream carries every non-meta `user`/`assistant` line with a non-empty timestamp — classified by content shape into `user_text`, `user_tool_result`, `asst_text`, `asst_thinking`, or `asst_tool_use`. This dual emission keeps the search corpus lean while letting the runtime metric reconstruct full agent-loop active intervals.
+The search index keeps its existing filter (it drops `tool_result`-only user messages and empty assistant blocks), while the event stream carries every non-meta `user`/`assistant` line with a non-empty timestamp — classified by content shape into `user_text`, `user_tool_result`, `asst_text`, `asst_thinking`, or `asst_tool_use`. This dual emission keeps the search corpus lean while letting the runtime metric reconstruct full agent-loop active intervals. Both the local mtime sweep in [[src-tauri/src/sessions.rs]] and the hook-driven `/sessions/notify` handler in [[src-tauri/src/server.rs]] ingest into `session_events` alongside `response_times`; the `/sessions/messages` remote-push handler uses a heuristic classifier over `(role, content, tools_used)` because wire-pushed messages lack the full content-block shape that the JSONL extractor sees.
 
 ### Sub-Agent Transcripts
 
