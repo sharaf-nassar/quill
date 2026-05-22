@@ -198,23 +198,54 @@ function UsageDisplay({
           <span className="col-resets">Resets In</span>
         </div>
       )}
-      {data.provider_errors.length > 0 && (
-        <div className="usage-provider-errors" role="status" aria-live="polite">
-          {data.provider_errors.map((providerError) => (
-            <div
-              key={providerError.provider}
-              className="usage-provider-error"
-            >
-              <span className="usage-provider-error__label">
-                {providerLabel(providerError.provider)}
-              </span>
-              <span className="usage-provider-error__message">
-                {providerError.message}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
+      {(() => {
+        // Coalesce all "network" errors into one offline pill so a missing
+        // internet connection produces a single signal instead of one banner
+        // per enabled provider. See
+        // [[lat.md/features#Features#Live Usage View]].
+        const offlineProviders = data.provider_errors
+          .filter((e) => e.kind === "network")
+          .map((e) => e.provider);
+        const otherErrors = data.provider_errors.filter(
+          (e) => e.kind !== "network",
+        );
+        if (offlineProviders.length === 0 && otherErrors.length === 0) {
+          return null;
+        }
+        return (
+          <div
+            className="usage-provider-errors"
+            role="status"
+            aria-live="polite"
+          >
+            {offlineProviders.length > 0 && (
+              <div
+                className="usage-provider-error usage-provider-error--offline"
+                data-error-kind="network"
+              >
+                <span className="usage-provider-error__label">Offline</span>
+                <span className="usage-provider-error__message">
+                  Showing cached data ({offlineProviders.map(providerLabel).join(", ")}).
+                </span>
+              </div>
+            )}
+            {otherErrors.map((providerError) => (
+              <div
+                key={providerError.provider}
+                className="usage-provider-error"
+                data-error-kind={providerError.kind}
+              >
+                <span className="usage-provider-error__label">
+                  {providerLabel(providerError.provider)}
+                </span>
+                <span className="usage-provider-error__message">
+                  {providerError.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        );
+      })()}
       <div className="usage-providers">
         {providerSections.map((section) => (
           <ProviderUsageModule

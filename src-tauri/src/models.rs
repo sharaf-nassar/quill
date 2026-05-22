@@ -70,9 +70,32 @@ pub struct UsageBucket {
     pub sort_order: u32,
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorKind {
+    // Transport failure: DNS, connect refused, or request timed out before a
+    // response. The poller treats this as "effectively offline" and applies a
+    // jittered exponential cooldown; the UI collapses these into a single
+    // offline pill (see [[lat.md/features#Features#Live Usage View]]).
+    Network,
+    // Auth credentials are missing or never configured (e.g. no MiniMax key,
+    // no Claude OAuth login).
+    Config,
+    // The provider rejected the credentials we sent (401 Unauthorized).
+    Auth,
+    // Provider returned 429. The poller writes a silent rate-limit cooldown
+    // and does NOT push this kind today, but the variant exists so future code
+    // can surface a "Rate-limited" pill without another payload change.
+    #[allow(dead_code)]
+    RateLimit,
+    // Provider responded but with a non-success status or unparseable body.
+    Server,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct UsageProviderError {
     pub provider: IntegrationProvider,
+    pub kind: ProviderErrorKind,
     pub message: String,
 }
 
@@ -1107,4 +1130,28 @@ pub struct LlmRuntimeStats {
     pub session_count: i64,
     pub avg_per_turn_secs: f64,
     pub sparkline: Vec<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The frontend's `ProviderErrorKind` union literal in src/types.ts assumes
+    // serde lowercases the variant names with `snake_case`. If anyone removes
+    // or changes the `#[serde(rename_all)]` attribute, this test catches the
+    // resulting silent IPC drift before it ships.
+    #[test]
+    fn provider_error_kind_serializes_to_snake_case() {
+        let cases = [
+            (ProviderErrorKind::Network, "\"network\""),
+            (ProviderErrorKind::Config, "\"config\""),
+            (ProviderErrorKind::Auth, "\"auth\""),
+            (ProviderErrorKind::RateLimit, "\"rate_limit\""),
+            (ProviderErrorKind::Server, "\"server\""),
+        ];
+        for (variant, expected) in cases {
+            let actual = serde_json::to_string(&variant).expect("serde serializes variant");
+            assert_eq!(actual, expected, "variant {variant:?}");
+        }
+    }
 }

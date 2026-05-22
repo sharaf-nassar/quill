@@ -473,17 +473,14 @@ fn parse_apply_patch_change(patch: &str) -> Option<(i64, i64, String)> {
         }
 
         match mode {
-            "add" => {
-                if line.starts_with('+') {
-                    added += 1;
-                }
+            "add" if line.starts_with('+') => {
+                added += 1;
             }
-            "update" => {
-                if line.starts_with('+') {
-                    added += 1;
-                } else if line.starts_with('-') {
-                    removed += 1;
-                }
+            "update" if line.starts_with('+') => {
+                added += 1;
+            }
+            "update" if line.starts_with('-') => {
+                removed += 1;
             }
             _ => {}
         }
@@ -5357,20 +5354,19 @@ impl Storage {
                         });
                     }
                 }
-                "commit" => {
-                    if commit_ref_resolves(&self.conn, repo_path, &r.id) {
-                        resolved.push(ResolvedCitation {
-                            kind: "commit".to_string(),
-                            ref_id: r.id.clone(),
-                            observation_id: None,
-                            provider: None,
-                            session_id: None,
-                            cwd: repo_path.map(str::to_string),
-                            tool_name: None,
-                            evidence_ts: None,
-                        });
-                    }
+                "commit" if commit_ref_resolves(&self.conn, repo_path, &r.id) => {
+                    resolved.push(ResolvedCitation {
+                        kind: "commit".to_string(),
+                        ref_id: r.id.clone(),
+                        observation_id: None,
+                        provider: None,
+                        session_id: None,
+                        cwd: repo_path.map(str::to_string),
+                        tool_name: None,
+                        evidence_ts: None,
+                    });
                 }
+                "commit" => {}
                 "session" => {
                     let found = [IntegrationProvider::Claude, IntegrationProvider::Codex]
                         .into_iter()
@@ -8471,7 +8467,7 @@ impl Storage {
                 }
             })
             .collect();
-        by_language.sort_by(|a, b| b.lines.cmp(&a.lines));
+        by_language.sort_by_key(|b| std::cmp::Reverse(b.lines));
 
         Ok(CodeStats {
             lines_added: total_added,

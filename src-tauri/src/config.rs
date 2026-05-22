@@ -17,8 +17,20 @@ static SHELL_PATH: RwLock<Option<String>> = RwLock::new(None);
 // without a cache every detection cycle paid 3 spawns per provider.
 static DYNAMIC_PREFIXES: Mutex<Option<Vec<PathBuf>>> = Mutex::new(None);
 
+// Shared reqwest client used for live-usage polling (Anthropic, MiniMax) and
+// GitHub release lookups. Without explicit timeouts, reqwest can block
+// indefinitely on a dead network (see seanmonstar/reqwest#1256), which would
+// freeze the periodic usage poller. A 5 s connect timeout gives a fast offline
+// signal that feeds the per-provider cooldown in lib.rs; a 15 s overall
+// timeout covers slow responses without holding a runtime task forever.
 pub fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(reqwest::Client::new)
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("failed to build shared reqwest client")
+    })
 }
 
 pub fn claude_user_agent() -> &'static str {

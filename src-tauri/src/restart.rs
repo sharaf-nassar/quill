@@ -492,7 +492,7 @@ fn discover_codex_session_metadata() -> HashMap<String, Vec<CodexSessionMeta>> {
     by_cwd
         .into_iter()
         .map(|(cwd, mut entries)| {
-            entries.sort_by(|left, right| right.1.cmp(&left.1));
+            entries.sort_by_key(|right| std::cmp::Reverse(right.1));
 
             let mut seen_session_ids = HashSet::new();
             let metas = entries
@@ -556,7 +556,7 @@ pub fn discover_instances() -> Vec<RestartInstance> {
     let mut codex_meta_offsets: HashMap<String, usize> = HashMap::new();
     let known_all_pids: Vec<u32> = known_pids.iter().copied().collect();
     let mut codex_processes = scan_proc_for_provider(IntegrationProvider::Codex, &known_all_pids);
-    codex_processes.sort_by(|left, right| right.0.cmp(&left.0));
+    codex_processes.sort_by_key(|right| std::cmp::Reverse(right.0));
 
     for (pid, cwd, tty) in codex_processes {
         known_pids.insert(pid);

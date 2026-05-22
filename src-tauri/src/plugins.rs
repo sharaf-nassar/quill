@@ -458,7 +458,7 @@ fn get_claude_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
         }
     }
 
-    plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    plugins.sort_by_key(|a| a.name.to_lowercase());
     Ok(plugins)
 }
 
@@ -526,7 +526,7 @@ fn get_claude_marketplaces() -> Result<Vec<Marketplace>, String> {
         });
     }
 
-    marketplaces.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    marketplaces.sort_by_key(|a| a.name.to_lowercase());
     Ok(marketplaces)
 }
 
@@ -582,7 +582,7 @@ fn get_codex_installed_plugins() -> Result<Vec<InstalledPlugin>, String> {
         }
     }
 
-    installed.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    installed.sort_by_key(|a| a.name.to_lowercase());
     Ok(installed)
 }
 
@@ -640,7 +640,7 @@ fn get_codex_marketplaces() -> Result<Vec<Marketplace>, String> {
         });
     }
 
-    marketplaces.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    marketplaces.sort_by_key(|a| a.name.to_lowercase());
     Ok(marketplaces)
 }
 

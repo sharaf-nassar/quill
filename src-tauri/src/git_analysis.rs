@@ -134,7 +134,7 @@ async fn run_git_commands(project_path: &str, limit: usize) -> Result<RawGitData
         }
     }
     let mut freq_vec: Vec<_> = freq.into_iter().collect();
-    freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    freq_vec.sort_by_key(|b| std::cmp::Reverse(b.1));
     let hotspots = freq_vec
         .iter()
         .take(30)

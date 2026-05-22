@@ -400,6 +400,8 @@ All IPC commands return `Result<T, String>` for frontend-friendly errors. Intern
 
 `log::error!()` / `log::warn!()` for debugging. Graceful degradation throughout.
 
+Live-usage IPC carries one structured exception to the plain-string contract: `UsageData.provider_errors` is `Vec<UsageProviderError>`, where each entry pairs the provider with a typed [[src-tauri/src/models.rs#ProviderErrorKind]] discriminator (`Network`, `Config`, `Auth`, `RateLimit`, `Server`) alongside the human-readable message. `RateLimit` is currently inert (429 responses persist a silent cooldown timestamp rather than emitting a visible pill); the variant is reserved so future code can opt into a "Rate-limited" pill without another payload change. The frontend uses the discriminator to collapse all `Network` entries into a single offline pill in [[src/components/UsageDisplay.tsx]] (so a multi-provider outage produces one signal instead of N) while keeping per-provider rows for non-network failure modes. The flow that drives this — transport-error cooldown, exponential half-jitter backoff, and the on-success counter clear — is documented under [[data-flow#Data Flow#Usage Bucket Fetching]] step 8b.
+
 ## Data Paths
 
 Key filesystem locations used by the backend for storage, config, and caching.

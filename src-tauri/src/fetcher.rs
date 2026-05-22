@@ -550,7 +550,7 @@ fn fetch_codex_usage_from_sessions() -> Result<Vec<UsageBucket>, String> {
         })
         .collect::<Vec<_>>();
 
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|right| std::cmp::Reverse(right.0));
 
     let mut latest: Option<(DateTime<Utc>, Vec<UsageBucket>)> = None;
     for (_modified_at, path) in candidates.into_iter().take(50) {
@@ -697,29 +697,89 @@ fn minimax_model_label(name: &str) -> String {
     name.strip_prefix("MiniMax-").unwrap_or(name).to_string()
 }
 
-pub async fn fetch_minimax_usage(api_key: &str) -> Result<Vec<UsageBucket>, String> {
-    let resp = http_client()
+// MiniMax error kinds mirror `ClaudeUsageErrorKind` so the polling layer in
+// lib.rs can apply the same rate-limit / network-offline cooldown policy to
+// both providers. `Request` is the transport-failure variant — DNS,
+// connection refused, or pre-response timeout — which is the signal the
+// caller uses to enter the offline backoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiniMaxUsageErrorKind {
+    Unauthorized,
+    RateLimited,
+    Request,
+    Api,
+    Parse,
+}
+
+#[derive(Debug)]
+pub struct MiniMaxUsageError {
+    pub kind: MiniMaxUsageErrorKind,
+    pub message: String,
+    pub retry_after_seconds: Option<i64>,
+}
+
+pub async fn fetch_minimax_usage(api_key: &str) -> Result<Vec<UsageBucket>, MiniMaxUsageError> {
+    let resp = match http_client()
         .get(MINIMAX_USAGE_URL)
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .send()
         .await
-        .map_err(|e| format!("MiniMax request failed: {e}"))?;
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            return Err(MiniMaxUsageError {
+                kind: MiniMaxUsageErrorKind::Request,
+                message: format!("MiniMax request failed: {error}"),
+                retry_after_seconds: None,
+            });
+        }
+    };
 
-    if !resp.status().is_success() {
-        return Err(format!("MiniMax API error: {}", resp.status()));
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(MiniMaxUsageError {
+            kind: MiniMaxUsageErrorKind::Unauthorized,
+            message: "MiniMax API key was rejected.".into(),
+            retry_after_seconds: None,
+        });
     }
 
-    let data: MiniMaxUsageResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("MiniMax parse error: {e}"))?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(MiniMaxUsageError {
+            kind: MiniMaxUsageErrorKind::RateLimited,
+            message: "MiniMax usage API rate limited.".into(),
+            retry_after_seconds: parse_retry_after_seconds(&resp),
+        });
+    }
+
+    if !resp.status().is_success() {
+        return Err(MiniMaxUsageError {
+            kind: MiniMaxUsageErrorKind::Api,
+            message: format!("MiniMax API error: {}", resp.status()),
+            retry_after_seconds: None,
+        });
+    }
+
+    let data: MiniMaxUsageResponse = match resp.json().await {
+        Ok(data) => data,
+        Err(error) => {
+            return Err(MiniMaxUsageError {
+                kind: MiniMaxUsageErrorKind::Parse,
+                message: format!("MiniMax parse error: {error}"),
+                retry_after_seconds: None,
+            });
+        }
+    };
 
     if data.base_resp.status_code != 0 {
-        return Err(format!(
-            "MiniMax API error: {} (code {})",
-            data.base_resp.status_msg, data.base_resp.status_code
-        ));
+        return Err(MiniMaxUsageError {
+            kind: MiniMaxUsageErrorKind::Api,
+            message: format!(
+                "MiniMax API error: {} (code {})",
+                data.base_resp.status_msg, data.base_resp.status_code
+            ),
+            retry_after_seconds: None,
+        });
     }
 
     let mut buckets = Vec::new();

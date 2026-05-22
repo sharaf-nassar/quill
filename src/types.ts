@@ -9,19 +9,25 @@ export interface UsageBucket {
   sort_order?: number;
 }
 
+// Mirrors `ProviderErrorKind` in src-tauri/src/models.rs. "network" means the
+// provider's API was unreachable (DNS / connect / timeout) and the poller is
+// in offline cooldown; the UI collapses these into a single offline pill.
+export type ProviderErrorKind =
+  | "network"
+  | "config"
+  | "auth"
+  | "rate_limit"
+  | "server";
+
 export interface UsageProviderError {
   provider: IntegrationProvider;
+  kind: ProviderErrorKind;
   message: string;
 }
 
 export interface ProviderCredits {
   provider: IntegrationProvider;
   balance: string | null;
-}
-
-export interface UsageProviderError {
-  provider: IntegrationProvider;
-  message: string;
 }
 
 export interface UsageData {

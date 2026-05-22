@@ -14,7 +14,7 @@ Production builds target ES2020 with esbuild minification and sourcemaps. TypeSc
 
 ### Backend Build
 
-Rust edition 2024. Crate types: `lib`, `cdylib`, `staticlib`. `build.rs` calls `tauri_build::build()`.
+Rust edition 2024 uses the pinned `rust-toolchain.toml` compiler version. Crate types: `lib`, `cdylib`, `staticlib`. `build.rs` calls `tauri_build::build()`.
 
 The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system dependency issues. Tauri bundles Claude and Codex integration assets as app resources.
 
@@ -32,7 +32,7 @@ GitHub Actions workflow (`.github/workflows/release.yml`) triggers on `v*` tags 
 
 `.github/workflows/ci.yml` is the Rust backend gate (feature 005, FR-021 / SC-008) that also blocks release on failure.
 
-It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (warnings deny — hard gate), and `cargo test`. Its single job id `rust` is stable for reuse.
+It triggers on `pull_request`, `push` to `main`, and `workflow_call`, installs the Linux Tauri development packages before Rust setup, installs Rust from `rust-toolchain.toml`, runs in `src-tauri` with `permissions: contents: read`, and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (warnings deny — hard gate), and `cargo test`. Its single job id `rust` is stable for reuse.
 
 `release.yml` calls it as a reusable workflow (`ci` job using `./.github/workflows/ci.yml`) and makes `create-release` `needs: ci`, so a failing learning-logic suite blocks the entire build/sign/notarize/publish chain (no OS/notarization matrix duplicated). Contract: `specs/005-learning-system-hardening/contracts/evaluation-harness.md`.
 
@@ -44,7 +44,7 @@ A `create-release` job runs before all builds to create a single draft release. 
 
 Four parallel builds (fail-fast disabled), all depending on `create-release` so `tauri-action` finds the existing draft.
 
-Platforms: Linux (Ubuntu 22.04, AppImage + DEB), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS). Each installs Node.js LTS, Rust stable, and platform-specific system dependencies.
+Platforms: Linux (Ubuntu 22.04, AppImage + DEB), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS). Each installs Node.js LTS, the pinned Rust toolchain, and platform-specific system dependencies.
 
 ### Version Injection
 
@@ -235,6 +235,14 @@ Windows is not covered: detection assumes a Unix shell (`bash -lc`/`zsh -lc`) an
 After the static list, `resolve_command_path_with_attempts` queries `npm config get prefix`, `bun pm bin -g`, and `yarn global bin` through the login shell to pick up custom global-install prefixes. Results are cached and invalidated alongside the shell PATH. Returned bin dirs are validated against a trusted-roots allow-list (`$HOME`, `/usr`, `/opt`, `/Library`, `/snap`, `/nix`, `/run/current-system`, Linuxbrew, flatpak); a malicious npm/bun config that points the prefix elsewhere is dropped before Quill could later execute the binary as a trusted CLI. Failed detections record every path inspected on `ProviderStatus.lastDetectionAttempts` (omitted from JSON when empty) with the user's home directory redacted to `~/...` so the persisted/emitted blob does not leak the local username; the integrations menu's per-row diagnostic tooltip renders the redacted paths as inline `<code>` so they read distinctly from the surrounding prose.
 
 Both Claude and Codex detection share [[src-tauri/src/config.rs#detect_provider_cli]], which calls `resolve_command_path_with_attempts`, runs `--version` with `path_for_resolved_command`'s symlink-aware PATH augmentation, and returns the success bool plus the (already-redacted) attempts list.
+
+## Shared Outbound HTTP Client
+
+[[src-tauri/src/config.rs#http_client]] is the single `reqwest::Client` instance shared by every outbound HTTP call the app makes: live usage polling against the Anthropic OAuth API and the MiniMax coding-plan API in [[src-tauri/src/fetcher.rs]], and GitHub release lookups in [[src-tauri/src/releases.rs]].
+
+The client is built with `connect_timeout(5s)` and `timeout(15s)`. Without these explicit timeouts `reqwest::Client::new()` has no upper bound on connect time and can block the `tokio` runtime indefinitely on a dead network or captive portal (see seanmonstar/reqwest#1256). The 5-second connect timeout is also the signal the poller uses to enter offline cooldown — see [[features#Features#Live Usage View]] and [[src-tauri/src/lib.rs#compute_network_backoff]].
+
+The client is lazily initialized in a `OnceLock`, so the timeout configuration applies process-wide on first use and is reused across every poll.
 
 ## Dependencies
 

@@ -158,10 +158,7 @@ fn validate_code_blocks(orig: &str, comp: &str, result: &mut ValidationResult) {
 fn extract_urls(text: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut rest = text;
-    loop {
-        let Some(http_pos) = rest.find("http") else {
-            break;
-        };
+    while let Some(http_pos) = rest.find("http") {
         let after_http = &rest[http_pos..];
         let prefix_len = if after_http.starts_with("https://") {
             8

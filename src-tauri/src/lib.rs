@@ -30,8 +30,8 @@ use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
     ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
-    LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderStatus, RuntimeSettings,
-    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, SkillBreakdown,
+    LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderErrorKind, ProviderStatus,
+    RuntimeSettings, SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, SkillBreakdown,
     SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats,
     ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
@@ -61,7 +61,23 @@ static TRAY_ON_TOP_ITEM: OnceLock<CheckMenuItem<tauri::Wry>> = OnceLock::new();
 const LIVE_USAGE_REFRESH_INTERVAL_SECS: i64 = 3 * 60;
 const CLAUDE_USAGE_LAST_ATTEMPT_KEY: &str = "usage.claude.last_attempt_at";
 const CLAUDE_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.claude.cooldown_until";
+const CLAUDE_USAGE_NETWORK_COOLDOWN_UNTIL_KEY: &str = "usage.claude.network_cooldown_until";
+const CLAUDE_USAGE_NETWORK_FAILURES_KEY: &str = "usage.claude.network_failures";
 const CLAUDE_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
+const MINIMAX_USAGE_LAST_ATTEMPT_KEY: &str = "usage.minimax.last_attempt_at";
+const MINIMAX_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.minimax.cooldown_until";
+const MINIMAX_USAGE_NETWORK_COOLDOWN_UNTIL_KEY: &str = "usage.minimax.network_cooldown_until";
+const MINIMAX_USAGE_NETWORK_FAILURES_KEY: &str = "usage.minimax.network_failures";
+const MINIMAX_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
+// Exponential backoff for transport-failure (offline) cooldowns. The first
+// failure waits ~30-60 s; each subsequent consecutive failure doubles the
+// target (60s, 120s, 240s, 480s, 960s, 1800s capped). Half-jitter (uniform in
+// [target/2, target]) spreads the FE setInterval and BE tokio loop so they
+// don't resync at recovery — see AWS Builders' Library "Timeouts, retries and
+// backoff with jitter".
+const USAGE_NETWORK_BACKOFF_BASE_SECS: i64 = 60;
+const USAGE_NETWORK_BACKOFF_CAP_SECS: i64 = 30 * 60;
+const USAGE_NETWORK_BACKOFF_MAX_DOUBLINGS: u32 = 5;
 const TRAY_ID: &str = "main";
 
 // RuntimeSettings storage keys
@@ -380,6 +396,168 @@ fn clear_usage_setting(key: &'static str) {
     }
 }
 
+fn read_failure_counter(key: &'static str) -> u32 {
+    let Ok(storage) = get_storage() else {
+        return 0;
+    };
+    run_blocking(move || storage.get_setting(key))
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn write_failure_counter(key: &'static str, value: u32) {
+    let Ok(storage) = get_storage() else {
+        return;
+    };
+    let encoded = value.to_string();
+    if let Err(err) = run_blocking(move || storage.set_setting(key, &encoded)) {
+        log::warn!("Failed to persist usage counter {key}: {err}");
+    }
+}
+
+fn increment_failure_counter(key: &'static str) -> u32 {
+    let next = read_failure_counter(key).saturating_add(1);
+    write_failure_counter(key, next);
+    next
+}
+
+// Half-jitter backoff: target = min(base * 2^(n-1), cap); sleep uniform in
+// [target/2, target]. The jitter is what prevents the FE setInterval and BE
+// tokio loop from rejoining lockstep on recovery (both pollers run at the
+// same 3-minute cadence).
+fn compute_network_backoff(consecutive_failures: u32) -> TimeDelta {
+    let doublings = consecutive_failures
+        .saturating_sub(1)
+        .min(USAGE_NETWORK_BACKOFF_MAX_DOUBLINGS);
+    let scaled = USAGE_NETWORK_BACKOFF_BASE_SECS.saturating_mul(1_i64 << doublings);
+    let target = scaled.min(USAGE_NETWORK_BACKOFF_CAP_SECS);
+    let half = (target / 2).max(1);
+    let jitter = i64::from(rand::thread_rng().next_u32()) % half;
+    TimeDelta::seconds(half + jitter)
+}
+
+// Per-provider settings keys for the cooldown helpers below. Each provider
+// (Claude, MiniMax) maps a constant `ProviderCooldownKeys` to its four keys so
+// the cooldown logic can be written once and dispatched via the keys.
+#[derive(Clone, Copy)]
+struct ProviderCooldownKeys {
+    rate_limit_cooldown_until: &'static str,
+    network_cooldown_until: &'static str,
+    network_failures: &'static str,
+    fallback_backoff_secs: i64,
+}
+
+const CLAUDE_COOLDOWN_KEYS: ProviderCooldownKeys = ProviderCooldownKeys {
+    rate_limit_cooldown_until: CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
+    network_cooldown_until: CLAUDE_USAGE_NETWORK_COOLDOWN_UNTIL_KEY,
+    network_failures: CLAUDE_USAGE_NETWORK_FAILURES_KEY,
+    fallback_backoff_secs: CLAUDE_USAGE_FALLBACK_BACKOFF_SECS,
+};
+
+const MINIMAX_COOLDOWN_KEYS: ProviderCooldownKeys = ProviderCooldownKeys {
+    rate_limit_cooldown_until: MINIMAX_USAGE_COOLDOWN_UNTIL_KEY,
+    network_cooldown_until: MINIMAX_USAGE_NETWORK_COOLDOWN_UNTIL_KEY,
+    network_failures: MINIMAX_USAGE_NETWORK_FAILURES_KEY,
+    fallback_backoff_secs: MINIMAX_USAGE_FALLBACK_BACKOFF_SECS,
+};
+
+enum ProviderCooldownDecision {
+    Proceed,
+    UseCachedSilently,
+    UseCachedAsOffline,
+}
+
+fn check_provider_cooldown(
+    keys: ProviderCooldownKeys,
+    now: DateTime<Utc>,
+) -> ProviderCooldownDecision {
+    if usage_setting_timestamp(keys.rate_limit_cooldown_until).is_some_and(|t| t > now) {
+        return ProviderCooldownDecision::UseCachedSilently;
+    }
+    if usage_setting_timestamp(keys.network_cooldown_until).is_some_and(|t| t > now) {
+        return ProviderCooldownDecision::UseCachedAsOffline;
+    }
+    ProviderCooldownDecision::Proceed
+}
+
+fn clear_provider_cooldowns(keys: ProviderCooldownKeys) {
+    clear_usage_setting(keys.rate_limit_cooldown_until);
+    clear_usage_setting(keys.network_cooldown_until);
+    clear_usage_setting(keys.network_failures);
+}
+
+fn write_rate_limit_cooldown(
+    keys: ProviderCooldownKeys,
+    now: DateTime<Utc>,
+    retry_after_seconds: Option<i64>,
+) {
+    let secs = retry_after_seconds.unwrap_or(keys.fallback_backoff_secs);
+    write_usage_setting_timestamp(
+        keys.rate_limit_cooldown_until,
+        now + TimeDelta::seconds(secs),
+    );
+}
+
+fn record_network_failure(
+    keys: ProviderCooldownKeys,
+    now: DateTime<Utc>,
+    provider: integrations::IntegrationProvider,
+) {
+    let attempts = increment_failure_counter(keys.network_failures);
+    let backoff = compute_network_backoff(attempts);
+    write_usage_setting_timestamp(keys.network_cooldown_until, now + backoff);
+    log::warn!(
+        "{} usage transport failure ({attempts} consecutive); cooldown {}s",
+        provider.as_str(),
+        backoff.num_seconds()
+    );
+}
+
+fn append_cached_buckets(
+    target: &mut Vec<UsageBucket>,
+    provider: integrations::IntegrationProvider,
+) {
+    if let Some(mut buckets) = load_cached_usage_buckets(provider) {
+        target.append(&mut buckets);
+    }
+}
+
+fn push_offline_error(
+    errors: &mut Vec<UsageProviderError>,
+    provider: integrations::IntegrationProvider,
+) {
+    errors.push(UsageProviderError {
+        provider,
+        kind: ProviderErrorKind::Network,
+        message: "Offline — showing cached data.".into(),
+    });
+}
+
+// Pure, testable: maps the fetcher's per-provider error kind onto the
+// UI-facing `ProviderErrorKind`. Returns `None` when the error has a dedicated
+// cooldown path (RateLimited, Request) and should NOT be pushed as a regular
+// provider error.
+fn classify_claude_error_kind(kind: fetcher::ClaudeUsageErrorKind) -> Option<ProviderErrorKind> {
+    use fetcher::ClaudeUsageErrorKind::*;
+    match kind {
+        Credentials => Some(ProviderErrorKind::Config),
+        Unauthorized => Some(ProviderErrorKind::Auth),
+        RateLimited | Request => None,
+        Api | Parse => Some(ProviderErrorKind::Server),
+    }
+}
+
+fn classify_minimax_error_kind(kind: fetcher::MiniMaxUsageErrorKind) -> Option<ProviderErrorKind> {
+    use fetcher::MiniMaxUsageErrorKind::*;
+    match kind {
+        Unauthorized => Some(ProviderErrorKind::Auth),
+        RateLimited | Request => None,
+        Api | Parse => Some(ProviderErrorKind::Server),
+    }
+}
+
 // Only partition the usage cache by provider identity and enabled state.
 // Detection and setup metadata can churn without changing whether a fresh
 // in-memory usage snapshot is still valid to reuse.
@@ -589,45 +767,51 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                         continue;
                     }
 
-                    if usage_setting_timestamp(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY)
-                        .is_some_and(|timestamp| timestamp > now)
-                    {
-                        if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                            display_buckets.append(&mut buckets);
+                    match check_provider_cooldown(CLAUDE_COOLDOWN_KEYS, now) {
+                        ProviderCooldownDecision::UseCachedSilently => {
+                            append_cached_buckets(&mut display_buckets, provider);
+                            continue;
                         }
-                        continue;
+                        ProviderCooldownDecision::UseCachedAsOffline => {
+                            push_offline_error(&mut provider_errors, provider);
+                            append_cached_buckets(&mut display_buckets, provider);
+                            continue;
+                        }
+                        ProviderCooldownDecision::Proceed => {}
                     }
 
                     write_usage_setting_timestamp(CLAUDE_USAGE_LAST_ATTEMPT_KEY, now);
 
                     match fetcher::fetch_claude_usage().await {
                         Ok(mut buckets) => {
-                            clear_usage_setting(CLAUDE_USAGE_COOLDOWN_UNTIL_KEY);
+                            clear_provider_cooldowns(CLAUDE_COOLDOWN_KEYS);
                             display_buckets.extend(buckets.clone());
                             live_buckets.append(&mut buckets);
                         }
                         Err(error) => {
-                            if matches!(error.kind, fetcher::ClaudeUsageErrorKind::RateLimited) {
-                                let retry_after_seconds = error
-                                    .retry_after_seconds
-                                    .unwrap_or(CLAUDE_USAGE_FALLBACK_BACKOFF_SECS);
-                                write_usage_setting_timestamp(
-                                    CLAUDE_USAGE_COOLDOWN_UNTIL_KEY,
-                                    now + TimeDelta::seconds(retry_after_seconds),
-                                );
-                                if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                                    display_buckets.append(&mut buckets);
+                            match error.kind {
+                                fetcher::ClaudeUsageErrorKind::RateLimited => {
+                                    write_rate_limit_cooldown(
+                                        CLAUDE_COOLDOWN_KEYS,
+                                        now,
+                                        error.retry_after_seconds,
+                                    );
                                 }
-                                continue;
+                                fetcher::ClaudeUsageErrorKind::Request => {
+                                    record_network_failure(CLAUDE_COOLDOWN_KEYS, now, provider);
+                                    push_offline_error(&mut provider_errors, provider);
+                                }
+                                other_kind => {
+                                    if let Some(kind) = classify_claude_error_kind(other_kind) {
+                                        provider_errors.push(UsageProviderError {
+                                            provider,
+                                            kind,
+                                            message: error.message,
+                                        });
+                                    }
+                                }
                             }
-
-                            provider_errors.push(UsageProviderError {
-                                provider,
-                                message: error.message,
-                            });
-                            if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                                display_buckets.append(&mut buckets);
-                            }
+                            append_cached_buckets(&mut display_buckets, provider);
                         }
                     }
                 }
@@ -641,33 +825,83 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                             }
                         }
                         Err(message) => {
-                            provider_errors.push(UsageProviderError { provider, message });
-                            if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                                display_buckets.append(&mut buckets);
-                            }
+                            provider_errors.push(UsageProviderError {
+                                provider,
+                                kind: ProviderErrorKind::Server,
+                                message,
+                            });
+                            append_cached_buckets(&mut display_buckets, provider);
                         }
                     }
                 }
                 integrations::IntegrationProvider::MiniMax => {
+                    let now = Utc::now();
+
+                    match check_provider_cooldown(MINIMAX_COOLDOWN_KEYS, now) {
+                        ProviderCooldownDecision::UseCachedSilently => {
+                            append_cached_buckets(&mut display_buckets, provider);
+                            continue;
+                        }
+                        ProviderCooldownDecision::UseCachedAsOffline => {
+                            push_offline_error(&mut provider_errors, provider);
+                            append_cached_buckets(&mut display_buckets, provider);
+                            continue;
+                        }
+                        ProviderCooldownDecision::Proceed => {}
+                    }
+
                     let api_key = get_storage().and_then(|storage| {
                         integrations::minimax::load_api_key(storage)?
                             .ok_or_else(|| "MiniMax API key not configured.".to_string())
                     });
                     match api_key {
-                        Ok(key) => match fetcher::fetch_minimax_usage(&key).await {
-                            Ok(mut buckets) => {
-                                display_buckets.extend(buckets.clone());
-                                live_buckets.append(&mut buckets);
-                            }
-                            Err(message) => {
-                                provider_errors.push(UsageProviderError { provider, message });
-                                if let Some(mut buckets) = load_cached_usage_buckets(provider) {
-                                    display_buckets.append(&mut buckets);
+                        Ok(key) => {
+                            write_usage_setting_timestamp(MINIMAX_USAGE_LAST_ATTEMPT_KEY, now);
+                            match fetcher::fetch_minimax_usage(&key).await {
+                                Ok(mut buckets) => {
+                                    clear_provider_cooldowns(MINIMAX_COOLDOWN_KEYS);
+                                    display_buckets.extend(buckets.clone());
+                                    live_buckets.append(&mut buckets);
+                                }
+                                Err(error) => {
+                                    match error.kind {
+                                        fetcher::MiniMaxUsageErrorKind::RateLimited => {
+                                            write_rate_limit_cooldown(
+                                                MINIMAX_COOLDOWN_KEYS,
+                                                now,
+                                                error.retry_after_seconds,
+                                            );
+                                        }
+                                        fetcher::MiniMaxUsageErrorKind::Request => {
+                                            record_network_failure(
+                                                MINIMAX_COOLDOWN_KEYS,
+                                                now,
+                                                provider,
+                                            );
+                                            push_offline_error(&mut provider_errors, provider);
+                                        }
+                                        other_kind => {
+                                            if let Some(kind) =
+                                                classify_minimax_error_kind(other_kind)
+                                            {
+                                                provider_errors.push(UsageProviderError {
+                                                    provider,
+                                                    kind,
+                                                    message: error.message,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    append_cached_buckets(&mut display_buckets, provider);
                                 }
                             }
-                        },
+                        }
                         Err(message) => {
-                            provider_errors.push(UsageProviderError { provider, message });
+                            provider_errors.push(UsageProviderError {
+                                provider,
+                                kind: ProviderErrorKind::Config,
+                                message,
+                            });
                         }
                     }
                 }
@@ -2657,4 +2891,120 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Compute the deterministic upper/lower bounds for the half-jitter window
+    // given the same constants the production function uses, so the asserts
+    // stay correct if anyone tunes the constants later.
+    fn expected_bounds(consecutive_failures: u32) -> (i64, i64) {
+        let doublings = consecutive_failures
+            .saturating_sub(1)
+            .min(USAGE_NETWORK_BACKOFF_MAX_DOUBLINGS);
+        let scaled = USAGE_NETWORK_BACKOFF_BASE_SECS.saturating_mul(1_i64 << doublings);
+        let target = scaled.min(USAGE_NETWORK_BACKOFF_CAP_SECS);
+        let half = (target / 2).max(1);
+        (half, half + (half - 1).max(0))
+    }
+
+    #[test]
+    fn compute_network_backoff_first_failure_lands_in_half_jitter_window() {
+        // n=0 and n=1 both map to 0 doublings (saturating_sub(1)), so the
+        // target is the 60-second base and the sleep falls in [30, 59].
+        for failures in [0u32, 1] {
+            let (lo, hi) = expected_bounds(failures);
+            for _ in 0..32 {
+                let secs = compute_network_backoff(failures).num_seconds();
+                assert!(secs >= lo, "n={failures}: {secs} < {lo}");
+                assert!(secs <= hi, "n={failures}: {secs} > {hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn compute_network_backoff_caps_at_max_doublings() {
+        // Anything past MAX_DOUBLINGS must keep returning sleeps inside the
+        // [cap/2, cap-1] window — no overflow and no creeping past the cap.
+        for failures in [
+            USAGE_NETWORK_BACKOFF_MAX_DOUBLINGS + 1,
+            USAGE_NETWORK_BACKOFF_MAX_DOUBLINGS + 10,
+            100,
+            u32::MAX,
+        ] {
+            for _ in 0..32 {
+                let secs = compute_network_backoff(failures).num_seconds();
+                assert!(
+                    secs >= USAGE_NETWORK_BACKOFF_CAP_SECS / 2,
+                    "n={failures}: {secs} < {}",
+                    USAGE_NETWORK_BACKOFF_CAP_SECS / 2
+                );
+                assert!(
+                    secs < USAGE_NETWORK_BACKOFF_CAP_SECS,
+                    "n={failures}: {secs} >= cap {}",
+                    USAGE_NETWORK_BACKOFF_CAP_SECS
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compute_network_backoff_doubles_per_consecutive_failure() {
+        // Each step n in [1, MAX_DOUBLINGS] must land in [target/2, target-1]
+        // where target = min(base * 2^(n-1), cap).
+        for n in 1..=USAGE_NETWORK_BACKOFF_MAX_DOUBLINGS {
+            let (lo, hi) = expected_bounds(n);
+            for _ in 0..32 {
+                let secs = compute_network_backoff(n).num_seconds();
+                assert!(secs >= lo, "n={n}: {secs} < {lo}");
+                assert!(secs <= hi, "n={n}: {secs} > {hi}");
+            }
+        }
+    }
+
+    #[test]
+    fn classify_claude_error_kind_maps_to_ui_kinds() {
+        use fetcher::ClaudeUsageErrorKind::*;
+        assert_eq!(
+            classify_claude_error_kind(Credentials),
+            Some(ProviderErrorKind::Config)
+        );
+        assert_eq!(
+            classify_claude_error_kind(Unauthorized),
+            Some(ProviderErrorKind::Auth)
+        );
+        assert_eq!(
+            classify_claude_error_kind(Api),
+            Some(ProviderErrorKind::Server)
+        );
+        assert_eq!(
+            classify_claude_error_kind(Parse),
+            Some(ProviderErrorKind::Server)
+        );
+        // RateLimited and Request have dedicated cooldown paths — they must
+        // never appear as a regular provider error.
+        assert_eq!(classify_claude_error_kind(RateLimited), None);
+        assert_eq!(classify_claude_error_kind(Request), None);
+    }
+
+    #[test]
+    fn classify_minimax_error_kind_maps_to_ui_kinds() {
+        use fetcher::MiniMaxUsageErrorKind::*;
+        assert_eq!(
+            classify_minimax_error_kind(Unauthorized),
+            Some(ProviderErrorKind::Auth)
+        );
+        assert_eq!(
+            classify_minimax_error_kind(Api),
+            Some(ProviderErrorKind::Server)
+        );
+        assert_eq!(
+            classify_minimax_error_kind(Parse),
+            Some(ProviderErrorKind::Server)
+        );
+        assert_eq!(classify_minimax_error_kind(RateLimited), None);
+        assert_eq!(classify_minimax_error_kind(Request), None);
+    }
 }
