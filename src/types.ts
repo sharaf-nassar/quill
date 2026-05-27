@@ -146,6 +146,25 @@ export interface SkillProjectBreakdown {
 }
 
 /**
+ * One row of the Now-tab Hooks breakdown (feature 009). Identity is
+ * canonicalized at the backend per FR-003 — Quill-deployed scripts
+ * collapse to `quill:<basename>`, `${CLAUDE_PLUGIN_ROOT}/<dir>/<file>`
+ * stays verbatim, other paths reduce to basename, and missing-command
+ * records fall back to `hookName`. `is_quill` is derived from the
+ * `quill:` prefix and drives the QUILL chip in the UI.
+ */
+export interface HookBreakdown {
+  hook_identity: string;
+  hook_event: string;
+  tool_name: string | null;
+  is_quill: boolean;
+  codex_count: number;
+  claude_count: number;
+  total_count: number;
+  last_fired_at: string;
+}
+
+/**
  * One node in a session's sub-agent tree returned by
  * `get_session_subagent_tree`. Today every chain originates from the parent
  * transcript so depth-1 sub-agents always carry `parent_agent_id = null`,
@@ -185,7 +204,7 @@ export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
 export type TrendType = "up" | "down" | "flat" | "unknown";
 
-export type BreakdownMode = "hosts" | "projects" | "sessions" | "skills";
+export type BreakdownMode = "hosts" | "projects" | "sessions" | "skills" | "hooks";
 
 export type SortMode = "relevance" | "recency";
 

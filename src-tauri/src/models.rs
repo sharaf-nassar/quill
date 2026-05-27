@@ -237,6 +237,45 @@ pub struct SkillProjectBreakdown {
     pub last_used: String,
 }
 
+/// One row of the Now-tab Hooks breakdown (feature 009). Aggregates
+/// `hook_invocations` rows by canonicalized `hook_identity` over the
+/// active timeframe (or all indexed history when `all_time = true`),
+/// with per-provider sub-counts so the All / Codex / Claude filter
+/// strip can display the appropriate column. `is_quill` is derived
+/// from the `quill:` identity prefix and powers the QUILL chip in the
+/// UI. See specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
+#[derive(Serialize, Clone, Debug)]
+pub struct HookBreakdown {
+    pub hook_identity: String,
+    pub hook_event: String,
+    pub tool_name: Option<String>,
+    pub is_quill: bool,
+    pub codex_count: i64,
+    pub claude_count: i64,
+    pub total_count: i64,
+    pub last_fired_at: String,
+}
+
+/// Codex hook fire observation submitted via
+/// `POST /api/v1/hooks/observed`. The server validates this payload,
+/// fast-acks `202 Accepted`, and persists it on a background blocking
+/// task via `Storage::store_codex_hook_observation`. Mirrors the wire
+/// contract in
+/// specs/009-hooks-breakdown-tab/contracts/hooks-observed-endpoint.md.
+#[derive(Deserialize, Clone, Debug)]
+pub struct CodexHookObservation {
+    pub provider: IntegrationProvider,
+    pub session_id: String,
+    pub hook_event: String,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    pub ts: String,
+    #[serde(default)]
+    pub hook_matcher: Option<String>,
+}
+
 /// One sub-agent node inside a parent session, returned by
 /// `get_session_subagent_tree`. Multi-level nesting is supported via
 /// `parent_agent_id`; today every chain originates from the parent

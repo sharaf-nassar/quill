@@ -240,6 +240,31 @@ pub struct SessionEventInput<'a> {
     pub parent_uuid: Option<&'a str>,
 }
 
+/// One observed lifecycle-hook fire borrowed for the `hook_invocations`
+/// ingest pipeline (feature 009). Claude rows are populated from the
+/// JSONL attachment extractor in `sessions.rs`; Codex rows arrive via
+/// the HTTP endpoint and are converted into owned
+/// [`crate::models::CodexHookObservation`] before insert. See
+/// specs/009-hooks-breakdown-tab/contracts/hook-invocations.md.
+// @lat: [[backend#Database#Schema#Hook Invocations]]
+#[derive(Clone)]
+pub struct HookInvocationInput<'a> {
+    pub session_id: &'a str,
+    pub agent_id: Option<&'a str>,
+    pub is_sidechain: bool,
+    pub timestamp: &'a str,
+    pub hook_event: &'a str,
+    pub hook_matcher: Option<&'a str>,
+    pub tool_name: Option<&'a str>,
+    pub hook_identity: &'a str,
+    pub script_command_raw: Option<&'a str>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub cwd: Option<&'a str>,
+    pub hostname: Option<&'a str>,
+    pub message_id: Option<&'a str>,
+}
+
 /// Sub-agent attribution triple carried alongside a tool action row.
 /// Bundled into a struct to keep `insert_tool_actions` under clippy's
 /// `too_many_arguments` threshold and to mirror the `ResponseTimeInput`
@@ -2308,6 +2333,65 @@ impl Storage {
                 .map_err(|e| format!("Migration 26 commit: {e}"))?;
         }
 
+        // Feature 009: introduces `hook_invocations`, a per-event table
+        // capturing every lifecycle-hook fire we observe from either
+        // provider. Claude rows are populated by the new attachment
+        // extractor during the existing dual-emission pass; Codex rows
+        // arrive via `POST /api/v1/hooks/observed`. A one-shot reingest
+        // flag (matching migrations 20-22 / 26) backfills historical
+        // Claude transcripts on the next mtime sweep. See
+        // specs/009-hooks-breakdown-tab/data-model.md and
+        // specs/009-hooks-breakdown-tab/contracts/hook-invocations.md.
+        // @lat: [[backend#Database#Schema#Hook Invocations]]
+        if current_version < 27 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 27 transaction begin: {e}"))?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS hook_invocations (
+                    provider           TEXT NOT NULL,
+                    session_id         TEXT NOT NULL,
+                    agent_id           TEXT,
+                    is_sidechain       INTEGER NOT NULL DEFAULT 0,
+                    timestamp          TEXT NOT NULL,
+                    hook_event         TEXT NOT NULL,
+                    hook_matcher       TEXT,
+                    tool_name          TEXT,
+                    hook_identity      TEXT NOT NULL,
+                    script_command_raw TEXT,
+                    exit_code          INTEGER,
+                    duration_ms        INTEGER,
+                    cwd                TEXT,
+                    hostname           TEXT,
+                    message_id         TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS uidx_hook_invocations_identity
+                    ON hook_invocations(provider, session_id, COALESCE(agent_id, ''),
+                                        timestamp, hook_identity);
+                CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_ts
+                    ON hook_invocations(provider, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_session
+                    ON hook_invocations(provider, session_id);
+                CREATE INDEX IF NOT EXISTS idx_hook_invocations_identity_ts
+                    ON hook_invocations(hook_identity, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_hook_invocations_identity_cwd
+                    ON hook_invocations(hook_identity, cwd);",
+            )
+            .map_err(|e| format!("Migration 27 (hook_invocations table): {e}"))?;
+
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["hook_invocation_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 27 (set reingest flag): {e}"))?;
+
+            tx.execute("INSERT INTO schema_version (version) VALUES (27)", [])
+                .map_err(|e| format!("Failed to record migration 27: {e}"))?;
+
+            tx.commit()
+                .map_err(|e| format!("Migration 27 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -3475,6 +3559,103 @@ impl Storage {
         Ok(results)
     }
 
+    /// Build the Now-tab Hooks breakdown. Aggregates `hook_invocations`
+    /// rows by canonicalized `hook_identity` over the active timeframe
+    /// (or all indexed history when `all_time = true`), splitting
+    /// per-provider counts so the All / Codex / Claude filter strip
+    /// can pick the right column. `is_quill` is derived from the
+    /// `quill:` identity prefix and drives the QUILL chip in the UI.
+    /// See specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
+    // @lat: [[backend#Database#Schema#Hook Invocations]]
+    pub fn get_hook_breakdown(
+        &self,
+        days: i32,
+        provider: Option<IntegrationProvider>,
+        all_time: bool,
+        limit: Option<i32>,
+    ) -> Result<Vec<crate::models::HookBreakdown>, String> {
+        if provider == Some(IntegrationProvider::MiniMax) {
+            return Ok(Vec::new());
+        }
+
+        let days = days.clamp(1, 365);
+        let limit = limit.unwrap_or(100).clamp(1, 500);
+        let conn = self.conn.lock();
+        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+
+        // For each `hook_identity` group, surface the most recently
+        // seen `hook_event` / `tool_name` via a correlated subquery
+        // ordered by timestamp DESC. The subqueries match the outer
+        // `provider` scope (`hi2.provider = hi.provider`) so a
+        // provider-filtered query never returns event/tool metadata
+        // from the other provider — important because an identity can
+        // appear under both providers (e.g., a script firing on both
+        // Claude transcripts and Codex live observations) and the
+        // outer aggregate only sums rows from the active provider.
+        let mut sql = String::from(
+            "SELECT
+                 hook_identity,
+                 (SELECT hook_event FROM hook_invocations hi2
+                  WHERE hi2.hook_identity = hi.hook_identity
+                    AND hi2.provider = hi.provider
+                  ORDER BY hi2.timestamp DESC LIMIT 1) AS hook_event,
+                 (SELECT tool_name FROM hook_invocations hi3
+                  WHERE hi3.hook_identity = hi.hook_identity
+                    AND hi3.provider = hi.provider
+                  ORDER BY hi3.timestamp DESC LIMIT 1) AS tool_name,
+                 CASE WHEN hook_identity LIKE 'quill:%' THEN 1 ELSE 0 END AS is_quill,
+                 COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
+                 COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
+                 COUNT(*) AS total_count,
+                 MAX(timestamp) AS last_fired_at
+             FROM hook_invocations hi
+             WHERE provider IN ('claude', 'codex')",
+        );
+
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if !all_time {
+            params_vec.push(Box::new(from));
+            sql.push_str(" AND timestamp >= ?1");
+        }
+        if let Some(provider) = provider {
+            let next_param = params_vec.len() + 1;
+            sql.push_str(&format!(" AND provider = ?{next_param}"));
+            params_vec.push(Box::new(provider.as_str().to_string()));
+        }
+        sql.push_str(
+            " GROUP BY hook_identity \
+             ORDER BY total_count DESC, hook_identity ASC",
+        );
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Prepare hook breakdown: {e}"))?;
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                let is_quill_i: i64 = row.get(3)?;
+                Ok(crate::models::HookBreakdown {
+                    hook_identity: row.get(0)?,
+                    hook_event: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    tool_name: row.get(2)?,
+                    is_quill: is_quill_i != 0,
+                    codex_count: row.get(4)?,
+                    claude_count: row.get(5)?,
+                    total_count: row.get(6)?,
+                    last_fired_at: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                })
+            })
+            .map_err(|e| format!("Query hook breakdown: {e}"))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| format!("Row hook breakdown: {e}"))?);
+        }
+        Ok(results)
+    }
+
     pub fn get_skill_project_breakdown(
         &self,
         skill_name: &str,
@@ -4114,6 +4295,26 @@ impl Storage {
             )
             .map_err(|e| format!("Delete session_events cascade error: {e}"))?;
 
+        // Feature 009: cascade hook_invocations rows for every session
+        // that lived on this host, using the same token_snapshots
+        // subquery pattern as the session_events cascade. Sequenced
+        // before the token_snapshots delete so the subquery still sees
+        // the source rows. Also drops any rows the observer captured
+        // with an explicit hostname column match (Codex side).
+        // @lat: [[backend#Database#Schema#Hook Invocations]]
+        let hook_count = tx
+            .execute(
+                "DELETE FROM hook_invocations
+                 WHERE (provider, session_id) IN (
+                     SELECT DISTINCT provider, session_id
+                     FROM token_snapshots
+                     WHERE hostname = ?1
+                 )
+                 OR hostname = ?1",
+                params![hostname],
+            )
+            .map_err(|e| format!("Delete hook_invocations cascade error: {e}"))?;
+
         let snap_count = tx
             .execute(
                 "DELETE FROM token_snapshots WHERE hostname = ?1",
@@ -4130,7 +4331,7 @@ impl Storage {
 
         tx.commit().map_err(|e| format!("Commit error: {e}"))?;
 
-        Ok((snap_count + hourly_count + event_count) as u64)
+        Ok((snap_count + hourly_count + event_count + hook_count) as u64)
     }
 
     pub fn delete_session_data(
@@ -4166,10 +4367,20 @@ impl Storage {
             )
             .map_err(|e| format!("Delete session_events error: {e}"))?;
 
+        // Feature 009: cascade hook_invocations for this session so the
+        // Hooks breakdown stays consistent with the visible session list.
+        // @lat: [[backend#Database#Schema#Hook Invocations]]
+        let hook_count = tx
+            .execute(
+                "DELETE FROM hook_invocations WHERE provider = ?1 AND session_id = ?2",
+                params![provider.as_str(), session_id],
+            )
+            .map_err(|e| format!("Delete hook_invocations error: {e}"))?;
+
         tx.commit()
             .map_err(|e| format!("Delete session commit error: {e}"))?;
 
-        Ok((token_count + skill_count + event_count) as u64)
+        Ok((token_count + skill_count + event_count + hook_count) as u64)
     }
 
     pub fn delete_project_data(&self, cwd: &str) -> Result<u64, String> {
@@ -4204,10 +4415,16 @@ impl Storage {
             .execute("DELETE FROM skill_usages WHERE cwd = ?1", params![cwd])
             .map_err(|e| format!("Delete skill_usages error: {e}"))?;
 
+        // Feature 009: cascade hook_invocations rows for this cwd.
+        // @lat: [[backend#Database#Schema#Hook Invocations]]
+        let hook_count = tx
+            .execute("DELETE FROM hook_invocations WHERE cwd = ?1", params![cwd])
+            .map_err(|e| format!("Delete hook_invocations error: {e}"))?;
+
         tx.commit()
             .map_err(|e| format!("Commit delete_project_data: {e}"))?;
 
-        Ok((token_count + skill_count + event_count) as u64)
+        Ok((token_count + skill_count + event_count + hook_count) as u64)
     }
 
     pub fn rename_project(&self, old_cwd: &str, new_cwd: &str) -> Result<u64, String> {
@@ -7688,6 +7905,26 @@ impl Storage {
         Ok(())
     }
 
+    /// Delete every `hook_invocations` row for a single session
+    /// (feature 009). Called from the session-delete cascade in
+    /// `delete_session_data` and from the per-session reindex path so
+    /// transcript replays don't accumulate duplicates beyond what
+    /// `INSERT OR IGNORE` absorbs.
+    // @lat: [[backend#Database#Schema#Hook Invocations]]
+    pub fn delete_hook_invocations_for_session(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM hook_invocations WHERE provider = ?1 AND session_id = ?2",
+            params![provider.as_str(), session_id],
+        )
+        .map_err(|e| format!("Delete hook_invocations for session: {e}"))?;
+        Ok(())
+    }
+
     pub fn store_tool_actions_for_messages(
         &self,
         provider: IntegrationProvider,
@@ -7804,6 +8041,114 @@ impl Storage {
 
         tx.commit()
             .map_err(|e| format!("Commit skill_usages batch: {e}"))?;
+        Ok(())
+    }
+
+    /// Insert observed lifecycle-hook fires into `hook_invocations`
+    /// (feature 009). Single transaction, prepared statement,
+    /// `INSERT OR IGNORE` against the UNIQUE identity index so
+    /// re-extraction of the same Claude transcript is idempotent. See
+    /// specs/009-hooks-breakdown-tab/contracts/hook-invocations.md
+    /// (§ Insert path).
+    // @lat: [[backend#Database#Schema#Hook Invocations]]
+    pub fn store_hook_invocations_for_messages(
+        &self,
+        provider: IntegrationProvider,
+        invocations: &[HookInvocationInput<'_>],
+    ) -> Result<(), String> {
+        if invocations.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin hook_invocations batch transaction: {e}"))?;
+
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO hook_invocations (
+                        provider, session_id, agent_id, is_sidechain, timestamp,
+                        hook_event, hook_matcher, tool_name, hook_identity,
+                        script_command_raw, exit_code, duration_ms, cwd, hostname,
+                        message_id
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                )
+                .map_err(|e| format!("Prepare store_hook_invocations: {e}"))?;
+
+            for inv in invocations {
+                stmt.execute(params![
+                    provider.as_str(),
+                    inv.session_id,
+                    inv.agent_id,
+                    inv.is_sidechain as i64,
+                    inv.timestamp,
+                    inv.hook_event,
+                    inv.hook_matcher,
+                    inv.tool_name,
+                    inv.hook_identity,
+                    inv.script_command_raw,
+                    inv.exit_code,
+                    inv.duration_ms,
+                    inv.cwd,
+                    inv.hostname,
+                    inv.message_id,
+                ])
+                .map_err(|e| format!("Insert hook_invocation: {e}"))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Commit hook_invocations batch: {e}"))?;
+        Ok(())
+    }
+
+    /// Insert a single Codex hook observation submitted via
+    /// `POST /api/v1/hooks/observed`. The endpoint validates the
+    /// payload and acknowledges synchronously; this insert runs on a
+    /// background blocking task. Identity is event-scoped (Codex does
+    /// not report per-script execution to the observer hook), with
+    /// `tool_name` appended when present so `PreToolUse:Bash` and
+    /// `PreToolUse:Read` separate cleanly in the breakdown.
+    ///
+    /// `cwd` is persisted verbatim — unlike `/learning/observations`
+    /// which redacts free-text content, the per-cwd drilldown axis on
+    /// the Hooks breakdown depends on path-accurate `cwd` values
+    /// matching the same paths stored in `skill_usages.cwd` and the
+    /// project-rename pipeline. The redaction boundary therefore lives
+    /// at the producer (`hook-observe.cjs`) which only forwards the
+    /// stdin `cwd` field Codex already chose to expose.
+    // @lat: [[backend#HTTP API Server#Endpoints]]
+    pub fn store_codex_hook_observation(
+        &self,
+        obs: &crate::models::CodexHookObservation,
+    ) -> Result<(), String> {
+        let identity = match obs.tool_name.as_deref() {
+            Some(t) if !t.is_empty() => format!("{}:{}", obs.hook_event, t),
+            _ => obs.hook_event.clone(),
+        };
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT OR IGNORE INTO hook_invocations (
+                    provider, session_id, agent_id, is_sidechain, timestamp,
+                    hook_event, hook_matcher, tool_name, hook_identity,
+                    script_command_raw, exit_code, duration_ms, cwd, hostname,
+                    message_id
+                ) VALUES (?1, ?2, NULL, 0, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL, NULL)",
+            )
+            .map_err(|e| format!("Prepare store_codex_hook_observation: {e}"))?;
+        stmt.execute(params![
+            obs.provider.as_str(),
+            obs.session_id,
+            obs.ts,
+            obs.hook_event,
+            obs.hook_matcher,
+            obs.tool_name,
+            identity,
+            obs.cwd,
+        ])
+        .map_err(|e| format!("Insert codex hook observation: {e}"))?;
         Ok(())
     }
 

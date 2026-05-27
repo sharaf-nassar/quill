@@ -17,9 +17,9 @@ use tauri::Emitter;
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{
-    ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
-    LearningRunPayload, ObservationPayload, SessionMessagesPayload, SessionNotifyPayload,
-    TokenReportPayload,
+    CodexHookObservation, ContextSavingsEventPayload, ContextSavingsEventsBatchPayload,
+    LearnedRulePayload, LearningRunPayload, ObservationPayload, SessionMessagesPayload,
+    SessionNotifyPayload, TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -29,6 +29,14 @@ const MAX_REQUESTS: usize = 100;
 const RATE_WINDOW_SECS: u64 = 60;
 const MAX_STRING_LEN: usize = 256;
 const MAX_CWD_LEN: usize = 4096;
+// Feature 009: tighter cap on `session_id` that matches the wire
+// contract in
+// specs/009-hooks-breakdown-tab/contracts/hooks-observed-endpoint.md
+// (§ Wire format) and the data-model validation rule. Codex session
+// UUIDs are 36 chars; this leaves comfortable headroom while still
+// rejecting any second producer that mistakenly forwards a longer
+// identifier.
+const MAX_SESSION_ID_LEN: usize = 128;
 const MAX_TOKEN_VALUE: i64 = 100_000_000;
 const MAX_TOOL_DATA_LEN: usize = 2048;
 
@@ -124,6 +132,7 @@ pub async fn start_server(
         .route("/api/v1/tokens", post(report_tokens))
         .route("/api/v1/learning/observations", post(post_observation))
         .route("/api/v1/learning/observations", get(get_observations))
+        .route("/api/v1/hooks/observed", post(post_hook_observed))
         .route("/api/v1/learning/status", get(get_learning_status))
         .route("/api/v1/learning/runs", post(post_learning_run))
         .route("/api/v1/learning/runs", get(get_learning_runs))
@@ -252,6 +261,31 @@ fn store_observation_in_background(storage: &'static Storage, payload: Observati
             log::error!("Failed to store observation: {err}");
         }
     });
+}
+
+// Feature 009: persist a Codex hook observation on a background blocking
+// task and emit `hooks-observed-updated` on success so the frontend
+// `useHookBreakdown` hook refreshes. Mirrors the spawn-then-emit shape
+// used by `learning-updated` / `context-savings-updated`. Failures
+// additionally emit `hooks-ingestion-error` with the error string so the
+// UI (or an operator log scraper) can surface silent ingestion drops —
+// without this signal a misconfigured DB or broken migration would
+// produce an empty Hooks breakdown with no user-visible cue.
+fn store_codex_hook_in_background(
+    storage: &'static Storage,
+    app_handle: tauri::AppHandle,
+    obs: CodexHookObservation,
+) {
+    let _task =
+        tokio::task::spawn_blocking(move || match storage.store_codex_hook_observation(&obs) {
+            Ok(()) => {
+                let _ = app_handle.emit("hooks-observed-updated", ());
+            }
+            Err(err) => {
+                log::error!("Failed to store codex hook observation: {err}");
+                let _ = app_handle.emit("hooks-ingestion-error", err.clone());
+            }
+        });
 }
 
 fn session_notify_key(payload: &SessionNotifyPayload) -> String {
@@ -420,6 +454,12 @@ fn process_session_notify_payload(
     if let Err(err) = storage.delete_session_events_for_session(payload.provider, &session_id) {
         log::warn!("Failed to delete old session_events: {err}");
     }
+    // Feature 009: hook_invocations follows the same delete-then-rebuild
+    // contract. Without this, hook fires from a Claude session never reach
+    // the Hooks breakdown when ingestion is driven by /sessions/notify.
+    if let Err(err) = storage.delete_hook_invocations_for_session(payload.provider, &session_id) {
+        log::warn!("Failed to delete old hook_invocations: {err}");
+    }
 
     let count = session_index.replace_session_docs_batch(
         payload.provider,
@@ -469,6 +509,38 @@ fn process_session_notify_payload(
         .collect();
     if let Err(err) = storage.ingest_session_events(payload.provider, &session_id, &rt_events) {
         log::warn!("Failed to store session_events: {err}");
+    }
+    // Feature 009: emit hook fires extracted from `type:"attachment"`
+    // records alongside the existing message/event/skill pipelines.
+    // Mirrors the per-batch hostname wiring used by the mtime sweep in
+    // sessions.rs.
+    if !extracted.hook_invocations.is_empty() {
+        let hostname = sessions::SessionIndex::local_hostname();
+        let invocations: Vec<crate::storage::HookInvocationInput<'_>> = extracted
+            .hook_invocations
+            .iter()
+            .map(|inv| crate::storage::HookInvocationInput {
+                session_id: inv.session_id.as_str(),
+                agent_id: inv.agent_id.as_deref(),
+                is_sidechain: inv.is_sidechain,
+                timestamp: inv.timestamp.as_str(),
+                hook_event: inv.hook_event.as_str(),
+                hook_matcher: inv.hook_matcher.as_deref(),
+                tool_name: inv.tool_name.as_deref(),
+                hook_identity: inv.hook_identity.as_str(),
+                script_command_raw: inv.script_command_raw.as_deref(),
+                exit_code: inv.exit_code,
+                duration_ms: inv.duration_ms,
+                cwd: inv.cwd.as_deref(),
+                hostname: Some(hostname.as_str()),
+                message_id: inv.message_id.as_deref(),
+            })
+            .collect();
+        if let Err(err) =
+            storage.store_hook_invocations_for_messages(payload.provider, &invocations)
+        {
+            log::warn!("Failed to store hook_invocations: {err}");
+        }
     }
     let _ = app_handle.emit("sessions-index-updated", count);
 
@@ -623,6 +695,78 @@ async fn post_observation(
     }
 
     store_observation_in_background(state.storage, payload);
+    (StatusCode::ACCEPTED, "queued".to_string())
+}
+
+// Feature 009: ingest Codex hook fires from the deployed
+// `hook-observe.cjs` observer. Validates the eight-event whitelist,
+// length-caps strings, fast-acks 202 ACCEPTED, and persists on a
+// background blocking task. The handler's response shape mirrors
+// `post_observation` so the script's fast-ack contract is preserved.
+// See specs/009-hooks-breakdown-tab/contracts/hooks-observed-endpoint.md.
+// @lat: [[backend#HTTP API Server#Endpoints]]
+async fn post_hook_observed(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<CodexHookObservation>,
+) -> impl IntoResponse {
+    const ALLOWED_EVENTS: &[&str] = &[
+        "PreToolUse",
+        "PostToolUse",
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "PreCompact",
+        "PostCompact",
+        "PermissionRequest",
+    ];
+
+    if !check_auth(&headers, &state.secret) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
+    }
+    if !check_rate_limit_with_max(&state.obs_rate_limiter, MAX_OBS_REQUESTS) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded".to_string(),
+        );
+    }
+    if payload.session_id.is_empty() || payload.session_id.len() > MAX_SESSION_ID_LEN {
+        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
+    }
+    if !ALLOWED_EVENTS.contains(&payload.hook_event.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("Unknown hook_event: {}", payload.hook_event),
+        );
+    }
+    if payload.ts.is_empty() || payload.ts.len() > 64 {
+        return (StatusCode::BAD_REQUEST, "Invalid ts".to_string());
+    }
+    if chrono::DateTime::parse_from_rfc3339(&payload.ts).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "ts must be ISO-8601 with offset".to_string(),
+        );
+    }
+    if payload
+        .tool_name
+        .as_ref()
+        .is_some_and(|t| t.len() > MAX_STRING_LEN)
+    {
+        return (StatusCode::BAD_REQUEST, "tool_name too long".to_string());
+    }
+    if payload.cwd.as_ref().is_some_and(|c| c.len() > MAX_CWD_LEN) {
+        return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
+    }
+    if payload
+        .hook_matcher
+        .as_ref()
+        .is_some_and(|m| m.len() > MAX_STRING_LEN)
+    {
+        return (StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
+    }
+
+    store_codex_hook_in_background(state.storage, state.app_handle.clone(), payload);
     (StatusCode::ACCEPTED, "queued".to_string())
 }
 

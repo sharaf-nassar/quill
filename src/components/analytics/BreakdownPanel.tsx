@@ -8,6 +8,7 @@ import { formatTokenCount } from "../../utils/tokens";
 import type {
   BreakdownMode,
   BreakdownSelection,
+  HookBreakdown,
   HostBreakdown,
   IntegrationProvider,
   ProjectBreakdown,
@@ -57,12 +58,13 @@ function projectName(path: string | null | undefined): string | null {
   return segments.length > 0 ? segments[segments.length - 1] : null;
 }
 
-const MODES: BreakdownMode[] = ["sessions", "projects", "hosts", "skills"];
+const MODES: BreakdownMode[] = ["sessions", "projects", "hosts", "skills", "hooks"];
 const MODE_LABELS: Record<BreakdownMode, string> = {
   hosts: "Hosts",
   projects: "Projects",
   sessions: "Sessions",
   skills: "Skills",
+  hooks: "Hooks",
 };
 const CONFIRM_TIMEOUT_MS = 3000;
 type SkillProviderFilter = "all" | "claude" | "codex";
@@ -78,6 +80,34 @@ const SKILL_PROVIDER_FILTERS: Array<{ value: SkillProviderFilter; label: string 
   { value: "codex", label: "Codex" },
   { value: "claude", label: "Claude" },
 ];
+
+// Feature 009: same provider filter shape as skills, scoped to hook
+// rows. Tracked independently so user's last Skills filter doesn't
+// leak into the Hooks breakdown.
+type HookProviderFilter = "all" | "claude" | "codex";
+const HOOK_PROVIDER_FILTERS: Array<{ value: HookProviderFilter; label: string }> = [
+  { value: "all", label: "All" },
+  { value: "codex", label: "Codex" },
+  { value: "claude", label: "Claude" },
+];
+
+function hookEmptyLabel(providerFilter: HookProviderFilter, allTime: boolean): string {
+  const provider = providerFilter === "all"
+    ? "all providers"
+    : providerFilter === "codex"
+      ? "Codex"
+      : "Claude Code";
+  const scope = allTime ? "all time" : "this timeframe";
+  return `No ${provider} hook fires for ${scope}`;
+}
+
+// Tooltip for the `?` help affordance on the Hooks breakdown header.
+// Explains why Codex rows look coarser than Claude rows (FR-017). The
+// asymmetry is intrinsic to the data sources, not a bug to be papered
+// over — see specs/009-hooks-breakdown-tab/spec.md (Overview).
+const HOOK_ASYMMETRY_HELP =
+  "Claude hooks are tracked per script. Codex hooks are tracked per event " +
+  "because Codex doesn't log per-script hook executions.";
 const SKILL_SORT_COLUMNS: Array<{ key: SkillSortKey; label: string }> = [
   { key: "name", label: "Skill" },
   { key: "uses", label: "Uses" },
@@ -529,6 +559,12 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const [mode, setMode] = useState<BreakdownMode>("sessions");
   const [skillsAllTime, setSkillsAllTime] = useState(true);
   const [skillsProvider, setSkillsProvider] = useState<SkillProviderFilter>("all");
+  // Feature 009: Hooks tab controls. ALL TIME defaults on because hook
+  // installations evolve slowly — users opening the tab usually want
+  // confirmation that a hook is wired up at all, which a 1h window
+  // would hide.
+  const [hooksAllTime, setHooksAllTime] = useState(true);
+  const [hooksProvider, setHooksProvider] = useState<HookProviderFilter>("all");
   const [skillSort, setSkillSort] = useState<SkillSortState>({
     key: "uses",
     direction: "desc",
@@ -556,10 +592,20 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skillProviderArg: IntegrationProvider | null =
     skillsProvider === "all" ? null : skillsProvider;
+  const hookProviderArg: IntegrationProvider | null =
+    hooksProvider === "all" ? null : hooksProvider;
   const { data, loading, error, refresh } = useBreakdownData(mode, days, {
     skillAllTime: skillsAllTime,
     skillProvider: skillProviderArg,
+    hookAllTime: hooksAllTime,
+    hookProvider: hookProviderArg,
   });
+  // Feature 009: hook rows arrive pre-sorted and pre-filtered from the
+  // backend SQL — `useBreakdownData` already passes `hookProvider` to
+  // `get_hook_breakdown`, which applies the provider scope as a WHERE
+  // predicate. The display count per row switches between
+  // codex_count / claude_count / total_count to match the active chip,
+  // but no client-side filtering is needed.
   // Mirrors the cache key shape used by `useBreakdownData` so the
   // per-skill project drilldown invalidates on the exact same filter
   // axes (days / all-time / provider) that drive the parent rows.
@@ -825,7 +871,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     (row) => "project" in row && (row as ProjectBreakdown).project === editingCwd.trim()
       && editingCwd.trim() !== selection?.key,
   );
-  const activeSelection = mode === "skills" ? null : selection;
+  const activeSelection = mode === "skills" || mode === "hooks" ? null : selection;
 
   return (
     <div className="breakdown-panel">
@@ -923,6 +969,46 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
         </div>
       )}
 
+      {/* Feature 009: Hooks tab reuses the Skills controls vocabulary
+          (provider tabs, ALL TIME chip) plus an asymmetry help button
+          explaining why Codex rows look coarser than Claude rows. */}
+      {mode === "hooks" && (
+        <div className="breakdown-skill-controls" aria-label="Hook breakdown controls">
+          <div className="breakdown-skill-provider-tabs" role="tablist" aria-label="Hook provider filter">
+            {HOOK_PROVIDER_FILTERS.map((filter) => (
+              <button
+                key={filter.value}
+                role="tab"
+                className={`breakdown-skill-provider${hooksProvider === filter.value ? " active" : ""}`}
+                aria-pressed={hooksProvider === filter.value}
+                aria-selected={hooksProvider === filter.value}
+                onClick={() => setHooksProvider(filter.value)}
+              >
+                <span className="breakdown-skill-provider-label">{filter.label}</span>
+                <span className="breakdown-skill-provider-underline" aria-hidden />
+              </button>
+            ))}
+          </div>
+          <button
+            className="breakdown-hook-help"
+            type="button"
+            aria-label="About Claude/Codex hook tracking"
+            title={HOOK_ASYMMETRY_HELP}
+          >
+            <span aria-hidden>?</span>
+          </button>
+          <button
+            className={`breakdown-skill-toggle${hooksAllTime ? " active" : ""}`}
+            aria-pressed={hooksAllTime}
+            onClick={() => setHooksAllTime((value) => !value)}
+            title={hooksAllTime ? "Showing all history. Click to scope to the active timeframe." : "Click to ignore the timeframe and count every recorded hook fire."}
+          >
+            <span className="breakdown-skill-toggle-glyph" aria-hidden>&#8734;</span>
+            <span className="breakdown-skill-toggle-label">All time</span>
+          </button>
+        </div>
+      )}
+
       {error && <div className="analytics-error">{error}</div>}
 
       {loading ? (
@@ -931,7 +1017,9 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
         <div className="breakdown-empty">
           {mode === "skills"
             ? skillEmptyLabel(skillsProvider, skillsAllTime)
-            : `No ${mode} data yet`}
+            : mode === "hooks"
+              ? hookEmptyLabel(hooksProvider, hooksAllTime)
+              : `No ${mode} data yet`}
         </div>
       ) : (
         <>
@@ -1162,7 +1250,48 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                       </Fragment>
                     );
                   })
-                : (data as SessionBreakdown[]).map((row) => {
+                : mode === "hooks"
+                  ? (data as HookBreakdown[]).map((row) => {
+                      const displayCount =
+                        hooksProvider === "claude"
+                          ? row.claude_count
+                          : hooksProvider === "codex"
+                            ? row.codex_count
+                            : row.total_count;
+                      const usesLabel = displayCount === 1 ? "1 use" : `${displayCount} uses`;
+                      const eventLabel = row.tool_name
+                        ? `${row.hook_event} · ${row.tool_name}`
+                        : row.hook_event;
+                      return (
+                        <div
+                          key={row.hook_identity}
+                          className="breakdown-row breakdown-row-hook"
+                          role="listitem"
+                          tabIndex={0}
+                          aria-label={`${row.hook_identity}: ${usesLabel}, last fired ${formatRelativeTime(row.last_fired_at)}`}
+                        >
+                          <span className="breakdown-name breakdown-name-hook" title={row.hook_identity}>
+                            {row.is_quill && (
+                              <span
+                                className="breakdown-provider-tag quill"
+                                title="Deployed by Quill"
+                              >
+                                QUILL
+                              </span>
+                            )}
+                            <span className="breakdown-hook-identity">{row.hook_identity}</span>
+                            <span className="breakdown-hook-event">{eventLabel}</span>
+                          </span>
+                          <span className="breakdown-tokens breakdown-hook-uses">
+                            {displayCount}
+                          </span>
+                          <span className="breakdown-time">
+                            {formatRelativeTime(row.last_fired_at)}
+                          </span>
+                        </div>
+                      );
+                    })
+                  : (data as SessionBreakdown[]).map((row) => {
                   const sessKey = sessionRefKey({
                     provider: row.provider,
                     session_id: row.session_id,

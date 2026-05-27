@@ -553,9 +553,23 @@ impl SessionIndex {
                     .flatten()
             })
             .is_some();
+        // Feature 009: migration 27 sets `hook_invocation_reingest_pending`
+        // so the next mtime sweep re-extracts hook fires from every
+        // Claude transcript and populates `hook_invocations`. Codex has
+        // no historical hook data to backfill — its rows arrive live
+        // via `POST /api/v1/hooks/observed` — so the sweep is a no-op
+        // for Codex even when the flag is set.
+        let hook_invocation_reingest_pending = storage
+            .and_then(|s| {
+                s.get_setting("hook_invocation_reingest_pending")
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
         if subagent_reingest_pending
             || skill_usage_reingest_pending
             || runtime_event_reingest_pending
+            || hook_invocation_reingest_pending
         {
             log::info!(
                 "Session derived-data migration: clearing mtime cache to force full transcript re-ingest"
@@ -617,6 +631,14 @@ impl SessionIndex {
                         &extracted.session_id,
                     ) {
                         log::warn!("Failed to delete old response_times: {e}");
+                    }
+                    // Feature 009: drop any hook_invocations from a prior
+                    // ingest of this session before the re-emission below.
+                    if let Err(e) = storage.delete_hook_invocations_for_session(
+                        discovered.provider,
+                        &extracted.session_id,
+                    ) {
+                        log::warn!("Failed to delete old hook_invocations: {e}");
                     }
                 }
             }
@@ -707,6 +729,40 @@ impl SessionIndex {
                 }
             }
 
+            // Feature 009: store hook fires extracted from
+            // `type:"attachment"` records. Hostname is the same value
+            // already attached to skill_usages and message rows in this
+            // batch. See contracts/hook-invocations.md.
+            if let Some(storage) = storage
+                && !extracted.hook_invocations.is_empty()
+            {
+                let invocations: Vec<crate::storage::HookInvocationInput<'_>> = extracted
+                    .hook_invocations
+                    .iter()
+                    .map(|inv| crate::storage::HookInvocationInput {
+                        session_id: inv.session_id.as_str(),
+                        agent_id: inv.agent_id.as_deref(),
+                        is_sidechain: inv.is_sidechain,
+                        timestamp: inv.timestamp.as_str(),
+                        hook_event: inv.hook_event.as_str(),
+                        hook_matcher: inv.hook_matcher.as_deref(),
+                        tool_name: inv.tool_name.as_deref(),
+                        hook_identity: inv.hook_identity.as_str(),
+                        script_command_raw: inv.script_command_raw.as_deref(),
+                        exit_code: inv.exit_code,
+                        duration_ms: inv.duration_ms,
+                        cwd: inv.cwd.as_deref(),
+                        hostname: Some(hostname.as_str()),
+                        message_id: inv.message_id.as_deref(),
+                    })
+                    .collect();
+                if let Err(e) =
+                    storage.store_hook_invocations_for_messages(discovered.provider, &invocations)
+                {
+                    log::warn!("Failed to store hook_invocations: {e}");
+                }
+            }
+
             total_indexed += extracted.messages.len();
             state.file_mtimes.insert(file_key, mtime);
         }
@@ -740,6 +796,17 @@ impl SessionIndex {
             && let Err(e) = storage.delete_setting("runtime_event_reingest_pending")
         {
             log::warn!("Failed to clear runtime_event_reingest_pending flag: {e}");
+        }
+        // Feature 009: clear the migration-27 backfill flag once the
+        // sweep completes successfully (same semantics as the feature
+        // 008 flag above). If the sweep aborted, the flag stays set so
+        // the next boot retries the hook-invocation catch-up scan.
+        // @lat: [[backend#Database#Schema#Hook Invocations]]
+        if hook_invocation_reingest_pending
+            && let Some(storage) = storage
+            && let Err(e) = storage.delete_setting("hook_invocation_reingest_pending")
+        {
+            log::warn!("Failed to clear hook_invocation_reingest_pending flag: {e}");
         }
 
         drop(writer);
@@ -1325,6 +1392,37 @@ pub struct ExtractedSession {
     /// [`extract_claude_messages_from_jsonl`] and
     /// [`extract_codex_messages_from_jsonl`] in the same parse pass.
     pub events: Vec<ExtractedEvent>,
+    /// Observed lifecycle-hook fires emitted alongside [`messages`] and
+    /// [`events`] (feature 009). Populated only by the Claude extractor,
+    /// which inspects `type:"attachment"` JSONL records carrying
+    /// `hook_*` payloads. Codex transcripts do not record hook
+    /// executions, so the Codex extractor always leaves this empty —
+    /// Codex hook data arrives live via the
+    /// `POST /api/v1/hooks/observed` endpoint instead.
+    pub hook_invocations: Vec<HookInvocation>,
+}
+
+/// Owned form of a hook fire extracted from a Claude transcript
+/// (feature 009). Held by [`ExtractedSession`] until the indexing pass
+/// converts it into a borrowed [`crate::storage::HookInvocationInput`]
+/// for the storage batch insert. See
+/// specs/009-hooks-breakdown-tab/contracts/hook-invocations.md.
+// @lat: [[backend#Database#Schema#Hook Invocations]]
+#[derive(Clone, Debug)]
+pub struct HookInvocation {
+    pub session_id: String,
+    pub agent_id: Option<String>,
+    pub is_sidechain: bool,
+    pub timestamp: String,
+    pub hook_event: String,
+    pub hook_matcher: Option<String>,
+    pub tool_name: Option<String>,
+    pub hook_identity: String,
+    pub script_command_raw: Option<String>,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub cwd: Option<String>,
+    pub message_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1561,6 +1659,338 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
         .collect()
 }
 
+/// Canonicalize a hook script command into a stable identity string used
+/// to aggregate hook fires in the `hook_invocations` table (feature 009).
+/// Rule (per spec FR-003 / research R-D):
+///
+/// 1. If `command` is `None` (older Claude transcripts), fall back to
+///    `hook_name`.
+/// 2. Strip a leading interpreter (`node`, `bash`, `sh`, `python`,
+///    `python3`) when present and take the first shell-token of the
+///    remainder as the executable path.
+/// 3. If the executable resolves into Quill-managed script directories
+///    (`/.config/quill/scripts/` or `/.config/quill/codex/scripts/`),
+///    return `quill:<basename>` so the UI's QUILL chip and per-machine
+///    identity stay stable.
+/// 4. If the executable begins with `${CLAUDE_PLUGIN_ROOT}/`, keep it
+///    verbatim — the unexpanded env-var prefix is the only stable
+///    plugin-scoped identifier the transcript provides.
+/// 5. Otherwise, return the basename of the executable.
+///
+/// See specs/009-hooks-breakdown-tab/contracts/hook-invocations.md
+/// (§ Canonicalization rule).
+// @lat: [[backend#Database#Schema#Hook Invocations]]
+pub fn canonicalize_hook_identity(command: Option<&str>, hook_name: &str) -> String {
+    let raw = match command {
+        Some(c) => c.trim(),
+        None => return hook_name.to_string(),
+    };
+    if raw.is_empty() {
+        return hook_name.to_string();
+    }
+    let after_interp = strip_interpreter_prefix(raw).unwrap_or(raw);
+    let exe = first_shell_token(after_interp);
+    if exe.is_empty() {
+        return hook_name.to_string();
+    }
+    if is_quill_managed_path(exe) {
+        let bn = basename_of(exe);
+        return format!("quill:{}", bn);
+    }
+    if exe.starts_with("${CLAUDE_PLUGIN_ROOT}/") {
+        return exe.to_string();
+    }
+    basename_of(exe).to_string()
+}
+
+fn strip_interpreter_prefix(s: &str) -> Option<&str> {
+    for interp in ["node ", "bash ", "sh ", "python ", "python3 "] {
+        if let Some(rest) = s.strip_prefix(interp) {
+            return Some(rest.trim_start());
+        }
+    }
+    None
+}
+
+fn first_shell_token(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return "";
+    }
+    if bytes[0] == b'"' || bytes[0] == b'\'' {
+        let quote = bytes[0];
+        if let Some(end) = bytes[1..].iter().position(|&b| b == quote) {
+            return &s[1..1 + end];
+        }
+        return &s[1..];
+    }
+    s.split_whitespace().next().unwrap_or("")
+}
+
+fn is_quill_managed_path(path: &str) -> bool {
+    path.contains("/.config/quill/scripts/") || path.contains("/.config/quill/codex/scripts/")
+}
+
+fn basename_of(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+}
+
+#[cfg(test)]
+mod hook_identity_tests {
+    use super::canonicalize_hook_identity;
+
+    #[test]
+    fn quill_path_becomes_namespaced_basename() {
+        let id = canonicalize_hook_identity(
+            Some("node \"/home/me/.config/quill/scripts/context-capture.cjs\""),
+            "SessionStart:startup",
+        );
+        assert_eq!(id, "quill:context-capture.cjs");
+    }
+
+    #[test]
+    fn codex_quill_path_recognized() {
+        let id = canonicalize_hook_identity(
+            Some("node \"/home/me/.config/quill/codex/scripts/hook-observe.cjs\""),
+            "PreToolUse",
+        );
+        assert_eq!(id, "quill:hook-observe.cjs");
+    }
+
+    #[test]
+    fn plugin_root_preserved_verbatim() {
+        let id = canonicalize_hook_identity(
+            Some("${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-start.sh"),
+            "SessionStart:startup",
+        );
+        assert_eq!(id, "${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-start.sh");
+    }
+
+    #[test]
+    fn plugin_root_quoted_with_args_preserves_path() {
+        let id = canonicalize_hook_identity(
+            Some("\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start"),
+            "SessionStart",
+        );
+        assert_eq!(id, "${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd");
+    }
+
+    #[test]
+    fn personal_script_reduces_to_basename() {
+        let id = canonicalize_hook_identity(
+            Some("/home/me/.codex/hooks/validate-commit-message.sh"),
+            "PreToolUse:Bash",
+        );
+        assert_eq!(id, "validate-commit-message.sh");
+    }
+
+    #[test]
+    fn missing_command_falls_back_to_hookname() {
+        let id = canonicalize_hook_identity(None, "PreToolUse:Bash");
+        assert_eq!(id, "PreToolUse:Bash");
+    }
+
+    #[test]
+    fn empty_command_falls_back_to_hookname() {
+        let id = canonicalize_hook_identity(Some("   "), "Stop");
+        assert_eq!(id, "Stop");
+    }
+}
+
+/// Extract a [`HookInvocation`] from a `type:"attachment"` JSONL record
+/// when the attachment carries a `hook_*` payload (`hook_success`,
+/// `hook_failure`, `hook_timeout`, `hook_blocked`). Returns `None` for
+/// any other attachment subtype. The truncation policy on
+/// `script_command_raw` matches the wire-side limit applied by
+/// `observe.cjs` (2048 chars). Feature 009.
+// @lat: [[backend#Database#Schema#Hook Invocations]]
+fn extract_hook_invocation_from_attachment(record: &serde_json::Value) -> Option<HookInvocation> {
+    let attachment = record.get("attachment")?.as_object()?;
+    let att_type = attachment.get("type").and_then(|v| v.as_str())?;
+    if !att_type.starts_with("hook_") {
+        return None;
+    }
+
+    let hook_event = attachment.get("hookEvent").and_then(|v| v.as_str())?;
+    if hook_event.is_empty() {
+        return None;
+    }
+    let hook_name = attachment
+        .get("hookName")
+        .and_then(|v| v.as_str())
+        .unwrap_or(hook_event);
+    let command = attachment.get("command").and_then(|v| v.as_str());
+
+    let timestamp = record
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    let session_id = record
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let is_sidechain = record
+        .get("isSidechain")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let agent_id = record
+        .get("agentId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let cwd = record
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let parent_uuid = record
+        .get("parentUuid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let hook_matcher = hook_name
+        .split_once(':')
+        .map(|(_, suffix)| suffix)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tool_name = attachment
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            // For PreToolUse / PostToolUse, the hookName matcher is the
+            // tool name (e.g., "PreToolUse:Bash" → tool_name = "Bash").
+            if hook_event == "PreToolUse" || hook_event == "PostToolUse" {
+                hook_matcher.clone()
+            } else {
+                None
+            }
+        });
+
+    let identity = canonicalize_hook_identity(command, hook_name);
+
+    let exit_code = attachment.get("exitCode").and_then(|v| v.as_i64());
+    let duration_ms = attachment.get("durationMs").and_then(|v| v.as_i64());
+
+    let script_command_raw = command.map(|c| {
+        if c.len() > 2048 {
+            // Walk back to a UTF-8 char boundary to avoid panic on
+            // multi-byte sequences straddling the cut.
+            let mut cut = 2048;
+            while cut > 0 && !c.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            c[..cut].to_string()
+        } else {
+            c.to_string()
+        }
+    });
+
+    Some(HookInvocation {
+        session_id,
+        agent_id,
+        is_sidechain,
+        timestamp,
+        hook_event: hook_event.to_string(),
+        hook_matcher,
+        tool_name,
+        hook_identity: identity,
+        script_command_raw,
+        exit_code,
+        duration_ms,
+        cwd,
+        message_id: parent_uuid,
+    })
+}
+
+#[cfg(test)]
+mod hook_attachment_tests {
+    use super::extract_hook_invocation_from_attachment;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_session_start_quill_hook() {
+        let record = json!({
+            "type": "attachment",
+            "timestamp": "2026-05-22T22:09:15.299Z",
+            "sessionId": "s1",
+            "cwd": "/home/me/work/quill",
+            "attachment": {
+                "type": "hook_success",
+                "hookName": "SessionStart:startup",
+                "hookEvent": "SessionStart",
+                "command": "node \"/home/me/.config/quill/scripts/context-capture.cjs\"",
+                "durationMs": 145,
+                "exitCode": 0
+            }
+        });
+        let inv = extract_hook_invocation_from_attachment(&record).expect("Some");
+        assert_eq!(inv.hook_event, "SessionStart");
+        assert_eq!(inv.hook_matcher.as_deref(), Some("startup"));
+        assert_eq!(inv.hook_identity, "quill:context-capture.cjs");
+        assert_eq!(inv.duration_ms, Some(145));
+        assert_eq!(inv.exit_code, Some(0));
+        assert_eq!(inv.cwd.as_deref(), Some("/home/me/work/quill"));
+    }
+
+    #[test]
+    fn extracts_pretool_bash_with_matcher_as_tool() {
+        let record = json!({
+            "type": "attachment",
+            "timestamp": "2026-05-22T22:10:00Z",
+            "sessionId": "s1",
+            "attachment": {
+                "type": "hook_success",
+                "hookName": "PreToolUse:Bash",
+                "hookEvent": "PreToolUse",
+                "command": "${CLAUDE_PLUGIN_ROOT}/hooks-handlers/bash-guard.sh"
+            }
+        });
+        let inv = extract_hook_invocation_from_attachment(&record).expect("Some");
+        assert_eq!(inv.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(
+            inv.hook_identity,
+            "${CLAUDE_PLUGIN_ROOT}/hooks-handlers/bash-guard.sh"
+        );
+    }
+
+    #[test]
+    fn skips_non_hook_attachments() {
+        let record = json!({
+            "type": "attachment",
+            "attachment": { "type": "image_paste" }
+        });
+        assert!(extract_hook_invocation_from_attachment(&record).is_none());
+    }
+
+    #[test]
+    fn falls_back_to_hookname_when_command_missing() {
+        let record = json!({
+            "type": "attachment",
+            "timestamp": "2026-05-22T22:11:00Z",
+            "sessionId": "s1",
+            "attachment": {
+                "type": "hook_success",
+                "hookName": "Stop",
+                "hookEvent": "Stop"
+            }
+        });
+        let inv = extract_hook_invocation_from_attachment(&record).expect("Some");
+        assert_eq!(inv.hook_identity, "Stop");
+        assert!(inv.script_command_raw.is_none());
+    }
+}
+
 /// Build a [`SkillAccess`] from the `skill` field of a Claude Code `Skill`
 /// tool call.
 ///
@@ -1793,12 +2223,19 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .map(SessionIndex::project_display_name),
                 messages: Vec::new(),
                 events: Vec::new(),
+                hook_invocations: Vec::new(),
             };
         }
     };
 
     let mut messages: Vec<ExtractedMessage> = Vec::new();
     let mut events: Vec<ExtractedEvent> = Vec::new();
+    // Feature 009: collect hook fires from `type:"attachment"` records
+    // carrying a `hook_*` payload (hook_success, hook_failure,
+    // hook_timeout, hook_blocked). Populated inline alongside messages
+    // and events so a single transcript walk feeds all three sibling
+    // ingestion pipelines.
+    let mut hook_invocations: Vec<HookInvocation> = Vec::new();
     // Maps tool_use block id -> entry for cross-message correlation
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
 
@@ -1812,6 +2249,18 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
         };
 
         let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Feature 009: peel off hook-attachment records before the
+        // user/assistant filter. Hook fires live in their own JSONL
+        // row shape and don't carry the message envelope the rest of
+        // this loop expects. See contracts/hook-invocations.md.
+        if msg_type == "attachment"
+            && let Some(invocation) = extract_hook_invocation_from_attachment(&obj)
+        {
+            hook_invocations.push(invocation);
+            continue;
+        }
+
         if msg_type != "user" && msg_type != "assistant" {
             continue;
         }
@@ -2161,6 +2610,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             .map(SessionIndex::project_display_name),
         messages,
         events,
+        hook_invocations,
     }
 }
 
@@ -2174,6 +2624,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                 project_name: None,
                 messages: Vec::new(),
                 events: Vec::new(),
+                hook_invocations: Vec::new(),
             };
         }
     };
@@ -2462,6 +2913,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
         project_name: cwd.as_deref().and_then(project_name_from_cwd),
         messages,
         events,
+        hook_invocations: Vec::new(),
     }
 }
 

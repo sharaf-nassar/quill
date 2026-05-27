@@ -221,16 +221,41 @@ fn resolve_on_path(binary: &str) -> Option<PathBuf> {
 /// on `readlink(/proc/self/exe)` / `open(/dev/urandom)` if these are denied,
 /// so they must be in the allow list for the subprocess to even start.
 /// Trade-off vs bwrap: `/proc/N/*` reveals other PIDs' cmdlines/environments
-/// to the confined subprocess (bwrap's private procfs hides them). The
-/// spec's stated guarantees (`$HOME`/`~/.claude`/`~/.config`/project paths
-/// denied) are preserved. Absent optional paths (`/lib32`, `/nix`, `/opt`
-/// are commonly missing) are silently skipped at ruleset build time. Plus
-/// the resolved `claude_install_root` is appended dynamically per call
-/// (R-C / C-B3).
+/// to the confined subprocess (bwrap's private procfs hides them). Absent
+/// optional paths (`/lib32`, `/nix`, `/opt` are commonly missing) are
+/// silently skipped at ruleset build time. Plus the resolved
+/// `claude_install_root` is appended dynamically per call (R-C / C-B3), and
+/// the user's `~/.claude.json` + `~/.claude/` paths are added in
+/// [`LandlockPolicy::default_for_call`] so claude's launcher can read its
+/// config + cached credentials (without those, claude 2.1.152's Bun runtime
+/// silently `process.exit(0)`s with empty stdout/stderr on EACCES). `$HOME`
+/// (outside the two claude paths) and `~/.config` / project paths remain
+/// denied.
 #[cfg(target_os = "linux")]
 const LANDLOCK_DEFAULT_RO_PATHS: &[&str] = &[
-    "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt", "/nix", "/proc", "/sys",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/etc",
+    "/opt",
+    "/nix",
+    "/proc",
+    "/sys",
     "/dev",
+    // R-H: required for DNS resolution from a Tokio-runtime parent.
+    // `/etc/resolv.conf` is a symlink to `/run/systemd/resolve/stub-resolv.conf`
+    // on systemd-resolved hosts; without RO access here, the child's glibc
+    // resolver fails to follow the symlink and falls back to default name
+    // servers (`127.0.0.1:53`), where nothing is listening — yielding the
+    // 180-second `ConnectionRefused` retry storm we observed in run #53.
+    // `path_beneath_rules` silently skips absent entries, so hosts without
+    // systemd-resolved are unaffected. `/run/dbus` is added for the
+    // libnss_resolve.so.2 D-Bus fallback path.
+    "/run/systemd/resolve",
+    "/run/dbus",
 ];
 
 /// Value object carrying the Landlock policy for one call. Pure data: no
@@ -255,8 +280,23 @@ struct LandlockPolicy {
 #[cfg(target_os = "linux")]
 impl LandlockPolicy {
     /// Construct the default per-call policy: the system RO tree + the
-    /// resolved `claude_install_root` for RO, the per-call temp dir for RW,
+    /// resolved `claude_install_root` + the user's claude config paths
+    /// (`~/.claude.json`, `~/.claude/`) for RO, the per-call temp dir for RW,
     /// `ABI::V3`. No syscalls.
+    ///
+    /// The `~/.claude.json` / `~/.claude/` RO entries deviate from spec 007's
+    /// original `no $HOME / no ~/.claude` design. Reason: claude 2.1.152's
+    /// launcher reads one of those paths during startup; on EACCES (vs. ENOENT)
+    /// the Bun runtime silently `process.exit(0)` with empty stdout and stderr
+    /// — there is no actionable error to surface. Granting RO `path_beneath`
+    /// on the two paths lets claude read its config + cached OAuth credentials
+    /// without giving the subprocess write access (so the launcher cannot
+    /// modify session history, hooks, plugins, or the credentials file).
+    /// `path_beneath_rules` silently skips absent entries, so the optional
+    /// `home_dir()` lookup is best-effort. See
+    /// `specs/007-landlock-inference-sandbox/research.md` R-G for the
+    /// bisection evidence and `lat.md/backend.md#Claude Code Inference Client`
+    /// for the updated RO set documentation.
     fn default_for_call(rw_dir: &Path, claude_path: &Path) -> Self {
         let mut ro_paths: Vec<PathBuf> = LANDLOCK_DEFAULT_RO_PATHS
             .iter()
@@ -264,6 +304,10 @@ impl LandlockPolicy {
             .collect();
         if let Some(root) = claude_install_root(claude_path) {
             ro_paths.push(root);
+        }
+        if let Some(home) = dirs::home_dir() {
+            ro_paths.push(home.join(".claude.json"));
+            ro_paths.push(home.join(".claude"));
         }
         // RW: the per-call temp dir (the spec's "single RW bind"), plus
         // `/dev/null` so anything the launcher redirects to it (Node's
@@ -1777,6 +1821,18 @@ async fn invoke_raw(
 
     let envelope = match envelope_result {
         Ok(env) => env,
+        Err(InferenceError::BadEnvelope { details }) => {
+            // Success exit with unparseable stdout: surface the stderr so
+            // silent-exit failures (e.g. sandbox-denied paths the launcher
+            // swallowed) are diagnosable from the run history error column.
+            return Err(InferenceError::BadEnvelope {
+                details: format!(
+                    "{details} | exit={} stderr first 1024 chars: {}",
+                    output.status,
+                    truncate(&stderr, 1024)
+                ),
+            });
+        }
         Err(e) => return Err(e),
     };
 

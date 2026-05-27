@@ -1,6 +1,6 @@
 # Data Flow
 
-The system has five primary data pipelines connecting hook scripts, the HTTP server, the database, and the frontend.
+The system has six primary data pipelines connecting hook scripts, the HTTP server, the database, and the frontend.
 
 ## Token Reporting Pipeline
 
@@ -46,6 +46,19 @@ Tool-use observations, git history, and recent session history are analyzed by L
 
 Observations are compressed for LLM context using [[src-tauri/src/prompt_utils.rs]]: errors prioritized, then file paths, then outcomes. UTF-8 boundary-aware truncation fits within token budgets.
 
+## Hook Telemetry Pipeline
+
+Lifecycle-hook fires are surfaced in the Now-tab Hooks breakdown via two distinct paths because Claude and Codex log hooks differently.
+
+1. **Claude path (transcript-derived).** Claude Code writes a `type:"attachment"` JSONL record for every hook invocation, carrying `hookEvent`, `hookName`, `command`, `exitCode`, `durationMs`, and `parentUuid`. The existing [[backend#Session Indexing]] sweep already walks those JSONL files; [[src-tauri/src/sessions.rs#extract_hook_invocation_from_attachment]] peels off the hook records in the same parse pass that produces messages and `session_events`, canonicalizes the script command via [[src-tauri/src/sessions.rs#canonicalize_hook_identity]] (`quill:<basename>` / verbatim `${CLAUDE_PLUGIN_ROOT}/…` / basename / `hookName` fallback), and the indexing loop calls [[src-tauri/src/storage.rs#Storage#store_hook_invocations_for_messages]] on a per-batch transaction with `INSERT OR IGNORE` against the UNIQUE identity index. Sub-agent transcripts feed the same path with `is_sidechain=1` and `agent_id` preserved.
+2. **Codex path (live observer).** Codex rollouts do not record hook executions, so the installer registers `src-tauri/codex-integration/scripts/hook-observe.cjs` on every one of the eight Codex hook events when `activity_tracking` is enabled. On each fire the script reads stdin, builds a `{provider, session_id, hook_event, tool_name, cwd, ts, hook_matcher}` payload, and POSTs to `POST /api/v1/hooks/observed` with bearer auth and a 1.5-second local timeout.
+3. The HTTP handler in [[src-tauri/src/server.rs]] validates the eight-event whitelist plus length caps and ISO-8601 timestamp shape, fast-acks `202 Accepted`, and dispatches the insert via [[src-tauri/src/storage.rs#Storage#store_codex_hook_observation]] on a `tokio::task::spawn_blocking`. Codex identity is event-scoped (`hook_event` plus optional `:tool_name`) because the observer fires per-event, not per-script.
+4. The server emits `hooks-observed-updated` after a successful Codex insert. [[src/hooks/useBreakdownData.ts#useBreakdownData]] subscribes to that channel (alongside `tokens-updated` and `sessions-index-updated`) with a 1-second debounce so Codex live fires tick the Hooks breakdown within ~2 seconds without flooding the IPC layer.
+5. Migration 27 seeds `hook_invocation_reingest_pending`; the post-boot sweep in [[src-tauri/src/sessions.rs]] picks that flag up alongside the existing skill/runtime reingest flags and replays the attachment extractor across every Claude transcript, then clears the flag only after the sweep completes cleanly. Codex has no historical backfill — its rows accrue prospectively via the observer endpoint.
+6. The frontend [[src/components/analytics/BreakdownPanel.tsx]] renders one row per `hook_identity` with optional QUILL chip when the identity prefix is `quill:`, plus a help affordance that explains the Claude/Codex tracking asymmetry.
+
+The privacy gate is the existing `activity_tracking` feature flag: toggling it off removes `hook-observe.cjs` and its eight `[[hooks.<Event>]]` config entries from `~/.codex/config.toml`, stopping new Codex observations. Claude-side ingestion is unaffected because Quill never writes anything to Claude transcripts — the data flows from the user's transcript to Quill, not the other way around.
+
 ## Session Indexing Pipeline
 
 Session transcripts are indexed for full-text search with enriched metadata, while provider-aware side tables keep tool and latency data distinct.
@@ -72,6 +85,8 @@ Claude Edit/Write tool calls become `code_changes`, Bash becomes `commands_run`,
 The same parse pass that produces `ExtractedMessage` for the search index also produces `ExtractedEvent` for the [[backend#Database#Schema#Code and Runtime Metrics]] `session_events` table.
 
 The search index keeps its existing filter (it drops `tool_result`-only user messages and empty assistant blocks), while the event stream carries every non-meta `user`/`assistant` line with a non-empty timestamp — classified by content shape into `user_text`, `user_tool_result`, `asst_text`, `asst_thinking`, or `asst_tool_use`. This dual emission keeps the search corpus lean while letting the runtime metric reconstruct full agent-loop active intervals. Both the local mtime sweep in [[src-tauri/src/sessions.rs]] and the hook-driven `/sessions/notify` handler in [[src-tauri/src/server.rs]] ingest into `session_events` alongside `response_times`; the `/sessions/messages` remote-push handler uses a heuristic classifier over `(role, content, tools_used)` because wire-pushed messages lack the full content-block shape that the JSONL extractor sees.
+
+Feature 009 adds a third sibling to this dual emission: the same Claude JSONL walk peels off `type:"attachment"` records whose `attachment.type` begins `hook_` (e.g. `hook_success`, `hook_failure`, `hook_timeout`, `hook_blocked`) via [[src-tauri/src/sessions.rs#extract_hook_invocation_from_attachment]], producing one [[backend#Database#Schema#Hook Invocations]] row per fire. Sub-agent transcripts inherit the `is_sidechain=1` and `agent_id` columns automatically because the attachment extractor reads the same record-level fields the message extractor does. Codex rollouts do not emit attachment records, so Codex hook telemetry instead arrives live via `POST /api/v1/hooks/observed` from a deployed observer script.
 
 ### Sub-Agent Transcripts
 

@@ -37,13 +37,19 @@ const CODEX_HOOK_EVENTS: [(&str, &str); 8] = [
 // entry on reinstall regardless of the active feature set so flipping a
 // feature off does not leave the corresponding script orphaned in
 // `~/.config/quill/scripts/`.
-const ALL_MANAGED_SCRIPT_FILES: [&str; 6] = [
+const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
     "observe.cjs",
     "report-tokens.sh",
     "session-sync.cjs",
     "context-router.cjs",
     "context-capture.cjs",
     "context-telemetry.cjs",
+    // Feature 009: tiny event-observer that POSTs every Codex hook fire
+    // to /api/v1/hooks/observed. Deployed when `activity_tracking` is on
+    // (see `hook_observation_scripts_for`). Listed here unconditionally
+    // so flipping `activity_tracking` off cleans up the file on
+    // reinstall the same way the other gated scripts are cleaned.
+    "hook-observe.cjs",
 ];
 
 // Per-feature subsets used to decide which files to deploy for the current
@@ -54,6 +60,17 @@ fn base_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
         scripts.push("observe.cjs");
     }
     scripts
+}
+
+// Feature 009: scripts deployed for the Hooks-breakdown telemetry path.
+// Gated on `activity_tracking` so users who opt out of tool observation
+// also opt out of hook observation (their privacy signal is consistent).
+fn hook_observation_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
+    if features.activity_tracking {
+        vec!["hook-observe.cjs"]
+    } else {
+        Vec::new()
+    }
 }
 
 fn context_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
@@ -182,10 +199,21 @@ pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
             missing.push((*script).to_string());
         }
     }
+    // Feature 009: hook observer rides with activity_tracking. Verified
+    // against the same managed-file lifecycle as the other gated scripts
+    // so toggle-off removes the file and the [[hooks.*]] blocks together.
+    let expected_hook_obs = hook_observation_scripts_for(features);
+    for script in &expected_hook_obs {
+        if !scripts_dir().join(script).exists() {
+            missing.push((*script).to_string());
+        }
+    }
     // Any managed script not in the expected set must NOT be present so a
     // recent toggle-off cleanly removes the orphaned file.
     for script in ALL_MANAGED_SCRIPT_FILES {
-        let still_expected = expected_base.contains(&script) || expected_context.contains(&script);
+        let still_expected = expected_base.contains(&script)
+            || expected_context.contains(&script)
+            || expected_hook_obs.contains(&script);
         if !still_expected && scripts_dir().join(script).exists() {
             return Err(format!(
                 "Codex managed script is still installed but not expected: {script}"
@@ -731,6 +759,15 @@ fn deploy_files(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result
             &context_scripts,
         )?;
     }
+    // Feature 009: deploy the hook observer when activity_tracking is on.
+    let hook_observation_scripts = hook_observation_scripts_for(features);
+    if !hook_observation_scripts.is_empty() {
+        copy_named_files(
+            &codex_source.join("scripts"),
+            &scripts_dir(),
+            &hook_observation_scripts,
+        )?;
+    }
     deploy_template(&codex_source.join("templates"), features)?;
     copy_dir_recursive(&shared_mcp_source, &mcp_dir())?;
     if !features.context_preservation {
@@ -948,6 +985,28 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
                 }],
             },
         ]);
+    }
+
+    // Feature 009: register the generic hook observer on every Codex
+    // hook event when activity tracking is enabled. Each event gets its
+    // own [[hooks.<Event>]] block with no matcher so the observer fires
+    // on every event firing, independent of which user / third-party
+    // scripts are also registered for that event.
+    if features.activity_tracking {
+        let hook_observe_command = format!(
+            "node {}",
+            shell_quote(&scripts_dir().join("hook-observe.cjs"))
+        );
+        for (event, _) in CODEX_HOOK_EVENTS {
+            groups.push(CodexHookGroup {
+                event,
+                matcher: None,
+                hooks: vec![CodexHookCommand {
+                    command: hook_observe_command.clone(),
+                    timeout: 3,
+                }],
+            });
+        }
     }
 
     groups

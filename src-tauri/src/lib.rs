@@ -29,11 +29,11 @@ mod tray_keepalive;
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
-    ContextSavingsAnalytics, DataPoint, HostBreakdown, LearnedRule, LearningRun, LearningSettings,
-    LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderErrorKind, ProviderStatus,
-    RuntimeSettings, SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, SkillBreakdown,
-    SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats,
-    ToolCount, UsageBucket, UsageData, UsageProviderError,
+    ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown, LearnedRule, LearningRun,
+    LearningSettings, LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderErrorKind,
+    ProviderStatus, RuntimeSettings, SessionBreakdown, SessionCodeStats, SessionRef, SessionStats,
+    SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
+    TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -111,6 +111,12 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+// Environment variable used by the post-update relaunch handshake. The
+// outgoing primary sets it on the detached child so the new instance can
+// wait for the predecessor's PID to disappear before claiming the
+// tauri-plugin-single-instance lock.
+const RELAUNCH_PARENT_PID_ENV: &str = "QUILL_RELAUNCH_PARENT_PID";
+
 // Spawn a detached child that re-launches Quill after the current process has
 // released the single-instance lock. `AppHandle::restart()` spawns the new
 // binary BEFORE the current process exits, so the new instance reaches
@@ -119,28 +125,37 @@ fn show_main_window(app: &tauri::AppHandle) {
 // as a duplicate launch, runs `show_main_window` inside the dying primary, and
 // exits, leaving no Quill instance running.
 //
-// On Unix we use the post-fork hook to detach the child (`setsid`) and sleep,
-// so the child only reaches single-instance init after the primary has fully
-// exited. On Windows the named mutex is released synchronously on parent
-// exit, so a fully-detached spawn is sufficient.
+// We cannot block in `pre_exec` to wait for the primary's exit: Rust's
+// `Command::spawn` synchronously waits for the post-fork hook to finish, so
+// any blocking wait there would deadlock the parent before it can call
+// `app.exit(0)`. Instead the outgoing primary records its PID in
+// `QUILL_RELAUNCH_PARENT_PID` on the child's environment, and the new
+// instance polls for that PID to disappear in `wait_for_predecessor_exit`
+// before any Tauri plugin is constructed. On Windows the named mutex is
+// released synchronously on parent exit, so a fully-detached spawn alone is
+// sufficient and the env var has no effect.
 fn spawn_delayed_relaunch(app: &tauri::AppHandle) -> Result<(), String> {
     let env = app.env();
     let binary = tauri::process::current_binary(&env)
         .map_err(|e| format!("Failed to resolve relaunch binary: {e}"))?;
     let mut cmd = std::process::Command::new(&binary);
     cmd.args(env.args_os.iter().skip(1));
+    cmd.env(
+        RELAUNCH_PARENT_PID_ENV,
+        (std::process::id() as i32).to_string(),
+    );
 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: the closure runs in the forked child before the new binary
-        // image is loaded. It only calls async-signal-safe operations
-        // (setsid, nanosleep via thread::sleep).
+        // image is loaded. It only calls setsid(2), which is async-signal-
+        // safe. The wait-for-predecessor-exit step runs after the new binary
+        // is loaded, in `wait_for_predecessor_exit`.
         unsafe {
             cmd.pre_exec(|| {
                 nix::unistd::setsid()
                     .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
-                std::thread::sleep(std::time::Duration::from_millis(750));
                 Ok(())
             });
         }
@@ -155,6 +170,120 @@ fn spawn_delayed_relaunch(app: &tauri::AppHandle) -> Result<(), String> {
     cmd.spawn()
         .map(|_| ())
         .map_err(|e| format!("Failed to spawn relaunch child: {e}"))
+}
+
+// If we were spawned by a previous instance's update-driven relaunch (see
+// `spawn_delayed_relaunch`), block until that PID is gone before returning.
+// MUST run before `tauri_plugin_single_instance::init`; otherwise the new
+// process tries to claim the D-Bus name / macOS distributed-notification
+// port while the predecessor still owns it, is treated as a duplicate
+// launch, and exits silently before the logger plugin initializes.
+//
+// Bounded by a 30s safety cap: if the predecessor is truly stuck, proceed
+// anyway — the worst case (silent duplicate exit) is the very failure mode
+// this function exists to prevent, but it becomes vanishingly rare instead
+// of routine. The 100ms grace at the end gives the dbus-daemon (Linux) or
+// launchd (macOS) time to process the connection close and release the
+// registered name.
+fn wait_for_predecessor_exit() {
+    let env_pid: Option<i32> = match std::env::var(RELAUNCH_PARENT_PID_ENV) {
+        Ok(raw) => {
+            // SAFETY: removed before Tauri or any worker thread is created,
+            // so there are no concurrent env readers and child processes
+            // spawned later cannot inherit a stale marker.
+            unsafe { std::env::remove_var(RELAUNCH_PARENT_PID_ENV) };
+            raw.parse::<i32>().ok().filter(|p| *p > 1)
+        }
+        Err(_) => None,
+    };
+
+    // Fallback for the one-time transition from a predecessor binary that
+    // did not yet set the env var: if our parent's executable is the same
+    // as ours, the parent is almost certainly a previous Quill instance
+    // doing an update-driven relaunch. Wait for it. Linux uses
+    // `/proc/<pid>/exe`; macOS uses `proc_pidpath`.
+    let target_pid = env_pid.or_else(detect_parent_same_binary_pid);
+    let Some(pid_value) = target_pid else {
+        return;
+    };
+
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::signal;
+        use nix::unistd::Pid;
+
+        let target = Pid::from_raw(pid_value);
+        let tick = std::time::Duration::from_millis(25);
+        let max_wait = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        loop {
+            // kill(pid, 0) checks process existence without sending a
+            // signal. ESRCH means the predecessor has fully exited and
+            // released its single-instance D-Bus name (Linux) or
+            // distributed-notification port (macOS).
+            if matches!(signal::kill(target, None), Err(Errno::ESRCH)) {
+                break;
+            }
+            if started.elapsed() >= max_wait {
+                break;
+            }
+            std::thread::sleep(tick);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid_value;
+    }
+}
+
+fn detect_parent_same_binary_pid() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let ppid_raw = nix::unistd::getppid().as_raw();
+        if ppid_raw <= 1 {
+            return None;
+        }
+        let parent_exe = std::fs::read_link(format!("/proc/{}/exe", ppid_raw)).ok()?;
+        let our_exe = std::fs::read_link("/proc/self/exe").ok()?;
+        if parent_exe == our_exe {
+            return Some(ppid_raw);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ppid_raw = nix::unistd::getppid().as_raw();
+        if ppid_raw <= 1 {
+            return None;
+        }
+        let parent_exe = macos_proc_pidpath(ppid_raw)?;
+        let our_exe = std::env::current_exe().ok()?;
+        // Canonicalize both sides so symlinks (e.g. /usr/local/bin/quill ->
+        // /Applications/Quill.app/Contents/MacOS/quill) compare correctly.
+        let parent_canon = parent_exe.canonicalize().ok()?;
+        let our_canon = our_exe.canonicalize().ok()?;
+        if parent_canon == our_canon {
+            return Some(ppid_raw);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_proc_pidpath(pid: i32) -> Option<std::path::PathBuf> {
+    use std::ffi::{CStr, c_void};
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: buf is a valid mutable buffer of the size accepted by
+    // proc_pidpath; the call writes a NUL-terminated path on success and
+    // returns the byte length written (excluding the NUL), or <= 0 on
+    // failure.
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+    if len <= 0 {
+        return None;
+    }
+    let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
+    Some(std::path::PathBuf::from(cstr.to_str().ok()?))
 }
 
 fn indicator_now_text(state: &StatusIndicatorState) -> String {
@@ -1129,6 +1258,22 @@ async fn get_skill_breakdown(
 ) -> Result<Vec<SkillBreakdown>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_skill_breakdown(days, provider, all_time, limit))
+}
+
+// Feature 009: powers the Now-tab Hooks breakdown. Signature mirrors
+// `get_skill_breakdown`; the storage layer derives the QUILL chip flag
+// from the canonicalized identity prefix. See
+// specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
+// @lat: [[backend#Tauri IPC Commands]]
+#[tauri::command]
+async fn get_hook_breakdown(
+    days: i32,
+    provider: Option<integrations::IntegrationProvider>,
+    all_time: bool,
+    limit: Option<i32>,
+) -> Result<Vec<HookBreakdown>, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_hook_breakdown(days, provider, all_time, limit))
 }
 
 #[tauri::command]
@@ -2401,6 +2546,10 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Must run before any Tauri plugin is constructed so the new instance
+    // does not race the dying predecessor for the single-instance lock.
+    wait_for_predecessor_exit();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
@@ -2798,6 +2947,7 @@ pub fn run() {
             get_host_breakdown,
             get_project_breakdown,
             get_skill_breakdown,
+            get_hook_breakdown,
             get_skill_project_breakdown,
             get_session_breakdown,
             get_session_subagent_tree,

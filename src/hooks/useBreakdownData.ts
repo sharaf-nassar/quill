@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   BreakdownMode,
+  HookBreakdown,
   HostBreakdown,
   IntegrationProvider,
   ProjectBreakdown,
@@ -10,15 +11,26 @@ import type {
   SkillBreakdown,
 } from "../types";
 
-type BreakdownRow = HostBreakdown | ProjectBreakdown | SessionBreakdown | SkillBreakdown;
+type BreakdownRow =
+  | HostBreakdown
+  | ProjectBreakdown
+  | SessionBreakdown
+  | SkillBreakdown
+  | HookBreakdown;
 interface BreakdownOptions {
   skillAllTime?: boolean;
   skillProvider?: IntegrationProvider | null;
+  // Feature 009: same All/Codex/Claude + ALL TIME pattern as skills,
+  // but tracked independently so the user's last Skills filter doesn't
+  // leak into the Hooks breakdown and vice versa.
+  hookAllTime?: boolean;
+  hookProvider?: IntegrationProvider | null;
 }
 
 const REFRESH_DEBOUNCE_MS = 1000;
 const SESSION_BREAKDOWN_LIMIT = 200;
 const SKILL_BREAKDOWN_LIMIT = 100;
+const HOOK_BREAKDOWN_LIMIT = 100;
 
 export function useBreakdownData(mode: BreakdownMode, days: number, options: BreakdownOptions = {}) {
   const [data, setData] = useState<BreakdownRow[]>([]);
@@ -29,7 +41,12 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
   const currentRequestKey = useRef("");
   const skillAllTime = options.skillAllTime ?? false;
   const skillProvider = options.skillProvider ?? null;
-  const requestKey = `${mode}:${days}:${skillAllTime}:${skillProvider ?? "all"}`;
+  const hookAllTime = options.hookAllTime ?? false;
+  const hookProvider = options.hookProvider ?? null;
+  const requestKey =
+    `${mode}:${days}:` +
+    `${skillAllTime}:${skillProvider ?? "all"}:` +
+    `${hookAllTime}:${hookProvider ?? "all"}`;
 
   useEffect(() => {
     currentMode.current = mode;
@@ -56,6 +73,15 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
           allTime: skillAllTime,
           limit: SKILL_BREAKDOWN_LIMIT,
         });
+      } else if (mode === "hooks") {
+        // Feature 009: Hooks breakdown reads from `hook_invocations`.
+        // Same arg shape as skills so the controls map 1:1.
+        result = await invoke<HookBreakdown[]>("get_hook_breakdown", {
+          days,
+          provider: hookProvider,
+          allTime: hookAllTime,
+          limit: HOOK_BREAKDOWN_LIMIT,
+        });
       } else {
         result = await invoke<SessionBreakdown[]>("get_session_breakdown", {
           days,
@@ -78,7 +104,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
         setLoading(false);
       }
     }
-  }, [mode, days, requestKey, skillAllTime, skillProvider]);
+  }, [mode, days, requestKey, skillAllTime, skillProvider, hookAllTime, hookProvider]);
 
   useEffect(() => {
     fetchData();
@@ -97,6 +123,14 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
       listen("tokens-updated", scheduleRefresh),
       listen("sessions-index-updated", scheduleRefresh),
     ];
+    // Feature 009: only subscribe to the Codex hook live-fire channel
+    // while the user is actually viewing the Hooks breakdown. A Codex
+    // hook fires every tool turn, so subscribing in every mode would
+    // churn the SQL layer for Sessions / Projects / Hosts / Skills
+    // refreshes that don't need it.
+    if (mode === "hooks") {
+      unlistenPromises.push(listen("hooks-observed-updated", scheduleRefresh));
+    }
     return () => {
       mounted = false;
       if (timer) clearTimeout(timer);
@@ -104,7 +138,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
         unlistenPromise.then((fn) => fn());
       }
     };
-  }, [fetchData]);
+  }, [fetchData, mode]);
 
   // Return loading when mode and dataMode are out of sync
   const stale = mode !== dataMode;

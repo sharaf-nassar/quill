@@ -202,11 +202,11 @@ Codex integration lives in [[src-tauri/src/integrations/codex.rs]] and deploys p
 
 Files and config entries created when the Codex provider is enabled.
 
-Deployment is allowlisted to token and sync scripts by default. `observe.cjs` is added when activity tracking is enabled. Context routing and continuity scripts are deployed only when context preservation is enabled, with `context-telemetry.cjs` further gated on the context telemetry flag. The Claude-only `qbuild-guard.sh` is never copied into Codex assets.
+Deployment is allowlisted to token and sync scripts by default. `observe.cjs` and `hook-observe.cjs` are added when activity tracking is enabled. Context routing and continuity scripts are deployed only when context preservation is enabled, with `context-telemetry.cjs` further gated on the context telemetry flag. The Claude-only `qbuild-guard.sh` is never copied into Codex assets.
 
 | Target | Content |
 |--------|---------|
-| `~/.config/quill/codex/scripts/` | Base hook scripts for token reporting and session sync. `observe.cjs` is added when activity tracking is enabled (default on). Context routing and continuity capture are added when context preservation is enabled, plus `context-telemetry.cjs` when context telemetry is also on |
+| `~/.config/quill/codex/scripts/` | Base hook scripts for token reporting and session sync. `observe.cjs` is added when activity tracking is enabled (default on); `hook-observe.cjs` rides with the same flag and ships hook-fire telemetry for the Now-tab Hooks breakdown via `POST /api/v1/hooks/observed`. Context routing and continuity capture are added when context preservation is enabled, plus `context-telemetry.cjs` when context telemetry is also on |
 | `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets; working-context tools only when context preservation is enabled |
 | `~/.config/quill/codex/templates/` | Managed AGENTS template block |
 | `~/.codex/config.toml` | `features.hooks = true`, inline `[[hooks.*]]` Quill hook registrations, Codex `hooks.state` trust hashes, plus a Quill-managed `mcp_servers.quill` block when no manual entry exists |
@@ -214,7 +214,7 @@ Deployment is allowlisted to token and sync scripts by default. `observe.cjs` is
 
 Codex install and uninstall remove only Quill-owned legacy `hooks.json` commands and delete `hooks.json` when no non-Quill hooks remain, then remove related hook trust state, managed config blocks, AGENTS blocks, and provider-owned asset directories. Codex deploys the same bounded-wait observation and session-sync behavior as Claude so a slow local widget cannot hold Codex hooks open until the host kills them.
 
-Codex installs SessionStart, UserPromptSubmit, and Stop hooks unconditionally; PreToolUse and PostToolUse `observe.cjs` hooks ride with the activity tracking flag. When context preservation is enabled, Codex also installs SessionStart, UserPromptSubmit, PreToolUse, PreCompact, and Stop context hooks. The installer asks `codex app-server` for `hooks/list` metadata, then writes each Quill hook's `trusted_hash` through `config/batchWrite` so the trust state matches Codex's own hook-review model.
+Codex installs SessionStart, UserPromptSubmit, and Stop hooks unconditionally; PreToolUse and PostToolUse `observe.cjs` hooks ride with the activity tracking flag. When context preservation is enabled, Codex also installs SessionStart, UserPromptSubmit, PreToolUse, PreCompact, and Stop context hooks. When activity tracking is enabled, the installer additionally registers `hook-observe.cjs` on every one of the eight Codex hook events (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest`) with no matcher, so the Now-tab Hooks breakdown sees every fire — Codex rollouts do not log hook executions, so this observer is the only source of Codex hook data. The installer asks `codex app-server` for `hooks/list` metadata, then writes each Quill hook's `trusted_hash` through `config/batchWrite` so the trust state matches Codex's own hook-review model.
 
 The app-server request pipe is flushed but kept open until each response arrives. Closing stdin immediately after writing requests can make `hooks/list` return no response before trust hashes are written.
 
