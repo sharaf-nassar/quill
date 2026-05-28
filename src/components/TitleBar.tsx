@@ -59,10 +59,14 @@ const RefreshIcon = () => (
   </svg>
 );
 
-const GearIcon = () => (
+const SettingsIcon = () => (
   <svg {...SVG_PROPS}>
-    <circle cx="7" cy="7" r="2" />
-    <path d="M7 1.4V3M7 11V12.6M1.4 7H3M11 7H12.6M3.05 3.05L4.18 4.18M9.82 9.82L10.95 10.95M3.05 10.95L4.18 9.82M9.82 4.18L10.95 3.05" />
+    <line x1="2" y1="3.5" x2="12" y2="3.5" />
+    <line x1="9" y1="2" x2="9" y2="5" />
+    <line x1="2" y1="7" x2="12" y2="7" />
+    <line x1="5" y1="5.5" x2="5" y2="8.5" />
+    <line x1="2" y1="10.5" x2="12" y2="10.5" />
+    <line x1="9" y1="9" x2="9" y2="12" />
   </svg>
 );
 
@@ -307,14 +311,6 @@ function TitleBar({
             {updating ? "Updating..." : `Update ${pendingUpdate.version}`}
           </button>
         )}
-        <button
-          className="titlebar-cog"
-          aria-label="Open settings"
-          title="Open settings"
-          onClick={() => void handleOpenSettings()}
-        >
-          <GearIcon />
-        </button>
         {version && (
           <button
             type="button"
@@ -326,6 +322,14 @@ function TitleBar({
             v{version}
           </button>
         )}
+        <button
+          className="titlebar-cog"
+          aria-label="Open settings"
+          title="Open settings"
+          onClick={() => void handleOpenSettings()}
+        >
+          <SettingsIcon />
+        </button>
         <span aria-hidden="true" className="titlebar-divider" />
         <button
           className="titlebar-close"

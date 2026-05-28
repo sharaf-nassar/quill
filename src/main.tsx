@@ -1,11 +1,23 @@
+import { setCrashReportingEnabled } from "./lib/crashReporting";
 import React, { Suspense, useCallback } from "react";
 import ReactDOM from "react-dom/client";
+import { reactErrorHandler } from "@sentry/react";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
 import WindowResizeHandles from "./components/WindowResizeHandles";
+import type { RuntimeSettings } from "./types";
 import "./styles/index.css";
+
+// SDK stays uninitialized until we confirm the user has not opted out — short
+// window at boot where errors aren't captured is the price of strict privacy.
+void invoke<RuntimeSettings>("get_runtime_settings")
+  .then((s) => setCrashReportingEnabled(s.crashReportingEnabled))
+  .catch(() => {
+    /* default to off when settings can't be read */
+  });
 
 const App = React.lazy(() => import("./App"));
 const RunsWindowView = React.lazy(() => import("./windows/RunsWindowView"));
@@ -210,7 +222,11 @@ function RoutedView() {
   return <ProviderRoutedView />;
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+ReactDOM.createRoot(document.getElementById("root")!, {
+  onUncaughtError: reactErrorHandler(),
+  onCaughtError: reactErrorHandler(),
+  onRecoverableError: reactErrorHandler(),
+}).render(
   <React.StrictMode>
     <ToastProvider>
       <WindowResizeHandles />

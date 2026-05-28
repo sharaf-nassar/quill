@@ -350,6 +350,7 @@ export interface RuntimeSettings {
   pluginUpdatesIntervalHours: number;
   ruleWatcherEnabled: boolean;
   alwaysOnTop: boolean;
+  crashReportingEnabled: boolean;
 }
 
 export interface IntegrationFeatures {

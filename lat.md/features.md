@@ -298,7 +298,7 @@ Claude install writes Quill hook scripts into `~/.claude/settings.json` plus she
 
 ## Settings Window
 
-Standalone Tauri window opened by the titlebar cogwheel button that exposes every user-configurable feature toggle in one comprehensive surface, replacing the previous inline `ProviderMenu` popover.
+Standalone Tauri window opened by the titlebar settings button (sliders icon) that exposes every user-configurable feature toggle in one comprehensive surface, replacing the previous inline `ProviderMenu` popover.
 
 ### Window Routing
 
@@ -312,7 +312,7 @@ Top-tabs navigation hosts five panels: General, Integrations, Context, Learning,
 
 | Tab | Panel | Settings |
 |-----|-------|----------|
-| General | [[src/components/settings/GeneralTab.tsx]] | Layout (stacked / side-by-side), time visualization mode, Live and Analytics panel visibility, always-on-top toggle, plus a bottom Advanced section with the current-config summary and "Reset to defaults" button covering runtime, learning, and UI prefs |
+| General | [[src/components/settings/GeneralTab.tsx]] | Layout (stacked / side-by-side), time visualization mode, Live and Analytics panel visibility, always-on-top toggle, an Advanced section with the current-config summary and "Reset to defaults" button covering runtime, learning, and UI prefs, plus a bottom "Help improve Quill" toggle that drives the [[features#Crash Reporting]] opt-out |
 | Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form |
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
 | Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
@@ -334,10 +334,32 @@ The [[src/hooks/useUiPrefs.ts#useUiPrefs]] hook writes localStorage and emits a 
 
 Always-on background tasks expose enable/interval toggles through a single `RuntimeSettings` IPC pair.
 
-[[src-tauri/src/lib.rs#get_runtime_settings]] and [[src-tauri/src/lib.rs#set_runtime_settings]] persist `live_usage.enabled`, `live_usage.interval_seconds`, `plugin_updates.enabled`, `plugin_updates.interval_hours`, `rule_watcher.enabled`, and `always_on_top` in the SQLite settings table. Live values are read on every iteration of the live-usage loop and the plugin-update checker so changes take effect on the next tick. The rule watcher reads its flag once at startup since `notify` holds an OS handle. Changing `always_on_top` calls `WebviewWindow::set_always_on_top` on the main window; other runtime saves do not touch the main window's topmost/focus state. After every save the backend emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] keeps any open Settings windows in sync.
+[[src-tauri/src/lib.rs#get_runtime_settings]] and [[src-tauri/src/lib.rs#set_runtime_settings]] persist `live_usage.enabled`, `live_usage.interval_seconds`, `plugin_updates.enabled`, `plugin_updates.interval_hours`, `rule_watcher.enabled`, `always_on_top`, and `crash_reporting.enabled` in the SQLite settings table. Live values are read on every iteration of the live-usage loop and the plugin-update checker so changes take effect on the next tick. The rule watcher reads its flag once at startup since `notify` holds an OS handle. Changing `always_on_top` calls `WebviewWindow::set_always_on_top` on the main window; toggling `crash_reporting.enabled` calls [[src-tauri/src/crash_reporting.rs#set_enabled]] which (re)initializes or drops the Sentry `ClientInitGuard` immediately; other runtime saves do not touch the main window's topmost/focus state. After every save the backend emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] keeps any open Settings windows in sync.
 
 ### MiniMax API Key Update
 
 The Integrations tab can update a stored MiniMax API key without disabling and re-enabling the integration.
 
 [[src-tauri/src/lib.rs#set_minimax_api_key]] delegates to [[src-tauri/src/integrations/manager.rs#set_minimax_api_key]] which trims the key, persists it via [[src-tauri/src/integrations/minimax.rs#save_api_key]], refreshes provider statuses, and emits `integrations-updated`. The frontend renders an inline `Save` / `Cancel` form; the dialog-based first-enable flow stays unchanged.
+
+## Crash Reporting
+
+Default-on, user-opt-out crash reporter that ships scrubbed stack traces to Sentry without exposing any session content. Toggled via the "Help improve Quill" row at the bottom of the General settings tab.
+
+### Deny-by-Default Scrubbing
+
+Both surfaces wire a `before_send` hook that strips every dynamic field — messages, exception values, breadcrumbs, request data, user context, extras, and filenames are reduced to basenames — before any event leaves the process.
+
+The threat model assumes the entire payload domain is sensitive: panic messages can contain prompts serialized across the Tauri IPC boundary, exception text can interpolate user data, and absolute file paths typically reveal the developer's `$HOME`. Rather than denylist known PII fields, both sides keep only stack-frame structure (function, module, line number) and an allowlist of tags (`release`, `environment`, `runtime`). Frontend session replay, browser-tracing, autoSessionTracking, default integrations, and HTTP context capture are all explicitly disabled — the only Sentry features in use are the global error handler and React error boundaries via `reactErrorHandler()`. Rust mirrors the policy with `auto_session_tracking: false`, `max_breadcrumbs: 0`, and a `before_breadcrumb` that drops every breadcrumb. Sentry server-side data scrubbing rules (IP, geolocation, user-agent) remain a follow-up configurable in the project's Sentry settings, not in code.
+
+### Dual-Surface Wiring
+
+Frontend [[src/lib/crashReporting.ts]] and Rust [[src-tauri/src/crash_reporting.rs]] share the same DSN and scrubbing policy.
+
+The Rust side stores its `ClientInitGuard` in a `OnceLock<Mutex<Option<ClientInitGuard>>>` so [[src-tauri/src/crash_reporting.rs#set_enabled]] can drop the guard on opt-out (which flushes pending events and closes the transport) and re-init on opt-in. The frontend calls `Sentry.close()` and `Sentry.init()` for the same effect; one-shot initialization is gated on the `crash_reporting.enabled` value returned by the very first `get_runtime_settings` IPC call from [[src/main.tsx]], so the SDK never sends data before the user's preference is read.
+
+### Toggle Lifecycle
+
+Toggling the "Help improve Quill" row in [[src/components/settings/GeneralTab.tsx]] writes through the standard [[features#Settings Window#Runtime Settings IPC]] pipeline and applies immediately on both surfaces.
+
+[[src-tauri/src/lib.rs#set_runtime_settings]] detects a `crash_reporting_enabled` delta and calls [[src-tauri/src/crash_reporting.rs#set_enabled]] directly on the Rust side, then emits `runtime-settings-updated` carrying the resolved `RuntimeSettings`. The frontend `crashReporting` module listens for that event and calls [[src/lib/crashReporting.ts#setCrashReportingEnabled]] so the React-side SDK opens or closes its transport in lock-step. Default is on; the user-facing copy never mentions Sentry and instead emphasises that session data is removed locally before transmission.

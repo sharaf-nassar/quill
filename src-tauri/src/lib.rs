@@ -6,6 +6,7 @@ mod claude_setup;
 mod compress_prose;
 mod config;
 mod context_category;
+mod crash_reporting;
 pub mod data_paths;
 mod eval_harness;
 mod fetcher;
@@ -87,6 +88,7 @@ const PLUGIN_UPDATES_ENABLED_KEY: &str = "plugin_updates.enabled";
 const PLUGIN_UPDATES_INTERVAL_KEY: &str = "plugin_updates.interval_hours";
 const RULE_WATCHER_ENABLED_KEY: &str = "rule_watcher.enabled";
 const ALWAYS_ON_TOP_KEY: &str = "always_on_top";
+const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
 
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
@@ -1570,6 +1572,11 @@ fn load_runtime_settings(storage: &Storage) -> RuntimeSettings {
             defaults.rule_watcher_enabled,
         ),
         always_on_top: read_bool_setting(storage, ALWAYS_ON_TOP_KEY, defaults.always_on_top),
+        crash_reporting_enabled: read_bool_setting(
+            storage,
+            CRASH_REPORTING_ENABLED_KEY,
+            defaults.crash_reporting_enabled,
+        ),
     }
 }
 
@@ -1628,6 +1635,14 @@ async fn set_runtime_settings(
             "false"
         },
     )?;
+    storage.set_setting(
+        CRASH_REPORTING_ENABLED_KEY,
+        if settings.crash_reporting_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    )?;
 
     if previous.always_on_top != settings.always_on_top
         && let Some(window) = app.get_webview_window("main")
@@ -1636,6 +1651,9 @@ async fn set_runtime_settings(
     }
     if let Some(item) = TRAY_ON_TOP_ITEM.get() {
         let _ = item.set_checked(settings.always_on_top);
+    }
+    if previous.crash_reporting_enabled != settings.crash_reporting_enabled {
+        crash_reporting::set_enabled(settings.crash_reporting_enabled);
     }
 
     let resolved = load_runtime_settings(storage);
@@ -2571,6 +2589,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let storage = initialize_storage_or_exit();
+            // Honor the crash-reporting opt-out before any other startup work
+            // so a panic during initialization respects the user's preference.
+            crash_reporting::set_enabled(read_bool_setting(
+                storage,
+                CRASH_REPORTING_ENABLED_KEY,
+                RuntimeSettings::default().crash_reporting_enabled,
+            ));
             // Clean up any runs left in "running" state from a previous crash.
             // This must stay after the single-instance plugin setup so a
             // duplicate launch cannot mark the primary's active runs interrupted.

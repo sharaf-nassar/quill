@@ -41,6 +41,7 @@ similar = "2"
 regex = "1"
 walkdir = "2"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }

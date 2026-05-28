@@ -64,7 +64,13 @@ It retries the draft lookup for API eventual consistency, updates `latest.json` 
 
 ### Required Secrets
 
-`GITHUB_TOKEN`, `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`.
+`GITHUB_TOKEN`, `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `SENTRY_AUTH_TOKEN`.
+
+### Sentry Source Map Upload
+
+The Vite build uploads frontend source maps to the [[features#Crash Reporting]] Sentry project when `SENTRY_AUTH_TOKEN` is exported on the build step.
+
+`vite.config.ts` reads `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`, and `SENTRY_RELEASE` from `process.env` and instantiates `sentryVitePlugin` only when the token is set AND `NODE_ENV === "production"` (which Vite sets for `vite build`); dev runs and unconfigured CI jobs skip the upload silently. `release.yml`'s "Build and release" step exports `SENTRY_AUTH_TOKEN` conditionally on `matrix.platform == 'ubuntu-22.04'` so the four-platform build matrix uploads exactly once per release — the macOS/Windows builds see an empty token and the plugin no-ops there. `SENTRY_RELEASE` is set to `github.ref_name` (the `v*` tag) so source maps and the runtime SDK's `release` tag (`VITE_APP_VERSION`, same value) link to the same Sentry release.
 
 ### Pages Workflow
 
@@ -264,7 +270,7 @@ Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 
 **Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-process 2, tauri-plugin-log 2.
 
-**Utilities**: serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix only).
+**Utilities**: serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
 
 **Dev-only**: serial_test 3 — used by [[src-tauri/src/data_paths.rs]] tests to serialize global env-var mutation across the three behavioral cases for each resolver (data dir, rules dir, Claude projects dir, Codex sessions dir) so concurrent test threads don't race.
 

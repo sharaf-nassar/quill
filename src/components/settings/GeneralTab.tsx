@@ -157,6 +157,25 @@ export function GeneralTab({
           from the Integrations tab. Storage cleanup commands are not exposed here.
         </p>
       </div>
+
+      <div className="settings-section-header">Help improve Quill</div>
+      <SettingRow
+        label="Help improve Quill"
+        description="Send anonymized crash reports. All session data, file paths, and prompt text are removed locally before transmission. Disable to send nothing."
+        control={
+          <Toggle
+            tone={runtime.settings.crashReportingEnabled ? "on" : "off"}
+            pressed={runtime.settings.crashReportingEnabled}
+            disabled={runtime.saving}
+            onClick={() =>
+              void runtime.save({
+                ...runtime.settings,
+                crashReportingEnabled: !runtime.settings.crashReportingEnabled,
+              })
+            }
+          />
+        }
+      />
     </div>
   );
 }

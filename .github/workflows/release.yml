@@ -137,6 +137,14 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          # Sentry source map upload runs only on the ubuntu build so identical
+          # JS maps aren't republished 4x per release. The vite plugin no-ops
+          # when SENTRY_AUTH_TOKEN is empty (macOS / Windows builds).
+          SENTRY_AUTH_TOKEN: ${{ matrix.platform == 'ubuntu-22.04' && secrets.SENTRY_AUTH_TOKEN || '' }}
+          SENTRY_ORG: stable-tech
+          SENTRY_PROJECT: quill
+          SENTRY_RELEASE: ${{ github.ref_name }}
+          VITE_APP_VERSION: ${{ github.ref_name }}
           # Notarization handled separately below — Tauri's built-in apple-codesign
           # polls indefinitely and loses network on GH Actions after ~2h
         with:

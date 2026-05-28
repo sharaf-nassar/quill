@@ -10,6 +10,7 @@ export const RUNTIME_SETTINGS_DEFAULTS: RuntimeSettings = {
   pluginUpdatesIntervalHours: 4,
   ruleWatcherEnabled: true,
   alwaysOnTop: false,
+  crashReportingEnabled: true,
 };
 
 export interface UseRuntimeSettingsResult {

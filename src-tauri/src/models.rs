@@ -777,6 +777,7 @@ pub struct RuntimeSettings {
     pub plugin_updates_interval_hours: i64,
     pub rule_watcher_enabled: bool,
     pub always_on_top: bool,
+    pub crash_reporting_enabled: bool,
 }
 
 impl Default for RuntimeSettings {
@@ -788,6 +789,7 @@ impl Default for RuntimeSettings {
             plugin_updates_interval_hours: 4,
             rule_watcher_enabled: true,
             always_on_top: false,
+            crash_reporting_enabled: true,
         }
     }
 }
