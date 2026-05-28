@@ -136,13 +136,21 @@ Flat config format (v9+) in `eslint.config.js`. Base: `@eslint/js` recommended +
 | detect-private-key | All | Catch hardcoded secrets |
 | shellcheck | `*.sh` | Shell script linting |
 | cargo fmt | `src-tauri/**` | Rust formatting |
-| cargo clippy | `src-tauri/**` | Rust linting (`-D warnings`) |
+| clippy | `src-tauri/**` | Platform-aware Rust linting via `scripts/precommit-rust.sh` (`-D warnings`) |
 | eslint | `src/**/*.{ts,tsx}` | TypeScript linting |
 | tsc --noEmit | `src/**/*.{ts,tsx}` | Type checking |
+
+The `clippy` hook delegates to `scripts/precommit-rust.sh` (see [[infrastructure#Infrastructure#Scripts#Platform-Aware Rust Lint Hook]]) so platform-gated `#[cfg(target_os = "…")]` code is linted on a matching host instead of slipping through to the macOS Release build.
 
 ## Scripts
 
 Utility scripts for development, testing, and documentation tasks.
+
+### Platform-Aware Rust Lint Hook
+
+`scripts/precommit-rust.sh` is the entry point for the `clippy` pre-commit hook. It runs `cargo clippy --all-targets -- -D warnings` against the code the host OS can compile, so platform-gated regressions surface at commit time.
+
+`cargo clippy` only compiles for the host target triple, so `#[cfg(target_os = "…")]` code is invisible to other platforms' lint runs — a macOS-only [[src-tauri/src/lib.rs#macos_proc_pidpath]] call (`libc::proc_pidpath`) compiles clean on Linux and first breaks on the macOS Release build. The script branches on `uname -s`: macOS lints the native Apple target (covering `cfg(target_os = "macos")`); Linux lints its native target and prints a notice that macOS-gated code is not lintable locally, because objc2's build script compiles Objective-C with Apple-only clang flags (`-arch`, `-mmacosx-version-min`) that Linux `cc` rejects. Cross-linting macOS from Linux would require an osxcross toolchain plus a packaged macOS SDK. Mirrors the `--all-targets` strictness of the [[infrastructure#Infrastructure#CI/CD Pipeline#Backend CI Gate]] so the local gate is never laxer than CI.
 
 ### Screenshot Capture
 

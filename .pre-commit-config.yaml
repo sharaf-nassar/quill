@@ -32,7 +32,7 @@ repos:
       - id: clippy
         name: clippy
         language: system
-        entry: bash -c 'cd src-tauri && cargo clippy -- -D warnings'
+        entry: scripts/precommit-rust.sh
         pass_filenames: false
         types: [rust]
 
