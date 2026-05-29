@@ -16,7 +16,7 @@ event slot; the script POSTs to a new `/api/v1/hooks/observed` endpoint.
 Both providers land in one new `hook_invocations` table behind a migration
 27 + `hook_invocation_reingest_pending` flag, so existing Claude transcripts
 backfill on next boot. The UI extends `BreakdownPanel.tsx` and
-`useBreakdownData.ts` with a new mode, adds a `QUILL` chip for
+`useBreakdownData.ts` with a new mode, keeps `quill:` prefixes visible for
 Quill-deployed scripts, and reuses the existing All/Codex/Claude filter
 strip and ALL TIME chip.
 
@@ -117,10 +117,8 @@ src-tauri/                                   # Rust backend (Tauri 2)
 src/                                         # TypeScript / React frontend
 ├── components/analytics/
 │   ├── BreakdownPanel.tsx                   # ADD "Hooks" mode + row renderer +
-│   │                                        # QUILL chip + inline help affordance
+│   │                                        # inline help affordance
 │   ├── NowTab.tsx                           # WIRE Hooks tab into the breakdown selector
-│   └── shared.tsx                           # ADD QUILL chip component (parallel to
-│                                            # the existing AGENT chip)
 ├── hooks/
 │   └── useBreakdownData.ts                  # ADD useHookBreakdown variant calling the
 │                                            # new IPC command
@@ -134,7 +132,7 @@ lat.md/                                      # Architecture docs (must stay in s
 ├── data-flow.md                             # UPDATE Session Indexing Pipeline section
 │                                            # to mention attachment extraction
 ├── features.md                              # UPDATE Now Tab Analytics Dashboard section
-│                                            # to describe Hooks breakdown + QUILL chip
+│                                            # to describe Hooks breakdown
 ├── infrastructure.md                        # UPDATE Codex Integration Deployment to
 │                                            # note hook-observe.cjs and the 8 hook
 │                                            # registrations

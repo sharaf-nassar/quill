@@ -17,7 +17,11 @@ export type ProviderErrorKind =
   | "config"
   | "auth"
   | "rate_limit"
-  | "server";
+  | "server"
+  // Live polling is paused for a transient, non-failure reason (a stale Claude
+  // access token returned 401 while still logged in). Rendered as a muted
+  // "Paused" badge by src/components/UsageDisplay.tsx, never a red prompt.
+  | "paused";
 
 export interface UsageProviderError {
   provider: IntegrationProvider;
@@ -151,7 +155,7 @@ export interface SkillProjectBreakdown {
  * collapse to `quill:<basename>`, `${CLAUDE_PLUGIN_ROOT}/<dir>/<file>`
  * stays verbatim, other paths reduce to basename, and missing-command
  * records fall back to `hookName`. `is_quill` is derived from the
- * `quill:` prefix and drives the QUILL chip in the UI.
+ * `quill:` prefix so callers can classify Quill-managed hook rows.
  */
 export interface HookBreakdown {
   hook_identity: string;

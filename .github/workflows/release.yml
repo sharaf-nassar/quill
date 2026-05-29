@@ -23,7 +23,7 @@ jobs:
     outputs:
       release_id: ${{ steps.create.outputs.release_id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -63,13 +63,13 @@ jobs:
             args: '--target aarch64-apple-darwin'
           - platform: macos-latest
             args: '--target x86_64-apple-darwin'
-          - platform: windows-latest
+          - platform: windows-2025
             args: ''
 
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -78,7 +78,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: lts/*
           cache: npm
@@ -153,6 +153,10 @@ jobs:
           releaseBody: 'Download the installer for your platform from the assets below.'
           releaseDraft: true
           prerelease: false
+          # Parallel matrix builds race uploading the shared latest.json
+          # (tauri-action#1270); retry so a transient 404 doesn't fail an
+          # otherwise-good build. The publish job rebuilds the manifest anyway.
+          retryAttempts: 3
           args: ${{ matrix.args }}
 
       - name: Verify macOS updater artifacts
@@ -202,7 +206,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -224,7 +228,7 @@ jobs:
             echo "No tag annotation found, using default"
           fi
 
-      - name: Rename release assets with platform labels
+      - name: Rename assets and rebuild updater manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -263,11 +267,11 @@ jobs:
 
             new_name="$name"
 
-            if [[ "$name" == *".AppImage"* ]] || [[ "$name" == *".deb"* ]]; then
+            if [[ "$name" == *".AppImage"* ]]; then
               new_name=$(echo "$name" | sed -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_/\1_linux_/')
             elif [[ "$name" == *".app.tar.gz"* ]] || [[ "$name" == *".dmg"* ]]; then
               new_name=$(echo "$name" | sed -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_/\1_macOS_/')
-            elif [[ "$name" == *".exe"* ]] || [[ "$name" == *".nsis"* ]] || [[ "$name" == *".msi"* ]]; then
+            elif [[ "$name" == *".exe"* ]] || [[ "$name" == *".nsis"* ]]; then
               new_name=$(echo "$name" | sed -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_/\1_windows_/')
             fi
 
@@ -283,23 +287,15 @@ jobs:
             fi
           done
 
-          # Update latest.json URLs to match renamed filenames
-          LATEST_ID=$(gh api "repos/${GH_REPO}/releases/${RELEASE_ID}/assets" --jq '.[] | select(.name == "latest.json") | .id')
-          if [[ -n "$LATEST_ID" ]]; then
-            gh api "repos/${GH_REPO}/releases/assets/${LATEST_ID}" \
-              -H "Accept: application/octet-stream" > latest.json
-
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.AppImage)/\1_linux_\2/g' latest.json
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.deb)/\1_linux_\2/g' latest.json
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.app\.tar\.gz)/\1_macOS_\2/g' latest.json
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.dmg)/\1_macOS_\2/g' latest.json
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.exe)/\1_windows_\2/g' latest.json
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.nsis)/\1_windows_\2/g' latest.json
-            sed -i -E 's/(_[0-9]+\.[0-9]+\.[0-9]+)_(.*\.msi)/\1_windows_\2/g' latest.json
-
-            gh api --method DELETE "repos/${GH_REPO}/releases/assets/${LATEST_ID}"
-            gh release upload "${TAG_NAME}" latest.json --clobber
-          fi
+          # Rebuild the updater manifest from the signed release assets.
+          # tauri-action uploads a per-build latest.json from each parallel
+          # matrix job, and those uploads race on the single shared asset
+          # (tauri-action#1270), silently dropping platforms — v0.3.33 shipped
+          # with no linux-x86_64 entry, breaking the updater for Linux users.
+          # Assembling once here (single writer, after the rename) is
+          # deterministic and fails the release if any base platform is missing.
+          bash .github/scripts/assemble-latest-json.sh "$GH_REPO" "$TAG_NAME" "$RELEASE_ID"
+          gh release upload "$TAG_NAME" latest.json --clobber
 
       - name: Publish release
         env:

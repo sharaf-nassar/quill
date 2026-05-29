@@ -1670,8 +1670,7 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
 ///    remainder as the executable path.
 /// 3. If the executable resolves into Quill-managed script directories
 ///    (`/.config/quill/scripts/` or `/.config/quill/codex/scripts/`),
-///    return `quill:<basename>` so the UI's QUILL chip and per-machine
-///    identity stay stable.
+///    return `quill:<basename>` so per-machine identity stays stable.
 /// 4. If the executable begins with `${CLAUDE_PLUGIN_ROOT}/`, keep it
 ///    verbatim — the unexpanded env-var prefix is the only stable
 ///    plugin-scoped identifier the transcript provides.

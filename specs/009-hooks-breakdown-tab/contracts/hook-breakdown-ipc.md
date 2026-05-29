@@ -116,8 +116,9 @@ matching the existing data-hook convention documented in
 - Mode selector: existing tab strip adds a "Hooks" entry after "Skills".
 - Empty state: same copy and styling as Skills empty state.
 - Row layout:
-  - Left: hook identity (with `QUILL` chip when `isQuill === true`,
-    rendered the same way as the existing `AGENT` chip).
+  - Left: hook identity, including the `quill:` prefix when present. The
+    `isQuill` field remains available for callers that need
+    Quill-managed row classification.
   - Middle: total fires (provider-summed when filter strip is on All).
   - Right: relative `last fired` timestamp (matches Skills "Last used").
 - Provider filter strip:

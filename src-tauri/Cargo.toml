@@ -45,10 +45,10 @@ sentry = { version = "0.34", default-features = false, features = ["backtrace", 
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
+libc = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.4"
-libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = "0.3"

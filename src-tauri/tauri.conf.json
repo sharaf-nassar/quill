@@ -9,7 +9,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "nsis", "appimage", "deb"],
+    "targets": ["app", "dmg", "nsis", "appimage"],
     "resources": ["claude-integration/**/*", "codex-integration/**/*"],
     "createUpdaterArtifacts": "v1Compatible",
     "macOS": {

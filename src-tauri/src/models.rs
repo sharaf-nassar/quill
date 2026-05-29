@@ -90,6 +90,13 @@ pub enum ProviderErrorKind {
     RateLimit,
     // Provider responded but with a non-success status or unparseable body.
     Server,
+    // Live polling is temporarily paused for a transient, non-failure reason —
+    // a stale Claude OAuth access token returned a 401 but the user is still
+    // logged in (no local credentials missing, or `claude auth status` reports
+    // `loggedIn: true`/inconclusive). The UI renders a muted "Paused" badge
+    // with cached rows still shown, NOT a red login prompt. See
+    // [[lat.md/data-flow#Usage Bucket Fetching]].
+    Paused,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -242,8 +249,9 @@ pub struct SkillProjectBreakdown {
 /// active timeframe (or all indexed history when `all_time = true`),
 /// with per-provider sub-counts so the All / Codex / Claude filter
 /// strip can display the appropriate column. `is_quill` is derived
-/// from the `quill:` identity prefix and powers the QUILL chip in the
-/// UI. See specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
+/// from the `quill:` identity prefix for Quill-managed row
+/// classification. See
+/// specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
 #[derive(Serialize, Clone, Debug)]
 pub struct HookBreakdown {
     pub hook_identity: String,
@@ -1189,6 +1197,7 @@ mod tests {
             (ProviderErrorKind::Auth, "\"auth\""),
             (ProviderErrorKind::RateLimit, "\"rate_limit\""),
             (ProviderErrorKind::Server, "\"server\""),
+            (ProviderErrorKind::Paused, "\"paused\""),
         ];
         for (variant, expected) in cases {
             let actual = serde_json::to_string(&variant).expect("serde serializes variant");

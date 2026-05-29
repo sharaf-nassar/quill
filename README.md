@@ -204,24 +204,24 @@ graph TB
 ### From releases
 
 Download the latest release for your platform from the [Releases](../../releases) page:
-- **Linux**: `.deb` (recommended) or `.AppImage`
+- **Linux**: `.AppImage`
 - **Windows**: `.exe`
 - **macOS**: `.dmg`
 
 #### Linux setup
 
-**Debian/Ubuntu (recommended)** — installs the binary, desktop entry, and icons system-wide:
-
-```bash
-sudo dpkg -i Quill_*_linux_amd64.deb
-```
-
-**AppImage** — portable executable, no installation required:
+**AppImage** — portable executable, no installation required. It is the only
+Linux build, and the only format Tauri's in-app updater can self-update:
 
 ```bash
 chmod +x Quill_*_linux_amd64.AppImage
 ./Quill_*_linux_amd64.AppImage
 ```
+
+> Quill no longer ships a `.deb`: Debian installs can't use the in-app updater
+> (Tauri only self-updates AppImages), so they were stranded on whatever version
+> was installed. If you previously installed the `.deb`, remove it (see below)
+> and switch to the AppImage to get automatic updates.
 
 #### Linux uninstall
 
@@ -485,7 +485,7 @@ Releases are driven by git tags via `release.sh`. The CI workflow (`.github/work
 
 `bump` and `retag` generate user-facing release notes via Claude, commit them as `release_notes.md`, then tag and push. The CI picks up the notes and applies them to the GitHub release.
 
-The `tauri-action` patches the version in `tauri.conf.json` at build time using the tag — you do not need to update version numbers manually. The workflow builds for all platforms (Linux AppImage + .deb, macOS dmg for Intel + ARM, Windows nsis), then publishes the release.
+The `tauri-action` patches the version in `tauri.conf.json` at build time using the tag — you do not need to update version numbers manually. The workflow builds for all platforms (Linux AppImage, macOS dmg for Intel + ARM, Windows nsis), then publishes the release.
 
 The in-app updater checks `latest.json` on GitHub Releases on startup and every 4 hours. When an update is found, a yellow "Update" button appears in the titlebar.
 

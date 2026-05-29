@@ -105,7 +105,24 @@ function UsageDisplay({
 
   const providerSections = buildProviderSections(enabledProviders, data.buckets);
 
-  if (providerSections.length === 0) {
+  // Partition provider errors. `network` (offline) and `paused` (stale Claude
+  // token) are transient banners that must render even with no buckets yet, so
+  // a first-run/empty view never preempts them with "No usage data".
+  const offlineProviders = data.provider_errors
+    .filter((e) => e.kind === "network")
+    .map((e) => e.provider);
+  const pausedProviders = data.provider_errors
+    .filter((e) => e.kind === "paused")
+    .map((e) => e.provider);
+  const otherErrors = data.provider_errors.filter(
+    (e) => e.kind !== "network" && e.kind !== "paused",
+  );
+
+  if (
+    providerSections.length === 0 &&
+    offlineProviders.length === 0 &&
+    pausedProviders.length === 0
+  ) {
     return <div className="loading">No usage data</div>;
   }
 
@@ -199,17 +216,17 @@ function UsageDisplay({
         </div>
       )}
       {(() => {
-        // Coalesce all "network" errors into one offline pill so a missing
-        // internet connection produces a single signal instead of one banner
-        // per enabled provider. See
-        // [[lat.md/features#Features#Live Usage View]].
-        const offlineProviders = data.provider_errors
-          .filter((e) => e.kind === "network")
-          .map((e) => e.provider);
-        const otherErrors = data.provider_errors.filter(
-          (e) => e.kind !== "network",
-        );
-        if (offlineProviders.length === 0 && otherErrors.length === 0) {
+        // Render transient banners (offline pill, Paused badge) plus any
+        // genuine per-provider errors. Partitions (offlineProviders,
+        // pausedProviders, otherErrors) are computed above the empty-view early
+        // return so these banners render even with no buckets. See
+        // [[lat.md/features#Features#Live Usage View]] and
+        // [[lat.md/data-flow#Usage Bucket Fetching]].
+        if (
+          offlineProviders.length === 0 &&
+          pausedProviders.length === 0 &&
+          otherErrors.length === 0
+        ) {
           return null;
         }
         return (
@@ -229,6 +246,24 @@ function UsageDisplay({
                 </span>
               </div>
             )}
+            {pausedProviders.map((provider) => (
+              <span
+                key={`paused-${provider}`}
+                className="usage-paused-badge"
+                data-error-kind="paused"
+                tabIndex={0}
+                aria-describedby={`paused-tip-${provider}`}
+              >
+                Paused
+                <span
+                  id={`paused-tip-${provider}`}
+                  className="usage-paused-tooltip"
+                  role="tooltip"
+                >
+                  Resumes the next time Claude CLI runs
+                </span>
+              </span>
+            ))}
             {otherErrors.map((providerError) => (
               <div
                 key={providerError.provider}

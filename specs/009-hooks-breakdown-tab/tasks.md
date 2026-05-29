@@ -197,29 +197,26 @@ Claude script identities. Start a Codex session, fire prompts. Within
 
 ## Phase 4: User Story 2 - Distinguish Quill telemetry from user hooks (Priority: P2)
 
-**Goal**: Rows backed by Quill-deployed scripts are visually marked
-with a QUILL chip, distinguishable on first inspection from
-plugin-installed or personal hooks.
+**Goal**: Rows backed by Quill-deployed scripts keep the `quill:`
+identity prefix, distinguishable from plugin-installed or personal
+hooks without a separate badge.
 
 **Independent Test**: With Phase 3 complete and Quill's
-`activity_tracking` ON, the Hooks breakdown shows a QUILL chip on
-every row whose `hookIdentity` starts with `quill:`; non-Quill rows
-have no chip (SC-004).
+`activity_tracking` ON, the Hooks breakdown shows `quill:` in every
+row whose `hookIdentity` starts with that prefix; non-Quill rows do not
+show that prefix (SC-004).
 
 ### Implementation for User Story 2
 
-- [x] T021 [US2] [P] Add a `QuillChip` component to
-  `src/components/analytics/shared.tsx` parallel to the existing
-  `AgentChip`. Uppercase `QUILL` text, distinctive color (green or
-  teal — different from the purple AGENT chip), same chip styling
-  as `AgentChip`.
+- [x] T021 [US2] [P] Keep the `isQuill`/`is_quill` field in the
+  contract so callers can classify Quill-managed rows when needed.
 - [x] T022 [US2] In `src/components/analytics/BreakdownPanel.tsx`,
-  render `<QuillChip />` immediately before the `hookIdentity` label
-  on rows where `row.isQuill === true`. Confirm the chip does not
-  break the row's flex layout in narrow widths.
+  render the `hookIdentity` label directly, preserving the `quill:`
+  prefix in row text without adding a separate QUILL badge.
 
-**Checkpoint**: Open Hooks breakdown. Rows starting `quill:` carry the
-QUILL chip; plugin and personal rows do not. Quickstart Step 4 passes.
+**Checkpoint**: Open Hooks breakdown. Rows starting `quill:` show that
+prefix in the identity text; plugin and personal rows do not.
+Quickstart Step 4 passes.
 
 ---
 
@@ -276,8 +273,7 @@ verification, and quality gates.
   dual-emission pass.
 - [x] T028 [P] Update `lat.md/features.md`: extend the
   `Analytics Dashboard#Now Tab` description to mention the Hooks
-  breakdown row, the QUILL chip vocabulary, and the Claude/Codex
-  granularity help affordance.
+  breakdown row and the Claude/Codex granularity help affordance.
 - [x] T029 [P] Update `lat.md/infrastructure.md`: extend the
   `Codex Integration Deployment` section to note `hook-observe.cjs`
   and its eight-event registration, gated on `activity_tracking`.
@@ -340,9 +336,9 @@ on different `lat.md/` files.
 
 Phases 2 + 3 only. That gives a working Hooks breakdown with both
 provider data sources flowing. Users see the feature, all FR-001
-through FR-017 are satisfied (excluding the QUILL chip and asymmetry
-tooltip, which are FR-006 and FR-017 deferred to Phases 4 and 5
-respectively).
+through FR-017 are satisfied (excluding the Quill-managed identity
+distinction and asymmetry tooltip, which are FR-006 and FR-017
+deferred to Phases 4 and 5 respectively).
 
 ### Incremental delivery
 

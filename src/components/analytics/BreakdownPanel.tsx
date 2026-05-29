@@ -1271,14 +1271,6 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                           aria-label={`${row.hook_identity}: ${usesLabel}, last fired ${formatRelativeTime(row.last_fired_at)}`}
                         >
                           <span className="breakdown-name breakdown-name-hook" title={row.hook_identity}>
-                            {row.is_quill && (
-                              <span
-                                className="breakdown-provider-tag quill"
-                                title="Deployed by Quill"
-                              >
-                                QUILL
-                              </span>
-                            )}
                             <span className="breakdown-hook-identity">{row.hook_identity}</span>
                             <span className="breakdown-hook-event">{eventLabel}</span>
                           </span>

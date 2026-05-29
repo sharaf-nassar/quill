@@ -131,8 +131,9 @@ The canonicalized form is the row's `hook_identity` column. The raw
 display the verbatim string if needed.
 
 **Rationale**:
-- Quill identity must be stable across machines so the QUILL chip behaves
-  consistently — `quill:<basename>` strips machine-specific path prefixes.
+- Quill identity must be stable across machines, and `quill:<basename>`
+  keeps Quill-managed rows recognizable while stripping machine-specific
+  path prefixes.
 - `${CLAUDE_PLUGIN_ROOT}` is preserved because two plugins with the same
   relative hook path are inherently indistinguishable in the transcript;
   collapsing them to basename would silently merge unrelated plugin
@@ -144,8 +145,8 @@ display the verbatim string if needed.
   command text without requiring a schema migration.
 
 **Alternatives considered**:
-- *Hash the full command*: rejected — defeats human readability and
-  prevents the QUILL chip lookup.
+- *Hash the full command*: rejected — defeats human readability and hides
+  whether the row came from Quill-managed hook scripts.
 - *Use `hookName` as the sole identity*: rejected — different scripts on
   the same event (e.g., multiple `PreToolUse:Bash` hooks) collapse,
   hiding the answer to "which script is firing".
@@ -177,24 +178,24 @@ a clean sweep, matching the behavior of `skill_usage_reingest_pending`
 - *One-shot backfill on migration*: rejected — migration runs inside a
   short-lived txn and cannot afford long-running I/O.
 
-## R-F — UI integration: BreakdownPanel mode + QUILL chip + filter strip
+## R-F — UI integration: BreakdownPanel mode + filter strip
 
 **Decision**: Extend `src/components/analytics/BreakdownPanel.tsx` with a
 new `'hooks'` mode parallel to `'sessions' | 'projects' | 'hosts' | 'skills'`.
 The Hooks mode renders one row per `hook_identity` with columns Hook /
-Uses / Last used, sorted by Uses descending. Rows carry a QUILL chip
-(parallel to the existing AGENT chip from the Sessions tab's sub-agent
-disclosure) when `hook_identity` starts with `quill:`. The provider filter
-strip (All / Codex / Claude) and the `∞ ALL TIME` chip are reused unchanged
-from the Skills implementation. An inline help affordance (a `?` button
-identical to the Now-tab insight-card pattern) on the breakdown header
-explains the Claude/Codex granularity asymmetry per FR-017.
+Uses / Last used, sorted by Uses descending. Quill-managed rows keep the
+`quill:` prefix in the identity text without an additional badge. The
+provider filter strip (All / Codex / Claude) and the `∞ ALL TIME` chip are
+reused unchanged from the Skills implementation. An inline help affordance
+(a `?` button identical to the Now-tab insight-card pattern) on the
+breakdown header explains the Claude/Codex granularity asymmetry per
+FR-017.
 
 **Rationale**:
 - Re-using `BreakdownPanel.tsx`'s mode-switching scaffolding means no new
   panel component is created; the change is additive.
-- The chip vocabulary on this panel already includes CLAUDE / CODEX /
-  AGENT chips. Adding QUILL fits the same vocabulary.
+- Keeping Quill attribution in the identity avoids competing badges in a
+  dense breakdown row while preserving the source signal.
 - The existing `useBreakdownData.ts` hook already implements the All-TIME
   toggle and provider scoping for skills; the new `useHookBreakdown`
   variant duplicates the smallest possible amount of code to reuse the
@@ -221,8 +222,8 @@ edits:
   mention attachment-record extraction as the third sibling of message and
   event extraction.
 - `lat.md/features.md` — extend the Analytics Dashboard / Now Tab section
-  to describe the Hooks breakdown row, the QUILL chip, and the
-  Claude/Codex asymmetry help affordance.
+  to describe the Hooks breakdown row and the Claude/Codex asymmetry help
+  affordance.
 - `lat.md/infrastructure.md` — extend the Codex Integration Deployment
   section to note `hook-observe.cjs` and its 8-event registration; note
   the `activity_tracking` gating.

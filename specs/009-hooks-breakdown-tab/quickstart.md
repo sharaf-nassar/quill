@@ -65,7 +65,8 @@ In the running app:
 3. Click **Hooks**.
 4. Expect at least one row to appear (the `quill:context-capture.cjs`
    hook fires on every SessionStart of the running Quill itself).
-5. Verify the QUILL chip is visible on rows starting with `quill:`.
+5. Verify rows starting with `quill:` display that prefix in the identity
+   text without an additional QUILL badge.
 6. Verify the All / Codex / Claude filter strip and the `∞ ALL TIME` chip
    are present and behave as on the Skills breakdown.
 
@@ -122,7 +123,7 @@ If you ran a Bash tool via Codex:
 - `PreToolUse · Bash` row with count ≥ 1
 - `PostToolUse · Bash` row with count ≥ 1
 
-Verify the rows do **not** carry the QUILL chip (the observer is a
+Verify the rows do **not** carry a separate QUILL badge (the observer is a
 generic event-observer, not a Quill telemetry script in the script-row
 sense; Codex rows are event-scoped).
 
@@ -224,8 +225,8 @@ This quickstart passes when:
   the flag on clean exit.
 - The Hooks breakdown renders rows for both providers under the cases in
   Steps 3-5.
-- The QUILL chip appears on Quill-deployed Claude rows and is absent on
-  plugin/personal rows.
+- Quill-deployed Claude rows keep their `quill:` identity prefix without a
+  separate QUILL badge; plugin/personal rows do not show that prefix.
 - Toggling `activity_tracking` cleanly adds/removes the Codex producer.
 - Idempotent reingest and session-delete cleanup both behave as
   specified.

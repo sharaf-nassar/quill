@@ -25,8 +25,14 @@ const BUCKET_KEYS: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaudeUsageErrorKind {
+    // Local OAuth credentials are missing entirely (`read_access_token` failed).
+    // The poller confirms this with an unconfined `claude auth status` check
+    // before warning the user — see [[src-tauri/src/lib.rs#refresh_usage_cache]].
     Credentials,
-    Unauthorized,
+    // The usage API returned 401 even though we sent a Bearer token. A token
+    // was present, so the user is logged in; the access token is just stale.
+    // This is surfaced as a muted "Paused" state, never a login prompt.
+    Paused,
     RateLimited,
     Request,
     Api,
@@ -599,9 +605,12 @@ pub async fn fetch_claude_usage() -> Result<Vec<UsageBucket>, ClaudeUsageError> 
     };
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        // A 401 with a Bearer token attached means the access token is stale,
+        // not that the user logged out. Surface a neutral Paused state instead
+        // of a login prompt; the poller keeps showing cached rows.
         Err(ClaudeUsageError {
-            kind: ClaudeUsageErrorKind::Unauthorized,
-            message: "Claude credentials are invalid or expired. Run: claude /login".into(),
+            kind: ClaudeUsageErrorKind::Paused,
+            message: "Paused".into(),
             retry_after_seconds: None,
         })
     } else if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {

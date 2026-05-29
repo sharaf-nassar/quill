@@ -70,32 +70,32 @@ additional events fire.
 
 ### User Story 2 - Distinguish Quill telemetry from user hooks (Priority: P2)
 
-The user can identify at a glance which hook rows are deployed by Quill
-itself (telemetry overhead) versus user-installed hooks (plugins, personal
-automation). Quill-managed rows are visually tagged with a **QUILL** chip in
-the row, analogous to how sub-agent rows are tagged with an **AGENT** chip in
-the Sessions breakdown.
+The user can identify which hook rows are deployed by Quill itself
+(telemetry overhead) versus user-installed hooks (plugins, personal
+automation). Quill-managed rows retain the `quill:` identity prefix in the
+row text instead of showing an additional badge.
 
 **Why this priority**: Quill's deployed telemetry hooks fire on every
-session-start, user-prompt, tool-use, and stop event. Without explicit
-tagging, those rows would dominate the breakdown and obscure user hooks.
-Tagging keeps the data honest without filtering it out.
+session-start, user-prompt, tool-use, and stop event. Keeping the `quill:`
+prefix visible identifies those rows without adding extra row chrome or
+filtering the telemetry out.
 
 **Independent Test**: With Quill's `activity_tracking` feature enabled (so
 `observe.cjs` and similar Quill-deployed hooks fire), every row whose
 underlying script path resolves to `~/.config/quill/...` (Claude or Codex)
-displays the QUILL chip. Rows for any other script path or for plugin hooks
-under `${CLAUDE_PLUGIN_ROOT}/...` do not display the chip.
+keeps the `quill:` prefix in the displayed identity. Rows for any other
+script path or for plugin hooks under `${CLAUDE_PLUGIN_ROOT}/...` do not
+show that prefix.
 
 **Acceptance Scenarios**:
 
 1. **Given** Quill's `session-sync.cjs` has fired during the selected
    timeframe, **When** the Hooks breakdown renders, **Then** the row for that
-   script displays a QUILL chip and is otherwise sorted in normal fire-count
-   order alongside non-Quill rows.
+   script displays as `quill:session-sync.cjs` and is otherwise sorted in
+   normal fire-count order alongside non-Quill rows.
 2. **Given** a user-installed Claude plugin hook fires, **When** the
-   breakdown renders, **Then** the row for that hook does not display the
-   QUILL chip.
+   breakdown renders, **Then** the row for that hook does not display a
+   `quill:` prefix.
 
 ---
 
@@ -182,8 +182,8 @@ regardless of the Now tab's active timeframe.
 - **FR-005**: System MUST persist hook observations in a dedicated table
   separate from `skill_usages`, `session_events`, and `response_times`, so
   hook analytics can evolve independently.
-- **FR-006**: System MUST tag rows backed by Quill-deployed scripts with a
-  visible QUILL chip when the canonicalized hook identity carries the
+- **FR-006**: System MUST keep the `quill:` prefix visible in rows backed by
+  Quill-deployed scripts when the canonicalized hook identity carries the
   `quill:` prefix produced by the rule in FR-003 (Claude) or when the
   observed script command resolves into Quill's managed script directories
   (Codex).

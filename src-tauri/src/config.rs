@@ -565,3 +565,56 @@ pub fn read_access_token() -> Result<String, String> {
         .map(String::from)
         .ok_or_else(|| "No access token found in credentials".into())
 }
+
+/// Shape of `claude auth status --json`. Only `loggedIn` is read; every other
+/// field is ignored. The CLI emits camelCase, hence the explicit rename.
+#[derive(serde::Deserialize)]
+struct ClaudeAuthStatus {
+    #[serde(rename = "loggedIn")]
+    logged_in: bool,
+}
+
+/// Ask the Claude CLI whether the user is logged in by spawning
+/// `claude auth status --json` UNCONFINED — a plain `tokio::process::Command`
+/// with the inherited environment, NO Landlock/bwrap/sandbox-exec, NO prompt,
+/// NO `-p`, and NO inference. The call only READS login state; it never writes
+/// to the credential store and never refreshes a token.
+///
+/// Returns `Ok(true)`/`Ok(false)` from the parsed `loggedIn` boolean. Any
+/// failure — binary not found, spawn error, ~15s timeout, non-zero exit, or
+/// unparseable JSON — maps to `Err`, which the caller MUST treat as
+/// inconclusive (i.e. do not warn the user; fall back to the Paused state).
+pub async fn claude_logged_in() -> Result<bool, String> {
+    let claude_path =
+        resolve_command_path("claude").ok_or_else(|| "claude binary not found".to_string())?;
+
+    let mut command = tokio::process::Command::new(&claude_path);
+    command
+        .args(["auth", "status", "--json"])
+        .env("PATH", path_for_resolved_command(&claude_path))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn claude auth status: {e}"))?;
+
+    let output =
+        match tokio::time::timeout(std::time::Duration::from_secs(15), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(format!("claude auth status failed: {e}")),
+            Err(_) => return Err("claude auth status timed out".to_string()),
+        };
+
+    if !output.status.success() {
+        return Err(format!("claude auth status exited with {}", output.status));
+    }
+
+    serde_json::from_slice::<ClaudeAuthStatus>(&output.stdout)
+        .map(|status| status.logged_in)
+        .map_err(|e| format!("Failed to parse claude auth status: {e}"))
+}

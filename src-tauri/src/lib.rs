@@ -65,6 +65,14 @@ const CLAUDE_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.claude.cooldown_until";
 const CLAUDE_USAGE_NETWORK_COOLDOWN_UNTIL_KEY: &str = "usage.claude.network_cooldown_until";
 const CLAUDE_USAGE_NETWORK_FAILURES_KEY: &str = "usage.claude.network_failures";
 const CLAUDE_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
+// Verdict cache for the unconfined `claude auth status --json` confirmation.
+// When a Claude poll yields a missing-credentials error we confirm the logout
+// at most once per TTL (the timestamp key) and reuse the last boolean verdict
+// (the logged-in key) in between, so the 3-minute poller does not spawn the CLI
+// every cycle while the user is logged out.
+const CLAUDE_AUTH_STATUS_CHECKED_AT_KEY: &str = "usage.claude.auth_status_checked_at";
+const CLAUDE_AUTH_STATUS_LOGGED_IN_KEY: &str = "usage.claude.auth_status_logged_in";
+const CLAUDE_AUTH_STATUS_TTL_SECS: i64 = 120;
 const MINIMAX_USAGE_LAST_ATTEMPT_KEY: &str = "usage.minimax.last_attempt_at";
 const MINIMAX_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.minimax.cooldown_until";
 const MINIMAX_USAGE_NETWORK_COOLDOWN_UNTIL_KEY: &str = "usage.minimax.network_cooldown_until";
@@ -666,6 +674,95 @@ fn push_offline_error(
     });
 }
 
+// Muted, non-failure signal for a transient pause (stale Claude access token,
+// or an inconclusive logout check). Cached rows are shown alongside; the UI
+// renders a neutral "Paused" badge instead of a red login prompt.
+fn push_paused_error(
+    errors: &mut Vec<UsageProviderError>,
+    provider: integrations::IntegrationProvider,
+) {
+    errors.push(UsageProviderError {
+        provider,
+        kind: ProviderErrorKind::Paused,
+        message: "Paused".into(),
+    });
+}
+
+// Outcome of confirming whether a missing-credentials Claude poll really means
+// the user logged out. `LoggedOut` is the only case that warrants the red
+// "Run: claude /login" guidance; `Paused` covers logged-in-but-inconclusive.
+enum ClaudeLogoutVerdict {
+    LoggedOut,
+    Paused,
+}
+
+// Decide whether a Claude `Credentials` (no local access token) error is a
+// genuine logout or a transient pause. Gated by a ~120s verdict cache so the
+// unconfined `claude auth status --json` spawn runs at most once per TTL even
+// though the poller fires every 3 minutes and `Credentials` recurs each cycle
+// while logged out. Only a confirmed `loggedIn: false` returns `LoggedOut`;
+// `loggedIn: true` OR any inconclusive failure (Err) downgrades to `Paused`.
+async fn resolve_claude_logout_or_paused(now: DateTime<Utc>) -> ClaudeLogoutVerdict {
+    let cache_fresh =
+        usage_setting_timestamp(CLAUDE_AUTH_STATUS_CHECKED_AT_KEY).is_some_and(|checked_at| {
+            now - checked_at < TimeDelta::seconds(CLAUDE_AUTH_STATUS_TTL_SECS)
+        });
+    if cache_fresh {
+        // Within the TTL: reuse the cached verdict. A missing/garbled cached
+        // value is treated as logged-in (Paused) so we never warn on a stale
+        // or unreadable cache entry.
+        return match read_cached_auth_logged_in() {
+            Some(false) => ClaudeLogoutVerdict::LoggedOut,
+            _ => ClaudeLogoutVerdict::Paused,
+        };
+    }
+
+    let verdict = config::claude_logged_in().await;
+    write_usage_setting_timestamp(CLAUDE_AUTH_STATUS_CHECKED_AT_KEY, now);
+    match verdict {
+        Ok(logged_in) => {
+            write_cached_auth_logged_in(logged_in);
+            if logged_in {
+                ClaudeLogoutVerdict::Paused
+            } else {
+                ClaudeLogoutVerdict::LoggedOut
+            }
+        }
+        Err(reason) => {
+            // Inconclusive (binary missing, spawn error, timeout, parse fail):
+            // do NOT warn. Cache logged-in so we stay quiet until the TTL
+            // lapses and we can re-check.
+            log::debug!("claude auth status inconclusive: {reason}");
+            write_cached_auth_logged_in(true);
+            ClaudeLogoutVerdict::Paused
+        }
+    }
+}
+
+fn read_cached_auth_logged_in() -> Option<bool> {
+    let storage = get_storage().ok()?;
+    let value = run_blocking(move || storage.get_setting(CLAUDE_AUTH_STATUS_LOGGED_IN_KEY))
+        .ok()
+        .flatten()?;
+    match value.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn write_cached_auth_logged_in(logged_in: bool) {
+    let Ok(storage) = get_storage() else {
+        return;
+    };
+    let encoded = if logged_in { "true" } else { "false" };
+    if let Err(err) =
+        run_blocking(move || storage.set_setting(CLAUDE_AUTH_STATUS_LOGGED_IN_KEY, encoded))
+    {
+        log::warn!("Failed to persist claude auth verdict: {err}");
+    }
+}
+
 // Pure, testable: maps the fetcher's per-provider error kind onto the
 // UI-facing `ProviderErrorKind`. Returns `None` when the error has a dedicated
 // cooldown path (RateLimited, Request) and should NOT be pushed as a regular
@@ -673,8 +770,13 @@ fn push_offline_error(
 fn classify_claude_error_kind(kind: fetcher::ClaudeUsageErrorKind) -> Option<ProviderErrorKind> {
     use fetcher::ClaudeUsageErrorKind::*;
     match kind {
+        // `Credentials` is gated by a `claude auth status` confirmation in the
+        // poller before it becomes a red `Config` (logged-out) error; this base
+        // mapping is the "confirmed logged out" outcome.
         Credentials => Some(ProviderErrorKind::Config),
-        Unauthorized => Some(ProviderErrorKind::Auth),
+        // A 401 with a token attached is a stale access token, not a logout —
+        // surface a muted Paused badge, never a login prompt.
+        Paused => Some(ProviderErrorKind::Paused),
         RateLimited | Request => None,
         Api | Parse => Some(ProviderErrorKind::Server),
     }
@@ -775,9 +877,16 @@ fn build_usage_data(
     provider_credits: Vec<models::ProviderCredits>,
 ) -> UsageData {
     sort_and_dedup_usage_buckets(&mut buckets);
+    // A `Paused` provider error (stale Claude access token, see
+    // [[lat.md/data-flow#Usage Bucket Fetching]] step 8a) is a transient,
+    // non-failure state and must never become the top-level red error label.
+    // Surface the first *genuine* failure instead, so a Paused-only poll with
+    // no cached rows yet falls through to the muted badge rather than a red
+    // "Failed to load usage data".
     let error = if buckets.is_empty() {
         provider_errors
-            .first()
+            .iter()
+            .find(|provider_error| !matches!(provider_error.kind, ProviderErrorKind::Paused))
             .map(|provider_error| provider_error.message.clone())
     } else {
         None
@@ -916,6 +1025,11 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                     match fetcher::fetch_claude_usage().await {
                         Ok(mut buckets) => {
                             clear_provider_cooldowns(CLAUDE_COOLDOWN_KEYS);
+                            // A successful fetch proves the user is logged in;
+                            // drop any stale auth-status verdict so a fresh
+                            // login is recognized without waiting out the TTL.
+                            clear_usage_setting(CLAUDE_AUTH_STATUS_CHECKED_AT_KEY);
+                            clear_usage_setting(CLAUDE_AUTH_STATUS_LOGGED_IN_KEY);
                             display_buckets.extend(buckets.clone());
                             live_buckets.append(&mut buckets);
                         }
@@ -931,6 +1045,34 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                                 fetcher::ClaudeUsageErrorKind::Request => {
                                     record_network_failure(CLAUDE_COOLDOWN_KEYS, now, provider);
                                     push_offline_error(&mut provider_errors, provider);
+                                }
+                                fetcher::ClaudeUsageErrorKind::Paused => {
+                                    // Stale access token (401). Show cached rows
+                                    // under a muted Paused badge; no cooldown
+                                    // bookkeeping and no login prompt.
+                                    push_paused_error(&mut provider_errors, provider);
+                                }
+                                fetcher::ClaudeUsageErrorKind::Credentials => {
+                                    // No local access token. Confirm with an
+                                    // unconfined `claude auth status` check
+                                    // (verdict-cached) before warning: only a
+                                    // certain logout shows the red prompt.
+                                    match resolve_claude_logout_or_paused(now).await {
+                                        ClaudeLogoutVerdict::LoggedOut => {
+                                            if let Some(kind) = classify_claude_error_kind(
+                                                fetcher::ClaudeUsageErrorKind::Credentials,
+                                            ) {
+                                                provider_errors.push(UsageProviderError {
+                                                    provider,
+                                                    kind,
+                                                    message: error.message,
+                                                });
+                                            }
+                                        }
+                                        ClaudeLogoutVerdict::Paused => {
+                                            push_paused_error(&mut provider_errors, provider);
+                                        }
+                                    }
                                 }
                                 other_kind => {
                                     if let Some(kind) = classify_claude_error_kind(other_kind) {
@@ -1263,8 +1405,8 @@ async fn get_skill_breakdown(
 }
 
 // Feature 009: powers the Now-tab Hooks breakdown. Signature mirrors
-// `get_skill_breakdown`; the storage layer derives the QUILL chip flag
-// from the canonicalized identity prefix. See
+// `get_skill_breakdown`; the storage layer derives the Quill-managed
+// identity flag from the canonicalized prefix. See
 // specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
 // @lat: [[backend#Tauri IPC Commands]]
 #[tauri::command]
@@ -3146,9 +3288,10 @@ mod tests {
             classify_claude_error_kind(Credentials),
             Some(ProviderErrorKind::Config)
         );
+        // A 401 with a token attached is a stale-token Pause, not a logout.
         assert_eq!(
-            classify_claude_error_kind(Unauthorized),
-            Some(ProviderErrorKind::Auth)
+            classify_claude_error_kind(Paused),
+            Some(ProviderErrorKind::Paused)
         );
         assert_eq!(
             classify_claude_error_kind(Api),

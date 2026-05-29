@@ -3564,7 +3564,7 @@ impl Storage {
     /// (or all indexed history when `all_time = true`), splitting
     /// per-provider counts so the All / Codex / Claude filter strip
     /// can pick the right column. `is_quill` is derived from the
-    /// `quill:` identity prefix and drives the QUILL chip in the UI.
+    /// `quill:` identity prefix for Quill-managed row classification.
     /// See specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md.
     // @lat: [[backend#Database#Schema#Hook Invocations]]
     pub fn get_hook_breakdown(

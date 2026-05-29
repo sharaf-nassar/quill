@@ -22,7 +22,7 @@ The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system depe
 
 `src-tauri/tauri.conf.json` defines product name "Quill", identifier `com.quilltoolkit.app`, with a borderless transparent main window (280x340px, min 240x200).
 
-Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage and DEB. Auto-updater uses GitHub releases endpoint with minisign public key verification, and macOS update detection depends on shipping the signed `.app.tar.gz` updater bundle in addition to the DMG installer.
+Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage. The Linux `.deb` was dropped because Tauri's updater only self-updates AppImages, so deb installs were stranded on their installed version. The `bundle.linux.deb.desktopTemplate` (`desktop-template.desktop`) is deliberately retained even with no `.deb` shipped: the AppImage bundler builds its AppDir via the shared Debian data generator (`appimage`'s `linuxdeploy` calls `debian::generate_data`), so that template still drives the AppImage `.desktop` entry — do not remove it as "unused deb config." Auto-updater uses GitHub releases endpoint with minisign public key verification, and macOS update detection depends on shipping the signed `.app.tar.gz` updater bundle in addition to the DMG installer.
 
 ## CI/CD Pipeline
 
@@ -44,7 +44,9 @@ A `create-release` job runs before all builds to create a single draft release. 
 
 Four parallel builds (fail-fast disabled), all depending on `create-release` so `tauri-action` finds the existing draft.
 
-Platforms: Linux (Ubuntu 22.04, AppImage + DEB), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS). Each installs Node.js LTS, the pinned Rust toolchain, and platform-specific system dependencies.
+`tauri-action` runs with `retryAttempts: 3` because its per-build `latest.json` uploads race on the shared release asset (tauri-action#1270); the publish job rebuilds that manifest deterministically regardless (see Release Publishing below).
+
+Platforms: Linux (Ubuntu 22.04, AppImage), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS, runner pinned to `windows-2025`). Each installs Node.js LTS, the pinned Rust toolchain, and platform-specific system dependencies.
 
 ### Version Injection
 
@@ -60,7 +62,7 @@ After build, submits DMG to Apple notary service (35-minute timeout), staples th
 
 A third job (`publish`) waits for all builds, finds the draft release, and renames assets with platform labels (e.g., `Quill_0.3.1_macOS_amd64.dmg`).
 
-It retries the draft lookup for API eventual consistency, updates `latest.json` for the auto-updater, and publishes the release. The macOS build now verifies that `*.app.tar.gz` plus its `.sig` exist before continuing so the published manifest includes `darwin-*` updater entries instead of DMG-only downloads.
+It retries the draft lookup for API eventual consistency, then rebuilds `latest.json` from scratch and publishes the release. Because `tauri-action`'s parallel per-build `latest.json` uploads race on the single shared asset and silently drop platforms (this shipped v0.3.33 with no `linux-x86_64` entry, breaking the updater for Linux), the publish job is the manifest's single writer: after renaming assets it runs `.github/scripts/assemble-latest-json.sh`, which reads each platform's signed `*.sig` asset (distinct names never race) and emits the four base updater keys (`linux-x86_64`, `darwin-aarch64`, `darwin-x86_64`, `windows-x86_64`). The script fails the release if any base platform is missing, turning a silently broken manifest into a hard failure. The macOS build still verifies that `*.app.tar.gz` plus its `.sig` exist before continuing so the `darwin-*` signatures are present to assemble.
 
 ### Required Secrets
 
@@ -136,13 +138,21 @@ Flat config format (v9+) in `eslint.config.js`. Base: `@eslint/js` recommended +
 | detect-private-key | All | Catch hardcoded secrets |
 | shellcheck | `*.sh` | Shell script linting |
 | cargo fmt | `src-tauri/**` | Rust formatting |
-| cargo clippy | `src-tauri/**` | Rust linting (`-D warnings`) |
+| clippy | `src-tauri/**` | Platform-aware Rust linting via `scripts/precommit-rust.sh` (`-D warnings`) |
 | eslint | `src/**/*.{ts,tsx}` | TypeScript linting |
 | tsc --noEmit | `src/**/*.{ts,tsx}` | Type checking |
+
+The `clippy` hook delegates to `scripts/precommit-rust.sh` (see [[infrastructure#Infrastructure#Scripts#Platform-Aware Rust Lint Hook]]) so platform-gated `#[cfg(target_os = "…")]` code is linted on a matching host instead of slipping through to the macOS Release build.
 
 ## Scripts
 
 Utility scripts for development, testing, and documentation tasks.
+
+### Platform-Aware Rust Lint Hook
+
+`scripts/precommit-rust.sh` is the entry point for the `clippy` pre-commit hook. It runs `cargo clippy --all-targets -- -D warnings` against the code the host OS can compile, so platform-gated regressions surface at commit time.
+
+`cargo clippy` only compiles for the host target triple, so `#[cfg(target_os = "…")]` code is invisible to other platforms' lint runs — a macOS-only [[src-tauri/src/lib.rs#macos_proc_pidpath]] call (`libc::proc_pidpath`) compiles clean on Linux and first breaks on the macOS Release build. The script branches on `uname -s`: macOS lints the native Apple target (covering `cfg(target_os = "macos")`); Linux lints its native target and prints a notice that macOS-gated code is not lintable locally, because objc2's build script compiles Objective-C with Apple-only clang flags (`-arch`, `-mmacosx-version-min`) that Linux `cc` rejects. Cross-linting macOS from Linux would require an osxcross toolchain plus a packaged macOS SDK. Mirrors the `--all-targets` strictness of the [[infrastructure#Infrastructure#CI/CD Pipeline#Backend CI Gate]] so the local gate is never laxer than CI.
 
 ### Screenshot Capture
 
