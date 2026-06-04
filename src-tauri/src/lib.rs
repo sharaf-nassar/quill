@@ -1,3 +1,4 @@
+mod appimage_integration;
 #[allow(dead_code)] // Used by learning.rs in upcoming tasks
 mod auth;
 mod brevity;
@@ -412,6 +413,101 @@ async fn check_for_update(app: &tauri::AppHandle) {
             log::error!("Update check failed: {e}");
         }
     }
+}
+
+/// First-run AppImage self-integration prompt (Feature 010).
+///
+/// When running as an un-integrated AppImage, show a one-time native
+/// confirmation. On **Add**: run the shared `integrate` routine and, on success,
+/// an Info dialog (the startup webview toast is unreliable this early). On
+/// **Not now**: persist the decline so the prompt never returns. Inert on
+/// non-AppImage runtimes and once a decision is recorded.
+async fn maybe_prompt_appimage_integration(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    let is_appimage = appimage_integration::running_as_appimage();
+    // The decision read hits synchronous storage; run it on the blocking pool
+    // (never `block_in_place`) so it stays valid regardless of caller thread.
+    let decision = tauri::async_runtime::spawn_blocking(move || {
+        get_storage()
+            .and_then(|s| s.get_setting("appimage.integration"))
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten();
+    if !appimage_integration::should_prompt(decision.as_deref(), is_appimage) {
+        return;
+    }
+
+    let app_handle = app.clone();
+    app.dialog()
+        .message(
+            "Add Quill to your applications menu? This copies Quill to your \
+             Applications folder and creates a launcher with an icon.",
+        )
+        .title("Add Quill to Applications")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Add".into(),
+            "Not now".into(),
+        ))
+        .show(move |confirmed| {
+            // This callback runs on the GTK main thread, not a Tokio worker, so
+            // it must never touch `block_in_place`. Mirror `check_for_update`:
+            // hop onto the async runtime and push the blocking filesystem work
+            // (multi-MB copy) to the blocking pool, then show the result dialog.
+            if confirmed {
+                tauri::async_runtime::spawn(async move {
+                    let integrate_handle = app_handle.clone();
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        appimage_integration::integrate(&integrate_handle)
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {
+                            app_handle
+                                .dialog()
+                                .message(
+                                    "Quill added to your applications menu. You can \
+                                     delete the original download.",
+                                )
+                                .title("Quill Added")
+                                .kind(MessageDialogKind::Info)
+                                .show(|_| {});
+                        }
+                        Ok(Err(error)) => {
+                            log::error!("AppImage integration failed: {error}");
+                            app_handle
+                                .dialog()
+                                .message(format!(
+                                    "Could not add Quill to your applications menu: {error}"
+                                ))
+                                .title("Integration Failed")
+                                .kind(MessageDialogKind::Error)
+                                .show(|_| {});
+                        }
+                        Err(join_error) => {
+                            log::error!("AppImage integration task failed: {join_error}");
+                            app_handle
+                                .dialog()
+                                .message(
+                                    "Could not add Quill to your applications menu: \
+                                     the integration task did not complete.",
+                                )
+                                .title("Integration Failed")
+                                .kind(MessageDialogKind::Error)
+                                .show(|_| {});
+                        }
+                    }
+                });
+            } else {
+                // Declining also writes to storage; keep it off the GTK thread.
+                tauri::async_runtime::spawn_blocking(move || {
+                    appimage_integration::record_declined()
+                });
+            }
+        });
 }
 
 fn get_storage() -> Result<&'static Storage, String> {
@@ -3097,6 +3193,18 @@ pub fn run() {
                     }
                 });
             }
+
+            // Feature 010 (FR-002): if running as an un-integrated AppImage,
+            // offer one-time self-integration via a native prompt. Spawned async
+            // so it never blocks GTK/webview startup (mirrors the tray
+            // check_for_update path). Inert on non-AppImage runtimes.
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    maybe_prompt_appimage_integration(&app_handle).await;
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -3205,6 +3313,8 @@ pub fn run() {
             quit_app,
             install_app_update,
             get_release_notes,
+            appimage_integration::get_appimage_integration_status,
+            appimage_integration::integrate_appimage,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

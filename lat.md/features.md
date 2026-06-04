@@ -363,3 +363,41 @@ The Rust side stores its `ClientInitGuard` in a `OnceLock<Mutex<Option<ClientIni
 Toggling the "Help improve Quill" row in [[src/components/settings/GeneralTab.tsx]] writes through the standard [[features#Settings Window#Runtime Settings IPC]] pipeline and applies immediately on both surfaces.
 
 [[src-tauri/src/lib.rs#set_runtime_settings]] detects a `crash_reporting_enabled` delta and calls [[src-tauri/src/crash_reporting.rs#set_enabled]] directly on the Rust side, then emits `runtime-settings-updated` carrying the resolved `RuntimeSettings`. The frontend `crashReporting` module listens for that event and calls [[src/lib/crashReporting.ts#setCrashReportingEnabled]] so the React-side SDK opens or closes its transport in lock-step. Default is on; the user-facing copy never mentions Sentry and instead emphasises that session data is removed locally before transmission.
+
+## AppImage Desktop Integration
+
+On Linux the AppImage is the only build and has no desktop presence by default. On first launch Quill offers to add itself to the applications menu, with a Settings control to re-run it. Inert on non-AppImage builds.
+
+Detection uses the `APPIMAGE` env var ([[src-tauri/src/appimage_integration.rs#running_as_appimage]]); the pure [[src-tauri/src/appimage_integration.rs#should_prompt]] gate fires the one-time prompt only when running as an AppImage with no decision yet recorded.
+
+### First-run prompt
+
+[[src-tauri/src/lib.rs#maybe_prompt_appimage_integration]] runs async from `.setup()` so it never blocks startup (mirroring the tray update check).
+
+It shows a native `tauri-plugin-dialog` confirmation. **Add** runs the shared integration routine then an info dialog noting the original download can be deleted; **Not now** persists a `declined` decision so the prompt never returns.
+
+### Integration routine
+
+[[src-tauri/src/appimage_integration.rs#integrate]] backs both the prompt and the Settings control, doing all work in user space (no privilege escalation).
+
+It copies `$APPIMAGE` to `~/Applications/Quill.AppImage` (executable), writes `~/.local/share/applications/quill.desktop`, installs an icon extracted from the running AppImage's `$APPDIR` to `~/.local/share/icons/hicolor/256x256/apps/quill.png`, and best-effort refreshes the desktop/icon caches. It is copy-not-move (the running session stays valid, no relaunch) and idempotent. State (`appimage.integration` = `done`/`declined`, plus `appimage.integration_path`) is persisted only after the filesystem work succeeds, so any failure is non-fatal and retryable.
+
+The module is compiled on every target (its two IPC commands are always registered), so the one platform-specific call — setting the executable bit — is `#[cfg(unix)]`-gated to keep the Windows build compiling; integration itself only ever runs on Linux.
+
+### Settings control
+
+The General settings tab ([[src/components/settings/GeneralTab.tsx]]) renders an "Install to applications menu" row only when running as an AppImage, via [[src/hooks/useAppImageIntegration.ts]].
+
+The hook calls [[src-tauri/src/appimage_integration.rs#get_appimage_integration_status]] (reports `is_appimage` + `integrated`, never errors) and [[src-tauri/src/appimage_integration.rs#integrate_appimage]]. The row shows an active install button when not integrated and a disabled "Installed ✓" once done — the path back for users who declined the prompt.
+
+### Install script
+
+The `install.sh` script (repo root) is a `curl | sh` one-liner that handles the *pre-launch* step the app cannot — browsers save downloads non-executable.
+
+It resolves the latest `*_linux_amd64.AppImage` from the GitHub releases API, downloads it to `~/Applications/Quill.AppImage`, marks it executable, and launches it; first-run integration then adds the menu entry. Because it lands the AppImage directly at the integration target, [[src-tauri/src/appimage_integration.rs#copy_appimage]] skips the copy when the source already resolves to the destination (otherwise `std::fs::copy` would truncate the file onto itself).
+
+### Updater interaction
+
+The updater is unchanged: because the menu launches the integrated `~/Applications/Quill.AppImage`, future updates replace that copy in place.
+
+The pre-launch step (a freshly downloaded file lacks an execute bit) is outside the reach of a not-yet-running app; the install script above covers it.

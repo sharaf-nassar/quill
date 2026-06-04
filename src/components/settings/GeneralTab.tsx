@@ -9,6 +9,7 @@ import {
   type UseLearningSettingsResult,
 } from "../../hooks/useLearningSettings";
 import { useToast } from "../../hooks/useToast";
+import { useAppImageIntegration } from "../../hooks/useAppImageIntegration";
 import SettingRow from "./SettingRow";
 import Toggle from "./Toggle";
 
@@ -28,6 +29,7 @@ export function GeneralTab({
   onResetUiPrefs,
 }: GeneralTabProps) {
   const { toast } = useToast();
+  const appImage = useAppImageIntegration();
 
   const handleAlwaysOnTop = (next: boolean) => {
     void runtime.save({ ...runtime.settings, alwaysOnTop: next });
@@ -130,6 +132,29 @@ export function GeneralTab({
           />
         }
       />
+
+      {appImage.isAppImage && (
+        <SettingRow
+          label="Install to applications menu"
+          description="Add Quill to your desktop applications menu with an icon, and keep it auto-updating."
+          control={
+            appImage.integrated ? (
+              <button type="button" className="settings-button" disabled>
+                Installed ✓
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="settings-button settings-button--primary"
+                onClick={() => void appImage.install()}
+                disabled={appImage.installing}
+              >
+                {appImage.installing ? "Installing…" : "Install to applications menu"}
+              </button>
+            )
+          }
+        />
+      )}
 
       <div className="settings-section-header">Advanced</div>
       <SettingRow

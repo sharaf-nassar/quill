@@ -210,13 +210,23 @@ Download the latest release for your platform from the [Releases](../../releases
 
 #### Linux setup
 
-**AppImage** — portable executable, no installation required. It is the only
-Linux build, and the only format Tauri's in-app updater can self-update:
+**Quick install (recommended)** — fetches the latest AppImage, makes it
+executable, installs it to `~/Applications`, and launches it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sharaf-nassar/quill/main/install.sh | sh
+```
+
+**Manual** — the AppImage is a portable executable, but browsers save downloads
+non-executable, so mark it runnable first (it is the only Linux build, and the
+only format the in-app updater can self-update):
 
 ```bash
 chmod +x Quill_*_linux_amd64.AppImage
 ./Quill_*_linux_amd64.AppImage
 ```
+
+On first launch Quill offers to add itself to your applications menu (with an icon) — no manual `.desktop` setup needed. You can re-run this anytime from **Settings → General → "Install to applications menu"**. Once added, Quill auto-updates in place.
 
 > Quill no longer ships a `.deb`: Debian installs can't use the in-app updater
 > (Tauri only self-updates AppImages), so they were stranded on whatever version

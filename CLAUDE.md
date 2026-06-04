@@ -107,13 +107,11 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
-at `specs/009-hooks-breakdown-tab/plan.md`. Linked artifacts:
-- `specs/009-hooks-breakdown-tab/spec.md` — feature specification
-- `specs/009-hooks-breakdown-tab/research.md` — Phase 0 design decisions (R-A..R-G)
-- `specs/009-hooks-breakdown-tab/data-model.md` — Phase 1 hook_invocations schema + migration 27
-- `specs/009-hooks-breakdown-tab/contracts/hook-invocations.md` — Claude extraction + storage contract
-- `specs/009-hooks-breakdown-tab/contracts/hooks-observed-endpoint.md` — POST /api/v1/hooks/observed wire contract
-- `specs/009-hooks-breakdown-tab/contracts/hook-breakdown-ipc.md` — get_hook_breakdown IPC contract
-- `specs/009-hooks-breakdown-tab/quickstart.md` — Phase 1 maintainer verification walkthrough
-- Prior feature context: `specs/008-runtime-redesign/` (active-time runtime tracking, migration 26 session_events), `specs/007-landlock-inference-sandbox/` (in-app learning loop with Landlock-confined CLI inference), `specs/006-learning-hardening-followups/` (honest confinement disclosure), `specs/005-learning-system-hardening/` (R-7 confinement design, migration 25 data model)
+at `specs/010-appimage-first-run-integration/plan.md`. Linked artifacts:
+- `specs/010-appimage-first-run-integration/spec.md` — feature specification
+- `specs/010-appimage-first-run-integration/research.md` — Phase 0 design decisions (R-A..R-I)
+- `specs/010-appimage-first-run-integration/data-model.md` — Phase 1 integration state + launcher entry (no schema change)
+- `specs/010-appimage-first-run-integration/contracts/ipc-commands.md` — get_appimage_integration_status + integrate_appimage IPC contract
+- `specs/010-appimage-first-run-integration/quickstart.md` — Phase 1 maintainer verification walkthrough
+- Prior feature context: `specs/009-hooks-breakdown-tab/` (Hooks breakdown tab, migration 27 hook_invocations), `specs/008-runtime-redesign/` (active-time runtime tracking, migration 26 session_events), `specs/007-landlock-inference-sandbox/` (in-app learning loop with Landlock-confined CLI inference), `specs/006-learning-hardening-followups/` (honest confinement disclosure)
 <!-- SPECKIT END -->
