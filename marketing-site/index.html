@@ -5,46 +5,64 @@
 	<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 	<meta name="color-scheme" content="dark">
 
-	<title>Quill - live telemetry for Claude Code and Codex</title>
-	<meta name="description" content="Quill is an open-source desktop instrument panel for Claude Code and Codex: live limits, usage analytics, session search, context accounting, and learned workflow patterns.">
+	<title>Quill - analytics and tools for AI coding agents</title>
+	<meta name="description" content="Quill is a local desktop console for Claude Code and Codex: complete token analytics plus context, search, and learning tools your agents use too. Open source.">
 
 	<link rel="canonical" href="https://sharaf-nassar.github.io/quill/">
 	<link rel="icon" type="image/png" href="assets/logo.png">
-	<link rel="preload" as="image" href="assets/logo.png">
-	<link rel="preload" as="image" href="assets/screenshots/hero.png" fetchpriority="high">
+	<link rel="preload" as="image" href="assets/logo-mark.png">
+	<link rel="preload" as="image" href="assets/screenshots/hero.png?v=5" fetchpriority="high">
+	<link rel="preload" as="font" type="font/woff2" href="assets/fonts/SpaceGrotesk-wght.woff2" crossorigin>
+	<link rel="preload" as="font" type="font/woff2" href="assets/fonts/Geist-wght.woff2" crossorigin>
 
 	<meta property="og:type" content="website">
 	<meta property="og:url" content="https://sharaf-nassar.github.io/quill/">
-	<meta property="og:title" content="Quill - live telemetry for Claude Code and Codex">
-	<meta property="og:description" content="A desktop instrument panel for live limits, analytics, session search, context accounting, and learned workflow patterns.">
+	<meta property="og:title" content="Quill - analytics and tools for AI coding agents">
+	<meta property="og:description" content="A local desktop console for Claude Code and Codex: complete token analytics plus context, search, and learning tools your agents use too.">
 	<meta property="og:image" content="https://sharaf-nassar.github.io/quill/assets/og-image.png">
 	<meta property="og:image:width" content="1200">
 	<meta property="og:image:height" content="630">
 
 	<meta name="twitter:card" content="summary_large_image">
-	<meta name="twitter:title" content="Quill - live telemetry for Claude Code and Codex">
-	<meta name="twitter:description" content="Track agent limits, analytics, searchable sessions, context movement, and learned workflow patterns from one desktop sidecar.">
+	<meta name="twitter:title" content="Quill - analytics and tools for AI coding agents">
+	<meta name="twitter:description" content="Complete token analytics plus context, search, and learning tools for Claude Code and Codex — local, on your own plan.">
 	<meta name="twitter:image" content="https://sharaf-nassar.github.io/quill/assets/og-image.png">
 
-	<link rel="stylesheet" href="styles.css?v=quiet-logo-palette-20260512">
+	<script type="application/ld+json">
+	{
+		"@context": "https://schema.org",
+		"@type": "SoftwareApplication",
+		"name": "Quill",
+		"applicationCategory": "DeveloperApplication",
+		"operatingSystem": "macOS, Linux, Windows",
+		"description": "A local desktop console for Claude Code and Codex: complete token analytics plus context, search, and learning tools your agents use too.",
+		"offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+		"license": "https://github.com/sharaf-nassar/quill/blob/main/LICENSE",
+		"url": "https://sharaf-nassar.github.io/quill/",
+		"downloadUrl": "https://github.com/sharaf-nassar/quill/releases/latest",
+		"softwareLicense": "MIT",
+		"isAccessibleForFree": true
+	}
+	</script>
+
+	<link rel="stylesheet" href="styles.css?v=slim-4">
 </head>
 <body>
 	<a class="skip-link" href="#main">Skip to content</a>
 
 	<header class="site-header" role="banner">
 		<a class="brand" href="#hero" aria-label="Quill home">
-			<img class="brand-mark" src="assets/logo.png" alt="" width="40" height="40" aria-hidden="true">
+			<img class="brand-mark" src="assets/logo-mark.png" alt="" width="102" height="127" aria-hidden="true">
 			<span class="brand-copy">
 				<span class="brand-name">Quill</span>
-				<span class="brand-role">desktop telemetry</span>
 			</span>
 		</a>
 
 		<nav class="site-nav" aria-label="Marketing sections">
-			<a href="#live">Live</a>
 			<a href="#analytics">Analytics</a>
 			<a href="#context">Context</a>
 			<a href="#search">Search</a>
+			<a href="#live">Live</a>
 			<a href="#learning">Learning</a>
 			<a href="#install">Install</a>
 		</nav>
@@ -60,16 +78,14 @@
 	<main id="main" class="page-shell">
 		<section id="hero" class="hero-section" aria-labelledby="hero-heading">
 			<div class="hero-copy">
-				<p class="prelude">Open-source telemetry for agent-heavy development</p>
+				<p class="prelude">Analytics + agent tooling for Claude Code &amp; Codex</p>
 				<h1 id="hero-heading">
-					Telemetry for live
-					<span class="inline-shot inline-shot-live" aria-hidden="true"></span>
-					AI coding.
+					Stop running your coding agents blind.
 				</h1>
+				<p class="hero-deck">You get the insight. Your agents get the tools.</p>
 				<p class="hero-lede">
-					Quill watches Claude Code, Codex, and MiniMax from the side: live
-					quota pressure, searchable work history, context movement, and
-					workflow rules you can inspect before they become habit.
+					A local console for Claude Code and Codex. It accounts for every
+					token, session, and rule your agents touch — then hands them tools they can use.
 				</p>
 				<div class="hero-actions" aria-label="Primary actions">
 					<a class="button button-primary" href="https://github.com/sharaf-nassar/quill/releases/latest">
@@ -85,9 +101,14 @@
 						</svg>
 					</a>
 				</div>
+				<p class="hero-reassure">
+					Runs on your own Claude plan — no API key, no cloud, no tracking
+					<span aria-hidden="true">·</span> Open source (MIT)
+					<span aria-hidden="true">·</span> macOS, Linux, Windows
+				</p>
 			</div>
 
-			<figure class="hero-stage motion-rise" aria-labelledby="hero-caption">
+			<figure class="hero-stage motion-rise">
 				<div class="hero-window">
 					<div class="window-chrome" aria-hidden="true">
 						<span></span>
@@ -96,211 +117,147 @@
 						<strong>main window</strong>
 					</div>
 					<img
-						src="assets/screenshots/hero.png"
-						alt="Quill main window showing live Claude and Codex limit buckets beside analytics cards for runtime, preserved context, retrieved context, efficiency, velocity, and routing cost."
-						width="1100"
-						height="720"
+						src="assets/screenshots/hero.png?v=5"
+						alt="Quill main window: the Live usage pane — session, project, and token sparklines with Claude and Codex rate-limit bars — stacked above the Analytics dashboard on its 7-day Now view (runtime, efficiency, velocity, preserved and retrieved tokens, routing cost, and a session breakdown)."
+						width="453"
+						height="1098"
 						loading="eager"
 						fetchpriority="high"
 					>
 				</div>
-				<div class="hero-float hero-float-search" aria-hidden="true">
-					<span>indexed sessions</span>
-					<strong>branch, file, tool, host</strong>
-				</div>
-				<div class="hero-float hero-float-context" aria-hidden="true">
-					<span>context store</span>
-					<strong>saved and retrieved separately</strong>
-				</div>
-				<figcaption id="hero-caption">
-					The actual desktop window is the proof surface, not a drawn mockup.
-				</figcaption>
 			</figure>
 		</section>
 
-		<section class="signal-strip" aria-label="Quill positioning">
-			<p>Not a chat client.</p>
-			<p>Not a wrapper around your agent.</p>
-			<p>A sidecar for the parts of agent work that disappear mid-run.</p>
-		</section>
-
-		<section class="bento-section" aria-labelledby="bento-heading">
-			<div class="section-intro">
-				<p class="prelude">What Quill makes visible</p>
-				<h2 id="bento-heading">
-					The work is already happening. Quill gives it instrumentation.
-				</h2>
-			</div>
-
-			<div class="feature-bento" aria-label="Quill feature map">
-				<section id="live" class="feature-card feature-card-live motion-rise" aria-labelledby="live-heading">
-					<div class="card-copy">
-						<p class="card-label">Live limits</p>
-						<h3 id="live-heading">Know the cap before it cuts the run.</h3>
-						<p>Bucket utilization, elapsed window, reset timing, and severity stay visible while the agents keep working.</p>
-					</div>
-					<div class="card-media card-media-large">
-						<img src="assets/screenshots/live.png" alt="Quill live pane with provider limit buckets, token totals, reset countdowns, and utilization bars." width="1100" height="720" loading="lazy">
-					</div>
-				</section>
-
-				<section id="analytics" class="feature-card feature-card-analytics motion-rise" aria-labelledby="analytics-heading">
-					<div class="card-copy">
-						<p class="card-label">Analytics</p>
-						<h3 id="analytics-heading">Session metrics that answer operational questions.</h3>
-						<p>Runtime, token efficiency, code velocity, context savings, retrieval, and routing cost share one timeline.</p>
-					</div>
-					<div class="card-media analytics-pair">
-						<img src="assets/screenshots/analytics-now.png" alt="Quill Analytics Now tab showing cards for runtime, efficiency, velocity, preserved tokens, retrieved tokens, and routing cost." width="1100" height="720" loading="lazy">
-						<img src="assets/screenshots/analytics-charts.png" alt="Quill Analytics Charts tab showing synchronized token, code-change, and cache-efficiency curves." width="1100" height="720" loading="lazy">
-					</div>
-				</section>
-
-				<section id="context" class="feature-card feature-card-context motion-rise" aria-labelledby="context-heading">
-					<div class="card-copy">
-						<p class="card-label">Context accounting</p>
-						<h3 id="context-heading">Large content becomes a reference instead of a paste.</h3>
-						<p>Quill separates preserved tokens, retrieved tokens, routing cost, and telemetry so savings are not hand-waved.</p>
-					</div>
-				</section>
-
-				<section id="search" class="feature-card feature-card-search motion-rise" aria-labelledby="search-heading">
-					<div class="card-copy">
-						<p class="card-label">Session search</p>
-						<h3 id="search-heading">Past runs become an index, not a memory test.</h3>
-						<p>Find work by prompt text, branch, project, host, role, file, command, or tool action.</p>
-					</div>
-					<div class="card-media card-media-crop">
-						<img src="assets/screenshots/sessions.png" alt="Quill Session Search window with filtered results, project paths, timestamps, snippets, and code-change context." width="1100" height="720" loading="lazy">
-					</div>
-				</section>
-
-				<section id="learning" class="feature-card feature-card-learning motion-rise" aria-labelledby="learning-heading">
-					<div class="card-copy">
-						<p class="card-label">Learning system</p>
-						<h3 id="learning-heading">Repeated behavior becomes a rule you can inspect.</h3>
-						<p>Rules carry provenance, confidence, domain, project, and state before they influence future sessions.</p>
-					</div>
-					<div class="card-media card-media-crop">
-						<img src="assets/screenshots/learning.png" alt="Quill Learning window showing discovered rules, confidence values, state labels, and domain breakdowns." width="1100" height="720" loading="lazy">
-					</div>
-				</section>
-			</div>
-		</section>
-
-		<section class="accordion-section" aria-labelledby="accordion-heading">
-			<div class="section-intro section-intro-split">
-				<p class="prelude">Where it helps during the run</p>
-				<h2 id="accordion-heading">
-					Every panel answers a different kind of operator panic.
-				</h2>
-			</div>
-
-			<div class="accordion-row" aria-label="Quill workflow surfaces">
-				<a class="accordion-panel" href="#live">
-					<img src="assets/screenshots/live.png" alt="Live usage screenshot crop." width="1100" height="720" loading="lazy">
-					<span>Quota pressure</span>
-					<strong>Is this model window about to close?</strong>
-				</a>
-				<a class="accordion-panel" href="#analytics">
-					<img src="assets/screenshots/analytics-now.png" alt="Analytics Now screenshot crop." width="1100" height="720" loading="lazy">
-					<span>Run shape</span>
-					<strong>Is the session getting slower or more expensive?</strong>
-				</a>
-				<a class="accordion-panel" href="#context">
-					<img src="assets/screenshots/analytics-context.png" alt="Context analytics screenshot crop." width="1100" height="720" loading="lazy">
-					<span>Context movement</span>
-					<strong>What was saved, and what came back?</strong>
-				</a>
-				<a class="accordion-panel" href="#search">
-					<img src="assets/screenshots/sessions.png" alt="Session search screenshot crop." width="1100" height="720" loading="lazy">
-					<span>Work history</span>
-					<strong>Where did that fix happen last week?</strong>
-				</a>
-			</div>
-		</section>
-
-		<section class="proof-run" aria-labelledby="proof-heading">
-			<div class="proof-copy">
-				<p class="prelude">The proof run</p>
-				<h2 id="proof-heading">One window follows the whole session.</h2>
-				<p class="scrub-copy" data-scrub-text>
-					Quill is built for the moment when the transcript is too large, the
-					reset timer matters, and the useful answer is buried in a session
-					from another branch. It keeps those signals close enough to change
-					what you do next.
+		<section id="analytics" class="spotlight motion-rise" aria-labelledby="analytics-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Usage over time</p>
+				<h2 id="analytics-heading">Every token accounted for — not estimated.</h2>
+				<p>
+					Token usage, code added and removed, and cache-hit efficiency on
+					three synchronized timelines — zoom from the last hour out to 30
+					days. Every point is measured from real Claude and Codex sessions,
+					not sampled or estimated.
 				</p>
 			</div>
-
-			<div class="proof-stack" aria-label="Product screenshots">
-				<figure class="proof-frame motion-rise">
-					<img src="assets/screenshots/analytics-context.png" alt="Context accounting tab with preserved and retrieved token analytics." width="1100" height="720" loading="lazy">
-					<figcaption>Context is counted as stored, retrieved, routed, and observed.</figcaption>
-				</figure>
-				<figure class="proof-frame motion-rise">
-					<img src="assets/screenshots/analytics-charts.png" alt="Charts tab showing synchronized utilization, token, code, and cache-efficiency data." width="1100" height="720" loading="lazy">
-					<figcaption>Token spikes can be compared against code movement and cache behavior.</figcaption>
-				</figure>
-				<figure class="proof-frame motion-rise">
-					<img src="assets/screenshots/sessions.png" alt="Session search results with snippets, projects, and code-change context." width="1100" height="720" loading="lazy">
-					<figcaption>Search results include enough surrounding context to act on them.</figcaption>
-				</figure>
-			</div>
+			<figure class="spotlight-media">
+				<div class="shot">
+					<img src="assets/screenshots/analytics-charts.png?v=3" alt="Quill Analytics Charts view: three synchronized timelines of token usage, code added and removed, and cache-hit efficiency over the selected range." width="480" height="420" loading="lazy">
+				</div>
+			</figure>
 		</section>
 
-		<section class="field-notes" aria-labelledby="notes-heading">
-			<div class="notes-copy">
-				<p class="prelude">Field notes</p>
-				<h2 id="notes-heading">The value is not another dashboard. It is fewer blind spots.</h2>
+		<section id="context" class="spotlight spotlight-reverse motion-rise" aria-labelledby="context-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Working memory · your agents use it too</p>
+				<h2 id="context-heading">Keep bloated context out of the model's window.</h2>
+				<p>
+					Quill gives your agent tools it calls directly — offloading web
+					fetches, command output, and file dumps into a local store and
+					returning only the chunk that matters. A routing layer keeps the
+					bloat out of the transcript, so the model stays focused on its
+					actual work.
+				</p>
+				<p class="callout">Yes — the LLM uses Quill too.</p>
+				<ul class="mcp-chips" aria-label="Tools the agent calls">
+					<li>quill_index_context</li>
+					<li>quill_execute</li>
+					<li>quill_fetch_and_index</li>
+					<li>quill_search_context</li>
+					<li>search_history</li>
+				</ul>
 			</div>
-
-			<div class="note-carousel" data-carousel>
-				<div class="note-portraits" aria-hidden="true">
-					<img src="assets/screenshots/live.png" alt="" width="1100" height="720" loading="lazy">
-					<img src="assets/screenshots/analytics-context.png" alt="" width="1100" height="720" loading="lazy">
-					<img src="assets/screenshots/learning.png" alt="" width="1100" height="720" loading="lazy">
+			<figure class="spotlight-media">
+				<div class="shot">
+					<img src="assets/screenshots/analytics-context.png?v=2" alt="Quill Context tab with preserved, retrieved, routing-cost, and telemetry columns, a stacked-bar trend, and a directional event log." width="480" height="600" loading="lazy">
 				</div>
+			</figure>
+		</section>
 
-				<div class="note-slides">
-					<article class="note-slide is-active">
-						<p>When a run slows down, Quill shows whether the problem is quota pressure, token overhead, or context retrieval.</p>
-						<span>debugging a long agent session</span>
-					</article>
-					<article class="note-slide">
-						<p>When an old conversation matters again, Quill searches the indexed transcript and the file changes around it.</p>
-						<span>reconstructing prior work</span>
-					</article>
-					<article class="note-slide">
-						<p>When a repeated instruction keeps appearing, Quill exposes the rule, confidence, and source before it becomes guidance.</p>
-						<span>turning behavior into a rule</span>
-					</article>
-				</div>
+		<div class="section-intro section-intro-band">
+			<p class="prelude">Across Claude Code &amp; Codex</p>
+			<h2 id="bento-heading">Recall, limits, and learning — in one local window.</h2>
+		</div>
 
-				<div class="carousel-controls" aria-label="Field note controls">
-					<button type="button" data-carousel-prev aria-label="Previous field note">
-						<svg viewBox="0 0 24 24" aria-hidden="true">
-							<path d="M15 6 9 12l6 6" />
-						</svg>
-					</button>
-					<button type="button" data-carousel-next aria-label="Next field note">
-						<svg viewBox="0 0 24 24" aria-hidden="true">
-							<path d="m9 6 6 6-6 6" />
-						</svg>
-					</button>
-				</div>
+		<section id="search" class="spotlight motion-rise" style="--shot-w: 520px" aria-labelledby="search-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Total recall</p>
+				<h2 id="search-heading">Every past run, indexed — Claude and Codex.</h2>
+				<p>Full-text search across prompts, tool calls, code changes, commands, files, and branches. Find where that fix happened, in any project, in seconds — and your agents can search it too.</p>
 			</div>
+			<figure class="spotlight-media">
+				<div class="shot">
+					<img src="assets/screenshots/sessions.png?v=2" alt="Quill Session Search window with filtered results, project paths, timestamps, snippets, and code-change context." width="588" height="716" loading="lazy">
+				</div>
+			</figure>
+		</section>
+
+		<section id="live" class="spotlight spotlight-reverse motion-rise" aria-labelledby="live-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Live limits</p>
+				<h2 id="live-heading">Know the cap before it cuts the run.</h2>
+				<p>Real-time quota pressure for Claude and Codex — utilization, reset countdowns, and severity, side by side, refreshing while the agents work.</p>
+			</div>
+			<figure class="spotlight-media spotlight-media-wide">
+				<div class="shot">
+					<img src="assets/screenshots/live.png?v=2" alt="Quill live pane with provider limit buckets, token totals, reset countdowns, and utilization bars." width="480" height="600" loading="lazy">
+				</div>
+			</figure>
+		</section>
+
+		<section id="learning" class="spotlight motion-rise" style="--shot-w: 520px" aria-labelledby="learning-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Behavioral learning</p>
+				<h2 id="learning-heading">Your agent learns your rules — only after Quill proves they help.</h2>
+				<p>Quill mines your sessions, git history, and tool use for reusable rules, then runs each through a counterfactual replay test before it's ever written to your agent's config. You approve everything that ships.</p>
+			</div>
+			<figure class="spotlight-media">
+				<div class="shot">
+					<img src="assets/screenshots/learning.png?v=2" alt="Quill Learning window with five active rules, three discovered candidate rules, confidence values, and a domain breakdown." width="520" height="722" loading="lazy">
+				</div>
+			</figure>
+		</section>
+
+		<div class="section-intro section-intro-band">
+			<p class="prelude">More agent tools</p>
+			<h2 id="tools-heading">Help your coding agents operate better.</h2>
+		</div>
+
+		<section id="memory" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 520px" aria-labelledby="memory-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Memory tools</p>
+				<h2 id="memory-heading">Keep your agent's memory clean and current.</h2>
+				<p>Quill reviews your <code>CLAUDE.md</code> / <code>AGENTS.md</code> and memory files and proposes merges, updates, and deletions — with a diff, one-click undo, and an optional pass that compresses prose while preserving every code block, path, and number.</p>
+			</div>
+			<figure class="spotlight-media spotlight-media-wide">
+				<div class="shot">
+					<img src="assets/screenshots/memory.png?v=2" alt="Quill Memories panel with an All Projects (4) selector, listing one memory file per project — components.md, rate-limits.md, data-prep.md, conventions.md — each tagged CONTEXT or CONVENTION with a one-line description, and an Optimize All control." width="520" height="414" loading="lazy">
+				</div>
+			</figure>
+		</section>
+
+		<section id="brevity" class="spotlight motion-rise" style="--shot-w: 560px" aria-labelledby="brevity-heading">
+			<div class="spotlight-copy">
+				<p class="card-label">Prose compression</p>
+				<h2 id="brevity-heading">Get tighter answers from your agents.</h2>
+				<p>One toggle asks your agent to write its own prose in a compressed style — preserving code, paths, commands, and numbers exactly. Shorter answers, same substance.</p>
+			</div>
+			<figure class="spotlight-media spotlight-media-wide spotlight-media-brevity">
+				<div class="shot">
+					<img src="assets/screenshots/brevity.png?v=2" alt="Quill Brevity profile toggle switched on, with an explanation that it compresses the agent's prose while preserving code, paths, commands, and numbers exactly." width="560" height="192" loading="lazy">
+				</div>
+			</figure>
 		</section>
 
 		<section id="install" class="install-section" aria-labelledby="install-heading">
 			<div class="install-copy">
 				<p class="prelude">Install</p>
 				<h2 id="install-heading">
-					Put the instrument panel beside the agents you already use.
+					Put it beside the agents you already use.
 				</h2>
 				<p>
-					MIT licensed. Tauri + React. Static releases for macOS, Linux, and
-					Windows. No hosted account is required for the marketing page or the
-					desktop app.
+					Quill runs entirely on your machine and your own Claude plan — its AI
+					features drive your local Claude CLI inside an OS sandbox. No API key,
+					no account, no tracking. MIT-licensed.
 				</p>
 				<div class="hero-actions">
 					<a class="button button-primary" href="https://github.com/sharaf-nassar/quill/releases/latest">
@@ -321,22 +278,22 @@
 			<div class="install-ledger" aria-label="Install details">
 				<div>
 					<span>Providers</span>
-					<p>Claude Code, Codex, and MiniMax with setup and status surfaced in the app.</p>
+					<p>Claude Code and Codex, with setup and status surfaced in the app.</p>
 				</div>
 				<div>
 					<span>Platforms</span>
 					<p>macOS universal DMG, Linux AppImage, Windows NSIS installer.</p>
 				</div>
 				<div>
-					<span>Project</span>
-					<p>Open source repository with architecture notes, Pages deploy workflow, and screenshot pipeline.</p>
+					<span>Privacy</span>
+					<p>100% local. Sandboxed inference on your own plan, read-only OAuth, no tracking.</p>
 				</div>
 			</div>
 		</section>
 	</main>
 
 	<footer class="site-footer">
-		<p>Quill - open-source telemetry for Claude Code, Codex, and MiniMax.</p>
+		<p>Quill - local analytics and agent tools for Claude Code and Codex.</p>
 		<nav aria-label="Footer links">
 			<a href="https://github.com/sharaf-nassar/quill">Source</a>
 			<a href="https://github.com/sharaf-nassar/quill/releases/latest">Releases</a>
@@ -346,6 +303,6 @@
 
 	<script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/gsap.min.js" defer></script>
 	<script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/ScrollTrigger.min.js" defer></script>
-	<script src="motion.js?v=signal-20260511" defer></script>
+	<script src="motion.js?v=insight-20260619" defer></script>
 </body>
 </html>
