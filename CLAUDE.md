@@ -108,3 +108,19 @@ The second example is invalid because `Bad Section` has no leading paragraph. `l
 For additional context about technologies to be used, project structure,
 shell commands, and other important information, read the current plan
 <!-- SPECKIT END -->
+
+# Design Context
+
+Frontend/UI work is grounded by two root design files. Read both before designing,
+restyling, or building any UI — they describe the target visual system.
+
+- **PRODUCT.md** — strategic context: register (`product` — the desktop app UI is the
+  primary surface), users, brand personality, anti-references, design principles.
+- **DESIGN.md** — the visual system. North Star **"The Glass Cockpit"**: a near-black
+  instrument with a reserved green/amber/red severity meter, a fixed provider
+  color-code (Claude blue · Codex cyan · MiniMax violet · Agent orchid), Geist /
+  Geist Mono with tabular figures, and two densities (Primary Flight Display vs.
+  Systems Pages). `.impeccable/design.json` is its machine-readable sidecar.
+
+These describe the target system, not necessarily the current `src/` — when they
+diverge, the design files are the intent.

@@ -3,7 +3,7 @@
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: #121216;
+  background: var(--console-black);
 }
 
 .sessions-window-titlebar {
@@ -11,7 +11,7 @@
   align-items: center;
   min-height: 28px;
   padding: 2px 8px;
-  background: #121216;
+  background: var(--console-black);
   flex-shrink: 0;
 }
 
@@ -104,10 +104,10 @@
   width: 100%;
   padding: 8px 10px;
   margin-bottom: 8px;
-  background: #1a1a1f;
+  background: var(--slate-input);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
-  color: #d4d4d4;
+  color: var(--readout);
   font-size: 12px;
   font-family: inherit;
   outline: none;
@@ -119,8 +119,8 @@
 }
 
 .sessions-search-input:focus {
-  border-color: #22C55E;
-  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.2);
+  border-color: var(--signal-blue);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.25);
 }
 
 /* ─── Filter bar ─── */
@@ -153,10 +153,10 @@
 
 .sessions-filter-select,
 .sessions-filter-date {
-  background: #1a1a1f;
+  background: var(--slate-input);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 4px;
-  color: #d4d4d4;
+  color: var(--readout);
   font-size: 10px;
   padding: 4px 6px;
   outline: none;
@@ -165,7 +165,7 @@
 
 .sessions-filter-select:focus,
 .sessions-filter-date:focus {
-  border-color: #22C55E;
+  border-color: var(--signal-blue);
 }
 
 .sessions-filter-date {
@@ -205,13 +205,13 @@
 }
 
 .sessions-sort-btn.active {
-	background: rgba(34, 197, 94, 0.15);
-	color: #22C55E;
+	background: rgba(96, 165, 250, 0.15);
+	color: var(--signal-blue);
 }
 
 /* ─── Results header ─── */
 .sessions-results-header {
-  color: #888;
+  color: var(--label);
   font-size: 10px;
   margin-bottom: 6px;
   padding: 0 2px;
@@ -219,8 +219,8 @@
 
 /* ─── Result card ─── */
 .sessions-result-card {
-  background: #1e1e24;
-  border: 1px solid #2a2a2f;
+  background: var(--panel-raised);
+  border: 1px solid var(--graphite-line);
   border-radius: 6px;
   padding: 8px 10px;
   margin-bottom: 4px;
@@ -234,8 +234,8 @@
 }
 
 .sessions-result-card--selected {
-  background: rgba(34, 197, 94, 0.06);
-  border-color: rgba(34, 197, 94, 0.3);
+  background: rgba(96, 165, 250, 0.06);
+  border-color: rgba(96, 165, 250, 0.3);
 }
 
 .sessions-result-header-row {
@@ -256,22 +256,22 @@
 }
 
 .sessions-provider-badge.claude {
-  color: #F9A8D4;
-  background: rgba(244, 114, 182, 0.12);
-  border-color: rgba(244, 114, 182, 0.22);
+  color: var(--provider-claude);
+  background: rgba(96, 165, 250, 0.12);
+  border-color: rgba(96, 165, 250, 0.22);
 }
 
 .sessions-provider-badge.codex {
-  color: #7DD3FC;
-  background: rgba(56, 189, 248, 0.12);
-  border-color: rgba(56, 189, 248, 0.22);
+  color: var(--provider-codex);
+  background: rgba(34, 211, 238, 0.12);
+  border-color: rgba(34, 211, 238, 0.22);
 }
 
 .sessions-result-snippet {
   flex: 1;
   font-size: 11px;
   line-height: 1.5;
-  color: #d4d4d4;
+  color: var(--readout);
   overflow: hidden;
   display: -webkit-box;
   -webkit-line-clamp: 3;
@@ -279,14 +279,14 @@
 }
 
 .sessions-result-snippet mark {
-  background: rgba(34, 197, 94, 0.3);
+  background: rgba(96, 165, 250, 0.3);
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
 }
 
 .sessions-result-meta {
-  color: #888;
+  color: var(--label);
   font-size: 10px;
   margin-top: 4px;
   padding-left: 20px;
@@ -303,11 +303,11 @@
 }
 
 .sessions-role-icon.user {
-  color: #60A5FA;
+  color: var(--signal-blue);
 }
 
 .sessions-role-icon.assistant {
-  color: #22C55E;
+  color: var(--signal-violet);
 }
 
 /* ─── Detail panel ─── */
@@ -344,19 +344,19 @@
 .sessions-detail-snippet {
   font-size: 12px;
   line-height: 1.6;
-  color: #d4d4d4;
+  color: var(--readout);
   margin-bottom: 6px;
 }
 
 .sessions-detail-snippet mark {
-  background: rgba(34, 197, 94, 0.3);
+  background: rgba(96, 165, 250, 0.3);
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
 }
 
 .sessions-detail-meta {
-  color: #888;
+  color: var(--label);
   font-size: 10px;
 }
 
@@ -393,8 +393,8 @@
 }
 
 .sessions-context-msg.match {
-  background: rgba(34, 197, 94, 0.08);
-  border: 1px solid rgba(34, 197, 94, 0.15);
+  background: rgba(96, 165, 250, 0.08);
+  border: 1px solid rgba(96, 165, 250, 0.15);
 }
 
 .sessions-context-role {
@@ -449,7 +449,7 @@
 .sessions-load-more {
   display: block;
   margin: 8px auto;
-  background: #1e1e24;
+  background: var(--panel-raised);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 4px;
   color: rgba(255, 255, 255, 0.6);
@@ -488,11 +488,11 @@
 }
 
 .sessions-loc-pill.positive {
-	background: rgba(34, 197, 94, 0.15);
-	color: #22c55e;
+	background: rgba(52, 211, 153, 0.15);
+	color: var(--meter-green);
 }
 
 .sessions-loc-pill.negative {
 	background: rgba(248, 113, 113, 0.15);
-	color: #f87171;
+	color: var(--meter-red);
 }

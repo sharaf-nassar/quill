@@ -1,0 +1,163 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-06-28T12:00:00Z",
+  "title": "Design System: Quill",
+  "extensions": {
+    "colorMeta": {
+      "console-black": { "role": "neutral", "displayName": "Console Black", "canonical": "#121216", "tonalRamp": ["#0a0a0d", "#121216", "#1c1c22", "#26262e", "#34343d", "#45454f", "#5a5a66", "#74747f"] },
+      "card-graphite": { "role": "neutral", "displayName": "Card Graphite", "canonical": "#161b22", "tonalRamp": ["#0d1117", "#161b22", "#21262d", "#2d333b", "#3a414b", "#4a525e", "#5d6671", "#717b87"] },
+      "signal-blue": { "role": "primary", "displayName": "Signal Blue", "canonical": "#60a5fa", "tonalRamp": ["#0b1f3a", "#102a4d", "#1b3e6b", "#2b5894", "#3f72bd", "#60a5fa", "#93c2fc", "#c7e0fe"] },
+      "meter-green": { "role": "secondary", "displayName": "Meter Green", "canonical": "#34d399", "tonalRamp": ["#06241a", "#0a3a2a", "#0f5740", "#157a59", "#1fa074", "#34d399", "#6ee7b7", "#b5f3da"] },
+      "meter-amber": { "role": "secondary", "displayName": "Caution Amber", "canonical": "#fbbf24", "tonalRamp": ["#2a1d02", "#3f2c05", "#5e420a", "#856010", "#b8851a", "#fbbf24", "#fcd569", "#fde9ad"] },
+      "meter-red": { "role": "secondary", "displayName": "Master-Warning Red", "canonical": "#f87171", "tonalRamp": ["#2e0f0f", "#471717", "#6b2222", "#963030", "#c84444", "#f87171", "#fba5a5", "#fdd0d0"] },
+      "signal-cyan": { "role": "tertiary", "displayName": "Codex Cyan", "canonical": "#22d3ee", "tonalRamp": ["#04282e", "#063d46", "#0a5b68", "#0f7e90", "#1aa6bd", "#22d3ee", "#67e3f4", "#a9f0f9"] },
+      "signal-violet": { "role": "tertiary", "displayName": "MiniMax Violet", "canonical": "#a78bfa", "tonalRamp": ["#1c1340", "#2b1d5e", "#3f2c84", "#5840ad", "#7660d4", "#a78bfa", "#c4b1fc", "#e0d6fe"] },
+      "signal-orchid": { "role": "tertiary", "displayName": "Agent Orchid", "canonical": "#c084fc", "tonalRamp": ["#22113f", "#341a5e", "#4b2785", "#6738ad", "#8f57d8", "#c084fc", "#d6aefd", "#ebd7fe"] }
+    },
+    "typographyMeta": {
+      "data": { "displayName": "Data", "purpose": "Large live readouts — token totals, the headline number on an insight card. Tabular, weight 700." },
+      "title": { "displayName": "Title", "purpose": "Section and card headings, panel names." },
+      "body": { "displayName": "Body", "purpose": "Rows and primary text. The 11px base size of the instrument." },
+      "label": { "displayName": "Label", "purpose": "Uppercase meta, badges, and the small tags on controls. The dense cockpit's connective tissue." },
+      "mono": { "displayName": "Mono", "purpose": "Geist Mono for ids, paths, code, diffs, and aligned numeric columns only — never decorative." }
+    },
+    "shadows": [
+      { "name": "menu", "value": "0 4px 12px rgba(0,0,0,0.5)", "purpose": "Dropdown and context menus raised off the canvas." },
+      { "name": "popover", "value": "0 8px 24px rgba(0,0,0,0.6)", "purpose": "Tooltips and detached floating panels — the highest everyday layer." },
+      { "name": "modal", "value": "0 24px 40px rgba(0,0,0,0.45)", "purpose": "Confirmation dialogs; the rare full-attention layer." },
+      { "name": "inset-ring", "value": "inset 0 0 0 1px rgba(255,255,255,0.20)", "purpose": "1px keyboard-focus keyline on chrome where an outline would clip." }
+    ],
+    "motion": [
+      { "name": "ease-standard", "value": "0.15s ease", "purpose": "Default for color/background/border state transitions." },
+      { "name": "ease-titlebar", "value": "140ms ease", "purpose": "Titlebar control hover transitions." },
+      { "name": "meter-fill", "value": "width 0.3s ease", "purpose": "Meter and time-bar fills — calm ballistics, not twitchy." },
+      { "name": "reveal", "value": "200ms cubic-bezier(0.32, 0.72, 0, 1)", "purpose": "The active-tab underline wipe; the system's one expressive easing." },
+      { "name": "reduced-motion", "value": "prefers-reduced-motion: reduce", "purpose": "Crossfade or instant; meter fills snap to value, the underline appears without a wipe." }
+    ],
+    "breakpoints": [
+      { "name": "hud-min", "value": "280px", "purpose": "Default always-on-top window width; the PFD must stay legible at this size." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Usage Meter Row",
+      "kind": "custom",
+      "refersTo": "signature",
+      "description": "The PFD hero: label/value/countdown over a thin track with a discrete severity fill and a pace marker. The clearest expression of the Glass Cockpit.",
+      "html": "<div class='ds-meter-row'><div class='ds-meter-top'><span class='ds-meter-label'>Sonnet · 5h</span><span class='ds-meter-pct'>68%</span><span class='ds-meter-countdown'>2h 14m</span></div><div class='ds-meter-track'><div class='ds-meter-fill ds-meter-fill--amber' style='width:68%'></div><div class='ds-meter-marker' style='left:55%'></div></div></div>",
+      "css": ".ds-meter-row{background:rgba(255,255,255,0.03);border-radius:8px;padding:8px 10px;font-family:Geist,-apple-system,'Segoe UI',sans-serif;} .ds-meter-top{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;margin-bottom:6px;font-size:11px;font-variant-numeric:tabular-nums;} .ds-meter-label{color:#8b949e;font-weight:600;} .ds-meter-pct{color:#fbbf24;font-weight:700;text-align:center;} .ds-meter-countdown{color:#6e7681;font-weight:600;text-align:right;} .ds-meter-track{position:relative;height:4px;border-radius:2px;background:rgba(255,255,255,0.04);} .ds-meter-fill{height:100%;border-radius:2px;transition:width 0.3s ease;} .ds-meter-fill--green{background:#34d399;} .ds-meter-fill--amber{background:#fbbf24;} .ds-meter-fill--red{background:#f87171;} .ds-meter-marker{position:absolute;top:-1px;width:2px;height:6px;border-radius:1px;background:rgba(200,200,220,0.7);transform:translateX(-50%);}"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one place blue becomes a background — a committed/active action. Used sparingly.",
+      "html": "<button class='ds-btn-primary'>&#8734; All time</button>",
+      "css": ".ds-btn-primary{display:inline-flex;align-items:center;gap:6px;background:rgba(96,165,250,0.92);color:#0a0f1a;border:1px solid rgba(96,165,250,0.92);border-radius:2px;font-family:Geist,sans-serif;font-size:9px;font-weight:700;letter-spacing:0.11em;text-transform:uppercase;padding:4px 9px;min-height:24px;cursor:pointer;transition:background 0.15s ease,border-color 0.15s ease;} .ds-btn-primary:hover{background:#7ab8ff;border-color:#7ab8ff;} .ds-btn-primary:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+    },
+    {
+      "name": "Feature Tab",
+      "kind": "nav",
+      "refersTo": "button-ghost",
+      "description": "The cockpit's primary navigation gesture: a ghost text tab whose active state grows a wiping underline.",
+      "html": "<button class='ds-tab ds-tab--active'>Analytics</button>",
+      "css": ".ds-tab{position:relative;background:none;border:none;color:rgba(255,255,255,0.42);font-family:Geist,sans-serif;font-size:10px;font-weight:600;letter-spacing:1.6px;text-transform:uppercase;padding:0 11px;height:26px;border-radius:2px;cursor:pointer;transition:color 140ms ease;} .ds-tab::after{content:'';position:absolute;left:50%;bottom:3px;width:0;height:1.5px;background:rgba(255,255,255,0.92);transform:translateX(-50%);transition:width 200ms cubic-bezier(0.32,0.72,0,1);border-radius:1px;} .ds-tab:hover{color:rgba(255,255,255,0.78);} .ds-tab--active{color:rgba(255,255,255,0.96);} .ds-tab--active::after{width:calc(100% - 22px);} .ds-tab:focus-visible{outline:none;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.20);}"
+    },
+    {
+      "name": "Status Toggle",
+      "kind": "button",
+      "refersTo": "toggle-on",
+      "description": "Provider/feature switch whose tone IS the status light: on=green, off=dim, setup=amber, unavailable=red, busy=blue (pulsing).",
+      "html": "<button class='ds-toggle ds-toggle--on'>On</button>",
+      "css": ".ds-toggle{min-width:48px;padding:4px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.55);font-family:Geist,sans-serif;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-variant-numeric:tabular-nums;cursor:pointer;transition:background 0.12s,border-color 0.12s,color 0.12s;} .ds-toggle:hover{background:rgba(255,255,255,0.08);border-color:rgba(255,255,255,0.16);color:#d4d4d4;} .ds-toggle--on{background:rgba(52,211,153,0.12);border-color:rgba(52,211,153,0.32);color:#34d399;} .ds-toggle--on:hover{background:rgba(52,211,153,0.18);border-color:rgba(52,211,153,0.5);color:#6ee7b7;} .ds-toggle--setup{background:rgba(251,191,36,0.12);border-color:rgba(251,191,36,0.32);color:#fbbf24;} .ds-toggle--na{background:rgba(248,113,113,0.08);border-color:rgba(248,113,113,0.22);color:#f87171;} .ds-toggle:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+    },
+    {
+      "name": "Range Tabs",
+      "kind": "nav",
+      "refersTo": "range-tab-active",
+      "description": "Segmented time-range selector on a recessed ground; the active segment fills.",
+      "html": "<div class='ds-range-tabs'><button class='ds-range-tab ds-range-tab--active'>1H</button><button class='ds-range-tab'>24H</button><button class='ds-range-tab'>7D</button><button class='ds-range-tab'>30D</button></div>",
+      "css": ".ds-range-tabs{display:inline-flex;background:rgba(255,255,255,0.04);border-radius:6px;padding:2px;gap:1px;} .ds-range-tab{background:none;border:none;color:rgba(255,255,255,0.5);font-family:Geist,sans-serif;font-size:11px;font-weight:600;padding:4px 10px;border-radius:4px;cursor:pointer;font-variant-numeric:tabular-nums;transition:color 0.15s ease,background 0.15s ease;} .ds-range-tab:hover{color:rgba(255,255,255,0.7);background:rgba(255,255,255,0.05);} .ds-range-tab--active{background:rgba(255,255,255,0.1);color:#d4d4d4;} .ds-range-tab:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+    },
+    {
+      "name": "Provider Badge",
+      "kind": "chip",
+      "refersTo": "badge-provider",
+      "description": "The fixed provider color-code as a pill: Claude blue, Codex cyan, MiniMax violet, Agent orchid. One provider, one color, every surface.",
+      "html": "<span class='ds-badge ds-badge--codex'>Codex</span>",
+      "css": ".ds-badge{display:inline-flex;align-items:center;border-radius:999px;padding:1px 6px;font-family:Geist,sans-serif;font-size:9px;font-weight:700;letter-spacing:0.11em;text-transform:uppercase;} .ds-badge--claude{background:rgba(96,165,250,0.12);color:#60a5fa;} .ds-badge--codex{background:rgba(34,211,238,0.12);color:#22d3ee;} .ds-badge--minimax{background:rgba(167,139,250,0.14);color:#a78bfa;} .ds-badge--agent{background:rgba(192,132,252,0.14);color:#c084fc;}"
+    },
+    {
+      "name": "Search Input",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Text field with a signal-blue focus ring (the corrected behavior — green focus is forbidden, it collides with the meter).",
+      "html": "<input class='ds-input' type='text' placeholder='Search sessions…' />",
+      "css": ".ds-input{width:100%;box-sizing:border-box;padding:8px 10px;background:#1a1a1f;border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#d4d4d4;font-family:Geist,sans-serif;font-size:12px;outline:none;transition:border-color 0.15s,box-shadow 0.15s;} .ds-input::placeholder{color:rgba(255,255,255,0.3);} .ds-input:focus{border-color:#60a5fa;box-shadow:0 0 0 1px rgba(96,165,250,0.25);}"
+    },
+    {
+      "name": "Insight Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Resting surface defined by a graphite fill + 1px border, no shadow. Big tabular value, dim label, severity-tinted trend.",
+      "html": "<div class='ds-card'><div class='ds-card-head'><span class='ds-card-label'>Tokens / hr</span><span class='ds-card-trend'>+12%</span></div><div class='ds-card-value'>48.2k</div><div class='ds-card-sub'>last 24h</div></div>",
+      "css": ".ds-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:10px;font-family:Geist,sans-serif;} .ds-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;} .ds-card-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:0.11em;} .ds-card-trend{font-size:8px;padding:1px 6px;border-radius:8px;color:#34d399;background:rgba(52,211,153,0.12);} .ds-card-value{font-size:20px;font-weight:700;line-height:1;color:#e6edf3;font-variant-numeric:tabular-nums;} .ds-card-sub{font-size:9px;color:#6e7681;margin-top:2px;}"
+    },
+    {
+      "name": "Tooltip",
+      "kind": "custom",
+      "refersTo": "popover",
+      "description": "Square dark popover, 1px border, popover shadow. No arrow, no diamond — the instrument doesn't decorate.",
+      "html": "<div class='ds-tooltip'>Working-context preservation keeps large transient data out of the transcript.</div>",
+      "css": ".ds-tooltip{max-width:240px;padding:8px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-family:Geist,sans-serif;font-size:11px;line-height:1.45;box-shadow:0 8px 24px rgba(0,0,0,0.6);}"
+    },
+    {
+      "name": "Analytics Tab",
+      "kind": "nav",
+      "refersTo": "tab-active",
+      "description": "Underline-indicator tab (never a pill). The 2px bottom border takes the tab's own accent when active.",
+      "html": "<div class='ds-atabs'><button class='ds-atab ds-atab--active'>Now</button><button class='ds-atab'>Trends</button><button class='ds-atab'>Charts</button><button class='ds-atab'>Context</button></div>",
+      "css": ".ds-atabs{display:flex;gap:0;} .ds-atab{background:none;border:none;border-bottom:2px solid transparent;color:#484f58;font-family:Geist,sans-serif;font-size:11px;font-weight:600;padding:5px 14px;cursor:pointer;transition:color 0.15s ease;} .ds-atab:hover{color:rgba(255,255,255,0.7);} .ds-atab--active{color:#e6edf3;border-bottom-color:#60a5fa;} .ds-atab:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Glass Cockpit",
+    "overview": "Quill is an instrument, not a dashboard. A glass cockpit is a calm, dark panel that surfaces system state and tiers its alarms by severity, so the operator stays ahead of the aircraft without staring. Quill watches what a coding agent can't see about itself — what it is burning and where it stands against the limits — and reports it with the exactness of a flight instrument. The aesthetic borrows the principles of that world (a strict color budget, severity tiers, numbers that never jitter, hairlines instead of chrome), not its skin. The system runs in two densities of the same instrument: the always-on-top Primary Flight Display (the dense live analytics you monitor at a glance) and the roomier Systems Pages (search, learning, plugins, agents, memory, settings — the same instrument zoomed out, for managing). Same tokens, same control vocabulary, inverted spacing.",
+    "keyCharacteristics": [
+      "Near-black canvas, chosen for contrast headroom.",
+      "A reserved three-color severity meter (green / amber / red) is the system's spine.",
+      "Color is semantic-only and on a strict budget; chrome is grayscale.",
+      "Numbers are tabular and never reflow; values are bright, labels are dim.",
+      "Structure is carried by 1px hairlines and flat tonal panels, never by cards and shadows.",
+      "Two densities, one identity: a dense cockpit and roomy systems pages."
+    ],
+    "rules": [
+      { "name": "The Severity Code Rule", "body": "Green, amber, and red are reserved for threshold state. They never decorate, brand, or indicate category. If a green thing is not 'healthy', it is a bug.", "section": "colors" },
+      { "name": "The Reserved-Status Rule", "body": "Provider identity (cyan / violet / orchid) is drawn from a cool set that never overlaps the severity meter. A provider hue rendering as green or amber is forbidden — the exact drift this system was built to kill.", "section": "colors" },
+      { "name": "The Dimming Ladder Rule", "body": "Hierarchy is built by brightness, not hue. Step down a ladder of white alpha or Readout to Label to Label-Faint. Reach for a new color only when it carries new meaning.", "section": "colors" },
+      { "name": "The Tabular Rule", "body": "Every live or comparative number uses tabular figures. A readout that reflows as its value ticks is broken.", "section": "typography" },
+      { "name": "The Mono-for-Truth Rule", "body": "Monospace is for things that are code or identifiers. It is never used on a label to look technical; jitter-free digits are tabular-nums, not a mono font.", "section": "typography" },
+      { "name": "The Floats-Only Rule", "body": "A shadow means 'this floats'. A surface sitting on the canvas never has one. Glow, neon, and colored shadows are forbidden.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do reserve green / amber / red for status only, on the 50% / 80% thresholds.",
+      "Do give every provider exactly one fixed color from the cool identity ramp, never a severity hue.",
+      "Do set font-variant-numeric: tabular-nums on every live or compared number.",
+      "Do structure with 1px hairlines and flat graphite panels.",
+      "Do make values bright and labels dim; build hierarchy with brightness and weight, not new hues.",
+      "Do invert density by mode — pack the PFD, give the Systems Pages room — keeping one control vocabulary.",
+      "Do keep motion functional and fast, and honor prefers-reduced-motion."
+    ],
+    "donts": [
+      "Don't ship a generic SaaS template: no gradient hero, no big-number metric panels, no pill buttons, no identical card grids.",
+      "Don't reach for AI-hype / crypto finishes: no neon gradients, no glassmorphism, no glow, no colored shadows.",
+      "Don't go playful-consumer: no bubbly palette, no radius above 8px (pills excepted), no emoji, no mascots.",
+      "Don't drift corporate-enterprise: no stock-photo blue, no gray-on-gray with acres of padding and three numbers on screen.",
+      "Don't let a provider change color between panels, and don't let a category hue borrow a status color.",
+      "Don't focus inputs in green; focus is signal-blue.",
+      "Don't use proportional figures for live numbers.",
+      "Don't cram editable controls into the always-on PFD; they belong in the Systems Pages.",
+      "Don't add another launcher window to the titlebar junk drawer; consolidate, don't extend."
+    ]
+  }
+}

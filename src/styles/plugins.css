@@ -4,7 +4,7 @@
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-  background: #121216;
+  background: var(--console-black);
   border-radius: 8px;
 }
 
@@ -13,7 +13,7 @@
   align-items: center;
   min-height: 28px;
   padding: 2px 8px;
-  background: #121216;
+  background: var(--console-black);
   flex-shrink: 0;
   -webkit-app-region: drag;
 }
@@ -61,15 +61,15 @@
 }
 
 .plugins-result-banner--success {
-  background: rgba(158, 206, 106, 0.15);
-  color: #9ece6a;
-  border-bottom: 1px solid rgba(158, 206, 106, 0.2);
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--meter-green);
+  border-bottom: 1px solid rgba(52, 211, 153, 0.2);
 }
 
 .plugins-result-banner--error {
-  background: rgba(247, 118, 142, 0.15);
-  color: #f7768e;
-  border-bottom: 1px solid rgba(247, 118, 142, 0.2);
+  background: rgba(248, 113, 113, 0.15);
+  color: var(--meter-red);
+  border-bottom: 1px solid rgba(248, 113, 113, 0.2);
 }
 
 .plugins-result-banner__message {
@@ -139,9 +139,9 @@
 }
 
 .plugins-provider-switcher__button--active {
-  background: rgba(122, 162, 247, 0.12);
-  border-color: rgba(122, 162, 247, 0.3);
-  color: #7aa2f7;
+  background: rgba(96, 165, 250, 0.12);
+  border-color: rgba(96, 165, 250, 0.3);
+  color: var(--signal-blue);
 }
 
 /* ─── Tab bar ─── */
@@ -149,7 +149,7 @@
   display: flex;
   gap: 2px;
   padding: 4px 10px;
-  border-bottom: 1px solid #1e1e2a;
+  border-bottom: 1px solid var(--panel-raised);
   flex-shrink: 0;
 }
 
@@ -175,18 +175,18 @@
 }
 
 .plugins-tab-bar__tab--active {
-  color: #7aa2f7;
-  background: rgba(122, 162, 247, 0.1);
+  color: var(--signal-blue);
+  background: rgba(96, 165, 250, 0.1);
 }
 
 .plugins-tab-bar__tab--active:hover {
-  color: #7aa2f7;
-  background: rgba(122, 162, 247, 0.15);
+  color: var(--signal-blue);
+  background: rgba(96, 165, 250, 0.15);
 }
 
 .plugins-tab-bar__badge {
-  background: #f7768e;
-  color: #fff;
+  background: var(--meter-red);
+  color: var(--readout-bright);
   font-size: 9px;
   font-weight: 700;
   min-width: 16px;
@@ -219,10 +219,10 @@
 .plugins-search-input {
   flex: 1;
   padding: 6px 10px;
-  background: #1a1a24;
+  background: var(--slate-input);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
-  color: #d4d4d4;
+  color: var(--readout);
   font-size: 12px;
   font-family: inherit;
   outline: none;
@@ -234,15 +234,15 @@
 }
 
 .plugins-search-input:focus {
-  border-color: #7aa2f7;
-  box-shadow: 0 0 0 1px rgba(122, 162, 247, 0.2);
+  border-color: var(--signal-blue);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.2);
 }
 
 .plugins-filter-select {
-  background: #1a1a24;
+  background: var(--slate-input);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
-  color: #d4d4d4;
+  color: var(--readout);
   font-size: 11px;
   padding: 4px 8px;
   outline: none;
@@ -250,7 +250,7 @@
 }
 
 .plugins-filter-select:focus {
-  border-color: #7aa2f7;
+  border-color: var(--signal-blue);
 }
 
 /* ─── Plugin list ─── */
@@ -283,8 +283,8 @@
   align-items: center;
   justify-content: space-between;
   padding: 6px 12px;
-  border-top: 1px solid #1e1e2a;
-  color: #565f89;
+  border-top: 1px solid var(--panel-raised);
+  color: var(--label);
   font-size: 10px;
   flex-shrink: 0;
 }
@@ -303,8 +303,8 @@
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  background: #16161e;
-  border: 1px solid #1e1e2a;
+  background: var(--card-graphite);
+  border: 1px solid var(--panel-raised);
   border-radius: 6px;
   margin-bottom: 4px;
   transition: background 0.15s, border-color 0.15s;
@@ -312,7 +312,7 @@
 
 .plugins-row:hover {
   background: rgba(255, 255, 255, 0.03);
-  border-color: #2a2a35;
+  border-color: var(--graphite-line);
 }
 
 .plugins-row--disabled {
@@ -320,7 +320,7 @@
 }
 
 .plugins-row--installed {
-  border-color: rgba(122, 162, 247, 0.2);
+  border-color: rgba(96, 165, 250, 0.2);
 }
 
 .plugins-row__info {
@@ -338,13 +338,13 @@
 .plugins-row__name {
   font-size: 12px;
   font-weight: 600;
-  color: #c0caf5;
+  color: var(--readout-bright);
   font-family: "SF Mono", "Fira Code", monospace;
 }
 
 .plugins-row__version {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
   font-family: "SF Mono", "Fira Code", monospace;
 }
 
@@ -358,13 +358,13 @@
 }
 
 .plugins-row__status--enabled {
-  background: rgba(158, 206, 106, 0.15);
-  color: #9ece6a;
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--meter-green);
 }
 
 .plugins-row__status--disabled {
   background: rgba(255, 255, 255, 0.06);
-  color: #565f89;
+  color: var(--label);
 }
 
 .plugins-row__description {
@@ -379,7 +379,7 @@
 
 .plugins-row__meta {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
   margin-top: 2px;
   display: flex;
   align-items: center;
@@ -394,8 +394,8 @@
   font-size: 9px;
   font-weight: 500;
   border-radius: 3px;
-  background: rgba(122, 162, 247, 0.12);
-  color: #7aa2f7;
+  background: rgba(96, 165, 250, 0.12);
+  color: var(--signal-blue);
   white-space: nowrap;
 }
 
@@ -409,8 +409,8 @@
 .plugins-row__category {
   font-size: 9px;
   font-weight: 500;
-  color: #7aa2f7;
-  background: rgba(122, 162, 247, 0.1);
+  color: var(--signal-blue);
+  background: rgba(96, 165, 250, 0.1);
   padding: 1px 6px;
   border-radius: 3px;
   text-transform: lowercase;
@@ -423,19 +423,19 @@
   letter-spacing: 0.5px;
   padding: 1px 6px;
   border-radius: 3px;
-  background: rgba(158, 206, 106, 0.15);
-  color: #9ece6a;
+  background: rgba(52, 211, 153, 0.15);
+  color: var(--meter-green);
 }
 
 .plugins-row__arrow {
   font-size: 11px;
-  color: #565f89;
+  color: var(--label);
 }
 
 .plugins-row__new-version {
   font-size: 10px;
   font-weight: 600;
-  color: #9ece6a;
+  color: var(--meter-green);
   font-family: "SF Mono", "Fira Code", monospace;
 }
 
@@ -456,9 +456,9 @@
 .plugins-provider-note {
   margin: 0 10px 8px;
   padding: 8px 10px;
-  border: 1px solid rgba(122, 162, 247, 0.12);
+  border: 1px solid rgba(96, 165, 250, 0.12);
   border-radius: 6px;
-  background: rgba(122, 162, 247, 0.06);
+  background: rgba(96, 165, 250, 0.06);
   color: rgba(255, 255, 255, 0.62);
   font-size: 11px;
   line-height: 1.45;
@@ -468,7 +468,7 @@
 .plugins-btn {
   background: none;
   border: 1px solid rgba(255, 255, 255, 0.15);
-  color: #d4d4d4;
+  color: var(--readout);
   font-size: 10px;
   font-weight: 600;
   padding: 4px 10px;
@@ -499,39 +499,39 @@
 }
 
 .plugins-btn--danger {
-  border-color: rgba(247, 118, 142, 0.4);
-  color: #f7768e;
+  border-color: rgba(248, 113, 113, 0.4);
+  color: var(--meter-red);
 }
 
 .plugins-btn--danger:hover {
-  background: rgba(247, 118, 142, 0.1);
-  border-color: rgba(247, 118, 142, 0.6);
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.6);
 }
 
 .plugins-btn--install {
-  border-color: rgba(122, 162, 247, 0.4);
-  color: #7aa2f7;
+  border-color: rgba(96, 165, 250, 0.4);
+  color: var(--signal-blue);
 }
 
 .plugins-btn--install:hover {
-  background: rgba(122, 162, 247, 0.1);
-  border-color: rgba(122, 162, 247, 0.6);
+  background: rgba(96, 165, 250, 0.1);
+  border-color: rgba(96, 165, 250, 0.6);
 }
 
 .plugins-btn--enable {
-  border-color: rgba(158, 206, 106, 0.4);
-  color: #9ece6a;
+  border-color: rgba(52, 211, 153, 0.4);
+  color: var(--meter-green);
 }
 
 .plugins-btn--enable:hover {
-  background: rgba(158, 206, 106, 0.1);
-  border-color: rgba(158, 206, 106, 0.6);
+  background: rgba(52, 211, 153, 0.1);
+  border-color: rgba(52, 211, 153, 0.6);
 }
 
 .plugins-btn-link {
   background: none;
   border: none;
-  color: #7aa2f7;
+  color: var(--signal-blue);
   font-size: 10px;
   font-weight: 600;
   cursor: pointer;
@@ -540,7 +540,7 @@
 }
 
 .plugins-btn-link:hover {
-  color: #89b4fa;
+  color: var(--signal-blue);
   text-decoration: underline;
 }
 
@@ -555,7 +555,7 @@
   width: 14px;
   height: 14px;
   border: 2px solid rgba(255, 255, 255, 0.1);
-  border-top-color: #7aa2f7;
+  border-top-color: var(--signal-blue);
   border-radius: 50%;
   animation: plugins-spin 0.7s linear infinite;
 }
@@ -576,7 +576,7 @@
 
 .plugins-spinner-text {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
 }
 
 @keyframes plugins-spin {
@@ -597,7 +597,7 @@
   width: 100%;
   padding: 6px 10px;
   background: rgba(255, 255, 255, 0.03);
-  border: 1px solid #1e1e2a;
+  border: 1px solid var(--panel-raised);
   border-radius: 6px;
   cursor: pointer;
   margin-bottom: 4px;
@@ -614,13 +614,13 @@
   gap: 6px;
   font-size: 11px;
   font-weight: 700;
-  color: #c0caf5;
+  color: var(--readout-bright);
   letter-spacing: 0.3px;
 }
 
 .plugins-marketplace-group__count {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
   margin-left: auto;
 }
 
@@ -633,8 +633,8 @@
 
 /* ─── Marketplace cards (Marketplaces tab) ─── */
 .plugins-marketplace-card {
-  background: #16161e;
-  border: 1px solid #1e1e2a;
+  background: var(--card-graphite);
+  border: 1px solid var(--panel-raised);
   border-radius: 6px;
   padding: 10px 12px;
   margin-bottom: 6px;
@@ -642,7 +642,7 @@
 }
 
 .plugins-marketplace-card:hover {
-  border-color: #2a2a35;
+  border-color: var(--graphite-line);
 }
 
 .plugins-marketplace-card__header {
@@ -665,13 +665,13 @@
 .plugins-marketplace-card__name {
   font-size: 13px;
   font-weight: 700;
-  color: #c0caf5;
+  color: var(--readout-bright);
 }
 
 .plugins-marketplace-card__source {
   font-size: 9px;
   font-weight: 500;
-  color: #565f89;
+  color: var(--label);
   background: rgba(255, 255, 255, 0.06);
   padding: 1px 6px;
   border-radius: 3px;
@@ -681,7 +681,7 @@
 
 .plugins-marketplace-card__repo {
   font-size: 11px;
-  color: #565f89;
+  color: var(--label);
   margin-top: 2px;
   font-family: "SF Mono", "Fira Code", monospace;
   overflow: hidden;
@@ -698,7 +698,7 @@
 
 .plugins-marketplace-card__updated {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
   white-space: nowrap;
 }
 
@@ -709,7 +709,7 @@
   padding-top: 6px;
   border-top: 1px solid rgba(255, 255, 255, 0.06);
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
 }
 
 /* ─── Updates header ─── */
@@ -730,12 +730,12 @@
 .plugins-updates-header__count {
   font-size: 12px;
   font-weight: 600;
-  color: #c0caf5;
+  color: var(--readout-bright);
 }
 
 .plugins-updates-header__time {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
 }
 
 .plugins-updates-header__actions {
@@ -747,8 +747,8 @@
 .plugins-bulk-progress {
   margin: 0 10px 8px;
   padding: 10px 12px;
-  background: #16161e;
-  border: 1px solid #1e1e2a;
+  background: var(--card-graphite);
+  border: 1px solid var(--panel-raised);
   border-radius: 6px;
 }
 
@@ -757,13 +757,13 @@
   align-items: center;
   justify-content: space-between;
   font-size: 11px;
-  color: #c0caf5;
+  color: var(--readout-bright);
   margin-bottom: 8px;
 }
 
 .plugins-bulk-progress__count {
   font-size: 10px;
-  color: #565f89;
+  color: var(--label);
   font-family: "SF Mono", "Fira Code", monospace;
 }
 
@@ -784,20 +784,20 @@
 }
 
 .plugins-bulk-progress__item--success {
-  color: #9ece6a;
+  color: var(--meter-green);
 }
 
 .plugins-bulk-progress__item--error {
-  color: #f7768e;
+  color: var(--meter-red);
 }
 
 .plugins-bulk-progress__item--active {
-  color: #7aa2f7;
+  color: var(--signal-blue);
 }
 
 .plugins-bulk-progress__error {
   font-size: 10px;
-  color: #f7768e;
+  color: var(--meter-red);
   opacity: 0.8;
   margin-left: 4px;
 }
@@ -813,7 +813,7 @@
 
 .plugins-progress-bar__fill {
   height: 100%;
-  background: #7aa2f7;
+  background: var(--signal-blue);
   border-radius: 2px;
   transition: width 0.3s ease;
 }
@@ -823,8 +823,8 @@
   position: absolute;
   top: 3px;
   right: 3px;
-  background: #f7768e;
-  color: #fff;
+  background: var(--meter-red);
+  color: var(--readout-bright);
   font-size: 8px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
@@ -836,14 +836,14 @@
   justify-content: center;
   padding: 0 3px;
   line-height: 1;
-  box-shadow: 0 0 0 1.5px #121216;
+  box-shadow: 0 0 0 1.5px var(--console-black);
   pointer-events: none;
 }
 
 /* ─── Installed check (Browse tab) ─── */
 .plugins-installed-check {
   font-size: 10px;
-  color: #9ece6a;
+  color: var(--meter-green);
   font-weight: 600;
   white-space: nowrap;
 }

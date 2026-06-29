@@ -11,6 +11,15 @@ import WindowResizeHandles from "./components/WindowResizeHandles";
 import type { RuntimeSettings } from "./types";
 import "./styles/index.css";
 
+// In a plain browser (no Tauri runtime) during dev, install a mock IPC layer so
+// the app renders with realistic fixture data. This is what lets `/impeccable live`
+// drive the real app in a browser. The dynamic import + DEV guard keeps the mock
+// and its fixtures out of production builds entirely.
+if (import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)) {
+  const { installBrowserMock } = await import("./mocks/installBrowserMock");
+  installBrowserMock();
+}
+
 // SDK stays uninitialized until we confirm the user has not opted out — short
 // window at boot where errors aren't captured is the price of strict privacy.
 void invoke<RuntimeSettings>("get_runtime_settings")

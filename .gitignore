@@ -39,3 +39,6 @@ lat.md/.cache
 .codex
 
 .superpowers/
+
+# Impeccable live-mode runtime journal (config.json + design.json stay tracked)
+.impeccable/live/sessions/

@@ -1,0 +1,6 @@
+{
+  "files": ["index.html", "marketing-site/**/*.html"],
+  "insertBefore": "</body>",
+  "commentSyntax": "html",
+  "cspChecked": true
+}

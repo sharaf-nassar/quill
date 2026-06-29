@@ -25,6 +25,16 @@ Eight Tauri windows are routed by the `?view=` URL parameter, each with its own 
 
 The `settings` and `release-notes` routes are not gated on having an enabled provider; both stay reachable so users can manage integrations and browse changelog history regardless of integration state.
 
+## Browser Mock Mode
+
+In a plain browser during dev (no Tauri runtime), the app installs a mock IPC layer so it renders with fixture data instead of failing every `invoke()`. This is what lets `/impeccable live` drive the real app in a browser.
+
+[[src/main.tsx]] checks `import.meta.env.DEV && !("__TAURI_INTERNALS__" in window)` before any IPC runs and only then dynamically imports [[src/mocks/installBrowserMock.ts#installBrowserMock]]. The dynamic import plus the `DEV` guard keep the mock and its fixtures out of production builds entirely.
+
+[[src/mocks/installBrowserMock.ts#installBrowserMock]] calls `mockWindows` and `mockIPC` from `@tauri-apps/api/mocks`, routing every `invoke()` to [[src/mocks/ipcFixtures.ts#handleInvoke]], and adds a fixed `MOCK DATA` badge. [[src/mocks/ipcFixtures.ts#handleInvoke]] returns typed sample data for the data commands (provider statuses with an enabled provider so the dashboard is not gated, usage buckets spanning the green/amber/red thresholds, token/code/breakdown/analytics datasets), benign defaults for Tauri core `plugin:*` commands so `listen()` resolves with events left inert, and `null` for anything unmapped.
+
+A dev-only Vite plugin in [[vite.config.ts]] (`apply: "serve"`) relaxes the strict production CSP so the browser can load Vite HMR, React Fast Refresh, and the Impeccable live client at `http://localhost:8400`. Because it is serve-only, `vite build` never runs it and the shipped CSP is untouched.
+
 ## Main Window Layout
 
 [[src/App.tsx]] implements a split-pane layout with a draggable divider separating the [[features#Live Usage View]] and [[features#Analytics Dashboard]].
@@ -187,7 +197,13 @@ Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`
 
 ## Styling
 
-Pure CSS with no framework. Dark theme (`#121216` background, `#d4d4d4` text, 11px system sans-serif).
+Pure CSS with no framework, organized around a `:root` design-token layer in `src/styles/index.css` per DESIGN.md. Dark theme: near-black `--console-black` (`#121216`) canvas, `--readout` (`#d4d4d4`) text, 11px system sans-serif.
+
+### Design Tokens
+
+The canonical palette lives as `:root` CSS custom properties in `src/styles/index.css`, following DESIGN.md. Because [[src/main.tsx]] loads `index.css` for every window, these tokens are global to all stylesheets.
+
+Tokens cover backgrounds (`--console-black`, `--panel-deep`, `--panel-raised`, `--card-graphite`, `--slate-input`, `--graphite-line`), text (`--readout`, `--readout-bright`, `--label`, `--label-faint`), the status meter (`--meter-green` / `--meter-amber` / `--meter-red`), accents (`--signal-blue` / `--signal-cyan` / `--signal-violet` / `--signal-orchid`), provider identity (`--provider-claude` / `--provider-codex` / `--provider-minimax` / `--provider-agent`), and `--radius-*` / `--space-*` scales. Every window stylesheet reads its palette from these vars. The former Tokyo-night palette (plugin and restart windows), the divergent green and lifecycle colors (learning window), and the GitHub-dark insight-card/tooltip sub-palette plus assorted near-whites (`index.css`, `settings.css`) have all been unified onto the canonical tokens. The only remaining color literals are neutral white/black alpha — the dimming ladder — and one intentional lighter-green toggle-hover tint.
 
 ### Stylesheets
 
@@ -203,12 +219,11 @@ Per-window CSS files under `src/styles/`, each scoped to a specific feature doma
 
 ### Color System
 
-Semantic color palette used across all stylesheets for consistent status indication.
+Semantic palette, drawn from the `:root` tokens. Status color is reserved; identity color is fixed per provider.
 
-- Green `#34d399`: success, utilization < 50%
-- Yellow `#fbbf24`: warning, utilization 50-80%
-- Red `#f87171`: error, utilization >= 80%
-- Blue `#60a5fa`: accents, interactive elements
+- **Status meter** (`--meter-green` `#34d399` < 50%, `--meter-amber` `#fbbf24` 50-80%, `--meter-red` `#f87171` >= 80%): utilization, trends, success/warning/error. Reserved for threshold state only.
+- **Signal blue** (`--signal-blue` `#60a5fa`): accents, selection, focus rings, primary actions. The sessions search/filter focus and active-sort toggle use this — previously green, which collided with the meter.
+- **Provider identity** — one fixed color per provider across all four surfaces (titlebar usage badges, breakdown tags, learning badges, session-search badges): Claude `--provider-claude` blue, Codex `--provider-codex` cyan, MiniMax `--provider-minimax` violet, sub-agent `--provider-agent` orchid. Drawn from the cool ramp so identity never reuses a status hue; the `shared` learning scope renders neutral.
 - Memory type badges: blue (user), red (feedback), green (project), yellow (reference), purple (claude-md)
 - Context savings categories: green (capture), blue (source), amber (router), purple (decision), pink (provider) — derived from the event-type prefix in [[src/components/analytics/ContextSavingsTab.tsx#categoryColor]] and reused by KPI swatches, breakdown dots, and event-line dots
 
