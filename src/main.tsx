@@ -1,10 +1,9 @@
 import { setCrashReportingEnabled } from "./lib/crashReporting";
-import React, { Suspense, useCallback } from "react";
+import React, { Suspense } from "react";
 import ReactDOM from "react-dom/client";
 import { reactErrorHandler } from "@sentry/react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
 import WindowResizeHandles from "./components/WindowResizeHandles";
@@ -29,24 +28,11 @@ void invoke<RuntimeSettings>("get_runtime_settings")
   });
 
 const App = React.lazy(() => import("./App"));
-const RunsWindowView = React.lazy(() => import("./windows/RunsWindowView"));
-const SessionsWindowView = React.lazy(
-  () => import("./windows/SessionsWindowView"),
-);
-const LearningWindowView = React.lazy(
-  () => import("./windows/LearningWindow"),
-);
-const PluginsWindowView = React.lazy(
-  () => import("./windows/PluginsWindowView"),
-);
-const RestartWindowView = React.lazy(
-  () => import("./windows/RestartWindowView"),
-);
-const SettingsWindowView = React.lazy(
-  () => import("./windows/SettingsWindowView"),
-);
 const ReleaseNotesWindowView = React.lazy(
   () => import("./windows/ReleaseNotesWindow"),
+);
+const ManageWindowView = React.lazy(
+  () => import("./windows/ManageWindowView"),
 );
 
 // Zoom with Ctrl+Plus / Ctrl+Minus / Ctrl+0 (per-window, persisted)
@@ -105,130 +91,23 @@ const ReleaseNotesWindowView = React.lazy(
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view");
 
-function blockedWindowTitle(currentView: string | null): string {
-  switch (currentView) {
-    case "runs":
-      return "Run History";
-    case "sessions":
-      return "Session Search";
-    case "learning":
-      return "Learning";
-    case "plugins":
-      return "Plugin Manager";
-    case "restart":
-      return "Restart Sessions";
-    case "settings":
-      return "Settings";
-    default:
-      return "Quill";
-  }
-}
-
-function blockedWindowMessage(
-  currentView: string | null,
-  hasDetectedProvider: boolean,
-  error: string | null,
-): string {
-  if (error) {
-    return "Quill could not load provider status. Restart the app, then enable Claude Code or Codex from the QUILL menu.";
-  }
-  if (hasDetectedProvider) {
-    return `Enable Claude Code or Codex from the QUILL menu before opening ${blockedWindowTitle(currentView)}.`;
-  }
-  return "Install Claude Code or Codex, then enable it from the QUILL menu before using this window.";
-}
-
-function BlockedWindow({
-  title,
-  heading = "No active provider",
-  message,
-}: {
-  title: string;
-  heading?: string;
-  message: string;
-}) {
-  const handleClose = useCallback(async () => {
-    await getCurrentWindow().close();
-  }, []);
-
-  return (
-    <div className="blocked-window">
-      <div className="blocked-window-titlebar" data-tauri-drag-region>
-        <span className="blocked-window-title" data-tauri-drag-region>
-          {title}
-        </span>
-        <button
-          className="blocked-window-close"
-          onClick={handleClose}
-          aria-label="Close"
-        >
-          &times;
-        </button>
-      </div>
-      <div className="blocked-window-body">
-        <div className="integration-empty-state integration-empty-state--window">
-          <p className="integration-empty-state__eyebrow">Providers</p>
-          <h2 className="integration-empty-state__title">{heading}</h2>
-          <p className="integration-empty-state__description">{message}</p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ProviderRoutedView() {
+function MainAppView() {
   const integrations = useIntegrations();
-  const hasDetectedProvider = integrations.statuses.some(
-    (status) => status.detectedCli,
-  );
-  const windowTitle = blockedWindowTitle(view);
-
-  if (view && view !== "main" && view !== "settings" && view !== "release-notes") {
-    if (integrations.loading) {
-      return (
-        <BlockedWindow
-          title={windowTitle}
-          heading="Checking integrations"
-          message="Quill is loading provider status for this window."
-        />
-      );
-    }
-
-    if (!integrations.hasEnabledProvider) {
-      return (
-        <BlockedWindow
-          title={windowTitle}
-          message={blockedWindowMessage(
-            view,
-            hasDetectedProvider,
-            integrations.error,
-          )}
-        />
-      );
-    }
-  }
-
-  return view === "runs" ? (
-    <RunsWindowView />
-  ) : view === "sessions" ? (
-    <SessionsWindowView />
-  ) : view === "learning" ? (
-    <LearningWindowView />
-  ) : view === "plugins" ? (
-    <PluginsWindowView />
-  ) : view === "restart" ? (
-    <RestartWindowView />
-  ) : view === "settings" ? (
-    <SettingsWindowView />
-  ) : view === "release-notes" ? (
-    <ReleaseNotesWindowView />
-  ) : (
-    <App integrations={integrations} />
-  );
+  return <App integrations={integrations} />;
 }
 
+// Only main / manage / release-notes routes remain after the workspace
+// consolidation, and all three are reachable without an enabled provider
+// (Manage gates each section inline), so the former per-window provider
+// blocking is gone.
 function RoutedView() {
-  return <ProviderRoutedView />;
+  if (view === "manage") {
+    return <ManageWindowView />;
+  }
+  if (view === "release-notes") {
+    return <ReleaseNotesWindowView />;
+  }
+  return <MainAppView />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")!, {

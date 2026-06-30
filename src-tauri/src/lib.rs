@@ -1925,9 +1925,10 @@ async fn set_minimax_api_key(
 // calling-window-label assertion; read-only learning commands stay open.
 
 /// Windows allowed to obtain the capability token and invoke state-changing
-/// learning commands. The learning UI runs in the `WebviewWindow` whose label
-/// is `"learning"` (see `src/components/TitleBar.tsx`).
-const LEARNING_WINDOW_ALLOWLIST: &[&str] = &["learning"];
+/// learning commands. The learning UI runs embedded in the consolidated
+/// `manage` workspace window (see `src/windows/ManageWindowView.tsx`); the
+/// former standalone `learning` window was retired.
+const LEARNING_WINDOW_ALLOWLIST: &[&str] = &["manage"];
 
 /// Ephemeral, per-process capability token for state-changing learning IPC.
 ///
@@ -1954,7 +1955,10 @@ fn assert_learning_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     if LEARNING_WINDOW_ALLOWLIST.contains(&window.label()) {
         Ok(())
     } else {
-        Err("Unauthorized: learning mutations are restricted to the learning window".to_string())
+        Err(
+            "Unauthorized: learning mutations are restricted to the manage workspace window"
+                .to_string(),
+        )
     }
 }
 

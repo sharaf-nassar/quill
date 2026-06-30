@@ -5,7 +5,7 @@
   height: 100vh;
   background: var(--console-black);
   color: var(--readout);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   font-size: 12px;
 }
 
@@ -408,7 +408,7 @@
   padding: 1px 4px;
   border-radius: 3px;
   font-size: 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   color: var(--readout);
 }
 

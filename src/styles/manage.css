@@ -1,0 +1,471 @@
+/* ─── Manage workspace ("Systems Pages") ───
+ * The "manage" half of the monitor-vs-manage split: a single rail-navigated
+ * window that consolidates the former tool windows. Same Glass Cockpit tokens
+ * as the PFD, but a deliberately roomier density (8/10/12/16 spacing, larger
+ * hit targets, visible labels — one task per view). Phase 1 = shell + rail;
+ * sections are wired in the next pass.
+ */
+
+.manage-window {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--console-black);
+  color: var(--readout);
+  border: 1px solid var(--hairline);
+  overflow: hidden;
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* ── Titlebar ── */
+.manage-titlebar {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+  height: 36px;
+  padding: 0 8px 0 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.manage-titlebar-title {
+  flex: 1;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+.manage-titlebar-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: rgba(255, 255, 255, 0.42);
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.manage-titlebar-close:hover {
+  color: var(--readout-bright);
+  background: var(--fill-hover);
+}
+.manage-titlebar-close:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
+}
+
+/* ── Body: rail + content ── */
+.manage-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ── Left rail ── */
+.manage-rail {
+  display: flex;
+  flex-direction: column;
+  width: 208px;
+  flex-shrink: 0;
+  padding: 12px 10px;
+  background: var(--panel-raised);
+  border-right: 1px solid var(--hairline);
+}
+
+.manage-rail-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.manage-rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 9px 12px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--label);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.manage-rail-item:hover {
+  color: var(--readout);
+  background: var(--fill-ghost);
+}
+.manage-rail-item.active {
+  color: var(--readout-bright);
+  background: var(--fill-hover);
+}
+/* Signal-blue left-edge indicator on the active section */
+.manage-rail-item.active::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 18px;
+  border-radius: 0 2px 2px 0;
+  background: var(--signal-blue);
+}
+.manage-rail-item:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: -2px;
+}
+
+.manage-rail-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: inherit;
+  opacity: 0.85;
+}
+.manage-rail-item.active .manage-rail-icon {
+  opacity: 1;
+}
+
+.manage-rail-label {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Rail footer ── */
+.manage-rail-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 12px;
+}
+
+.manage-rail-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  color: var(--label);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.manage-rail-back:hover {
+  color: var(--readout);
+  border-color: var(--hairline-strong, rgba(255, 255, 255, 0.18));
+  background: var(--fill-ghost);
+}
+.manage-rail-back:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
+}
+.manage-rail-back .manage-rail-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.manage-rail-version {
+  margin-left: auto;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--label-faint);
+}
+
+/* ── Content pane ── */
+.manage-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Each section reuses its existing window-view component. Suppress that
+ * component's own window chrome (titlebar + close) so it sits flush inside the
+ * pane, and let it fill the available height (overriding its 100vh wrapper). */
+.manage-content > .sessions-window,
+.manage-content > .learning-window,
+.manage-content > .plugins-window,
+.manage-content > .restart-window,
+.manage-content > .settings-window {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+  border: none;
+  background: transparent;
+}
+.manage-content .sessions-window-titlebar,
+.manage-content .learning-window-titlebar,
+.manage-content .plugins-window-titlebar,
+.manage-content .restart-window-titlebar,
+.manage-content .settings-window-titlebar {
+  display: none;
+}
+
+/* Suspense fallback while a section chunk loads. */
+.manage-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  font-size: 12px;
+  color: var(--label);
+}
+
+/* Inline no-provider state for the provider-dependent sections (Settings stays
+ * reachable so a provider can be enabled). */
+.manage-noprovider {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex: 1;
+  padding: 32px;
+  text-align: center;
+}
+.manage-noprovider-icon {
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  color: var(--label-faint);
+}
+.manage-noprovider-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--readout-bright);
+}
+.manage-noprovider-text {
+  margin: 0;
+  max-width: 42ch;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--label);
+}
+.manage-noprovider-btn {
+  margin-top: 6px;
+  padding: 7px 14px;
+  background: rgba(96, 165, 250, 0.1);
+  border: 1px solid rgba(96, 165, 250, 0.32);
+  border-radius: 6px;
+  color: var(--signal-blue);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.manage-noprovider-btn:hover {
+  background: rgba(96, 165, 250, 0.16);
+  border-color: rgba(96, 165, 250, 0.5);
+}
+.manage-noprovider-btn:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
+}
+
+/* ── Rail search trigger (opens the ⌘K palette) ── */
+.manage-rail-search {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  background: var(--panel-deep);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  color: var(--label);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.manage-rail-search:hover {
+  color: var(--readout);
+  border-color: var(--hairline-strong, rgba(255, 255, 255, 0.18));
+}
+.manage-rail-search:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: -1px;
+}
+.manage-rail-search-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  opacity: 0.8;
+}
+.manage-rail-search-label {
+  flex: 1;
+  text-align: left;
+}
+.manage-rail-kbd {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  color: var(--label-faint);
+  background: var(--card-graphite);
+}
+
+/* ── ⌘K command palette ── */
+.cmdk-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 400;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 14vh 16px 16px;
+  background: rgba(7, 7, 10, 0.68);
+  animation: cmdk-fade 140ms ease-out;
+}
+
+.cmdk {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: 58vh;
+  overflow: hidden;
+  background: var(--panel-raised);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+  animation: cmdk-in 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.cmdk-input {
+  flex-shrink: 0;
+  height: 46px;
+  padding: 0 16px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--readout-bright);
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+.cmdk-input::placeholder {
+  color: var(--label-faint);
+}
+.cmdk-input:focus {
+  outline: none;
+}
+
+.cmdk-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+}
+
+.cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  padding: 9px 12px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  color: var(--label);
+  font-family: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.cmdk-item.active {
+  background: var(--fill-hover);
+  color: var(--readout-bright);
+}
+
+.cmdk-item-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: inherit;
+  opacity: 0.85;
+}
+.cmdk-item.active .cmdk-item-icon {
+  color: var(--signal-blue);
+  opacity: 1;
+}
+
+.cmdk-item-label {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.cmdk-item-hint {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--label-faint);
+}
+
+.cmdk-empty {
+  padding: 22px 12px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--label-faint);
+}
+
+@keyframes cmdk-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes cmdk-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cmdk-backdrop,
+  .cmdk {
+    animation: none;
+  }
+}

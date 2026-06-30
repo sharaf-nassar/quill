@@ -73,9 +73,16 @@ function RestartPanel() {
 				(i) => typeof i.status === "string" && i.status !== "Unknown",
 			);
 			if (allOk) {
-				setTimeout(async () => {
-					await getCurrentWindow().close();
-				}, 3000);
+				// Only the dedicated restart window self-dismisses on success.
+				// When embedded in the Manage workspace (window label "manage"),
+				// closing the window would destroy the whole workspace, so the
+				// auto-close is scoped to the standalone restart window.
+				const win = getCurrentWindow();
+				if (win.label === "restart") {
+					setTimeout(() => {
+						void win.close();
+					}, 3000);
+				}
 			}
 		}
 	}, []);

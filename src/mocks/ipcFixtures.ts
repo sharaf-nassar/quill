@@ -37,8 +37,17 @@ const now = Date.now();
 const M = 60_000;
 const H = 3_600_000;
 const D = 24 * H;
+// Most timestamps mirror the Rust backend's `to_rfc3339()` (zone-designated)
+// and are consumed directly via `new Date(...)` — session times, rate-limit
+// resets, verification stamps.
 const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
 const isoIn = (msAhead: number) => new Date(now + msAhead).toISOString();
+// `created_at` columns are DB-populated by SQLite `datetime('now')`, which is a
+// space-separated naive-UTC string with NO "Z" (e.g. "2026-06-30 12:00:00").
+// utils/time.ts#timeAgo appends the "Z" to read it as UTC, so pre-suffixing one
+// here double-stamps it -> Invalid Date -> "NaNd ago" in the learning header.
+const sqliteUtc = (msAgo: number) =>
+  new Date(now - msAgo).toISOString().replace("T", " ").slice(0, -5);
 
 // --- Integrations (these gate whether the app renders the dashboard) ----------
 
@@ -111,6 +120,7 @@ const usageData: UsageData = {
   buckets: [
     { provider: "claude", key: "claude_5h", label: "Sonnet · 5h", utilization: 34, resets_at: isoIn(2 * H + 14 * M), sort_order: 0 },
     { provider: "claude", key: "claude_week", label: "Weekly", utilization: 68, resets_at: isoIn(3 * D), sort_order: 1 },
+    { provider: "claude", key: "weekly_scoped_fable", label: "Fable", utilization: 22, resets_at: isoIn(6 * D), sort_order: 1 },
     { provider: "codex", key: "codex_5h", label: "Codex · 5h", utilization: 86, resets_at: isoIn(48 * M), sort_order: 2 },
     { provider: "codex", key: "codex_week", label: "Codex · Weekly", utilization: 52, resets_at: isoIn(4 * D), sort_order: 3 },
   ],
@@ -320,8 +330,8 @@ const learnedRules: LearnedRule[] = [
 ];
 
 const learningRuns: LearningRun[] = [
-  { id: 42, trigger_mode: "periodic", observations_analyzed: 184, rules_created: 2, rules_updated: 5, duration_ms: 41_200, status: "complete", error: null, logs: null, created_at: iso(2 * H), phases: [{ name: "collect", status: "complete", duration_ms: 1_200, findings_count: 184 }, { name: "infer", status: "complete", duration_ms: 38_000, findings_count: 7 }], provider_scope: ["claude", "codex"], inference: { total_cost_usd: 0.142, total_duration_ms: 38_000, primary_model: "claude-opus-4-8", call_count: 4, failed_call_count: 0, calls: [] } },
-  { id: 41, trigger_mode: "on-demand", observations_analyzed: 96, rules_created: 1, rules_updated: 2, duration_ms: 22_800, status: "complete", error: null, logs: null, created_at: iso(28 * H), phases: null, provider_scope: ["claude"] },
+  { id: 42, trigger_mode: "periodic", observations_analyzed: 184, rules_created: 2, rules_updated: 5, duration_ms: 41_200, status: "completed", error: null, logs: null, created_at: sqliteUtc(2 * H), phases: [{ name: "collect", status: "completed", duration_ms: 1_200, findings_count: 184 }, { name: "infer", status: "completed", duration_ms: 38_000, findings_count: 7 }], provider_scope: ["claude", "codex"], inference: { total_cost_usd: 0.142, total_duration_ms: 38_000, primary_model: "claude-opus-4-8", call_count: 4, failed_call_count: 0, calls: [] } },
+  { id: 41, trigger_mode: "on-demand", observations_analyzed: 96, rules_created: 1, rules_updated: 2, duration_ms: 22_800, status: "completed", error: null, logs: null, created_at: sqliteUtc(28 * H), phases: null, provider_scope: ["claude"] },
 ];
 
 const restartStatus: RestartStatus = {

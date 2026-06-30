@@ -339,13 +339,13 @@
   font-size: 12px;
   font-weight: 600;
   color: var(--readout-bright);
-  font-family: "SF Mono", "Fira Code", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", monospace;
 }
 
 .plugins-row__version {
   font-size: 10px;
   color: var(--label);
-  font-family: "SF Mono", "Fira Code", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", monospace;
 }
 
 .plugins-row__status {
@@ -436,7 +436,7 @@
   font-size: 10px;
   font-weight: 600;
   color: var(--meter-green);
-  font-family: "SF Mono", "Fira Code", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", monospace;
 }
 
 .plugins-provider-badge {
@@ -683,7 +683,7 @@
   font-size: 11px;
   color: var(--label);
   margin-top: 2px;
-  font-family: "SF Mono", "Fira Code", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -764,7 +764,7 @@
 .plugins-bulk-progress__count {
   font-size: 10px;
   color: var(--label);
-  font-family: "SF Mono", "Fira Code", monospace;
+  font-family: "Geist Mono", "SF Mono", "Fira Code", monospace;
 }
 
 .plugins-bulk-progress__items {

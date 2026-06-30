@@ -2704,7 +2704,7 @@ impl Storage {
                 // Avoid the correlated MAX(timestamp) subquery here. On large
                 // usage_snapshots tables it scales poorly enough to stall the
                 // startup fetch path that restores cached live buckets.
-                "SELECT snapshot.bucket_key, snapshot.bucket_label, snapshot.utilization, snapshot.resets_at
+                "SELECT snapshot.bucket_key, snapshot.bucket_label, snapshot.utilization, snapshot.resets_at, snapshot.timestamp
                  FROM usage_snapshots snapshot
                  INNER JOIN (
                      SELECT bucket_key, MAX(timestamp) AS latest_timestamp
@@ -2723,21 +2723,53 @@ impl Storage {
 
         let rows = stmt
             .query_map(params![provider.as_str()], |row| {
-                Ok(UsageBucket {
-                    provider,
-                    key: row.get(0)?,
-                    label: row.get(1)?,
-                    utilization: row.get(2)?,
-                    resets_at: row.get(3)?,
-                    sort_order: 0,
-                })
+                let timestamp: String = row.get(4)?;
+                let parsed = DateTime::parse_from_rfc3339(&timestamp)
+                    .ok()
+                    .map(|value| value.with_timezone(&Utc));
+                Ok((
+                    UsageBucket {
+                        provider,
+                        key: row.get(0)?,
+                        label: row.get(1)?,
+                        utilization: row.get(2)?,
+                        resets_at: row.get(3)?,
+                        sort_order: 0,
+                    },
+                    parsed,
+                ))
             })
             .map_err(|e| format!("Query error: {e}"))?;
 
-        let mut buckets = Vec::new();
+        let mut rows_with_ts = Vec::new();
         for row in rows {
-            buckets.push(row.map_err(|e| format!("Row error: {e}"))?);
+            rows_with_ts.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
+
+        // Prune ghost buckets. `MAX(timestamp) GROUP BY bucket_key` keeps the
+        // last snapshot of a key forever, so a limit the provider stopped
+        // returning — e.g. the per-model weekly keys Anthropic moved into
+        // `limits[]` and now sends as `null` — lingers as a stale tile in the
+        // live view. Drop any bucket whose newest snapshot is far older than
+        // the provider's most recent fetch. Buckets from one fetch share a
+        // timestamp, so a paused/rate-limited provider prunes nothing (all its
+        // keys age together); only keys absent from recent fetches fall off.
+        // History and stats queries read snapshots directly and are unaffected.
+        const USAGE_BUCKET_STALE_AFTER_SECS: i64 = 60 * 60;
+        let newest = rows_with_ts.iter().filter_map(|(_, ts)| *ts).max();
+
+        let buckets = match newest {
+            Some(newest) => {
+                let cutoff = newest - TimeDelta::seconds(USAGE_BUCKET_STALE_AFTER_SECS);
+                rows_with_ts
+                    .into_iter()
+                    .filter(|(_, ts)| ts.is_none_or(|parsed| parsed >= cutoff))
+                    .map(|(bucket, _)| bucket)
+                    .collect()
+            }
+            None => rows_with_ts.into_iter().map(|(bucket, _)| bucket).collect(),
+        };
+
         Ok(buckets)
     }
 

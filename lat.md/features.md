@@ -86,9 +86,9 @@ Analysis can run **on-demand** (manual) or **periodic** (every N minutes). Confi
 
 ### UI
 
-The Learning window has two tabs: **Rules** and **Memories** (memory optimization), plus a provider filter for combined, Claude-only, or Codex-only views.
+The Learning section (in the [[frontend#Manage Workspace]]) has two tabs — **Rules** and **Memories** (memory optimization) — a provider filter for combined, Claude-only, or Codex-only views, and a Runs toggle that opens run history inline.
 
-The Rules tab splits rules into two sections: **Active Rules** (have `.md` files on disk) and **Discovered** (DB-only candidates). Both rules and runs show provider-scope badges so shared Claude-plus-Codex rules are distinct from provider-specific ones. A `StatusStrip` shows scoped observation counts and a "Run Analysis" button. A floating `RunHistory` OS window shows past runs with per-phase timing, provider scope, and real-time logs during active runs; its toggle state follows manual closes and Strict Mode remounts.
+The Rules tab splits rules into two sections: **Active Rules** (have `.md` files on disk) and **Discovered** (DB-only candidates). Both rules and runs show provider-scope badges so shared Claude-plus-Codex rules are distinct from provider-specific ones. A `StatusStrip` shows scoped observation counts and a "Run Analysis" button. A `RunHistory` panel docks inline as a right-side overlay over the content (toggled by the toolbar Runs button) and shows past runs with per-phase timing, provider scope, and real-time logs during active runs.
 
 ### Rule Storage
 
@@ -298,13 +298,13 @@ Claude install writes Quill hook scripts into `~/.claude/settings.json` plus she
 
 ## Settings Window
 
-Standalone Tauri window opened by the titlebar settings button (sliders icon) that exposes every user-configurable feature toggle in one comprehensive surface, replacing the previous inline `ProviderMenu` popover.
+The Settings section of the [[frontend#Manage Workspace]], opened by the titlebar cog (sliders icon), exposes every user-configurable feature toggle in one comprehensive surface, replacing the previous inline `ProviderMenu` popover.
 
 ### Window Routing
 
-Registered as `?view=settings` in [[src/main.tsx]] and listed in `src-tauri/capabilities/default.json`.
+Rendered as the `settings` section of the Manage workspace ([[src/windows/ManageWindowView.tsx]]); the titlebar cog opens `manage` at that section (via a `manage:navigate` event when it is already open). The former standalone `?view=settings` window was retired.
 
-The window is intentionally NOT provider-gated so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]] and follows the same custom-titlebar pattern as the Sessions and Plugins windows (transparent, decorations off, default and min 540x620 with min height 480). The default width matches the min width so the five top tabs always fit on a single row on first launch with a small buffer past the last tab, and the `.settings-tabs` flex container uses `nowrap` so tabs never collapse onto a second row even if the user pushes the window narrower.
+Settings is always reachable (the Manage workspace never gates it) so users can manage integrations and runtime preferences before any provider is enabled. The shell lives in [[src/windows/SettingsWindowView.tsx]]; its `.settings-tabs` flex container uses `nowrap` so the five top tabs never collapse onto a second row, and its own window chrome (titlebar/close) is suppressed via `manage.css` when embedded in the Manage content pane.
 
 ### Tab Layout
 

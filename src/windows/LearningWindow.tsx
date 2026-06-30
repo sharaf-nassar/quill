@@ -5,7 +5,7 @@ import { normalizeProviderScope } from "../utils/providers";
 import StatusStrip from "../components/learning/StatusStrip";
 import RuleCard from "../components/learning/RuleCard";
 import DomainBreakdown from "../components/learning/DomainBreakdown";
-import FloatingRunsWindow from "../components/learning/FloatingRunsWindow";
+import RunHistory from "../components/learning/RunHistory";
 import { MemoriesPanel } from "../components/learning/MemoriesPanel";
 import type { LearningSettings, ProviderFilter } from "../types";
 import { isActiveRule } from "../types";
@@ -120,6 +120,7 @@ function LearningPanel() {
     settings,
     rules,
     runs,
+    liveLogs,
     observationCount,
     unanalyzedCount,
     topTools,
@@ -247,6 +248,7 @@ function LearningPanel() {
           />
         </div>
       </div>
+      <div className="learning-main">
       <div className="learning-content" ref={contentRef}>
         {activeTab === "rules" ? (
           <>
@@ -318,8 +320,24 @@ function LearningPanel() {
         )}
       </div>
       {showRuns && (
-        <FloatingRunsWindow onClose={handleCloseRuns} />
+        <aside className="learning-runs-panel" aria-label="Run history">
+          <div className="learning-runs-panel-head">
+            <span className="learning-runs-panel-title">Run History</span>
+            <button
+              type="button"
+              className="learning-runs-panel-close"
+              onClick={handleCloseRuns}
+              aria-label="Close run history"
+            >
+              &times;
+            </button>
+          </div>
+          <div className="learning-runs-panel-body">
+            <RunHistory runs={runs} liveLogs={liveLogs} />
+          </div>
+        </aside>
       )}
+      </div>
       </div>
     </div>
   );

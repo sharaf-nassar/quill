@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { UseIntegrationsResult } from "../hooks/useIntegrations";
 import type { PendingUpdate } from "../types";
@@ -30,32 +30,12 @@ const SVG_PROPS = {
   focusable: false,
 };
 
-const SparkIcon = () => (
+const ManageIcon = () => (
   <svg {...SVG_PROPS}>
-    <path d="M7 1.5L8.4 5.6 12.5 7 8.4 8.4 7 12.5 5.6 8.4 1.5 7 5.6 5.6Z" />
-  </svg>
-);
-
-const SearchIcon = () => (
-  <svg {...SVG_PROPS}>
-    <circle cx="6" cy="6" r="3.4" />
-    <line x1="8.6" y1="8.6" x2="11.6" y2="11.6" />
-  </svg>
-);
-
-const PluginIcon = () => (
-  <svg {...SVG_PROPS}>
-    <rect x="2.5" y="2.5" width="3.6" height="3.6" rx="0.5" />
-    <rect x="7.9" y="2.5" width="3.6" height="3.6" rx="0.5" />
-    <rect x="2.5" y="7.9" width="3.6" height="3.6" rx="0.5" />
-    <rect x="7.9" y="7.9" width="3.6" height="3.6" rx="0.5" />
-  </svg>
-);
-
-const RefreshIcon = () => (
-  <svg {...SVG_PROPS}>
-    <path d="M11.5 6.6A4.5 4.5 0 1 0 11.7 8.6" />
-    <path d="M11.5 2.5V6.6H7.4" />
+    <rect x="1.8" y="2.5" width="10.4" height="9" rx="1.4" />
+    <line x1="5.4" y1="2.5" x2="5.4" y2="11.5" />
+    <line x1="3" y1="5" x2="4.1" y2="5" />
+    <line x1="3" y1="7" x2="4.1" y2="7" />
   </svg>
 );
 
@@ -107,80 +87,25 @@ function TitleBar({
 
   const featuresDisabled = providersLoading || !hasEnabledProvider;
 
-  const handleOpenSessions = useCallback(async () => {
-    const existing = await WebviewWindow.getByLabel("sessions");
+  const handleOpenManage = useCallback(async (section?: string) => {
+    const existing = await WebviewWindow.getByLabel("manage");
     if (existing) {
       await existing.show();
       await existing.setFocus();
+      // Already open: ask it to navigate (e.g. cog -> Settings) since the
+      // ?section= deep-link only applies on first creation.
+      if (section) {
+        await emit("manage:navigate", section);
+      }
       return;
     }
-    new WebviewWindow("sessions", {
-      url: "/?view=sessions",
-      title: "Session Search",
-      width: 1000,
-      height: 650,
-      minWidth: 600,
-      minHeight: 400,
-      decorations: false,
-      transparent: true,
-      resizable: true,
-    });
-  }, []);
-
-  const handleOpenLearning = useCallback(async () => {
-    const existing = await WebviewWindow.getByLabel("learning");
-    if (existing) {
-      await existing.show();
-      await existing.setFocus();
-      return;
-    }
-    new WebviewWindow("learning", {
-      url: "/?view=learning",
-      title: "Learning",
-      width: 500,
-      height: 600,
-      minWidth: 400,
-      minHeight: 400,
-      decorations: false,
-      transparent: true,
-      resizable: true,
-    });
-  }, []);
-
-  const handleOpenRestart = useCallback(async () => {
-    const existing = await WebviewWindow.getByLabel("restart");
-    if (existing) {
-      await existing.show();
-      await existing.setFocus();
-      return;
-    }
-    new WebviewWindow("restart", {
-      url: "/?view=restart",
-      title: "Restart Sessions",
-      width: 420,
-      height: 400,
-      minWidth: 320,
-      minHeight: 250,
-      decorations: false,
-      transparent: true,
-      resizable: true,
-    });
-  }, []);
-
-  const handleOpenPlugins = useCallback(async () => {
-    const existing = await WebviewWindow.getByLabel("plugins");
-    if (existing) {
-      await existing.show();
-      await existing.setFocus();
-      return;
-    }
-    new WebviewWindow("plugins", {
-      url: "/?view=plugins",
-      title: "Plugin Manager",
-      width: 700,
-      height: 550,
-      minWidth: 500,
-      minHeight: 400,
+    new WebviewWindow("manage", {
+      url: section ? `/?view=manage&section=${section}` : "/?view=manage",
+      title: "Manage",
+      width: 960,
+      height: 680,
+      minWidth: 720,
+      minHeight: 480,
       decorations: false,
       transparent: true,
       resizable: true,
@@ -201,30 +126,6 @@ function TitleBar({
       height: 600,
       minWidth: 380,
       minHeight: 360,
-      decorations: false,
-      transparent: true,
-      resizable: true,
-    });
-  }, []);
-
-  const handleOpenSettings = useCallback(async () => {
-    const existing = await WebviewWindow.getByLabel("settings");
-    if (existing) {
-      await existing.show();
-      await existing.setFocus();
-      return;
-    }
-    new WebviewWindow("settings", {
-      url: "/?view=settings",
-      title: "Settings",
-      // Default width matches minWidth so the five top tabs (General …
-      // Performance) always fit on a single row without horizontal
-      // scroll or flex wrap on first launch, with a small buffer past
-      // the last tab.
-      width: 540,
-      height: 620,
-      minWidth: 540,
-      minHeight: 480,
       decorations: false,
       transparent: true,
       resizable: true,
@@ -255,43 +156,15 @@ function TitleBar({
           </button>
           <span aria-hidden="true" className="view-tab-divider" />
           <button
-            className="view-tab view-tab--icon"
-            onClick={handleOpenLearning}
-            aria-label="Open learning"
-            title="Learning"
-            disabled={featuresDisabled}
-          >
-            <SparkIcon />
-          </button>
-          <button
-            className="view-tab view-tab--icon"
-            onClick={handleOpenSessions}
-            aria-label="Search sessions"
-            title="Search sessions"
-            disabled={featuresDisabled}
-          >
-            <SearchIcon />
-          </button>
-          <button
             className="view-tab view-tab--icon view-tab--plugins"
-            onClick={handleOpenPlugins}
-            aria-label="Plugin Manager"
-            title="Plugin Manager"
-            disabled={featuresDisabled}
+            onClick={() => void handleOpenManage()}
+            aria-label="Open Tools workspace"
+            title="Tools"
           >
-            <PluginIcon />
+            <ManageIcon />
             {pluginUpdateCount > 0 && (
               <span className="plugins-update-badge">{pluginUpdateCount}</span>
             )}
-          </button>
-          <button
-            className="view-tab view-tab--icon"
-            onClick={handleOpenRestart}
-            aria-label="Restart sessions"
-            title="Restart sessions"
-            disabled={featuresDisabled}
-          >
-            <RefreshIcon />
           </button>
         </div>
       </div>
@@ -326,7 +199,7 @@ function TitleBar({
           className="titlebar-cog"
           aria-label="Open settings"
           title="Open settings"
-          onClick={() => void handleOpenSettings()}
+          onClick={() => void handleOpenManage("settings")}
         >
           <SettingsIcon />
         </button>

@@ -4,7 +4,7 @@ use crate::models::{ProviderCredits, UsageBucket};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -13,6 +13,13 @@ use std::process::{Command, Stdio};
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MINIMAX_USAGE_URL: &str = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
 
+// Flat top-level usage keys. `five_hour`, `seven_day`, and `extra_usage` are
+// still populated. The per-model weekly keys (`seven_day_sonnet`/`_opus`/
+// `_cowork`/`_oauth_apps`) are legacy: the usage API now returns them as `null`
+// and exposes per-model weekly limits through the structured `limits` array
+// instead — see [[src-tauri/src/fetcher.rs#parse_scoped_weekly_limits]]. They
+// stay here so accounts still served the old shape keep their buckets; a `null`
+// entry is skipped in [[src-tauri/src/fetcher.rs#parse_buckets]].
 const BUCKET_KEYS: &[(&str, &str)] = &[
     ("five_hour", "5 hours"),
     ("seven_day", "7 days"),
@@ -135,6 +142,71 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
             utilization: util,
             resets_at,
             sort_order: 0,
+        });
+    }
+
+    let existing_labels: HashSet<String> = buckets.iter().map(|b| b.label.clone()).collect();
+    buckets.extend(parse_scoped_weekly_limits(data, &existing_labels));
+    buckets
+}
+
+/// Per-model weekly limits from the structured `limits` array. The usage API
+/// moved these out of the flat `seven_day_<model>` keys (now `null`) into
+/// `limits[]`, where each `weekly_scoped` entry carries a `percent` plus a
+/// `scope.model.display_name` (e.g. `"Fable"`). This is the only place the
+/// Fable 5 weekly bucket is surfaced. The `session` and `weekly_all` limits are
+/// skipped because the flat `five_hour` / `seven_day` keys already produce those
+/// buckets (and drive the tray indicator windows).
+fn parse_scoped_weekly_limits(
+    data: &serde_json::Value,
+    existing_labels: &HashSet<String>,
+) -> Vec<UsageBucket> {
+    let mut buckets = Vec::new();
+    let Some(limits) = data.get("limits").and_then(|v| v.as_array()) else {
+        return buckets;
+    };
+
+    // Seed with the labels the flat keys already produced so a window covered by
+    // both shapes during a rollout renders one tile, not two.
+    let mut seen = existing_labels.clone();
+
+    for entry in limits {
+        if entry.get("kind").and_then(|v| v.as_str()) != Some("weekly_scoped") {
+            continue;
+        }
+
+        let Some(util) = entry
+            .get("percent")
+            .and_then(|v| v.as_f64())
+            .and_then(validate_utilization)
+        else {
+            continue;
+        };
+
+        let scope = entry.get("scope");
+        let label = scope
+            .and_then(|s| s.get("model"))
+            .and_then(|m| m.get("display_name"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                scope
+                    .and_then(|s| s.get("surface"))
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("Weekly")
+            .to_string();
+
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+
+        buckets.push(UsageBucket {
+            provider: IntegrationProvider::Claude,
+            key: format!("weekly_scoped_{}", label.to_lowercase().replace(' ', "_")),
+            label,
+            utilization: util,
+            resets_at: entry.get("resets_at").and_then(parse_resets_at),
+            sort_order: 1,
         });
     }
 

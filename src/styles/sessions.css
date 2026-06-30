@@ -420,7 +420,7 @@
 }
 
 .sessions-context-tool-summary {
-	font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+	font-family: "Geist Mono", "SF Mono", "Cascadia Code", "Fira Code", monospace;
 	font-size: 10px;
 	line-height: 1.5;
 	color: rgba(255, 255, 255, 0.45);

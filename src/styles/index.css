@@ -1,3 +1,19 @@
+@font-face {
+  font-family: "Geist";
+  src: url("../assets/fonts/Geist-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("../assets/fonts/GeistMono-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -72,7 +88,7 @@ html {
 body {
   background: var(--console-black);
   color: #d4d4d4;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 11px;
   overflow: hidden;
   user-select: none;
@@ -909,10 +925,6 @@ body {
   gap: 8px;
 }
 
-.integration-empty-state--window {
-  max-width: 360px;
-}
-
 .integration-empty-state__eyebrow {
   color: rgba(255, 255, 255, 0.45);
   font-size: 9px;
@@ -1214,54 +1226,6 @@ body {
 
 .confirm-dialog-input::placeholder {
   color: rgba(255, 255, 255, 0.3);
-}
-
-.blocked-window {
-  display: flex;
-  flex-direction: column;
-  min-height: 100vh;
-  background: var(--console-black);
-}
-
-.blocked-window--loading {
-  align-items: center;
-  justify-content: center;
-}
-
-.blocked-window-titlebar {
-  min-height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.blocked-window-title {
-  color: rgba(255, 255, 255, 0.85);
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.blocked-window-close {
-  background: none;
-  border: none;
-  color: rgba(255, 255, 255, 0.45);
-  font-size: 16px;
-  cursor: pointer;
-  padding: 2px 6px;
-}
-
-.blocked-window-close:hover {
-  color: rgba(255, 255, 255, 0.85);
-}
-
-.blocked-window-body {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
 }
 
 /* ─── Analytics view ─── */
@@ -2289,13 +2253,13 @@ body {
   display: inline-block;
   color: rgba(255, 255, 255, 0.3);
   margin-right: 6px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   user-select: none;
 }
 
 .breakdown-subagent-id {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px;
   color: rgba(255, 255, 255, 0.7);
   margin-right: 4px;
@@ -4525,7 +4489,7 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
   display: block;
   justify-self: start;
   color: var(--signal-cyan);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -4549,7 +4513,7 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
   display: inline-flex;
   align-items: center;
   width: fit-content;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   background: rgba(125, 211, 252, 0.08);
   border: 1px solid rgba(125, 211, 252, 0.16);
   color: rgba(224, 242, 254, 0.92);
@@ -4581,7 +4545,7 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
 
 .release-notes-markdown {
   color: rgba(248, 250, 252, 0.86);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "Geist", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 12.5px;
   line-height: 1.6;
   max-width: none;
@@ -4651,7 +4615,7 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
 }
 
 .release-notes-markdown code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.92em;
   color: var(--readout-bright);
   background: rgba(125, 211, 252, 0.1);
@@ -4808,7 +4772,7 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
 .release-notes-source {
   color: rgba(148, 163, 184, 0.78);
   font-size: 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   user-select: text;
   overflow: hidden;
   text-overflow: ellipsis;

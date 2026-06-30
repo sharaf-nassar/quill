@@ -112,7 +112,7 @@ function StatusStrip({
           className="learning-asymmetry-note learning-status-row"
           role="note"
         >
-          <span className="learning-asymmetry-icon">\u24D8</span>
+          <span className="learning-asymmetry-icon">{"\u24D8"}</span>
           <span>
             {PROVIDER_ASYMMETRY_DISCLOSURE}{" "}
             <span className="learning-asymmetry-quant">

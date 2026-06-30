@@ -10,20 +10,21 @@ Each window gets its own Suspense boundary with a fallback. Per-window zoom pers
 
 ### Window Routes
 
-Eight Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary.
+Three Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary: the main split-pane app, the consolidated Manage workspace, and the release-notes viewer.
 
 | Route | Component | Purpose |
 |-------|-----------|---------|
 | `?view=main` (default) | [[src/App.tsx]] | Split-pane live + analytics |
-| `?view=sessions` | `SessionsWindowView` | Full-text session search |
-| `?view=learning` | `LearningWindow` | Rules and memory optimization |
-| `?view=plugins` | `PluginsWindowView` | Plugin management |
-| `?view=restart` | `RestartWindowView` | Claude Code instance restart |
-| `?view=runs` | `RunsWindowView` | Learning run history details |
-| `?view=settings` | `SettingsWindowView` | Comprehensive feature toggle and runtime configuration surface |
+| `?view=manage` | [[src/windows/ManageWindowView.tsx]] | Rail-navigated Manage workspace; the five tool UIs (Sessions, Learning, Plugins, Instances, Settings) embedded as sections |
 | `?view=release-notes` | `ReleaseNotesWindow` | Browse published GitHub release notes |
 
-The `settings` and `release-notes` routes are not gated on having an enabled provider; both stay reachable so users can manage integrations and browse changelog history regardless of integration state.
+The former per-tool windows (`sessions`, `learning`, `plugins`, `restart`, `runs`, `settings`) were retired into Manage sections, and run history folded into the Learning section. All three remaining routes are reachable without an enabled provider — the Manage workspace gates each tool section inline (Settings always renders), so the former `BlockedWindow` per-window provider-blocking was removed.
+
+## Manage Workspace
+
+`?view=manage` ([[src/windows/ManageWindowView.tsx]]) is a single rail-navigated window that consolidates the former tool windows into the "Systems Pages" half of the monitor-vs-manage split. It is opened from the PFD titlebar's un-gated Tools button.
+
+The left rail has five flat sections — Sessions, Learning (Rules / Memory / Runs), Plugins, Instances (instance restart), and Settings — with a signal-blue active indicator and a footer "Live" affordance back to the PFD. The active section persists to `localStorage` (`quill-manage-section`) and accepts a `?section=` deep-link (the titlebar cog opens `manage` at Settings). It uses the roomier Systems-Pages density and the Glass Cockpit tokens from DESIGN.md. Each section's content reuses the tool's existing window-view component, lazy-loaded and rendered with its own window chrome (titlebar/close) suppressed via `manage.css`; provider-dependent sections (Sessions, Learning, Plugins, Instances) show an inline no-provider state while Settings stays reachable. The Learning section's Runs toggle opens run history as an inline right-docked panel (folded in from the former floating `runs` window). The standalone tool windows, their `?view=` routes, and capabilities entries have been retired. A rail Search affordance and `⌘K` / `Ctrl K` open the [[src/components/CommandPalette.tsx]] — a substring-filtered list of the five sections plus Back-to-Live and Close-Tools actions, navigated with arrow keys and Enter. The titlebar, its launcher button, and the palette's Close action display the label "Tools"; the window label, `?view=manage` route, `manage.css`, and component names are unchanged.
 
 ## Browser Mock Mode
 
@@ -59,7 +60,7 @@ Components are organized by feature domain under `src/components/`.
 
 Top-level UI chrome and live rate limit display shared across the main window.
 
-- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with left-aligned feature buttons, a centered static `QUILL` brand label, and a right-aligned cluster containing the version button followed by a settings button rendered as a horizontal-sliders icon (immediately right of the version) that opens the standalone [[features#Settings Window]], then the close control. When the frontend's periodic updater check finds a release, it also shows an `Update x.y.z` action that installs via [[src-tauri/src/lib.rs#install_app_update]] so the backend owns the restart handoff. The version label is rendered as a button that opens the `release-notes` window via [[src/windows/ReleaseNotesWindow.tsx]]. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
+- **TitleBar** (`src/components/TitleBar.tsx`) — Custom window chrome with a left-aligned Live/Analytics toggle plus a single un-gated **Tools** button (labeled "Tools") that opens the [[lat.md/frontend#Frontend#Manage Workspace]] window (it replaced the former Learning/Search/Plugins/Restart launch icons), a centered static `QUILL` brand label, and a right-aligned cluster containing the version button followed by a settings button rendered as a horizontal-sliders icon (immediately right of the version) that opens the workspace at its Settings section, then the close control. When the frontend's periodic updater check finds a release, it also shows an `Update x.y.z` action that installs via [[src-tauri/src/lib.rs#install_app_update]] so the backend owns the restart handoff. The version label is rendered as a button that opens the `release-notes` window via [[src/windows/ReleaseNotesWindow.tsx]]. Owns the confirmation-driven enable/disable flow via `ConfirmDialog`.
 - **ReleaseNotesWindow** (`src/windows/ReleaseNotesWindow.tsx`) — Standalone window that fetches published GitHub releases through the [[src-tauri/src/lib.rs#get_release_notes]] command, shows the latest first, and places Previous/Next navigation plus the selectable release URL in a top toolbar below the titlebar. Centers the release tag between the release counter and publish date, renders release bodies as sanitized GitHub-flavored Markdown that fills the scroll area, surfaces loading, empty, and error states with a Retry control, and supports Escape plus Left/Right arrow keyboard navigation.
 - **ProviderMenu** (`src/components/integrations/ProviderMenu.tsx`) — Reusable provider action panel rendered as a compact terminal-utility list of 22 px rows separated by 1 px hairlines. Inline rows for Layout (stacked/side-by-side icon toggle), Status (compact `<select>` for the indicator primary provider), and Context (working-context preservation toggle) come first, followed by the `Integrations` group (Claude Code, Codex, MiniMax) and then `Brevity` (Claude Code, Codex). The Integrations group leads with a "Rescan PATH" row whose `RUN`/`...` toggle calls the `rescan` callback (which invokes the `rescan_integrations` IPC) so users can re-derive the login-shell PATH after installing a CLI or editing shell config without restarting. Each provider toggle is a single 36 px-min `pmenu-toggle` pill that resolves to one of `ON` / `OFF` / `N/A` / `SETUP` / `…` / `—` depending on `inFlightProviders`, `setupState`, `detectedCli`, and per-provider `enabled` flags, with semantic colors drawn from [[lat.md/frontend#Frontend#Styling#Color System]] (green = on, dim = off, red = unavailable, yellow = needs setup, blue = busy). Hovering any row in a section instantly shows a detailed `pmenu-tooltip` (one of `layout`, `status`, `context`, `brevity`, `integrations`) rendered via `react-dom/createPortal` into `document.body` to escape the popover's `overflow-y: auto`; the tooltip is positioned `fixed` to the left of the menu by default and falls back below the popover when there is no horizontal room for the 252 px panel, with a small CSS-rotated diamond pointing back at the source row. Tooltip copy lines support inline `<code>` rendering via a backtick parser. When a provider row shows N/A and `lastDetectionAttempts` is non-empty, hover replaces the generic Integrations tooltip with a per-row diagnostic listing every path Quill checked while looking for that provider's CLI. The portal layer dismisses on `mouseleave`, window resize, or menu scroll. Layout props remain optional for backward compatibility with the legacy `IntegrationsWindowView`.
 - **ConfirmDialog** (`src/components/ConfirmDialog.tsx`) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation.
@@ -94,8 +95,7 @@ Rule management and memory optimization UI in `src/components/learning/`.
 - **SuggestionCard** (258 lines) — Memory optimization suggestion with approve/deny/undo actions and diff summaries.
 - **StatusStrip** — Observation count, unanalyzed count, last run time, and "Run Analysis" button. On the combined "All Providers" scope only, when at least one shared-scope rule exists, it renders the quantified provider-asymmetry disclosure ([[src/utils/providers.ts#PROVIDER_ASYMMETRY_DISCLOSURE]]) appended with a per-provider shared-rule contribution count derived in `LearningWindow` from the already-fetched rules' `provider_scope` (no extra fetch); single-provider filters omit the note (feature 005 R-7 / M-6 / FR-028).
 - **DomainBreakdown** (38 lines) — Rules-by-domain pie chart.
-- **RunHistory** — Run list with status badges and per-phase breakdown. The selected-run detail block surfaces the derived `LearningRun.inference` rollup ([[src/types.ts#RunInferenceSummary]]) as Model / Cost / Inference-time rows (em-dash and never a crash when `inference` is absent on legacy/micro runs), plus a Failed-calls row when any inference call failed; the existing wall-clock Duration row is kept alongside the summed inference time. `degraded` is a first-class status with a distinct amber ⚠ icon and phase dot (no longer masked by the hard-fail ✗) and a degraded-but-with-rules result label. A presentational consecutive-failure banner (no circuit-breaker, no extra fetch) appears when the last K=3 terminal-with-verdict runs are all hard `failed` (`running`/`interrupted` neither contribute nor reset) (feature 005 R-7 / H-6 / L-3 / FR-024).
-- **FloatingRunsWindow** (146 lines) — Collapsible OS window for run history, positioned with physical screen coordinates and owned by the Learning toggle so Strict Mode remounts and manual closes keep state synchronized.
+- **RunHistory** — Run list with status badges and per-phase breakdown. The selected-run detail block surfaces the derived `LearningRun.inference` rollup ([[src/types.ts#RunInferenceSummary]]) as Model / Cost / Inference-time rows (em-dash and never a crash when `inference` is absent on legacy/micro runs), plus a Failed-calls row when any inference call failed; the existing wall-clock Duration row is kept alongside the summed inference time. `degraded` is a first-class status with a distinct amber ⚠ icon and phase dot (no longer masked by the hard-fail ✗) and a degraded-but-with-rules result label. A presentational consecutive-failure banner (no circuit-breaker, no extra fetch) appears when the last K=3 terminal-with-verdict runs are all hard `failed` (`running`/`interrupted` neither contribute nor reset) (feature 005 R-7 / H-6 / L-3 / FR-024). Rendered inline as a right-docked panel within the Learning section (toggled by the toolbar Runs button), reusing the same `runs`/`liveLogs` from [[src/hooks/useLearningData.ts]]; the former standalone floating run-history window was retired.
 
 ### Session Components
 
@@ -197,7 +197,13 @@ Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`
 
 ## Styling
 
-Pure CSS with no framework, organized around a `:root` design-token layer in `src/styles/index.css` per DESIGN.md. Dark theme: near-black `--console-black` (`#121216`) canvas, `--readout` (`#d4d4d4`) text, 11px system sans-serif.
+Pure CSS with no framework, organized around a `:root` design-token layer in `src/styles/index.css` per DESIGN.md. Dark theme: near-black `--console-black` (`#121216`) canvas, `--readout` (`#d4d4d4`) text, 11px Geist with system fallback.
+
+### Typography
+
+Body/UI text is **Geist** and monospace contexts (ids, code, paths) are **Geist Mono** — both self-hosted variable fonts (weights 100–900) with system stacks as fallback.
+
+Both are vendored from the `geist` npm package into `src/assets/fonts/` (`Geist-Variable.woff2`, `GeistMono-Variable.woff2`) and declared via `@font-face` in `index.css` with `font-display: swap`. Every window stylesheet's mono stack leads with `"Geist Mono"`.
 
 ### Design Tokens
 
