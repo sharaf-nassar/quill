@@ -38,12 +38,19 @@ for i in "${!keys[@]}"; do
   key="${keys[$i]}"
   pat="${pats[$i]}"
 
-  read -r bname burl < <(echo "$assets_json" | jq -r --arg re "$pat" \
-    '([.[] | select(.name | test($re))][0]) | if . == null then "" else "\(.name) \(.browser_download_url)" end')
+  bname="$(echo "$assets_json" | jq -r --arg re "$pat" \
+    '([.[] | select(.name | test($re))][0]) | if . == null then "" else .name end')"
   if [[ -z "${bname:-}" ]]; then
     echo "WARN: no bundle asset matching /${pat}/ for ${key}" >&2
     continue
   fi
+
+  # Never use the API's browser_download_url here: on a draft it points at
+  # the ephemeral untagged-<hash> path, which GitHub invalidates when the
+  # release is published (v0.3.34 shipped with dead updater URLs this way).
+  # The canonical /releases/download/<tag>/<name> path is stable after
+  # publish, so build it from the tag we are publishing.
+  burl="https://github.com/${REPO}/releases/download/${TAG}/${bname}"
 
   sid="$(echo "$assets_json" | jq -r --arg n "${bname}.sig" \
     '([.[] | select(.name == $n)][0]) | if . == null then "" else (.id | tostring) end')"

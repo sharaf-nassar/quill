@@ -64,6 +64,8 @@ A third job (`publish`) waits for all builds, finds the draft release, and renam
 
 It retries the draft lookup for API eventual consistency, then rebuilds `latest.json` from scratch and publishes the release. Because `tauri-action`'s parallel per-build `latest.json` uploads race on the single shared asset and silently drop platforms (this shipped v0.3.33 with no `linux-x86_64` entry, breaking the updater for Linux), the publish job is the manifest's single writer: after renaming assets it runs `.github/scripts/assemble-latest-json.sh`, which reads each platform's signed `*.sig` asset (distinct names never race) and emits the four base updater keys (`linux-x86_64`, `darwin-aarch64`, `darwin-x86_64`, `windows-x86_64`). The script fails the release if any base platform is missing, turning a silently broken manifest into a hard failure. The macOS build still verifies that `*.app.tar.gz` plus its `.sig` exist before continuing so the `darwin-*` signatures are present to assemble.
 
+Asset URLs are constructed as `https://github.com/<repo>/releases/download/<tag>/<name>` rather than read from the draft's `browser_download_url`: the API reports draft assets under an ephemeral `untagged-<hash>` path that GitHub invalidates at publish time, which shipped v0.3.34 with dead updater URLs (Install silently no-oped; the manifest was hot-patched in place with corrected URLs).
+
 ### Required Secrets
 
 `GITHUB_TOKEN`, `TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `KEYCHAIN_PASSWORD`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`, `SENTRY_AUTH_TOKEN`.
