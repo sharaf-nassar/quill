@@ -13253,9 +13253,15 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
+        // Fixture times are relative to now: the stats window is anchored
+        // to Utc::now(), so absolute dates age out of "30d" and rot the test.
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let at = |secs: i64| (base + chrono::Duration::seconds(secs)).to_rfc3339();
+        let (a_start, a_end) = (at(0), at(30));
+        let (b_start, b_end) = (at(5), at(40));
         let events_a = vec![
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:00.000Z",
+                timestamp: &a_start,
                 kind: crate::sessions::SessionEventKind::UserText,
                 is_sidechain: true,
                 agent_id: Some("agent-a"),
@@ -13263,7 +13269,7 @@ mod tests {
                 parent_uuid: None,
             },
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:30.000Z",
+                timestamp: &a_end,
                 kind: crate::sessions::SessionEventKind::AsstText,
                 is_sidechain: true,
                 agent_id: Some("agent-a"),
@@ -13273,7 +13279,7 @@ mod tests {
         ];
         let events_b = vec![
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:05.000Z",
+                timestamp: &b_start,
                 kind: crate::sessions::SessionEventKind::UserText,
                 is_sidechain: true,
                 agent_id: Some("agent-b"),
@@ -13281,7 +13287,7 @@ mod tests {
                 parent_uuid: None,
             },
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:40.000Z",
+                timestamp: &b_end,
                 kind: crate::sessions::SessionEventKind::AsstText,
                 is_sidechain: true,
                 agent_id: Some("agent-b"),
@@ -13295,7 +13301,6 @@ mod tests {
         storage
             .ingest_session_events(IntegrationProvider::Claude, "sess-1", &events_b)
             .expect("ingest b");
-        // Wide range avoids clock-skew flake across the test cutoff.
         let stats = storage.get_llm_runtime_stats("30d", None).expect("stats");
         assert_eq!(
             stats.turn_count, 2,
@@ -13314,9 +13319,14 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
+        // Relative fixture times, same rationale as the sibling test above.
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let at = |secs: i64| (base + chrono::Duration::seconds(secs)).to_rfc3339();
+        let (p_start, p_end) = (at(0), at(10));
+        let (s_start, s_end) = (at(20), at(50));
         let mut all_events = vec![
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:00.000Z",
+                timestamp: &p_start,
                 kind: crate::sessions::SessionEventKind::UserText,
                 is_sidechain: false,
                 agent_id: None,
@@ -13324,7 +13334,7 @@ mod tests {
                 parent_uuid: None,
             },
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:10.000Z",
+                timestamp: &p_end,
                 kind: crate::sessions::SessionEventKind::AsstText,
                 is_sidechain: false,
                 agent_id: None,
@@ -13334,7 +13344,7 @@ mod tests {
         ];
         let subagent = vec![
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:20.000Z",
+                timestamp: &s_start,
                 kind: crate::sessions::SessionEventKind::UserText,
                 is_sidechain: true,
                 agent_id: Some("agent-x"),
@@ -13342,7 +13352,7 @@ mod tests {
                 parent_uuid: None,
             },
             crate::storage::SessionEventInput {
-                timestamp: "2026-05-20T10:00:50.000Z",
+                timestamp: &s_end,
                 kind: crate::sessions::SessionEventKind::AsstText,
                 is_sidechain: true,
                 agent_id: Some("agent-x"),
