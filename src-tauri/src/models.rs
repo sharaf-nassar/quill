@@ -83,9 +83,11 @@ pub enum ProviderErrorKind {
     Config,
     // The provider rejected the credentials we sent (401 Unauthorized).
     Auth,
-    // Provider returned 429. The poller writes a silent rate-limit cooldown
-    // and does NOT push this kind today, but the variant exists so future code
-    // can surface a "Rate-limited" pill without another payload change.
+    // Provider returned 429. The poller no longer surfaces this cause-oriented
+    // kind — it writes a rate-limit cooldown and pushes the consequence-oriented
+    // `Stale` (see below) instead, so the pill reads "showing cached data"
+    // rather than naming the cause. Kept (dead) so the enum still documents the
+    // 429 mapping without another payload change.
     #[allow(dead_code)]
     RateLimit,
     // Provider responded but with a non-success status or unparseable body.
@@ -97,6 +99,17 @@ pub enum ProviderErrorKind {
     // with cached rows still shown, NOT a red login prompt. See
     // [[lat.md/data-flow#Usage Bucket Fetching]].
     Paused,
+    // Live rows are being served from the last-persisted snapshot because the
+    // provider is in a rate-limit cooldown — a 429 armed it, or a fresh 429 just
+    // landed. The snapshot can be arbitrarily old (the user's real limits may
+    // reset while the cooldown holds), so the UI shows a muted "showing cached
+    // data" pill (slate, never red or a meter color) instead of presenting a
+    // stale snapshot as live. Consequence-oriented on purpose; the cause (429)
+    // is not named. Like `Paused`, excluded from the top-level `error` in
+    // [[src-tauri/src/lib.rs#build_usage_data]] so a first-run 429 with no cache
+    // shows the pill, not a red failure. See
+    // [[lat.md/data-flow#Usage Bucket Fetching]].
+    Stale,
 }
 
 #[derive(Serialize, Clone, Debug)]

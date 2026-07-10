@@ -105,23 +105,31 @@ function UsageDisplay({
 
   const providerSections = buildProviderSections(enabledProviders, data.buckets);
 
-  // Partition provider errors. `network` (offline) and `paused` (stale Claude
-  // token) are transient banners that must render even with no buckets yet, so
-  // a first-run/empty view never preempts them with "No usage data".
+  // Partition provider errors. `network` (offline), `paused` (stale Claude
+  // token), and `stale` (rate-limit cooldown serving cached rows) are transient
+  // banners that must render even with no buckets yet, so a first-run/empty
+  // view never preempts them with "No usage data".
   const offlineProviders = data.provider_errors
     .filter((e) => e.kind === "network")
     .map((e) => e.provider);
   const pausedProviders = data.provider_errors
     .filter((e) => e.kind === "paused")
     .map((e) => e.provider);
+  // Providers whose rows come from cache during a rate-limit cooldown. Shown as
+  // one consolidated "Showing cached data" pill, but the offline pill wins when
+  // both are present (see below) so the user never sees two near-identical pills.
+  const staleProviders = data.provider_errors
+    .filter((e) => e.kind === "stale")
+    .map((e) => e.provider);
   const otherErrors = data.provider_errors.filter(
-    (e) => e.kind !== "network" && e.kind !== "paused",
+    (e) => e.kind !== "network" && e.kind !== "paused" && e.kind !== "stale",
   );
 
   if (
     providerSections.length === 0 &&
     offlineProviders.length === 0 &&
-    pausedProviders.length === 0
+    pausedProviders.length === 0 &&
+    staleProviders.length === 0
   ) {
     return <div className="loading">No usage data</div>;
   }
@@ -225,6 +233,7 @@ function UsageDisplay({
         if (
           offlineProviders.length === 0 &&
           pausedProviders.length === 0 &&
+          staleProviders.length === 0 &&
           otherErrors.length === 0
         ) {
           return null;
@@ -243,6 +252,20 @@ function UsageDisplay({
                 <span className="usage-provider-error__label">Offline</span>
                 <span className="usage-provider-error__message">
                   Showing cached data ({offlineProviders.map(providerLabel).join(", ")}).
+                </span>
+              </div>
+            )}
+            {/* Rate-limit cooldown pill. Suppressed when an offline pill is
+                already showing — both say "showing cached data", so the offline
+                pill wins to avoid two near-identical rows. */}
+            {offlineProviders.length === 0 && staleProviders.length > 0 && (
+              <div
+                className="usage-provider-error usage-provider-error--stale"
+                data-error-kind="stale"
+              >
+                <span className="usage-provider-error__label">Stale</span>
+                <span className="usage-provider-error__message">
+                  Showing cached data ({staleProviders.map(providerLabel).join(", ")}).
                 </span>
               </div>
             )}

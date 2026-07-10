@@ -91,6 +91,23 @@ function getTimeFraction(
   }
 }
 
+// True when a non-null `resets_at` is in the past — the same boundary that makes
+// formatCountdown render "now". The window this utilization was measured against
+// has already rolled over, so the value is from a bygone window and the row must
+// read as stale (muted %, no severity badge, slate bars) rather than presenting
+// an old number as a live severity. Invalid/absent timestamps → not stale.
+function isResetElapsed(resetsAt: string | null): boolean {
+  if (!resetsAt) return false;
+  try {
+    const totalSeconds = Math.floor(
+      (new Date(resetsAt).getTime() - new Date().getTime()) / 1000,
+    );
+    return totalSeconds <= 0;
+  } catch {
+    return false;
+  }
+}
+
 interface BarProps {
   fraction: number;
   cls: string;
@@ -177,10 +194,14 @@ function UsageRow({
     return () => clearInterval(interval);
   }, []);
 
+  const stale = isResetElapsed(resetsAt);
   const fraction = Math.min(utilization / 100, 1);
-  const cls = colorClass(utilization);
-  const status = statusText(utilization);
-  const pctColor = gradientColor(utilization);
+  // A stale row (its reset window already elapsed) must not read as a live
+  // severity: neutralize the meter fill to slate, mute the %, and drop the
+  // High/Crit badge. Meter green/amber/red are reserved for real thresholds.
+  const cls = stale ? "stale" : colorClass(utilization);
+  const status = stale ? { short: "", full: "" } : statusText(utilization);
+  const pctColor = stale ? "var(--label)" : gradientColor(utilization);
   const countdown = formatCountdown(resetsAt);
   const timeFraction = getTimeFraction(resetsAt, label);
   const isBackground = timeMode === "background";

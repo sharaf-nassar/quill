@@ -21,7 +21,13 @@ export type ProviderErrorKind =
   // Live polling is paused for a transient, non-failure reason (a stale Claude
   // access token returned 401 while still logged in). Rendered as a muted
   // "Paused" badge by src/components/UsageDisplay.tsx, never a red prompt.
-  | "paused";
+  | "paused"
+  // Rows are being served from the last-persisted snapshot during a rate-limit
+  // cooldown (a 429 armed it, or one just landed), so the values may be out of
+  // date. Rendered as a single muted "Showing cached data" pill (slate, never
+  // red) by src/components/UsageDisplay.tsx; the offline pill wins when both
+  // network and stale errors are present.
+  | "stale";
 
 export interface UsageProviderError {
   provider: IntegrationProvider;

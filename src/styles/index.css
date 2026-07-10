@@ -447,14 +447,17 @@ body {
   font-weight: 700;
 }
 
-/* Offline pill — single coalesced row when one or more providers are in
- * transport-error cooldown. Uses a neutral slate palette instead of red,
- * because offline is a transient state, not a failure. */
-.usage-provider-error--offline {
+/* Offline / stale pills — single coalesced row when one or more providers are
+ * serving cached rows: a transport-error cooldown reads "Offline", a rate-limit
+ * cooldown reads "Stale". Both use a neutral slate palette instead of red,
+ * because each is a transient state, not a failure. */
+.usage-provider-error--offline,
+.usage-provider-error--stale {
   background: rgba(148, 163, 184, 0.10);
   border-color: rgba(148, 163, 184, 0.18);
 }
-.usage-provider-error--offline .usage-provider-error__label {
+.usage-provider-error--offline .usage-provider-error__label,
+.usage-provider-error--stale .usage-provider-error__label {
   color: rgba(226, 232, 240, 0.92);
 }
 
@@ -843,6 +846,13 @@ body {
 
 .progress-fill.red {
   background-color: var(--meter-red);
+}
+
+/* Reset window already elapsed → the utilization is from a bygone window. The
+ * fill goes slate so a stale value can't masquerade as a live severity state
+ * (green/amber/red are reserved for real thresholds). */
+.progress-fill.stale {
+  background-color: rgba(148, 163, 184, 0.5);
 }
 
 /* Time-elapsed bar (dual mode) */

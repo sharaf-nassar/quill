@@ -700,7 +700,7 @@ const MINIMAX_COOLDOWN_KEYS: ProviderCooldownKeys = ProviderCooldownKeys {
 
 enum ProviderCooldownDecision {
     Proceed,
-    UseCachedSilently,
+    UseCachedAsStale,
     UseCachedAsOffline,
 }
 
@@ -709,7 +709,7 @@ fn check_provider_cooldown(
     now: DateTime<Utc>,
 ) -> ProviderCooldownDecision {
     if usage_setting_timestamp(keys.rate_limit_cooldown_until).is_some_and(|t| t > now) {
-        return ProviderCooldownDecision::UseCachedSilently;
+        return ProviderCooldownDecision::UseCachedAsStale;
     }
     if usage_setting_timestamp(keys.network_cooldown_until).is_some_and(|t| t > now) {
         return ProviderCooldownDecision::UseCachedAsOffline;
@@ -781,6 +781,22 @@ fn push_paused_error(
         provider,
         kind: ProviderErrorKind::Paused,
         message: "Paused".into(),
+    });
+}
+
+// Muted, non-failure signal that a provider's rows are being served from the
+// last-persisted snapshot during a rate-limit cooldown, so they may be stale.
+// Cached rows are shown alongside; the UI renders a neutral "showing cached
+// data" pill (slate, never red), NOT a rate-limit error. The message is only
+// consumed by the tray indicator (the live-pane pill builds its own copy).
+fn push_stale_error(
+    errors: &mut Vec<UsageProviderError>,
+    provider: integrations::IntegrationProvider,
+) {
+    errors.push(UsageProviderError {
+        provider,
+        kind: ProviderErrorKind::Stale,
+        message: "Rate limited.".into(),
     });
 }
 
@@ -973,16 +989,22 @@ fn build_usage_data(
     provider_credits: Vec<models::ProviderCredits>,
 ) -> UsageData {
     sort_and_dedup_usage_buckets(&mut buckets);
-    // A `Paused` provider error (stale Claude access token, see
-    // [[lat.md/data-flow#Usage Bucket Fetching]] step 8a) is a transient,
-    // non-failure state and must never become the top-level red error label.
-    // Surface the first *genuine* failure instead, so a Paused-only poll with
-    // no cached rows yet falls through to the muted badge rather than a red
-    // "Failed to load usage data".
+    // `Paused` (stale Claude access token, see
+    // [[lat.md/data-flow#Usage Bucket Fetching]] step 8a) and `Stale` (rate-limit
+    // cooldown serving cached rows) are transient, non-failure states and must
+    // never become the top-level red error label. Surface the first *genuine*
+    // failure instead, so a Paused- or Stale-only poll with no cached rows yet
+    // falls through to the muted badge/pill rather than a red "Failed to load
+    // usage data".
     let error = if buckets.is_empty() {
         provider_errors
             .iter()
-            .find(|provider_error| !matches!(provider_error.kind, ProviderErrorKind::Paused))
+            .find(|provider_error| {
+                !matches!(
+                    provider_error.kind,
+                    ProviderErrorKind::Paused | ProviderErrorKind::Stale
+                )
+            })
             .map(|provider_error| provider_error.message.clone())
     } else {
         None
@@ -1104,7 +1126,8 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                     }
 
                     match check_provider_cooldown(CLAUDE_COOLDOWN_KEYS, now) {
-                        ProviderCooldownDecision::UseCachedSilently => {
+                        ProviderCooldownDecision::UseCachedAsStale => {
+                            push_stale_error(&mut provider_errors, provider);
                             append_cached_buckets(&mut display_buckets, provider);
                             continue;
                         }
@@ -1137,6 +1160,10 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                                         now,
                                         error.retry_after_seconds,
                                     );
+                                    // Surface staleness on the very first 429:
+                                    // the rows appended below are the last
+                                    // snapshot, not live.
+                                    push_stale_error(&mut provider_errors, provider);
                                 }
                                 fetcher::ClaudeUsageErrorKind::Request => {
                                     record_network_failure(CLAUDE_COOLDOWN_KEYS, now, provider);
@@ -1207,7 +1234,8 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                     let now = Utc::now();
 
                     match check_provider_cooldown(MINIMAX_COOLDOWN_KEYS, now) {
-                        ProviderCooldownDecision::UseCachedSilently => {
+                        ProviderCooldownDecision::UseCachedAsStale => {
+                            push_stale_error(&mut provider_errors, provider);
                             append_cached_buckets(&mut display_buckets, provider);
                             continue;
                         }
@@ -1240,6 +1268,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                                                 now,
                                                 error.retry_after_seconds,
                                             );
+                                            push_stale_error(&mut provider_errors, provider);
                                         }
                                         fetcher::MiniMaxUsageErrorKind::Request => {
                                             record_network_failure(
