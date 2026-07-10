@@ -209,7 +209,7 @@ Files and directories created during first-launch auto-deployment.
 | `~/.claude/commands/` | Custom CLI commands (if applicable) |
 | `~/.claude/settings.json` | Hook registrations (marked with `_source: "quill-setup"`) |
 | `~/.claude.json` | MCP server registration |
-| `~/.claude/CLAUDE.md` | Quill MCP usage instructions injected as a managed block between `<!-- quill-managed:claude:start -->` / `<!-- quill-managed:claude:end -->` markers |
+| `~/.claude/CLAUDE.md` | Quill MCP usage instructions injected as a managed block between `<!-- quill-managed:claude:start -->` / `<!-- quill-managed:claude:end -->` markers. The block is deliberately minimal — the raw-JSONL prohibition plus a working-context routing pointer — because the MCP server already publishes full usage guidance through FastMCP `instructions` in every session where it is connected; the `claude-md-section-base.md` template variant (deployed when context preservation is off) drops the pointer |
 
 Scripts get 0o755 permissions; auth files get 0o600. Existing hook entries are detected to avoid duplication. Original `settings.json` is backed up before patching. Deployed `observe.cjs`, `session-sync.cjs`, and optional `context-telemetry.cjs` calls cap HTTP waits so provider CLIs fail open instead of timing out on Quill stalls.
 
@@ -231,7 +231,7 @@ Deployment is allowlisted to token and sync scripts by default. `observe.cjs` an
 | `~/.config/quill/codex/mcp/` | Python MCP server copied from the bundled Quill MCP assets; working-context tools only when context preservation is enabled |
 | `~/.config/quill/codex/templates/` | Managed AGENTS template block |
 | `~/.codex/config.toml` | `features.hooks = true`, inline `[[hooks.*]]` Quill hook registrations, Codex `hooks.state` trust hashes, plus a Quill-managed `mcp_servers.quill` block when no manual entry exists |
-| `~/.codex/AGENTS.md` | Managed Quill session-history guidance block |
+| `~/.codex/AGENTS.md` | Managed Quill session-history guidance block. Kept slightly richer than Claude's (key working-context tool names plus the `<quill_continuity>` note) because Codex is not guaranteed to surface MCP server `instructions`; the `agents-md-section-base.md` variant (context preservation off) carries only the `search_history` route and the raw-JSONL prohibition |
 
 Codex install and uninstall remove only Quill-owned legacy `hooks.json` commands and delete `hooks.json` when no non-Quill hooks remain, then remove related hook trust state, managed config blocks, AGENTS blocks, and provider-owned asset directories. Codex deploys the same bounded-wait observation and session-sync behavior as Claude so a slow local widget cannot hold Codex hooks open until the host kills them.
 
