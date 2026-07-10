@@ -60,11 +60,16 @@ if [ -z "$SESSION_ID" ] || [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH
     exit 0
 fi
 
-# Find the last assistant message with usage data in the JSONL transcript
-USAGE_JSON=$(tac "$TRANSCRIPT_PATH" | python3 -c "
+# Find the last assistant message with usage data in the JSONL transcript.
+# Reads and reverses in Python (not `tac`, which GNU coreutils ships but
+# macOS/BSD does not) so this works the same on Linux and macOS.
+USAGE_JSON=$(python3 -c "
 import sys, json
 
-for line in sys.stdin:
+with open(sys.argv[1]) as f:
+    lines = f.readlines()
+
+for line in reversed(lines):
     line = line.strip()
     if not line:
         continue
@@ -88,7 +93,7 @@ for line in sys.stdin:
     }
     print(json.dumps(result))
     break
-" 2>/dev/null || true)
+" "$TRANSCRIPT_PATH" 2>/dev/null || true)
 
 if [ -z "$USAGE_JSON" ]; then
     exit 0

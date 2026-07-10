@@ -446,6 +446,16 @@ fn should_sync_context_assets(status: &ProviderStatus) -> bool {
         )
 }
 
+// Always reinstalls rather than gating on `verify()` first: `verify()` only
+// checks that managed files are present and hooks are registered, not that
+// file contents match the currently-bundled version, so a verify-first-then-
+// skip gate would leave stale script/mcp/template content in place forever
+// once a user has it installed — including across app updates that fix a
+// managed file's contents without changing its name or hook registration.
+// `install()`'s steps (deploy_files, register_mcp_server, register_hooks,
+// update_claude_md) are all idempotent merge/overwrite operations, and this
+// same unconditional-install pattern is already used by
+// `sync_features_for_enabled_providers` on every feature toggle.
 fn repair_provider(
     app: &AppHandle,
     provider: IntegrationProvider,
@@ -453,16 +463,10 @@ fn repair_provider(
 ) -> Result<(), String> {
     match provider {
         IntegrationProvider::Claude => {
-            if crate::claude_setup::verify(features).is_ok() {
-                return Ok(());
-            }
             claude::install(app, features)?;
             crate::claude_setup::verify(features)
         }
         IntegrationProvider::Codex => {
-            if codex::verify(features).is_ok() {
-                return Ok(());
-            }
             codex::install(app, features)?;
             codex::verify(features)
         }
