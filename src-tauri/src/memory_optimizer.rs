@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
-use crate::integrations::IntegrationProvider;
+use crate::integrations::{IntegrationProvider, integration_mutation_guard};
 use crate::models::{
     ActionType, MemoryFile, MemoryFilesUpdatedEvent, MemoryOptimizerLogEvent,
     MemoryOptimizerUpdatedEvent, OptimizationOutput,
@@ -1270,6 +1270,16 @@ pub fn execute_suggestion_group(
 
     let project_path = pending[0].project_path.clone();
     let mem_dir = memory_dir(&project_path);
+    let _mutation_guard = if pending.iter().any(|suggestion| {
+        suggestion
+            .target_file
+            .as_deref()
+            .is_some_and(is_instruction_target)
+    }) {
+        Some(integration_mutation_guard()?)
+    } else {
+        None
+    };
 
     // Phase 1: Validate staleness for ALL suggestions before executing any
     for s in &pending {
@@ -1577,6 +1587,11 @@ pub fn execute_suggestion(
         .as_ref()
         .map(|target| is_instruction_target(target))
         .unwrap_or(false);
+    let _mutation_guard = if is_instruction_file {
+        Some(integration_mutation_guard()?)
+    } else {
+        None
+    };
 
     // Staleness check: verify file hasn't changed since suggestion was created
     if let Some(ref original) = suggestion.original_content
@@ -1839,6 +1854,15 @@ pub fn undo_suggestion(
         ));
     }
 
+    let is_instruction_file = suggestion
+        .target_file
+        .as_deref()
+        .is_some_and(is_instruction_target);
+    let _mutation_guard = if is_instruction_file {
+        Some(integration_mutation_guard()?)
+    } else {
+        None
+    };
     let mem_dir = memory_dir(&suggestion.project_path);
 
     match suggestion.action_type.as_str() {
@@ -1869,6 +1893,22 @@ pub fn undo_suggestion(
                 .as_ref()
                 .ok_or("Cannot undo update: no target file")?;
             let path = resolve_target_path(target, &suggestion.project_path, &mem_dir)?;
+            if is_instruction_file {
+                let proposed = suggestion
+                    .proposed_content
+                    .as_ref()
+                    .ok_or("Cannot undo instruction update: no proposed content stored")?;
+                let current = std::fs::read_to_string(&path).map_err(|e| {
+                    format!(
+                        "Stale undo for instruction file '{target}': cannot read current content: {e}"
+                    )
+                })?;
+                if current.as_str() != proposed.as_str() {
+                    return Err(format!(
+                        "Stale undo for instruction file '{target}': current content no longer matches the applied suggestion; refusing to overwrite newer content"
+                    ));
+                }
+            }
             std::fs::write(&path, content)
                 .map_err(|e| format!("Failed to restore {}: {e}", path.display()))?;
         }

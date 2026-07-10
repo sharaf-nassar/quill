@@ -236,7 +236,7 @@ It switches between enabled providers and keeps one tab set: **Installed**, **Br
 
 ## Memory Optimizer
 
-LLM-driven optimization of provider-aware memory and instruction files via [[src-tauri/src/memory_optimizer.rs]] (1,670 lines).
+LLM-driven optimization of provider-aware memory and instruction files via [[src-tauri/src/memory_optimizer.rs]].
 
 ### Scanning
 
@@ -254,7 +254,7 @@ Calls Sonnet 4.6 to generate provider-scoped optimization suggestions. Suggestio
 
 Suggestions follow a status flow: pending -> approved/denied, with backup for undo. Group operations allow batch approve/deny.
 
-Approved suggestions are executed (file written/deleted/merged), with original content backed up. Denied suggestions can be un-denied. Executed suggestions can be undone (restores from backup). Malformed LLM output is filtered before storage so the UI only surfaces actionable suggestions, and `MEMORY.md` is treated as a special index file that can be updated directly but not merged as a source.
+Approved suggestions are executed (file written/deleted/merged), with original content backed up. Denied suggestions can be un-denied. Executed suggestions can be undone (restores from backup). Provider instruction-file execution and undo share the integration mutation guard with provider installers from staleness checks through filesystem and status writes; grouped execution holds the guard when any target is an instruction file. Undo of an instruction update restores the original only when live content still exactly matches the applied proposed content, rejecting stale undo rather than overwriting newer changes. Malformed LLM output is filtered before storage so the UI only surfaces actionable suggestions, and `MEMORY.md` is treated as a special index file that can be updated directly but not merged as a source.
 
 ### UI
 

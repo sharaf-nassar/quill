@@ -13,6 +13,8 @@ Hook scripts capture token usage from Claude Code and Codex sessions and report 
 5. Frontend hooks (`useTokenData`, `useAnalyticsData`) receive event and refresh via IPC
 6. Hourly cleanup task aggregates snapshots into `token_hourly` by provider/host for historical queries
 
+Each provider script searches newest-first with a binary reverse reader using fixed 64 KiB chunks. Memory stays bounded by one chunk plus the current logical record; invalid UTF-8, invalid JSON, non-object records, and malformed provider payloads are skipped so an older valid usage sample can still report. Every consumed token leaf must be a non-boolean integer from 0 through 100,000,000. Codex prefers a valid `last_token_usage`, falls back to valid `total_token_usage` in the same record, then continues to older records.
+
 ### Data Shape
 
 `TokenReportPayload` carries provider, session id, hostname, timestamp, token counts, and cwd.
@@ -110,8 +112,10 @@ LLM analyzes project memory files to suggest consolidation, cleanup, and improve
 10. User reviews suggestions in the Memories panel with provider badges and a shared provider filter
 11. On approve: execute action (write/delete/merge file), store backup in `backup_data` column, set status=executed
 12. On deny: set status=denied (can be un-denied later)
-13. On undo: restore from backup_data, set status=reverted
+13. On undo: restore from backup_data and set status=undone; provider instruction updates first reject stale live content
 14. `memory-files-updated` event triggers UI refresh
+
+Single and group execution acquire the shared integration mutation guard whenever a suggestion targets a provider instruction file. The guard covers staleness validation, filesystem changes, and status updates. Undo of an instruction update additionally requires the live file to equal the stored proposed content before restoring its backup, protecting newer installer or user edits.
 
 ### Suggestion Types
 

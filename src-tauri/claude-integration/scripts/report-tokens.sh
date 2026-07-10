@@ -61,36 +61,78 @@ if [ -z "$SESSION_ID" ] || [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH
 fi
 
 # Find the last assistant message with usage data in the JSONL transcript.
-# Reads and reverses in Python (not `tac`, which GNU coreutils ships but
-# macOS/BSD does not) so this works the same on Linux and macOS.
+# Scans backward in bounded binary chunks so large transcripts do not need to
+# be loaded into memory and malformed trailing records can be skipped.
 USAGE_JSON=$(python3 -c "
 import sys, json
 
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
+CHUNK_SIZE = 65536
+MAX_TOKEN_COUNT = 100_000_000
+TOKEN_FIELDS = (
+    'input_tokens',
+    'output_tokens',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+)
 
-for line in reversed(lines):
-    line = line.strip()
+def validated_usage(usage):
+    if not isinstance(usage, dict) or not usage:
+        return None
+    result = {}
+    for field in TOKEN_FIELDS:
+        value = usage.get(field, 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if value < 0 or value > MAX_TOKEN_COUNT:
+            return None
+        result[field] = value
+    return result
+
+def reverse_lines(path):
+    with open(path, 'rb') as transcript:
+        transcript.seek(0, 2)
+        position = transcript.tell()
+        fragments = []
+
+        while position:
+            read_size = min(CHUNK_SIZE, position)
+            position -= read_size
+            transcript.seek(position)
+            chunk = transcript.read(read_size)
+            lines = chunk.split(b'\n')
+            for fragment in reversed(lines[1:]):
+                fragments.append(fragment)
+                line = b''.join(reversed(fragments))
+                fragments.clear()
+                yield line
+            fragments.append(lines[0])
+
+        if fragments:
+            yield b''.join(reversed(fragments))
+
+for raw_line in reverse_lines(sys.argv[1]):
+    line = raw_line.strip()
     if not line:
         continue
     try:
         msg = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        continue
+
+    if not isinstance(msg, dict):
         continue
 
     if msg.get('type') != 'assistant':
         continue
 
-    usage = msg.get('message', {}).get('usage')
-    if usage is None:
+    message = msg.get('message')
+    if not isinstance(message, dict):
         continue
 
-    result = {
-        'input_tokens': usage.get('input_tokens', 0),
-        'output_tokens': usage.get('output_tokens', 0),
-        'cache_creation_input_tokens': usage.get('cache_creation_input_tokens', 0),
-        'cache_read_input_tokens': usage.get('cache_read_input_tokens', 0),
-    }
+    result = validated_usage(message.get('usage'))
+    if result is None:
+        continue
+
     print(json.dumps(result))
     break
 " "$TRANSCRIPT_PATH" 2>/dev/null || true)
