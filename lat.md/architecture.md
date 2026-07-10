@@ -130,3 +130,9 @@ A 500 ms time-based debounce coalesces wake-with-display-change events that fire
 On startup, [[src-tauri/src/integrations/manager.rs]] refreshes all provider state for the UI.
 
 CLI providers (Claude, Codex) run installers after explicit enable confirmation: Claude via [[src-tauri/src/claude_setup.rs]] and Codex via [[src-tauri/src/integrations/codex.rs]]. Service-only providers like MiniMax ([[src-tauri/src/integrations/minimax.rs]]) require only an API key, stored in the SQLite settings table.
+
+### Startup Repair
+
+For every already-enabled and detected Claude/Codex provider, [[src-tauri/src/integrations/manager.rs#repair_provider]] unconditionally reinstalls on every app launch, then calls `verify()` afterward purely to report status.
+
+"Reinstall" means redeploying managed scripts/mcp/templates, re-registering the MCP server and hooks, and refreshing CLAUDE.md. Earlier this gated the reinstall behind a `verify()` check first and skipped reinstalling when it passed. `verify()` only checks that managed files exist and hooks are registered in `settings.json` — never file *contents* — so a bugfix to a managed file (e.g. a hook script) that didn't change the file's presence or hook registration would silently never reach already-installed users, surviving indefinitely across app updates. `install()`'s steps are idempotent merge/overwrite operations (matching the pattern already used by `sync_features_for_enabled_providers` on every feature toggle), so calling them unconditionally on every startup is safe.
