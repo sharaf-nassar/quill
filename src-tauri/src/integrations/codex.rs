@@ -1,15 +1,27 @@
 #![allow(dead_code)]
 
+use crate::integrations::deploy::{
+    FileSnapshots, PublishedBatch, StagedDirectory, path_exists, publish_staged_batch,
+    recover_staged_batch, remove_path, validate_staged_mcp,
+};
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::IntegrationFeatures;
 use chrono::Utc;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 use tauri::Manager;
+
+/// Hard cap on a single `codex app-server` request. The read loop runs at boot
+/// while holding the process-wide mutation lock, so a hung child must not be
+/// able to block every guarded operation indefinitely.
+const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
 const HOOK_MARKER: &str = "quill-codex-setup";
@@ -133,13 +145,50 @@ struct CodexHookMetadata {
     current_hash: String,
 }
 
+struct CodexInstallPaths {
+    home: PathBuf,
+    hooks: PathBuf,
+    config: PathBuf,
+    agents: PathBuf,
+}
+
+struct ReapedChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl ReapedChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn terminate(&mut self) {
+        if self.reaped {
+            return;
+        }
+        let _ = self.child.kill();
+        if self.child.wait().is_ok() {
+            self.reaped = true;
+        }
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
 fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
     ALL_MANAGED_SCRIPT_FILES.into_iter()
 }
 
 pub fn detect() -> Result<ProviderStatus, String> {
     let (detected_cli, attempts) = detect_codex_cli();
-    let detected_home = detect_codex_home()?;
+    let detected_home = detect_codex_home();
     let setup_state = match (detected_cli, detected_home) {
         (true, true) => ProviderSetupState::Installed,
         (false, false) => ProviderSetupState::NotInstalled,
@@ -163,21 +212,94 @@ pub fn install(
     app: &tauri::AppHandle,
     features: IntegrationFeatures,
 ) -> Result<OwnedAssetManifest, String> {
-    deploy_files(app, features)?;
-    create_local_config()?;
-    remove_managed_hooks()?;
-    update_config_toml(features)?;
-    trust_codex_hooks(features)?;
-    update_agents_md()?;
-    verify(features)?;
-    Ok(build_owned_manifest())
+    let paths = resolve_codex_install_paths()?;
+    let deployment_targets = deployment_targets();
+    let snapshots = FileSnapshots::capture(
+        &deployment_targets,
+        &[
+            quill_config_dir().join("config.json"),
+            paths.hooks.clone(),
+            paths.config.clone(),
+            paths.agents.clone(),
+        ],
+    )?;
+    let published = deploy_files(app, features, snapshots)?;
+
+    let setup_result = (|| {
+        create_local_config()?;
+        remove_managed_hooks(&paths.hooks)?;
+        update_config_toml(features, &paths.config)?;
+        trust_codex_hooks(features, &paths)?;
+        update_agents_md(&paths.agents)?;
+        verify_with_paths(features, &paths)?;
+        Ok(build_owned_manifest())
+    })();
+
+    match setup_result {
+        Ok(manifest) => {
+            published.commit()?;
+            write_deployment_stamp_best_effort(app, features);
+            Ok(manifest)
+        }
+        Err(err) => Err(published.rollback_with_error(err)),
+    }
+}
+
+pub(crate) fn recover_interrupted_install() -> Result<(), String> {
+    recover_staged_batch(&deployment_targets())
+}
+
+/// Signature of the inputs that determine Codex's deployed configuration: the
+/// bundled source trees plus feature flags and app version (config-generation
+/// logic can change between builds without the bundle bytes changing).
+fn deployment_stamp(
+    app: &tauri::AppHandle,
+    features: IntegrationFeatures,
+) -> Result<String, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|err| format!("Cannot get resource dir: {err}"))?;
+    let codex_source = resource_dir.join("codex-integration");
+    let shared_mcp_source = resource_dir.join("claude-integration").join("mcp");
+    let inputs = format!("{}\u{1f}{features:?}", env!("CARGO_PKG_VERSION"));
+    crate::integrations::deploy::deployment_stamp_current(
+        &[&codex_source, &shared_mcp_source],
+        &inputs,
+    )
+}
+
+/// Fast path for startup repair: the deployment is current when the stamp
+/// matches the bundled sources plus feature/version inputs AND the existing
+/// verification still passes, letting repair skip the full transactional
+/// reinstall (which would swap the MCP tree and force a `uv` resync).
+pub(crate) fn deployment_is_current(app: &tauri::AppHandle, features: IntegrationFeatures) -> bool {
+    let Ok(stamp) = deployment_stamp(app, features) else {
+        return false;
+    };
+    crate::integrations::deploy::deployment_stamp_matches(&provider_root(), &stamp)
+        && verify(features).is_ok()
+}
+
+fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: IntegrationFeatures) {
+    match deployment_stamp(app, features) {
+        Ok(stamp) => {
+            if let Err(err) =
+                crate::integrations::deploy::write_deployment_stamp(&provider_root(), &stamp)
+            {
+                log::warn!("Codex deployment committed but stamp write failed: {err}");
+            }
+        }
+        Err(err) => log::warn!("Codex deployment committed but stamp could not be computed: {err}"),
+    }
 }
 
 pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
+    let paths = resolve_codex_uninstall_paths()?;
     let manifest = build_owned_manifest();
-    remove_managed_hooks()?;
-    remove_managed_config_entries()?;
-    remove_agents_block()?;
+    remove_managed_hooks(&paths.hooks)?;
+    remove_managed_config_entries(&paths.config)?;
+    remove_agents_block(&paths.agents)?;
     remove_owned_files(&manifest.files)?;
     remove_owned_directories(&manifest.directories)?;
     crate::restart::uninstall_codex_restart_assets(remove_shared_restart_assets)?;
@@ -185,6 +307,14 @@ pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
 }
 
 pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
+    let paths = resolve_codex_install_paths()?;
+    verify_with_paths(features, &paths)
+}
+
+fn verify_with_paths(
+    features: IntegrationFeatures,
+    paths: &CodexInstallPaths,
+) -> Result<(), String> {
     let mut missing = Vec::new();
 
     let expected_base = base_scripts_for(features);
@@ -234,7 +364,7 @@ pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
         ));
     }
 
-    let config_content = fs::read_to_string(config_path()).unwrap_or_default();
+    let config_content = fs::read_to_string(&paths.config).unwrap_or_default();
     if !config_content.contains("report-tokens.sh") {
         return Err("Codex base hooks were not written to config.toml".to_string());
     }
@@ -294,7 +424,7 @@ pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
         return Err("Codex context MCP tool is still installed".to_string());
     }
 
-    let agents_content = fs::read_to_string(agents_path()).unwrap_or_default();
+    let agents_content = fs::read_to_string(&paths.agents).unwrap_or_default();
     if !agents_content.contains(AGENTS_BLOCK_START) {
         return Err("AGENTS.md does not contain the Quill managed block".to_string());
     }
@@ -351,7 +481,10 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     Ok(())
 }
 
-fn trust_codex_hooks(features: IntegrationFeatures) -> Result<(), String> {
+fn trust_codex_hooks(
+    features: IntegrationFeatures,
+    paths: &CodexInstallPaths,
+) -> Result<(), String> {
     let expected_count: usize = build_codex_hook_groups(features)
         .iter()
         .map(|group| group.hooks.len())
@@ -365,10 +498,10 @@ fn trust_codex_hooks(features: IntegrationFeatures) -> Result<(), String> {
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let response: CodexHooksListResponse =
-        run_codex_app_server_request(2, "hooks/list", serde_json::json!({ "cwds": [cwd] }))?;
+        run_codex_app_server_request(2, "hooks/list", serde_json::json!({ "cwds": [cwd] }), paths)?;
 
     let script_root = scripts_dir().to_string_lossy().to_string();
-    let config_file = config_path();
+    let config_file = &paths.config;
     let mut state = serde_json::Map::new();
 
     for entry in response.data {
@@ -376,7 +509,7 @@ fn trust_codex_hooks(features: IntegrationFeatures) -> Result<(), String> {
             let Some(command) = hook.command.as_deref() else {
                 continue;
             };
-            if !command.contains(&script_root) || !paths_equivalent(&hook.source_path, &config_file)
+            if !command.contains(&script_root) || !paths_equivalent(&hook.source_path, config_file)
             {
                 continue;
             }
@@ -408,10 +541,11 @@ fn trust_codex_hooks(features: IntegrationFeatures) -> Result<(), String> {
                     "mergeStrategy": "upsert",
                 }
             ],
-            "filePath": null,
+            "filePath": paths.config.to_string_lossy(),
             "expectedVersion": null,
             "reloadUserConfig": true,
         }),
+        paths,
     )?;
 
     Ok(())
@@ -431,24 +565,29 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
     request_id: u64,
     method: &str,
     params: serde_json::Value,
+    paths: &CodexInstallPaths,
 ) -> Result<T, String> {
     let codex_path = crate::config::resolve_command_path("codex")
         .ok_or_else(|| "Codex CLI was not found in PATH".to_string())?;
     let codex_env_path = crate::config::path_for_resolved_command(&codex_path);
-    let mut child = Command::new(&codex_path)
+    let child = Command::new(&codex_path)
         .args(["app-server", "--enable", "hooks", "--listen", "stdio://"])
         .env("PATH", codex_env_path)
+        .env("CODEX_HOME", &paths.home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("Failed to start codex app-server: {err}"))?;
+    let mut child = ReapedChild::new(child);
 
     let mut stdin = child
+        .child
         .stdin
         .take()
         .ok_or_else(|| "Failed to open codex app-server stdin".to_string())?;
     let stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| "Failed to open codex app-server stdout".to_string())?;
@@ -491,42 +630,17 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
         .flush()
         .map_err(|err| format!("Failed to flush codex app-server stdin: {err}"))?;
 
-    let mut stderr = child.stderr.take();
-    let reader = BufReader::new(stdout);
-    let mut response = None;
+    let mut stderr = child.child.stderr.take();
 
-    for line in reader.lines() {
-        let line = line.map_err(|err| format!("Failed to read codex app-server output: {err}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
+    let response: Option<T> = collect_app_server_response(
+        stdout,
+        &mut child,
+        request_id,
+        method,
+        CODEX_APP_SERVER_TIMEOUT,
+    )?;
 
-        let envelope: CodexAppServerEnvelope = serde_json::from_str(&line)
-            .map_err(|err| format!("Failed to parse codex app-server message: {err}"))?;
-        if envelope.id != Some(request_id) {
-            continue;
-        }
-
-        if let Some(error) = envelope.error {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "Codex app-server {method} failed (code {}): {}",
-                error.code, error.message
-            ));
-        }
-
-        if let Some(result) = envelope.result {
-            let parsed = serde_json::from_value::<T>(result).map_err(|err| {
-                format!("Failed to parse codex app-server {method} response: {err}")
-            })?;
-            response = Some(parsed);
-            break;
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(stdin);
 
     if let Some(result) = response {
         return Ok(result);
@@ -547,24 +661,129 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// Read `codex app-server` stdout for the response to `request_id`, bounded by a
+/// hard deadline. A dedicated reader thread feeds lines over a channel so a hung
+/// child cannot block the caller (and the process-wide mutation lock it holds)
+/// forever; on timeout the child is killed via its RAII wrapper and a clear
+/// error is returned. Returns `Ok(None)` on clean EOF with no matching response.
+fn collect_app_server_response<T: serde::de::DeserializeOwned>(
+    stdout: ChildStdout,
+    child: &mut ReapedChild,
+    request_id: u64,
+    method: &str,
+    timeout: Duration,
+) -> Result<Option<T>, String> {
+    let (sender, receiver) = mpsc::channel::<Result<String, String>>();
+    let reader = std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let failed = line.is_err();
+            let message =
+                line.map_err(|err| format!("Failed to read codex app-server output: {err}"));
+            if sender.send(message).is_err() || failed {
+                return;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break Err(app_server_timeout_error(method, timeout));
+        }
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(line)) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let envelope: CodexAppServerEnvelope = match serde_json::from_str(&line) {
+                    Ok(envelope) => envelope,
+                    Err(err) => {
+                        break Err(format!("Failed to parse codex app-server message: {err}"));
+                    }
+                };
+                if envelope.id != Some(request_id) {
+                    continue;
+                }
+                if let Some(error) = envelope.error {
+                    break Err(format!(
+                        "Codex app-server {method} failed (code {}): {}",
+                        error.code, error.message
+                    ));
+                }
+                if let Some(result) = envelope.result {
+                    break serde_json::from_value::<T>(result)
+                        .map(Some)
+                        .map_err(|err| {
+                            format!("Failed to parse codex app-server {method} response: {err}")
+                        });
+                }
+            }
+            Ok(Err(read_err)) => break Err(read_err),
+            Err(RecvTimeoutError::Timeout) => break Err(app_server_timeout_error(method, timeout)),
+            Err(RecvTimeoutError::Disconnected) => break Ok(None),
+        }
+    };
+
+    // Killing the child closes stdout so the reader thread observes EOF; the join
+    // then cannot deadlock and guarantees no reader outlives this call.
+    child.terminate();
+    drop(receiver);
+    let _ = reader.join();
+    outcome
+}
+
+fn app_server_timeout_error(method: &str, timeout: Duration) -> String {
+    format!(
+        "Codex app-server {method} timed out after {}s",
+        timeout.as_secs()
+    )
+}
+
 fn detect_codex_cli() -> (bool, Vec<String>) {
     crate::config::detect_provider_cli("codex")
 }
 
-fn detect_codex_home() -> Result<bool, String> {
-    let Some(home_dir) = dirs::home_dir() else {
-        return Ok(false);
+/// Detection must never fail because of `CODEX_HOME`: one custom override would
+/// otherwise fail-fast the whole `detect_all` collection and brick startup
+/// repair and disable for Claude and MiniMax too. A custom home is reported as
+/// home-not-detected (with a warning); only the default `~/.codex` counts as
+/// detected. Install/enable still reject a custom home at the point it matters.
+fn detect_codex_home() -> bool {
+    let Some(user_home) = dirs::home_dir() else {
+        return false;
     };
-
-    let path = home_dir.join(".codex");
-    if path.exists() {
-        return path
-            .canonicalize()
-            .map(|_| true)
-            .map_err(|err| format!("Failed to resolve {}: {err}", path.display()));
+    let default_home = user_home.join(".codex");
+    if let Some(custom) =
+        classify_codex_home(std::env::var_os("CODEX_HOME").as_deref(), &default_home)
+    {
+        log::warn!(
+            "Custom CODEX_HOME {} is unsupported; reporting Codex home as not detected (Quill only manages {})",
+            custom.display(),
+            default_home.display()
+        );
+        return false;
     }
+    default_home.is_dir()
+}
 
-    Ok(false)
+/// Classify a `CODEX_HOME` override against the default home without touching
+/// process state. Returns `None` when the override is absent or resolves to the
+/// default (so Quill's default management applies), or `Some(custom)` for an
+/// unsupported custom home. The env value is injected so this stays unit-testable
+/// without `std::env::set_var`, which is unsound under a threaded test runner.
+fn classify_codex_home(env: Option<&OsStr>, default_home: &Path) -> Option<PathBuf> {
+    let value = env?;
+    if value.is_empty() {
+        return Some(PathBuf::new());
+    }
+    let configured = PathBuf::from(value);
+    if paths_equivalent(&configured, default_home) {
+        None
+    } else {
+        Some(configured)
+    }
 }
 
 fn quill_config_dir() -> PathBuf {
@@ -590,25 +809,82 @@ fn mcp_dir() -> PathBuf {
     provider_root().join("mcp")
 }
 
-fn hooks_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".codex")
-        .join("hooks.json")
+fn deployment_targets() -> Vec<PathBuf> {
+    vec![scripts_dir(), templates_dir(), mcp_dir()]
 }
 
-fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".codex")
-        .join("config.toml")
+/// Resolve the Codex home for install/enable/verify. A custom `CODEX_HOME` is
+/// rejected here with a hard, clear error: this is the one place where failing
+/// closed is correct, because writing managed entries into a home Quill does not
+/// otherwise manage would strand them. Uninstall uses a separate resolver.
+fn resolve_codex_install_paths() -> Result<CodexInstallPaths, String> {
+    let user_home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let home = user_home.join(".codex");
+
+    if let Some(configured_home) = std::env::var_os("CODEX_HOME") {
+        if configured_home.is_empty() {
+            return Err("CODEX_HOME is set but empty".to_string());
+        }
+        let configured_home = PathBuf::from(configured_home);
+        if configured_home != home {
+            let configured_canonical = configured_home.canonicalize().map_err(|err| {
+                format!(
+                    "Custom CODEX_HOME is unsupported; unset CODEX_HOME or set it to {} (failed to resolve {}: {err})",
+                    home.display(),
+                    configured_home.display()
+                )
+            })?;
+            let default_canonical = home.canonicalize().map_err(|err| {
+                format!(
+                    "Custom CODEX_HOME is unsupported; unset CODEX_HOME or set it to {} (failed to resolve the default: {err})",
+                    home.display()
+                )
+            })?;
+            if configured_canonical != default_canonical {
+                return Err(format!(
+                    "Custom CODEX_HOME {} is unsupported; Quill only manages the default {}",
+                    configured_home.display(),
+                    home.display()
+                ));
+            }
+        }
+    }
+
+    match fs::metadata(&home) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!("CODEX_HOME is not a directory: {}", home.display()));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "Failed to inspect default CODEX_HOME {}: {err}",
+                home.display()
+            ));
+        }
+    }
+
+    Ok(CodexInstallPaths {
+        hooks: home.join("hooks.json"),
+        config: home.join("config.toml"),
+        agents: home.join("AGENTS.md"),
+        home,
+    })
 }
 
-fn agents_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".codex")
-        .join("AGENTS.md")
+/// Resolve the Codex home for uninstall/disable. Invariant: Quill only ever
+/// writes to the default `~/.codex`, so uninstall always targets it regardless
+/// of a custom `CODEX_HOME` — otherwise a stray env var would strand managed
+/// entries and block disable entirely.
+fn resolve_codex_uninstall_paths() -> Result<CodexInstallPaths, String> {
+    let user_home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let home = user_home.join(".codex");
+    Ok(CodexInstallPaths {
+        hooks: home.join("hooks.json"),
+        config: home.join("config.toml"),
+        agents: home.join("AGENTS.md"),
+        home,
+    })
 }
 
 fn app_data_dir() -> PathBuf {
@@ -713,84 +989,100 @@ fn copy_named_files(src_dir: &Path, dst_dir: &Path, file_names: &[&str]) -> Resu
     Ok(())
 }
 
-fn clean_owned_dir(dir: &Path) -> Result<(), String> {
-    if dir.exists() {
-        fs::remove_dir_all(dir)
-            .map_err(|err| format!("Failed to clean {}: {err}", dir.display()))?;
-    }
-    fs::create_dir_all(dir)
-        .map_err(|err| format!("Failed to recreate {}: {err}", dir.display()))?;
-    Ok(())
-}
+fn deploy_files(
+    app: &tauri::AppHandle,
+    features: IntegrationFeatures,
+    snapshots: FileSnapshots,
+) -> Result<PublishedBatch, String> {
+    let staged_result = (|| {
+        let deployment_targets = deployment_targets();
 
-fn deploy_files(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|err| format!("Cannot get resource dir: {err}"))?;
-    let codex_source = resource_dir.join("codex-integration");
-    let shared_mcp_source = resource_dir.join("claude-integration").join("mcp");
+        let resource_dir = app
+            .path()
+            .resource_dir()
+            .map_err(|err| format!("Cannot get resource dir: {err}"))?;
+        let codex_source = resource_dir.join("codex-integration");
+        let shared_mcp_source = resource_dir.join("claude-integration").join("mcp");
 
-    if !codex_source.exists() {
-        return Err(format!(
-            "Bundled codex-integration not found at {}",
-            codex_source.display()
-        ));
-    }
-
-    if !shared_mcp_source.exists() {
-        return Err(format!(
-            "Bundled Quill MCP server not found at {}",
-            shared_mcp_source.display()
-        ));
-    }
-
-    clean_owned_dir(&scripts_dir())?;
-    clean_owned_dir(&templates_dir())?;
-    clean_owned_dir(&mcp_dir())?;
-
-    let base_scripts = base_scripts_for(features);
-    copy_named_files(&codex_source.join("scripts"), &scripts_dir(), &base_scripts)?;
-    let context_scripts = context_scripts_for(features);
-    if !context_scripts.is_empty() {
-        copy_named_files(
-            &codex_source.join("scripts"),
-            &scripts_dir(),
-            &context_scripts,
-        )?;
-    }
-    // Feature 009: deploy the hook observer when activity_tracking is on.
-    let hook_observation_scripts = hook_observation_scripts_for(features);
-    if !hook_observation_scripts.is_empty() {
-        copy_named_files(
-            &codex_source.join("scripts"),
-            &scripts_dir(),
-            &hook_observation_scripts,
-        )?;
-    }
-    deploy_template(&codex_source.join("templates"), features)?;
-    copy_dir_recursive(&shared_mcp_source, &mcp_dir())?;
-    if !features.context_preservation {
-        remove_context_mcp_tool()?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        let token_script = scripts_dir().join("report-tokens.sh");
-        if token_script.exists() {
-            fs::set_permissions(&token_script, perms)
-                .map_err(|err| format!("Failed to set permissions on report-tokens.sh: {err}"))?;
+        if !codex_source.exists() {
+            return Err(format!(
+                "Bundled codex-integration not found at {}",
+                codex_source.display()
+            ));
         }
-    }
 
-    Ok(())
+        if !shared_mcp_source.exists() {
+            return Err(format!(
+                "Bundled Quill MCP server not found at {}",
+                shared_mcp_source.display()
+            ));
+        }
+
+        let staged_scripts = StagedDirectory::new(deployment_targets[0].clone())?;
+        let staged_templates = StagedDirectory::new(deployment_targets[1].clone())?;
+        let staged_mcp = StagedDirectory::new(deployment_targets[2].clone())?;
+
+        let base_scripts = base_scripts_for(features);
+        copy_named_files(
+            &codex_source.join("scripts"),
+            staged_scripts.path(),
+            &base_scripts,
+        )?;
+        let context_scripts = context_scripts_for(features);
+        if !context_scripts.is_empty() {
+            copy_named_files(
+                &codex_source.join("scripts"),
+                staged_scripts.path(),
+                &context_scripts,
+            )?;
+        }
+        // Feature 009: deploy the hook observer when activity_tracking is on.
+        let hook_observation_scripts = hook_observation_scripts_for(features);
+        if !hook_observation_scripts.is_empty() {
+            copy_named_files(
+                &codex_source.join("scripts"),
+                staged_scripts.path(),
+                &hook_observation_scripts,
+            )?;
+        }
+        deploy_template(
+            &codex_source.join("templates"),
+            staged_templates.path(),
+            features,
+        )?;
+        copy_dir_recursive(&shared_mcp_source, staged_mcp.path())?;
+        if !features.context_preservation {
+            remove_context_mcp_tool(staged_mcp.path())?;
+        }
+        validate_staged_mcp(staged_mcp.path(), features.context_preservation)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            let token_script = staged_scripts.path().join("report-tokens.sh");
+            if token_script.exists() {
+                fs::set_permissions(&token_script, perms).map_err(|err| {
+                    format!("Failed to set permissions on report-tokens.sh: {err}")
+                })?;
+            }
+        }
+
+        Ok(vec![staged_scripts, staged_templates, staged_mcp])
+    })();
+
+    match staged_result {
+        Ok(stages) => publish_staged_batch(stages, snapshots),
+        Err(err) => Err(snapshots.restore_with_error(err)),
+    }
 }
 
-fn deploy_template(src_dir: &Path, features: IntegrationFeatures) -> Result<(), String> {
-    fs::create_dir_all(templates_dir())
-        .map_err(|err| format!("Failed to create templates dir: {err}"))?;
+fn deploy_template(
+    src_dir: &Path,
+    dst_dir: &Path,
+    features: IntegrationFeatures,
+) -> Result<(), String> {
+    fs::create_dir_all(dst_dir).map_err(|err| format!("Failed to create templates dir: {err}"))?;
     let template_name = if features.context_preservation {
         "agents-md-section.md"
     } else {
@@ -800,15 +1092,15 @@ fn deploy_template(src_dir: &Path, features: IntegrationFeatures) -> Result<(), 
     if !source.exists() {
         return Err(format!("Bundled template missing at {}", source.display()));
     }
-    fs::copy(source, templates_dir().join("agents-md-section.md"))
+    fs::copy(source, dst_dir.join("agents-md-section.md"))
         .map_err(|err| format!("Failed to deploy Codex template: {err}"))?;
     Ok(())
 }
 
-fn remove_context_mcp_tool() -> Result<(), String> {
-    let context_tool = mcp_dir().join("tools").join("context.py");
-    if context_tool.exists() {
-        fs::remove_file(&context_tool).map_err(|err| {
+fn remove_context_mcp_tool(mcp_root: &Path) -> Result<(), String> {
+    let context_tool = mcp_root.join("tools").join("context.py");
+    if path_exists(&context_tool)? {
+        remove_path(&context_tool).map_err(|err| {
             format!(
                 "Failed to remove context MCP tool {}: {err}",
                 context_tool.display()
@@ -1015,16 +1307,17 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
 fn upsert_codex_inline_hooks(
     content: &str,
     features: IntegrationFeatures,
+    config_path: &Path,
 ) -> Result<String, String> {
     let mut doc = parse_config_doc(content)?;
-    remove_codex_inline_hooks_from_doc(&mut doc)?;
+    remove_codex_inline_hooks_from_doc(&mut doc, config_path)?;
     append_codex_inline_hooks(&mut doc, &build_codex_hook_groups(features))?;
     Ok(normalize_toml_doc(doc))
 }
 
-fn remove_codex_inline_hooks(content: &str) -> Result<String, String> {
+fn remove_codex_inline_hooks(content: &str, config_path: &Path) -> Result<String, String> {
     let mut doc = parse_config_doc(content)?;
-    remove_codex_inline_hooks_from_doc(&mut doc)?;
+    remove_codex_inline_hooks_from_doc(&mut doc, config_path)?;
     Ok(normalize_toml_doc(doc))
 }
 
@@ -1110,9 +1403,12 @@ fn codex_hook_command_table(hook: &CodexHookCommand) -> Table {
     table
 }
 
-fn remove_codex_inline_hooks_from_doc(doc: &mut DocumentMut) -> Result<(), String> {
+fn remove_codex_inline_hooks_from_doc(
+    doc: &mut DocumentMut,
+    config_path: &Path,
+) -> Result<(), String> {
     let script_root = scripts_dir().to_string_lossy().to_string();
-    let config_source = config_path().display().to_string();
+    let config_source = config_path.display().to_string();
     let mut state_keys = HashSet::new();
 
     if let Some(hooks_table) = doc
@@ -1220,21 +1516,20 @@ fn remove_hook_state_keys(hooks_table: &mut Table, state_keys: &HashSet<String>)
     }
 }
 
-fn update_config_toml(features: IntegrationFeatures) -> Result<(), String> {
-    let path = config_path();
+fn update_config_toml(features: IntegrationFeatures, path: &Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
     }
 
     let existing = if path.exists() {
-        fs::read_to_string(&path).map_err(|err| format!("Failed to read config.toml: {err}"))?
+        fs::read_to_string(path).map_err(|err| format!("Failed to read config.toml: {err}"))?
     } else {
         String::new()
     };
 
     let without_managed_block = strip_block(&existing, MCP_BLOCK_START, MCP_BLOCK_END);
-    let with_hooks = upsert_codex_inline_hooks(&without_managed_block, features)?;
+    let with_hooks = upsert_codex_inline_hooks(&without_managed_block, features, path)?;
     let with_features = upsert_features_flag(&with_hooks);
     let updated = if with_features.contains("[mcp_servers.quill]") {
         ensure_codex_mcp_env(&with_features, features.context_preservation)
@@ -1242,23 +1537,22 @@ fn update_config_toml(features: IntegrationFeatures) -> Result<(), String> {
         append_managed_mcp_block(&with_features, features.context_preservation)
     };
 
-    fs::write(&path, updated).map_err(|err| format!("Failed to write config.toml: {err}"))?;
+    fs::write(path, updated).map_err(|err| format!("Failed to write config.toml: {err}"))?;
     Ok(())
 }
 
-fn update_agents_md() -> Result<(), String> {
+fn update_agents_md(path: &Path) -> Result<(), String> {
     let template_path = templates_dir().join("agents-md-section.md");
     let template = fs::read_to_string(&template_path)
         .map_err(|err| format!("Failed to read agents-md-section.md: {err}"))?;
 
-    let path = agents_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
     }
 
     let existing = if path.exists() {
-        fs::read_to_string(&path).map_err(|err| format!("Failed to read AGENTS.md: {err}"))?
+        fs::read_to_string(path).map_err(|err| format!("Failed to read AGENTS.md: {err}"))?
     } else {
         String::new()
     };
@@ -1276,18 +1570,17 @@ fn update_agents_md() -> Result<(), String> {
         format!("{}\n\n{}\n", existing.trim_end(), template.trim())
     };
 
-    fs::write(&path, updated).map_err(|err| format!("Failed to write AGENTS.md: {err}"))?;
+    fs::write(path, updated).map_err(|err| format!("Failed to write AGENTS.md: {err}"))?;
     Ok(())
 }
 
-fn remove_managed_hooks() -> Result<(), String> {
-    let path = hooks_path();
+fn remove_managed_hooks(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
 
     let content =
-        fs::read_to_string(&path).map_err(|err| format!("Failed to read hooks.json: {err}"))?;
+        fs::read_to_string(path).map_err(|err| format!("Failed to read hooks.json: {err}"))?;
     let mut root: serde_json::Value = match serde_json::from_str(&content) {
         Ok(value) => value,
         Err(_) => return Ok(()),
@@ -1311,13 +1604,13 @@ fn remove_managed_hooks() -> Result<(), String> {
     }
 
     if hooks_json_has_no_active_hooks(&root) && hooks_json_has_no_other_entries(&root) {
-        fs::remove_file(&path).map_err(|err| format!("Failed to remove hooks.json: {err}"))?;
+        remove_path(path).map_err(|err| format!("Failed to remove hooks.json: {err}"))?;
         return Ok(());
     }
 
     let output = serde_json::to_string_pretty(&root)
         .map_err(|err| format!("Failed to serialize hooks.json: {err}"))?;
-    fs::write(&path, output).map_err(|err| format!("Failed to write hooks.json: {err}"))?;
+    fs::write(path, output).map_err(|err| format!("Failed to write hooks.json: {err}"))?;
     Ok(())
 }
 
@@ -1339,32 +1632,30 @@ fn hooks_json_has_no_other_entries(root: &serde_json::Value) -> bool {
     })
 }
 
-fn remove_managed_config_entries() -> Result<(), String> {
-    let path = config_path();
+fn remove_managed_config_entries(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
 
     let content =
-        fs::read_to_string(&path).map_err(|err| format!("Failed to read config.toml: {err}"))?;
+        fs::read_to_string(path).map_err(|err| format!("Failed to read config.toml: {err}"))?;
     let without_mcp = strip_block(&content, MCP_BLOCK_START, MCP_BLOCK_END);
-    let without_hooks = remove_codex_inline_hooks(&without_mcp)?;
+    let without_hooks = remove_codex_inline_hooks(&without_mcp, path)?;
     let cleaned = remove_features_flag(&without_hooks);
-    fs::write(&path, cleaned).map_err(|err| format!("Failed to write config.toml: {err}"))?;
+    fs::write(path, cleaned).map_err(|err| format!("Failed to write config.toml: {err}"))?;
     Ok(())
 }
 
-fn remove_agents_block() -> Result<(), String> {
-    let path = agents_path();
+fn remove_agents_block(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
 
     let content =
-        fs::read_to_string(&path).map_err(|err| format!("Failed to read AGENTS.md: {err}"))?;
+        fs::read_to_string(path).map_err(|err| format!("Failed to read AGENTS.md: {err}"))?;
     // Brevity block lifecycle is owned by `crate::brevity`; do not touch it here.
     let updated = strip_block(&content, AGENTS_BLOCK_START, AGENTS_BLOCK_END);
-    fs::write(&path, updated).map_err(|err| format!("Failed to write AGENTS.md: {err}"))?;
+    fs::write(path, updated).map_err(|err| format!("Failed to write AGENTS.md: {err}"))?;
     Ok(())
 }
 
@@ -1657,4 +1948,65 @@ fn normalize_lines(lines: Vec<String>, trailing_newline: bool) -> String {
 
 fn toml_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "\\\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_codex_home_accepts_default_and_absent() {
+        let default_home = PathBuf::from("/home/user/.codex");
+        assert!(classify_codex_home(None, &default_home).is_none());
+        assert!(
+            classify_codex_home(Some(OsStr::new("/home/user/.codex")), &default_home).is_none()
+        );
+    }
+
+    #[test]
+    fn classify_codex_home_flags_custom_and_empty() {
+        let default_home = PathBuf::from("/home/user/.codex");
+        assert_eq!(
+            classify_codex_home(Some(OsStr::new("/tmp/other-codex")), &default_home),
+            Some(PathBuf::from("/tmp/other-codex"))
+        );
+        assert_eq!(
+            classify_codex_home(Some(OsStr::new("")), &default_home),
+            Some(PathBuf::new())
+        );
+    }
+
+    // A hung `codex app-server` must not block the caller (and the process-wide
+    // mutation lock it holds) forever: the read is bounded and the child reaped.
+    #[cfg(unix)]
+    #[test]
+    fn app_server_read_times_out_and_reaps_child() {
+        use std::process::{Command, Stdio};
+
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn sleep");
+        let mut child = ReapedChild::new(child);
+        let stdout = child.child.stdout.take().unwrap();
+
+        let started = Instant::now();
+        let result: Result<Option<serde_json::Value>, String> = collect_app_server_response(
+            stdout,
+            &mut child,
+            2,
+            "hooks/list",
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a silent child must time out");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not block for the full sleep"
+        );
+        assert!(child.reaped, "the hung child must be reaped");
+    }
 }

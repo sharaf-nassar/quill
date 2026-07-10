@@ -1,3 +1,7 @@
+use crate::integrations::deploy::{
+    FileSnapshots, PublishedBatch, StagedDirectory, path_exists, publish_staged_batch,
+    recover_staged_batch, remove_path, validate_staged_mcp,
+};
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::models::IntegrationFeatures;
 use std::collections::HashSet;
@@ -66,6 +70,33 @@ fn commands_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".claude")
         .join("commands")
+}
+
+fn deployment_targets() -> Vec<PathBuf> {
+    vec![scripts_dir(), mcp_dir(), templates_dir()]
+}
+
+fn install_transaction_paths() -> Result<Vec<PathBuf>, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let claude_dir = home.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+    let hooks_dir = claude_dir.join("hooks");
+    let mut paths = vec![
+        config_dir().join("config.json"),
+        home.join(".claude.json"),
+        settings_path.clone(),
+        settings_path.with_extension("json.bak"),
+        claude_dir.join("CLAUDE.md"),
+        hooks_dir.join("quill-hook.sh"),
+        hooks_dir.join("quill-observe.cjs"),
+        hooks_dir.join("quill-session-end-learn.cjs"),
+    ];
+    paths.extend(
+        MANAGED_COMMAND_FILES
+            .into_iter()
+            .map(|name| commands_dir().join(name)),
+    );
+    Ok(paths)
 }
 
 /// Get the short hostname, falling back to "local".
@@ -190,15 +221,6 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
     Ok(())
 }
 
-/// Remove and recreate a directory we own entirely, ensuring no stale files remain.
-fn clean_owned_dir(dir: &std::path::Path) -> Result<(), String> {
-    if dir.exists() {
-        fs::remove_dir_all(dir).map_err(|e| format!("Failed to clean {}: {e}", dir.display()))?;
-    }
-    fs::create_dir_all(dir).map_err(|e| format!("Failed to recreate {}: {e}", dir.display()))?;
-    Ok(())
-}
-
 /// Remove Quill-managed command files from ~/.claude/commands/ (shared directory).
 /// Uses an explicit list of all current AND previously shipped names to clean stale files.
 fn clean_quill_commands() -> Result<(), String> {
@@ -209,10 +231,9 @@ fn clean_quill_commands() -> Result<(), String> {
     // All command filenames we have ever shipped — keeps old names so updates clean them up
     for name in &MANAGED_COMMAND_FILES {
         let path = dir.join(name);
-        if path.exists()
-            && let Err(e) = fs::remove_file(&path)
-        {
-            log::warn!("Failed to remove command {}: {e}", name);
+        if path_exists(&path)? {
+            remove_path(&path)
+                .map_err(|err| format!("Failed to remove command {}: {err}", path.display()))?;
         }
     }
     Ok(())
@@ -226,35 +247,80 @@ pub(crate) fn owned_asset_manifest() -> OwnedAssetManifest {
     build_owned_manifest()
 }
 
+pub(crate) fn recover_interrupted_install() -> Result<(), String> {
+    recover_staged_batch(&deployment_targets())
+}
+
 pub fn install_with_manifest(
     app: &tauri::AppHandle,
     features: IntegrationFeatures,
 ) -> Result<OwnedAssetManifest, String> {
-    deploy_files(app, features)?;
+    let deployment_targets = deployment_targets();
+    let snapshots = FileSnapshots::capture(&deployment_targets, &install_transaction_paths()?)?;
+    let published = deploy_files(app, features, snapshots)?;
 
-    if let Err(err) = create_local_config() {
-        log::error!("Failed to create local config: {err}");
+    let setup_result = (|| {
+        create_local_config()?;
+        register_mcp_server(features)?;
+        register_hooks(features)?;
+        update_claude_md()?;
+        cleanup_legacy_hooks()?;
+        verify(features)?;
+        Ok(build_owned_manifest())
+    })();
+
+    match setup_result {
+        Ok(manifest) => {
+            published.commit()?;
+            cleanup_stale_skills_best_effort();
+            write_deployment_stamp_best_effort(app, features);
+            Ok(manifest)
+        }
+        Err(err) => Err(published.rollback_with_error(err)),
     }
+}
 
-    if let Err(err) = register_mcp_server(features) {
-        log::error!("Failed to register MCP server: {err}");
+/// Signature of the inputs that determine Claude's deployed configuration: the
+/// bundled source trees plus feature flags and app version (config-generation
+/// logic can change between builds without the bundle bytes changing).
+fn deployment_stamp(
+    app: &tauri::AppHandle,
+    features: IntegrationFeatures,
+) -> Result<String, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Cannot get resource dir: {e}"))?;
+    let bundle = resource_dir.join("claude-integration");
+    let inputs = format!("{}\u{1f}{features:?}", env!("CARGO_PKG_VERSION"));
+    crate::integrations::deploy::deployment_stamp_current(&[&bundle], &inputs)
+}
+
+/// Fast path for startup repair: the deployment is current when the stamp
+/// matches the bundled sources plus feature/version inputs AND the existing
+/// verification still passes, letting repair skip the full transactional
+/// reinstall (which would swap the MCP tree and force a `uv` resync).
+pub(crate) fn deployment_is_current(app: &tauri::AppHandle, features: IntegrationFeatures) -> bool {
+    let Ok(stamp) = deployment_stamp(app, features) else {
+        return false;
+    };
+    crate::integrations::deploy::deployment_stamp_matches(&config_dir(), &stamp)
+        && verify(features).is_ok()
+}
+
+fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: IntegrationFeatures) {
+    match deployment_stamp(app, features) {
+        Ok(stamp) => {
+            if let Err(err) =
+                crate::integrations::deploy::write_deployment_stamp(&config_dir(), &stamp)
+            {
+                log::warn!("Claude deployment committed but stamp write failed: {err}");
+            }
+        }
+        Err(err) => {
+            log::warn!("Claude deployment committed but stamp could not be computed: {err}")
+        }
     }
-
-    if let Err(err) = register_hooks(features) {
-        log::error!("Failed to register hooks: {err}");
-    }
-
-    if let Err(err) = update_claude_md() {
-        log::error!("Failed to update CLAUDE.md: {err}");
-    }
-
-    if let Err(err) = cleanup_legacy_hooks() {
-        log::error!("Failed to clean up legacy hooks: {err}");
-    }
-
-    verify(features)?;
-
-    Ok(build_owned_manifest())
 }
 
 pub fn uninstall_with_manifest(manifest: &OwnedAssetManifest) -> Result<(), String> {
@@ -497,70 +563,102 @@ fn cleanup_quill_hooks() -> Result<(), String> {
 }
 
 /// Extract bundled resources from the app to managed directories.
-fn deploy_files(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
-    let resource_dir = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Cannot get resource dir: {e}"))?;
-    let source = resource_dir.join("claude-integration");
+fn deploy_files(
+    app: &tauri::AppHandle,
+    features: IntegrationFeatures,
+    snapshots: FileSnapshots,
+) -> Result<PublishedBatch, String> {
+    let staged_result = (|| {
+        let deployment_targets = deployment_targets();
 
-    if !source.exists() {
-        return Err(format!(
-            "Bundled claude-integration not found at {}",
-            source.display()
-        ));
-    }
+        let resource_dir = app
+            .path()
+            .resource_dir()
+            .map_err(|e| format!("Cannot get resource dir: {e}"))?;
+        let source = resource_dir.join("claude-integration");
 
-    // Clean directories we own entirely before deploying (removes stale files from old versions)
-    clean_owned_dir(&scripts_dir())?;
-    clean_owned_dir(&mcp_dir())?;
-    clean_owned_dir(&templates_dir())?;
+        if !source.exists() {
+            return Err(format!(
+                "Bundled claude-integration not found at {}",
+                source.display()
+            ));
+        }
 
-    // Clean stale skills dir from older versions (skills now live in the Claude Code plugin)
-    if skills_dir().exists() {
-        let _ = fs::remove_dir_all(skills_dir());
-    }
+        let mcp_source = source.join("mcp");
 
-    // Clean only our commands from the shared ~/.claude/commands/ directory
-    clean_quill_commands()?;
+        let staged_scripts = StagedDirectory::new(deployment_targets[0].clone())?;
+        let staged_mcp = StagedDirectory::new(deployment_targets[1].clone())?;
+        let staged_templates = StagedDirectory::new(deployment_targets[2].clone())?;
 
-    // Deploy each subdirectory to its target.
-    // Script lists are computed dynamically from `features` so disabling
-    // activity tracking skips observe.cjs and disabling context telemetry
-    // (while context preservation stays on) skips context-telemetry.cjs.
-    fs::create_dir_all(scripts_dir()).map_err(|e| format!("Failed to create scripts dir: {e}"))?;
-    let base_scripts = base_scripts_for(features);
-    copy_named_files(&source.join("scripts"), &scripts_dir(), &base_scripts)?;
-    let context_scripts = context_scripts_for(features);
-    if !context_scripts.is_empty() {
-        copy_named_files(&source.join("scripts"), &scripts_dir(), &context_scripts)?;
-    }
-    copy_dir_recursive(&source.join("mcp"), &mcp_dir())?;
-    copy_dir_recursive(&source.join("commands"), &commands_dir())?;
-    deploy_template(&source.join("templates"), features)?;
-    if !features.context_preservation {
-        remove_context_mcp_tool()?;
-    }
+        // Populate every owned directory before changing any live deployment.
+        // Script lists are computed dynamically from `features` so disabling
+        // activity tracking skips observe.cjs and disabling context telemetry
+        // (while context preservation stays on) skips context-telemetry.cjs.
+        let base_scripts = base_scripts_for(features);
+        copy_named_files(
+            &source.join("scripts"),
+            staged_scripts.path(),
+            &base_scripts,
+        )?;
+        let context_scripts = context_scripts_for(features);
+        if !context_scripts.is_empty() {
+            copy_named_files(
+                &source.join("scripts"),
+                staged_scripts.path(),
+                &context_scripts,
+            )?;
+        }
+        copy_dir_recursive(&mcp_source, staged_mcp.path())?;
+        deploy_template(&source.join("templates"), staged_templates.path(), features)?;
+        if !features.context_preservation {
+            remove_context_mcp_tool(staged_mcp.path())?;
+        }
+        validate_staged_mcp(staged_mcp.path(), features.context_preservation)?;
 
-    // Make shell scripts executable on Unix
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        for script in &["report-tokens.sh", "qbuild-guard.sh"] {
-            let path = scripts_dir().join(script);
-            if path.exists() {
-                fs::set_permissions(&path, perms.clone())
-                    .map_err(|e| format!("Failed to set permissions on {script}: {e}"))?;
+        // Make shell scripts executable on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o755);
+            for script in &["report-tokens.sh", "qbuild-guard.sh"] {
+                let path = staged_scripts.path().join(script);
+                if path.exists() {
+                    fs::set_permissions(&path, perms.clone())
+                        .map_err(|e| format!("Failed to set permissions on {script}: {e}"))?;
+                }
             }
         }
-    }
 
-    log::info!(
-        "Deployed claude-integration files from {}",
-        source.display()
-    );
-    Ok(())
+        // Clean only our commands from the shared ~/.claude/commands/ directory.
+        clean_quill_commands()?;
+        copy_dir_recursive(&source.join("commands"), &commands_dir())?;
+
+        Ok(vec![staged_scripts, staged_mcp, staged_templates])
+    })();
+
+    match staged_result {
+        Ok(stages) => publish_staged_batch(stages, snapshots),
+        Err(err) => Err(snapshots.restore_with_error(err)),
+    }
+}
+
+fn cleanup_stale_skills_best_effort() {
+    let stale_skills_dir = skills_dir();
+    match path_exists(&stale_skills_dir) {
+        Ok(true) => {
+            if let Err(err) = remove_path(&stale_skills_dir) {
+                log::warn!(
+                    "Integration committed but stale skills cleanup failed for {}: {err}",
+                    stale_skills_dir.display()
+                );
+            }
+        }
+        Ok(false) => {}
+        Err(err) => log::warn!(
+            "Integration committed but stale skills inspection failed for {}: {err}",
+            stale_skills_dir.display()
+        ),
+    }
 }
 
 fn copy_named_files<S: AsRef<str>>(
@@ -591,9 +689,12 @@ fn copy_named_files<S: AsRef<str>>(
     Ok(())
 }
 
-fn deploy_template(src_dir: &Path, features: IntegrationFeatures) -> Result<(), String> {
-    fs::create_dir_all(templates_dir())
-        .map_err(|err| format!("Failed to create templates dir: {err}"))?;
+fn deploy_template(
+    src_dir: &Path,
+    dst_dir: &Path,
+    features: IntegrationFeatures,
+) -> Result<(), String> {
+    fs::create_dir_all(dst_dir).map_err(|err| format!("Failed to create templates dir: {err}"))?;
     let template_name = if features.context_preservation {
         "claude-md-section.md"
     } else {
@@ -603,15 +704,15 @@ fn deploy_template(src_dir: &Path, features: IntegrationFeatures) -> Result<(), 
     if !source.exists() {
         return Err(format!("Bundled template missing at {}", source.display()));
     }
-    fs::copy(source, templates_dir().join("claude-md-section.md"))
+    fs::copy(source, dst_dir.join("claude-md-section.md"))
         .map_err(|err| format!("Failed to deploy Claude template: {err}"))?;
     Ok(())
 }
 
-fn remove_context_mcp_tool() -> Result<(), String> {
-    let context_tool = mcp_dir().join("tools").join("context.py");
-    if context_tool.exists() {
-        fs::remove_file(&context_tool).map_err(|err| {
+fn remove_context_mcp_tool(mcp_root: &Path) -> Result<(), String> {
+    let context_tool = mcp_root.join("tools").join("context.py");
+    if path_exists(&context_tool)? {
+        remove_path(&context_tool).map_err(|err| {
             format!(
                 "Failed to remove context MCP tool {}: {err}",
                 context_tool.display()
@@ -712,7 +813,8 @@ fn update_claude_md() -> Result<(), String> {
     // If CLAUDE.md doesn't exist, create it with the block
     if !claude_md_path.exists() {
         if let Some(parent) = claude_md_path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
         }
         fs::write(&claude_md_path, format!("{block_content}\n"))
             .map_err(|e| format!("Failed to create CLAUDE.md: {e}"))?;
@@ -944,13 +1046,19 @@ fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
             Err(_) => {
                 // Back up malformed file
                 let backup = settings_path.with_extension("json.bak");
-                let _ = fs::copy(&settings_path, &backup);
+                fs::copy(&settings_path, &backup).map_err(|err| {
+                    format!(
+                        "Failed to back up malformed settings.json to {}: {err}",
+                        backup.display()
+                    )
+                })?;
                 serde_json::json!({})
             }
         }
     } else {
         if let Some(parent) = settings_path.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
         }
         serde_json::json!({})
     };
@@ -1347,12 +1455,10 @@ fn cleanup_legacy_hooks() -> Result<(), String> {
 
     for file in &legacy_files {
         let path = hooks_dir.join(file);
-        if path.exists() {
-            if let Err(e) = fs::remove_file(&path) {
-                log::warn!("Failed to remove legacy hook {}: {e}", path.display());
-            } else {
-                log::info!("Removed legacy hook file: {}", path.display());
-            }
+        if path_exists(&path)? {
+            remove_path(&path)
+                .map_err(|err| format!("Failed to remove legacy hook {}: {err}", path.display()))?;
+            log::info!("Removed legacy hook file: {}", path.display());
         }
     }
 

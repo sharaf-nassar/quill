@@ -1,4 +1,4 @@
-use super::{claude, codex, minimax};
+use super::{claude, codex, integration_mutation_guard, minimax};
 use crate::brevity;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::{ContextPreservationStatus, IntegrationFeatures};
@@ -107,6 +107,7 @@ pub fn confirm_enable_with_key(
     provider: IntegrationProvider,
     api_key: Option<String>,
 ) -> Result<ProviderStatus, String> {
+    let _mutation_guard = integration_mutation_guard()?;
     let storage = Storage::init()?;
     let features = load_integration_features(&storage)?;
 
@@ -159,6 +160,7 @@ pub fn confirm_enable_with_key(
 }
 
 pub fn set_minimax_api_key(app: &AppHandle, api_key: &str) -> Result<ProviderStatus, String> {
+    let _mutation_guard = integration_mutation_guard()?;
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
         return Err("API key is required.".to_string());
@@ -190,6 +192,7 @@ pub fn confirm_disable(
     app: &AppHandle,
     provider: IntegrationProvider,
 ) -> Result<ProviderStatus, String> {
+    let _mutation_guard = integration_mutation_guard()?;
     let storage = Storage::init()?;
     let features = load_integration_features(&storage)?;
     let mut existing_statuses = detect_all_with_storage(&storage)?;
@@ -246,6 +249,11 @@ pub fn confirm_disable(
 }
 
 pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    let _mutation_guard = integration_mutation_guard()?;
+    startup_refresh_unlocked(app)
+}
+
+fn startup_refresh_unlocked(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
     let storage = Storage::init()?;
     let mut statuses = detect_all_with_storage(&storage)?;
     repair_enabled_providers(app, &storage, &mut statuses);
@@ -261,8 +269,9 @@ pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
 /// their shell config or installed a CLI and wants Quill to pick it up
 /// without restarting.
 pub fn force_rescan(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    let _mutation_guard = integration_mutation_guard()?;
     crate::config::refresh_shell_path();
-    startup_refresh(app)
+    startup_refresh_unlocked(app)
 }
 
 pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
@@ -282,6 +291,7 @@ pub fn set_context_preservation_enabled(
     app: &AppHandle,
     enabled: bool,
 ) -> Result<ContextPreservationStatus, String> {
+    let _mutation_guard = integration_mutation_guard()?;
     let storage = Storage::init()?;
     storage.set_setting(
         CONTEXT_PRESERVATION_ENABLED_KEY,
@@ -313,6 +323,7 @@ fn set_feature_flag(
     key: &str,
     enabled: bool,
 ) -> Result<IntegrationFeatures, String> {
+    let _mutation_guard = integration_mutation_guard()?;
     let storage = Storage::init()?;
     storage.set_setting(key, if enabled { "true" } else { "false" })?;
     apply_features_to_enabled_providers(app, &storage)?;
@@ -446,16 +457,15 @@ fn should_sync_context_assets(status: &ProviderStatus) -> bool {
         )
 }
 
-// Always reinstalls rather than gating on `verify()` first: `verify()` only
-// checks that managed files are present and hooks are registered, not that
-// file contents match the currently-bundled version, so a verify-first-then-
-// skip gate would leave stale script/mcp/template content in place forever
-// once a user has it installed — including across app updates that fix a
-// managed file's contents without changing its name or hook registration.
-// `install()`'s steps (deploy_files, register_mcp_server, register_hooks,
-// update_claude_md) are all idempotent merge/overwrite operations, and this
-// same unconditional-install pattern is already used by
-// `sync_features_for_enabled_providers` on every feature toggle.
+// Startup repair holds the integration mutation guard. A per-provider deployment
+// stamp (bundled source hash plus feature/version inputs) gates the work: when
+// the stamp matches and the provider still verifies, the full transactional
+// reinstall is skipped, restoring the base's cheap startup while still catching
+// stale managed *contents* that `verify()` alone cannot see. On any mismatch or
+// failed verify, `install()` runs its idempotent merge/overwrite pass, finishes
+// with its own verification, and rewrites the stamp only after a clean commit.
+// Feature toggles and explicit enable call `install()` directly, since their
+// input change already alters the stamp.
 fn repair_provider(
     app: &AppHandle,
     provider: IntegrationProvider,
@@ -463,12 +473,16 @@ fn repair_provider(
 ) -> Result<(), String> {
     match provider {
         IntegrationProvider::Claude => {
-            claude::install(app, features)?;
-            crate::claude_setup::verify(features)
+            if claude::deployment_is_current(app, features) {
+                return Ok(());
+            }
+            claude::install(app, features).map(|_| ())
         }
         IntegrationProvider::Codex => {
-            codex::install(app, features)?;
-            codex::verify(features)
+            if codex::deployment_is_current(app, features) {
+                return Ok(());
+            }
+            codex::install(app, features).map(|_| ())
         }
         IntegrationProvider::MiniMax => Ok(()),
     }

@@ -34,6 +34,17 @@ pub fn install(
     crate::claude_setup::install_with_manifest(app, features)
 }
 
+pub(crate) fn recover_interrupted_install() -> Result<(), String> {
+    crate::claude_setup::recover_interrupted_install()
+}
+
+pub(crate) fn deployment_is_current(
+    app: &AppHandle,
+    features: crate::models::IntegrationFeatures,
+) -> bool {
+    crate::claude_setup::deployment_is_current(app, features)
+}
+
 pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
     let manifest = crate::claude_setup::owned_asset_manifest();
     crate::claude_setup::uninstall_with_manifest(&manifest)?;

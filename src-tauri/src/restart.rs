@@ -1442,15 +1442,18 @@ pub async fn get_restart_status(
 pub async fn install_restart_hooks(provider: Option<IntegrationProvider>) -> Result<(), String> {
     #[cfg(unix)]
     {
-        match provider.unwrap_or(IntegrationProvider::Claude) {
-            IntegrationProvider::Claude => {
-                install_hook_script()?;
-                merge_hooks_into_settings()?;
-                install_shell_integration()
+        tokio::task::block_in_place(|| {
+            let _mutation_guard = crate::integrations::integration_mutation_guard()?;
+            match provider.unwrap_or(IntegrationProvider::Claude) {
+                IntegrationProvider::Claude => {
+                    install_hook_script()?;
+                    merge_hooks_into_settings()?;
+                    install_shell_integration()
+                }
+                IntegrationProvider::Codex => install_shell_integration(),
+                IntegrationProvider::MiniMax => Ok(()),
             }
-            IntegrationProvider::Codex => install_shell_integration(),
-            IntegrationProvider::MiniMax => Ok(()),
-        }
+        })
     }
     #[cfg(not(unix))]
     {

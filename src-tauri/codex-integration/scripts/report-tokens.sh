@@ -54,33 +54,84 @@ if [ -z "$SESSION_ID" ] || [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH
     exit 0
 fi
 
-# Reads and reverses in Python (not `tac`, which GNU coreutils ships but
-# macOS/BSD does not) so this works the same on Linux and macOS.
+# Scans backward in bounded binary chunks so large transcripts do not need to
+# be loaded into memory and malformed trailing records can be skipped.
 USAGE_JSON=$(python3 -c "
 import sys, json
 
-with open(sys.argv[1]) as f:
-    lines = f.readlines()
+CHUNK_SIZE = 65536
+MAX_TOKEN_COUNT = 100_000_000
+TOKEN_FIELDS = (
+    'input_tokens',
+    'cached_input_tokens',
+    'output_tokens',
+)
 
-for line in reversed(lines):
-    line = line.strip()
+def validated_usage(usage):
+    if not isinstance(usage, dict) or not usage:
+        return None
+    result = {}
+    for field in TOKEN_FIELDS:
+        value = usage.get(field, 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        if value < 0 or value > MAX_TOKEN_COUNT:
+            return None
+        result[field] = value
+    return result
+
+def reverse_lines(path):
+    with open(path, 'rb') as transcript:
+        transcript.seek(0, 2)
+        position = transcript.tell()
+        fragments = []
+
+        while position:
+            read_size = min(CHUNK_SIZE, position)
+            position -= read_size
+            transcript.seek(position)
+            chunk = transcript.read(read_size)
+            lines = chunk.split(b'\n')
+            for fragment in reversed(lines[1:]):
+                fragments.append(fragment)
+                line = b''.join(reversed(fragments))
+                fragments.clear()
+                yield line
+            fragments.append(lines[0])
+
+        if fragments:
+            yield b''.join(reversed(fragments))
+
+for raw_line in reverse_lines(sys.argv[1]):
+    line = raw_line.strip()
     if not line:
         continue
     try:
         msg = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        continue
+
+    if not isinstance(msg, dict):
         continue
 
     if msg.get('type') != 'event_msg':
         continue
 
-    payload = msg.get('payload') or {}
+    payload = msg.get('payload')
+    if not isinstance(payload, dict):
+        continue
+
     if payload.get('type') != 'token_count':
         continue
 
-    info = payload.get('info') or {}
-    usage = info.get('last_token_usage') or info.get('total_token_usage')
-    if not usage:
+    info = payload.get('info')
+    if not isinstance(info, dict):
+        continue
+
+    usage = validated_usage(info.get('last_token_usage'))
+    if usage is None:
+        usage = validated_usage(info.get('total_token_usage'))
+    if usage is None:
         continue
 
     result = {

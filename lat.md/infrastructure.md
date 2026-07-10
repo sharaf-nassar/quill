@@ -239,6 +239,8 @@ Codex installs SessionStart, UserPromptSubmit, and Stop hooks unconditionally; P
 
 The app-server request pipe is flushed but kept open until each response arrives. Closing stdin immediately after writing requests can make `hooks/list` return no response before trust hashes are written.
 
+Quill manages Codex configuration only at `$HOME/.codex`. Detection never fails on `CODEX_HOME`: a value resolving to that default is honored, while a custom directory degrades Codex to home-not-detected with a warning instead of failing the whole `detect_all` collection and bricking startup repair and disable for Claude and MiniMax. Install and enable still reject a custom home with a clear error before any file is mutated, but uninstall resolves the default `~/.codex` regardless of the env var so a stray `CODEX_HOME` cannot strand managed entries or block disable. The spawned app-server is pinned to the default home and receives that `config.toml` as the explicit batch-write target; each request is bounded by a ~10s timeout after which the child is killed, and every return path terminates and reaps the child before transaction rollback can begin.
+
 Quill resolves the Codex CLI before running provider checks or `codex app-server`, then augments the child process `PATH` with launcher and symlink-target directories so Homebrew and npm installs work from macOS app launches with stripped inherited environments.
 
 ## Provider CLI Detection
