@@ -45,13 +45,14 @@ If none resolve, exit with code `4` and print a message instructing the maintain
 
 1. **Discover Quill binary**. If absent, exit `4`.
 2. **Resolve `$SANDBOX`**. Optionally `rm -rf $SANDBOX` (`--clean` / `-Clean`).
-3. **Create `$SANDBOX/data` and `$SANDBOX/rules`** (`mkdir -p`).
+3. **Create `$SANDBOX/data`, `$SANDBOX/rules`, `$SANDBOX/projects`, and `$SANDBOX/codex-sessions`** (`mkdir -p`).
 4. **Set environment** for the seeder + Quill child:
    - `QUILL_DEMO_MODE=1`
    - `QUILL_DATA_DIR=$SANDBOX/data`
    - `QUILL_RULES_DIR=$SANDBOX/rules`
    - `QUILL_CLAUDE_PROJECTS_DIR=$SANDBOX/projects`
-5. **Invoke seeder**: `python3 scripts/populate_dummy_data.py --data-dir "$QUILL_DATA_DIR" --rules-dir "$QUILL_RULES_DIR" --projects-dir "$QUILL_CLAUDE_PROJECTS_DIR" --no-backup`. Exit non-zero on seeder failure.
+   - `QUILL_CODEX_SESSIONS_DIR=$SANDBOX/codex-sessions`
+5. **Invoke seeder**: `python3 scripts/populate_dummy_data.py --data-dir "$QUILL_DATA_DIR" --rules-dir "$QUILL_RULES_DIR" --projects-dir "$QUILL_CLAUDE_PROJECTS_DIR" --codex-sessions-dir "$QUILL_CODEX_SESSIONS_DIR" --no-backup`. POSIX passes quoted arguments directly; PowerShell invokes `& python3 @seederArgs` so paths containing spaces remain distinct arguments. Exit `3` on seeder failure.
 6. **Print sandbox banner** to stderr: `[demo] sandbox at /tmp/quill-demo-alex` and `[demo] launching quill ...`.
 7. **Exec the Quill binary** with the prepared environment.
 8. **On exit**, unless `--keep-on-exit` / `-KeepOnExit` is set, print the teardown command (`rm -rf /tmp/quill-demo-alex` or `Remove-Item -Recurse $env:TEMP\quill-demo-alex`) WITHOUT executing it. Maintainer decides.

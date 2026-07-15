@@ -60,6 +60,8 @@ Each endpoint validates input (length limits, range checks, type validation) bef
 
 [[src-tauri/src/storage.rs]] manages a SQLite database with WAL mode and 5-second busy timeout. The largest backend module.
 
+Most operations use one mutex-protected primary connection. The paired Models aggregate and history reads instead open independent read-only, query-only connections with the same timeout, allowing WAL concurrency while each response retains its own deferred snapshot.
+
 ### Location
 
 The SQLite database file path varies by operating system.
@@ -69,7 +71,7 @@ The SQLite database file path varies by operating system.
 
 ### Schema
 
-The database schema is versioned through migration 25 and includes usage, token, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
+The database schema is versioned through migration 28 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
 
 #### Usage Tracking
 
@@ -91,6 +93,36 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
 Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+
+#### Model Analytics Evidence
+
+Migration 28 stores replayable transcript evidence and source ownership for provider-qualified model analytics without a model catalog.
+
+The source lifecycle and graph-resolution path is documented in [[data-flow#Model Observation Reconciliation]].
+
+- **model_usage_observations** — Normalized turn and token facts with exact raw model identity, nullable token dimensions, resolved session/chain ownership, and source-local ordering.
+- **model_observation_sources** — Retained source inventory, fingerprints, activity bounds, reconciliation status, and durable deletion suppression.
+- **model_backfill_state** — Singleton progress and completeness state used to distinguish final empty claims from provisional recovered data.
+
+Backfill lifecycle writes are transactional and state-guarded. Interrupted and explicit retry initialization advance the inventory generation, clear only run-local counters, and preserve evidence; pending work alone can become running. Root outcomes precede an explicit source-total publication marker, which distinguishes an authoritative empty inventory from work not yet inventoried. Batch counters cannot exceed remaining work, and only a failure-free resolved inventory with at least one configured root and a published source total can finish complete. Partial and failed states persist inventory completeness independently, so unreadable sources and unreadable roots remain distinguishable. Persisted diagnostics use the bounded `ModelBackfillDiagnostic` value rather than raw filesystem errors.
+
+[[src-tauri/src/model_usage.rs#run_retained_model_history_backfill]] owns one retained-history pass under the shared process permit. It inventories each provider root off the async executor and commits its cumulative outcome before starting the next, then prepares stable generation-owned work before publishing the plan's validated source total. Bounded source batches commit and record progress between yields, source failures retain last-good rows, and only completed root proofs prune child rows before parents. Terminal `partial` versus `failed` reflects useful committed work, while inventory completeness depends only on resolved roots and attempted discovered sources.
+
+[[src-tauri/src/lib.rs#run]] resets an interrupted running pass to a fresh `startup_resume` generation after storage initialization and reserves one nonblocking worker for migration-pending or resumed work. The reservation waits for live reconciliation to release the shared process permit instead of discarding historical work.
+
+[[src-tauri/src/storage.rs#Storage#get_model_analytics]] reads aggregates and backfill state from one SQLite snapshot. Global sessions use all unsuppressed retained source ownership, while range sessions, represented providers, evidence, coverage, and model rows require actual normalized timestamps in the half-open range. Cache-read share remains unavailable when any contributing token row lacks a required dimension.
+
+Attributed coverage uses one token-bearing observation population: rows with accepted raw IDs form the numerator, and null IDs form the unattributed remainder. A zero-token denominator stays unavailable. Tokenless turns still contribute model, session, first/last-seen, primary-model, and switch evidence.
+
+[[src-tauri/src/storage.rs#Storage#get_model_history]] reads one matching snapshot into fixed, zero-filled UTC buckets: 5 minutes for 1 hour, 1 hour for 24 hours, 6 hours for 7 days, and 1 day for 30 days. It keeps attributed, unattributed, and optional provider-qualified selected-model series separate while excluding suppressed sources.
+
+The frontend issues aggregate and history commands together. Each command opens a short-lived read-only connection and starts its existing deferred transaction there, so neither waits on the primary storage mutex or serializes behind the paired overview query; WAL still governs database-level writer/readers safely.
+
+[[src-tauri/src/storage.rs#Storage#get_model_sessions]] pages sessions for one exact provider-qualified raw model without a catalog. Its checksummed opaque cursor fixes the half-open range, records the persisted model-data revision, and seeks by last activity descending, then binary provider/session identity ascending. Observation replacement, source pruning/failure visibility, deletion suppression, and model cwd changes advance that revision in their own commit; a later page rejects a stale cursor instead of mixing totals with unreachable rows. Each page derives selected-model usage, latest project/host context, range-scoped primary model, distinct models, independent chains, and turn-only within-chain switches from unsuppressed evidence.
+
+[[src-tauri/src/storage.rs#Storage#get_session_model_history]] reads one provider/session over the same half-open range and unsuppressed source ownership. It returns coverage totals from every token-bearing observation, but only ordered turns create segments: repeated models compress, null-model turns compress into gaps and reset adjacency, and token-only rows neither create segments nor reset switches. Parent and subagent chain metadata must remain consistent, chains order parent first then first activity and binary chain ID, segment endpoints are the inclusive first/last turn timestamps, and primary-model ties use attributed tokens, turn count, then binary provider/raw ID. A session with no retained in-range observations returns a distinct storage-level not-found outcome for stale-row IPC handling.
+
+Existing session, project, and host deletion transactions select model evidence through retained source ownership, delete observation children first, and leave each matching source suppressed at its last committed content hash. Session deletion matches the provider-qualified analytics/root session so parent and subagent sources are removed together. Project deletion selects a source when its retained `cwd` or any child observation `cwd` matches, then deletes every child of that source to preserve atomic replacement. Unchanged retries remain suppressed; only an atomic changed-content replacement restores evidence. Project rename updates exact-matching source and observation `cwd` fields independently in one transaction, preserving per-record cwd differences. Tauri wrappers perform snapshot reads and mutations off the async command worker, then emit `model-analytics-updated` only after commit. Model evidence has no independent TTL and is not coupled to token-hourly cleanup.
 
 #### Learning System
 
@@ -180,7 +212,7 @@ Codex transcripts emit only `user_text` and `asst_text` events because Codex kee
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v27). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts. Migration 27 adds the [[backend#Database#Schema#Hook Invocations]] `hook_invocations` table with one UNIQUE expression index (identity + agent_id COALESCE) plus four secondary indices (provider+timestamp, provider+session, identity+timestamp, identity+cwd), and sets a `hook_invocation_reingest_pending` flag so the same sweep replays the new attachment extractor across every Claude transcript. All four reingest-pending flags share the same sweep handler: the mtime cache clears once at the start of the sweep, every flag-driven extractor runs against every transcript, and each flag is deleted only after the sweep completes cleanly so a mid-sweep abort retries on the next boot.
+- **schema_version** — Migration version tracking (currently v28). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts. Migration 27 adds the [[backend#Database#Schema#Hook Invocations]] `hook_invocations` table with one UNIQUE expression index (identity + agent_id COALESCE) plus four secondary indices (provider+timestamp, provider+session, identity+timestamp, identity+cwd), and sets a `hook_invocation_reingest_pending` flag so the same sweep replays the new attachment extractor across every Claude transcript. Migration 28 adds normalized model observations, retained-source ownership, and the singleton state that separates backfill lifecycle, root completeness, source-total publication, and bounded progress counters. All four reingest-pending flags share the same sweep handler: the mtime cache clears once at the start of the sweep, every flag-driven extractor runs against every transcript, and each flag is deleted only after the sweep completes cleanly so a mid-sweep abort retries on the next boot.
 
 ## Tauri IPC Commands
 
@@ -210,6 +242,20 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 
 `get_context_savings_analytics` returns range-scoped summary totals, timeseries buckets, grouped breakdowns, and recent append-only events for the Analytics Context tab. Token values are approximate `ceil(bytes / 4)` estimates, while byte counts and event counts are exact where producers can measure them.
 
+### Model Analytics Commands (5)
+
+Model analytics IPC exposes validated aggregate, history, paged-session, session-detail, and backfill operations through one structured, user-safe error contract.
+
+[[src-tauri/src/lib.rs#get_model_analytics]] validates the fixed time range and optional existing Quill provider identifier before reading one analytics snapshot off the async command thread. [[src-tauri/src/lib.rs#get_model_history]] also validates an optional exact raw model identity and rejects provider-filter mismatches.
+
+[[src-tauri/src/lib.rs#get_model_sessions]] validates the fixed range and exact provider-qualified opaque model ID, preserves the storage-owned 20-row null default, and clamps signed numeric limits to 1–100 before platform-independent conversion. Malformed, foreign, or stale opaque cursors return `invalid_cursor` without exposing cursor diagnostics.
+
+[[src-tauri/src/lib.rs#get_session_model_history]] validates provider and range before loading one provider-owned session. Missing in-range retained evidence returns `not_found`, distinct from storage failure.
+
+[[src-tauri/src/lib.rs#retry_model_history_backfill]] reserves scheduling before advancing the durable retry generation, returns current state when that retained pass is already scheduled or running, and treats an unowned persisted `running` row as interrupted work. A live-source owner can release the shared process permit before the pending pass starts.
+
+Storage and blocking-task failures stay in local logs. All five commands return only the bounded serialized model analytics error envelope, and model IDs use shared opaque Unicode validation without a catalog or version allowlist.
+
 ### Indicator Commands (3)
 
 `get_indicator_primary_provider`, `set_indicator_primary_provider`, and `get_indicator_state` keep one backend-owned indicator model shared across the tray title, tray summary rows, and the integrations menu.
@@ -220,7 +266,7 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 
 `get_project_tokens`, `get_session_stats`, `get_project_breakdown`, `delete_project_data`, `rename_project`, `delete_host_data`, `delete_session_data`.
 
-`delete_session_data` deletes both token snapshots and skill-use rows for the selected `(provider, session_id)` pair so the Sessions and Skills breakdowns cannot retain different views of a deleted session.
+`delete_session_data` deletes token snapshots and skill-use rows for the selected `(provider, session_id)` pair, plus every model source owned by that provider-qualified analytics/root session. Model observation children are removed before retained source fingerprints become suppressed, preventing a retry from resurrecting unchanged deleted evidence.
 
 ### Integration Commands (12)
 
@@ -363,6 +409,8 @@ Skill usage is derived during the same extraction pass by [[src-tauri/src/sessio
 The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript at `<projectSlug>/*.jsonl`, and each `DiscoveredSessionFile` carries an `is_subagent` flag so downstream extraction can tell the two apart. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid` from each JSON record; Codex extraction writes the provider-agnostic defaults (`is_sidechain=0`, `agent_id=NULL`, `parent_uuid=NULL`) so today's Codex CLI inherits the same code path the day OpenAI ships a sub-agent feature. Per-session sub-agent files live in one flat directory — multi-level hierarchy is reconstructed at query time via `parent_uuid` chains rather than nested filesystem layout.
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
+
+[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits that canonical source to model reconciliation before session-keyed search coalescing; direct `messages` payloads remain search-only.
 
 ### Search Scoring
 

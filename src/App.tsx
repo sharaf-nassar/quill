@@ -399,7 +399,7 @@ function App({ integrations }: AppProps) {
 	}, [toast]);
 
 	useEffect(() => {
-		if (providersLoading) {
+		if (!showLive || providersLoading) {
 			return;
 		}
 		if (!hasEnabledProvider) {
@@ -409,7 +409,7 @@ function App({ integrations }: AppProps) {
 		refresh();
 		const interval = setInterval(refresh, 3 * 60_000);
 		return () => clearInterval(interval);
-	}, [hasEnabledProvider, liveProviderKey, providersLoading, refresh]);
+	}, [hasEnabledProvider, liveProviderKey, providersLoading, refresh, showLive]);
 
 	const [pendingUpdate, setPendingUpdate] = useState<PendingUpdate | null>(null);
 	const [updating, setUpdating] = useState(false);
@@ -556,9 +556,6 @@ function App({ integrations }: AppProps) {
 	const handleRefresh = async () => {
 		closeMenu();
 		await refreshIntegrations();
-		if (hasEnabledProvider && !providersLoading) {
-			await refresh();
-		}
 	};
 
 	const activeSplitRatio = isHorizontal ? splitRatioH : splitRatio;
@@ -602,42 +599,38 @@ function App({ integrations }: AppProps) {
 				className={`panels${isSplit ? " panels--split" : ""}${isSplit && isHorizontal ? " panels--side-by-side" : ""}`}
 				ref={upperRef}
 			>
-				{providersLoading ? (
-					<div className="content">
-						<div className="loading">Checking integrations...</div>
-					</div>
-				) : !hasEnabledProvider ? (
-					<div className="content">
-						<div className="integration-empty-state">
-							<p className="integration-empty-state__eyebrow">Providers</p>
-							<h2 className="integration-empty-state__title">
-								{emptyState.title}
-							</h2>
-							<p className="integration-empty-state__description">
-								{emptyState.description}
-							</p>
-							<button
-								className="integration-empty-state__action"
-								onClick={() => void refreshIntegrations()}
-								disabled={providersLoading}
-							>
-								Rescan Providers
-							</button>
-						</div>
-					</div>
-				) : (
-					<>
-						{showLive && (
+				{showLive && (
 					<div className="content live-content" ref={liveRef} style={liveStyle}>
-						<UsageDisplay
-							data={usageData}
-							timeMode={timeMode}
-							enabledProviders={statuses.filter((status) => status.enabled).map((status) => status.provider)}
-							onTimeModeChange={handleTimeModeChange}
-						/>
-					</div>
+						{providersLoading ? (
+							<div className="loading">Checking integrations...</div>
+						) : !hasEnabledProvider ? (
+							<div className="integration-empty-state">
+								<p className="integration-empty-state__eyebrow">Providers</p>
+								<h2 className="integration-empty-state__title">
+									{emptyState.title}
+								</h2>
+								<p className="integration-empty-state__description">
+									{emptyState.description}
+								</p>
+								<button
+									className="integration-empty-state__action"
+									onClick={() => void refreshIntegrations()}
+									disabled={providersLoading}
+								>
+									Rescan Providers
+								</button>
+							</div>
+						) : (
+							<UsageDisplay
+								data={usageData}
+								timeMode={timeMode}
+								enabledProviders={statuses.filter((status) => status.enabled).map((status) => status.provider)}
+								onTimeModeChange={handleTimeModeChange}
+							/>
 						)}
-						{isSplit && (
+					</div>
+				)}
+				{isSplit && (
 					<div
 						className="panel-divider"
 						role="separator"
@@ -647,18 +640,19 @@ function App({ integrations }: AppProps) {
 						onMouseDown={handleDividerMouseDown}
 						onKeyDown={handleDividerKeyDown}
 					/>
-						)}
-						{showAnalytics && (
+				)}
+				{showAnalytics && (
 					<div className="content analytics-content">
-						<AnalyticsView contextPreservation={contextPreservation} />
+						<AnalyticsView
+							contextPreservation={contextPreservation}
+							contextPreservationReady={!providersLoading && !providersError}
+						/>
 					</div>
-						)}
-						{!showLive && !showAnalytics && (
+				)}
+				{!showLive && !showAnalytics && (
 					<div className="content">
 						<div className="loading">Toggle a view from the titlebar</div>
 					</div>
-						)}
-					</>
 				)}
 			</div>
 			{showMenu && (

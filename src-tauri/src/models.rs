@@ -1146,6 +1146,462 @@ pub struct MemoryFilesUpdatedEvent {
     pub project_path: String,
 }
 
+// --- Session model analytics models ---
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelRange {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "24h")]
+    TwentyFourHours,
+    #[serde(rename = "7d")]
+    SevenDays,
+    #[serde(rename = "30d")]
+    ThirtyDays,
+}
+
+impl ModelRange {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OneHour => "1h",
+            Self::TwentyFourHours => "24h",
+            Self::SevenDays => "7d",
+            Self::ThirtyDays => "30d",
+        }
+    }
+}
+
+impl TryFrom<&str> for ModelRange {
+    type Error = ModelAnalyticsError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "1h" => Ok(Self::OneHour),
+            "24h" => Ok(Self::TwentyFourHours),
+            "7d" => Ok(Self::SevenDays),
+            "30d" => Ok(Self::ThirtyDays),
+            _ => Err(ModelAnalyticsError::new(
+                ModelAnalyticsErrorCode::InvalidRange,
+                "Range must be one of 1h, 24h, 7d, or 30d.",
+            )),
+        }
+    }
+}
+
+impl std::str::FromStr for ModelRange {
+    type Err = ModelAnalyticsError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelIdentity {
+    pub provider: String,
+    pub model_id: String,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelBackfillTrigger {
+    Migration,
+    StartupResume,
+    Retry,
+    Reconcile,
+}
+
+impl ModelBackfillTrigger {
+    pub const MIGRATION: &'static str = "migration";
+    pub const STARTUP_RESUME: &'static str = "startup_resume";
+    pub const RETRY: &'static str = "retry";
+    pub const RECONCILE: &'static str = "reconcile";
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseModelBackfillTriggerError;
+
+impl std::fmt::Display for ParseModelBackfillTriggerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid model backfill trigger")
+    }
+}
+
+impl std::error::Error for ParseModelBackfillTriggerError {}
+
+impl TryFrom<&str> for ModelBackfillTrigger {
+    type Error = ParseModelBackfillTriggerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            Self::MIGRATION => Ok(Self::Migration),
+            Self::STARTUP_RESUME => Ok(Self::StartupResume),
+            Self::RETRY => Ok(Self::Retry),
+            Self::RECONCILE => Ok(Self::Reconcile),
+            _ => Err(ParseModelBackfillTriggerError),
+        }
+    }
+}
+
+impl std::str::FromStr for ModelBackfillTrigger {
+    type Err = ParseModelBackfillTriggerError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelBackfillState {
+    Pending,
+    Running,
+    Complete,
+    Partial,
+    Failed,
+}
+
+impl ModelBackfillState {
+    pub const PENDING: &'static str = "pending";
+    pub const RUNNING: &'static str = "running";
+    pub const COMPLETE: &'static str = "complete";
+    pub const PARTIAL: &'static str = "partial";
+    pub const FAILED: &'static str = "failed";
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => Self::PENDING,
+            Self::Running => Self::RUNNING,
+            Self::Complete => Self::COMPLETE,
+            Self::Partial => Self::PARTIAL,
+            Self::Failed => Self::FAILED,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseModelBackfillStateError;
+
+impl std::fmt::Display for ParseModelBackfillStateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid model backfill state")
+    }
+}
+
+impl std::error::Error for ParseModelBackfillStateError {}
+
+impl TryFrom<&str> for ModelBackfillState {
+    type Error = ParseModelBackfillStateError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            Self::PENDING => Ok(Self::Pending),
+            Self::RUNNING => Ok(Self::Running),
+            Self::COMPLETE => Ok(Self::Complete),
+            Self::PARTIAL => Ok(Self::Partial),
+            Self::FAILED => Ok(Self::Failed),
+            _ => Err(ParseModelBackfillStateError),
+        }
+    }
+}
+
+impl std::str::FromStr for ModelBackfillState {
+    type Err = ParseModelBackfillStateError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::try_from(value)
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ModelBackfillDiagnostic(String);
+
+impl ModelBackfillDiagnostic {
+    pub fn from_user_safe_message(message: impl AsRef<str>) -> Self {
+        Self(bounded_model_analytics_message(
+            message.as_ref(),
+            "Model history backfill encountered an error.",
+        ))
+    }
+
+    pub fn storage_error() -> Self {
+        Self("Some model history could not be processed.".to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ModelBackfillDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelBackfillStatus {
+    pub generation: i64,
+    pub trigger: ModelBackfillTrigger,
+    pub status: ModelBackfillState,
+    pub total_roots: i64,
+    pub completed_roots: i64,
+    pub failed_roots: i64,
+    pub inventory_complete: bool,
+    pub total_sources: i64,
+    pub processed_sources: i64,
+    pub failed_sources: i64,
+    pub skipped_sources: i64,
+    pub remaining_sources: i64,
+    pub observations_written: i64,
+    pub started_at: Option<String>,
+    pub updated_at: String,
+    pub finished_at: Option<String>,
+    pub last_error: Option<ModelBackfillDiagnostic>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAnalyticsScope {
+    pub global_session_count: i64,
+    pub scoped_session_count: i64,
+    pub scoped_evidence_count: i64,
+    pub inventory_complete: bool,
+    pub scope_final: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAnalyticsSummary {
+    pub attributed_tokens: i64,
+    pub unattributed_tokens: i64,
+    pub total_tokens: i64,
+    pub attributed_coverage_percent: Option<f64>,
+    pub distinct_models: i64,
+    pub multi_model_sessions: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageRow {
+    pub identity: ModelIdentity,
+    pub attributed_tokens: i64,
+    pub attributed_share_percent: Option<f64>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub observed_turns: i64,
+    pub session_count: i64,
+    pub cache_read_share_percent: Option<f64>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAnalyticsResponse {
+    pub generated_at: String,
+    pub range: ModelRange,
+    pub provider: Option<String>,
+    pub represented_providers: Vec<String>,
+    pub scope: ModelAnalyticsScope,
+    pub summary: ModelAnalyticsSummary,
+    pub models: Vec<ModelUsageRow>,
+    pub backfill: ModelBackfillStatus,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHistoryPoint {
+    pub bucket_start: String,
+    pub bucket_end: String,
+    pub attributed_tokens: i64,
+    pub unattributed_tokens: i64,
+    pub selected_model_tokens: Option<i64>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelHistoryResponse {
+    pub generated_at: String,
+    pub range: ModelRange,
+    pub provider: Option<String>,
+    pub selected_model: Option<ModelIdentity>,
+    pub bucket_seconds: i64,
+    pub points: Vec<ModelHistoryPoint>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSessionRow {
+    pub provider: String,
+    pub session_id: String,
+    pub display_name: String,
+    pub cwd: Option<String>,
+    pub hostname: Option<String>,
+    pub selected_model_tokens: i64,
+    pub selected_model_turns: i64,
+    pub last_activity_at: String,
+    pub primary_model: ModelIdentity,
+    pub distinct_models: i64,
+    pub has_within_chain_switches: bool,
+    pub chain_count: i64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSessionsResponse {
+    pub identity: ModelIdentity,
+    pub total: i64,
+    pub next_cursor: Option<String>,
+    pub sessions: Vec<ModelSessionRow>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionModelChainKind {
+    Parent,
+    Subagent,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SessionModelSegment {
+    Model {
+        identity: ModelIdentity,
+        started_at: String,
+        ended_at: String,
+        turn_count: i64,
+        attributed_tokens: i64,
+    },
+    ModelGap {
+        started_at: String,
+        ended_at: String,
+        turn_count: i64,
+    },
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModelChain {
+    pub chain_id: String,
+    pub parent_chain_id: Option<String>,
+    pub kind: SessionModelChainKind,
+    pub agent_id: Option<String>,
+    pub switch_count: i64,
+    pub attributed_tokens: i64,
+    pub unattributed_tokens: i64,
+    pub segments: Vec<SessionModelSegment>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModelHistoryResponse {
+    pub provider: String,
+    pub session_id: String,
+    pub display_name: String,
+    pub primary_model: Option<ModelIdentity>,
+    pub distinct_models: i64,
+    pub switch_count: i64,
+    pub attributed_tokens: i64,
+    pub unattributed_tokens: i64,
+    pub chains: Vec<SessionModelChain>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAnalyticsUpdatedEvent {
+    pub generation: i64,
+    pub status: ModelBackfillState,
+    pub data_changed: bool,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelAnalyticsErrorCode {
+    InvalidRange,
+    InvalidProvider,
+    InvalidModelId,
+    InvalidCursor,
+    NotFound,
+    StorageError,
+}
+
+impl ModelAnalyticsErrorCode {
+    fn default_message(self) -> &'static str {
+        match self {
+            Self::InvalidRange => "The selected model analytics range is invalid.",
+            Self::InvalidProvider => "The selected provider is invalid.",
+            Self::InvalidModelId => "The selected model identifier is invalid.",
+            Self::InvalidCursor => "The model session cursor is invalid or expired.",
+            Self::NotFound => "The requested model analytics record was not found.",
+            Self::StorageError => "Model analytics data is temporarily unavailable.",
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAnalyticsError {
+    code: ModelAnalyticsErrorCode,
+    message: String,
+}
+
+impl ModelAnalyticsError {
+    pub fn new(code: ModelAnalyticsErrorCode, message: impl AsRef<str>) -> Self {
+        let message = if code == ModelAnalyticsErrorCode::StorageError {
+            code.default_message().to_string()
+        } else {
+            bounded_model_analytics_message(message.as_ref(), code.default_message())
+        };
+
+        Self { code, message }
+    }
+
+    pub fn storage_error() -> Self {
+        Self::new(ModelAnalyticsErrorCode::StorageError, "")
+    }
+}
+
+impl std::fmt::Display for ModelAnalyticsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ModelAnalyticsError {}
+
+const MODEL_ANALYTICS_MESSAGE_MAX_CHARS: usize = 240;
+
+fn bounded_model_analytics_message(message: &str, fallback: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = if normalized.is_empty() {
+        fallback
+    } else {
+        &normalized
+    };
+
+    if normalized.chars().count() <= MODEL_ANALYTICS_MESSAGE_MAX_CHARS {
+        normalized.to_string()
+    } else {
+        let mut bounded = normalized
+            .chars()
+            .take(MODEL_ANALYTICS_MESSAGE_MAX_CHARS - 1)
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    }
+}
+
 // --- Code change stats models ---
 
 /// Aggregate code change stats for a time range

@@ -1,24 +1,49 @@
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+#[cfg(any(unix, windows))]
+use std::ffi::OsString;
+use std::fs::Metadata;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
 use crate::integrations::IntegrationProvider;
+use crate::model_usage::{
+    CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
+    SourceProcessingStatus,
+};
 use crate::models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
     ContextSavingsBreakdownItem, ContextSavingsBreakdowns, ContextSavingsEvent,
     ContextSavingsEventPayload, ContextSavingsInsertResult, ContextSavingsSummary,
     ContextSavingsTimeseriesPoint, DataPoint, EvidenceRef, GitSnapshot, HostBreakdown,
     LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
-    LearningStatus, LlmRuntimeStats, ObservationPayload, ObservationSummary, ProjectBreakdown,
-    ProjectTokens, RunInferenceCall, RunInferenceConfinement, RunInferenceSummary,
-    SessionBreakdown, SessionCodeStats, SessionRef, SessionStats, SkillBreakdown,
-    SkillProjectBreakdown, SkillUsage, SubagentNode, TokenDataPoint, TokenReportPayload,
-    TokenStats, ToolCount, UsageBucket,
+    LearningStatus, LlmRuntimeStats, ModelAnalyticsResponse, ModelAnalyticsScope,
+    ModelAnalyticsSummary, ModelBackfillDiagnostic, ModelBackfillState, ModelBackfillStatus,
+    ModelBackfillTrigger, ModelHistoryPoint, ModelHistoryResponse, ModelIdentity, ModelRange,
+    ModelSessionRow, ModelSessionsResponse, ModelUsageRow, ObservationPayload, ObservationSummary,
+    ProjectBreakdown, ProjectTokens, RunInferenceCall, RunInferenceConfinement,
+    RunInferenceSummary, SessionBreakdown, SessionCodeStats, SessionModelChain,
+    SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment, SessionRef,
+    SessionStats, SkillBreakdown, SkillProjectBreakdown, SkillUsage, SubagentNode, TokenDataPoint,
+    TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
+const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
+// NUL cannot occur in a filesystem path, so encoded rows cannot collide with
+// legacy plain-Unicode paths that happen to resemble one of these tags.
+const MODEL_SOURCE_PATH_UNIX_PREFIX: &str = "\0quill-source-path-unix-v1:";
+const MODEL_SOURCE_PATH_WINDOWS_PREFIX: &str = "\0quill-source-path-windows-v1:";
+const MODEL_SOURCE_PATH_UNICODE_PREFIX: &str = "\0quill-source-path-unicode-v1:";
 #[allow(dead_code)]
 const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
 
@@ -263,6 +288,144 @@ pub struct HookInvocationInput<'a> {
     pub cwd: Option<&'a str>,
     pub hostname: Option<&'a str>,
     pub message_id: Option<&'a str>,
+}
+
+/// Filesystem metadata used for the model-source fast path.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourceFastFingerprint {
+    mtime_ns: i64,
+    size_bytes: i64,
+}
+
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+impl ModelSourceFastFingerprint {
+    pub(crate) const fn mtime_ns(self) -> i64 {
+        self.mtime_ns
+    }
+
+    pub(crate) const fn size_bytes(self) -> i64 {
+        self.size_bytes
+    }
+}
+
+/// Complete fingerprint computed from one already-read source buffer.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourceFingerprint {
+    fast: ModelSourceFastFingerprint,
+    content_sha256: String,
+}
+
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+impl ModelSourceFingerprint {
+    pub(crate) fn from_content(fast: ModelSourceFastFingerprint, content: &[u8]) -> Self {
+        Self {
+            fast,
+            content_sha256: model_source_content_sha256(content),
+        }
+    }
+
+    pub(crate) const fn fast(&self) -> ModelSourceFastFingerprint {
+        self.fast
+    }
+
+    pub(crate) fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+}
+
+/// Last successfully parsed ownership and activity metadata retained on error.
+#[allow(dead_code)] // T010/T029 consume persisted source inventory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourceLastGoodMetadata {
+    pub(crate) source_session_id: Option<String>,
+    pub(crate) analytics_session_id: Option<String>,
+    pub(crate) chain_id: Option<String>,
+    pub(crate) parent_chain_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) is_sidechain: bool,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) first_activity_at_ms: Option<i64>,
+    pub(crate) last_activity_at_ms: Option<i64>,
+    pub(crate) observation_count: i64,
+    pub(crate) last_success_at_ms: Option<i64>,
+}
+
+/// Root-owned persisted state for one model transcript source.
+#[allow(dead_code)] // T010/T029 consume persisted source inventory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredModelSource {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: String,
+    pub(crate) source_root_key: String,
+    pub(crate) source_path: PathBuf,
+    pub(crate) fast_fingerprint: Option<ModelSourceFastFingerprint>,
+    pub(crate) content_sha256: Option<String>,
+    pub(crate) processing_status: SourceProcessingStatus,
+    pub(crate) last_error: Option<ModelUsageDiagnostic>,
+    pub(crate) suppressed_sha256: Option<String>,
+    pub(crate) suppressed_at_ms: Option<i64>,
+    pub(crate) seen_generation: i64,
+    pub(crate) last_attempt_at_ms: Option<i64>,
+    pub(crate) last_good: ModelSourceLastGoodMetadata,
+}
+
+/// Result of staged fast-fingerprint and content-hash comparison.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSourceChange {
+    FastUnchanged,
+    ContentHashRequired,
+    ContentUnchanged,
+    ContentChanged,
+    SuppressedUnchanged,
+    SuppressedChanged,
+}
+
+/// Post-commit result used by T010 to decide whether to emit an update event.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSourceReplacementOutcome {
+    Replaced,
+    SuppressedUnchanged,
+}
+
+/// Post-commit result used by T010 to decide whether to emit an update event.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourceReplacementResult {
+    pub(crate) outcome: ModelSourceReplacementOutcome,
+    pub(crate) data_changed: bool,
+    pub(crate) observation_count: i64,
+}
+
+/// Post-commit result for one completed root's absence pruning.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourcePruneResult {
+    pub(crate) data_changed: bool,
+    pub(crate) sources_pruned: usize,
+}
+
+/// Post-commit result for an existing data-management mutation that also
+/// changes model analytics. The IPC wrappers keep their historical `u64`
+/// response while using `model_data_changed` to publish a committed refresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DataMutationResult {
+    affected_rows: u64,
+    model_data_changed: bool,
+}
+
+impl DataMutationResult {
+    pub(crate) const fn affected_rows(self) -> u64 {
+        self.affected_rows
+    }
+
+    pub(crate) const fn model_data_changed(self) -> bool {
+        self.model_data_changed
+    }
 }
 
 /// Sub-agent attribution triple carried alongside a tool action row.
@@ -1109,8 +1272,1235 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+const MODEL_SOURCE_STATE_COLUMNS: &str = "
+    source_key, source_root_key, source_path,
+    source_session_id, analytics_session_id, chain_id,
+    parent_chain_id, agent_id, is_sidechain, cwd, hostname,
+    first_activity_at_ms, last_activity_at_ms, mtime_ns, size_bytes,
+    content_sha256, last_error, suppressed_sha256, suppressed_at_ms,
+    seen_generation, processing_status, observation_count,
+    last_attempt_at_ms, last_success_at_ms";
+
+struct RawStoredModelSource {
+    source_key: String,
+    source_root_key: String,
+    source_path: String,
+    source_session_id: Option<String>,
+    analytics_session_id: Option<String>,
+    chain_id: Option<String>,
+    parent_chain_id: Option<String>,
+    agent_id: Option<String>,
+    is_sidechain: i64,
+    cwd: Option<String>,
+    hostname: Option<String>,
+    first_activity_at_ms: Option<i64>,
+    last_activity_at_ms: Option<i64>,
+    mtime_ns: Option<i64>,
+    size_bytes: Option<i64>,
+    content_sha256: Option<String>,
+    last_error: Option<String>,
+    suppressed_sha256: Option<String>,
+    suppressed_at_ms: Option<i64>,
+    seen_generation: i64,
+    processing_status: String,
+    observation_count: i64,
+    last_attempt_at_ms: Option<i64>,
+    last_success_at_ms: Option<i64>,
+}
+
+struct PreparedModelObservation<'a> {
+    observation: &'a NormalizedObservation,
+    source_ordinal: i64,
+    cwd: Option<String>,
+}
+
+struct CurrentModelSourceSuppression {
+    processing_status: String,
+    suppressed_sha256: Option<String>,
+    content_sha256: Option<String>,
+    last_success_at_ms: Option<i64>,
+    observation_count: i64,
+    has_observations: bool,
+}
+
+/// Convert already-fetched filesystem metadata into an exact SQLite-safe
+/// nanosecond mtime and byte size without performing another stat.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+pub(crate) fn model_source_fast_fingerprint(
+    path: &Path,
+    metadata: &Metadata,
+) -> Result<ModelSourceFastFingerprint, String> {
+    let modified = metadata.modified().map_err(|error| {
+        format!(
+            "Read model source modification time for {}: {error}",
+            path.display()
+        )
+    })?;
+    let elapsed = modified.duration_since(UNIX_EPOCH).map_err(|error| {
+        format!(
+            "Model source modification time predates Unix epoch for {}: {error}",
+            path.display()
+        )
+    })?;
+    let mtime_ns = i64::try_from(elapsed.as_nanos()).map_err(|_| {
+        format!(
+            "Model source modification time exceeds SQLite INTEGER range for {}",
+            path.display()
+        )
+    })?;
+    let size_bytes = i64::try_from(metadata.len()).map_err(|_| {
+        format!(
+            "Model source size exceeds SQLite INTEGER range for {}",
+            path.display()
+        )
+    })?;
+
+    Ok(ModelSourceFastFingerprint {
+        mtime_ns,
+        size_bytes,
+    })
+}
+
+/// Hash the same complete source bytes that parsing will consume.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+pub(crate) fn model_source_content_sha256(content: &[u8]) -> String {
+    hex::encode(Sha256::digest(content))
+}
+
+/// Classify one source in two stages: callers omit `content_sha256` before
+/// reading, then call again with the hash of those exact bytes when required.
+#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+pub(crate) fn classify_model_source_change(
+    existing: Option<&StoredModelSource>,
+    fast: ModelSourceFastFingerprint,
+    content_sha256: Option<&str>,
+) -> ModelSourceChange {
+    let Some(existing) = existing else {
+        return if content_sha256.is_some() {
+            ModelSourceChange::ContentChanged
+        } else {
+            ModelSourceChange::ContentHashRequired
+        };
+    };
+
+    let is_suppressed = existing.processing_status == SourceProcessingStatus::Suppressed
+        || existing.suppressed_sha256.is_some();
+    if !is_suppressed
+        && existing.processing_status == SourceProcessingStatus::Ok
+        && existing.fast_fingerprint == Some(fast)
+    {
+        return ModelSourceChange::FastUnchanged;
+    }
+
+    let Some(content_sha256) = content_sha256 else {
+        return ModelSourceChange::ContentHashRequired;
+    };
+
+    if is_suppressed {
+        return if existing.suppressed_sha256.as_deref() == Some(content_sha256) {
+            ModelSourceChange::SuppressedUnchanged
+        } else {
+            ModelSourceChange::SuppressedChanged
+        };
+    }
+
+    if existing.content_sha256.as_deref() == Some(content_sha256) {
+        ModelSourceChange::ContentUnchanged
+    } else {
+        ModelSourceChange::ContentChanged
+    }
+}
+
+fn read_raw_model_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawStoredModelSource> {
+    Ok(RawStoredModelSource {
+        source_key: row.get(0)?,
+        source_root_key: row.get(1)?,
+        source_path: row.get(2)?,
+        source_session_id: row.get(3)?,
+        analytics_session_id: row.get(4)?,
+        chain_id: row.get(5)?,
+        parent_chain_id: row.get(6)?,
+        agent_id: row.get(7)?,
+        is_sidechain: row.get(8)?,
+        cwd: row.get(9)?,
+        hostname: row.get(10)?,
+        first_activity_at_ms: row.get(11)?,
+        last_activity_at_ms: row.get(12)?,
+        mtime_ns: row.get(13)?,
+        size_bytes: row.get(14)?,
+        content_sha256: row.get(15)?,
+        last_error: row.get(16)?,
+        suppressed_sha256: row.get(17)?,
+        suppressed_at_ms: row.get(18)?,
+        seen_generation: row.get(19)?,
+        processing_status: row.get(20)?,
+        observation_count: row.get(21)?,
+        last_attempt_at_ms: row.get(22)?,
+        last_success_at_ms: row.get(23)?,
+    })
+}
+
+fn stored_model_source_from_raw(
+    provider: IntegrationProvider,
+    row: RawStoredModelSource,
+) -> Result<StoredModelSource, String> {
+    let fast_fingerprint = match (row.mtime_ns, row.size_bytes) {
+        (Some(mtime_ns), Some(size_bytes)) => {
+            validate_nonnegative_model_source_value(mtime_ns, "mtime_ns")?;
+            validate_nonnegative_model_source_value(size_bytes, "size_bytes")?;
+            Some(ModelSourceFastFingerprint {
+                mtime_ns,
+                size_bytes,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(format!(
+                "Model source {} has an incomplete fast fingerprint",
+                row.source_key
+            ));
+        }
+    };
+    let is_sidechain = match row.is_sidechain {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(format!(
+                "Model source {} has invalid is_sidechain value {value}",
+                row.source_key
+            ));
+        }
+    };
+    let processing_status = SourceProcessingStatus::try_from(row.processing_status.as_str())
+        .map_err(|error| format!("Model source {} {error}", row.source_key))?;
+    validate_nonnegative_model_source_value(row.seen_generation, "seen_generation")?;
+    validate_nonnegative_model_source_value(row.observation_count, "observation_count")?;
+    validate_optional_model_source_value(row.first_activity_at_ms, "first_activity_at_ms")?;
+    validate_optional_model_source_value(row.last_activity_at_ms, "last_activity_at_ms")?;
+    validate_optional_model_source_value(row.suppressed_at_ms, "suppressed_at_ms")?;
+    validate_optional_model_source_value(row.last_attempt_at_ms, "last_attempt_at_ms")?;
+    validate_optional_model_source_value(row.last_success_at_ms, "last_success_at_ms")?;
+    if let (Some(first), Some(last)) = (row.first_activity_at_ms, row.last_activity_at_ms)
+        && first > last
+    {
+        return Err(format!(
+            "Model source {} first activity exceeds last activity",
+            row.source_key
+        ));
+    }
+    let source_path = model_source_path_from_storage(&row.source_path)?;
+
+    Ok(StoredModelSource {
+        provider,
+        source_key: row.source_key,
+        source_root_key: row.source_root_key,
+        source_path,
+        fast_fingerprint,
+        content_sha256: row.content_sha256,
+        processing_status,
+        last_error: row
+            .last_error
+            .map(|message| ModelUsageDiagnostic::from_user_safe_message(&message)),
+        suppressed_sha256: row.suppressed_sha256,
+        suppressed_at_ms: row.suppressed_at_ms,
+        seen_generation: row.seen_generation,
+        last_attempt_at_ms: row.last_attempt_at_ms,
+        last_good: ModelSourceLastGoodMetadata {
+            source_session_id: row.source_session_id,
+            analytics_session_id: row.analytics_session_id,
+            chain_id: row.chain_id,
+            parent_chain_id: row.parent_chain_id,
+            agent_id: row.agent_id,
+            is_sidechain,
+            cwd: row.cwd.map(PathBuf::from),
+            hostname: row.hostname,
+            first_activity_at_ms: row.first_activity_at_ms,
+            last_activity_at_ms: row.last_activity_at_ms,
+            observation_count: row.observation_count,
+            last_success_at_ms: row.last_success_at_ms,
+        },
+    })
+}
+
+fn validate_nonnegative_model_source_value(value: i64, field: &str) -> Result<(), String> {
+    if value < 0 {
+        Err(format!("Model source {field} cannot be negative: {value}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_optional_model_source_value(value: Option<i64>, field: &str) -> Result<(), String> {
+    if let Some(value) = value {
+        validate_nonnegative_model_source_value(value, field)?;
+    }
+    Ok(())
+}
+
+fn model_source_path_for_storage(path: &Path) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        Ok(format!(
+            "{MODEL_SOURCE_PATH_UNIX_PREFIX}{}",
+            hex::encode(path.as_os_str().as_bytes())
+        ))
+    }
+
+    #[cfg(windows)]
+    {
+        let bytes = path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<_>>();
+        Ok(format!(
+            "{MODEL_SOURCE_PATH_WINDOWS_PREFIX}{}",
+            hex::encode(bytes)
+        ))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let value = path
+            .to_str()
+            .ok_or_else(|| "Model source path is not valid Unicode".to_string())?;
+        Ok(format!("{MODEL_SOURCE_PATH_UNICODE_PREFIX}{value}"))
+    }
+}
+
+fn model_source_path_from_storage(value: &str) -> Result<PathBuf, String> {
+    if let Some(encoded) = value.strip_prefix(MODEL_SOURCE_PATH_UNIX_PREFIX) {
+        #[cfg(unix)]
+        {
+            let bytes = hex::decode(encoded)
+                .map_err(|error| format!("Decode Unix model source path: {error}"))?;
+            return Ok(PathBuf::from(OsString::from_vec(bytes)));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = encoded;
+            return Err("Cannot decode a Unix model source path on this platform".to_string());
+        }
+    }
+
+    if let Some(encoded) = value.strip_prefix(MODEL_SOURCE_PATH_WINDOWS_PREFIX) {
+        #[cfg(windows)]
+        {
+            let bytes = hex::decode(encoded)
+                .map_err(|error| format!("Decode Windows model source path: {error}"))?;
+            let mut chunks = bytes.chunks_exact(2);
+            let wide = chunks
+                .by_ref()
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            if !chunks.remainder().is_empty() {
+                return Err("Decode Windows model source path: odd UTF-16 byte count".to_string());
+            }
+            return Ok(PathBuf::from(OsString::from_wide(&wide)));
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = encoded;
+            return Err("Cannot decode a Windows model source path on this platform".to_string());
+        }
+    }
+
+    if let Some(value) = value.strip_prefix(MODEL_SOURCE_PATH_UNICODE_PREFIX) {
+        return Ok(PathBuf::from(value));
+    }
+
+    // Migration-28 rows written before exact path encoding used plain Unicode.
+    Ok(PathBuf::from(value))
+}
+
+fn model_source_cwd_for_storage(path: &Path) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "Model source cwd is not valid Unicode".to_string())
+}
+
+fn validate_normalized_model_source(source: &NormalizedSource) -> Result<(), String> {
+    if source.source_key.is_empty() {
+        return Err("Model source key cannot be empty".to_string());
+    }
+    if source.source_root_key.is_empty() {
+        return Err("Model source root key cannot be empty".to_string());
+    }
+
+    validate_nonnegative_model_source_value(source.seen_generation, "seen_generation")?;
+    validate_nonnegative_model_source_value(source.observation_count, "observation_count")?;
+    validate_optional_model_source_value(source.first_activity_at_ms, "first_activity_at_ms")?;
+    validate_optional_model_source_value(source.last_activity_at_ms, "last_activity_at_ms")?;
+    validate_optional_model_source_value(source.mtime_ns, "mtime_ns")?;
+    validate_optional_model_source_value(source.size_bytes, "size_bytes")?;
+    validate_optional_model_source_value(source.suppressed_at_ms, "suppressed_at_ms")?;
+    validate_optional_model_source_value(source.last_attempt_at_ms, "last_attempt_at_ms")?;
+    validate_optional_model_source_value(source.last_success_at_ms, "last_success_at_ms")?;
+
+    if let (Some(first), Some(last)) = (source.first_activity_at_ms, source.last_activity_at_ms)
+        && first > last
+    {
+        return Err(format!(
+            "Model source first_activity_at_ms {first} exceeds last_activity_at_ms {last}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_model_source_fingerprint(
+    source: &NormalizedSource,
+    fingerprint: &ModelSourceFingerprint,
+) -> Result<(), String> {
+    let fast = fingerprint.fast();
+    if source
+        .mtime_ns
+        .is_some_and(|value| value != fast.mtime_ns())
+    {
+        return Err("Normalized source mtime does not match replacement fingerprint".to_string());
+    }
+    if source
+        .size_bytes
+        .is_some_and(|value| value != fast.size_bytes())
+    {
+        return Err("Normalized source size does not match replacement fingerprint".to_string());
+    }
+    if source
+        .content_sha256
+        .as_deref()
+        .is_some_and(|value| value != fingerprint.content_sha256())
+    {
+        return Err("Normalized source hash does not match replacement fingerprint".to_string());
+    }
+
+    Ok(())
+}
+
+fn prepare_model_observations<'a>(
+    source: &NormalizedSource,
+    observations: &'a [NormalizedObservation],
+) -> Result<Vec<PreparedModelObservation<'a>>, String> {
+    let observation_count = i64::try_from(observations.len())
+        .map_err(|_| "Model source observation count exceeds SQLite INTEGER range".to_string())?;
+    if source.observation_count != observation_count {
+        return Err(format!(
+            "Normalized source observation_count {} does not match parsed count {observation_count}",
+            source.observation_count
+        ));
+    }
+
+    observations
+        .iter()
+        .map(|observation| {
+            let metadata = observation.metadata();
+            if metadata.provider != source.provider {
+                return Err(format!(
+                    "Model observation provider {} does not match source provider {}",
+                    metadata.provider.as_str(),
+                    source.provider.as_str()
+                ));
+            }
+            if metadata.source_key != source.source_key {
+                return Err(format!(
+                    "Model observation source key {} does not match source key {}",
+                    metadata.source_key, source.source_key
+                ));
+            }
+            validate_nonnegative_model_source_value(
+                metadata.observed_at_ms,
+                "observation observed_at_ms",
+            )?;
+            let source_ordinal = i64::try_from(metadata.source_ordinal).map_err(|_| {
+                format!(
+                    "Model observation source ordinal {} exceeds SQLite INTEGER range",
+                    metadata.source_ordinal
+                )
+            })?;
+
+            Ok(PreparedModelObservation {
+                observation,
+                source_ordinal,
+                cwd: metadata
+                    .cwd
+                    .as_deref()
+                    .map(model_source_cwd_for_storage)
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// Delete every stale source owned by one completed root and its children.
+///
+/// Migration 28 deliberately does not enable connection-wide foreign keys,
+/// so source pruning must preserve child-first ordering explicitly.
+/// Accepting an existing transaction keeps both deletes in the caller's
+/// atomic pruning operation.
+fn delete_model_observation_sources_for_root_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_root_key: &str,
+    generation: i64,
+) -> Result<usize, String> {
+    tx.execute(
+        "DELETE FROM model_usage_observations
+         WHERE provider = ?1
+           AND source_key IN (
+               SELECT source_key
+               FROM model_observation_sources
+               WHERE provider = ?1
+                 AND source_root_key = ?2
+                 AND seen_generation < ?3
+           )",
+        params![provider, source_root_key, generation],
+    )
+    .map_err(|e| format!("Delete completed-root model observation children: {e}"))?;
+
+    tx.execute(
+        "DELETE FROM model_observation_sources
+         WHERE provider = ?1
+           AND source_root_key = ?2
+           AND seen_generation < ?3",
+        params![provider, source_root_key, generation],
+    )
+    .map_err(|e| format!("Delete completed-root model observation parents: {e}"))
+}
+
+/// Remove every model source owned by a project context, including sources
+/// whose retained first cwd differs from a later observation cwd.
+///
+/// The matching keys are captured before any child deletion. Each selected
+/// source then loses all observation children before its retained fingerprint
+/// is suppressed, preserving source-level replacement atomicity.
+fn suppress_project_model_sources_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    cwd: &str,
+    suppressed_at_ms: i64,
+) -> Result<(usize, usize), String> {
+    let matching_sources = {
+        let mut stmt = tx
+            .prepare_cached(
+                "SELECT provider, source_key
+                 FROM model_observation_sources
+                 WHERE cwd = ?1
+                 UNION
+                 SELECT source.provider, source.source_key
+                 FROM model_usage_observations observation
+                 JOIN model_observation_sources source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE observation.cwd = ?1
+                 ORDER BY provider, source_key",
+            )
+            .map_err(|e| format!("Prepare project model source selection: {e}"))?;
+        let rows = stmt
+            .query_map(params![cwd], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("Query project model source selection: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Read project model source selection: {e}"))?
+    };
+
+    let mut observations_deleted = 0_usize;
+    let mut sources_suppressed = 0_usize;
+    {
+        let mut delete_observations = tx
+            .prepare_cached(
+                "DELETE FROM model_usage_observations
+                 WHERE provider = ?1 AND source_key = ?2",
+            )
+            .map_err(|e| format!("Prepare project model observation delete: {e}"))?;
+        let mut suppress_source = tx
+            .prepare_cached(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed',
+                     suppressed_sha256 = COALESCE(
+                         suppressed_sha256, content_sha256
+                     ),
+                     suppressed_at_ms = COALESCE(suppressed_at_ms, ?3)
+                 WHERE provider = ?1
+                   AND source_key = ?2
+                   AND (
+                       processing_status != 'suppressed'
+                       OR suppressed_at_ms IS NULL
+                       OR (suppressed_sha256 IS NULL
+                           AND content_sha256 IS NOT NULL)
+                   )",
+            )
+            .map_err(|e| format!("Prepare project model source suppression: {e}"))?;
+
+        for (provider, source_key) in matching_sources {
+            observations_deleted = observations_deleted.saturating_add(
+                delete_observations
+                    .execute(params![provider, source_key])
+                    .map_err(|e| format!("Delete project model observations: {e}"))?,
+            );
+            sources_suppressed = sources_suppressed.saturating_add(
+                suppress_source
+                    .execute(params![provider, source_key, suppressed_at_ms])
+                    .map_err(|e| format!("Suppress project model source: {e}"))?,
+            );
+        }
+    }
+
+    Ok((observations_deleted, sources_suppressed))
+}
+
+fn model_backfill_millis_to_rfc3339(value: i64, field: &str) -> Result<String, String> {
+    DateTime::<Utc>::from_timestamp_millis(value)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .ok_or_else(|| format!("Invalid model backfill {field}: {value}"))
+}
+
+fn optional_model_backfill_millis_to_rfc3339(
+    value: Option<i64>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    value
+        .map(|millis| model_backfill_millis_to_rfc3339(millis, field))
+        .transpose()
+}
+
+struct ModelBackfillStatusRow {
+    generation: i64,
+    trigger: String,
+    status: String,
+    total_roots: i64,
+    completed_roots: i64,
+    failed_roots: i64,
+    inventory_complete: i64,
+    total_sources: i64,
+    processed_sources: i64,
+    failed_sources: i64,
+    skipped_sources: i64,
+    remaining_sources: i64,
+    observations_written: i64,
+    started_at_ms: Option<i64>,
+    updated_at_ms: i64,
+    finished_at_ms: Option<i64>,
+    last_error: Option<String>,
+}
+
+fn model_backfill_count(value: usize, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("Model backfill {field} exceeds SQLite INTEGER range"))
+}
+
+fn checked_model_backfill_sum(left: i64, right: i64, field: &str) -> Result<i64, String> {
+    left.checked_add(right)
+        .ok_or_else(|| format!("Model backfill {field} exceeds SQLite INTEGER range"))
+}
+
+fn require_running_model_backfill(status: &ModelBackfillStatus) -> Result<(), String> {
+    if status.status == ModelBackfillState::Running {
+        Ok(())
+    } else {
+        Err(format!(
+            "Model backfill is {}, not running",
+            status.status.as_str()
+        ))
+    }
+}
+
+struct ModelAnalyticsAggregateRow {
+    scoped_session_count: i64,
+    scoped_evidence_count: i64,
+    total_tokens: i64,
+    attributed_tokens: i64,
+    distinct_models: i64,
+    multi_model_sessions: i64,
+}
+
+struct ModelUsageAggregateRow {
+    provider: String,
+    raw_model_id: String,
+    attributed_tokens: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_creation_tokens: i64,
+    cache_read_tokens: i64,
+    observed_turns: i64,
+    session_count: i64,
+    incomplete_cache_share_rows: i64,
+    first_seen_ms: i64,
+    last_seen_ms: i64,
+}
+
+struct ModelHistoryAggregateRow {
+    bucket_index: i64,
+    attributed_tokens: i64,
+    unattributed_tokens: i64,
+    selected_model_tokens: i64,
+}
+
+const MODEL_SESSIONS_DEFAULT_LIMIT: usize = 20;
+const MODEL_SESSIONS_MAX_LIMIT: usize = 100;
+const MODEL_SESSIONS_CURSOR_PREFIX: &str = "quill-model-sessions-v1";
+const MODEL_SESSIONS_CURSOR_MAX_BYTES: usize = 16_384;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelSessionsCursorV1 {
+    range: String,
+    model_provider: String,
+    model_id: String,
+    data_revision: i64,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    last_activity_ms: i64,
+    provider: String,
+    session_id: String,
+}
+
+struct ModelSessionAggregateRow {
+    provider: String,
+    session_id: String,
+    cwd: Option<String>,
+    hostname: Option<String>,
+    selected_model_tokens: i64,
+    selected_model_turns: i64,
+    last_activity_ms: i64,
+    primary_model_provider: String,
+    primary_model_id: String,
+    distinct_models: i64,
+    has_within_chain_switches: bool,
+    chain_count: i64,
+}
+
+struct SessionModelObservationRow {
+    chain_id: String,
+    parent_chain_id: Option<String>,
+    agent_id: Option<String>,
+    is_sidechain: bool,
+    observed_at_ms: i64,
+    observation_kind: String,
+    raw_model_id: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    effective_cwd: Option<String>,
+}
+
+#[derive(Default)]
+struct SessionModelStats {
+    attributed_tokens: i64,
+    turn_count: i64,
+}
+
+enum SessionModelSegmentAccumulator {
+    Model {
+        model_id: String,
+        started_at_ms: i64,
+        ended_at_ms: i64,
+        turn_count: i64,
+        attributed_tokens: i64,
+    },
+    ModelGap {
+        started_at_ms: i64,
+        ended_at_ms: i64,
+        turn_count: i64,
+    },
+}
+
+struct SessionModelChainAccumulator {
+    chain_id: String,
+    parent_chain_id: Option<String>,
+    agent_id: Option<String>,
+    is_sidechain: bool,
+    first_activity_at_ms: i64,
+    switch_count: i64,
+    attributed_tokens: i64,
+    unattributed_tokens: i64,
+    segments: Vec<SessionModelSegmentAccumulator>,
+}
+
+impl SessionModelChainAccumulator {
+    fn new(row: &SessionModelObservationRow) -> Self {
+        Self {
+            chain_id: row.chain_id.clone(),
+            parent_chain_id: row.parent_chain_id.clone(),
+            agent_id: row.agent_id.clone(),
+            is_sidechain: row.is_sidechain,
+            first_activity_at_ms: row.observed_at_ms,
+            switch_count: 0,
+            attributed_tokens: 0,
+            unattributed_tokens: 0,
+            segments: Vec::new(),
+        }
+    }
+
+    fn merge_metadata(&mut self, row: &SessionModelObservationRow) -> Result<(), String> {
+        if self.is_sidechain != row.is_sidechain {
+            return Err(format!(
+                "Model history chain {} mixes parent and subagent observations",
+                self.chain_id
+            ));
+        }
+        merge_consistent_chain_metadata(
+            &mut self.parent_chain_id,
+            row.parent_chain_id.as_deref(),
+            &self.chain_id,
+            "parent chain",
+        )?;
+        merge_consistent_chain_metadata(
+            &mut self.agent_id,
+            row.agent_id.as_deref(),
+            &self.chain_id,
+            "agent",
+        )?;
+        Ok(())
+    }
+
+    fn add_tokens(
+        &mut self,
+        raw_model_id: Option<&str>,
+        token_amount: Option<i64>,
+    ) -> Result<(), String> {
+        let Some(token_amount) = token_amount else {
+            return Ok(());
+        };
+        let total = if raw_model_id.is_some() {
+            &mut self.attributed_tokens
+        } else {
+            &mut self.unattributed_tokens
+        };
+        checked_add_session_model_value(total, token_amount, "chain token total")
+    }
+
+    fn add_turn(
+        &mut self,
+        raw_model_id: Option<&str>,
+        token_amount: Option<i64>,
+        observed_at_ms: i64,
+    ) -> Result<(), String> {
+        match raw_model_id {
+            Some(model_id) => {
+                if let Some(last_segment) = self.segments.last_mut() {
+                    match last_segment {
+                        SessionModelSegmentAccumulator::Model {
+                            model_id: previous_model_id,
+                            ended_at_ms,
+                            turn_count,
+                            attributed_tokens,
+                            ..
+                        } if previous_model_id == model_id => {
+                            *ended_at_ms = observed_at_ms;
+                            checked_add_session_model_value(turn_count, 1, "segment turn count")?;
+                            checked_add_session_model_value(
+                                attributed_tokens,
+                                token_amount.unwrap_or(0),
+                                "segment attributed tokens",
+                            )?;
+                            return Ok(());
+                        }
+                        SessionModelSegmentAccumulator::Model { .. } => {
+                            checked_add_session_model_value(
+                                &mut self.switch_count,
+                                1,
+                                "chain switch count",
+                            )?;
+                        }
+                        SessionModelSegmentAccumulator::ModelGap { .. } => {}
+                    }
+                }
+                self.segments.push(SessionModelSegmentAccumulator::Model {
+                    model_id: model_id.to_owned(),
+                    started_at_ms: observed_at_ms,
+                    ended_at_ms: observed_at_ms,
+                    turn_count: 1,
+                    attributed_tokens: token_amount.unwrap_or(0),
+                });
+            }
+            None => {
+                if let Some(SessionModelSegmentAccumulator::ModelGap {
+                    ended_at_ms,
+                    turn_count,
+                    ..
+                }) = self.segments.last_mut()
+                {
+                    *ended_at_ms = observed_at_ms;
+                    checked_add_session_model_value(turn_count, 1, "gap turn count")?;
+                    return Ok(());
+                }
+                self.segments
+                    .push(SessionModelSegmentAccumulator::ModelGap {
+                        started_at_ms: observed_at_ms,
+                        ended_at_ms: observed_at_ms,
+                        turn_count: 1,
+                    });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Missing detail is intentionally separate from storage failure so T040 can
+/// map a stale selected-session row to the stable `not_found` IPC envelope.
+#[derive(Debug)]
+pub(crate) enum SessionModelHistoryQueryError {
+    NotFound,
+    Storage(String),
+}
+
+impl std::fmt::Display for SessionModelHistoryQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("Model session history was not found"),
+            Self::Storage(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SessionModelHistoryQueryError {}
+
+impl From<String> for SessionModelHistoryQueryError {
+    fn from(message: String) -> Self {
+        Self::Storage(message)
+    }
+}
+
+fn merge_consistent_chain_metadata(
+    current: &mut Option<String>,
+    candidate: Option<&str>,
+    chain_id: &str,
+    field: &str,
+) -> Result<(), String> {
+    let Some(candidate) = candidate else {
+        return Ok(());
+    };
+    match current {
+        Some(current) if current != candidate => Err(format!(
+            "Model history chain {chain_id} has conflicting {field} metadata"
+        )),
+        Some(_) => Ok(()),
+        None => {
+            *current = Some(candidate.to_owned());
+            Ok(())
+        }
+    }
+}
+
+fn checked_add_session_model_value(
+    total: &mut i64,
+    amount: i64,
+    field: &str,
+) -> Result<(), String> {
+    if amount < 0 {
+        return Err(format!("Model history {field} cannot be negative"));
+    }
+    *total = total
+        .checked_add(amount)
+        .ok_or_else(|| format!("Model history {field} exceeds SQLite INTEGER range"))?;
+    Ok(())
+}
+
+fn session_model_observation_token_amount(
+    row: &SessionModelObservationRow,
+) -> Result<Option<i64>, String> {
+    let dimensions = [
+        row.input_tokens,
+        row.output_tokens,
+        row.cache_creation_tokens,
+        row.cache_read_tokens,
+    ];
+    if dimensions.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+
+    let mut total = 0_i64;
+    for amount in dimensions.into_iter().flatten() {
+        checked_add_session_model_value(&mut total, amount, "observation token amount")?;
+    }
+    Ok(Some(total))
+}
+
+/// Storage failures remain distinct from client-owned cursor failures so T040
+/// can preserve the shared `invalid_cursor` versus `storage_error` IPC contract.
+#[derive(Debug)]
+pub(crate) enum ModelSessionsQueryError {
+    InvalidCursor(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for ModelSessionsQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCursor(message) | Self::Storage(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ModelSessionsQueryError {}
+
+impl From<String> for ModelSessionsQueryError {
+    fn from(message: String) -> Self {
+        Self::Storage(message)
+    }
+}
+
+fn invalid_model_sessions_cursor(message: impl Into<String>) -> ModelSessionsQueryError {
+    ModelSessionsQueryError::InvalidCursor(message.into())
+}
+
+fn encode_model_sessions_cursor(cursor: &ModelSessionsCursorV1) -> Result<String, String> {
+    let payload = serde_json::to_vec(cursor)
+        .map_err(|error| format!("Serialize model sessions cursor: {error}"))?;
+    let checksum = Sha256::digest(&payload);
+    Ok(format!(
+        "{MODEL_SESSIONS_CURSOR_PREFIX}:{}:{}",
+        hex::encode(payload),
+        hex::encode(checksum)
+    ))
+}
+
+fn decode_model_sessions_cursor(
+    encoded: &str,
+    range: ModelRange,
+    identity: &ModelIdentity,
+) -> Result<ModelSessionsCursorV1, ModelSessionsQueryError> {
+    if encoded.is_empty() || encoded.len() > MODEL_SESSIONS_CURSOR_MAX_BYTES {
+        return Err(invalid_model_sessions_cursor(
+            "Model sessions cursor has an invalid length",
+        ));
+    }
+
+    let mut parts = encoded.split(':');
+    let prefix = parts.next();
+    let payload_hex = parts.next();
+    let checksum = parts.next();
+    if prefix != Some(MODEL_SESSIONS_CURSOR_PREFIX)
+        || payload_hex.is_none()
+        || checksum.is_none()
+        || parts.next().is_some()
+    {
+        return Err(invalid_model_sessions_cursor(
+            "Model sessions cursor has an invalid envelope",
+        ));
+    }
+
+    let payload = hex::decode(payload_hex.unwrap_or_default()).map_err(|_| {
+        invalid_model_sessions_cursor("Model sessions cursor payload is not valid hex")
+    })?;
+    let expected_checksum = hex::decode(checksum.unwrap_or_default()).map_err(|_| {
+        invalid_model_sessions_cursor("Model sessions cursor checksum is not valid hex")
+    })?;
+    let actual_checksum = Sha256::digest(&payload);
+    if expected_checksum.as_slice() != actual_checksum.as_slice() {
+        return Err(invalid_model_sessions_cursor(
+            "Model sessions cursor checksum does not match",
+        ));
+    }
+
+    let cursor: ModelSessionsCursorV1 = serde_json::from_slice(&payload)
+        .map_err(|_| invalid_model_sessions_cursor("Model sessions cursor payload is not valid"))?;
+    if cursor.range != range.as_str()
+        || cursor.model_provider != identity.provider
+        || cursor.model_id != identity.model_id
+    {
+        return Err(invalid_model_sessions_cursor(
+            "Model sessions cursor belongs to a different request",
+        ));
+    }
+
+    let expected_start = cursor
+        .range_end_ms
+        .checked_sub(model_range_duration(range).num_milliseconds())
+        .ok_or_else(|| {
+            invalid_model_sessions_cursor("Model sessions cursor range boundary overflowed")
+        })?;
+    if cursor.range_start_ms != expected_start
+        || cursor.data_revision < 0
+        || cursor.range_start_ms < 0
+        || cursor.range_end_ms <= cursor.range_start_ms
+        || cursor.last_activity_ms < cursor.range_start_ms
+        || cursor.last_activity_ms >= cursor.range_end_ms
+        || cursor.provider != identity.provider
+        || cursor.provider.is_empty()
+        || cursor.session_id.is_empty()
+    {
+        return Err(invalid_model_sessions_cursor(
+            "Model sessions cursor contains invalid boundaries",
+        ));
+    }
+
+    Ok(cursor)
+}
+
+fn model_session_display_name(cwd: Option<&str>, session_id: &str) -> String {
+    cwd.filter(|value| !value.is_empty())
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(session_id)
+        .to_owned()
+}
+
+fn read_model_data_revision(conn: &Connection) -> Result<i64, String> {
+    let value = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![MODEL_DATA_REVISION_SETTINGS_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Read model analytics data revision: {error}"))?;
+    let revision = value
+        .as_deref()
+        .unwrap_or("0")
+        .parse::<i64>()
+        .map_err(|_| "Model analytics data revision is invalid".to_string())?;
+    if revision < 0 {
+        return Err("Model analytics data revision cannot be negative".to_string());
+    }
+    Ok(revision)
+}
+
+/// Advance the persisted revision in the same transaction as every mutation
+/// that can change a model query result. Cursor readers use it as an optimistic
+/// snapshot guard rather than pretending mutable SQLite rows have an ID
+/// high-water snapshot.
+fn bump_model_data_revision(conn: &Connection) -> Result<i64, String> {
+    let revision = read_model_data_revision(conn)?;
+    let next_revision = revision
+        .checked_add(1)
+        .ok_or_else(|| "Model analytics data revision overflow".to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![MODEL_DATA_REVISION_SETTINGS_KEY, next_revision.to_string()],
+    )
+    .map_err(|error| format!("Advance model analytics data revision: {error}"))?;
+    Ok(next_revision)
+}
+
+fn model_range_duration(range: ModelRange) -> TimeDelta {
+    match range {
+        ModelRange::OneHour => TimeDelta::hours(1),
+        ModelRange::TwentyFourHours => TimeDelta::hours(24),
+        ModelRange::SevenDays => TimeDelta::days(7),
+        ModelRange::ThirtyDays => TimeDelta::days(30),
+    }
+}
+
+fn model_history_bucket_seconds(range: ModelRange) -> i64 {
+    match range {
+        ModelRange::OneHour => 5 * 60,
+        ModelRange::TwentyFourHours => 60 * 60,
+        ModelRange::SevenDays => 6 * 60 * 60,
+        ModelRange::ThirtyDays => 24 * 60 * 60,
+    }
+}
+
+fn model_observation_millis_to_rfc3339(value: i64, field: &str) -> Result<String, String> {
+    DateTime::<Utc>::from_timestamp_millis(value)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .ok_or_else(|| format!("Invalid model observation {field}: {value}"))
+}
+
+fn model_percentage(numerator: i64, denominator: i64) -> Option<f64> {
+    (denominator > 0).then(|| 100.0 * numerator as f64 / denominator as f64)
+}
+
+fn read_model_backfill_status(conn: &Connection) -> Result<ModelBackfillStatus, String> {
+    let row = conn
+        .query_row(
+            "SELECT generation, trigger, status,
+                    total_roots, completed_roots, failed_roots,
+                    inventory_complete, total_sources, processed_sources,
+                    failed_sources, skipped_sources, remaining_sources,
+                    observations_written, started_at_ms, updated_at_ms,
+                    finished_at_ms, last_error
+             FROM model_backfill_state
+             WHERE id = 1",
+            [],
+            |row| {
+                Ok(ModelBackfillStatusRow {
+                    generation: row.get(0)?,
+                    trigger: row.get(1)?,
+                    status: row.get(2)?,
+                    total_roots: row.get(3)?,
+                    completed_roots: row.get(4)?,
+                    failed_roots: row.get(5)?,
+                    inventory_complete: row.get(6)?,
+                    total_sources: row.get(7)?,
+                    processed_sources: row.get(8)?,
+                    failed_sources: row.get(9)?,
+                    skipped_sources: row.get(10)?,
+                    remaining_sources: row.get(11)?,
+                    observations_written: row.get(12)?,
+                    started_at_ms: row.get(13)?,
+                    updated_at_ms: row.get(14)?,
+                    finished_at_ms: row.get(15)?,
+                    last_error: row.get(16)?,
+                })
+            },
+        )
+        .map_err(|e| format!("Read model backfill status singleton: {e}"))?;
+
+    let trigger = ModelBackfillTrigger::try_from(row.trigger.as_str())
+        .map_err(|_| format!("Invalid model backfill trigger: {}", row.trigger))?;
+    let status = ModelBackfillState::try_from(row.status.as_str())
+        .map_err(|_| format!("Invalid model backfill state: {}", row.status))?;
+    let inventory_complete = match row.inventory_complete {
+        0 => false,
+        1 => true,
+        value => {
+            return Err(format!(
+                "Invalid model backfill inventory_complete value: {value}"
+            ));
+        }
+    };
+
+    Ok(ModelBackfillStatus {
+        generation: row.generation,
+        trigger,
+        status,
+        total_roots: row.total_roots,
+        completed_roots: row.completed_roots,
+        failed_roots: row.failed_roots,
+        inventory_complete,
+        total_sources: row.total_sources,
+        processed_sources: row.processed_sources,
+        failed_sources: row.failed_sources,
+        skipped_sources: row.skipped_sources,
+        remaining_sources: row.remaining_sources,
+        observations_written: row.observations_written,
+        started_at: optional_model_backfill_millis_to_rfc3339(row.started_at_ms, "started_at_ms")?,
+        updated_at: model_backfill_millis_to_rfc3339(row.updated_at_ms, "updated_at_ms")?,
+        finished_at: optional_model_backfill_millis_to_rfc3339(
+            row.finished_at_ms,
+            "finished_at_ms",
+        )?,
+        last_error: row
+            .last_error
+            .map(ModelBackfillDiagnostic::from_user_safe_message),
+    })
+}
+
+fn read_model_backfill_source_total_published(conn: &Connection) -> Result<bool, String> {
+    let value = conn
+        .query_row(
+            "SELECT source_total_published
+             FROM model_backfill_state
+             WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Read model backfill source publication state: {error}"))?;
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(format!(
+            "Invalid model backfill source_total_published value: {value}"
+        )),
+    }
+}
+
 pub struct Storage {
     conn: Mutex<Connection>,
+    db_path: PathBuf,
 }
 
 impl Storage {
@@ -2392,10 +3782,201 @@ impl Storage {
                 .map_err(|e| format!("Migration 27 commit: {e}"))?;
         }
 
+        // Migration 28: normalized model-usage evidence and resumable
+        // historical backfill state. Source ownership is logical: this
+        // migration neither changes SQLite's connection-wide foreign-key
+        // pragma nor relies on cascading deletes.
+        if current_version < 28 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 28 transaction begin: {e}"))?;
+
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS model_usage_observations (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    provider              TEXT NOT NULL,
+                    source_key            TEXT NOT NULL,
+                    source_record_key     TEXT NOT NULL,
+                    source_ordinal        INTEGER NOT NULL,
+                    observation_kind      TEXT NOT NULL,
+                    source_session_id     TEXT NOT NULL,
+                    analytics_session_id  TEXT NOT NULL,
+                    chain_id              TEXT NOT NULL,
+                    parent_chain_id       TEXT,
+                    agent_id              TEXT,
+                    turn_id               TEXT,
+                    raw_model_id          TEXT,
+                    cwd                   TEXT,
+                    hostname              TEXT,
+                    is_sidechain          INTEGER NOT NULL,
+                    observed_at_ms        INTEGER NOT NULL,
+                    input_tokens          INTEGER,
+                    output_tokens         INTEGER,
+                    cache_creation_tokens INTEGER,
+                    cache_read_tokens     INTEGER,
+                    model_evidence        TEXT NOT NULL,
+                    token_evidence        TEXT NOT NULL,
+                    UNIQUE(provider, source_key, source_record_key),
+                    CHECK(source_ordinal >= 0),
+                    CHECK(observation_kind IN ('turn', 'token')),
+                    CHECK(is_sidechain IN (0, 1)),
+                    CHECK(observed_at_ms >= 0),
+                    CHECK(input_tokens IS NULL
+                          OR input_tokens BETWEEN 0 AND 100000000),
+                    CHECK(output_tokens IS NULL
+                          OR output_tokens BETWEEN 0 AND 100000000),
+                    CHECK(cache_creation_tokens IS NULL
+                          OR cache_creation_tokens BETWEEN 0 AND 100000000),
+                    CHECK(cache_read_tokens IS NULL
+                          OR cache_read_tokens BETWEEN 0 AND 100000000),
+                    CHECK(model_evidence IN ('explicit', 'missing', 'invalid')),
+                    CHECK(token_evidence IN
+                          ('direct', 'cumulative_delta', 'unavailable'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_model_observations_observed_provider
+                    ON model_usage_observations(observed_at_ms, provider);
+                CREATE INDEX IF NOT EXISTS idx_model_observations_model_time
+                    ON model_usage_observations(provider, raw_model_id, observed_at_ms);
+                CREATE INDEX IF NOT EXISTS idx_model_observations_session_time
+                    ON model_usage_observations(
+                        provider, analytics_session_id, observed_at_ms
+                    );
+                CREATE INDEX IF NOT EXISTS idx_model_observations_chain_time
+                    ON model_usage_observations(
+                        provider, analytics_session_id, chain_id,
+                        observed_at_ms, source_ordinal
+                    );
+                CREATE INDEX IF NOT EXISTS idx_model_observations_source
+                    ON model_usage_observations(provider, source_key);
+
+                CREATE TABLE IF NOT EXISTS model_observation_sources (
+                    provider              TEXT NOT NULL,
+                    source_key            TEXT NOT NULL,
+                    source_root_key       TEXT NOT NULL,
+                    source_path           TEXT NOT NULL,
+                    source_session_id     TEXT,
+                    analytics_session_id  TEXT,
+                    chain_id              TEXT,
+                    parent_chain_id       TEXT,
+                    agent_id              TEXT,
+                    is_sidechain          INTEGER NOT NULL,
+                    cwd                   TEXT,
+                    hostname              TEXT,
+                    first_activity_at_ms  INTEGER,
+                    last_activity_at_ms   INTEGER,
+                    mtime_ns              INTEGER,
+                    size_bytes            INTEGER,
+                    content_sha256        TEXT,
+                    last_error            TEXT,
+                    suppressed_sha256     TEXT,
+                    suppressed_at_ms      INTEGER,
+                    seen_generation       INTEGER NOT NULL,
+                    processing_status     TEXT NOT NULL,
+                    observation_count     INTEGER NOT NULL,
+                    last_attempt_at_ms    INTEGER,
+                    last_success_at_ms    INTEGER,
+                    PRIMARY KEY(provider, source_key),
+                    CHECK(is_sidechain IN (0, 1)),
+                    CHECK(first_activity_at_ms IS NULL
+                          OR first_activity_at_ms >= 0),
+                    CHECK(last_activity_at_ms IS NULL
+                          OR last_activity_at_ms >= 0),
+                    CHECK(mtime_ns IS NULL OR mtime_ns >= 0),
+                    CHECK(size_bytes IS NULL OR size_bytes >= 0),
+                    CHECK(suppressed_at_ms IS NULL OR suppressed_at_ms >= 0),
+                    CHECK(seen_generation >= 0),
+                    CHECK(processing_status IN
+                          ('pending', 'ok', 'stale', 'failed', 'suppressed')),
+                    CHECK(observation_count >= 0),
+                    CHECK(last_attempt_at_ms IS NULL OR last_attempt_at_ms >= 0),
+                    CHECK(last_success_at_ms IS NULL OR last_success_at_ms >= 0)
+                );
+                CREATE INDEX IF NOT EXISTS idx_model_sources_activity
+                    ON model_observation_sources(
+                        provider, first_activity_at_ms, last_activity_at_ms
+                    );
+                CREATE INDEX IF NOT EXISTS idx_model_sources_session
+                    ON model_observation_sources(provider, analytics_session_id);
+                CREATE INDEX IF NOT EXISTS idx_model_sources_cwd
+                    ON model_observation_sources(provider, cwd);
+                CREATE INDEX IF NOT EXISTS idx_model_sources_hostname
+                    ON model_observation_sources(provider, hostname);
+                CREATE INDEX IF NOT EXISTS idx_model_sources_root_generation
+                    ON model_observation_sources(
+                        provider, source_root_key, seen_generation
+                    );
+
+                CREATE TABLE IF NOT EXISTS model_backfill_state (
+                    id                   INTEGER PRIMARY KEY CHECK(id = 1),
+                    generation           INTEGER NOT NULL,
+                    trigger              TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    total_roots          INTEGER NOT NULL,
+                    completed_roots      INTEGER NOT NULL,
+                    failed_roots         INTEGER NOT NULL,
+                    inventory_complete   INTEGER NOT NULL,
+                    total_sources        INTEGER NOT NULL,
+                    source_total_published INTEGER NOT NULL DEFAULT 0,
+                    processed_sources    INTEGER NOT NULL,
+                    failed_sources       INTEGER NOT NULL,
+                    skipped_sources      INTEGER NOT NULL,
+                    remaining_sources    INTEGER NOT NULL,
+                    observations_written INTEGER NOT NULL,
+                    started_at_ms        INTEGER,
+                    updated_at_ms        INTEGER NOT NULL,
+                    finished_at_ms       INTEGER,
+                    last_error           TEXT,
+                    CHECK(generation >= 0),
+                    CHECK(trigger IN
+                          ('migration', 'startup_resume', 'retry', 'reconcile')),
+                    CHECK(status IN
+                          ('pending', 'running', 'complete', 'partial', 'failed')),
+                    CHECK(total_roots >= 0),
+                    CHECK(completed_roots >= 0),
+                    CHECK(failed_roots >= 0),
+                    CHECK(inventory_complete IN (0, 1)),
+                    CHECK(total_sources >= 0),
+                    CHECK(source_total_published IN (0, 1)),
+                    CHECK(processed_sources >= 0),
+                    CHECK(failed_sources >= 0),
+                    CHECK(skipped_sources >= 0),
+                    CHECK(remaining_sources >= 0),
+                    CHECK(observations_written >= 0),
+                    CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
+                    CHECK(updated_at_ms >= 0),
+                    CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0)
+                );",
+            )
+            .map_err(|e| format!("Migration 28 (model analytics tables): {e}"))?;
+
+            tx.execute(
+                "INSERT OR IGNORE INTO model_backfill_state (
+                    id, generation, trigger, status,
+                    total_roots, completed_roots, failed_roots,
+                    inventory_complete, total_sources, source_total_published,
+                    processed_sources, failed_sources, skipped_sources,
+                    remaining_sources, observations_written, started_at_ms,
+                    updated_at_ms, finished_at_ms, last_error
+                 ) VALUES (
+                    1, 0, 'migration', 'pending',
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, ?1, NULL, NULL
+                 )",
+                params![Utc::now().timestamp_millis()],
+            )
+            .map_err(|e| format!("Migration 28 (initialize backfill state): {e}"))?;
+
+            tx.execute("INSERT INTO schema_version (version) VALUES (28)", [])
+                .map_err(|e| format!("Failed to record migration 28: {e}"))?;
+
+            tx.commit()
+                .map_err(|e| format!("Migration 28 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
             conn: Mutex::new(conn),
+            db_path: path,
         };
 
         if let Err(e) = storage.aggregate_and_cleanup() {
@@ -2432,6 +4013,2291 @@ impl Storage {
         }
 
         Ok(storage)
+    }
+
+    /// Open an independent read-only connection for the two Models overview
+    /// queries that the frontend issues together. Their deferred transactions
+    /// still provide one snapshot per response, while WAL can now serve both
+    /// readers without serializing them behind the primary connection mutex.
+    fn open_model_analytics_reader(&self) -> Result<Connection, String> {
+        let conn = Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Open model analytics read connection: {error}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Configure model analytics read timeout: {error}"))?;
+        conn.pragma_update(None, "query_only", true)
+            .map_err(|error| format!("Configure model analytics read-only mode: {error}"))?;
+        Ok(conn)
+    }
+
+    /// Read the migration-28 singleton without changing backfill state.
+    #[allow(dead_code)]
+    pub fn get_model_backfill_status(&self) -> Result<ModelBackfillStatus, String> {
+        let conn = self.conn.lock();
+        read_model_backfill_status(&conn)
+    }
+
+    /// Recover a state left running by a previous process without touching
+    /// committed source or observation rows. A fresh generation prevents an
+    /// interrupted inventory from proving removals during the resumed pass.
+    #[allow(dead_code)] // T030 schedules the resumed retained-history worker.
+    pub(crate) fn reset_interrupted_model_backfill(&self) -> Result<ModelBackfillStatus, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin interrupted model backfill reset: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+        if current.status != ModelBackfillState::Running {
+            tx.commit()
+                .map_err(|error| format!("Finish model backfill state check: {error}"))?;
+            return Ok(current);
+        }
+
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "Model backfill generation exceeds SQLite INTEGER range".to_string())?;
+        let now_ms = Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE model_backfill_state
+             SET generation = ?1,
+                 trigger = 'startup_resume',
+                 status = 'pending',
+                 total_roots = 0,
+                 completed_roots = 0,
+                 failed_roots = 0,
+                 inventory_complete = 0,
+                 total_sources = 0,
+                 source_total_published = 0,
+                 processed_sources = 0,
+                 failed_sources = 0,
+                 skipped_sources = 0,
+                 remaining_sources = 0,
+                 observations_written = 0,
+                 started_at_ms = NULL,
+                 updated_at_ms = ?2,
+                 finished_at_ms = NULL,
+                 last_error = NULL
+             WHERE id = 1 AND status = 'running'",
+            params![generation, now_ms],
+        )
+        .map_err(|error| format!("Reset interrupted model backfill: {error}"))?;
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit interrupted model backfill reset: {error}"))?;
+        Ok(status)
+    }
+
+    /// Initialize an explicit retry after the caller has exclusively reserved
+    /// retained-history scheduling for this process.
+    ///
+    /// That reservation proves no retained worker is scheduled or running, so
+    /// a persisted `running` row is orphaned and must also advance to a fresh
+    /// pending generation. Callers that cannot reserve scheduling must return
+    /// the current status without invoking this mutation.
+    #[allow(dead_code)] // T030 exposes retry_model_history_backfill.
+    pub(crate) fn initialize_model_backfill_retry(&self) -> Result<ModelBackfillStatus, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model backfill retry initialization: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+
+        let generation = current
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| "Model backfill generation exceeds SQLite INTEGER range".to_string())?;
+        let now_ms = Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE model_backfill_state
+             SET generation = ?1,
+                 trigger = 'retry',
+                 status = 'pending',
+                 total_roots = 0,
+                 completed_roots = 0,
+                 failed_roots = 0,
+                 inventory_complete = 0,
+                 total_sources = 0,
+                 source_total_published = 0,
+                 processed_sources = 0,
+                 failed_sources = 0,
+                 skipped_sources = 0,
+                 remaining_sources = 0,
+                 observations_written = 0,
+                 started_at_ms = NULL,
+                 updated_at_ms = ?2,
+                 finished_at_ms = NULL,
+                 last_error = NULL
+             WHERE id = 1",
+            params![generation, now_ms],
+        )
+        .map_err(|error| format!("Initialize model backfill retry: {error}"))?;
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill retry initialization: {error}"))?;
+        Ok(status)
+    }
+
+    /// Atomically claim pending work for the single retained-history runner.
+    #[allow(dead_code)] // T029 starts the retained-history worker.
+    pub(crate) fn start_model_backfill(&self) -> Result<ModelBackfillStatus, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model backfill start: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+        if current.status != ModelBackfillState::Pending {
+            return Err(format!(
+                "Model backfill is {}, not pending",
+                current.status.as_str()
+            ));
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE model_backfill_state
+             SET status = 'running',
+                 total_roots = 0,
+                 completed_roots = 0,
+                 failed_roots = 0,
+                 inventory_complete = 0,
+                 total_sources = 0,
+                 source_total_published = 0,
+                 processed_sources = 0,
+                 failed_sources = 0,
+                 skipped_sources = 0,
+                 remaining_sources = 0,
+                 observations_written = 0,
+                 started_at_ms = ?1,
+                 updated_at_ms = ?1,
+                 finished_at_ms = NULL,
+                 last_error = NULL
+             WHERE id = 1 AND status = 'pending'",
+            params![now_ms],
+        )
+        .map_err(|error| format!("Start model backfill: {error}"))?;
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill start: {error}"))?;
+        Ok(status)
+    }
+
+    /// Persist absolute root-discovery progress before publishing source totals.
+    #[allow(dead_code)] // T029 records retained provider-root outcomes.
+    pub(crate) fn update_model_backfill_roots(
+        &self,
+        total_roots: usize,
+        completed_roots: usize,
+        failed_roots: usize,
+        diagnostic: Option<&ModelBackfillDiagnostic>,
+    ) -> Result<ModelBackfillStatus, String> {
+        let total_roots = model_backfill_count(total_roots, "total_roots")?;
+        let completed_roots = model_backfill_count(completed_roots, "completed_roots")?;
+        let failed_roots = model_backfill_count(failed_roots, "failed_roots")?;
+        if total_roots == 0 {
+            return Err("Model backfill must configure at least one provider root".to_string());
+        }
+        let resolved_roots =
+            checked_model_backfill_sum(completed_roots, failed_roots, "resolved root count")?;
+        if resolved_roots > total_roots {
+            return Err("Resolved model backfill roots exceed configured roots".to_string());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model backfill root update: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+        require_running_model_backfill(&current)?;
+        if current.total_roots != 0 && current.total_roots != total_roots {
+            return Err("Configured model backfill root count changed during the run".to_string());
+        }
+        if completed_roots < current.completed_roots || failed_roots < current.failed_roots {
+            return Err("Model backfill root progress cannot move backward".to_string());
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE model_backfill_state
+             SET total_roots = ?1,
+                 completed_roots = ?2,
+                 failed_roots = ?3,
+                 inventory_complete = 0,
+                 updated_at_ms = ?4,
+                 last_error = COALESCE(?5, last_error)
+             WHERE id = 1 AND status = 'running'",
+            params![
+                total_roots,
+                completed_roots,
+                failed_roots,
+                now_ms,
+                diagnostic.map(ModelBackfillDiagnostic::as_str),
+            ],
+        )
+        .map_err(|error| format!("Update model backfill root progress: {error}"))?;
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill root update: {error}"))?;
+        Ok(status)
+    }
+
+    /// Publish discovered source count after every configured root has reached
+    /// a complete or failed enumeration outcome.
+    #[allow(dead_code)] // T029 publishes the prepared inventory size.
+    pub(crate) fn set_model_backfill_source_total(
+        &self,
+        total_sources: usize,
+    ) -> Result<ModelBackfillStatus, String> {
+        let total_sources = model_backfill_count(total_sources, "total_sources")?;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model backfill source total update: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+        require_running_model_backfill(&current)?;
+        let source_total_published = read_model_backfill_source_total_published(&tx)?;
+        if source_total_published {
+            if current.total_sources != total_sources {
+                return Err("Model backfill source total changed after publication".to_string());
+            }
+            tx.commit()
+                .map_err(|error| format!("Finish model backfill source total check: {error}"))?;
+            return Ok(current);
+        }
+        if current.total_roots <= 0 {
+            return Err(
+                "Model backfill roots must be initialized before source totals".to_string(),
+            );
+        }
+        let resolved_roots = checked_model_backfill_sum(
+            current.completed_roots,
+            current.failed_roots,
+            "resolved root count",
+        )?;
+        if resolved_roots != current.total_roots {
+            return Err(
+                "Model backfill source total cannot precede resolved root outcomes".to_string(),
+            );
+        }
+        if current.processed_sources != 0
+            || current.failed_sources != 0
+            || current.skipped_sources != 0
+            || current.observations_written != 0
+        {
+            return Err("Model backfill source total cannot change after progress".to_string());
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let updated = tx
+            .execute(
+                "UPDATE model_backfill_state
+             SET total_sources = ?1,
+                 source_total_published = 1,
+                 remaining_sources = ?1,
+                 inventory_complete = 0,
+                 updated_at_ms = ?2
+             WHERE id = 1
+               AND status = 'running'
+               AND source_total_published = 0",
+                params![total_sources, now_ms],
+            )
+            .map_err(|error| format!("Update model backfill source total: {error}"))?;
+        if updated != 1 {
+            return Err(
+                "Model backfill source total publication lost its running state".to_string(),
+            );
+        }
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill source total: {error}"))?;
+        Ok(status)
+    }
+
+    /// Commit one batch of source outcomes with checked, nonnegative counters.
+    #[allow(dead_code)] // T029 records each bounded reconciliation batch.
+    pub(crate) fn record_model_backfill_progress(
+        &self,
+        processed_sources: usize,
+        failed_sources: usize,
+        skipped_sources: usize,
+        observations_written: i64,
+        diagnostic: Option<&ModelBackfillDiagnostic>,
+    ) -> Result<ModelBackfillStatus, String> {
+        if observations_written < 0 {
+            return Err("Model backfill observations_written cannot be negative".to_string());
+        }
+        let processed_sources = model_backfill_count(processed_sources, "processed_sources")?;
+        let failed_sources = model_backfill_count(failed_sources, "failed_sources")?;
+        let skipped_sources = model_backfill_count(skipped_sources, "skipped_sources")?;
+        let attempted_sources = checked_model_backfill_sum(
+            checked_model_backfill_sum(
+                processed_sources,
+                failed_sources,
+                "attempted source count",
+            )?,
+            skipped_sources,
+            "attempted source count",
+        )?;
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model backfill progress update: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+        require_running_model_backfill(&current)?;
+        if attempted_sources > current.remaining_sources {
+            return Err("Model backfill progress exceeds remaining sources".to_string());
+        }
+
+        let next_processed = checked_model_backfill_sum(
+            current.processed_sources,
+            processed_sources,
+            "processed_sources",
+        )?;
+        let next_failed =
+            checked_model_backfill_sum(current.failed_sources, failed_sources, "failed_sources")?;
+        let next_skipped = checked_model_backfill_sum(
+            current.skipped_sources,
+            skipped_sources,
+            "skipped_sources",
+        )?;
+        let next_observations = checked_model_backfill_sum(
+            current.observations_written,
+            observations_written,
+            "observations_written",
+        )?;
+        let next_remaining = current.remaining_sources - attempted_sources;
+        let now_ms = Utc::now().timestamp_millis();
+        tx.execute(
+            "UPDATE model_backfill_state
+             SET processed_sources = ?1,
+                 failed_sources = ?2,
+                 skipped_sources = ?3,
+                 remaining_sources = ?4,
+                 observations_written = ?5,
+                 inventory_complete = 0,
+                 updated_at_ms = ?6,
+                 last_error = COALESCE(?7, last_error)
+             WHERE id = 1 AND status = 'running'",
+            params![
+                next_processed,
+                next_failed,
+                next_skipped,
+                next_remaining,
+                next_observations,
+                now_ms,
+                diagnostic.map(ModelBackfillDiagnostic::as_str),
+            ],
+        )
+        .map_err(|error| format!("Update model backfill progress: {error}"))?;
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill progress update: {error}"))?;
+        Ok(status)
+    }
+
+    /// Resolve a running pass while keeping terminal status independent from
+    /// inventory completeness. Complete is intentionally the strict exception.
+    #[allow(dead_code)] // T029 resolves retained-history terminal state.
+    pub(crate) fn finish_model_backfill(
+        &self,
+        terminal_state: ModelBackfillState,
+        inventory_complete: bool,
+        diagnostic: Option<&ModelBackfillDiagnostic>,
+    ) -> Result<ModelBackfillStatus, String> {
+        if matches!(
+            terminal_state,
+            ModelBackfillState::Pending | ModelBackfillState::Running
+        ) {
+            return Err(
+                "Model backfill terminal state must be complete, partial, or failed".to_string(),
+            );
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model backfill terminal update: {error}"))?;
+        let current = read_model_backfill_status(&tx)?;
+        require_running_model_backfill(&current)?;
+        let source_total_published = read_model_backfill_source_total_published(&tx)?;
+
+        if (inventory_complete || terminal_state == ModelBackfillState::Complete)
+            && (current.total_roots <= 0 || !source_total_published)
+        {
+            return Err(
+                "Complete model backfill inventory requires initialized roots and a published source total"
+                    .to_string(),
+            );
+        }
+
+        let roots_complete =
+            current.completed_roots == current.total_roots && current.failed_roots == 0;
+        let sources_complete = current.remaining_sources == 0;
+        if inventory_complete && !(roots_complete && sources_complete) {
+            return Err(
+                "Complete model backfill inventory requires all roots and sources to resolve"
+                    .to_string(),
+            );
+        }
+        if terminal_state == ModelBackfillState::Complete
+            && (!inventory_complete
+                || current.failed_roots != 0
+                || current.failed_sources != 0
+                || !sources_complete)
+        {
+            return Err(
+                "Complete model backfill state requires complete failure-free inventory"
+                    .to_string(),
+            );
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let last_error = if terminal_state == ModelBackfillState::Complete {
+            None
+        } else {
+            diagnostic.map(ModelBackfillDiagnostic::as_str).or(current
+                .last_error
+                .as_ref()
+                .map(ModelBackfillDiagnostic::as_str))
+        };
+        tx.execute(
+            "UPDATE model_backfill_state
+             SET status = ?1,
+                 inventory_complete = ?2,
+                 updated_at_ms = ?3,
+                 finished_at_ms = ?3,
+                 last_error = ?4
+             WHERE id = 1 AND status = 'running'",
+            params![
+                terminal_state.as_str(),
+                i64::from(inventory_complete),
+                now_ms,
+                last_error,
+            ],
+        )
+        .map_err(|error| format!("Finish model backfill: {error}"))?;
+        let status = read_model_backfill_status(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill terminal update: {error}"))?;
+        Ok(status)
+    }
+
+    /// Aggregate retained model evidence for one half-open range snapshot.
+    ///
+    /// Global inventory facts come from unsuppressed source ownership. Every
+    /// range/provider fact comes from an actual normalized observation joined
+    /// back to that ownership; source activity bounds are never treated as a
+    /// continuous interval.
+    pub(crate) fn get_model_analytics(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+    ) -> Result<ModelAnalyticsResponse, String> {
+        let range_end = Utc::now();
+        let range_end_ms = range_end.timestamp_millis();
+        let range_start_ms = (range_end - model_range_duration(range)).timestamp_millis();
+        let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
+
+        let mut conn = self.open_model_analytics_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin model analytics read snapshot: {error}"))?;
+
+        let backfill = read_model_backfill_status(&tx)?;
+        let global_session_count = tx
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM (
+                     SELECT source.provider, source.analytics_session_id
+                     FROM model_observation_sources AS source
+                     WHERE source.processing_status != 'suppressed'
+                       AND source.suppressed_sha256 IS NULL
+                       AND source.analytics_session_id IS NOT NULL
+                     GROUP BY source.provider COLLATE BINARY,
+                              source.analytics_session_id COLLATE BINARY
+                 ) AS retained_sessions",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Query global model analytics session scope: {error}"))?;
+
+        let aggregate = tx
+            .query_row(
+                "WITH scoped_observations AS MATERIALIZED (
+                     SELECT observation.provider,
+                            observation.analytics_session_id,
+                            observation.raw_model_id,
+                            observation.input_tokens,
+                            observation.output_tokens,
+                            observation.cache_creation_tokens,
+                            observation.cache_read_tokens
+                     FROM model_usage_observations AS observation
+                     JOIN model_observation_sources AS source
+                       ON source.provider = observation.provider
+                      AND source.source_key = observation.source_key
+                     WHERE source.processing_status != 'suppressed'
+                       AND source.suppressed_sha256 IS NULL
+                       AND observation.observed_at_ms >= ?1
+                       AND observation.observed_at_ms < ?2
+                       AND (?3 IS NULL OR observation.provider = ?3)
+                 )
+                 SELECT
+                     (
+                         SELECT COUNT(*)
+                         FROM (
+                             SELECT provider, analytics_session_id
+                             FROM scoped_observations
+                             GROUP BY provider COLLATE BINARY,
+                                      analytics_session_id COLLATE BINARY
+                         ) AS scoped_sessions
+                     ),
+                     (
+                         SELECT COUNT(*)
+                         FROM scoped_observations
+                         WHERE raw_model_id IS NOT NULL
+                     ),
+                     COALESCE((
+                         SELECT SUM(
+                             COALESCE(input_tokens, 0)
+                             + COALESCE(output_tokens, 0)
+                             + COALESCE(cache_creation_tokens, 0)
+                             + COALESCE(cache_read_tokens, 0)
+                         )
+                         FROM scoped_observations
+                     ), 0),
+                     COALESCE((
+                         SELECT SUM(
+                             COALESCE(input_tokens, 0)
+                             + COALESCE(output_tokens, 0)
+                             + COALESCE(cache_creation_tokens, 0)
+                             + COALESCE(cache_read_tokens, 0)
+                         )
+                         FROM scoped_observations
+                         WHERE raw_model_id IS NOT NULL
+                     ), 0),
+                     (
+                         SELECT COUNT(*)
+                         FROM (
+                             SELECT provider, raw_model_id
+                             FROM scoped_observations
+                             WHERE raw_model_id IS NOT NULL
+                             GROUP BY provider COLLATE BINARY,
+                                      raw_model_id COLLATE BINARY
+                         ) AS scoped_models
+                     ),
+                     (
+                         SELECT COUNT(*)
+                         FROM (
+                             SELECT provider, analytics_session_id
+                             FROM (
+                                 SELECT provider, analytics_session_id, raw_model_id
+                                 FROM scoped_observations
+                                 WHERE raw_model_id IS NOT NULL
+                                 GROUP BY provider COLLATE BINARY,
+                                          analytics_session_id COLLATE BINARY,
+                                          raw_model_id COLLATE BINARY
+                             ) AS session_model_identities
+                             GROUP BY provider COLLATE BINARY,
+                                      analytics_session_id COLLATE BINARY
+                             HAVING COUNT(*) > 1
+                         ) AS multi_model_session_ids
+                     )",
+                params![range_start_ms, range_end_ms, provider],
+                |row| {
+                    Ok(ModelAnalyticsAggregateRow {
+                        scoped_session_count: row.get(0)?,
+                        scoped_evidence_count: row.get(1)?,
+                        total_tokens: row.get(2)?,
+                        attributed_tokens: row.get(3)?,
+                        distinct_models: row.get(4)?,
+                        multi_model_sessions: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Query model analytics aggregate scope: {error}"))?;
+
+        let mut represented_provider_statement = tx
+            .prepare_cached(
+                "SELECT observation.provider
+                 FROM model_usage_observations AS observation
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE source.processing_status != 'suppressed'
+                   AND source.suppressed_sha256 IS NULL
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                 GROUP BY observation.provider COLLATE BINARY
+                 ORDER BY observation.provider COLLATE BINARY ASC",
+            )
+            .map_err(|error| format!("Prepare represented model providers query: {error}"))?;
+        let represented_provider_rows = represented_provider_statement
+            .query_map(params![range_start_ms, range_end_ms], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("Query represented model providers: {error}"))?;
+        let mut represented_providers = Vec::new();
+        for row in represented_provider_rows {
+            represented_providers.push(
+                row.map_err(|error| format!("Read represented model provider row: {error}"))?,
+            );
+        }
+        drop(represented_provider_statement);
+
+        let mut model_statement = tx
+            .prepare_cached(
+                "SELECT
+                     observation.provider,
+                     observation.raw_model_id,
+                     SUM(
+                         COALESCE(observation.input_tokens, 0)
+                         + COALESCE(observation.output_tokens, 0)
+                         + COALESCE(observation.cache_creation_tokens, 0)
+                         + COALESCE(observation.cache_read_tokens, 0)
+                     ) AS attributed_tokens,
+                     SUM(COALESCE(observation.input_tokens, 0)) AS input_tokens,
+                     SUM(COALESCE(observation.output_tokens, 0)) AS output_tokens,
+                     SUM(COALESCE(observation.cache_creation_tokens, 0))
+                         AS cache_creation_tokens,
+                     SUM(COALESCE(observation.cache_read_tokens, 0))
+                         AS cache_read_tokens,
+                     SUM(CASE WHEN observation.observation_kind = 'turn'
+                              THEN 1 ELSE 0 END) AS observed_turns,
+                     COUNT(DISTINCT observation.analytics_session_id COLLATE BINARY)
+                         AS session_count,
+                     SUM(
+                         CASE
+                             WHEN (
+                                 observation.input_tokens IS NOT NULL
+                                 OR observation.output_tokens IS NOT NULL
+                                 OR observation.cache_creation_tokens IS NOT NULL
+                                 OR observation.cache_read_tokens IS NOT NULL
+                             ) AND (
+                                 observation.input_tokens IS NULL
+                                 OR observation.cache_creation_tokens IS NULL
+                                 OR observation.cache_read_tokens IS NULL
+                             )
+                             THEN 1 ELSE 0
+                         END
+                     ) AS incomplete_cache_share_rows,
+                     MIN(observation.observed_at_ms) AS first_seen_ms,
+                     MAX(observation.observed_at_ms) AS last_seen_ms
+                 FROM model_usage_observations AS observation
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE source.processing_status != 'suppressed'
+                   AND source.suppressed_sha256 IS NULL
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                   AND (?3 IS NULL OR observation.provider = ?3)
+                   AND observation.raw_model_id IS NOT NULL
+                 GROUP BY observation.provider COLLATE BINARY,
+                          observation.raw_model_id COLLATE BINARY
+                 ORDER BY attributed_tokens DESC,
+                          observation.provider COLLATE BINARY ASC,
+                          observation.raw_model_id COLLATE BINARY ASC",
+            )
+            .map_err(|error| format!("Prepare model usage rows query: {error}"))?;
+        let model_aggregate_rows = model_statement
+            .query_map(params![range_start_ms, range_end_ms, provider], |row| {
+                Ok(ModelUsageAggregateRow {
+                    provider: row.get(0)?,
+                    raw_model_id: row.get(1)?,
+                    attributed_tokens: row.get(2)?,
+                    input_tokens: row.get(3)?,
+                    output_tokens: row.get(4)?,
+                    cache_creation_tokens: row.get(5)?,
+                    cache_read_tokens: row.get(6)?,
+                    observed_turns: row.get(7)?,
+                    session_count: row.get(8)?,
+                    incomplete_cache_share_rows: row.get(9)?,
+                    first_seen_ms: row.get(10)?,
+                    last_seen_ms: row.get(11)?,
+                })
+            })
+            .map_err(|error| format!("Query model usage rows: {error}"))?;
+
+        let mut models = Vec::new();
+        for aggregate_row in model_aggregate_rows {
+            let row = aggregate_row
+                .map_err(|error| format!("Read model usage aggregate row: {error}"))?;
+            let cache_read_denominator = row
+                .input_tokens
+                .checked_add(row.cache_creation_tokens)
+                .and_then(|value| value.checked_add(row.cache_read_tokens))
+                .ok_or_else(|| {
+                    format!(
+                        "Model cache-read denominator overflow for provider {}",
+                        row.provider
+                    )
+                })?;
+            let cache_read_share_percent = (row.incomplete_cache_share_rows == 0)
+                .then(|| model_percentage(row.cache_read_tokens, cache_read_denominator))
+                .flatten();
+
+            models.push(ModelUsageRow {
+                identity: ModelIdentity {
+                    provider: row.provider,
+                    model_id: row.raw_model_id,
+                },
+                attributed_tokens: row.attributed_tokens,
+                attributed_share_percent: model_percentage(
+                    row.attributed_tokens,
+                    aggregate.attributed_tokens,
+                ),
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                cache_creation_tokens: row.cache_creation_tokens,
+                cache_read_tokens: row.cache_read_tokens,
+                observed_turns: row.observed_turns,
+                session_count: row.session_count,
+                cache_read_share_percent,
+                first_seen: model_observation_millis_to_rfc3339(
+                    row.first_seen_ms,
+                    "first_seen_ms",
+                )?,
+                last_seen: model_observation_millis_to_rfc3339(row.last_seen_ms, "last_seen_ms")?,
+            });
+        }
+        drop(model_statement);
+
+        let unattributed_tokens = aggregate
+            .total_tokens
+            .checked_sub(aggregate.attributed_tokens)
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| {
+                "Model analytics attributed tokens exceed the scoped token total".to_string()
+            })?;
+        let scope_final = backfill.status == ModelBackfillState::Complete
+            && backfill.inventory_complete
+            && backfill.failed_roots == 0
+            && backfill.failed_sources == 0
+            && backfill.remaining_sources == 0;
+
+        tx.commit()
+            .map_err(|error| format!("Commit model analytics read snapshot: {error}"))?;
+
+        Ok(ModelAnalyticsResponse {
+            generated_at,
+            range,
+            provider: provider.map(str::to_owned),
+            represented_providers,
+            scope: ModelAnalyticsScope {
+                global_session_count,
+                scoped_session_count: aggregate.scoped_session_count,
+                scoped_evidence_count: aggregate.scoped_evidence_count,
+                inventory_complete: backfill.inventory_complete,
+                scope_final,
+            },
+            summary: ModelAnalyticsSummary {
+                attributed_tokens: aggregate.attributed_tokens,
+                unattributed_tokens,
+                total_tokens: aggregate.total_tokens,
+                attributed_coverage_percent: model_percentage(
+                    aggregate.attributed_tokens,
+                    aggregate.total_tokens,
+                ),
+                distinct_models: aggregate.distinct_models,
+                multi_model_sessions: aggregate.multi_model_sessions,
+            },
+            models,
+            backfill,
+        })
+    }
+
+    /// Aggregate retained model evidence into a fixed, zero-filled UTC axis.
+    ///
+    /// Bucket membership uses actual observation timestamps in the half-open
+    /// request interval. Source activity bounds never manufacture history, and
+    /// suppressed source ownership never contributes tokens.
+    // @lat: [[backend#Database#Schema#Model Analytics Evidence]]
+    pub(crate) fn get_model_history(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+        selected_model: Option<&ModelIdentity>,
+    ) -> Result<ModelHistoryResponse, String> {
+        let range_end = Utc::now();
+        let range_end_ms = range_end.timestamp_millis();
+        let range_millis = model_range_duration(range).num_milliseconds();
+        let range_start_ms = range_end_ms
+            .checked_sub(range_millis)
+            .ok_or_else(|| "Model history range boundary overflow".to_string())?;
+        let bucket_seconds = model_history_bucket_seconds(range);
+        let bucket_millis = bucket_seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| "Model history bucket width overflow".to_string())?;
+        let bucket_count = range_millis
+            .checked_div(bucket_millis)
+            .filter(|count| *count > 0 && range_millis % bucket_millis == 0)
+            .ok_or_else(|| "Model history range does not divide into fixed buckets".to_string())?;
+        let point_capacity = usize::try_from(bucket_count)
+            .map_err(|_| "Model history bucket count exceeds platform capacity".to_string())?;
+        let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
+
+        let mut points = Vec::with_capacity(point_capacity);
+        for bucket_index in 0..bucket_count {
+            let bucket_offset = bucket_index
+                .checked_mul(bucket_millis)
+                .ok_or_else(|| "Model history bucket offset overflow".to_string())?;
+            let bucket_start_ms = range_start_ms
+                .checked_add(bucket_offset)
+                .ok_or_else(|| "Model history bucket start overflow".to_string())?;
+            let bucket_end_ms = bucket_start_ms
+                .checked_add(bucket_millis)
+                .ok_or_else(|| "Model history bucket end overflow".to_string())?;
+
+            points.push(ModelHistoryPoint {
+                bucket_start: model_observation_millis_to_rfc3339(bucket_start_ms, "bucket_start")?,
+                bucket_end: model_observation_millis_to_rfc3339(bucket_end_ms, "bucket_end")?,
+                attributed_tokens: 0,
+                unattributed_tokens: 0,
+                selected_model_tokens: selected_model.map(|_| 0),
+            });
+        }
+
+        let selected_provider = selected_model.map(|identity| identity.provider.as_str());
+        let selected_model_id = selected_model.map(|identity| identity.model_id.as_str());
+        let mut conn = self.open_model_analytics_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin model history read snapshot: {error}"))?;
+        let mut statement = tx
+            .prepare_cached(
+                "SELECT
+                     (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
+                     SUM(
+                         CASE WHEN observation.raw_model_id IS NOT NULL THEN
+                             COALESCE(observation.input_tokens, 0)
+                             + COALESCE(observation.output_tokens, 0)
+                             + COALESCE(observation.cache_creation_tokens, 0)
+                             + COALESCE(observation.cache_read_tokens, 0)
+                         ELSE 0 END
+                     ) AS attributed_tokens,
+                     SUM(
+                         CASE WHEN observation.raw_model_id IS NULL THEN
+                             COALESCE(observation.input_tokens, 0)
+                             + COALESCE(observation.output_tokens, 0)
+                             + COALESCE(observation.cache_creation_tokens, 0)
+                             + COALESCE(observation.cache_read_tokens, 0)
+                         ELSE 0 END
+                     ) AS unattributed_tokens,
+                     SUM(
+                         CASE
+                             WHEN ?5 IS NOT NULL
+                              AND observation.provider COLLATE BINARY = ?5
+                              AND observation.raw_model_id COLLATE BINARY = ?6
+                             THEN COALESCE(observation.input_tokens, 0)
+                                  + COALESCE(observation.output_tokens, 0)
+                                  + COALESCE(observation.cache_creation_tokens, 0)
+                                  + COALESCE(observation.cache_read_tokens, 0)
+                             ELSE 0
+                         END
+                     ) AS selected_model_tokens
+                 FROM model_usage_observations AS observation
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE source.processing_status != 'suppressed'
+                   AND source.suppressed_sha256 IS NULL
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                   AND (?4 IS NULL OR observation.provider = ?4)
+                 GROUP BY bucket_index
+                 ORDER BY bucket_index ASC",
+            )
+            .map_err(|error| format!("Prepare model history query: {error}"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    range_start_ms,
+                    range_end_ms,
+                    bucket_millis,
+                    provider,
+                    selected_provider,
+                    selected_model_id
+                ],
+                |row| {
+                    Ok(ModelHistoryAggregateRow {
+                        bucket_index: row.get(0)?,
+                        attributed_tokens: row.get(1)?,
+                        unattributed_tokens: row.get(2)?,
+                        selected_model_tokens: row.get(3)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Query model history: {error}"))?;
+
+        for aggregate_row in rows {
+            let row = aggregate_row
+                .map_err(|error| format!("Read model history aggregate row: {error}"))?;
+            let bucket_index = usize::try_from(row.bucket_index)
+                .map_err(|_| format!("Invalid model history bucket index: {}", row.bucket_index))?;
+            let point = points.get_mut(bucket_index).ok_or_else(|| {
+                format!(
+                    "Model history bucket index outside fixed axis: {}",
+                    row.bucket_index
+                )
+            })?;
+            if row.attributed_tokens < 0
+                || row.unattributed_tokens < 0
+                || row.selected_model_tokens < 0
+            {
+                return Err("Model history aggregate contained negative tokens".to_string());
+            }
+            if row.selected_model_tokens > row.attributed_tokens {
+                return Err(
+                    "Selected model history exceeded aggregate attributed tokens".to_string(),
+                );
+            }
+
+            point.attributed_tokens = row.attributed_tokens;
+            point.unattributed_tokens = row.unattributed_tokens;
+            if selected_model.is_some() {
+                point.selected_model_tokens = Some(row.selected_model_tokens);
+            }
+        }
+        drop(statement);
+
+        tx.commit()
+            .map_err(|error| format!("Commit model history read snapshot: {error}"))?;
+
+        Ok(ModelHistoryResponse {
+            generated_at,
+            range,
+            provider: provider.map(str::to_owned),
+            selected_model: selected_model.cloned(),
+            bucket_seconds,
+            points,
+        })
+    }
+
+    /// Page in-range sessions containing one exact provider-qualified model.
+    ///
+    /// The first page fixes half-open time bounds plus the current persisted
+    /// data revision in its opaque cursor. Later pages reject changed evidence,
+    /// then reuse those bounds and seek after the final stable
+    /// `(last_activity, provider, session)` tuple instead of using offsets.
+    // @lat: [[backend#Database#Schema#Model Analytics Evidence]]
+    pub(crate) fn get_model_sessions(
+        &self,
+        range: ModelRange,
+        identity: &ModelIdentity,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ModelSessionsResponse, ModelSessionsQueryError> {
+        let decoded_cursor = cursor
+            .map(|encoded| decode_model_sessions_cursor(encoded, range, identity))
+            .transpose()?;
+        let range_millis = model_range_duration(range).num_milliseconds();
+        let (range_start_ms, range_end_ms) = match decoded_cursor.as_ref() {
+            Some(cursor) => (cursor.range_start_ms, cursor.range_end_ms),
+            None => {
+                let range_end_ms = Utc::now().timestamp_millis();
+                let range_start_ms = range_end_ms.checked_sub(range_millis).ok_or_else(|| {
+                    ModelSessionsQueryError::Storage(
+                        "Model sessions range boundary overflow".to_string(),
+                    )
+                })?;
+                (range_start_ms, range_end_ms)
+            }
+        };
+        let page_limit = limit
+            .unwrap_or(MODEL_SESSIONS_DEFAULT_LIMIT)
+            .clamp(1, MODEL_SESSIONS_MAX_LIMIT);
+        let query_limit = page_limit.checked_add(1).ok_or_else(|| {
+            ModelSessionsQueryError::Storage("Model sessions page limit overflow".to_string())
+        })?;
+        let query_limit = i64::try_from(query_limit).map_err(|_| {
+            ModelSessionsQueryError::Storage(
+                "Model sessions page limit exceeds SQLite INTEGER range".to_string(),
+            )
+        })?;
+        let cursor_last_activity_ms = decoded_cursor
+            .as_ref()
+            .map(|cursor| cursor.last_activity_ms);
+        let cursor_provider = decoded_cursor
+            .as_ref()
+            .map(|cursor| cursor.provider.as_str());
+        let cursor_session_id = decoded_cursor
+            .as_ref()
+            .map(|cursor| cursor.session_id.as_str());
+
+        (|| -> Result<ModelSessionsResponse, ModelSessionsQueryError> {
+            let mut conn = self.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("Begin model sessions read snapshot: {error}"))?;
+            let data_revision = read_model_data_revision(&tx)?;
+            if decoded_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.data_revision != data_revision)
+            {
+                return Err(invalid_model_sessions_cursor(
+                    "Model sessions cursor is stale after model data changed",
+                ));
+            }
+
+            let total = tx
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM (
+                         SELECT observation.provider,
+                                observation.analytics_session_id
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE source.processing_status != 'suppressed'
+                           AND source.suppressed_sha256 IS NULL
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2
+                           AND observation.provider COLLATE BINARY = ?3
+                           AND observation.raw_model_id COLLATE BINARY = ?4
+                         GROUP BY observation.provider COLLATE BINARY,
+                                  observation.analytics_session_id COLLATE BINARY
+                     ) AS matching_sessions",
+                    params![
+                        range_start_ms,
+                        range_end_ms,
+                        identity.provider,
+                        identity.model_id
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| format!("Count selected-model sessions: {error}"))?;
+
+            let mut statement = tx
+                .prepare_cached(
+                    "WITH scoped AS (
+                         SELECT observation.*,
+                                COALESCE(
+                                    NULLIF(observation.cwd, ''),
+                                    NULLIF(source.cwd, '')
+                                ) AS effective_cwd,
+                                COALESCE(
+                                    NULLIF(observation.hostname, ''),
+                                    NULLIF(source.hostname, '')
+                                ) AS effective_hostname
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE source.processing_status != 'suppressed'
+                           AND source.suppressed_sha256 IS NULL
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2
+                           AND observation.provider COLLATE BINARY = ?3
+                     ),
+                     selected_sessions AS (
+                         SELECT provider,
+                                analytics_session_id AS session_id,
+                                SUM(
+                                    COALESCE(input_tokens, 0)
+                                    + COALESCE(output_tokens, 0)
+                                    + COALESCE(cache_creation_tokens, 0)
+                                    + COALESCE(cache_read_tokens, 0)
+                                ) AS selected_model_tokens,
+                                SUM(CASE WHEN observation_kind = 'turn'
+                                         THEN 1 ELSE 0 END)
+                                    AS selected_model_turns
+                         FROM scoped
+                         WHERE raw_model_id COLLATE BINARY = ?4
+                         GROUP BY provider COLLATE BINARY,
+                                  analytics_session_id COLLATE BINARY
+                     ),
+                     matching_sessions AS (
+                         SELECT selected.provider,
+                                selected.session_id,
+                                selected.selected_model_tokens,
+                                selected.selected_model_turns,
+                                MAX(scoped.observed_at_ms) AS last_activity_ms
+                         FROM selected_sessions AS selected
+                         JOIN scoped
+                           ON scoped.provider = selected.provider
+                          AND scoped.analytics_session_id = selected.session_id
+                         GROUP BY selected.provider COLLATE BINARY,
+                                  selected.session_id COLLATE BINARY
+                         HAVING ?5 IS NULL
+                            OR MAX(scoped.observed_at_ms) < ?5
+                            OR (
+                                MAX(scoped.observed_at_ms) = ?5
+                                AND selected.provider COLLATE BINARY > ?6
+                            )
+                            OR (
+                                MAX(scoped.observed_at_ms) = ?5
+                                AND selected.provider COLLATE BINARY = ?6
+                                AND selected.session_id COLLATE BINARY > ?7
+                            )
+                         ORDER BY last_activity_ms DESC,
+                                  selected.provider COLLATE BINARY ASC,
+                                  selected.session_id COLLATE BINARY ASC
+                         LIMIT ?8
+                     ),
+                     page_scope AS (
+                         SELECT scoped.*
+                         FROM scoped
+                         JOIN matching_sessions AS page
+                           ON page.provider = scoped.provider
+                          AND page.session_id = scoped.analytics_session_id
+                     ),
+                     model_stats AS (
+                         SELECT provider,
+                                analytics_session_id AS session_id,
+                                raw_model_id,
+                                SUM(
+                                    COALESCE(input_tokens, 0)
+                                    + COALESCE(output_tokens, 0)
+                                    + COALESCE(cache_creation_tokens, 0)
+                                    + COALESCE(cache_read_tokens, 0)
+                                ) AS attributed_tokens,
+                                SUM(CASE WHEN observation_kind = 'turn'
+                                         THEN 1 ELSE 0 END) AS observed_turns
+                         FROM page_scope
+                         WHERE raw_model_id IS NOT NULL
+                         GROUP BY provider COLLATE BINARY,
+                                  analytics_session_id COLLATE BINARY,
+                                  raw_model_id COLLATE BINARY
+                     ),
+                     ranked_models AS (
+                         SELECT model_stats.*,
+                                COUNT(*) OVER (
+                                    PARTITION BY provider COLLATE BINARY,
+                                                 session_id COLLATE BINARY
+                                ) AS distinct_models,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY provider COLLATE BINARY,
+                                                 session_id COLLATE BINARY
+                                    ORDER BY attributed_tokens DESC,
+                                             observed_turns DESC,
+                                             provider COLLATE BINARY ASC,
+                                             raw_model_id COLLATE BINARY ASC
+                                ) AS primary_rank
+                         FROM model_stats
+                     ),
+                     metadata_ranked AS (
+                         SELECT provider,
+                                analytics_session_id AS session_id,
+                                effective_cwd AS cwd,
+                                effective_hostname AS hostname,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY provider COLLATE BINARY,
+                                                 analytics_session_id COLLATE BINARY
+                                    ORDER BY CASE WHEN effective_cwd IS NULL
+                                                  THEN 1 ELSE 0 END,
+                                             observed_at_ms DESC,
+                                             source_ordinal DESC,
+                                             source_record_key COLLATE BINARY DESC,
+                                             source_key COLLATE BINARY DESC,
+                                             id DESC
+                                ) AS cwd_rank,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY provider COLLATE BINARY,
+                                                 analytics_session_id COLLATE BINARY
+                                    ORDER BY CASE WHEN effective_hostname IS NULL
+                                                  THEN 1 ELSE 0 END,
+                                             observed_at_ms DESC,
+                                             source_ordinal DESC,
+                                             source_record_key COLLATE BINARY DESC,
+                                             source_key COLLATE BINARY DESC,
+                                             id DESC
+                                ) AS hostname_rank
+                         FROM page_scope
+                     ),
+                     session_metadata AS (
+                         SELECT provider,
+                                session_id,
+                                MAX(CASE WHEN cwd_rank = 1
+                                         THEN NULLIF(cwd, '') END) AS cwd,
+                                MAX(CASE WHEN hostname_rank = 1
+                                         THEN NULLIF(hostname, '') END) AS hostname
+                         FROM metadata_ranked
+                         GROUP BY provider COLLATE BINARY,
+                                  session_id COLLATE BINARY
+                     ),
+                     session_chains AS (
+                         SELECT provider,
+                                analytics_session_id AS session_id,
+                                chain_id
+                         FROM page_scope
+                         GROUP BY provider COLLATE BINARY,
+                                  analytics_session_id COLLATE BINARY,
+                                  chain_id COLLATE BINARY
+                     ),
+                     chain_counts AS (
+                         SELECT provider, session_id, COUNT(*) AS chain_count
+                         FROM session_chains
+                         GROUP BY provider COLLATE BINARY,
+                                  session_id COLLATE BINARY
+                     ),
+                     ordered_turns AS (
+                         SELECT provider,
+                                analytics_session_id AS session_id,
+                                chain_id,
+                                raw_model_id,
+                                LAG(raw_model_id) OVER (
+                                    PARTITION BY provider COLLATE BINARY,
+                                                 analytics_session_id COLLATE BINARY,
+                                                 chain_id COLLATE BINARY
+                                    ORDER BY observed_at_ms ASC,
+                                             source_ordinal ASC,
+                                             source_record_key COLLATE BINARY ASC,
+                                             source_key COLLATE BINARY ASC,
+                                             id ASC
+                                ) AS previous_model_id
+                         FROM page_scope
+                         WHERE observation_kind = 'turn'
+                     ),
+                     session_switches AS (
+                         SELECT provider,
+                                session_id,
+                                MAX(
+                                    CASE
+                                        WHEN raw_model_id IS NOT NULL
+                                         AND previous_model_id IS NOT NULL
+                                         AND raw_model_id COLLATE BINARY
+                                             != previous_model_id COLLATE BINARY
+                                        THEN 1 ELSE 0
+                                    END
+                                ) AS has_within_chain_switches
+                         FROM ordered_turns
+                         GROUP BY provider COLLATE BINARY,
+                                  session_id COLLATE BINARY
+                     )
+                     SELECT page.provider,
+                            page.session_id,
+                            metadata.cwd,
+                            metadata.hostname,
+                            page.selected_model_tokens,
+                            page.selected_model_turns,
+                            page.last_activity_ms,
+                            primary_model.provider,
+                            primary_model.raw_model_id,
+                            primary_model.distinct_models,
+                            COALESCE(switches.has_within_chain_switches, 0),
+                            chains.chain_count
+                     FROM matching_sessions AS page
+                     JOIN ranked_models AS primary_model
+                       ON primary_model.provider = page.provider
+                      AND primary_model.session_id = page.session_id
+                      AND primary_model.primary_rank = 1
+                     JOIN session_metadata AS metadata
+                       ON metadata.provider = page.provider
+                      AND metadata.session_id = page.session_id
+                     JOIN chain_counts AS chains
+                       ON chains.provider = page.provider
+                      AND chains.session_id = page.session_id
+                     LEFT JOIN session_switches AS switches
+                       ON switches.provider = page.provider
+                      AND switches.session_id = page.session_id
+                     ORDER BY page.last_activity_ms DESC,
+                              page.provider COLLATE BINARY ASC,
+                              page.session_id COLLATE BINARY ASC",
+                )
+                .map_err(|error| format!("Prepare selected-model sessions query: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![
+                        range_start_ms,
+                        range_end_ms,
+                        identity.provider,
+                        identity.model_id,
+                        cursor_last_activity_ms,
+                        cursor_provider,
+                        cursor_session_id,
+                        query_limit
+                    ],
+                    |row| {
+                        Ok(ModelSessionAggregateRow {
+                            provider: row.get(0)?,
+                            session_id: row.get(1)?,
+                            cwd: row.get(2)?,
+                            hostname: row.get(3)?,
+                            selected_model_tokens: row.get(4)?,
+                            selected_model_turns: row.get(5)?,
+                            last_activity_ms: row.get(6)?,
+                            primary_model_provider: row.get(7)?,
+                            primary_model_id: row.get(8)?,
+                            distinct_models: row.get(9)?,
+                            has_within_chain_switches: row.get::<_, i64>(10)? != 0,
+                            chain_count: row.get(11)?,
+                        })
+                    },
+                )
+                .map_err(|error| format!("Query selected-model sessions: {error}"))?;
+
+            let mut aggregate_rows = Vec::with_capacity(page_limit.saturating_add(1));
+            for row in rows {
+                let row =
+                    row.map_err(|error| format!("Read selected-model session row: {error}"))?;
+                if row.selected_model_tokens < 0
+                    || row.selected_model_turns < 0
+                    || row.distinct_models <= 0
+                    || row.chain_count <= 0
+                    || row.last_activity_ms < range_start_ms
+                    || row.last_activity_ms >= range_end_ms
+                {
+                    return Err(ModelSessionsQueryError::Storage(
+                        "Selected-model session aggregate is invalid".to_string(),
+                    ));
+                }
+                aggregate_rows.push(row);
+            }
+            drop(statement);
+
+            let has_more = aggregate_rows.len() > page_limit;
+            if has_more {
+                aggregate_rows.truncate(page_limit);
+            }
+            let next_cursor = if has_more {
+                aggregate_rows
+                    .last()
+                    .map(|row| {
+                        encode_model_sessions_cursor(&ModelSessionsCursorV1 {
+                            range: range.as_str().to_string(),
+                            model_provider: identity.provider.clone(),
+                            model_id: identity.model_id.clone(),
+                            data_revision,
+                            range_start_ms,
+                            range_end_ms,
+                            last_activity_ms: row.last_activity_ms,
+                            provider: row.provider.clone(),
+                            session_id: row.session_id.clone(),
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+
+            let sessions = aggregate_rows
+                .into_iter()
+                .map(|row| {
+                    let display_name =
+                        model_session_display_name(row.cwd.as_deref(), &row.session_id);
+                    Ok(ModelSessionRow {
+                        provider: row.provider,
+                        session_id: row.session_id,
+                        display_name,
+                        cwd: row.cwd,
+                        hostname: row.hostname,
+                        selected_model_tokens: row.selected_model_tokens,
+                        selected_model_turns: row.selected_model_turns,
+                        last_activity_at: model_observation_millis_to_rfc3339(
+                            row.last_activity_ms,
+                            "last_activity_ms",
+                        )?,
+                        primary_model: ModelIdentity {
+                            provider: row.primary_model_provider,
+                            model_id: row.primary_model_id,
+                        },
+                        distinct_models: row.distinct_models,
+                        has_within_chain_switches: row.has_within_chain_switches,
+                        chain_count: row.chain_count,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            tx.commit()
+                .map_err(|error| format!("Commit model sessions read snapshot: {error}"))?;
+
+            Ok(ModelSessionsResponse {
+                identity: identity.clone(),
+                total,
+                next_cursor,
+                sessions,
+            })
+        })()
+    }
+
+    /// Return complete in-range model history for one provider-owned session.
+    ///
+    /// Coverage includes every token-bearing observation, while only ordered
+    /// turns create model/gap segments and switch adjacency. Segment bounds are
+    /// the inclusive timestamps of their first and last represented turns.
+    // @lat: [[backend#Database#Schema#Model Analytics Evidence]]
+    pub(crate) fn get_session_model_history(
+        &self,
+        provider: &str,
+        session_id: &str,
+        range: ModelRange,
+    ) -> Result<SessionModelHistoryResponse, SessionModelHistoryQueryError> {
+        let range_end_ms = Utc::now().timestamp_millis();
+        let range_start_ms = range_end_ms
+            .checked_sub(model_range_duration(range).num_milliseconds())
+            .ok_or_else(|| {
+                SessionModelHistoryQueryError::Storage(
+                    "Model session history range boundary overflow".to_string(),
+                )
+            })?;
+
+        (|| -> Result<SessionModelHistoryResponse, SessionModelHistoryQueryError> {
+            let mut conn = self.conn.lock();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("Begin model session history read snapshot: {error}"))?;
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT observation.chain_id,
+                            observation.parent_chain_id,
+                            observation.agent_id,
+                            observation.is_sidechain,
+                            observation.observed_at_ms,
+                            observation.observation_kind,
+                            observation.raw_model_id,
+                            observation.input_tokens,
+                            observation.output_tokens,
+                            observation.cache_creation_tokens,
+                            observation.cache_read_tokens,
+                            COALESCE(
+                                NULLIF(observation.cwd, ''),
+                                NULLIF(source.cwd, '')
+                            ) AS effective_cwd
+                     FROM model_usage_observations AS observation
+                     JOIN model_observation_sources AS source
+                       ON source.provider = observation.provider
+                      AND source.source_key = observation.source_key
+                     WHERE source.processing_status != 'suppressed'
+                       AND source.suppressed_sha256 IS NULL
+                       AND observation.provider COLLATE BINARY = ?1
+                       AND observation.analytics_session_id COLLATE BINARY = ?2
+                       AND observation.observed_at_ms >= ?3
+                       AND observation.observed_at_ms < ?4
+                     ORDER BY observation.observed_at_ms ASC,
+                              observation.source_ordinal ASC,
+                              observation.source_record_key COLLATE BINARY ASC,
+                              observation.source_key COLLATE BINARY ASC,
+                              observation.id ASC",
+                )
+                .map_err(|error| format!("Prepare model session history query: {error}"))?;
+            let rows = statement
+                .query_map(
+                    params![provider, session_id, range_start_ms, range_end_ms],
+                    |row| {
+                        Ok(SessionModelObservationRow {
+                            chain_id: row.get(0)?,
+                            parent_chain_id: row.get(1)?,
+                            agent_id: row.get(2)?,
+                            is_sidechain: row.get::<_, i64>(3)? != 0,
+                            observed_at_ms: row.get(4)?,
+                            observation_kind: row.get(5)?,
+                            raw_model_id: row.get(6)?,
+                            input_tokens: row.get(7)?,
+                            output_tokens: row.get(8)?,
+                            cache_creation_tokens: row.get(9)?,
+                            cache_read_tokens: row.get(10)?,
+                            effective_cwd: row.get(11)?,
+                        })
+                    },
+                )
+                .map_err(|error| format!("Query model session history: {error}"))?;
+
+            let mut saw_observation = false;
+            let mut display_cwd = None;
+            let mut attributed_tokens = 0_i64;
+            let mut unattributed_tokens = 0_i64;
+            let mut model_stats = BTreeMap::<(String, String), SessionModelStats>::new();
+            let mut chain_accumulators = BTreeMap::<String, SessionModelChainAccumulator>::new();
+
+            for row in rows {
+                let row =
+                    row.map_err(|error| format!("Read model session history row: {error}"))?;
+                saw_observation = true;
+                if row
+                    .effective_cwd
+                    .as_deref()
+                    .is_some_and(|cwd| !cwd.is_empty())
+                {
+                    display_cwd = row.effective_cwd.clone();
+                }
+
+                let token_amount = session_model_observation_token_amount(&row)?;
+                if let Some(token_amount) = token_amount {
+                    let total = if row.raw_model_id.is_some() {
+                        &mut attributed_tokens
+                    } else {
+                        &mut unattributed_tokens
+                    };
+                    checked_add_session_model_value(total, token_amount, "session token total")?;
+                }
+
+                let is_turn = match row.observation_kind.as_str() {
+                    "turn" => true,
+                    "token" => false,
+                    _ => {
+                        return Err(SessionModelHistoryQueryError::Storage(
+                            "Model session history has an invalid observation kind".to_string(),
+                        ));
+                    }
+                };
+                if let Some(model_id) = row.raw_model_id.as_deref() {
+                    let stats = model_stats
+                        .entry((provider.to_owned(), model_id.to_owned()))
+                        .or_default();
+                    if let Some(token_amount) = token_amount {
+                        checked_add_session_model_value(
+                            &mut stats.attributed_tokens,
+                            token_amount,
+                            "primary-model attributed tokens",
+                        )?;
+                    }
+                    if is_turn {
+                        checked_add_session_model_value(
+                            &mut stats.turn_count,
+                            1,
+                            "primary-model turn count",
+                        )?;
+                    }
+                }
+
+                let chain = chain_accumulators
+                    .entry(row.chain_id.clone())
+                    .or_insert_with(|| SessionModelChainAccumulator::new(&row));
+                chain.merge_metadata(&row)?;
+                chain.add_tokens(row.raw_model_id.as_deref(), token_amount)?;
+                if is_turn {
+                    chain.add_turn(
+                        row.raw_model_id.as_deref(),
+                        token_amount,
+                        row.observed_at_ms,
+                    )?;
+                }
+            }
+            drop(statement);
+
+            if !saw_observation {
+                tx.commit().map_err(|error| {
+                    format!("Commit empty model session history snapshot: {error}")
+                })?;
+                return Err(SessionModelHistoryQueryError::NotFound);
+            }
+
+            let distinct_models = i64::try_from(model_stats.len()).map_err(|_| {
+                "Model session history distinct-model count exceeds SQLite INTEGER range"
+                    .to_string()
+            })?;
+            let primary_model = model_stats
+                .iter()
+                .min_by(
+                    |((provider_a, model_id_a), stats_a), ((provider_b, model_id_b), stats_b)| {
+                        stats_b
+                            .attributed_tokens
+                            .cmp(&stats_a.attributed_tokens)
+                            .then_with(|| stats_b.turn_count.cmp(&stats_a.turn_count))
+                            .then_with(|| provider_a.as_bytes().cmp(provider_b.as_bytes()))
+                            .then_with(|| model_id_a.as_bytes().cmp(model_id_b.as_bytes()))
+                    },
+                )
+                .map(|((provider, model_id), _)| ModelIdentity {
+                    provider: provider.clone(),
+                    model_id: model_id.clone(),
+                });
+
+            let mut chain_accumulators = chain_accumulators.into_values().collect::<Vec<_>>();
+            chain_accumulators.sort_by(|left, right| {
+                left.is_sidechain
+                    .cmp(&right.is_sidechain)
+                    .then_with(|| left.first_activity_at_ms.cmp(&right.first_activity_at_ms))
+                    .then_with(|| left.chain_id.as_bytes().cmp(right.chain_id.as_bytes()))
+            });
+
+            let mut switch_count = 0_i64;
+            let mut chains = Vec::with_capacity(chain_accumulators.len());
+            for chain in chain_accumulators {
+                checked_add_session_model_value(
+                    &mut switch_count,
+                    chain.switch_count,
+                    "session switch count",
+                )?;
+                let segments = chain
+                    .segments
+                    .into_iter()
+                    .map(|segment| match segment {
+                        SessionModelSegmentAccumulator::Model {
+                            model_id,
+                            started_at_ms,
+                            ended_at_ms,
+                            turn_count,
+                            attributed_tokens,
+                        } => Ok(SessionModelSegment::Model {
+                            identity: ModelIdentity {
+                                provider: provider.to_owned(),
+                                model_id,
+                            },
+                            started_at: model_observation_millis_to_rfc3339(
+                                started_at_ms,
+                                "segment started_at_ms",
+                            )?,
+                            ended_at: model_observation_millis_to_rfc3339(
+                                ended_at_ms,
+                                "segment ended_at_ms",
+                            )?,
+                            turn_count,
+                            attributed_tokens,
+                        }),
+                        SessionModelSegmentAccumulator::ModelGap {
+                            started_at_ms,
+                            ended_at_ms,
+                            turn_count,
+                        } => Ok(SessionModelSegment::ModelGap {
+                            started_at: model_observation_millis_to_rfc3339(
+                                started_at_ms,
+                                "gap started_at_ms",
+                            )?,
+                            ended_at: model_observation_millis_to_rfc3339(
+                                ended_at_ms,
+                                "gap ended_at_ms",
+                            )?,
+                            turn_count,
+                        }),
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                chains.push(SessionModelChain {
+                    chain_id: chain.chain_id,
+                    parent_chain_id: chain.parent_chain_id,
+                    kind: if chain.is_sidechain {
+                        SessionModelChainKind::Subagent
+                    } else {
+                        SessionModelChainKind::Parent
+                    },
+                    agent_id: chain.agent_id,
+                    switch_count: chain.switch_count,
+                    attributed_tokens: chain.attributed_tokens,
+                    unattributed_tokens: chain.unattributed_tokens,
+                    segments,
+                });
+            }
+
+            let response = SessionModelHistoryResponse {
+                provider: provider.to_owned(),
+                session_id: session_id.to_owned(),
+                display_name: model_session_display_name(display_cwd.as_deref(), session_id),
+                primary_model,
+                distinct_models,
+                switch_count,
+                attributed_tokens,
+                unattributed_tokens,
+                chains,
+            };
+            tx.commit()
+                .map_err(|error| format!("Commit model session history read snapshot: {error}"))?;
+            Ok(response)
+        })()
+    }
+
+    /// Look up one provider-owned source without mutating reconciliation state.
+    #[allow(dead_code)] // T010/T029 consume persisted source inventory.
+    pub(crate) fn get_model_source(
+        &self,
+        provider: IntegrationProvider,
+        source_key: &str,
+    ) -> Result<Option<StoredModelSource>, String> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {MODEL_SOURCE_STATE_COLUMNS}
+             FROM model_observation_sources
+             WHERE provider = ?1 AND source_key = ?2"
+        );
+        let row = conn
+            .query_row(&sql, params![provider.as_str(), source_key], |row| {
+                read_raw_model_source(row)
+            })
+            .optional()
+            .map_err(|error| format!("Read model source {source_key}: {error}"))?;
+
+        row.map(|row| stored_model_source_from_raw(provider, row))
+            .transpose()
+    }
+
+    /// Enumerate only sources owned by one exact provider/root pair.
+    #[allow(dead_code)] // T010/T029 consume persisted source inventory.
+    pub(crate) fn list_model_sources_for_root(
+        &self,
+        provider: IntegrationProvider,
+        source_root_key: &str,
+    ) -> Result<Vec<StoredModelSource>, String> {
+        let conn = self.conn.lock();
+        let sql = format!(
+            "SELECT {MODEL_SOURCE_STATE_COLUMNS}
+             FROM model_observation_sources
+             WHERE provider = ?1 AND source_root_key = ?2
+             ORDER BY source_key"
+        );
+        let mut stmt = conn
+            .prepare_cached(&sql)
+            .map_err(|error| format!("Prepare model source root inventory: {error}"))?;
+        let rows = stmt
+            .query_map(params![provider.as_str(), source_root_key], |row| {
+                read_raw_model_source(row)
+            })
+            .map_err(|error| format!("Read model source root inventory: {error}"))?;
+        let mut sources = Vec::new();
+        for row in rows {
+            let row = row.map_err(|error| format!("Read model source inventory row: {error}"))?;
+            sources.push(stored_model_source_from_raw(provider, row)?);
+        }
+
+        Ok(sources)
+    }
+
+    /// Advance root ownership/generation for an `ok` source whose fast
+    /// fingerprint matched. Observations and successful metadata stay intact.
+    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+    pub(crate) fn mark_model_source_fast_unchanged(
+        &self,
+        source: &NormalizedSource,
+        fast: ModelSourceFastFingerprint,
+        attempted_at_ms: i64,
+    ) -> Result<(), String> {
+        validate_normalized_model_source(source)?;
+        validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
+        if source
+            .mtime_ns
+            .is_some_and(|value| value != fast.mtime_ns())
+            || source
+                .size_bytes
+                .is_some_and(|value| value != fast.size_bytes())
+        {
+            return Err("Normalized source does not match fast fingerprint".to_string());
+        }
+        let source_path = model_source_path_for_storage(&source.path)?;
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE model_observation_sources
+                 SET source_root_key = ?3,
+                     source_path = ?4,
+                     seen_generation = ?5,
+                     last_attempt_at_ms = ?6
+                 WHERE provider = ?1
+                   AND source_key = ?2
+                   AND processing_status = 'ok'
+                   AND suppressed_sha256 IS NULL
+                   AND mtime_ns = ?7
+                   AND size_bytes = ?8",
+                params![
+                    source.provider.as_str(),
+                    source.source_key,
+                    source.source_root_key,
+                    source_path,
+                    source.seen_generation,
+                    attempted_at_ms,
+                    fast.mtime_ns(),
+                    fast.size_bytes(),
+                ],
+            )
+            .map_err(|error| format!("Mark model source fast fingerprint unchanged: {error}"))?;
+        if updated != 1 {
+            return Err(format!(
+                "Model source {} changed before fast fingerprint refresh",
+                source.source_key
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Refresh fast metadata after a full-byte hash matches last-known-good
+    /// content. This never rewrites observation rows or suppression fields.
+    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+    pub(crate) fn refresh_model_source_unchanged_content(
+        &self,
+        source: &NormalizedSource,
+        fingerprint: &ModelSourceFingerprint,
+        attempted_at_ms: i64,
+    ) -> Result<(), String> {
+        validate_normalized_model_source(source)?;
+        validate_model_source_fingerprint(source, fingerprint)?;
+        validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
+        let source_path = model_source_path_for_storage(&source.path)?;
+        let fast = fingerprint.fast();
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE model_observation_sources
+                 SET source_root_key = ?3,
+                     source_path = ?4,
+                     mtime_ns = ?5,
+                     size_bytes = ?6,
+                     last_error = NULL,
+                     seen_generation = ?7,
+                     processing_status = 'ok',
+                     last_attempt_at_ms = ?8
+                 WHERE provider = ?1
+                   AND source_key = ?2
+                   AND content_sha256 = ?9
+                   AND processing_status != 'suppressed'
+                   AND suppressed_sha256 IS NULL",
+                params![
+                    source.provider.as_str(),
+                    source.source_key,
+                    source.source_root_key,
+                    source_path,
+                    fast.mtime_ns(),
+                    fast.size_bytes(),
+                    source.seen_generation,
+                    attempted_at_ms,
+                    fingerprint.content_sha256(),
+                ],
+            )
+            .map_err(|error| format!("Refresh unchanged model source content: {error}"))?;
+        if updated != 1 {
+            return Err(format!(
+                "Model source {} changed before content fingerprint refresh",
+                source.source_key
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Keep an equal-hash suppressed source in the completed-root inventory
+    /// without restoring observations or clearing its suppression hash.
+    #[allow(dead_code)] // T010/T029 consume suppression reconciliation APIs.
+    pub(crate) fn mark_suppressed_model_source_unchanged(
+        &self,
+        source: &NormalizedSource,
+        fingerprint: &ModelSourceFingerprint,
+        attempted_at_ms: i64,
+    ) -> Result<(), String> {
+        validate_normalized_model_source(source)?;
+        validate_model_source_fingerprint(source, fingerprint)?;
+        validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
+        let source_path = model_source_path_for_storage(&source.path)?;
+        let fast = fingerprint.fast();
+        let conn = self.conn.lock();
+        let updated = conn
+            .execute(
+                "UPDATE model_observation_sources
+                 SET source_root_key = ?3,
+                     source_path = ?4,
+                     mtime_ns = ?5,
+                     size_bytes = ?6,
+                     seen_generation = ?7,
+                     processing_status = 'suppressed',
+                     last_attempt_at_ms = ?8
+                 WHERE provider = ?1
+                   AND source_key = ?2
+                   AND suppressed_sha256 = ?9",
+                params![
+                    source.provider.as_str(),
+                    source.source_key,
+                    source.source_root_key,
+                    source_path,
+                    fast.mtime_ns(),
+                    fast.size_bytes(),
+                    source.seen_generation,
+                    attempted_at_ms,
+                    fingerprint.content_sha256(),
+                ],
+            )
+            .map_err(|error| format!("Mark suppressed model source unchanged: {error}"))?;
+        if updated != 1 {
+            return Err(format!(
+                "Model source {} suppression changed before refresh",
+                source.source_key
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Atomically replace one source's complete normalized observation set.
+    /// Parsing and hashing are complete before this short transaction begins.
+    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+    pub(crate) fn replace_model_source(
+        &self,
+        source: &NormalizedSource,
+        observations: &[NormalizedObservation],
+        fingerprint: &ModelSourceFingerprint,
+    ) -> Result<ModelSourceReplacementResult, String> {
+        validate_normalized_model_source(source)?;
+        validate_model_source_fingerprint(source, fingerprint)?;
+        if source.processing_status != SourceProcessingStatus::Ok {
+            return Err("Replacement source processing status must be ok".to_string());
+        }
+        let last_attempt_at_ms = source
+            .last_attempt_at_ms
+            .ok_or_else(|| "Replacement source must include last_attempt_at_ms".to_string())?;
+        let last_success_at_ms = source
+            .last_success_at_ms
+            .ok_or_else(|| "Replacement source must include last_success_at_ms".to_string())?;
+        let prepared_observations = prepare_model_observations(source, observations)?;
+        let source_path = model_source_path_for_storage(&source.path)?;
+        let source_cwd = source
+            .cwd
+            .as_deref()
+            .map(model_source_cwd_for_storage)
+            .transpose()?;
+        let fast = fingerprint.fast();
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Begin model source replacement: {error}"))?;
+        let current_suppression = tx
+            .query_row(
+                "SELECT source.processing_status,
+                        source.suppressed_sha256,
+                        source.content_sha256,
+                        source.last_success_at_ms,
+                        source.observation_count,
+                        EXISTS (
+                            SELECT 1
+                            FROM model_usage_observations observation
+                            WHERE observation.provider = source.provider
+                              AND observation.source_key = source.source_key
+                        )
+                 FROM model_observation_sources source
+                 WHERE source.provider = ?1 AND source.source_key = ?2",
+                params![source.provider.as_str(), source.source_key],
+                |row| {
+                    Ok(CurrentModelSourceSuppression {
+                        processing_status: row.get(0)?,
+                        suppressed_sha256: row.get(1)?,
+                        content_sha256: row.get(2)?,
+                        last_success_at_ms: row.get(3)?,
+                        observation_count: row.get(4)?,
+                        has_observations: row.get::<_, i64>(5)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Recheck model source suppression: {error}"))?;
+        if let Some(current) = current_suppression
+            && (current.processing_status == SourceProcessingStatus::Suppressed.as_str()
+                || current.suppressed_sha256.is_some())
+        {
+            if current.has_observations {
+                return Err(format!(
+                    "Model source suppression invariant violated for {}: suppressed source retains observation rows",
+                    source.source_key
+                ));
+            }
+            let suppression_baseline = current
+                .suppressed_sha256
+                .as_deref()
+                .or(current.content_sha256.as_deref());
+            let outcome = match suppression_baseline {
+                Some(baseline) if baseline == fingerprint.content_sha256() => {
+                    Some(ModelSourceReplacementOutcome::SuppressedUnchanged)
+                }
+                Some(_) => {
+                    // Different content intentionally re-arms this source, but
+                    // suppression remains visible until this transaction commits.
+                    None
+                }
+                None if current.last_success_at_ms.is_none()
+                    && current.observation_count == 0
+                    && !current.has_observations =>
+                {
+                    // No successful content exists to resurrect, so a parsed
+                    // replacement may establish the first durable baseline.
+                    None
+                }
+                None => {
+                    return Err(format!(
+                        "Model source suppression invariant violated for {}: prior successful state has no content hash",
+                        source.source_key
+                    ));
+                }
+            };
+            if let Some(outcome) = outcome {
+                tx.execute(
+                    "UPDATE model_observation_sources
+                     SET source_root_key = ?3,
+                         source_path = ?4,
+                         mtime_ns = ?5,
+                         size_bytes = ?6,
+                         seen_generation = ?7,
+                         processing_status = 'suppressed',
+                         last_attempt_at_ms = ?8,
+                         suppressed_sha256 = COALESCE(
+                             suppressed_sha256, content_sha256
+                         )
+                     WHERE provider = ?1 AND source_key = ?2",
+                    params![
+                        source.provider.as_str(),
+                        source.source_key,
+                        source.source_root_key,
+                        source_path,
+                        fast.mtime_ns(),
+                        fast.size_bytes(),
+                        source.seen_generation,
+                        last_attempt_at_ms,
+                    ],
+                )
+                .map_err(|error| format!("Refresh raced model source suppression: {error}"))?;
+                tx.commit().map_err(|error| {
+                    format!("Commit suppressed model source no-change check: {error}")
+                })?;
+                return Ok(ModelSourceReplacementResult {
+                    outcome,
+                    data_changed: false,
+                    observation_count: 0,
+                });
+            }
+        }
+        tx.execute(
+            "DELETE FROM model_usage_observations
+             WHERE provider = ?1 AND source_key = ?2",
+            params![source.provider.as_str(), source.source_key],
+        )
+        .map_err(|error| format!("Delete replaced model source observations: {error}"))?;
+
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO model_usage_observations (
+                        provider, source_key, source_record_key, source_ordinal,
+                        observation_kind, source_session_id,
+                        analytics_session_id, chain_id, parent_chain_id,
+                        agent_id, turn_id, raw_model_id, cwd, hostname,
+                        is_sidechain, observed_at_ms, input_tokens,
+                        output_tokens, cache_creation_tokens, cache_read_tokens,
+                        model_evidence, token_evidence
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                        ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                        ?22
+                     )",
+                )
+                .map_err(|error| format!("Prepare model source observation insert: {error}"))?;
+            for prepared in &prepared_observations {
+                let observation = prepared.observation;
+                let metadata = observation.metadata();
+                stmt.execute(params![
+                    source.provider.as_str(),
+                    source.source_key,
+                    metadata.source_record_key,
+                    prepared.source_ordinal,
+                    metadata.kind.as_str(),
+                    metadata.source_session_id,
+                    metadata.analytics_session_id,
+                    metadata.chain_id,
+                    metadata.parent_chain_id,
+                    metadata.agent_id,
+                    metadata.turn_id,
+                    observation.raw_model_id(),
+                    prepared.cwd,
+                    metadata.hostname,
+                    i64::from(metadata.is_sidechain),
+                    metadata.observed_at_ms,
+                    observation.input_tokens(),
+                    observation.output_tokens(),
+                    observation.cache_creation_tokens(),
+                    observation.cache_read_tokens(),
+                    observation.model_evidence().as_str(),
+                    observation.token_evidence().as_str(),
+                ])
+                .map_err(|error| format!("Insert model source observation: {error}"))?;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO model_observation_sources (
+                provider, source_key, source_root_key, source_path,
+                source_session_id, analytics_session_id, chain_id,
+                parent_chain_id, agent_id, is_sidechain, cwd, hostname,
+                first_activity_at_ms, last_activity_at_ms, mtime_ns,
+                size_bytes, content_sha256, last_error, suppressed_sha256,
+                suppressed_at_ms, seen_generation, processing_status,
+                observation_count, last_attempt_at_ms, last_success_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, NULL, NULL, NULL, ?18, 'ok',
+                ?19, ?20, ?21
+             )
+             ON CONFLICT(provider, source_key) DO UPDATE SET
+                source_root_key = excluded.source_root_key,
+                source_path = excluded.source_path,
+                source_session_id = excluded.source_session_id,
+                analytics_session_id = excluded.analytics_session_id,
+                chain_id = excluded.chain_id,
+                parent_chain_id = excluded.parent_chain_id,
+                agent_id = excluded.agent_id,
+                is_sidechain = excluded.is_sidechain,
+                cwd = excluded.cwd,
+                hostname = excluded.hostname,
+                first_activity_at_ms = excluded.first_activity_at_ms,
+                last_activity_at_ms = excluded.last_activity_at_ms,
+                mtime_ns = excluded.mtime_ns,
+                size_bytes = excluded.size_bytes,
+                content_sha256 = excluded.content_sha256,
+                last_error = NULL,
+                suppressed_sha256 = NULL,
+                suppressed_at_ms = NULL,
+                seen_generation = excluded.seen_generation,
+                processing_status = 'ok',
+                observation_count = excluded.observation_count,
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_success_at_ms = excluded.last_success_at_ms",
+            params![
+                source.provider.as_str(),
+                source.source_key,
+                source.source_root_key,
+                source_path,
+                source.source_session_id,
+                source.analytics_session_id,
+                source.chain_id,
+                source.parent_chain_id,
+                source.agent_id,
+                i64::from(source.is_sidechain),
+                source_cwd,
+                source.hostname,
+                source.first_activity_at_ms,
+                source.last_activity_at_ms,
+                fast.mtime_ns(),
+                fast.size_bytes(),
+                fingerprint.content_sha256(),
+                source.seen_generation,
+                source.observation_count,
+                last_attempt_at_ms,
+                last_success_at_ms,
+            ],
+        )
+        .map_err(|error| format!("Upsert replaced model source metadata: {error}"))?;
+        bump_model_data_revision(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model source replacement: {error}"))?;
+
+        Ok(ModelSourceReplacementResult {
+            outcome: ModelSourceReplacementOutcome::Replaced,
+            data_changed: true,
+            observation_count: source.observation_count,
+        })
+    }
+
+    /// Mark a source attempt failed while retaining last-known-good rows and
+    /// preserving any durable suppression until replacement commits.
+    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
+    pub(crate) fn mark_model_source_failure(
+        &self,
+        source: &NormalizedSource,
+        fast: Option<ModelSourceFastFingerprint>,
+        diagnostic: &ModelUsageDiagnostic,
+        attempted_at_ms: i64,
+    ) -> Result<(), String> {
+        validate_normalized_model_source(source)?;
+        validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
+        if let Some(fast) = fast
+            && (source
+                .mtime_ns
+                .is_some_and(|value| value != fast.mtime_ns())
+                || source
+                    .size_bytes
+                    .is_some_and(|value| value != fast.size_bytes()))
+        {
+            return Err("Failed source does not match fast fingerprint".to_string());
+        }
+        let source_path = model_source_path_for_storage(&source.path)?;
+        let source_cwd = source
+            .cwd
+            .as_deref()
+            .map(model_source_cwd_for_storage)
+            .transpose()?;
+        let mtime_ns = fast.map(ModelSourceFastFingerprint::mtime_ns);
+        let size_bytes = fast.map(ModelSourceFastFingerprint::size_bytes);
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin model source failure update: {error}"))?;
+        tx.execute(
+            "INSERT INTO model_observation_sources (
+                provider, source_key, source_root_key, source_path,
+                source_session_id, analytics_session_id, chain_id,
+                parent_chain_id, agent_id, is_sidechain, cwd, hostname,
+                first_activity_at_ms, last_activity_at_ms, mtime_ns,
+                size_bytes, content_sha256, last_error, suppressed_sha256,
+                suppressed_at_ms, seen_generation, processing_status,
+                observation_count, last_attempt_at_ms, last_success_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, NULL, ?17, NULL, NULL, ?18, 'failed',
+                0, ?19, NULL
+             )
+             ON CONFLICT(provider, source_key) DO UPDATE SET
+                source_root_key = excluded.source_root_key,
+                source_path = excluded.source_path,
+                mtime_ns = COALESCE(excluded.mtime_ns, model_observation_sources.mtime_ns),
+                size_bytes = COALESCE(excluded.size_bytes, model_observation_sources.size_bytes),
+                last_error = excluded.last_error,
+                seen_generation = excluded.seen_generation,
+                processing_status = CASE
+                    WHEN model_observation_sources.processing_status = 'suppressed'
+                         OR model_observation_sources.suppressed_sha256 IS NOT NULL
+                        THEN 'suppressed'
+                    WHEN model_observation_sources.last_success_at_ms IS NOT NULL
+                         OR model_observation_sources.content_sha256 IS NOT NULL
+                         OR model_observation_sources.observation_count > 0
+                        THEN 'stale'
+                    ELSE 'failed'
+                END,
+                last_attempt_at_ms = excluded.last_attempt_at_ms",
+            params![
+                source.provider.as_str(),
+                source.source_key,
+                source.source_root_key,
+                source_path,
+                source.source_session_id,
+                source.analytics_session_id,
+                source.chain_id,
+                source.parent_chain_id,
+                source.agent_id,
+                i64::from(source.is_sidechain),
+                source_cwd,
+                source.hostname,
+                source.first_activity_at_ms,
+                source.last_activity_at_ms,
+                mtime_ns,
+                size_bytes,
+                diagnostic.as_str(),
+                source.seen_generation,
+                attempted_at_ms,
+            ],
+        )
+        .map_err(|error| format!("Mark model source processing failure: {error}"))?;
+        // A first failed source can still add unsuppressed retained-session
+        // ownership, so conservatively invalidate active pages on every
+        // committed failure-state write.
+        bump_model_data_revision(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("Commit model source processing failure: {error}"))?;
+
+        Ok(())
+    }
+
+    /// Prune sources absent from one explicitly completed provider/root scan.
+    /// Suppressed rows are eligible because completion proves physical absence.
+    #[allow(dead_code)] // T010 consumes completed-root reconciliation APIs.
+    pub(crate) fn prune_model_sources_for_completed_root(
+        &self,
+        completed_root: &CompletedModelSourceRoot,
+    ) -> Result<ModelSourcePruneResult, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin completed model source root prune: {error}"))?;
+        let sources_pruned = delete_model_observation_sources_for_root_in_transaction(
+            &tx,
+            completed_root.provider().as_str(),
+            completed_root.source_root_key(),
+            completed_root.generation(),
+        )?;
+        if sources_pruned != 0 {
+            bump_model_data_revision(&tx)?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Commit completed model source root prune: {error}"))?;
+
+        Ok(ModelSourcePruneResult {
+            data_changed: sources_pruned != 0,
+            sources_pruned,
+        })
     }
 
     pub fn store_snapshot(&self, buckets: &[UsageBucket]) -> Result<(), String> {
@@ -4299,11 +8165,46 @@ impl Storage {
         }
     }
 
-    pub fn delete_host_data(&self, hostname: &str) -> Result<u64, String> {
+    pub fn delete_host_data(&self, hostname: &str) -> Result<DataMutationResult, String> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Transaction error: {e}"))?;
+
+        // Model evidence follows retained source/session lifecycle, not the
+        // token-hourly rollup. Delete children explicitly, then leave the
+        // retained source fingerprint suppressed so unchanged history cannot
+        // reappear during retry.
+        let model_observation_count = tx
+            .execute(
+                "DELETE FROM model_usage_observations
+                 WHERE (provider, source_key) IN (
+                     SELECT provider, source_key
+                     FROM model_observation_sources
+                     WHERE hostname = ?1
+                 )",
+                params![hostname],
+            )
+            .map_err(|e| format!("Delete host model observations error: {e}"))?;
+        let suppressed_at_ms = Utc::now().timestamp_millis();
+        let model_source_count = tx
+            .execute(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed',
+                     suppressed_sha256 = COALESCE(
+                         suppressed_sha256, content_sha256
+                     ),
+                     suppressed_at_ms = COALESCE(suppressed_at_ms, ?2)
+                 WHERE hostname = ?1
+                   AND (
+                       processing_status != 'suppressed'
+                       OR suppressed_at_ms IS NULL
+                       OR (suppressed_sha256 IS NULL
+                           AND content_sha256 IS NOT NULL)
+                   )",
+                params![hostname, suppressed_at_ms],
+            )
+            .map_err(|e| format!("Suppress host model sources error: {e}"))?;
 
         // Feature 008: cascade session_events for every session that lived
         // on this host. session_events keys on (provider, session_id), so
@@ -4361,20 +8262,64 @@ impl Storage {
             )
             .map_err(|e| format!("Delete hourly error: {e}"))?;
 
+        if model_observation_count != 0 || model_source_count != 0 {
+            bump_model_data_revision(&tx)?;
+        }
+
         tx.commit().map_err(|e| format!("Commit error: {e}"))?;
 
-        Ok((snap_count + hourly_count + event_count + hook_count) as u64)
+        Ok(DataMutationResult {
+            affected_rows: (snap_count + hourly_count + event_count + hook_count) as u64,
+            model_data_changed: model_observation_count != 0 || model_source_count != 0,
+        })
     }
 
     pub fn delete_session_data(
         &self,
         provider: IntegrationProvider,
         session_id: &str,
-    ) -> Result<u64, String> {
+    ) -> Result<DataMutationResult, String> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Delete session transaction error: {e}"))?;
+
+        // A visible session is the resolved analytics/root session. Matching
+        // that identity removes every parent and subagent source without
+        // conflating equal native IDs reported by different providers.
+        let model_observation_count = tx
+            .execute(
+                "DELETE FROM model_usage_observations
+                 WHERE provider = ?1
+                   AND source_key IN (
+                       SELECT source_key
+                       FROM model_observation_sources
+                       WHERE provider = ?1
+                         AND analytics_session_id = ?2
+                   )",
+                params![provider.as_str(), session_id],
+            )
+            .map_err(|e| format!("Delete session model observations error: {e}"))?;
+        let suppressed_at_ms = Utc::now().timestamp_millis();
+        let model_source_count = tx
+            .execute(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed',
+                     suppressed_sha256 = COALESCE(
+                         suppressed_sha256, content_sha256
+                     ),
+                     suppressed_at_ms = COALESCE(suppressed_at_ms, ?3)
+                 WHERE provider = ?1
+                   AND analytics_session_id = ?2
+                   AND (
+                       processing_status != 'suppressed'
+                       OR suppressed_at_ms IS NULL
+                       OR (suppressed_sha256 IS NULL
+                           AND content_sha256 IS NOT NULL)
+                   )",
+                params![provider.as_str(), session_id, suppressed_at_ms],
+            )
+            .map_err(|e| format!("Suppress session model sources error: {e}"))?;
 
         let token_count = tx
             .execute(
@@ -4409,17 +8354,28 @@ impl Storage {
             )
             .map_err(|e| format!("Delete hook_invocations error: {e}"))?;
 
+        if model_observation_count != 0 || model_source_count != 0 {
+            bump_model_data_revision(&tx)?;
+        }
+
         tx.commit()
             .map_err(|e| format!("Delete session commit error: {e}"))?;
 
-        Ok((token_count + skill_count + event_count + hook_count) as u64)
+        Ok(DataMutationResult {
+            affected_rows: (token_count + skill_count + event_count + hook_count) as u64,
+            model_data_changed: model_observation_count != 0 || model_source_count != 0,
+        })
     }
 
-    pub fn delete_project_data(&self, cwd: &str) -> Result<u64, String> {
+    pub fn delete_project_data(&self, cwd: &str) -> Result<DataMutationResult, String> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Begin delete_project_data transaction: {e}"))?;
+
+        let suppressed_at_ms = Utc::now().timestamp_millis();
+        let (model_observation_count, model_source_count) =
+            suppress_project_model_sources_in_transaction(&tx, cwd, suppressed_at_ms)?;
 
         // Feature 008: cascade session_events for every session that lived
         // under this cwd. As in `delete_host_data`, the subquery resolving
@@ -4453,13 +8409,24 @@ impl Storage {
             .execute("DELETE FROM hook_invocations WHERE cwd = ?1", params![cwd])
             .map_err(|e| format!("Delete hook_invocations error: {e}"))?;
 
+        if model_observation_count != 0 || model_source_count != 0 {
+            bump_model_data_revision(&tx)?;
+        }
+
         tx.commit()
             .map_err(|e| format!("Commit delete_project_data: {e}"))?;
 
-        Ok((token_count + skill_count + event_count + hook_count) as u64)
+        Ok(DataMutationResult {
+            affected_rows: (token_count + skill_count + event_count + hook_count) as u64,
+            model_data_changed: model_observation_count != 0 || model_source_count != 0,
+        })
     }
 
-    pub fn rename_project(&self, old_cwd: &str, new_cwd: &str) -> Result<u64, String> {
+    pub fn rename_project(
+        &self,
+        old_cwd: &str,
+        new_cwd: &str,
+    ) -> Result<DataMutationResult, String> {
         let new_cwd = new_cwd.trim();
         if new_cwd.is_empty() {
             return Err("New project path cannot be empty".to_string());
@@ -4486,9 +8453,29 @@ impl Storage {
         )
         .map_err(|e| format!("Update observations error: {e}"))?;
 
+        let model_observation_count = tx
+            .execute(
+                "UPDATE model_usage_observations SET cwd = ?2 WHERE cwd = ?1",
+                params![old_cwd, new_cwd],
+            )
+            .map_err(|e| format!("Update model observations error: {e}"))?;
+        let model_source_count = tx
+            .execute(
+                "UPDATE model_observation_sources SET cwd = ?2 WHERE cwd = ?1",
+                params![old_cwd, new_cwd],
+            )
+            .map_err(|e| format!("Update model sources error: {e}"))?;
+
+        if model_observation_count != 0 || model_source_count != 0 {
+            bump_model_data_revision(&tx)?;
+        }
+
         tx.commit().map_err(|e| format!("Commit error: {e}"))?;
 
-        Ok(snap_count as u64)
+        Ok(DataMutationResult {
+            affected_rows: snap_count as u64,
+            model_data_changed: model_observation_count != 0 || model_source_count != 0,
+        })
     }
 
     pub fn get_project_provider_map(

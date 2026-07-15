@@ -657,7 +657,212 @@ export interface SessionContext {
 
 // Analytics redesign types
 
-export type AnalyticsTab = "now" | "trends" | "charts" | "context";
+export type ModelRange = "1h" | "24h" | "7d" | "30d";
+
+export interface ModelIdentity {
+  provider: string;
+  modelId: string;
+}
+
+declare const modelIdentityKeyBrand: unique symbol;
+
+/**
+ * Stable frontend key for an opaque provider/model pair. The branded type
+ * prevents callers from accidentally substituting a delimiter-built string.
+ */
+export type ModelIdentityKey = string & {
+  readonly [modelIdentityKeyBrand]: true;
+};
+
+/**
+ * JSON tuple encoding preserves string boundaries and cannot collide when
+ * provider or model IDs contain delimiters or other arbitrary characters.
+ */
+export function modelIdentityKey(identity: ModelIdentity): ModelIdentityKey {
+  return JSON.stringify([identity.provider, identity.modelId]) as ModelIdentityKey;
+}
+
+export type ModelBackfillTrigger =
+  | "migration"
+  | "startup_resume"
+  | "retry"
+  | "reconcile";
+
+export type ModelBackfillState =
+  | "pending"
+  | "running"
+  | "complete"
+  | "partial"
+  | "failed";
+
+export interface ModelBackfillStatus {
+  generation: number;
+  trigger: ModelBackfillTrigger;
+  status: ModelBackfillState;
+  totalRoots: number;
+  completedRoots: number;
+  failedRoots: number;
+  inventoryComplete: boolean;
+  totalSources: number;
+  processedSources: number;
+  failedSources: number;
+  skippedSources: number;
+  remainingSources: number;
+  observationsWritten: number;
+  startedAt: string | null;
+  updatedAt: string;
+  finishedAt: string | null;
+  lastError: string | null;
+}
+
+export interface ModelAnalyticsScope {
+  globalSessionCount: number;
+  scopedSessionCount: number;
+  scopedEvidenceCount: number;
+  inventoryComplete: boolean;
+  scopeFinal: boolean;
+}
+
+export interface ModelAnalyticsSummary {
+  attributedTokens: number;
+  unattributedTokens: number;
+  totalTokens: number;
+  attributedCoveragePercent: number | null;
+  distinctModels: number;
+  multiModelSessions: number;
+}
+
+export interface ModelUsageRow {
+  identity: ModelIdentity;
+  attributedTokens: number;
+  attributedSharePercent: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  observedTurns: number;
+  sessionCount: number;
+  cacheReadSharePercent: number | null;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+export interface ModelAnalyticsResponse {
+  generatedAt: string;
+  range: ModelRange;
+  provider: string | null;
+  representedProviders: string[];
+  scope: ModelAnalyticsScope;
+  summary: ModelAnalyticsSummary;
+  models: ModelUsageRow[];
+  backfill: ModelBackfillStatus;
+}
+
+export interface ModelHistoryPoint {
+  bucketStart: string;
+  bucketEnd: string;
+  attributedTokens: number;
+  unattributedTokens: number;
+  selectedModelTokens: number | null;
+}
+
+export interface ModelHistoryResponse {
+  generatedAt: string;
+  range: ModelRange;
+  provider: string | null;
+  selectedModel: ModelIdentity | null;
+  bucketSeconds: number;
+  points: ModelHistoryPoint[];
+}
+
+export interface ModelSessionRow {
+  provider: string;
+  sessionId: string;
+  displayName: string;
+  cwd: string | null;
+  hostname: string | null;
+  selectedModelTokens: number;
+  selectedModelTurns: number;
+  lastActivityAt: string;
+  primaryModel: ModelIdentity;
+  distinctModels: number;
+  hasWithinChainSwitches: boolean;
+  chainCount: number;
+}
+
+export interface ModelSessionsResponse {
+  identity: ModelIdentity;
+  total: number;
+  nextCursor: string | null;
+  sessions: ModelSessionRow[];
+}
+
+export interface SessionModelSegmentModel {
+  kind: "model";
+  identity: ModelIdentity;
+  startedAt: string;
+  endedAt: string;
+  turnCount: number;
+  attributedTokens: number;
+}
+
+export interface SessionModelSegmentGap {
+  kind: "modelGap";
+  startedAt: string;
+  endedAt: string;
+  turnCount: number;
+}
+
+export type SessionModelSegment =
+  | SessionModelSegmentModel
+  | SessionModelSegmentGap;
+
+export type SessionModelChainKind = "parent" | "subagent";
+
+export interface SessionModelChain {
+  chainId: string;
+  parentChainId: string | null;
+  kind: SessionModelChainKind;
+  agentId: string | null;
+  switchCount: number;
+  attributedTokens: number;
+  unattributedTokens: number;
+  segments: SessionModelSegment[];
+}
+
+export interface SessionModelHistoryResponse {
+  provider: string;
+  sessionId: string;
+  displayName: string;
+  primaryModel: ModelIdentity | null;
+  distinctModels: number;
+  switchCount: number;
+  attributedTokens: number;
+  unattributedTokens: number;
+  chains: SessionModelChain[];
+}
+
+export interface ModelAnalyticsUpdatedEvent {
+  generation: number;
+  status: ModelBackfillState;
+  dataChanged: boolean;
+  updatedAt: string;
+}
+
+export type ModelAnalyticsErrorCode =
+  | "invalid_range"
+  | "invalid_provider"
+  | "invalid_model_id"
+  | "invalid_cursor"
+  | "not_found"
+  | "storage_error";
+
+export interface ModelAnalyticsError {
+  code: ModelAnalyticsErrorCode;
+  message: string;
+}
+
+export type AnalyticsTab = "now" | "trends" | "charts" | "models" | "context";
 
 export type ContextSavingsEstimateConfidence =
 	| "exact"

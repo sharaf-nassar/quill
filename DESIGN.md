@@ -302,10 +302,20 @@ shape, color logic, and states never change between the two.
 - **Range tabs (1H / 24H / 7D / 30D):** a segmented group on a `fill-ghost` ground, 6px
   radius, 2px inset. The active tab fills to `fill-hover` with `readout` text; the
   group dims to 35% opacity when a selection elsewhere overrides it.
-- **Analytics tabs (Now / Trends / Charts / Context):** underline indicator, never a
-  pill. A 2px bottom border, transparent by default, that takes the tab's own accent
-  when active (`signal-blue`, `signal-violet`, `meter-green`, `caution-amber`). Active
-  label brightens to `readout-bright`.
+- **Analytics tabs (Now / Trends / Charts / Models / Context):** underline
+  indicator, never a pill. A 2px bottom border is transparent by default and
+  appears when active. Models uses `signal-blue` as interactive selection chrome;
+  this accent never colors raw model identifiers or implies model-family identity.
+  Provider badges retain fixed provider hues, model IDs remain neutral, and the
+  five-tab layout scrolls horizontally without truncating labels. Active labels
+  brighten to `readout-bright`.
+- **Model history focus:** the selected-model chart series uses `signal-blue` and
+  a visible "Selected model" label because blue means current selection. Every
+  selected model uses that same treatment; provider badges alone carry provider
+  identity, and no raw model ID receives a generated hue.
+- **Range/provider filter semantics:** use separately labeled native-button groups
+  with `aria-pressed`; these are filters, not nested tablists. Chart buckets expose
+  the same bounds and series values in a visually hidden semantic table.
 
 ### Chips & Badges
 - **Provider badge:** a 999px pill, 9px uppercase, 1px 6px. Background is a ~10% tint of

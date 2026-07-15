@@ -61,6 +61,7 @@ export function useAnalyticsData(
   const [history, setHistory] = useState<DataPoint[]>([]);
   const [stats, setStats] = useState<BucketStats | null>(null);
   const [snapshotCount, setSnapshotCount] = useState(0);
+  const [snapshotCountReady, setSnapshotCountReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -106,9 +107,19 @@ export function useAnalyticsData(
           )
         : [];
 
-      const [historyArrays, countData, statsArrays] = await Promise.all([
+      const snapshotCountPromise = invoke<number>("get_snapshot_count").then(
+        (countData) => {
+          if (requestId === requestIdRef.current) {
+            setSnapshotCount(countData);
+            setSnapshotCountReady(true);
+          }
+          return countData;
+        },
+      );
+
+      const [historyArrays, , statsArrays] = await Promise.all([
         Promise.all(historyPromises),
-        invoke<number>("get_snapshot_count"),
+        snapshotCountPromise,
         Promise.all(statsPromises),
       ]);
 
@@ -117,7 +128,6 @@ export function useAnalyticsData(
       setHistory(
         historyArrays.length > 0 ? mergeHistories(historyArrays) : [],
       );
-      setSnapshotCount(countData);
 
       if (hasBucket && current && statsArrays.length > 0) {
         setStats(mergeStats(statsArrays, current));
@@ -149,6 +159,7 @@ export function useAnalyticsData(
     history,
     stats,
     snapshotCount,
+    snapshotCountReady,
     loading,
     error,
     refresh: fetchData,

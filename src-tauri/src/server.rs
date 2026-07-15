@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -390,7 +391,7 @@ fn process_session_notify_payload(
     session_index: Arc<sessions::SessionIndex>,
     payload: SessionNotifyPayload,
 ) -> Result<usize, String> {
-    let path = std::path::PathBuf::from(&payload.jsonl_path);
+    let path = PathBuf::from(&payload.jsonl_path);
 
     let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
     if let Some(git_branch) = payload
@@ -415,7 +416,7 @@ fn process_session_notify_payload(
         .or_else(|| extracted.project_name.clone())
         .or_else(|| {
             payload.cwd.as_deref().and_then(|cwd| {
-                std::path::Path::new(cwd)
+                Path::new(cwd)
                     .file_name()
                     .and_then(|name| name.to_str())
                     .map(|name| name.to_string())
@@ -1133,22 +1134,70 @@ async fn post_session_notify(
         return (StatusCode::BAD_REQUEST, "Invalid jsonl_path".to_string());
     }
 
-    let path = std::path::Path::new(&payload.jsonl_path);
-    if !path.exists() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "jsonl_path does not exist".to_string(),
-        );
-    }
+    let provider = payload.provider;
+    let jsonl_path = PathBuf::from(&payload.jsonl_path);
+    let model_source = match tokio::task::spawn_blocking(move || {
+        sessions::validate_retained_notify_source(provider, &jsonl_path)
+    })
+    .await
+    {
+        Ok(Ok(source)) => source,
+        Ok(Err(sessions::RetainedNotifySourceValidationError::Invalid(message))) => {
+            return (StatusCode::BAD_REQUEST, message.to_string());
+        }
+        Ok(Err(sessions::RetainedNotifySourceValidationError::Unavailable(message))) => {
+            if state.session_index.is_some() {
+                queue_session_notify(state.clone(), payload);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Session search queued; {message}"),
+                );
+            }
+            return (StatusCode::SERVICE_UNAVAILABLE, message.to_string());
+        }
+        Err(error) => {
+            log::error!("Session notify source validation task failed: {error}");
+            if state.session_index.is_some() {
+                queue_session_notify(state.clone(), payload);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session search queued; retained transcript validation failed".to_string(),
+                );
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Retained transcript validation failed".to_string(),
+            );
+        }
+    };
+
+    let model_admission_error = model_source
+        .and_then(|source| crate::enqueue_model_usage_live_source(&state.app_handle, source).err());
 
     if state.session_index.is_none() {
+        if let Some(error) = model_admission_error {
+            log::error!(
+                "Failed to admit retained transcript while session index was unavailable: {error}"
+            );
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Session index not available".to_string(),
         );
     }
 
+    // Model-source admission must happen before the existing session-keyed
+    // coalescer. Even if runner state is temporarily unavailable, retain the
+    // already-valid Session Search notification and report the partial failure
+    // so the caller can retry model admission.
     queue_session_notify(state.clone(), payload);
+    if let Some(error) = model_admission_error {
+        log::error!("Failed to admit retained transcript to model queue: {error}");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Session search queued; model analytics queue unavailable".to_string(),
+        );
+    }
     (StatusCode::ACCEPTED, "queued".to_string())
 }
 

@@ -81,7 +81,7 @@ if (( CLEAN )); then
 	rm -rf "$SANDBOX" || { echo "[demo] ERROR: could not clean $SANDBOX" >&2; exit 2; }
 fi
 
-mkdir -p "$SANDBOX/data" "$SANDBOX/rules" "$SANDBOX/projects" || {
+mkdir -p "$SANDBOX/data" "$SANDBOX/rules" "$SANDBOX/projects" "$SANDBOX/codex-sessions" || {
 	echo "[demo] ERROR: could not create sandbox dirs under $SANDBOX" >&2
 	exit 2
 }
@@ -90,11 +90,13 @@ export QUILL_DEMO_MODE=1
 export QUILL_DATA_DIR="$SANDBOX/data"
 export QUILL_RULES_DIR="$SANDBOX/rules"
 export QUILL_CLAUDE_PROJECTS_DIR="$SANDBOX/projects"
+export QUILL_CODEX_SESSIONS_DIR="$SANDBOX/codex-sessions"
 
 echo "[demo] sandbox at $SANDBOX" >&2
 echo "[demo] data:     $QUILL_DATA_DIR" >&2
 echo "[demo] rules:    $QUILL_RULES_DIR" >&2
 echo "[demo] projects: $QUILL_CLAUDE_PROJECTS_DIR" >&2
+echo "[demo] codex:    $QUILL_CODEX_SESSIONS_DIR" >&2
 
 # ── Seed ──────────────────────────────────────────────────────────────────────
 
@@ -102,6 +104,7 @@ if ! python3 "$REPO_ROOT/scripts/populate_dummy_data.py" \
 		--data-dir "$QUILL_DATA_DIR" \
 		--rules-dir "$QUILL_RULES_DIR" \
 		--projects-dir "$QUILL_CLAUDE_PROJECTS_DIR" \
+		--codex-sessions-dir "$QUILL_CODEX_SESSIONS_DIR" \
 		--no-backup \
 		--quiet; then
 	echo "[demo] ERROR: seeder failed; sandbox left at $SANDBOX for inspection" >&2

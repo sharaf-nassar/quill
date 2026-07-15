@@ -13,6 +13,816 @@ use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::integrations::IntegrationProvider;
 
+const CLAUDE_SOURCE_ROOT_KEY: &str = "claude:projects";
+const CODEX_SOURCE_ROOT_KEY: &str = "codex:sessions";
+const ROOT_DIAGNOSTIC_MAX_CHARS: usize = 240;
+
+/// One provider-owned filesystem root that may contain retained transcripts.
+///
+/// `resolved_root_path` records the path selected by `data_paths`, including
+/// demo overrides. Existing roots also carry their canonical filesystem path.
+#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderSourceRoot {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_root_key: &'static str,
+    pub(crate) resolved_root_path: PathBuf,
+    pub(crate) canonical_root_path: Option<PathBuf>,
+    pub(crate) outcome: ProviderRootEnumerationOutcome,
+    pub(crate) sources: Vec<DiscoveredRetainedJsonlSource>,
+}
+
+/// Whether a provider root was enumerated completely.
+///
+/// A failed root may still contain sources found before the filesystem error.
+/// Diagnostics are bounded and intentionally omit raw paths and OS messages.
+#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderRootEnumerationOutcome {
+    Complete,
+    Failed { diagnostic: String },
+}
+
+/// A retained JSONL source discovered from a provider-owned filesystem root.
+///
+/// The source key is derived from the provider-qualified root key and the
+/// canonical path, preventing Claude and Codex paths from colliding.
+#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveredRetainedJsonlSource {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_root_key: &'static str,
+    pub(crate) source_key: String,
+    pub(crate) filesystem_path: PathBuf,
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) layout_hint: RetainedJsonlSourceLayoutHint,
+}
+
+/// Filesystem-layout facts available without reading transcript contents.
+#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedJsonlSourceLayoutHint {
+    ClaudeParent { default_project: String },
+    ClaudeSubagent { default_project: String },
+    CodexTranscript,
+}
+
+/// Bounded failure returned while validating one hook-notified transcript.
+///
+/// Invalid candidates are caller errors. Unavailable validation means local
+/// filesystem state prevented Quill from proving source ownership safely.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedNotifySourceValidationError {
+    Invalid(&'static str),
+    Unavailable(&'static str),
+}
+
+#[derive(Debug)]
+struct RetainedJsonlCandidate {
+    filesystem_path: PathBuf,
+}
+
+/// Validate one notified path without walking either provider transcript tree.
+///
+/// Claude and Codex source identity comes only from the configured provider
+/// root, canonical containment, and the same layout classifier used by full
+/// inventory. MiniMax has no model adapter and retains its legacy search-only
+/// behavior: the target must remain locally resolvable, but has no provider
+/// root or layout requirement.
+pub(crate) fn validate_retained_notify_source(
+    provider: IntegrationProvider,
+    candidate_path: &Path,
+) -> Result<Option<DiscoveredRetainedJsonlSource>, RetainedNotifySourceValidationError> {
+    if provider == IntegrationProvider::MiniMax {
+        let canonical_path = canonicalize_notify_candidate(provider, candidate_path)?;
+        std::fs::metadata(&canonical_path).map_err(|error| {
+            log_notify_validation_io_error(
+                provider,
+                "inspect legacy search-only notify target",
+                &canonical_path,
+                &error,
+            );
+            match error.kind() {
+                std::io::ErrorKind::NotFound => {
+                    RetainedNotifySourceValidationError::Invalid("jsonl_path does not exist")
+                }
+                _ => RetainedNotifySourceValidationError::Unavailable(
+                    "Session transcript validation is temporarily unavailable",
+                ),
+            }
+        })?;
+        return Ok(None);
+    }
+
+    if candidate_path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
+        return Err(RetainedNotifySourceValidationError::Invalid(
+            "jsonl_path must identify a retained JSONL transcript",
+        ));
+    }
+
+    let (source_root_key, resolved_root_path) = match provider {
+        IntegrationProvider::Claude => (
+            CLAUDE_SOURCE_ROOT_KEY,
+            crate::data_paths::resolve_claude_projects_dir(),
+        ),
+        IntegrationProvider::Codex => (
+            CODEX_SOURCE_ROOT_KEY,
+            crate::data_paths::resolve_codex_sessions_dir(),
+        ),
+        IntegrationProvider::MiniMax => unreachable!("MiniMax returned above"),
+    };
+
+    match std::fs::symlink_metadata(&resolved_root_path) {
+        Ok(_) => {}
+        Err(error) => {
+            log_notify_validation_io_error(
+                provider,
+                "inspect configured transcript root",
+                &resolved_root_path,
+                &error,
+            );
+            return Err(if error.kind() == std::io::ErrorKind::NotFound {
+                RetainedNotifySourceValidationError::Invalid(
+                    "Configured retained transcript root does not exist",
+                )
+            } else {
+                RetainedNotifySourceValidationError::Unavailable(
+                    "Retained transcript validation is temporarily unavailable",
+                )
+            });
+        }
+    }
+
+    let root_metadata = std::fs::metadata(&resolved_root_path).map_err(|error| {
+        log_notify_validation_io_error(
+            provider,
+            "follow configured transcript root",
+            &resolved_root_path,
+            &error,
+        );
+        RetainedNotifySourceValidationError::Unavailable(
+            "Retained transcript validation is temporarily unavailable",
+        )
+    })?;
+    if !root_metadata.is_dir() {
+        return Err(RetainedNotifySourceValidationError::Unavailable(
+            "Configured retained transcript root is unavailable",
+        ));
+    }
+
+    let canonical_root_path = std::fs::canonicalize(&resolved_root_path).map_err(|error| {
+        log_notify_validation_io_error(
+            provider,
+            "canonicalize configured transcript root",
+            &resolved_root_path,
+            &error,
+        );
+        RetainedNotifySourceValidationError::Unavailable(
+            "Retained transcript validation is temporarily unavailable",
+        )
+    })?;
+    let canonical_path = canonicalize_notify_candidate(provider, candidate_path)?;
+    let source_metadata = std::fs::metadata(&canonical_path).map_err(|error| {
+        log_notify_validation_io_error(
+            provider,
+            "inspect notified transcript",
+            &canonical_path,
+            &error,
+        );
+        match error.kind() {
+            std::io::ErrorKind::NotFound => RetainedNotifySourceValidationError::Invalid(
+                "jsonl_path does not identify a retained transcript",
+            ),
+            _ => RetainedNotifySourceValidationError::Unavailable(
+                "Retained transcript validation is temporarily unavailable",
+            ),
+        }
+    })?;
+    if !source_metadata.is_file() {
+        return Err(RetainedNotifySourceValidationError::Invalid(
+            "jsonl_path must identify a retained transcript file",
+        ));
+    }
+    if !canonical_path.starts_with(&canonical_root_path) {
+        return Err(RetainedNotifySourceValidationError::Invalid(
+            "jsonl_path is outside the configured retained transcript root",
+        ));
+    }
+
+    let layout_hint =
+        retained_jsonl_source_layout_hint(provider, &canonical_root_path, &canonical_path).ok_or(
+            RetainedNotifySourceValidationError::Invalid(
+                "jsonl_path is outside the configured retained transcript layout",
+            ),
+        )?;
+
+    Ok(Some(DiscoveredRetainedJsonlSource {
+        provider,
+        source_root_key,
+        source_key: canonical_source_key(source_root_key, &canonical_path),
+        filesystem_path: canonical_path.clone(),
+        canonical_path,
+        layout_hint,
+    }))
+}
+
+fn canonicalize_notify_candidate(
+    provider: IntegrationProvider,
+    candidate_path: &Path,
+) -> Result<PathBuf, RetainedNotifySourceValidationError> {
+    std::fs::canonicalize(candidate_path).map_err(|error| {
+        log_notify_validation_io_error(
+            provider,
+            "canonicalize notified transcript",
+            candidate_path,
+            &error,
+        );
+        match error.kind() {
+            std::io::ErrorKind::NotFound => {
+                RetainedNotifySourceValidationError::Invalid("jsonl_path does not exist")
+            }
+            _ => RetainedNotifySourceValidationError::Unavailable(
+                "Session transcript validation is temporarily unavailable",
+            ),
+        }
+    })
+}
+
+fn log_notify_validation_io_error(
+    provider: IntegrationProvider,
+    operation: &str,
+    path: &Path,
+    error: &std::io::Error,
+) {
+    log::warn!(
+        "Session notify validation filesystem error: provider={} operation={operation} path={} kind={:?} error={error}",
+        provider.as_str(),
+        path.display(),
+        error.kind(),
+    );
+}
+
+fn retained_jsonl_source_layout_hint(
+    provider: IntegrationProvider,
+    canonical_root_path: &Path,
+    canonical_path: &Path,
+) -> Option<RetainedJsonlSourceLayoutHint> {
+    if canonical_path.extension() != Some(std::ffi::OsStr::new("jsonl")) {
+        return None;
+    }
+
+    let relative = canonical_path.strip_prefix(canonical_root_path).ok()?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Some(value),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    match provider {
+        IntegrationProvider::Claude => match components.as_slice() {
+            [project, _transcript] => Some(RetainedJsonlSourceLayoutHint::ClaudeParent {
+                default_project: SessionIndex::project_display_name(
+                    project.to_str().unwrap_or("unknown"),
+                ),
+            }),
+            [project, _session, subagents, _transcript]
+                if *subagents == std::ffi::OsStr::new("subagents") =>
+            {
+                Some(RetainedJsonlSourceLayoutHint::ClaudeSubagent {
+                    default_project: SessionIndex::project_display_name(
+                        project.to_str().unwrap_or("unknown"),
+                    ),
+                })
+            }
+            _ => None,
+        },
+        IntegrationProvider::Codex if !components.is_empty() => {
+            Some(RetainedJsonlSourceLayoutHint::CodexTranscript)
+        }
+        IntegrationProvider::Codex | IntegrationProvider::MiniMax => None,
+    }
+}
+
+/// Enumerate Claude and Codex transcript roots independently.
+///
+/// This inventory is intentionally separate from Session Search discovery so
+/// one unreadable provider root cannot suppress the other provider and cannot
+/// change existing indexing behavior.
+#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
+pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot> {
+    vec![
+        enumerate_claude_retained_jsonl_source_root(),
+        enumerate_codex_retained_jsonl_source_root(),
+    ]
+}
+
+/// Enumerate the configured Claude transcript root as one independent outcome.
+pub(crate) fn enumerate_claude_retained_jsonl_source_root() -> ProviderSourceRoot {
+    enumerate_provider_source_root(
+        IntegrationProvider::Claude,
+        CLAUDE_SOURCE_ROOT_KEY,
+        crate::data_paths::resolve_claude_projects_dir(),
+        collect_claude_jsonl_candidates,
+    )
+}
+
+/// Enumerate the configured Codex transcript root as one independent outcome.
+pub(crate) fn enumerate_codex_retained_jsonl_source_root() -> ProviderSourceRoot {
+    enumerate_provider_source_root(
+        IntegrationProvider::Codex,
+        CODEX_SOURCE_ROOT_KEY,
+        crate::data_paths::resolve_codex_sessions_dir(),
+        collect_codex_jsonl_candidates,
+    )
+}
+
+/// Admit every retained transcript discovered during a Session Search scan to
+/// the independent model-source reconciliation queue.
+///
+/// Enumeration and admission deliberately happen outside `IndexState` so an
+/// unchanged search mtime, empty search extraction, or later scan failure
+/// cannot suppress provider-qualified model evidence. The queue performs the
+/// blocking fingerprint/read work and preserves each source's owning root.
+fn enqueue_startup_model_source_reconciliation(app_handle: &tauri::AppHandle) {
+    for root in enumerate_retained_jsonl_source_roots() {
+        if let ProviderRootEnumerationOutcome::Failed { diagnostic } = &root.outcome {
+            log::warn!(
+                "Startup model source inventory incomplete: provider={} root={} diagnostic={diagnostic}",
+                root.provider.as_str(),
+                root.source_root_key,
+            );
+        }
+
+        for source in root.sources {
+            let provider = source.provider;
+            let source_root_key = source.source_root_key;
+            if let Err(error) = crate::enqueue_model_usage_live_source(app_handle, source) {
+                log::warn!(
+                    "Failed to enqueue startup model source reconciliation: provider={} root={} error={error}",
+                    provider.as_str(),
+                    source_root_key,
+                );
+            }
+        }
+    }
+}
+
+fn enumerate_provider_source_root(
+    provider: IntegrationProvider,
+    source_root_key: &'static str,
+    resolved_root_path: PathBuf,
+    collect_candidates: fn(
+        &Path,
+        IntegrationProvider,
+        &mut Option<String>,
+    ) -> Vec<RetainedJsonlCandidate>,
+) -> ProviderSourceRoot {
+    let mut diagnostic = None;
+
+    match std::fs::symlink_metadata(&resolved_root_path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProviderSourceRoot {
+                provider,
+                source_root_key,
+                resolved_root_path,
+                canonical_root_path: None,
+                outcome: ProviderRootEnumerationOutcome::Complete,
+                sources: Vec::new(),
+            };
+        }
+        Err(error) => {
+            log_inventory_io_error(
+                provider,
+                "inspect root directory entry",
+                &resolved_root_path,
+                &error,
+            );
+            record_root_failure(&mut diagnostic, provider, "root could not be inspected.");
+            return finish_provider_source_root(
+                provider,
+                source_root_key,
+                resolved_root_path,
+                None,
+                diagnostic,
+                Vec::new(),
+            );
+        }
+    }
+
+    let root_metadata = match std::fs::metadata(&resolved_root_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            log_inventory_io_error(provider, "follow root target", &resolved_root_path, &error);
+            record_root_failure(
+                &mut diagnostic,
+                provider,
+                "root target could not be inspected.",
+            );
+            return finish_provider_source_root(
+                provider,
+                source_root_key,
+                resolved_root_path,
+                None,
+                diagnostic,
+                Vec::new(),
+            );
+        }
+    };
+
+    if !root_metadata.is_dir() {
+        record_root_failure(&mut diagnostic, provider, "root is not a directory.");
+        return finish_provider_source_root(
+            provider,
+            source_root_key,
+            resolved_root_path,
+            None,
+            diagnostic,
+            Vec::new(),
+        );
+    }
+
+    let canonical_root_path = match std::fs::canonicalize(&resolved_root_path) {
+        Ok(path) => path,
+        Err(error) => {
+            log_inventory_io_error(provider, "canonicalize root", &resolved_root_path, &error);
+            record_root_failure(
+                &mut diagnostic,
+                provider,
+                "root could not be canonicalized.",
+            );
+            return finish_provider_source_root(
+                provider,
+                source_root_key,
+                resolved_root_path,
+                None,
+                diagnostic,
+                Vec::new(),
+            );
+        }
+    };
+
+    let candidates = collect_candidates(&resolved_root_path, provider, &mut diagnostic);
+    let mut sources = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let canonical_path = match std::fs::canonicalize(&candidate.filesystem_path) {
+            Ok(path) => path,
+            Err(error) => {
+                log_inventory_io_error(
+                    provider,
+                    "canonicalize JSONL source",
+                    &candidate.filesystem_path,
+                    &error,
+                );
+                record_root_failure(
+                    &mut diagnostic,
+                    provider,
+                    "could not canonicalize all JSONL sources.",
+                );
+                continue;
+            }
+        };
+
+        match std::fs::metadata(&canonical_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => continue,
+            Err(error) => {
+                log_inventory_io_error(
+                    provider,
+                    "inspect canonical JSONL source",
+                    &canonical_path,
+                    &error,
+                );
+                record_root_failure(
+                    &mut diagnostic,
+                    provider,
+                    "could not inspect all canonical JSONL sources.",
+                );
+                continue;
+            }
+        }
+
+        if !canonical_path.starts_with(&canonical_root_path) {
+            log::warn!(
+                "Transcript inventory skipped source outside canonical root: provider={} root={} source={}",
+                provider.as_str(),
+                canonical_root_path.display(),
+                canonical_path.display(),
+            );
+            continue;
+        }
+        let Some(layout_hint) =
+            retained_jsonl_source_layout_hint(provider, &canonical_root_path, &canonical_path)
+        else {
+            continue;
+        };
+
+        sources.push(DiscoveredRetainedJsonlSource {
+            provider,
+            source_root_key,
+            source_key: canonical_source_key(source_root_key, &canonical_path),
+            filesystem_path: candidate.filesystem_path,
+            canonical_path,
+            layout_hint,
+        });
+    }
+
+    sources.sort_by(|left, right| {
+        left.source_key
+            .cmp(&right.source_key)
+            .then_with(|| left.filesystem_path.cmp(&right.filesystem_path))
+    });
+    sources.dedup_by(|left, right| left.source_key == right.source_key);
+
+    finish_provider_source_root(
+        provider,
+        source_root_key,
+        resolved_root_path,
+        Some(canonical_root_path),
+        diagnostic,
+        sources,
+    )
+}
+
+fn finish_provider_source_root(
+    provider: IntegrationProvider,
+    source_root_key: &'static str,
+    resolved_root_path: PathBuf,
+    canonical_root_path: Option<PathBuf>,
+    diagnostic: Option<String>,
+    sources: Vec<DiscoveredRetainedJsonlSource>,
+) -> ProviderSourceRoot {
+    let outcome = diagnostic.map_or(ProviderRootEnumerationOutcome::Complete, |diagnostic| {
+        ProviderRootEnumerationOutcome::Failed { diagnostic }
+    });
+
+    ProviderSourceRoot {
+        provider,
+        source_root_key,
+        resolved_root_path,
+        canonical_root_path,
+        outcome,
+        sources,
+    }
+}
+
+fn collect_claude_jsonl_candidates(
+    projects_dir: &Path,
+    provider: IntegrationProvider,
+    diagnostic: &mut Option<String>,
+) -> Vec<RetainedJsonlCandidate> {
+    let mut candidates = Vec::new();
+
+    for project_entry in read_directory_entries(projects_dir, provider, diagnostic) {
+        let project_dir = project_entry.path();
+        if !path_is_directory(&project_dir, provider, diagnostic, true) {
+            continue;
+        }
+
+        for entry in read_directory_entries(&project_dir, provider, diagnostic) {
+            let path = entry.path();
+
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                candidates.push(RetainedJsonlCandidate {
+                    filesystem_path: path.clone(),
+                });
+            }
+
+            if !path_is_directory(&path, provider, diagnostic, true) {
+                continue;
+            }
+
+            let subagents_dir = path.join("subagents");
+            if !path_is_directory(&subagents_dir, provider, diagnostic, false) {
+                continue;
+            }
+
+            for subagent_entry in read_directory_entries(&subagents_dir, provider, diagnostic) {
+                let subagent_path = subagent_entry.path();
+                if subagent_path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                {
+                    candidates.push(RetainedJsonlCandidate {
+                        filesystem_path: subagent_path,
+                    });
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn collect_codex_jsonl_candidates(
+    sessions_dir: &Path,
+    provider: IntegrationProvider,
+    diagnostic: &mut Option<String>,
+) -> Vec<RetainedJsonlCandidate> {
+    let mut candidates = Vec::new();
+
+    for entry in walkdir::WalkDir::new(sessions_dir)
+        .sort_by_file_name()
+        .into_iter()
+    {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log_inventory_walkdir_error(provider, sessions_dir, &error);
+                record_root_failure(
+                    diagnostic,
+                    provider,
+                    "could not read all filesystem entries.",
+                );
+                continue;
+            }
+        };
+
+        if entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            candidates.push(RetainedJsonlCandidate {
+                filesystem_path: entry.into_path(),
+            });
+        }
+    }
+
+    candidates
+}
+
+fn read_directory_entries(
+    directory: &Path,
+    provider: IntegrationProvider,
+    diagnostic: &mut Option<String>,
+) -> Vec<std::fs::DirEntry> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log_inventory_io_error(provider, "read transcript directory", directory, &error);
+            record_root_failure(
+                diagnostic,
+                provider,
+                "could not read all transcript directories.",
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut collected = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => collected.push(entry),
+            Err(error) => {
+                log_inventory_io_error(
+                    provider,
+                    "read transcript directory entry",
+                    directory,
+                    &error,
+                );
+                record_root_failure(
+                    diagnostic,
+                    provider,
+                    "could not read all filesystem entries.",
+                );
+            }
+        }
+    }
+    collected.sort_by_key(std::fs::DirEntry::file_name);
+    collected
+}
+
+fn path_is_directory(
+    path: &Path,
+    provider: IntegrationProvider,
+    diagnostic: &mut Option<String>,
+    missing_is_failure: bool,
+) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !missing_is_failure => {
+            return false;
+        }
+        Err(error) => {
+            log_inventory_io_error(provider, "inspect directory entry", path, &error);
+            record_root_failure(
+                diagnostic,
+                provider,
+                "could not inspect all filesystem entries.",
+            );
+            return false;
+        }
+    }
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => {
+            log_inventory_io_error(provider, "follow directory target", path, &error);
+            record_root_failure(
+                diagnostic,
+                provider,
+                "could not inspect all filesystem entries.",
+            );
+            false
+        }
+    }
+}
+
+fn log_inventory_io_error(
+    provider: IntegrationProvider,
+    operation: &str,
+    path: &Path,
+    error: &std::io::Error,
+) {
+    log::warn!(
+        "Transcript inventory filesystem error: provider={} operation={operation} path={} kind={:?} error={error}",
+        provider.as_str(),
+        path.display(),
+        error.kind(),
+    );
+}
+
+fn log_inventory_walkdir_error(provider: IntegrationProvider, root: &Path, error: &walkdir::Error) {
+    let path = error.path().unwrap_or(root);
+    let error_kind = error.io_error().map(std::io::Error::kind);
+    log::warn!(
+        "Transcript inventory walk error: provider={} operation=walk transcript root path={} depth={} kind={error_kind:?} error={error}",
+        provider.as_str(),
+        path.display(),
+        error.depth(),
+    );
+}
+
+fn record_root_failure(
+    diagnostic: &mut Option<String>,
+    provider: IntegrationProvider,
+    detail: &str,
+) {
+    if diagnostic.is_some() {
+        return;
+    }
+
+    let message = format!("{provider} transcript inventory {detail}");
+    *diagnostic = Some(if message.chars().count() <= ROOT_DIAGNOSTIC_MAX_CHARS {
+        message
+    } else {
+        let mut bounded = message
+            .chars()
+            .take(ROOT_DIAGNOSTIC_MAX_CHARS - 1)
+            .collect::<String>();
+        bounded.push('…');
+        bounded
+    });
+}
+
+fn canonical_source_key(source_root_key: &str, canonical_path: &Path) -> String {
+    let mut key = String::with_capacity(source_root_key.len() + 4);
+    key.push_str(source_root_key);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        key.push_str(":fs-unix:");
+        append_hex_bytes(&mut key, canonical_path.as_os_str().as_bytes());
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        key.push_str(":fs-windows:");
+        for unit in canonical_path.as_os_str().encode_wide() {
+            append_hex_bytes(&mut key, &unit.to_be_bytes());
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        key.push_str(":fs-other:");
+        key.push_str(&canonical_path.to_string_lossy());
+    }
+
+    key
+}
+
+#[cfg(any(unix, windows))]
+fn append_hex_bytes(output: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Schema fields wrapper
 // ---------------------------------------------------------------------------
@@ -522,6 +1332,12 @@ impl SessionIndex {
         storage: Option<&crate::storage::Storage>,
     ) -> Result<usize, String> {
         use tauri::Emitter;
+
+        // @lat: [[data-flow#Model Observation Reconciliation]]
+        // Keep model-source discovery independent from Session Search's mtime
+        // cache and extraction outcome. Admission is non-blocking; the shared
+        // model runner performs fingerprint reconciliation in the background.
+        enqueue_startup_model_source_reconciliation(app_handle);
 
         let mut total_indexed = 0usize;
         let mut index_changed = false;

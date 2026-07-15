@@ -9,6 +9,8 @@ Sandboxed usage (writes only inside an arbitrary dir, no backup, no running-Quil
     python3 scripts/populate_dummy_data.py \\
         --data-dir /tmp/quill-demo/data \\
         --rules-dir /tmp/quill-demo/rules \\
+        --projects-dir /tmp/quill-demo/projects \\
+        --codex-sessions-dir /tmp/quill-demo/codex-sessions \\
         --no-backup
 
 The CLI surface is documented in
@@ -18,10 +20,13 @@ specs/001-marketing-site/contracts/seeder-cli.md.
 import argparse
 import hashlib
 import json
+import ntpath
 import os
 import random
 import shutil
 import sqlite3
+import stat
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,16 +34,19 @@ from pathlib import Path
 DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "com.quilltoolkit.app"
 DEFAULT_RULES_DIR = Path.home() / ".claude" / "rules" / "learned"
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+DEFAULT_CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 
 # Module-level globals bound by main() after argparse so existing populate_* helpers
 # can read them without threading a config object through every signature.
 DB_PATH: Path = DEFAULT_DATA_DIR / "usage.db"
 BAK_PATH: Path = DB_PATH.with_suffix(".db.bak")
 PROJECTS_DIR: Path = DEFAULT_PROJECTS_DIR
+CODEX_SESSIONS_DIR: Path | None = None
 QUIET: bool = False
 NO_BACKUP: bool = False
 USING_OVERRIDE: bool = False  # True when --data-dir was passed; skips running-Quill guard
 SKIP_PROJECTS: bool = False   # True when --no-projects was passed
+MODEL_FIXTURE_MODE: bool = False
 
 
 def log(msg: str = "") -> None:
@@ -227,7 +235,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			inference_metadata TEXT DEFAULT NULL
 		);
 
-		-- learned_rules: TRUE v27 shape. Base cols + source (mig 4-ish),
+		-- learned_rules: TRUE v28 shape. Base cols + source (mig 4-ish),
 		-- content (mig 11), provider_scope (mig 12), content_hash (mig 15), and
 		-- the six migration-25 provenance/lifecycle columns.
 		CREATE TABLE IF NOT EXISTS learned_rules (
@@ -412,7 +420,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			ON session_events(provider, session_id, is_sidechain, timestamp);
 
 		-- ── Tables created by migrations 21/25/27 ──────────────────────────────
-		-- The app records schema_version up to the latest (27), so it runs ZERO
+		-- The app records schema_version up to the latest (28), so it runs ZERO
 		-- migrations against this DB. Every table a migration would otherwise
 		-- CREATE must therefore exist here in final shape, or the app's queries
 		-- against them fail. Shapes copied verbatim from src-tauri/src/storage.rs.
@@ -575,6 +583,145 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			ON hook_invocations(hook_identity, timestamp);
 		CREATE INDEX IF NOT EXISTS idx_hook_invocations_identity_cwd
 			ON hook_invocations(hook_identity, cwd);
+
+		-- Model analytics: migration 28. Retained JSONL files remain source of
+		-- truth; these tables cache provider-qualified evidence and reconciliation
+		-- state without a model catalog.
+		CREATE TABLE IF NOT EXISTS model_usage_observations (
+			id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+			provider              TEXT NOT NULL,
+			source_key            TEXT NOT NULL,
+			source_record_key     TEXT NOT NULL,
+			source_ordinal        INTEGER NOT NULL,
+			observation_kind      TEXT NOT NULL,
+			source_session_id     TEXT NOT NULL,
+			analytics_session_id  TEXT NOT NULL,
+			chain_id              TEXT NOT NULL,
+			parent_chain_id       TEXT,
+			agent_id              TEXT,
+			turn_id               TEXT,
+			raw_model_id          TEXT,
+			cwd                   TEXT,
+			hostname              TEXT,
+			is_sidechain          INTEGER NOT NULL,
+			observed_at_ms        INTEGER NOT NULL,
+			input_tokens          INTEGER,
+			output_tokens         INTEGER,
+			cache_creation_tokens INTEGER,
+			cache_read_tokens     INTEGER,
+			model_evidence        TEXT NOT NULL,
+			token_evidence        TEXT NOT NULL,
+			UNIQUE(provider, source_key, source_record_key),
+			CHECK(source_ordinal >= 0),
+			CHECK(observation_kind IN ('turn', 'token')),
+			CHECK(is_sidechain IN (0, 1)),
+			CHECK(observed_at_ms >= 0),
+			CHECK(input_tokens IS NULL OR input_tokens BETWEEN 0 AND 100000000),
+			CHECK(output_tokens IS NULL OR output_tokens BETWEEN 0 AND 100000000),
+			CHECK(cache_creation_tokens IS NULL OR cache_creation_tokens BETWEEN 0 AND 100000000),
+			CHECK(cache_read_tokens IS NULL OR cache_read_tokens BETWEEN 0 AND 100000000),
+			CHECK(model_evidence IN ('explicit', 'missing', 'invalid')),
+			CHECK(token_evidence IN ('direct', 'cumulative_delta', 'unavailable'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_model_observations_observed_provider
+			ON model_usage_observations(observed_at_ms, provider);
+		CREATE INDEX IF NOT EXISTS idx_model_observations_model_time
+			ON model_usage_observations(provider, raw_model_id, observed_at_ms);
+		CREATE INDEX IF NOT EXISTS idx_model_observations_session_time
+			ON model_usage_observations(provider, analytics_session_id, observed_at_ms);
+		CREATE INDEX IF NOT EXISTS idx_model_observations_chain_time
+			ON model_usage_observations(provider, analytics_session_id, chain_id, observed_at_ms, source_ordinal);
+		CREATE INDEX IF NOT EXISTS idx_model_observations_source
+			ON model_usage_observations(provider, source_key);
+
+		CREATE TABLE IF NOT EXISTS model_observation_sources (
+			provider              TEXT NOT NULL,
+			source_key            TEXT NOT NULL,
+			source_root_key       TEXT NOT NULL,
+			source_path           TEXT NOT NULL,
+			source_session_id     TEXT,
+			analytics_session_id  TEXT,
+			chain_id              TEXT,
+			parent_chain_id       TEXT,
+			agent_id              TEXT,
+			is_sidechain          INTEGER NOT NULL,
+			cwd                   TEXT,
+			hostname              TEXT,
+			first_activity_at_ms  INTEGER,
+			last_activity_at_ms   INTEGER,
+			mtime_ns              INTEGER,
+			size_bytes            INTEGER,
+			content_sha256        TEXT,
+			last_error            TEXT,
+			suppressed_sha256     TEXT,
+			suppressed_at_ms      INTEGER,
+			seen_generation       INTEGER NOT NULL,
+			processing_status     TEXT NOT NULL,
+			observation_count     INTEGER NOT NULL,
+			last_attempt_at_ms    INTEGER,
+			last_success_at_ms    INTEGER,
+			PRIMARY KEY(provider, source_key),
+			CHECK(is_sidechain IN (0, 1)),
+			CHECK(first_activity_at_ms IS NULL OR first_activity_at_ms >= 0),
+			CHECK(last_activity_at_ms IS NULL OR last_activity_at_ms >= 0),
+			CHECK(mtime_ns IS NULL OR mtime_ns >= 0),
+			CHECK(size_bytes IS NULL OR size_bytes >= 0),
+			CHECK(suppressed_at_ms IS NULL OR suppressed_at_ms >= 0),
+			CHECK(seen_generation >= 0),
+			CHECK(processing_status IN ('pending', 'ok', 'stale', 'failed', 'suppressed')),
+			CHECK(observation_count >= 0),
+			CHECK(last_attempt_at_ms IS NULL OR last_attempt_at_ms >= 0),
+			CHECK(last_success_at_ms IS NULL OR last_success_at_ms >= 0)
+		);
+		CREATE INDEX IF NOT EXISTS idx_model_sources_activity
+			ON model_observation_sources(provider, first_activity_at_ms, last_activity_at_ms);
+		CREATE INDEX IF NOT EXISTS idx_model_sources_session
+			ON model_observation_sources(provider, analytics_session_id);
+		CREATE INDEX IF NOT EXISTS idx_model_sources_cwd
+			ON model_observation_sources(provider, cwd);
+		CREATE INDEX IF NOT EXISTS idx_model_sources_hostname
+			ON model_observation_sources(provider, hostname);
+		CREATE INDEX IF NOT EXISTS idx_model_sources_root_generation
+			ON model_observation_sources(provider, source_root_key, seen_generation);
+
+		CREATE TABLE IF NOT EXISTS model_backfill_state (
+			id                     INTEGER PRIMARY KEY CHECK(id = 1),
+			generation             INTEGER NOT NULL,
+			trigger                TEXT NOT NULL,
+			status                 TEXT NOT NULL,
+			total_roots            INTEGER NOT NULL,
+			completed_roots        INTEGER NOT NULL,
+			failed_roots           INTEGER NOT NULL,
+			inventory_complete     INTEGER NOT NULL,
+			total_sources          INTEGER NOT NULL,
+			source_total_published INTEGER NOT NULL DEFAULT 0,
+			processed_sources      INTEGER NOT NULL,
+			failed_sources         INTEGER NOT NULL,
+			skipped_sources        INTEGER NOT NULL,
+			remaining_sources      INTEGER NOT NULL,
+			observations_written   INTEGER NOT NULL,
+			started_at_ms          INTEGER,
+			updated_at_ms          INTEGER NOT NULL,
+			finished_at_ms         INTEGER,
+			last_error             TEXT,
+			CHECK(generation >= 0),
+			CHECK(trigger IN ('migration', 'startup_resume', 'retry', 'reconcile')),
+			CHECK(status IN ('pending', 'running', 'complete', 'partial', 'failed')),
+			CHECK(total_roots >= 0),
+			CHECK(completed_roots >= 0),
+			CHECK(failed_roots >= 0),
+			CHECK(inventory_complete IN (0, 1)),
+			CHECK(total_sources >= 0),
+			CHECK(source_total_published IN (0, 1)),
+			CHECK(processed_sources >= 0),
+			CHECK(failed_sources >= 0),
+			CHECK(skipped_sources >= 0),
+			CHECK(remaining_sources >= 0),
+			CHECK(observations_written >= 0),
+			CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
+			CHECK(updated_at_ms >= 0),
+			CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0)
+		);
 	""")
 
 
@@ -588,6 +735,8 @@ def clear_tables(conn: sqlite3.Connection) -> None:
 		"session_events", "skill_usages", "hook_invocations",
 		"rule_versions", "rule_evidence_citations", "rule_tombstones",
 		"operator_feedback", "evaluation_results", "reviewer_overrides",
+		"model_usage_observations", "model_observation_sources",
+		"model_backfill_state",
 	]
 	for tbl in tables:
 		conn.execute(f"DELETE FROM {tbl}")
@@ -1107,14 +1256,14 @@ def populate_learned_rules(conn: sqlite3.Connection) -> None:
 # ── 9. schema_version ─────────────────────────────────────────────────────────
 
 def populate_schema_version(conn: sqlite3.Connection) -> None:
-	# Record EVERY migration version up to the app's latest (27). The Rust
+	# Record EVERY migration version up to the app's latest (28). The Rust
 	# migration runner guards each block with `if current_version < N`, so
-	# recording 1..27 makes the app run ZERO migrations against the seeded DB.
+	# recording 1..28 makes the app run ZERO migrations against the seeded DB.
 	# This is required because ensure_schema already builds every table in its
 	# final post-migration shape — re-running ALTER ADD COLUMN migrations would
 	# collide (e.g. "duplicate column name: cwd"). Bump this if storage.rs adds
-	# a migration beyond 27 (search: INSERT INTO schema_version (version) VALUES).
-	LATEST_SCHEMA_VERSION = 27
+	# a migration beyond 28 (search: INSERT INTO schema_version (version) VALUES).
+	LATEST_SCHEMA_VERSION = 28
 	for v in range(1, LATEST_SCHEMA_VERSION + 1):
 		conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (v,))
 	print(f"  schema_version: versions 1-{LATEST_SCHEMA_VERSION}")
@@ -1869,9 +2018,764 @@ def populate_session_events(conn: sqlite3.Connection) -> None:
 	print(f"  session_events: {len(rows)} rows across {distinct_sessions} sessions")
 
 
-# ── 18. claude session JSONL files ────────────────────────────────────────────
+# ── 18. retained model-bearing JSONL files ────────────────────────────────────
 
-def populate_session_jsonls() -> None:
+DEMO_MODEL_HOSTNAME = "demo-workstation"
+DEMO_JSONL_OWNER_FIELD = "_quillDemoFixture"
+DEMO_JSONL_OWNER_VALUE = "populate_dummy_data.py:model-fixture:v1"
+
+
+def datetime_to_ms(value: datetime) -> int:
+	return int(value.timestamp() * 1000)
+
+
+def configured_fixture_root(provider: str) -> Path:
+	if provider == "claude":
+		return PROJECTS_DIR
+	if provider == "codex" and CODEX_SESSIONS_DIR is not None:
+		return CODEX_SESSIONS_DIR
+	raise ValueError(f"unsupported or unconfigured demo transcript provider: {provider}")
+
+
+def path_is_link_or_junction(path: Path) -> bool:
+	return path.is_symlink() or (
+		hasattr(path, "is_junction") and path.is_junction()
+	)
+
+
+def ensure_configured_fixture_root(provider: str, root: Path) -> tuple[Path, Path]:
+	lexical_root = Path(os.path.abspath(root.expanduser()))
+	if os.path.lexists(lexical_root):
+		if path_is_link_or_junction(lexical_root):
+			raise ValueError(f"refusing symlinked or junction-backed {provider} fixture root")
+		if not stat.S_ISDIR(lexical_root.lstat().st_mode):
+			raise ValueError(f"configured {provider} fixture root is not a directory")
+	else:
+		lexical_root.mkdir(parents=True)
+	canonical_root = lexical_root.resolve(strict=True)
+	return lexical_root, canonical_root
+
+
+def prepare_jsonl_fixture_target(provider: str, path: Path) -> Path:
+	lexical_root, canonical_root = ensure_configured_fixture_root(
+		provider,
+		configured_fixture_root(provider),
+	)
+	target = Path(os.path.abspath(path.expanduser()))
+	try:
+		relative = target.relative_to(lexical_root)
+	except ValueError as error:
+		raise ValueError(f"{provider} fixture target is outside its configured root") from error
+	if not relative.parts or target.suffix != ".jsonl":
+		raise ValueError(f"{provider} fixture target must be a child JSONL path")
+
+	parent = lexical_root
+	for component in relative.parts[:-1]:
+		parent /= component
+		if os.path.lexists(parent):
+			if path_is_link_or_junction(parent):
+				raise ValueError(f"refusing symlinked or junction-backed {provider} fixture parent")
+			if not stat.S_ISDIR(parent.lstat().st_mode):
+				raise ValueError(f"{provider} fixture parent is not a directory")
+		else:
+			parent.mkdir()
+		if canonical_path_inside(canonical_root, parent) is None:
+			raise ValueError(f"{provider} fixture parent escaped its canonical root")
+
+	if os.path.lexists(target):
+		if path_is_link_or_junction(target):
+			raise ValueError(f"refusing symlinked or junction-backed {provider} fixture target")
+		if MODEL_FIXTURE_MODE:
+			raise FileExistsError(
+				f"refusing to overwrite existing {provider} fixture target: {target}"
+			)
+		if not stat.S_ISREG(target.lstat().st_mode):
+			raise ValueError(f"legacy {provider} fixture target is not a regular file")
+	return target
+
+
+def safe_write_text(path: Path, contents: str, *, overwrite: bool) -> None:
+	if os.name == "posix" and hasattr(os, "O_NOFOLLOW"):
+		parent_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+		parent_fd = os.open(path.parent, parent_flags)
+		try:
+			file_flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW
+			file_flags |= os.O_TRUNC if overwrite else os.O_EXCL
+			file_fd = os.open(path.name, file_flags, 0o666, dir_fd=parent_fd)
+			with os.fdopen(file_fd, "w", encoding="utf-8") as target:
+				target.write(contents)
+		finally:
+			os.close(parent_fd)
+	else:
+		mode = "w" if overwrite else "x"
+		with path.open(mode, encoding="utf-8") as target:
+			target.write(contents)
+
+
+def write_jsonl_fixture(provider: str, path: Path, records: list[dict | str]) -> None:
+	lines = [record if isinstance(record, str) else json.dumps(record) for record in records]
+	if MODEL_FIXTURE_MODE and lines:
+		first_record = json.loads(lines[0])
+		if not isinstance(first_record, dict):
+			raise ValueError("demo JSONL ownership marker requires an object record")
+		first_record[DEMO_JSONL_OWNER_FIELD] = DEMO_JSONL_OWNER_VALUE
+		lines[0] = json.dumps(first_record)
+	target = prepare_jsonl_fixture_target(provider, path)
+	safe_write_text(
+		target,
+		"\n".join(lines) + "\n",
+		overwrite=not MODEL_FIXTURE_MODE,
+	)
+
+
+def canonical_path_inside(root: Path, path: Path) -> Path | None:
+	canonical_root = root.resolve(strict=True)
+	canonical_path = path.resolve(strict=True)
+	try:
+		canonical_path.relative_to(canonical_root)
+	except ValueError:
+		return None
+	return canonical_path
+
+
+def discover_runtime_model_jsonls(provider: str, root: Path) -> dict[Path, Path]:
+	"""Mirror provider transcript discovery and key by canonical source path."""
+	root.mkdir(parents=True, exist_ok=True)
+	candidates = []
+	if provider == "claude":
+		for project_dir in sorted(root.iterdir()):
+			if not project_dir.is_dir():
+				continue
+			for entry in sorted(project_dir.iterdir()):
+				if entry.is_file() and entry.suffix == ".jsonl":
+					candidates.append(entry)
+				elif entry.is_dir():
+					subagents_dir = entry / "subagents"
+					if subagents_dir.is_dir():
+						candidates.extend(
+							path for path in sorted(subagents_dir.iterdir())
+							if path.is_file() and path.suffix == ".jsonl"
+						)
+	elif provider == "codex":
+		def raise_walk_error(error: OSError) -> None:
+			raise error
+
+		for directory, subdirectories, filenames in os.walk(
+			root,
+			followlinks=False,
+			onerror=raise_walk_error,
+		):
+			subdirectories.sort()
+			for filename in sorted(filenames):
+				if Path(filename).suffix == ".jsonl":
+					candidates.append(Path(directory) / filename)
+	else:
+		raise ValueError(f"unsupported demo transcript provider: {provider}")
+
+	discovered = {}
+	for candidate in candidates:
+		canonical = canonical_path_inside(root, candidate)
+		if canonical is not None:
+			discovered[canonical] = candidate
+	return discovered
+
+
+def is_seeder_owned_jsonl(path: Path) -> bool:
+	try:
+		with path.open("r", encoding="utf-8") as source:
+			first_line = next((line for line in source if line.strip()), "")
+		first_record = json.loads(first_line)
+	except (OSError, UnicodeError, json.JSONDecodeError):
+		return False
+	return (
+		isinstance(first_record, dict)
+		and first_record.get(DEMO_JSONL_OWNER_FIELD) == DEMO_JSONL_OWNER_VALUE
+	)
+
+
+def cleanup_owned_model_jsonls() -> None:
+	"""Remove only prior complete-mode fixtures, never unrelated transcripts."""
+	if not MODEL_FIXTURE_MODE or CODEX_SESSIONS_DIR is None:
+		return
+	for provider, root, production_root in (
+		("claude", PROJECTS_DIR, DEFAULT_PROJECTS_DIR),
+		("codex", CODEX_SESSIONS_DIR, DEFAULT_CODEX_SESSIONS_DIR),
+	):
+		ensure_configured_fixture_root(provider, root)
+		if paths_overlap(root, production_root):
+			raise ValueError(f"refusing to clean marker-owned files in {provider} production paths")
+		for candidate in discover_runtime_model_jsonls(provider, root).values():
+			if is_seeder_owned_jsonl(candidate):
+				candidate.unlink()
+
+
+def rust_windows_canonical_path_text(canonical_path: str) -> str:
+	"""Restore the verbatim path form returned by Rust canonicalize on Windows."""
+	extended_prefix = "\\\\?\\"
+	unc_prefix = "\\\\?\\UNC\\"
+	if canonical_path.startswith(extended_prefix):
+		return canonical_path
+	if canonical_path.startswith("\\\\"):
+		return unc_prefix + canonical_path[2:]
+	drive, tail = ntpath.splitdrive(canonical_path)
+	if len(drive) == 2 and drive[1] == ":" and tail.startswith("\\"):
+		return extended_prefix + canonical_path
+	raise ValueError("Windows canonical model source path is not absolute")
+
+
+def rust_windows_source_key_hex(canonical_path: str) -> str:
+	# sessions.rs iterates OsStr::encode_wide(), then hex-encodes each UTF-16
+	# code unit's big-endian bytes. utf-16-be produces the identical byte stream.
+	return rust_windows_canonical_path_text(canonical_path).encode(
+		"utf-16-be",
+		"surrogatepass",
+	).hex()
+
+
+def canonical_model_source_key(source_root_key: str, path: Path) -> str:
+	canonical = path.resolve(strict=True)
+	if os.name == "nt":
+		return f"{source_root_key}:fs-windows:{rust_windows_source_key_hex(str(canonical))}"
+	return f"{source_root_key}:fs-unix:{os.fsencode(canonical).hex()}"
+
+
+def model_fixture_source(
+	*,
+	provider: str,
+	source_root_key: str,
+	path: Path,
+	source_session_id: str,
+	analytics_session_id: str,
+	chain_id: str,
+	parent_chain_id: str | None,
+	agent_id: str | None,
+	is_sidechain: bool,
+	cwd: str,
+	observations: list[dict],
+	first_activity_at_ms: int | None = None,
+) -> dict:
+	activity = [observation["observed_at_ms"] for observation in observations]
+	return {
+		"provider": provider,
+		"source_root_key": source_root_key,
+		"path": path,
+		"source_session_id": source_session_id,
+		"analytics_session_id": analytics_session_id,
+		"chain_id": chain_id,
+		"parent_chain_id": parent_chain_id,
+		"agent_id": agent_id,
+		"is_sidechain": is_sidechain,
+		"cwd": cwd,
+		"hostname": DEMO_MODEL_HOSTNAME,
+		"first_activity_at_ms": first_activity_at_ms if first_activity_at_ms is not None else min(activity),
+		"last_activity_at_ms": max(activity),
+		"observations": observations,
+	}
+
+
+def claude_fixture_observation(
+	source_ordinal: int,
+	record: dict,
+	analytics_session_id: str,
+	cwd: str,
+) -> dict:
+	message = record["message"]
+	usage = message.get("usage", {})
+	is_sidechain = record.get("isSidechain") is True
+	agent_id = record.get("agentId") if is_sidechain else None
+	source_session_id = record["sessionId"]
+	model = message.get("model")
+	return {
+		"source_record_key": f"v1:claude_assistant:{source_ordinal}:0",
+		"source_ordinal": source_ordinal,
+		"observation_kind": "turn",
+		"source_session_id": source_session_id,
+		"analytics_session_id": analytics_session_id,
+		"chain_id": agent_id if is_sidechain else source_session_id,
+		"parent_chain_id": source_session_id if is_sidechain else None,
+		"agent_id": agent_id,
+		"turn_id": record.get("uuid"),
+		"raw_model_id": model if isinstance(model, str) else None,
+		"cwd": cwd,
+		"hostname": DEMO_MODEL_HOSTNAME,
+		"is_sidechain": is_sidechain,
+		"observed_at_ms": datetime_to_ms(datetime.fromisoformat(record["timestamp"])),
+		"input_tokens": usage.get("input_tokens"),
+		"output_tokens": usage.get("output_tokens"),
+		"cache_creation_tokens": usage.get("cache_creation_input_tokens"),
+		"cache_read_tokens": usage.get("cache_read_input_tokens"),
+		"model_evidence": "explicit" if isinstance(model, str) else "missing",
+		"token_evidence": "direct" if usage else "unavailable",
+	}
+
+
+def write_claude_model_edge_fixtures() -> list[dict]:
+	fixture_sources = []
+
+	# One uncapped provider-qualified session. Raw IDs are generated data, not a
+	# catalog: every valid string is retained exactly as written.
+	scale_session_id = "demo-claude-model-scale-session"
+	scale_cwd = PROJECTS[0]
+	scale_project = PROJECTS_DIR / scale_cwd.replace("/", "-").lstrip("-")
+	scale_path = scale_project / f"{scale_session_id}.jsonl"
+	scale_records = []
+	scale_observations = []
+	scale_start = NOW - timedelta(minutes=25)
+	for model_index in range(1001):
+		observed_at = scale_start + timedelta(seconds=model_index)
+		record = {
+			"type": "assistant",
+			"uuid": f"demo-scale-turn-{model_index:04d}",
+			"sessionId": scale_session_id,
+			"timestamp": ts_tz(observed_at),
+			"cwd": scale_cwd,
+			"gitBranch": "main",
+			"message": {
+				"role": "assistant",
+				"model": f"demo/generated/model-{model_index:04d}",
+				"usage": {
+					"input_tokens": 2 + model_index % 7,
+					"output_tokens": 1 + model_index % 5,
+					"cache_creation_input_tokens": model_index % 3,
+					"cache_read_input_tokens": model_index % 11,
+				},
+				"content": [{"type": "text", "text": "Generated model identity fixture."}],
+			},
+		}
+		scale_records.append(record)
+		scale_observations.append(claude_fixture_observation(
+			model_index,
+			record,
+			scale_session_id,
+			scale_cwd,
+		))
+	write_jsonl_fixture("claude", scale_path, scale_records)
+	fixture_sources.append(model_fixture_source(
+		provider="claude",
+		source_root_key="claude:projects",
+		path=scale_path,
+		source_session_id=scale_session_id,
+		analytics_session_id=scale_session_id,
+		chain_id=scale_session_id,
+		parent_chain_id=None,
+		agent_id=None,
+		is_sidechain=False,
+		cwd=scale_cwd,
+		observations=scale_observations,
+	))
+
+	# Interleaved parent/subagent timestamps include dynamic IDs, a missing-model
+	# token turn, and a consecutive repeated model within each chain.
+	chain_session_id = "demo-claude-chain-session"
+	chain_agent_id = "demo-claude-agent-alpha"
+	chain_cwd = PROJECTS[1]
+	chain_project = PROJECTS_DIR / chain_cwd.replace("/", "-").lstrip("-")
+	parent_path = chain_project / f"{chain_session_id}.jsonl"
+	subagent_path = chain_project / chain_session_id / "subagents" / f"{chain_agent_id}.jsonl"
+
+	def chain_record(offset_minutes: int, turn_id: str, model: str | None, sidechain: bool) -> dict:
+		message = {
+			"role": "assistant",
+			"usage": {
+				"input_tokens": 80,
+				"output_tokens": 24,
+				"cache_creation_input_tokens": 8,
+				"cache_read_input_tokens": 32,
+			},
+			"content": [{"type": "text", "text": "Chain fixture turn."}],
+		}
+		if model is not None:
+			message["model"] = model
+		record = {
+			"type": "assistant",
+			"uuid": turn_id,
+			"sessionId": chain_session_id,
+			"timestamp": ts_tz(NOW - timedelta(minutes=offset_minutes)),
+			"cwd": chain_cwd,
+			"gitBranch": "main",
+			"message": message,
+		}
+		if sidechain:
+			record["isSidechain"] = True
+			record["agentId"] = chain_agent_id
+		return record
+
+	parent_records = [
+		chain_record(54, "demo-parent-turn-1", "demo/claude/parent-alpha", False),
+		chain_record(50, "demo-parent-turn-2", None, False),
+		chain_record(46, "demo-parent-turn-3", "demo/claude/parent-beta", False),
+		chain_record(42, "demo-parent-turn-4", "demo/claude/parent-beta", False),
+	]
+	subagent_records = [
+		chain_record(52, "demo-agent-turn-1", "demo/claude/agent-alpha", True),
+		chain_record(48, "demo-agent-turn-2", "demo/claude/agent-alpha", True),
+		chain_record(44, "demo-agent-turn-3", None, True),
+		chain_record(40, "demo-agent-turn-4", "demo/claude/agent-beta", True),
+	]
+	for path, records, agent_id, is_sidechain in [
+		(parent_path, parent_records, None, False),
+		(subagent_path, subagent_records, chain_agent_id, True),
+	]:
+		write_jsonl_fixture("claude", path, records)
+		observations = [
+			claude_fixture_observation(index, record, chain_session_id, chain_cwd)
+			for index, record in enumerate(records)
+		]
+		fixture_sources.append(model_fixture_source(
+			provider="claude",
+			source_root_key="claude:projects",
+			path=path,
+			source_session_id=chain_session_id,
+			analytics_session_id=chain_session_id,
+			chain_id=agent_id if is_sidechain else chain_session_id,
+			parent_chain_id=chain_session_id if is_sidechain else None,
+			agent_id=agent_id,
+			is_sidechain=is_sidechain,
+			cwd=chain_cwd,
+			observations=observations,
+		))
+
+	return fixture_sources
+
+
+def codex_turn_observation(
+	source_ordinal: int,
+	observed_at: datetime,
+	source_session_id: str,
+	analytics_session_id: str,
+	parent_chain_id: str | None,
+	cwd: str,
+	turn_id: str,
+	model: str | None,
+) -> dict:
+	return {
+		"source_record_key": f"v1:codex_turn_context:{source_ordinal}:0",
+		"source_ordinal": source_ordinal,
+		"observation_kind": "turn",
+		"source_session_id": source_session_id,
+		"analytics_session_id": analytics_session_id,
+		"chain_id": source_session_id,
+		"parent_chain_id": parent_chain_id,
+		"agent_id": None,
+		"turn_id": turn_id,
+		"raw_model_id": model,
+		"cwd": cwd,
+		"hostname": DEMO_MODEL_HOSTNAME,
+		"is_sidechain": parent_chain_id is not None,
+		"observed_at_ms": datetime_to_ms(observed_at),
+		"input_tokens": None,
+		"output_tokens": None,
+		"cache_creation_tokens": None,
+		"cache_read_tokens": None,
+		"model_evidence": "explicit" if model is not None else "missing",
+		"token_evidence": "unavailable",
+	}
+
+
+def codex_token_observation(
+	source_ordinal: int,
+	observed_at: datetime,
+	source_session_id: str,
+	analytics_session_id: str,
+	parent_chain_id: str | None,
+	cwd: str,
+	deltas: tuple[int, int, int, int],
+) -> dict:
+	return {
+		"source_record_key": f"v1:codex_token_count:{source_ordinal}:0",
+		"source_ordinal": source_ordinal,
+		"observation_kind": "token",
+		"source_session_id": source_session_id,
+		"analytics_session_id": analytics_session_id,
+		"chain_id": source_session_id,
+		"parent_chain_id": parent_chain_id,
+		"agent_id": None,
+		"turn_id": None,
+		"raw_model_id": None,
+		"cwd": cwd,
+		"hostname": DEMO_MODEL_HOSTNAME,
+		"is_sidechain": parent_chain_id is not None,
+		"observed_at_ms": datetime_to_ms(observed_at),
+		"input_tokens": deltas[0],
+		"output_tokens": deltas[1],
+		"cache_creation_tokens": deltas[2],
+		"cache_read_tokens": deltas[3],
+		"model_evidence": "missing",
+		"token_evidence": "cumulative_delta",
+	}
+
+
+def populate_codex_session_jsonls() -> list[dict]:
+	if not MODEL_FIXTURE_MODE or CODEX_SESSIONS_DIR is None:
+		return []
+
+	root_session_id = "demo-codex-chain-root"
+	child_session_id = "demo-codex-chain-child"
+	cwd = PROJECTS[2]
+	day_dir = CODEX_SESSIONS_DIR / NOW.strftime("%Y/%m/%d")
+	fixture_sources = []
+
+	for session_id, parent_id, minute_offset in [
+		(root_session_id, None, 38),
+		(child_session_id, root_session_id, 37),
+	]:
+		start = NOW - timedelta(minutes=minute_offset)
+		path = day_dir / f"rollout-{session_id}.jsonl"
+		session_payload = {"id": session_id, "cwd": cwd}
+		if parent_id is not None:
+			session_payload["parent_thread_id"] = parent_id
+		records = [{"timestamp": ts_tz(start), "type": "session_meta", "payload": session_payload}]
+		observations = []
+		cumulative = [0, 0, 0, 0]
+		models = [
+			f"demo/codex/dynamic-{0 if parent_id is None else 2}",
+			None,
+			f"demo/codex/dynamic-{1 if parent_id is None else 3}",
+			f"demo/codex/dynamic-{1 if parent_id is None else 3}",
+		]
+		for turn_index, model in enumerate(models):
+			turn_time = start + timedelta(minutes=turn_index * 2 + 1)
+			turn_payload = {"turn_id": f"{session_id}-turn-{turn_index}"}
+			if model is not None:
+				turn_payload["model"] = model
+			records.append({"timestamp": ts_tz(turn_time), "type": "turn_context", "payload": turn_payload})
+			observations.append(codex_turn_observation(
+				len(records) - 1,
+				turn_time,
+				session_id,
+				root_session_id,
+				parent_id,
+				cwd,
+				turn_payload["turn_id"],
+				model,
+			))
+
+			delta = (55 + turn_index * 3, 18 + turn_index, 4 + turn_index, 20 + turn_index * 2)
+			for dimension, value in enumerate(delta):
+				cumulative[dimension] += value
+			token_time = turn_time + timedelta(seconds=20)
+			total_usage = {
+				"input_tokens": cumulative[0] + cumulative[3],
+				"output_tokens": cumulative[1],
+				"cache_creation_tokens": cumulative[2],
+				"cached_input_tokens": cumulative[3],
+			}
+			records.append({
+				"timestamp": ts_tz(token_time),
+				"type": "event_msg",
+				"payload": {
+					"type": "token_count",
+					"info": {"total_token_usage": total_usage},
+				},
+			})
+			observations.append(codex_token_observation(
+				len(records) - 1,
+				token_time,
+				session_id,
+				root_session_id,
+				parent_id,
+				cwd,
+				delta,
+			))
+
+		write_jsonl_fixture("codex", path, records)
+		fixture_sources.append(model_fixture_source(
+			provider="codex",
+			source_root_key="codex:sessions",
+			path=path,
+			source_session_id=session_id,
+			analytics_session_id=root_session_id,
+			chain_id=session_id,
+			parent_chain_id=parent_id,
+			agent_id=None,
+			is_sidechain=parent_id is not None,
+			cwd=cwd,
+			observations=observations,
+			first_activity_at_ms=datetime_to_ms(start),
+		))
+
+	print(f"  codex_session_jsonls: {len(fixture_sources)} files in {CODEX_SESSIONS_DIR}")
+	return fixture_sources
+
+
+def populate_model_analytics(conn: sqlite3.Connection, fixture_sources: list[dict]) -> None:
+	state_updated_at_ms = datetime_to_ms(datetime.now(timezone.utc))
+	if not MODEL_FIXTURE_MODE:
+		conn.execute(
+			"INSERT INTO model_backfill_state ("
+			"id, generation, trigger, status, total_roots, completed_roots, failed_roots, "
+			"inventory_complete, total_sources, source_total_published, processed_sources, "
+			"failed_sources, skipped_sources, remaining_sources, observations_written, "
+			"started_at_ms, updated_at_ms, finished_at_ms, last_error"
+			") VALUES (1, 0, 'migration', 'pending', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "
+			"NULL, ?, NULL, NULL)",
+			(state_updated_at_ms,),
+		)
+		print("  model_analytics: pending (isolated Claude + Codex paths not supplied)")
+		return
+
+	configured_roots = {
+		"claude": PROJECTS_DIR.resolve(strict=True),
+		"codex": CODEX_SESSIONS_DIR.resolve(strict=True) if CODEX_SESSIONS_DIR else None,
+	}
+	expected_paths = {"claude": set(), "codex": set()}
+	for source in fixture_sources:
+		path = source["path"].resolve(strict=True)
+		root = configured_roots[source["provider"]]
+		if root is None or canonical_path_inside(root, path) is None:
+			raise ValueError(f"model fixture source escaped configured {source['provider']} root")
+		expected_paths[source["provider"]].add(path)
+	discovered_paths = {
+		provider: set(discover_runtime_model_jsonls(provider, root))
+		for provider, root in configured_roots.items()
+		if root is not None
+	}
+	completed_roots = sum(
+		expected_paths[provider] == discovered_paths.get(provider, set())
+		for provider in expected_paths
+	)
+	inventory_matches = completed_roots == len(expected_paths)
+	backfill_started_at_ms = datetime_to_ms(datetime.now(timezone.utc))
+	total_observations = 0
+	for source in fixture_sources:
+		path = source["path"].resolve(strict=True)
+		contents = path.read_bytes()
+		stat = path.stat()
+		source_key = canonical_model_source_key(source["source_root_key"], path)
+		content_sha256 = hashlib.sha256(contents).hexdigest()
+		observation_count = len(source["observations"])
+		source_success_at_ms = datetime_to_ms(datetime.now(timezone.utc))
+		conn.execute(
+			"INSERT INTO model_observation_sources ("
+			"provider, source_key, source_root_key, source_path, source_session_id, "
+			"analytics_session_id, chain_id, parent_chain_id, agent_id, is_sidechain, "
+			"cwd, hostname, first_activity_at_ms, last_activity_at_ms, mtime_ns, size_bytes, "
+			"content_sha256, last_error, suppressed_sha256, suppressed_at_ms, seen_generation, "
+			"processing_status, observation_count, last_attempt_at_ms, last_success_at_ms"
+			") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, "
+			"NULL, 1, 'ok', ?, ?, ?)",
+			(
+				source["provider"], source_key, source["source_root_key"], str(path),
+				source["source_session_id"], source["analytics_session_id"], source["chain_id"],
+				source["parent_chain_id"], source["agent_id"], int(source["is_sidechain"]),
+				source["cwd"], source["hostname"], source["first_activity_at_ms"],
+				source["last_activity_at_ms"], stat.st_mtime_ns, stat.st_size, content_sha256,
+				observation_count, source_success_at_ms, source_success_at_ms,
+			),
+		)
+		for observation in source["observations"]:
+			conn.execute(
+				"INSERT INTO model_usage_observations ("
+				"provider, source_key, source_record_key, source_ordinal, observation_kind, "
+				"source_session_id, analytics_session_id, chain_id, parent_chain_id, agent_id, "
+				"turn_id, raw_model_id, cwd, hostname, is_sidechain, observed_at_ms, input_tokens, "
+				"output_tokens, cache_creation_tokens, cache_read_tokens, model_evidence, token_evidence"
+				") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				(
+					source["provider"], source_key, observation["source_record_key"],
+					observation["source_ordinal"], observation["observation_kind"],
+					observation["source_session_id"], observation["analytics_session_id"],
+					observation["chain_id"], observation["parent_chain_id"], observation["agent_id"],
+					observation["turn_id"], observation["raw_model_id"], observation["cwd"],
+					observation["hostname"], int(observation["is_sidechain"]),
+					observation["observed_at_ms"], observation["input_tokens"],
+					observation["output_tokens"], observation["cache_creation_tokens"],
+					observation["cache_read_tokens"], observation["model_evidence"],
+					observation["token_evidence"],
+				),
+			)
+		total_observations += observation_count
+
+	backfill_finished_at_ms = datetime_to_ms(datetime.now(timezone.utc))
+	if inventory_matches:
+		conn.execute(
+			"INSERT INTO model_backfill_state ("
+			"id, generation, trigger, status, total_roots, completed_roots, failed_roots, "
+			"inventory_complete, total_sources, source_total_published, processed_sources, "
+			"failed_sources, skipped_sources, remaining_sources, observations_written, "
+			"started_at_ms, updated_at_ms, finished_at_ms, last_error"
+			") VALUES (1, 1, 'reconcile', 'complete', 2, 2, 0, 1, ?, 1, ?, 0, 0, 0, ?, ?, ?, ?, NULL)",
+			(
+				len(fixture_sources), len(fixture_sources), total_observations,
+				backfill_started_at_ms, backfill_finished_at_ms, backfill_finished_at_ms,
+			),
+		)
+	else:
+		# Runtime backfill owns unmarked/pre-existing sources. Keep this generation
+		# pending instead of claiming a complete inventory the seeder did not write.
+		conn.execute(
+			"INSERT INTO model_backfill_state ("
+			"id, generation, trigger, status, total_roots, completed_roots, failed_roots, "
+			"inventory_complete, total_sources, source_total_published, processed_sources, "
+			"failed_sources, skipped_sources, remaining_sources, observations_written, "
+			"started_at_ms, updated_at_ms, finished_at_ms, last_error"
+			") VALUES (1, 1, 'reconcile', 'pending', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "
+			"NULL, ?, NULL, NULL)",
+			(backfill_finished_at_ms,),
+		)
+	conn.execute(
+		"INSERT OR REPLACE INTO settings (key, value) VALUES ('model_analytics.data_revision.v1', '1')"
+	)
+	if inventory_matches:
+		print(
+			f"  model_analytics: {total_observations} observations from "
+			f"{len(fixture_sources)} sources; 2/2 roots complete"
+		)
+	else:
+		discovered_count = sum(len(paths) for paths in discovered_paths.values())
+		print(
+			f"  model_analytics: pending runtime reconciliation; seeded "
+			f"{len(fixture_sources)} of {discovered_count} retained sources"
+		)
+
+
+def restore_pending_model_state_after_failure() -> None:
+	"""Best-effort singleton recovery without replacing the original failure."""
+	recovery = None
+	try:
+		recovery = sqlite3.connect(str(DB_PATH))
+		recovery.execute("BEGIN IMMEDIATE")
+		recovery.execute(
+			"INSERT INTO model_backfill_state ("
+			"id, generation, trigger, status, total_roots, completed_roots, failed_roots, "
+			"inventory_complete, total_sources, source_total_published, processed_sources, "
+			"failed_sources, skipped_sources, remaining_sources, observations_written, "
+			"started_at_ms, updated_at_ms, finished_at_ms, last_error"
+			") VALUES (1, 0, 'migration', 'pending', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "
+			"NULL, ?, NULL, NULL) "
+			"ON CONFLICT(id) DO UPDATE SET "
+			"generation=excluded.generation, trigger=excluded.trigger, status=excluded.status, "
+			"total_roots=0, completed_roots=0, failed_roots=0, inventory_complete=0, "
+			"total_sources=0, source_total_published=0, processed_sources=0, failed_sources=0, "
+			"skipped_sources=0, remaining_sources=0, observations_written=0, started_at_ms=NULL, "
+			"updated_at_ms=excluded.updated_at_ms, finished_at_ms=NULL, last_error=NULL",
+			(datetime_to_ms(datetime.now(timezone.utc)),),
+		)
+		recovery.commit()
+	except Exception as recovery_error:
+		if recovery is not None:
+			try:
+				recovery.rollback()
+			except Exception:
+				pass
+		try:
+			print(
+				f"WARNING: could not restore pending model backfill state: {recovery_error}",
+				file=sys.stderr,
+			)
+		except Exception:
+			pass
+	finally:
+		if recovery is not None:
+			try:
+				recovery.close()
+			except Exception:
+				pass
+
+
+# ── 19. Claude session JSONL files ────────────────────────────────────────────
+
+def populate_session_jsonls() -> list[dict]:
 	"""Write fictional Claude-Code session JSONL files into PROJECTS_DIR.
 
 	Tantivy's session indexer scans `<HOME>/.claude/projects/<project_dir>/*.jsonl`
@@ -1886,7 +2790,7 @@ def populate_session_jsonls() -> None:
 	"""
 	if SKIP_PROJECTS:
 		log("  session_jsonls: skipped (--no-projects)")
-		return
+		return []
 
 	prompts = [
 		"Why is the request handler timing out under load?",
@@ -1911,11 +2815,12 @@ def populate_session_jsonls() -> None:
 	tools_used_pool = ["Edit", "Write", "Read", "Bash", "Grep", "Glob", "Task"]
 	branches = ["main", "fix/auth-token-format", "perf/cache-skip-flag", "fix/rate-limit-off-by-one"]
 
-	PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+	ensure_configured_fixture_root("claude", PROJECTS_DIR)
 
 	total_messages = 0
 	total_files = 0
-	for project_path in PROJECTS_DIR.iterdir() if False else PROJECTS:
+	fixture_sources = []
+	for project_index, project_path in enumerate(PROJECTS):
 		# project_path is a string from the PROJECTS list (e.g. "/home/alex/projects/quill")
 		# Claude-Code dir-naming convention replaces slashes with dashes.
 		project_slug = project_path.replace("/", "-").lstrip("-")
@@ -1927,6 +2832,7 @@ def populate_session_jsonls() -> None:
 			session_id = rand_session()
 			session_file = project_dir / f"{session_id}.jsonl"
 			lines = []
+			observations = []
 			session_start = NOW - timedelta(hours=random.randint(1, 96))
 			branch = random.choice(branches)
 			turn_count = random.randint(2, 5)
@@ -1977,7 +2883,7 @@ def populate_session_jsonls() -> None:
 						"input": tool_input,
 					})
 
-				lines.append(json.dumps({
+				assistant_record = {
 					"type": "assistant",
 					"uuid": str(uuid.UUID(int=random.getrandbits(128))),
 					"sessionId": session_id,
@@ -1986,18 +2892,56 @@ def populate_session_jsonls() -> None:
 					"gitBranch": branch,
 					"message": {
 						"role": "assistant",
+						"model": f"demo-claude-opaque-{project_index}-{session_idx}-{turn % 3}",
+						"usage": {
+							"input_tokens": 120 + turn * 7,
+							"output_tokens": 36 + turn * 3,
+							"cache_creation_input_tokens": 12 + turn,
+							"cache_read_input_tokens": 48 + turn * 2,
+						},
 						"content": assistant_blocks,
 					},
-				}))
+				}
+				lines.append(json.dumps(assistant_record))
+				observations.append(claude_fixture_observation(
+					len(lines) - 1,
+					assistant_record,
+					session_id,
+					project_path,
+				))
 
-			session_file.write_text("\n".join(lines) + "\n")
+			write_jsonl_fixture("claude", session_file, lines)
+			fixture_sources.append(model_fixture_source(
+				provider="claude",
+				source_root_key="claude:projects",
+				path=session_file,
+				source_session_id=session_id,
+				analytics_session_id=session_id,
+				chain_id=session_id,
+				parent_chain_id=None,
+				agent_id=None,
+				is_sidechain=False,
+				cwd=project_path,
+				observations=observations,
+			))
 			total_files += 1
 			total_messages += len(lines)
 
+	if MODEL_FIXTURE_MODE:
+		edge_sources = write_claude_model_edge_fixtures()
+		fixture_sources.extend(edge_sources)
+		total_files += len(edge_sources)
+		total_messages += sum(len(source["observations"]) for source in edge_sources)
 	print(f"  session_jsonls: {total_files} files, {total_messages} messages in {PROJECTS_DIR}")
+	return fixture_sources
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def paths_overlap(left: Path, right: Path) -> bool:
+	left = left.expanduser().resolve()
+	right = right.expanduser().resolve()
+	return left == right or left in right.parents or right in left.parents
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(
@@ -2016,6 +2960,10 @@ def parse_args() -> argparse.Namespace:
 		help="Directory to write fictional Claude session JSONL files into. Default: ~/.claude/projects/.",
 	)
 	parser.add_argument(
+		"--codex-sessions-dir", type=Path, default=None,
+		help="Isolated directory to write fictional Codex session JSONL files into.",
+	)
+	parser.add_argument(
 		"--no-projects", action="store_true",
 		help="Skip writing session JSONL files (omits the Session Search demo data).",
 	)
@@ -2031,11 +2979,27 @@ def parse_args() -> argparse.Namespace:
 		"--quiet", action="store_true",
 		help="Suppress per-step progress output; only emit the final summary.",
 	)
-	return parser.parse_args()
+	args = parser.parse_args()
+	if (
+		args.data_dir is not None
+		and args.projects_dir is not None
+		and args.codex_sessions_dir is not None
+		and not args.no_projects
+	):
+		for configured, production, label in (
+			(args.projects_dir, DEFAULT_PROJECTS_DIR, "Claude projects"),
+			(args.codex_sessions_dir, DEFAULT_CODEX_SESSIONS_DIR, "Codex sessions"),
+		):
+			if paths_overlap(configured, production):
+				parser.error(
+					f"isolated model fixtures cannot overlap the production {label} path"
+				)
+	return args
 
 
 def main() -> None:
-	global DB_PATH, BAK_PATH, LEARNED_DIR, PROJECTS_DIR, QUIET, NO_BACKUP, USING_OVERRIDE, SKIP_PROJECTS
+	global DB_PATH, BAK_PATH, LEARNED_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR
+	global QUIET, NO_BACKUP, USING_OVERRIDE, SKIP_PROJECTS, MODEL_FIXTURE_MODE
 
 	args = parse_args()
 
@@ -2043,6 +3007,12 @@ def main() -> None:
 	NO_BACKUP = args.no_backup
 	USING_OVERRIDE = args.data_dir is not None
 	SKIP_PROJECTS = args.no_projects
+	MODEL_FIXTURE_MODE = (
+		USING_OVERRIDE
+		and args.projects_dir is not None
+		and args.codex_sessions_dir is not None
+		and not SKIP_PROJECTS
+	)
 
 	data_dir = args.data_dir if args.data_dir is not None else DEFAULT_DATA_DIR
 	rules_dir = args.rules_dir if args.rules_dir is not None else DEFAULT_RULES_DIR
@@ -2052,12 +3022,15 @@ def main() -> None:
 	BAK_PATH = DB_PATH.with_suffix(".db.bak")
 	LEARNED_DIR = rules_dir
 	PROJECTS_DIR = projects_dir
+	CODEX_SESSIONS_DIR = args.codex_sessions_dir
 
 	random.seed(args.seed)
 
 	log(f"\nQuill Dummy Data Seeder")
 	log(f"DB path:    {DB_PATH}")
 	log(f"Rules path: {LEARNED_DIR}")
+	if CODEX_SESSIONS_DIR is not None:
+		log(f"Codex path: {CODEX_SESSIONS_DIR}")
 	if USING_OVERRIDE:
 		log("Mode:       sandbox (--data-dir override; running-Quill guard skipped)")
 	log()
@@ -2110,14 +3083,32 @@ def main() -> None:
 		log()
 
 		conn.commit()
-		log("Done. All 18 tables populated.")
+		log("Done. Core analytics tables populated.")
 	finally:
 		conn.execute("PRAGMA foreign_keys = ON")
 		conn.close()
 
-	# Session JSONL files (out of band — they live on the filesystem under
-	# PROJECTS_DIR, not in the SQLite DB).
-	populate_session_jsonls()
+	try:
+		# Session JSONL files live outside SQLite. Every failure after the core DB
+		# commit must restore migration-safe pending model state before bubbling.
+		cleanup_owned_model_jsonls()
+		fixture_sources = populate_session_jsonls()
+		fixture_sources.extend(populate_codex_session_jsonls())
+
+		# Model tables depend on exact retained-file fingerprints and canonical
+		# source keys, so populate them only after both provider fixtures are on disk.
+		model_conn = sqlite3.connect(str(DB_PATH))
+		try:
+			populate_model_analytics(model_conn, fixture_sources)
+			model_conn.commit()
+		except Exception:
+			model_conn.rollback()
+			raise
+		finally:
+			model_conn.close()
+	except Exception:
+		restore_pending_model_state_after_failure()
+		raise
 
 	# Final summary always prints (not gated by --quiet) so the maintainer always sees it.
 	print()
@@ -2128,6 +3119,8 @@ def main() -> None:
 		print(f"  rules:    {LEARNED_DIR}")
 		if not SKIP_PROJECTS:
 			print(f"  projects: {PROJECTS_DIR}")
+			if CODEX_SESSIONS_DIR is not None:
+				print(f"  codex:    {CODEX_SESSIONS_DIR}")
 	elif BAK_PATH.exists():
 		print("To restore the original DB, STOP QUILL FIRST then run:")
 		print(f"  pkill -f quill; sleep 1; cp {BAK_PATH} {DB_PATH}")

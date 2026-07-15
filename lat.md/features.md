@@ -24,11 +24,13 @@ The shared workload rail lives in [[src/components/live/LiveSummaryModule.tsx]],
 
 ## Analytics Dashboard
 
-Four-tab analytics view in the main window's right pane, powered by [[frontend#Custom Hooks]] and Recharts.
+Five-tab analytics view in the main window's right pane, powered by [[frontend#Custom Hooks]] and Recharts.
 
 Most analytics data is aggregated across all LLM providers; provider-scoped controls appear only where the underlying data model can preserve reliable provider identity.
 
-Each tab opens at its smallest available timeframe toggle by default: Now and Context default to `1h`, Trends defaults to `7d` (its smallest because week-over-week comparison requires at least a week), and Charts defaults to `1h` when no localStorage preference is saved (`quill-charts-range`).
+Each tab opens at its smallest available timeframe toggle by default: Now, Models, and Context default to `1h`, Trends defaults to `7d` (its smallest because week-over-week comparison requires at least a week), and Charts defaults to `1h` when no localStorage preference is saved (`quill-charts-range`). Models is always present. Context appears while enabled or represented by historical events; only a persisted active Context tab remains visible while availability is still loading.
+
+[[src/components/analytics/AnalyticsView.tsx#AnalyticsView]] restores the persisted active tab, including Models, and keeps a matching labeled panel from [[src/components/analytics/TabBar.tsx#analyticsPanelId]] mounted for every visible tab. Data-heavy content loads only for the effective active view except Models: it mounts on first visit, then remains alive under its hidden panel so tab switches preserve fetched evidence and the event listener instead of repeating listener-gap reconciliation. A definitive unavailable Context result maps immediately to Now. Snapshot checks run only while Now, Trends, or Charts is active; a successful zero count shows empty content inside that panel, while snapshot failures, Models, and Context bypass the empty gate.
 
 ### Now Tab
 
@@ -53,6 +55,18 @@ Week-over-week comparison charts for token usage trends, code velocity, and cach
 Composite Recharts visualization with three synchronized charts: tokens, code changes, and cache efficiency.
 
 Crosshair context synchronizes tooltip position across chart components. Lazy-loaded with React Suspense to reduce initial bundle size.
+
+### Models Tab
+
+Provider-qualified transcript evidence shows which opaque model IDs were observed, how much token activity remains unattributed, and which sessions changed models.
+
+Models stays available without live usage snapshots. Its `1h`, `24h`, `7d`, and `30d` ranges and response-derived provider filters scope the summary, fixed-bucket history, complete model table, and selected-model detail together. Coverage is attributed tokens divided by all token-bearing model observations; missing identity contributes only to the unattributed remainder, and a zero denominator renders unavailable. Backfill status keeps recovered results usable while pending, partial, failed, or retrying, and only complete inventory plus final backend scope permits a definitive empty claim. See [[backend#Database#Schema#Model Analytics Evidence]].
+
+Each accepted raw ID appears exactly as observed after surrounding-whitespace trimming and is qualified by provider; no model catalog, family parsing, alias, friendly name, generated hue, or `unknown` row participates. Provider badges alone use the fixed Claude blue, Codex cyan, and MiniMax violet identities. The selected row and history overlay use signal blue as selection chrome while raw IDs stay neutral. [[src/components/analytics/ModelsTab.tsx#ModelsTab]] clears selections only when fresh evidence proves their provider-qualified identity is outside scope.
+
+Selecting a model opens 20 most-recent matching sessions at a time through [[src-tauri/src/storage.rs#Storage#get_model_sessions]]. Expanded rows lazily read [[src-tauri/src/storage.rs#Storage#get_session_model_history|complete chronological history]]: repeated adjacent models compress, missing-model turns form visible gaps that reset switch adjacency, and token-only observations do not create segments. Parent and subagent chains remain separate, so interleaving never creates a false switch; primary-model ties resolve by attributed tokens, turn count, then binary provider and raw ID.
+
+Committed model events coalesce from the first event into one fixed one-second refresh, with a 60-second fallback poll. Aggregate and history regions refresh independently; selected-model pages replay atomically and expanded chain rows refetch independently, preserving accepted results beside local Retry states. A stale `not_found` detail removes only its exact provider/session row after a bounded notice. See [[data-flow#Model Observation Reconciliation]] and [[frontend#Components#Models Composition]].
 
 ### Context Tab
 

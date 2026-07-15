@@ -85,7 +85,7 @@ function TitleBar({
     };
   }, []);
 
-  const featuresDisabled = providersLoading || !hasEnabledProvider;
+  const liveDisabled = !showLive && (providersLoading || !hasEnabledProvider);
 
   const handleOpenManage = useCallback(async (section?: string) => {
     const existing = await WebviewWindow.getByLabel("manage");
@@ -143,14 +143,13 @@ function TitleBar({
           <button
             className={`view-tab${showLive ? " active" : ""}`}
             onClick={() => onToggleLive(!showLive)}
-            disabled={featuresDisabled}
+            disabled={liveDisabled}
           >
             Live
           </button>
           <button
             className={`view-tab${showAnalytics ? " active" : ""}`}
             onClick={() => onToggleAnalytics(!showAnalytics)}
-            disabled={featuresDisabled}
           >
             Analytics
           </button>

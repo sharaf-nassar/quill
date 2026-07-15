@@ -115,9 +115,9 @@
       "name": "Analytics Tab",
       "kind": "nav",
       "refersTo": "tab-active",
-      "description": "Underline-indicator tab (never a pill). The 2px bottom border takes the tab's own accent when active.",
-      "html": "<div class='ds-atabs'><button class='ds-atab ds-atab--active'>Now</button><button class='ds-atab'>Trends</button><button class='ds-atab'>Charts</button><button class='ds-atab'>Context</button></div>",
-      "css": ".ds-atabs{display:flex;gap:0;} .ds-atab{background:none;border:none;border-bottom:2px solid transparent;color:#484f58;font-family:Geist,sans-serif;font-size:11px;font-weight:600;padding:5px 14px;cursor:pointer;transition:color 0.15s ease;} .ds-atab:hover{color:rgba(255,255,255,0.7);} .ds-atab--active{color:#e6edf3;border-bottom-color:#60a5fa;} .ds-atab:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+      "description": "Five-tab underline navigation (never a pill). Models uses signal-blue only as active selection chrome; raw model IDs remain neutral and provider badges retain provider hues.",
+      "html": "<div class='ds-atabs' role='tablist' aria-label='Analytics'><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Now</button><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Trends</button><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Charts</button><button class='ds-atab ds-atab--active' role='tab' aria-selected='true' tabindex='0'>Models</button><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Context</button></div>",
+      "css": ".ds-atabs{display:flex;gap:0;max-width:100%;min-width:0;overflow-x:auto;} .ds-atab{flex:0 0 auto;background:none;border:none;border-bottom:2px solid transparent;color:#484f58;font-family:Geist,sans-serif;font-size:11px;font-weight:600;padding:5px 14px;cursor:pointer;transition:color 0.15s ease;} .ds-atab:hover{color:rgba(255,255,255,0.7);} .ds-atab--active{color:#e6edf3;border-bottom-color:#60a5fa;} .ds-atab:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
     }
   ],
   "narrative": {

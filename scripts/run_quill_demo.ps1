@@ -71,6 +71,7 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $Sandbox "data")     | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $Sandbox "rules")    | Out-Null
     New-Item -ItemType Directory -Force -Path (Join-Path $Sandbox "projects") | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $Sandbox "codex-sessions") | Out-Null
 }
 catch {
     Write-Error "[demo] ERROR: could not create sandbox dirs under $Sandbox"
@@ -81,11 +82,13 @@ $env:QUILL_DEMO_MODE            = "1"
 $env:QUILL_DATA_DIR             = Join-Path $Sandbox "data"
 $env:QUILL_RULES_DIR            = Join-Path $Sandbox "rules"
 $env:QUILL_CLAUDE_PROJECTS_DIR  = Join-Path $Sandbox "projects"
+$env:QUILL_CODEX_SESSIONS_DIR   = Join-Path $Sandbox "codex-sessions"
 
 Write-Host "[demo] sandbox at $Sandbox"
 Write-Host "[demo] data:     $env:QUILL_DATA_DIR"
 Write-Host "[demo] rules:    $env:QUILL_RULES_DIR"
 Write-Host "[demo] projects: $env:QUILL_CLAUDE_PROJECTS_DIR"
+Write-Host "[demo] codex:    $env:QUILL_CODEX_SESSIONS_DIR"
 
 # ── Seed ──────────────────────────────────────────────────────────────────────
 
@@ -94,12 +97,20 @@ $seederArgs = @(
     "--data-dir",     $env:QUILL_DATA_DIR,
     "--rules-dir",    $env:QUILL_RULES_DIR,
     "--projects-dir", $env:QUILL_CLAUDE_PROJECTS_DIR,
+    "--codex-sessions-dir", $env:QUILL_CODEX_SESSIONS_DIR,
     "--no-backup",
     "--quiet"
 )
-$seeder = Start-Process -FilePath "python3" -ArgumentList $seederArgs -NoNewWindow -PassThru -Wait
-if ($seeder.ExitCode -ne 0) {
-    Write-Error "[demo] ERROR: seeder failed; sandbox left at $Sandbox for inspection"
+try {
+    & python3 @seederArgs
+    $seederExitCode = $LASTEXITCODE
+}
+catch {
+    [Console]::Error.WriteLine("[demo] ERROR: seeder failed; sandbox left at $Sandbox for inspection")
+    exit 3
+}
+if ($seederExitCode -ne 0) {
+    [Console]::Error.WriteLine("[demo] ERROR: seeder failed; sandbox left at $Sandbox for inspection")
     exit 3
 }
 

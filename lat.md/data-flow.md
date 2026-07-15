@@ -1,6 +1,6 @@
 # Data Flow
 
-The system has six primary data pipelines connecting hook scripts, the HTTP server, the database, and the frontend.
+The system has seven primary data pipelines connecting hook scripts, the HTTP server, the database, and the frontend.
 
 ## Token Reporting Pipeline
 
@@ -60,6 +60,30 @@ Lifecycle-hook fires are surfaced in the Now-tab Hooks breakdown via two distinc
 6. The frontend [[src/components/analytics/BreakdownPanel.tsx]] renders one row per `hook_identity`, keeps `quill:` prefixes visible in the identity text, and includes a help affordance that explains the Claude/Codex tracking asymmetry.
 
 The privacy gate is the existing `activity_tracking` feature flag: toggling it off removes `hook-observe.cjs` and its eight `[[hooks.<Event>]]` config entries from `~/.codex/config.toml`, stopping new Codex observations. Claude-side ingestion is unaffected because Quill never writes anything to Claude transcripts — the data flows from the user's transcript to Quill, not the other way around.
+
+## Model Observation Reconciliation
+
+Retained Claude and Codex transcripts become source-owned model observations without coupling model identity to Session Search indexing.
+
+[[src-tauri/src/sessions.rs#enumerate_retained_jsonl_source_roots]] canonicalizes each configured provider root and contained supported JSONL path. [[src-tauri/src/sessions.rs#canonical_source_key]] combines the stable provider-root key with native path bytes, so full inventory and [[src-tauri/src/sessions.rs#validate_retained_notify_source|live notify validation]] address the same source without lossy path or cross-provider collisions.
+
+[[src-tauri/src/model_usage.rs#parse_claude_model_usage_jsonl]] emits Claude assistant turns from explicit `message.model` plus any dimensions on that record. [[src-tauri/src/model_usage.rs#parse_codex_model_usage_jsonl]] keeps explicit `turn_context` model evidence separate from normalized cumulative `token_count` deltas. Missing or invalid identity remains null, so unsupported attribution lowers coverage instead of inventing an `unknown` model or borrowing a nearby ID.
+
+[[src-tauri/src/model_usage.rs#prepare_model_source_reconciliation]] stages complete source reads, content hashes, provider parsing, and graph resolution into an owned plan before any replacement transaction. Filesystem layout hints can report conflicts but cannot override transcript-native parent metadata.
+
+When an ancestor changes a retained descendant's resolved analytics root, preparation reparses that otherwise unchanged descendant before writes begin. [[src-tauri/src/model_usage.rs#commit_next_model_source_batch]] commits bounded source batches from the stable plan so a worker can yield without losing graph context; errors return prior committed outcomes. Preparation captures prune proofs only for roots complete in that inventory, and pruning also requires every planned source commit. Event status is read before mutation, each source commit remains atomic, and post-commit `model-analytics-updated` delivery is best-effort and storage-free.
+
+Deletion keeps each removed source fingerprint as durable suppression. Reconciliation skips unchanged suppressed content; only one successful atomic replacement of changed content clears suppression and restores observations. All aggregate, history, paging, and chain queries exclude suppressed ownership, so attribution coverage and empty-state scope follow the same lifecycle.
+
+Paired [[src-tauri/src/storage.rs#Storage#get_model_analytics|aggregate]] and [[src-tauri/src/storage.rs#Storage#get_model_history|history]] reads use separate read-only deferred transactions rather than the primary connection mutex. They can read WAL snapshots concurrently with each other and committed reconciliation batches without changing per-response snapshot semantics.
+
+[[src-tauri/src/lib.rs#enqueue_model_usage_live_source]] admits validated retained transcripts to a managed queue keyed by provider and canonical source key. Repeated notifications for one source coalesce, while sibling sources remain independent. [[src-tauri/src/lib.rs#drain_model_usage_live_queue]] acquires the atomic process permit, applies capped failure backoff, and moves blocking discovery and reconciliation off Tauri's async command threads. It retains the permit across bounded commit batches and yields between them, preserving one prepared graph decision while keeping the runtime responsive.
+
+After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted running history to pending and reserves one nonblocking migration/resume worker. Explicit [[src-tauri/src/lib.rs#retry_model_history_backfill]] uses the same reservation before changing durable state, so concurrent retries are idempotent and an unowned persisted `running` row is safely recovered; live work can finish under the shared permit before the pending retained pass starts.
+
+[[src-tauri/src/sessions.rs#SessionIndex#startup_scan]] independently enumerates and admits every retained source before Session Search reads its mtime cache. Search extraction, unchanged mtimes, and later scan failures therefore cannot suppress model fingerprint reconciliation; partial root diagnostics remain bounded while discovered siblings keep their provider and owning root.
+
+[[src/hooks/useModelAnalytics.ts#useModelAnalytics]] advances one frontend refresh generation after committed model events or fallback polls. Aggregate and history requests independently collapse same-identity signals received in flight into one post-commit deferred refresh, preventing live backfill events from continuously superseding accepted scope data; changed identities still supersede immediately. [[src/components/analytics/ModelsTab.tsx#ModelsTab]] passes the shared generation to selected-model paging and lazy session history, so loaded pages replay while expanded rows refetch independently. A stale history `not_found` is shown before composition hides only its exact provider/session row in the active range/model scope; old-scope callbacks cannot remove current rows, and successful page reconciliation releases hide markers for absent rows.
 
 ## Session Indexing Pipeline
 

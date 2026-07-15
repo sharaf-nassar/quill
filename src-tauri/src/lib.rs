@@ -16,6 +16,7 @@ mod indicator;
 mod integrations;
 mod learning;
 mod memory_optimizer;
+mod model_usage;
 mod models;
 mod plugins;
 mod prompt_utils;
@@ -32,15 +33,19 @@ use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
     ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown, LearnedRule, LearningRun,
-    LearningSettings, LlmRuntimeStats, ProjectBreakdown, ProjectTokens, ProviderErrorKind,
-    ProviderStatus, RuntimeSettings, SessionBreakdown, SessionCodeStats, SessionRef, SessionStats,
-    SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
-    TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
+    LearningSettings, LlmRuntimeStats, ModelAnalyticsError, ModelAnalyticsErrorCode,
+    ModelAnalyticsResponse, ModelAnalyticsUpdatedEvent, ModelBackfillState, ModelBackfillStatus,
+    ModelHistoryResponse, ModelIdentity, ModelRange, ModelSessionsResponse, ProjectBreakdown,
+    ProjectTokens, ProviderErrorKind, ProviderStatus, RuntimeSettings, SessionBreakdown,
+    SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats, SkillBreakdown,
+    SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats,
+    ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc, OnceLock,
+    Arc, OnceLock, Weak,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 use storage::Storage;
@@ -60,6 +65,12 @@ static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
 // Holds the tray's "Always on Top" CheckMenuItem so the Settings window can
 // keep the tray checkmark and the window state in sync after a toggle.
 static TRAY_ON_TOP_ITEM: OnceLock<CheckMenuItem<tauri::Wry>> = OnceLock::new();
+const MODEL_USAGE_PERMIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const MODEL_USAGE_FAILURE_RETRY_BASE_SECS: u64 = 1;
+const MODEL_USAGE_FAILURE_RETRY_CAP_SECS: u64 = 30;
+const MODEL_USAGE_LIVE_COMMIT_BATCH_SIZE: usize = 32;
+const MODEL_SESSIONS_MIN_LIMIT: i64 = 1;
+const MODEL_SESSIONS_MAX_LIMIT: i64 = 100;
 const LIVE_USAGE_REFRESH_INTERVAL_SECS: i64 = 3 * 60;
 const CLAUDE_USAGE_LAST_ATTEMPT_KEY: &str = "usage.claude.last_attempt_at";
 const CLAUDE_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.claude.cooldown_until";
@@ -103,6 +114,424 @@ const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
 const PLUGIN_UPDATES_INTERVAL_MIN_HOURS: i64 = 1;
 const PLUGIN_UPDATES_INTERVAL_MAX_HOURS: i64 = 24;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ModelUsageLiveSourceKey {
+    provider: &'static str,
+    source_key: String,
+}
+
+impl ModelUsageLiveSourceKey {
+    fn from_source(source: &sessions::DiscoveredRetainedJsonlSource) -> Self {
+        Self {
+            provider: source.provider.as_str(),
+            source_key: source.source_key.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModelUsageRunnerInner {
+    live_sources: HashMap<ModelUsageLiveSourceKey, sessions::DiscoveredRetainedJsonlSource>,
+    drain_scheduled: bool,
+    retained_backfill_scheduled: bool,
+}
+
+/// Process-owned scheduling state for model source reconciliation.
+///
+/// The live queue deliberately keys work by provider plus canonical source key,
+/// not by session ID. The process-wide atomic permit in `model_usage` remains
+/// the final authority for runner ownership.
+pub(crate) struct ModelUsageRunnerState {
+    inner: Mutex<ModelUsageRunnerInner>,
+}
+
+impl ModelUsageRunnerState {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(ModelUsageRunnerInner::default()),
+        }
+    }
+
+    fn enqueue_live_source(
+        &self,
+        source: sessions::DiscoveredRetainedJsonlSource,
+    ) -> Result<(ModelUsageLiveQueueAdmission, bool), String> {
+        if !matches!(
+            source.provider,
+            integrations::IntegrationProvider::Claude | integrations::IntegrationProvider::Codex
+        ) {
+            return Err("Unsupported provider for model source reconciliation".to_string());
+        }
+        if source.source_root_key.is_empty()
+            || source.source_key.is_empty()
+            || !source.canonical_path.is_absolute()
+        {
+            return Err("Invalid retained model source identity".to_string());
+        }
+
+        let key = ModelUsageLiveSourceKey::from_source(&source);
+        let mut inner = self.inner.lock();
+        let admission = if let Some(queued) = inner.live_sources.get_mut(&key) {
+            if queued.canonical_path != source.canonical_path
+                || queued.source_root_key != source.source_root_key
+            {
+                return Err("Conflicting canonical path for retained model source key".to_string());
+            }
+            *queued = source;
+            ModelUsageLiveQueueAdmission::Coalesced
+        } else {
+            inner.live_sources.insert(key, source);
+            ModelUsageLiveQueueAdmission::Queued
+        };
+
+        let should_schedule = !inner.drain_scheduled;
+        if should_schedule {
+            inner.drain_scheduled = true;
+        }
+        Ok((admission, should_schedule))
+    }
+
+    fn take_live_sources(&self) -> Vec<sessions::DiscoveredRetainedJsonlSource> {
+        let mut inner = self.inner.lock();
+        inner
+            .live_sources
+            .drain()
+            .map(|(_, source)| source)
+            .collect()
+    }
+
+    fn requeue_live_sources(&self, sources: Vec<sessions::DiscoveredRetainedJsonlSource>) {
+        let mut inner = self.inner.lock();
+        for source in sources {
+            let key = ModelUsageLiveSourceKey::from_source(&source);
+            // Preserve a notification admitted while the failed batch ran.
+            inner.live_sources.entry(key).or_insert(source);
+        }
+    }
+
+    fn has_live_work_or_finish_drain(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.live_sources.is_empty() {
+            inner.drain_scheduled = false;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn try_reserve_retained_backfill(
+        self: &Arc<Self>,
+    ) -> Option<ModelHistoryBackfillScheduleReservation> {
+        let mut inner = self.inner.lock();
+        if inner.retained_backfill_scheduled {
+            return None;
+        }
+        inner.retained_backfill_scheduled = true;
+        Some(ModelHistoryBackfillScheduleReservation {
+            state: Arc::clone(self),
+        })
+    }
+
+    fn release_retained_backfill(&self) {
+        self.inner.lock().retained_backfill_scheduled = false;
+    }
+
+    fn retained_backfill_is_scheduled(&self) -> bool {
+        self.inner.lock().retained_backfill_scheduled
+    }
+}
+
+/// RAII ownership for one retained-history schedule request.
+///
+/// The reservation begins before retry mutates durable state, so concurrent
+/// commands cannot advance the generation twice. It stays held while waiting
+/// for live reconciliation to release the shared process permit and is also
+/// released if initialization or the async task fails.
+struct ModelHistoryBackfillScheduleReservation {
+    state: Arc<ModelUsageRunnerState>,
+}
+
+impl Drop for ModelHistoryBackfillScheduleReservation {
+    fn drop(&mut self) {
+        self.state.release_retained_backfill();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // T015 reports whether a live source notification coalesced.
+pub(crate) enum ModelUsageLiveQueueAdmission {
+    Queued,
+    Coalesced,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModelUsageLiveReconciliationProgress {
+    processed_sources: usize,
+    skipped_sources: usize,
+    failed_sources: usize,
+    observations_written: i64,
+    data_changed: bool,
+}
+
+impl ModelUsageLiveReconciliationProgress {
+    fn record(&mut self, batch: &model_usage::ModelSourceReconciliationBatchResult) {
+        self.processed_sources = self
+            .processed_sources
+            .saturating_add(batch.processed_sources());
+        self.skipped_sources = self.skipped_sources.saturating_add(batch.skipped_sources());
+        self.failed_sources = self.failed_sources.saturating_add(batch.failed_sources());
+        self.observations_written = self
+            .observations_written
+            .saturating_add(batch.observations_written());
+        self.data_changed |= batch.data_changed;
+    }
+}
+
+#[derive(Debug)]
+struct ModelUsageLiveReconciliationFailure {
+    error: String,
+    committed: ModelUsageLiveReconciliationProgress,
+}
+
+fn model_usage_failure_retry_delay(consecutive_failures: u32) -> std::time::Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(63);
+    let multiplier = 1_u64.checked_shl(doublings).unwrap_or(u64::MAX);
+    let seconds = MODEL_USAGE_FAILURE_RETRY_BASE_SECS
+        .saturating_mul(multiplier)
+        .min(MODEL_USAGE_FAILURE_RETRY_CAP_SECS);
+    std::time::Duration::from_secs(seconds)
+}
+
+/// Admit one already-discovered retained transcript without blocking its caller.
+///
+/// T014/T015 own discovery and request validation. This boundary owns only
+/// source-keyed coalescing and background runner scheduling.
+#[allow(dead_code)] // T014/T015 call this shared scheduling boundary.
+pub(crate) fn enqueue_model_usage_live_source(
+    app_handle: &tauri::AppHandle,
+    source: sessions::DiscoveredRetainedJsonlSource,
+) -> Result<ModelUsageLiveQueueAdmission, String> {
+    let state = app_handle
+        .try_state::<Arc<ModelUsageRunnerState>>()
+        .ok_or_else(|| "Model usage runner state is not initialized".to_string())?;
+    let state = Arc::clone(state.inner());
+    let (admission, should_schedule) = state.enqueue_live_source(source)?;
+    if should_schedule {
+        spawn_model_usage_live_queue_drain(app_handle.clone(), Arc::downgrade(&state));
+    }
+    Ok(admission)
+}
+
+fn spawn_model_usage_live_queue_drain(
+    app_handle: tauri::AppHandle,
+    state: Weak<ModelUsageRunnerState>,
+) {
+    tauri::async_runtime::spawn(async move {
+        drain_model_usage_live_queue(app_handle, state).await;
+    });
+}
+
+async fn drain_model_usage_live_queue(
+    app_handle: tauri::AppHandle,
+    state: Weak<ModelUsageRunnerState>,
+) {
+    let mut consecutive_work_failures = 0_u32;
+    loop {
+        let Some(state_ref) = state.upgrade() else {
+            return;
+        };
+        if !state_ref.has_live_work_or_finish_drain() {
+            return;
+        }
+        if state_ref.retained_backfill_is_scheduled() {
+            drop(state_ref);
+            tokio::time::sleep(MODEL_USAGE_PERMIT_RETRY_DELAY).await;
+            continue;
+        }
+
+        // The active getter is advisory only. Atomic acquisition decides who
+        // owns all retained-history, startup, and live reconciliation work.
+        let Some(permit) = model_usage::try_acquire_model_usage_runner() else {
+            drop(state_ref);
+            tokio::time::sleep(MODEL_USAGE_PERMIT_RETRY_DELAY).await;
+            continue;
+        };
+
+        let queued = state_ref.take_live_sources();
+        drop(state_ref);
+        if queued.is_empty() {
+            drop(permit);
+            continue;
+        }
+
+        let retry_sources = queued.clone();
+        match reconcile_queued_model_usage_sources(app_handle.clone(), queued, permit).await {
+            Ok(_) => {
+                consecutive_work_failures = 0;
+            }
+            Err(failure) => {
+                consecutive_work_failures = consecutive_work_failures.saturating_add(1);
+                log::error!(
+                    "Live model source reconciliation failed: {}; committed before failure: processed={}, skipped={}, failed={}, observations={}, data_changed={}",
+                    failure.error,
+                    failure.committed.processed_sources,
+                    failure.committed.skipped_sources,
+                    failure.committed.failed_sources,
+                    failure.committed.observations_written,
+                    failure.committed.data_changed,
+                );
+                if let Some(state_ref) = state.upgrade() {
+                    state_ref.requeue_live_sources(retry_sources);
+                } else {
+                    return;
+                }
+                tokio::time::sleep(model_usage_failure_retry_delay(consecutive_work_failures))
+                    .await;
+            }
+        }
+    }
+}
+
+fn emit_committed_model_backfill_status(
+    app_handle: &tauri::AppHandle,
+    status: &ModelBackfillStatus,
+) {
+    let event = ModelAnalyticsUpdatedEvent {
+        generation: status.generation,
+        status: status.status,
+        data_changed: false,
+        updated_at: status.updated_at.clone(),
+    };
+    if let Err(error) = app_handle.emit(model_usage::MODEL_ANALYTICS_UPDATED_EVENT, event) {
+        log::warn!("Model backfill status event could not be delivered: {error}");
+    }
+}
+
+fn spawn_reserved_model_history_backfill(
+    app_handle: tauri::AppHandle,
+    reservation: ModelHistoryBackfillScheduleReservation,
+) -> Result<(), String> {
+    let storage = get_storage()?;
+    tauri::async_runtime::spawn(async move {
+        let permit = loop {
+            if let Some(permit) = model_usage::try_acquire_model_usage_runner() {
+                break permit;
+            }
+            tokio::time::sleep(MODEL_USAGE_PERMIT_RETRY_DELAY).await;
+        };
+
+        if let Err(error) =
+            model_usage::run_retained_model_history_backfill(storage, app_handle, permit).await
+        {
+            log::error!("Retained model history backfill failed: {error}");
+        }
+
+        drop(reservation);
+    });
+    Ok(())
+}
+
+async fn reconcile_queued_model_usage_sources(
+    app_handle: tauri::AppHandle,
+    queued: Vec<sessions::DiscoveredRetainedJsonlSource>,
+    mut permit: model_usage::ModelUsageRunnerPermit,
+) -> Result<ModelUsageLiveReconciliationProgress, ModelUsageLiveReconciliationFailure> {
+    let storage = get_storage().map_err(|error| ModelUsageLiveReconciliationFailure {
+        error,
+        committed: ModelUsageLiveReconciliationProgress::default(),
+    })?;
+    let prepare_result = tauri::async_runtime::spawn_blocking(move || {
+        let requested_roots = queued
+            .iter()
+            .map(|source| (source.provider.as_str(), source.source_root_key))
+            .collect::<HashSet<_>>();
+        let roots = sessions::enumerate_retained_jsonl_source_roots()
+            .into_iter()
+            .filter(|root| {
+                requested_roots.contains(&(root.provider.as_str(), root.source_root_key))
+            })
+            .collect::<Vec<_>>();
+
+        if roots.len() != requested_roots.len() {
+            return Err("Retained model source root is no longer configured".to_string());
+        }
+
+        let generation = storage.get_model_backfill_status()?.generation;
+        let plan = model_usage::prepare_model_source_reconciliation(
+            storage,
+            &roots,
+            generation,
+            &mut permit,
+        )?;
+        Ok((plan, permit))
+    })
+    .await;
+
+    let (mut plan, mut permit) = match prepare_result {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            return Err(ModelUsageLiveReconciliationFailure {
+                error,
+                committed: ModelUsageLiveReconciliationProgress::default(),
+            });
+        }
+        Err(error) => {
+            return Err(ModelUsageLiveReconciliationFailure {
+                error: format!("Model source preparation task failed: {error}"),
+                committed: ModelUsageLiveReconciliationProgress::default(),
+            });
+        }
+    };
+
+    let mut progress = ModelUsageLiveReconciliationProgress::default();
+    while !plan.is_complete() {
+        let batch_handle = app_handle.clone();
+        let commit_result = tauri::async_runtime::spawn_blocking(move || {
+            let result = model_usage::commit_next_model_source_batch(
+                &mut plan,
+                storage,
+                &batch_handle,
+                MODEL_USAGE_LIVE_COMMIT_BATCH_SIZE,
+                &mut permit,
+            );
+            (plan, permit, result)
+        })
+        .await;
+
+        let (returned_plan, returned_permit, result) = match commit_result {
+            Ok(result) => result,
+            Err(error) => {
+                return Err(ModelUsageLiveReconciliationFailure {
+                    error: format!("Model source commit task failed: {error}"),
+                    committed: progress,
+                });
+            }
+        };
+        plan = returned_plan;
+        permit = returned_permit;
+
+        match result {
+            Ok(batch) => progress.record(&batch),
+            Err(error) => {
+                progress.record(&error.committed);
+                return Err(ModelUsageLiveReconciliationFailure {
+                    error: error.to_string(),
+                    committed: progress,
+                });
+            }
+        }
+
+        if !plan.is_complete() {
+            // Keep the permit across yields: the prepared root graph is one
+            // immutable reconciliation decision, so another runner must not
+            // mutate its sources between bounded commits.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    Ok(progress)
+}
 
 #[derive(Clone, Debug)]
 struct UsageCacheEntry {
@@ -1437,6 +1866,293 @@ async fn get_snapshot_count() -> Result<i64, String> {
     run_blocking(move || storage.get_snapshot_count())
 }
 
+fn validate_model_analytics_provider_value(
+    provider: String,
+) -> Result<String, ModelAnalyticsError> {
+    provider
+        .parse::<integrations::IntegrationProvider>()
+        .map(|provider| provider.as_str().to_owned())
+        .map_err(|_| {
+            ModelAnalyticsError::new(
+                ModelAnalyticsErrorCode::InvalidProvider,
+                "Provider must use a supported Quill provider identifier.",
+            )
+        })
+}
+
+fn validate_model_analytics_provider(
+    provider: Option<String>,
+) -> Result<Option<String>, ModelAnalyticsError> {
+    provider
+        .map(validate_model_analytics_provider_value)
+        .transpose()
+}
+
+fn validate_model_identity(
+    provider: String,
+    model_id: String,
+) -> Result<ModelIdentity, ModelAnalyticsError> {
+    let provider = validate_model_analytics_provider_value(provider)?;
+    let model_id = model_usage::validate_model_id(&model_id).map_err(|error| {
+        ModelAnalyticsError::new(
+            ModelAnalyticsErrorCode::InvalidModelId,
+            format!("Selected model identifier is invalid: {error}."),
+        )
+    })?;
+
+    Ok(ModelIdentity { provider, model_id })
+}
+
+fn validate_selected_model(
+    selected_model: Option<ModelIdentity>,
+    provider_filter: Option<&str>,
+) -> Result<Option<ModelIdentity>, ModelAnalyticsError> {
+    let Some(selected_model) = selected_model else {
+        return Ok(None);
+    };
+
+    let selected_model = validate_model_identity(selected_model.provider, selected_model.model_id)?;
+    if provider_filter.is_some_and(|filter| filter != selected_model.provider) {
+        return Err(ModelAnalyticsError::new(
+            ModelAnalyticsErrorCode::InvalidProvider,
+            "Selected model provider must match the active provider filter.",
+        ));
+    }
+
+    Ok(Some(selected_model))
+}
+
+fn model_analytics_storage_error(
+    context: &str,
+    error: impl std::fmt::Display,
+) -> ModelAnalyticsError {
+    log::error!("{context}: {error}");
+    ModelAnalyticsError::storage_error()
+}
+
+fn normalize_model_sessions_limit(
+    limit: Option<i64>,
+) -> Result<Option<usize>, ModelAnalyticsError> {
+    limit
+        .map(|value| {
+            usize::try_from(value.clamp(MODEL_SESSIONS_MIN_LIMIT, MODEL_SESSIONS_MAX_LIMIT))
+                .map_err(|error| {
+                    model_analytics_storage_error(
+                        "Model sessions limit conversion failed after clamping",
+                        error,
+                    )
+                })
+        })
+        .transpose()
+}
+
+/// Return provider-qualified model aggregates from one retained-evidence snapshot.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+#[tauri::command]
+async fn get_model_analytics(
+    range: String,
+    provider: Option<String>,
+) -> Result<ModelAnalyticsResponse, ModelAnalyticsError> {
+    let range = ModelRange::try_from(range.as_str())?;
+    let provider = validate_model_analytics_provider(provider)?;
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Model analytics storage unavailable", error)
+    })?;
+
+    match tauri::async_runtime::spawn_blocking(move || {
+        storage.get_model_analytics(range, provider.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(model_analytics_storage_error(
+            "Failed to read model analytics",
+            error,
+        )),
+        Err(error) => Err(model_analytics_storage_error(
+            "Model analytics blocking task failed",
+            error,
+        )),
+    }
+}
+
+/// Return fixed-bucket model history, optionally scoped to one exact identity.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+#[tauri::command]
+async fn get_model_history(
+    range: String,
+    provider: Option<String>,
+    selected_model: Option<ModelIdentity>,
+) -> Result<ModelHistoryResponse, ModelAnalyticsError> {
+    let range = ModelRange::try_from(range.as_str())?;
+    let provider = validate_model_analytics_provider(provider)?;
+    let selected_model = validate_selected_model(selected_model, provider.as_deref())?;
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Model history storage unavailable", error)
+    })?;
+
+    match tauri::async_runtime::spawn_blocking(move || {
+        storage.get_model_history(range, provider.as_deref(), selected_model.as_ref())
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(model_analytics_storage_error(
+            "Failed to read model history",
+            error,
+        )),
+        Err(error) => Err(model_analytics_storage_error(
+            "Model history blocking task failed",
+            error,
+        )),
+    }
+}
+
+/// Page sessions that contain one exact provider-qualified raw model identity.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+#[tauri::command]
+async fn get_model_sessions(
+    range: String,
+    model_provider: String,
+    model_id: String,
+    cursor: Option<String>,
+    limit: Option<i64>,
+) -> Result<ModelSessionsResponse, ModelAnalyticsError> {
+    let range = ModelRange::try_from(range.as_str())?;
+    let identity = validate_model_identity(model_provider, model_id)?;
+    let limit = normalize_model_sessions_limit(limit)?;
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Model sessions storage unavailable", error)
+    })?;
+
+    match tauri::async_runtime::spawn_blocking(move || {
+        storage.get_model_sessions(range, &identity, cursor.as_deref(), limit)
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(storage::ModelSessionsQueryError::InvalidCursor(error))) => {
+            log::warn!("Rejected model sessions cursor: {error}");
+            Err(ModelAnalyticsError::new(
+                ModelAnalyticsErrorCode::InvalidCursor,
+                "The model session cursor is malformed, stale, or belongs to another request.",
+            ))
+        }
+        Ok(Err(storage::ModelSessionsQueryError::Storage(error))) => Err(
+            model_analytics_storage_error("Failed to read model sessions", error),
+        ),
+        Err(error) => Err(model_analytics_storage_error(
+            "Model sessions blocking task failed",
+            error,
+        )),
+    }
+}
+
+/// Return chain-separated model history for one provider-owned session.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+#[tauri::command]
+async fn get_session_model_history(
+    provider: String,
+    session_id: String,
+    range: String,
+) -> Result<SessionModelHistoryResponse, ModelAnalyticsError> {
+    let provider = validate_model_analytics_provider_value(provider)?;
+    let range = ModelRange::try_from(range.as_str())?;
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Session model history storage unavailable", error)
+    })?;
+
+    match tauri::async_runtime::spawn_blocking(move || {
+        storage.get_session_model_history(&provider, &session_id, range)
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(storage::SessionModelHistoryQueryError::NotFound)) => Err(ModelAnalyticsError::new(
+            ModelAnalyticsErrorCode::NotFound,
+            "No retained model history exists for this session in the selected range.",
+        )),
+        Ok(Err(storage::SessionModelHistoryQueryError::Storage(error))) => Err(
+            model_analytics_storage_error("Failed to read session model history", error),
+        ),
+        Err(error) => Err(model_analytics_storage_error(
+            "Session model history blocking task failed",
+            error,
+        )),
+    }
+}
+
+/// Start a fresh retained-history generation unless one is already scheduled.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+#[tauri::command]
+async fn retry_model_history_backfill(
+    app_handle: tauri::AppHandle,
+) -> Result<ModelBackfillStatus, ModelAnalyticsError> {
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Model backfill storage unavailable", error)
+    })?;
+    let state = app_handle
+        .try_state::<Arc<ModelUsageRunnerState>>()
+        .map(|state| Arc::clone(state.inner()))
+        .ok_or_else(|| {
+            model_analytics_storage_error(
+                "Model backfill scheduling unavailable",
+                "model usage runner state is not initialized",
+            )
+        })?;
+
+    let Some(reservation) = state.try_reserve_retained_backfill() else {
+        return match tauri::async_runtime::spawn_blocking(move || {
+            storage.get_model_backfill_status()
+        })
+        .await
+        {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(error)) => Err(model_analytics_storage_error(
+                "Failed to read active model backfill status",
+                error,
+            )),
+            Err(error) => Err(model_analytics_storage_error(
+                "Model backfill status task failed",
+                error,
+            )),
+        };
+    };
+
+    let status = match tauri::async_runtime::spawn_blocking(move || {
+        storage.initialize_model_backfill_retry()
+    })
+    .await
+    {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            return Err(model_analytics_storage_error(
+                "Failed to initialize model history retry",
+                error,
+            ));
+        }
+        Err(error) => {
+            return Err(model_analytics_storage_error(
+                "Model history retry task failed",
+                error,
+            ));
+        }
+    };
+
+    if status.status != ModelBackfillState::Pending {
+        return Err(model_analytics_storage_error(
+            "Model history retry produced an invalid state",
+            status.status.as_str(),
+        ));
+    }
+
+    emit_committed_model_backfill_status(&app_handle, &status);
+    spawn_reserved_model_history_backfill(app_handle, reservation).map_err(|error| {
+        model_analytics_storage_error("Model history retry scheduling failed", error)
+    })?;
+    Ok(status)
+}
+
 #[tauri::command]
 async fn get_token_history(
     range: String,
@@ -1560,30 +2276,67 @@ async fn get_skill_project_breakdown(
 }
 
 #[tauri::command]
-async fn delete_project_data(cwd: String) -> Result<u64, String> {
+async fn delete_project_data(cwd: String, app: tauri::AppHandle) -> Result<u64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.delete_project_data(&cwd))
+    let (event_snapshot, result) = run_blocking(move || {
+        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
+        let result = storage.delete_project_data(&cwd)?;
+        Ok((event_snapshot, result))
+    })?;
+    if result.model_data_changed() {
+        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
+    }
+    Ok(result.affected_rows())
 }
 
 #[tauri::command]
-async fn rename_project(old_cwd: String, new_cwd: String) -> Result<u64, String> {
+async fn rename_project(
+    old_cwd: String,
+    new_cwd: String,
+    app: tauri::AppHandle,
+) -> Result<u64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.rename_project(&old_cwd, &new_cwd))
+    let (event_snapshot, result) = run_blocking(move || {
+        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
+        let result = storage.rename_project(&old_cwd, &new_cwd)?;
+        Ok((event_snapshot, result))
+    })?;
+    if result.model_data_changed() {
+        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
+    }
+    Ok(result.affected_rows())
 }
 
 #[tauri::command]
-async fn delete_host_data(hostname: String) -> Result<u64, String> {
+async fn delete_host_data(hostname: String, app: tauri::AppHandle) -> Result<u64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.delete_host_data(&hostname))
+    let (event_snapshot, result) = run_blocking(move || {
+        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
+        let result = storage.delete_host_data(&hostname)?;
+        Ok((event_snapshot, result))
+    })?;
+    if result.model_data_changed() {
+        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
+    }
+    Ok(result.affected_rows())
 }
 
 #[tauri::command]
 async fn delete_session_data(
     provider: integrations::IntegrationProvider,
     session_id: String,
+    app: tauri::AppHandle,
 ) -> Result<u64, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.delete_session_data(provider, &session_id))
+    let (event_snapshot, result) = run_blocking(move || {
+        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
+        let result = storage.delete_session_data(provider, &session_id)?;
+        Ok((event_snapshot, result))
+    })?;
+    if result.model_data_changed() {
+        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
+    }
+    Ok(result.affected_rows())
 }
 
 #[tauri::command]
@@ -2878,6 +3631,31 @@ pub fn run() {
             // HTTP server starts, so a state-changing learning IPC can never
             // race ahead of an initialized token.
             app.manage(LearningCapability::generate());
+            let model_usage_runner_state = Arc::new(ModelUsageRunnerState::new());
+            app.manage(Arc::clone(&model_usage_runner_state));
+
+            // Migration 28 starts pending. A prior process can also leave a
+            // committed running state behind; reset that run to a fresh
+            // startup_resume generation before scheduling the same nonblocking
+            // retained-history worker. Live reconciliation may temporarily own
+            // the shared permit, so the reserved task waits instead of dropping
+            // the startup pass.
+            match storage.reset_interrupted_model_backfill() {
+                Ok(status) if status.status == ModelBackfillState::Pending => {
+                    emit_committed_model_backfill_status(app.handle(), &status);
+                    if let Some(reservation) =
+                        model_usage_runner_state.try_reserve_retained_backfill()
+                        && let Err(error) =
+                            spawn_reserved_model_history_backfill(app.handle().clone(), reservation)
+                    {
+                        log::error!("Could not schedule model history backfill: {error}");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::error!("Could not resume interrupted model history backfill: {error}");
+                }
+            }
 
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
@@ -3249,6 +4027,11 @@ pub fn run() {
             get_usage_stats,
             get_all_bucket_stats,
             get_snapshot_count,
+            get_model_analytics,
+            get_model_history,
+            get_model_sessions,
+            get_session_model_history,
+            retry_model_history_backfill,
             get_token_history,
             get_token_stats,
             get_token_hostnames,
