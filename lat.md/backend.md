@@ -30,7 +30,7 @@ Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 | Session notify | 500 req/min |
 | Session messages | 100 req/min |
 
-`/api/v1/hooks/observed` (feature 009) shares the **Observations** bucket because both endpoints accept hook-fire telemetry whose call rate scales with tool-call volume in active sessions, and a hook chain that fires `PreToolUse` + `PostToolUse` + Quill's own scripts can saturate a stricter limit on a heavy bash-driven turn. The handler runs `check_auth` → `check_rate_limit_with_max(obs_rate_limiter, MAX_OBS_REQUESTS)` → validation (eight-event whitelist, ISO-8601 timestamp parse, length caps) → background insert before returning `202 Accepted`, preserving the fast-ack contract observed by `src-tauri/codex-integration/scripts/hook-observe.cjs`.
+`/api/v1/hooks/observed` (feature 009) shares the **Observations** bucket because both endpoints accept hook-fire telemetry whose call rate scales with tool-call volume in active sessions, and a hook chain that fires `PreToolUse` + `PostToolUse` + Quill's own scripts can saturate a stricter limit on a heavy bash-driven turn. The handler runs `check_auth` → `check_rate_limit_with_max(obs_rate_limiter, MAX_OBS_REQUESTS)` → validation (ten-event whitelist, ISO-8601 timestamp parse, length caps on `tool_name`/`hook_matcher`/`agent_id`) → background insert before returning `202 Accepted`, preserving the fast-ack contract observed by `src-tauri/codex-integration/scripts/hook-observe.cjs`.
 
 ### Endpoints
 
@@ -168,7 +168,11 @@ Observed lifecycle-hook fires keyed for the Now-tab Hooks breakdown. Claude rows
 
 Codex rows are inserted by [[src-tauri/src/storage.rs#Storage#store_codex_hook_observation]] from the `POST /api/v1/hooks/observed` background blocking task. Codex identity is event-scoped (`hook_event` with an optional `:tool_name` suffix when the event is `PreToolUse` or `PostToolUse`) because the deployed `hook-observe.cjs` observer (`src-tauri/codex-integration/scripts/hook-observe.cjs`) fires on every event without per-script attribution — Codex registers multiple scripts per event and the observer cannot identify which sibling script ran. Quill ships its own Codex hooks (`session-sync.cjs`, `context-capture.cjs`, `context-router.cjs`, `observe.cjs`, `report-tokens.sh`, plus the new `hook-observe.cjs` itself when `activity_tracking` is on); third-party Codex hooks fire but are not attributed beyond the event level. Codex telemetry is gated on the same `activity_tracking` IntegrationFeatures flag that already gates `observe.cjs`.
 
+The endpoint accepts observations only for a ten-event whitelist (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest`) after the `SubagentStart`/`SubagentStop` lifecycle events were added, and length-caps `agent_id` exactly as it caps `tool_name`. [[src-tauri/src/models.rs#CodexHookObservation]] now carries a serde-defaulted `agent_id: Option<String>` that `hook-observe.cjs` sends on every payload, and `store_codex_hook_observation` threads it into the row insert — feeding the `COALESCE(agent_id,'')` uniqueness component — while the `hook_identity` computation stays event-scoped and unchanged.
+
 Session-deletion cascades into hook_invocations via [[src-tauri/src/storage.rs#Storage#delete_hook_invocations_for_session]], and per-cwd and per-host cleanups follow the same pattern as `skill_usages` and `session_events`.
+
+Known limitation (Claude side): transcript extraction only sees hook fires that Claude Code records as `hook_*` attachment records, which it writes only for hooks that produce output or fail. Silent, always-on Quill hooks — `observe.cjs`, `session-sync.cjs`, `report-tokens.sh`, and `qbuild-guard.sh` — succeed without emitting output, so they never appear as attachments and are undercounted in the Hooks breakdown. Closing the gap needs a Claude-side live observer with a dedup design against the transcript-derived rows so the same fire is not double-counted; that observer is deliberately not shipped yet.
 
 #### Working Context Store
 

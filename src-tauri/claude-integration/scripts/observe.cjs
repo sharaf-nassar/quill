@@ -80,7 +80,6 @@ function main() {
       "Bash",
       "Edit",
       "Write",
-      "MultiEdit",
       "NotebookEdit",
     ]);
     if (hookPhase === "post" && !HIGH_SIGNAL_POST.has(input.tool_name)) return;

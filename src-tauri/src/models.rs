@@ -295,6 +295,8 @@ pub struct CodexHookObservation {
     pub ts: String,
     #[serde(default)]
     pub hook_matcher: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 /// One sub-agent node inside a parent session, returned by

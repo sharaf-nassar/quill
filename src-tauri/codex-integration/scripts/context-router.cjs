@@ -152,6 +152,16 @@ function stripQuotedContent(command) {
     .replace(/"[^"]*"/g, '""');
 }
 
+// Like stripQuotedContent, but PRESERVES the inner text of quoted spans and
+// drops only the surrounding quote characters. Used by commandReadsTaintedPath
+// so a read written as `cat '/tmp/x.json'` still exposes the path — plain
+// stripQuotedContent would collapse it to an empty `''` token and miss it.
+function unquoteCommand(command) {
+  return stripHeredocs(command)
+    .replace(/'([^']*)'/g, "$1")
+    .replace(/"([^"]*)"/g, "$1");
+}
+
 function commandFromInput(toolInput) {
   if (!toolInput) return "";
   if (typeof toolInput === "string") return toolInput;
@@ -230,10 +240,28 @@ function taintedStatePath(provider, sessionId) {
   return path.join(markerDir(provider, sessionId), TAINTED_STATE_FILE);
 }
 
+// A "degenerate" taint entry can never correspond to a real fetched file:
+// empty/whitespace-only, or a token whose whole basename is nothing but quote
+// characters (`''`, `""`, `/cwd/''`). These are residue from an earlier bug
+// that recorded quote-STRIPPED output flags (a quoted `-o '/tmp/x'` collapsed to
+// a bare `''`, whose cwd-resolved twin was `/cwd/''`). recordTainted must never
+// store them, and loadTainted must drop any left behind in on-disk state so old
+// poisoned files self-heal on the next run with no migration step. Tokens that
+// merely CONTAIN `$` are NOT degenerate — an unexpanded `/tmp/x.$$` can still
+// legitimately match a later literal reuse of that same path.
+function isDegenerateTaint(p) {
+  if (typeof p !== "string") return true;
+  const trimmed = p.trim();
+  if (trimmed === "") return true;
+  if (/^['"]+$/.test(trimmed)) return true;
+  return /^['"]+$/.test(path.basename(trimmed));
+}
+
 function loadTainted(provider, sessionId) {
   try {
     const raw = JSON.parse(fs.readFileSync(taintedStatePath(provider, sessionId), "utf8"));
-    return new Set(Array.isArray(raw.paths) ? raw.paths : []);
+    const paths = Array.isArray(raw.paths) ? raw.paths : [];
+    return new Set(paths.filter((p) => !isDegenerateTaint(p)));
   } catch (_) {
     return new Set();
   }
@@ -265,18 +293,93 @@ function resolveLiteralPath(p) {
   return out;
 }
 
+// Split a shell command on top-level `&&`, `||`, and `;` separators WITHOUT
+// splitting inside single- or double-quoted spans, so a quoted separator (e.g.
+// an output path like `-o 'a && b.json'`) stays in one segment. Single `|`
+// (pipe) and single `&` (background) are intentionally not separators, matching
+// the previous regex-based segmentation.
+function splitTopLevel(command) {
+  const segments = [];
+  let current = "";
+  let quote = null;
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if ((ch === "&" && command[i + 1] === "&") || (ch === "|" && command[i + 1] === "|")) {
+      segments.push(current);
+      current = "";
+      i += 1;
+      continue;
+    }
+    if (ch === ";") {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  segments.push(current);
+  return segments;
+}
+
+// Strip one layer of matching surrounding single/double quotes from a captured
+// output token. `'/tmp/x.json'` -> `/tmp/x.json`, `"out file.html"` ->
+// `out file.html`, `''` -> `` (empty, then dropped by the caller's guard).
+function unquoteToken(tok) {
+  if (typeof tok !== "string" || tok.length < 2) return tok;
+  const first = tok[0];
+  const last = tok[tok.length - 1];
+  if ((first === "'" && last === "'") || (first === '"' && last === '"')) {
+    return tok.slice(1, -1);
+  }
+  return tok;
+}
+
+// Value after an output flag or redirect: a single-quoted span, a double-quoted
+// span (either may contain spaces), or a bare whitespace-delimited token.
+const OUTPUT_TARGET = "('[^']*'|\"[^\"]*\"|[^\\s]+)";
+
 function extractFetchOutputPaths(command) {
-  const stripped = stripQuotedContent(command);
+  // Operate on heredoc-stripped (NOT quote-stripped) text so quoted output
+  // paths survive intact and can be unquoted; stripQuotedContent would replace
+  // them with bare quote-pair residue.
+  const visible = stripHeredocs(command);
   const out = [];
-  for (const segment of stripped.split(/\s*(?:&&|\|\||;)\s*/)) {
-    if (!/(^|\s)(curl|wget)\s/i.test(segment)) continue;
-    if (/\s(-I|--head)(\s|$)/.test(segment)) continue;
-    for (const m of segment.matchAll(/\s(?:-o|--output|-O|--output-document)\s+(\S+)/g)) {
-      const p = m[1];
+  for (const segment of splitTopLevel(visible)) {
+    // Detect the fetch command on the quote-STRIPPED view so a `curl`/`wget`
+    // that only appears inside a quoted data string (e.g. a commit message like
+    // `git commit -m "add curl -o /tmp/ci.json fetch"`) is not mistaken for a
+    // real command. Paths are still extracted from the quote-preserving
+    // `segment` below, so genuinely quoted output targets survive intact.
+    const bare = stripQuotedContent(segment);
+    if (!/(?:^|\s)(?:curl|wget)(?:\s|$)/i.test(bare)) continue;
+    if (/(?:^|\s)(?:-I|--head)(?:\s|$)/.test(bare)) continue;
+    // curl's `-O`/`--remote-name` takes NO argument (it derives the filename
+    // from the URL), so it must never consume the following token; wget's `-O`
+    // IS the output document and does take one.
+    const isWget = /(?:^|\s)wget(?:\s|$)/i.test(bare);
+    const shortFlags = isWget ? "-[oO]" : "-o";
+    // Case-sensitive on purpose: `-o` and `-O` are distinct flags.
+    const flagRe = new RegExp(
+      `(?:^|\\s)(?:(?:--output-document|--output)(?:\\s+|=)|${shortFlags}\\s+)${OUTPUT_TARGET}`,
+      "g",
+    );
+    for (const m of segment.matchAll(flagRe)) {
+      const p = unquoteToken(m[1]);
       if (p && p !== "-" && p !== "/dev/stdout" && p !== "/dev/null") out.push(p);
     }
-    for (const m of segment.matchAll(/\s>>?\s*(\S+)/g)) {
-      const p = m[1];
+    const redirectRe = new RegExp(`(?:^|\\s)>>?\\s*${OUTPUT_TARGET}`, "g");
+    for (const m of segment.matchAll(redirectRe)) {
+      const p = unquoteToken(m[1]);
       if (p && p !== "/dev/null" && p !== "/dev/stdout") out.push(p);
     }
   }
@@ -287,9 +390,10 @@ function recordTainted(provider, sessionId, paths) {
   if (!paths || paths.length === 0) return;
   const set = loadTainted(provider, sessionId);
   for (const p of paths) {
+    if (isDegenerateTaint(p)) continue;
     set.add(p);
     const resolved = resolveLiteralPath(p);
-    if (resolved && resolved !== p) set.add(resolved);
+    if (resolved && resolved !== p && !isDegenerateTaint(resolved)) set.add(resolved);
   }
   saveTainted(provider, sessionId, set);
 }
@@ -300,11 +404,24 @@ function escapeRegExp(s) {
 
 function commandReadsTaintedPath(command, taintedSet) {
   if (!command || taintedSet.size === 0) return null;
+  // Match against BOTH normalizations: the quote-stripped form (catches bare
+  // reads) and the unquote-preserving form (catches `cat '/tmp/x.json'`, which
+  // the stripped form collapses to `cat ''` and would miss).
   const stripped = stripQuotedContent(command);
-  if (!READER_COMMAND_PATTERN.test(stripped)) return null;
+  const unquoted = unquoteCommand(command);
+  // Gate on the quote-STRIPPED form only: a real reader command is never itself
+  // inside quotes, so a reader keyword that surfaces purely from unquoting
+  // (e.g. `echo 'next step: cat /tmp/x.json'` or `git commit -m 'jq . /tmp/x'`)
+  // is quoted DATA, not a read, and must not open the gate. Path matching below
+  // still runs against `unquoted` to catch a genuinely quoted path argument such
+  // as `cat '/tmp/x.json'`.
+  if (!READER_COMMAND_PATTERN.test(stripped)) {
+    return null;
+  }
   for (const p of taintedSet) {
-    const esc = escapeRegExp(p);
-    if (new RegExp(`(?:^|[\\s=])${esc}(?:[\\s)>;|&]|$)`).test(stripped)) return p;
+    if (isDegenerateTaint(p)) continue;
+    const re = new RegExp(`(?:^|[\\s=])${escapeRegExp(p)}(?:[\\s)>;|&]|$)`);
+    if (re.test(stripped) || re.test(unquoted)) return p;
   }
   return null;
 }

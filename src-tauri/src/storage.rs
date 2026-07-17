@@ -12154,12 +12154,13 @@ impl Storage {
                     hook_event, hook_matcher, tool_name, hook_identity,
                     script_command_raw, exit_code, duration_ms, cwd, hostname,
                     message_id
-                ) VALUES (?1, ?2, NULL, 0, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, NULL, NULL)",
+                ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, NULL, NULL)",
             )
             .map_err(|e| format!("Prepare store_codex_hook_observation: {e}"))?;
         stmt.execute(params![
             obs.provider.as_str(),
             obs.session_id,
+            obs.agent_id,
             obs.ts,
             obs.hook_event,
             obs.hook_matcher,

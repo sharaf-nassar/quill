@@ -700,7 +700,7 @@ async fn post_observation(
 }
 
 // Feature 009: ingest Codex hook fires from the deployed
-// `hook-observe.cjs` observer. Validates the eight-event whitelist,
+// `hook-observe.cjs` observer. Validates the ten-event whitelist,
 // length-caps strings, fast-acks 202 ACCEPTED, and persists on a
 // background blocking task. The handler's response shape mirrors
 // `post_observation` so the script's fast-ack contract is preserved.
@@ -720,6 +720,8 @@ async fn post_hook_observed(
         "PreCompact",
         "PostCompact",
         "PermissionRequest",
+        "SubagentStart",
+        "SubagentStop",
     ];
 
     if !check_auth(&headers, &state.secret) {
@@ -765,6 +767,13 @@ async fn post_hook_observed(
         .is_some_and(|m| m.len() > MAX_STRING_LEN)
     {
         return (StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
+    }
+    if payload
+        .agent_id
+        .as_ref()
+        .is_some_and(|a| a.len() > MAX_STRING_LEN)
+    {
+        return (StatusCode::BAD_REQUEST, "agent_id too long".to_string());
     }
 
     store_codex_hook_in_background(state.storage, state.app_handle.clone(), payload);

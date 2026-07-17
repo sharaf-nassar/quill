@@ -1105,7 +1105,7 @@ fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
 
     hook_defs.push((
         "PreToolUse",
-        "Edit|Write|MultiEdit|NotebookEdit",
+        "Edit|Write|NotebookEdit",
         serde_json::json!({
             "_source": HOOK_MARKER,
             "hooks": [
@@ -1143,7 +1143,8 @@ fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
             "hooks": [
                 {
                     "type": "command",
-                    "command": report_tokens_command
+                    "command": report_tokens_command,
+                    "timeout": 5
                 },
                 {
                     "type": "command",
@@ -1233,7 +1234,8 @@ fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
     // Matches both marked entries (_source: "quill-setup") AND unmarked legacy entries
     // that reference our scripts directory (from before the marker was introduced).
     let quill_scripts_path = sd.to_string_lossy().to_string();
-    for (_event, entries) in hooks_obj.iter_mut() {
+    let mut empty_events = Vec::new();
+    for (event, entries) in hooks_obj.iter_mut() {
         if let Some(arr) = entries.as_array_mut() {
             arr.retain(|entry| {
                 let s = entry.to_string();
@@ -1241,7 +1243,15 @@ fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
                     && !s.contains(CONTEXT_HOOK_MARKER)
                     && !s.contains(&quill_scripts_path)
             });
+            if arr.is_empty() {
+                empty_events.push(event.clone());
+            }
         }
+    }
+    // Drop event keys left with an empty array so we don't leave cruft
+    // (e.g. "PreCompact": []) behind.
+    for event in empty_events {
+        hooks_obj.remove(&event);
     }
 
     // Second pass: add the current set of hooks.

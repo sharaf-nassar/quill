@@ -214,6 +214,15 @@ it("extractFetchOutputPaths catches -o, -O, --output, --output-document, > and >
     ["curl -sS https://example.com >> /tmp/f.log", ["/tmp/f.log"]],
     ["curl -sS -o /dev/null https://example.com", []],
     ["curl -I https://example.com", []],
+    // Quoted output path yields the clean path, not quote-pair residue.
+    ["curl -sS https://api.example.com/v1 -o '/tmp/x.json'", ["/tmp/x.json"]],
+    // curl -O/--remote-name takes no argument, so it records nothing.
+    ["curl -sSO https://example.com/a.tgz", []],
+    ["curl -O https://example.com/a.tgz", []],
+    // wget -O does take an argument, and a quoted target may contain spaces.
+    [`wget -O "out file.html" https://example.com`, ["out file.html"]],
+    // Long-form output flags accept the --flag=value form too.
+    ["curl -sS --output=/tmp/g.json https://example.com", ["/tmp/g.json"]],
   ];
   for (const [cmd, expected] of cases) {
     const got = router.extractFetchOutputPaths(cmd);

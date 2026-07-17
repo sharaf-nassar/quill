@@ -6,7 +6,8 @@
 // Codex rollout JSONL transcripts do not record hook executions, so the
 // Quill installer registers this single-purpose script on every Codex
 // hook event (PreToolUse, PostToolUse, SessionStart, UserPromptSubmit,
-// Stop, PreCompact, PostCompact, PermissionRequest). On each invocation
+// Stop, PreCompact, PostCompact, PermissionRequest, SubagentStart,
+// SubagentStop). On each invocation
 // the script POSTs one event record to /api/v1/hooks/observed, then
 // exits with code 0 so it never blocks the hook chain. The endpoint
 // fast-acks 202 ACCEPTED, persists in the background, and emits a
@@ -99,12 +100,13 @@ function main() {
     const config = loadConfig();
     const payload = {
       provider: "codex",
-      session_id: input.session_id || "",
+      session_id: input.session_id || input.conversation_id || input.id || "",
       hook_event: event,
       tool_name: input.tool_name || null,
       cwd: input.cwd || null,
       ts: new Date().toISOString(),
       hook_matcher: input.matcher || null,
+      agent_id: input.agent_id || null,
     };
     postJSON(config, "/api/v1/hooks/observed", payload, "codex hook-observe");
   } catch (err) {

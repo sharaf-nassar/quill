@@ -78,7 +78,10 @@ function main() {
 
     const phaseMap = { PreToolUse: "pre", PostToolUse: "post" };
     const hookPhase = phaseMap[input.hook_event_name];
-    if (!hookPhase || input.tool_name !== "Bash") return;
+    // Only observe shell-style tool calls; mirrors the Bash|apply_patch
+    // matcher the installer registers this observer on.
+    const observedTools = new Set(["Bash", "apply_patch"]);
+    if (!hookPhase || !observedTools.has(input.tool_name)) return;
 
     const config = loadConfig();
     const payload = {

@@ -70,7 +70,7 @@ function main() {
   try {
     const raw = fs.readFileSync(0, "utf8");
     const input = JSON.parse(raw);
-    const sessionId = input.session_id;
+    const sessionId = input.session_id || input.conversation_id || input.id;
     const transcriptPath = input.transcript_path;
     if (!sessionId || !transcriptPath) return;
 

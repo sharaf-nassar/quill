@@ -34,7 +34,7 @@ const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
 
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
-const CODEX_HOOK_EVENTS: [(&str, &str); 8] = [
+const CODEX_HOOK_EVENTS: [(&str, &str); 10] = [
     ("PreToolUse", "pre_tool_use"),
     ("PermissionRequest", "permission_request"),
     ("PostToolUse", "post_tool_use"),
@@ -42,6 +42,8 @@ const CODEX_HOOK_EVENTS: [(&str, &str); 8] = [
     ("PostCompact", "post_compact"),
     ("SessionStart", "session_start"),
     ("UserPromptSubmit", "user_prompt_submit"),
+    ("SubagentStart", "subagent_start"),
+    ("SubagentStop", "subagent_stop"),
     ("Stop", "stop"),
 ];
 
@@ -1182,7 +1184,7 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
     let mut groups = vec![
         CodexHookGroup {
             event: "SessionStart",
-            matcher: Some("".to_string()),
+            matcher: None,
             hooks: vec![CodexHookCommand {
                 command: sync_command.clone(),
                 timeout: 5,
@@ -1203,7 +1205,7 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
     if features.activity_tracking {
         groups.push(CodexHookGroup {
             event: "PreToolUse",
-            matcher: Some("Bash".to_string()),
+            matcher: Some("Bash|apply_patch".to_string()),
             hooks: vec![CodexHookCommand {
                 command: observe_command.clone(),
                 timeout: 3,
@@ -1211,7 +1213,7 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
         });
         groups.push(CodexHookGroup {
             event: "PostToolUse",
-            matcher: Some("Bash".to_string()),
+            matcher: Some("Bash|apply_patch".to_string()),
             hooks: vec![CodexHookCommand {
                 command: observe_command,
                 timeout: 3,
@@ -1238,7 +1240,7 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
         groups.extend([
             CodexHookGroup {
                 event: "SessionStart",
-                matcher: Some("".to_string()),
+                matcher: None,
                 hooks: vec![CodexHookCommand {
                     command: context_capture_command.clone(),
                     timeout: 5,
@@ -1574,6 +1576,10 @@ fn update_agents_md(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Strip Quill's older `hooks.json` entries. Quill now registers its Codex hooks
+/// inline in `config.toml`, so its own `hooks.json` entries are the legacy ones —
+/// the `hooks.json` format itself is still a current first-class Codex format, so
+/// only Quill-managed entries are removed and anything else is left intact.
 fn remove_managed_hooks(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
@@ -1754,6 +1760,9 @@ fn replace_block(content: &str, start_marker: &str, end_marker: &str, replacemen
     result
 }
 
+/// Codex hooks are stable and default-enabled since Codex 0.124.0, so this flag
+/// is not what turns hooks on. Quill keeps writing `hooks = true` only to
+/// re-enable them if a user had explicitly set `hooks = false`.
 fn upsert_features_flag(content: &str) -> String {
     let managed_line = format!("hooks = true # {FEATURES_MARKER}");
     let mut lines: Vec<String> = if content.is_empty() {
