@@ -208,7 +208,11 @@ function AnalyticsView({
 				tabIndex={effectiveActiveTab === "models" ? 0 : -1}
 			>
 				{hasVisitedModels ? (
-					<ModelsTab range={modelsRange} onRangeChange={setModelsRange} />
+					<ModelsTab
+						range={modelsRange}
+						onRangeChange={setModelsRange}
+						active={effectiveActiveTab === "models"}
+					/>
 				) : null}
 			</div>
 			{showContextTab ? (

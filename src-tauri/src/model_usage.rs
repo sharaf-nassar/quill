@@ -31,6 +31,9 @@ use crate::storage::{
 
 const MODEL_ID_MAX_SCALARS: usize = 256;
 const TOKEN_COUNT_MAX: i64 = 100_000_000;
+/// Placeholder Claude ids that are not model identities: they never update the
+/// carry-forward running model and their rows inherit the current one instead.
+const SYNTHETIC_MODEL_ID: &str = "<synthetic>";
 const DIAGNOSTIC_MAX_SCALARS: usize = 240;
 const SOURCE_RECORD_KEY_VERSION: &str = "v1";
 const RETAINED_SOURCE_COMMIT_BATCH_SIZE: usize = 32;
@@ -75,6 +78,10 @@ pub(crate) struct NormalizedObservation {
     metadata: NormalizedObservationMetadata,
     model_attribution: attribution::ModelAttribution,
     token_attribution: attribution::TokenAttribution,
+    /// Carry-forward attribution stamped by
+    /// [`apply_carry_forward_attribution`] after adapter parsing. Raw model
+    /// evidence stays untouched so stored evidence remains replayable.
+    derived_model_id: Option<String>,
 }
 
 /// Observation fields that cannot contradict model or token attribution.
@@ -108,6 +115,7 @@ impl NormalizedObservation {
             metadata,
             model_attribution,
             token_attribution,
+            derived_model_id: None,
         }
     }
 
@@ -117,6 +125,10 @@ impl NormalizedObservation {
 
     pub(crate) fn raw_model_id(&self) -> Option<&str> {
         self.model_attribution.raw_model_id()
+    }
+
+    pub(crate) fn derived_model_id(&self) -> Option<&str> {
+        self.derived_model_id.as_deref()
     }
 
     pub(crate) fn model_evidence(&self) -> ModelEvidence {
@@ -921,6 +933,29 @@ impl ProviderAdapterParseResult {
     }
 }
 
+/// Stamp per-chain carry-forward attribution across one adapter result.
+///
+/// Observations arrive in source order. Within each chain the running model is
+/// the last non-null, non-`<synthetic>` raw model id seen on a turn: turn rows
+/// carrying their own valid raw id derive that id, `<synthetic>` and model-less
+/// rows inherit the current running model, and rows before any model evidence
+/// keep a null derived id so they stay unattributed.
+fn apply_carry_forward_attribution(result: &mut ProviderAdapterParseResult) {
+    let mut running_models = HashMap::<String, String>::new();
+    for observation in &mut result.observations {
+        if observation.metadata.kind == ObservationKind::Turn
+            && let Some(raw_model_id) = observation.model_attribution.raw_model_id()
+            && raw_model_id != SYNTHETIC_MODEL_ID
+        {
+            running_models.insert(
+                observation.metadata.chain_id.clone(),
+                raw_model_id.to_owned(),
+            );
+        }
+        observation.derived_model_id = running_models.get(&observation.metadata.chain_id).cloned();
+    }
+}
+
 /// Parse complete Claude JSONL content without allowing one record to abort later records.
 pub(crate) fn parse_claude_model_usage_jsonl(
     contents: &str,
@@ -1129,6 +1164,7 @@ pub(crate) fn parse_claude_model_usage_jsonl(
         result.counts.observations_emitted = result.counts.observations_emitted.saturating_add(1);
     }
 
+    apply_carry_forward_attribution(&mut result);
     result
 }
 
@@ -1251,6 +1287,8 @@ pub(crate) fn parse_codex_model_usage_jsonl(
     // Observation-bearing records are parsed once here and buffered for the
     // second pass so no line is deserialized twice.
     let mut deferred_records = Vec::<(u64, serde_json::Map<String, Value>)>::new();
+    // Ancestor thread ids a forked rollout may restate after the child's meta.
+    let mut expected_ancestors = Vec::<String>::new();
     for (line_index, line) in contents.lines().enumerate() {
         result.counts.lines_seen = result.counts.lines_seen.saturating_add(1);
         let source_ordinal = u64::try_from(line_index).unwrap_or(u64::MAX);
@@ -1340,9 +1378,22 @@ pub(crate) fn parse_codex_model_usage_jsonl(
             );
             continue;
         };
-        let parent_chain_id = match optional_nonempty_record_string(payload.get("parent_thread_id"))
-        {
-            Ok(parent_chain_id) => parent_chain_id,
+        let parent_thread_id =
+            match optional_nonempty_record_string(payload.get("parent_thread_id")) {
+                Ok(parent_thread_id) => parent_thread_id,
+                Err(()) => {
+                    result.counts.invalid_identity_records =
+                        result.counts.invalid_identity_records.saturating_add(1);
+                    push_adapter_diagnostic(
+                        &mut result,
+                        source_ordinal,
+                        ModelUsageDiagnosticKind::RecordSkipped,
+                    );
+                    continue;
+                }
+            };
+        let forked_from_id = match optional_nonempty_record_string(payload.get("forked_from_id")) {
+            Ok(forked_from_id) => forked_from_id,
             Err(()) => {
                 result.counts.invalid_identity_records =
                     result.counts.invalid_identity_records.saturating_add(1);
@@ -1354,6 +1405,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
                 continue;
             }
         };
+        let parent_chain_id = parent_thread_id.or(forked_from_id);
         let cwd = nonempty_record_string(payload.get("cwd")).map(PathBuf::from);
         let is_sidechain = parent_chain_id.is_some();
         let record_metadata = ProviderNativeSourceMetadata {
@@ -1371,7 +1423,12 @@ pub(crate) fn parse_codex_model_usage_jsonl(
             last_activity_at_ms: observed_at_ms,
         };
 
-        if !accept_codex_native_source(&mut result, record_metadata, source_ordinal) {
+        if !accept_codex_native_source(
+            &mut result,
+            &mut expected_ancestors,
+            record_metadata,
+            source_ordinal,
+        ) {
             result.counts.native_metadata_conflict_records = result
                 .counts
                 .native_metadata_conflict_records
@@ -1415,16 +1472,21 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         }
     }
 
+    apply_carry_forward_attribution(&mut result);
     result
 }
 
 fn accept_codex_native_source(
     result: &mut ProviderAdapterParseResult,
+    expected_ancestors: &mut Vec<String>,
     record_metadata: ProviderNativeSourceMetadata,
     source_ordinal: u64,
 ) -> bool {
     match &result.native_identity {
         ProviderNativeIdentityState::Absent => {
+            if let Some(parent_chain_id) = &record_metadata.parent_chain_id {
+                expected_ancestors.push(parent_chain_id.clone());
+            }
             result.native_identity = ProviderNativeIdentityState::Valid(Box::new(record_metadata));
             return true;
         }
@@ -1433,6 +1495,18 @@ fn accept_codex_native_source(
             if native_source.source_session_id != record_metadata.source_session_id
                 || native_source.parent_chain_id != record_metadata.parent_chain_id =>
         {
+            // Forked subagent rollouts restate the whole ancestor chain after
+            // the child's own meta: each later record names an ancestor the
+            // previous link declared, and may declare its own parent in turn.
+            // Accept restatements and keep the child identity untouched.
+            if expected_ancestors.contains(&record_metadata.source_session_id) {
+                if let Some(parent_chain_id) = record_metadata.parent_chain_id
+                    && !expected_ancestors.contains(&parent_chain_id)
+                {
+                    expected_ancestors.push(parent_chain_id);
+                }
+                return true;
+            }
             result.native_identity = ProviderNativeIdentityState::Conflicted;
             return false;
         }
@@ -2399,6 +2473,75 @@ pub(crate) fn prepare_model_source_reconciliation(
     })
 }
 
+/// Stage only the live queue's changed sources into an owned plan.
+///
+/// The live/incremental path already knows the exact changed source identities,
+/// so it never enumerates or fingerprints the whole provider root. Cross-source
+/// chain resolution stays correct: the root's persisted source metadata is
+/// loaded once from storage (a single query, no filesystem work) and feeds the
+/// graph alongside the freshly parsed changed sources. Only descendants whose
+/// resolved analytics root actually moves because of a changed ancestor are
+/// re-read and re-parsed, preserving the forced-fan-out invariant without paying
+/// O(history) syscalls per live edit. The live path never prunes, so it captures
+/// no completed-root proofs.
+pub(crate) fn prepare_scoped_model_source_reconciliation(
+    storage: &Storage,
+    queued: &[DiscoveredRetainedJsonlSource],
+    generation: i64,
+    _permit: &mut ModelUsageRunnerPermit,
+) -> Result<PreparedModelSourceReconciliation, String> {
+    if generation < 0 {
+        return Err("Model reconciliation generation cannot be negative".to_string());
+    }
+
+    let hostname = crate::sessions::SessionIndex::local_hostname();
+
+    // Load the persisted inventory for each affected root exactly once. This is
+    // the only per-root work and it is a single indexed query, not a tree walk.
+    let mut persisted_by_key = HashMap::<ProviderSourceKey, StoredModelSource>::new();
+    let mut loaded_roots = HashSet::<(&'static str, &'static str)>::new();
+    for source in queued {
+        if !loaded_roots.insert((source.provider.as_str(), source.source_root_key)) {
+            continue;
+        }
+        let persisted =
+            storage.list_model_sources_for_root(source.provider, source.source_root_key)?;
+        for stored in persisted {
+            persisted_by_key.insert(
+                ProviderSourceKey::new(stored.provider, &stored.source_key),
+                stored,
+            );
+        }
+    }
+
+    // Stage (fingerprint/read/parse) only the queued changed sources.
+    let mut staged_keys = HashSet::<ProviderSourceKey>::new();
+    let mut staged = Vec::<StagedModelSource>::with_capacity(queued.len());
+    for source in queued {
+        let key = ProviderSourceKey::new(source.provider, &source.source_key);
+        if !staged_keys.insert(key.clone()) {
+            // A drain coalesces by key, but stay defensive against duplicates.
+            continue;
+        }
+        let existing = persisted_by_key.get(&key).cloned();
+        staged.push(stage_model_source(source.clone(), existing, &hostname));
+    }
+
+    stabilize_scoped_root_graph(&mut staged, &persisted_by_key, &mut staged_keys, &hostname);
+    for source in &mut staged {
+        // Equal-content bytes are needed only while deciding forced fan-out.
+        source.unchanged_contents = None;
+    }
+
+    let total_sources = staged.len();
+    Ok(PreparedModelSourceReconciliation {
+        generation,
+        total_sources,
+        pending_sources: staged.into(),
+        completed_root_proofs: HashMap::new(),
+    })
+}
+
 /// Whether a reconciliation commit belongs to a run that will later prune.
 ///
 /// The retained backfill prunes stale sources, so it must re-stamp every seen
@@ -3324,6 +3467,273 @@ fn force_parse_model_source(source: &mut StagedModelSource, hostname: &str) {
     }
 }
 
+/// Build the resolution graph for the scoped live path.
+///
+/// Unlike [`build_source_root_graph`], every persisted sibling that is not part
+/// of the changed (staged) set contributes its stored chain metadata, so a
+/// changed source still resolves its full ancestry and descendants are still
+/// reachable — all without any filesystem work for unchanged sources.
+fn build_scoped_source_root_graph(
+    staged: &[StagedModelSource],
+    persisted_by_key: &HashMap<ProviderSourceKey, StoredModelSource>,
+    staged_keys: &HashSet<ProviderSourceKey>,
+) -> SourceRootGraph {
+    let mut metadata = staged
+        .iter()
+        .filter_map(StagedModelSource::native_graph_metadata)
+        .collect::<Vec<_>>();
+
+    for (key, source) in persisted_by_key {
+        if staged_keys.contains(key) {
+            continue;
+        }
+        if let Some(source_metadata) = SourceGraphMetadata::from_stored(source) {
+            metadata.push(source_metadata);
+        }
+    }
+
+    SourceRootGraph::from_metadata(metadata)
+}
+
+/// Resolve and stamp the scoped changed set, forcing only moved descendants.
+///
+/// This mirrors [`stabilize_root_graph`] but resolves against the root's
+/// persisted stored metadata instead of a fully re-fingerprinted inventory. It
+/// re-parses two kinds of otherwise-unchanged sources whose resolved analytics
+/// root moved because a changed ancestor altered the graph: queued sources that
+/// turned out content-unchanged, and persisted siblings that were never queued.
+/// A persisted sibling is revalidated from its stored path and re-read only when
+/// its root actually changes, keeping fan-out cost proportional to the change.
+fn stabilize_scoped_root_graph(
+    staged: &mut Vec<StagedModelSource>,
+    persisted_by_key: &HashMap<ProviderSourceKey, StoredModelSource>,
+    staged_keys: &mut HashSet<ProviderSourceKey>,
+    hostname: &str,
+) {
+    // A persisted sibling that cannot be revalidated must not be rescanned every
+    // pass, or a single unforceable descendant would burn the whole bound.
+    let mut forced_attempted = HashSet::<ProviderSourceKey>::new();
+    // Each pass is one-way: fail a replacement, force a staged unchanged source,
+    // or move one persisted descendant into the staged set. The bound spans the
+    // changed set plus every persisted sibling that could be forced.
+    let max_passes = staged
+        .len()
+        .saturating_add(persisted_by_key.len())
+        .saturating_mul(2)
+        .saturating_add(1);
+    for _ in 0..max_passes {
+        let graph = build_scoped_source_root_graph(staged, persisted_by_key, staged_keys);
+        let mut changed = false;
+
+        // 1) Fail changed sources whose native chain cannot resolve.
+        for source in staged.iter_mut() {
+            if source.action != StagedSourceAction::Replace {
+                continue;
+            }
+            let Some(native) = source
+                .parsed
+                .as_ref()
+                .and_then(ProviderAdapterParseResult::valid_native_source)
+            else {
+                continue;
+            };
+            if let Err(error) = graph.resolve(native.provider, &native.chain_id) {
+                log::warn!(
+                    "Cannot resolve scoped model source graph for {}: {error}",
+                    source.discovered.canonical_path.display()
+                );
+                source.fail(ModelUsageDiagnostic::new(
+                    ModelUsageDiagnosticKind::SourceParseFailed,
+                ));
+                changed = true;
+            }
+        }
+        if changed {
+            continue;
+        }
+
+        // 2a) Re-parse queued-but-unchanged sources whose resolved root moved.
+        for source in staged.iter_mut() {
+            if !source.can_force_root_replacement() {
+                continue;
+            }
+            let Some(native) = source.native_graph_metadata() else {
+                continue;
+            };
+            let resolved_root = match graph.resolve(native.provider, &native.chain_id) {
+                Ok(root) => root,
+                Err(error) => {
+                    log::warn!(
+                        "Cannot resolve scoped retained model source graph for {}: {error}",
+                        source.discovered.canonical_path.display()
+                    );
+                    continue;
+                }
+            };
+            let stored_root = source
+                .existing
+                .as_ref()
+                .and_then(|existing| existing.last_good.analytics_session_id.as_deref());
+            if stored_root == Some(resolved_root.as_str()) {
+                continue;
+            }
+            force_parse_model_source(source, hostname);
+            changed = true;
+        }
+        if changed {
+            continue;
+        }
+
+        // 2b) Re-parse persisted siblings (never queued) whose resolved root
+        // moved because a changed ancestor altered the graph.
+        let mut to_force = Vec::<ProviderSourceKey>::new();
+        for (key, stored) in persisted_by_key {
+            if staged_keys.contains(key) || forced_attempted.contains(key) {
+                continue;
+            }
+            if stored.suppressed_sha256.is_some() {
+                continue;
+            }
+            let Some(chain_id) = stored.last_good.chain_id.as_deref() else {
+                continue;
+            };
+            let Some(stored_root) = stored.last_good.analytics_session_id.as_deref() else {
+                continue;
+            };
+            let resolved_root = match graph.resolve(stored.provider, chain_id) {
+                Ok(root) => root,
+                Err(_) => continue,
+            };
+            if resolved_root == stored_root {
+                continue;
+            }
+            to_force.push(key.clone());
+        }
+        for key in to_force {
+            forced_attempted.insert(key.clone());
+            if let Some(forced) =
+                stage_forced_descendant(persisted_by_key.get(&key).cloned(), hostname)
+            {
+                staged_keys.insert(key);
+                staged.push(forced);
+                changed = true;
+            }
+        }
+        if changed {
+            continue;
+        }
+
+        // 3) Resolve and stamp every replacement's analytics root.
+        let mut stamp_failed = false;
+        for source in staged.iter_mut() {
+            if source.action != StagedSourceAction::Replace {
+                continue;
+            }
+            let Some(native) = source
+                .parsed
+                .as_ref()
+                .and_then(ProviderAdapterParseResult::valid_native_source)
+            else {
+                continue;
+            };
+            let resolved_root = match graph.resolve(native.provider, &native.chain_id) {
+                Ok(root) => root,
+                Err(error) => {
+                    log::warn!(
+                        "Cannot finalize scoped model source graph for {}: {error}",
+                        source.discovered.canonical_path.display()
+                    );
+                    source.fail(ModelUsageDiagnostic::new(
+                        ModelUsageDiagnosticKind::SourceParseFailed,
+                    ));
+                    stamp_failed = true;
+                    continue;
+                }
+            };
+            let resolution = source
+                .parsed
+                .as_mut()
+                .expect("replace action always retains a parse result")
+                .resolve_analytics_root(&resolved_root);
+            if let Err(error) = resolution {
+                log::warn!(
+                    "Cannot stamp scoped model source graph for {}: {error}",
+                    source.discovered.canonical_path.display()
+                );
+                source.fail(ModelUsageDiagnostic::new(
+                    ModelUsageDiagnosticKind::SourceParseFailed,
+                ));
+                stamp_failed = true;
+            }
+        }
+        if stamp_failed {
+            continue;
+        }
+        return;
+    }
+
+    for source in staged.iter_mut() {
+        if source.action == StagedSourceAction::Replace {
+            log::warn!(
+                "Scoped model source graph did not converge for {}",
+                source.discovered.canonical_path.display()
+            );
+            source.fail(ModelUsageDiagnostic::new(
+                ModelUsageDiagnosticKind::SourceParseFailed,
+            ));
+        }
+    }
+}
+
+/// Reconstruct and force-reparse one persisted descendant for scoped fan-out.
+///
+/// The stored inventory omits the layout hint, so the descendant is revalidated
+/// from its stored path through the same classifier used by live notifications.
+/// If it can no longer be proven a retained source, or its identity changed, the
+/// descendant is left to the retained backfill rather than written under a
+/// mismatched key.
+fn stage_forced_descendant(
+    stored: Option<StoredModelSource>,
+    hostname: &str,
+) -> Option<StagedModelSource> {
+    let stored = stored?;
+    let discovered = match crate::sessions::validate_retained_notify_source(
+        stored.provider,
+        &stored.source_path,
+    ) {
+        Ok(Some(discovered)) => discovered,
+        Ok(None) => {
+            log::warn!(
+                "Forced model descendant {} is no longer a retained source; deferring to backfill",
+                stored.source_path.display()
+            );
+            return None;
+        }
+        Err(error) => {
+            log::warn!(
+                "Could not revalidate forced model descendant {}: {error:?}; deferring to backfill",
+                stored.source_path.display()
+            );
+            return None;
+        }
+    };
+    if discovered.source_key != stored.source_key {
+        log::warn!(
+            "Forced model descendant {} changed identity; deferring to backfill",
+            stored.source_path.display()
+        );
+        return None;
+    }
+
+    let mut staged = stage_model_source(discovered, Some(stored), hostname);
+    if staged.can_force_root_replacement() {
+        // Content is unchanged, but its resolved root moved: re-parse so the new
+        // analytics root is stamped into replacement rows.
+        force_parse_model_source(&mut staged, hostname);
+    }
+    Some(staged)
+}
+
 /// Authoritative backfill event fields captured before a source mutation.
 #[derive(Clone, Debug)]
 pub(crate) struct ModelAnalyticsEventSnapshot {
@@ -3733,6 +4143,25 @@ mod tests {
         )
     }
 
+    fn codex_forked_session_meta_line(
+        timestamp: &str,
+        session_id: &str,
+        parent_thread_id: Option<&str>,
+        forked_from_id: Option<&str>,
+    ) -> String {
+        let parent_thread_field = parent_thread_id
+            .map(|parent_thread_id| format!(",\"parent_thread_id\":\"{parent_thread_id}\""))
+            .unwrap_or_default();
+        let forked_from_field = forked_from_id
+            .map(|forked_from_id| format!(",\"forked_from_id\":\"{forked_from_id}\""))
+            .unwrap_or_default();
+        format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"{timestamp}\",\
+             \"payload\":{{\"id\":\"{session_id}\"\
+             {parent_thread_field}{forked_from_field}}}}}"
+        )
+    }
+
     fn codex_turn_context_line(timestamp: &str, model: &str) -> String {
         format!(
             "{{\"type\":\"turn_context\",\"timestamp\":\"{timestamp}\",\
@@ -4036,6 +4465,163 @@ mod tests {
     }
 
     #[test]
+    fn codex_forked_subagent_parent_meta_keeps_child_identity() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        // Forked rollouts carry the child's meta first, then restate ancestor
+        // metas; a parent that names its own parent must not read as conflict.
+        let contents = [
+            codex_forked_session_meta_line(
+                "2026-01-01T00:00:00Z",
+                "child-1",
+                Some("parent-1"),
+                Some("parent-1"),
+            ),
+            codex_forked_session_meta_line(
+                "2026-01-01T00:00:01Z",
+                "parent-1",
+                Some("grand-1"),
+                None,
+            ),
+            codex_token_count_line("2026-01-01T00:00:02Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        let native_source = match &result.native_identity {
+            ProviderNativeIdentityState::Valid(native_source) => native_source,
+            state => panic!("expected valid native identity, got {state:?}"),
+        };
+        assert_eq!(native_source.source_session_id, "child-1");
+        assert_eq!(native_source.parent_chain_id.as_deref(), Some("parent-1"));
+        assert!(native_source.is_sidechain);
+        assert_eq!(result.counts.native_metadata_conflict_records, 0);
+        assert_eq!(result.observations.len(), 1);
+        for observation in &result.observations {
+            assert_eq!(observation.metadata().source_session_id, "child-1");
+            assert_eq!(
+                observation.metadata().parent_chain_id.as_deref(),
+                Some("parent-1")
+            );
+        }
+    }
+
+    #[test]
+    fn codex_forked_chain_depth_three_keeps_child_identity() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        // Deeper forks restate the full linear chain child -> P -> G; every
+        // restated ancestor must be accepted without flagging a conflict.
+        let contents = [
+            codex_forked_session_meta_line(
+                "2026-01-01T00:00:00Z",
+                "child-1",
+                None,
+                Some("parent-1"),
+            ),
+            codex_forked_session_meta_line(
+                "2026-01-01T00:00:01Z",
+                "parent-1",
+                None,
+                Some("grand-1"),
+            ),
+            codex_session_meta_line("2026-01-01T00:00:02Z", "grand-1"),
+            codex_token_count_line("2026-01-01T00:00:03Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        let native_source = match &result.native_identity {
+            ProviderNativeIdentityState::Valid(native_source) => native_source,
+            state => panic!("expected valid native identity, got {state:?}"),
+        };
+        assert_eq!(native_source.source_session_id, "child-1");
+        assert_eq!(native_source.parent_chain_id.as_deref(), Some("parent-1"));
+        assert_eq!(result.counts.native_metadata_conflict_records, 0);
+        assert_eq!(result.observations.len(), 1);
+        for observation in &result.observations {
+            assert_eq!(observation.metadata().source_session_id, "child-1");
+        }
+    }
+
+    #[test]
+    fn codex_out_of_chain_session_meta_still_conflicts() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        // A second meta whose id is not in the declared ancestor chain is a
+        // genuine identity conflict even when the first meta is a fork.
+        let contents = [
+            codex_forked_session_meta_line(
+                "2026-01-01T00:00:00Z",
+                "child-1",
+                Some("parent-1"),
+                None,
+            ),
+            codex_session_meta_line("2026-01-01T00:00:01Z", "intruder-1"),
+            codex_token_count_line("2026-01-01T00:00:02Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        assert!(matches!(
+            result.native_identity,
+            ProviderNativeIdentityState::Conflicted
+        ));
+        assert_eq!(result.counts.native_metadata_conflict_records, 1);
+    }
+
+    #[test]
+    fn codex_forked_meta_parent_chain_falls_back_to_forked_from_id() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        // Observed CLI 0.118.0 rollouts omit parent_thread_id and carry the
+        // parent link only in forked_from_id.
+        let contents = [
+            codex_forked_session_meta_line(
+                "2026-01-01T00:00:00Z",
+                "child-1",
+                None,
+                Some("parent-1"),
+            ),
+            codex_session_meta_line("2026-01-01T00:00:01Z", "parent-1"),
+            codex_token_count_line("2026-01-01T00:00:02Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        let native_source = match &result.native_identity {
+            ProviderNativeIdentityState::Valid(native_source) => native_source,
+            state => panic!("expected valid native identity, got {state:?}"),
+        };
+        assert_eq!(native_source.source_session_id, "child-1");
+        assert_eq!(native_source.parent_chain_id.as_deref(), Some("parent-1"));
+        assert_eq!(result.counts.native_metadata_conflict_records, 0);
+    }
+
+    #[test]
+    fn codex_unrelated_second_session_meta_still_conflicts() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let contents = [
+            codex_session_meta_line("2026-01-01T00:00:00Z", "sess-1"),
+            codex_session_meta_line("2026-01-01T00:00:01Z", "sess-2"),
+            codex_token_count_line("2026-01-01T00:00:02Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        assert!(matches!(
+            result.native_identity,
+            ProviderNativeIdentityState::Conflicted
+        ));
+        assert_eq!(result.counts.native_metadata_conflict_records, 1);
+        assert!(has_diagnostic(
+            &result,
+            ModelUsageDiagnosticKind::RecordSkipped
+        ));
+    }
+
+    #[test]
     fn codex_turn_context_model_stays_separate_from_token_deltas() {
         let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
         let contents = [
@@ -4063,5 +4649,77 @@ mod tests {
         assert_eq!(token.token_evidence(), TokenEvidence::CumulativeDelta);
         assert_eq!(token.input_tokens(), Some(100));
         assert_eq!(token.output_tokens(), Some(50));
+    }
+
+    // ---- Carry-forward derived attribution ------------------------------
+
+    #[test]
+    fn codex_token_rows_inherit_chain_model_and_pre_evidence_rows_stay_null() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let contents = [
+            codex_session_meta_line("2026-01-01T00:00:00Z", "sess-1"),
+            // Cumulative delta before any model evidence in the chain.
+            codex_token_count_line("2026-01-01T00:00:01Z", 10, 0, 5, 0),
+            codex_turn_context_line("2026-01-01T00:00:02Z", "gpt-5-codex"),
+            codex_token_count_line("2026-01-01T00:00:03Z", 40, 0, 20, 0),
+            codex_token_count_line("2026-01-01T00:00:04Z", 90, 0, 45, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        assert_eq!(result.observations.len(), 4);
+        // Pre-evidence token delta stays unattributed.
+        let pre_evidence = &result.observations[0];
+        assert_eq!(pre_evidence.metadata().kind, ObservationKind::Token);
+        assert_eq!(pre_evidence.raw_model_id(), None);
+        assert_eq!(pre_evidence.derived_model_id(), None);
+        // The turn carrying its own explicit model derives that id.
+        let turn = &result.observations[1];
+        assert_eq!(turn.metadata().kind, ObservationKind::Turn);
+        assert_eq!(turn.derived_model_id(), Some("gpt-5-codex"));
+        // Later token deltas inherit the chain's running model while their
+        // raw evidence stays null and replayable.
+        for token in &result.observations[2..] {
+            assert_eq!(token.metadata().kind, ObservationKind::Token);
+            assert_eq!(token.raw_model_id(), None);
+            assert_eq!(token.model_evidence(), ModelEvidence::Missing);
+            assert_eq!(token.derived_model_id(), Some("gpt-5-codex"));
+        }
+    }
+
+    #[test]
+    fn claude_synthetic_model_never_updates_the_running_model() {
+        let hint = claude_parent_hint();
+        let contents = [
+            // Synthetic before any real evidence: nothing to inherit.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","message":{"model":"<synthetic>"}}"#,
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","sessionId":"sess-1","message":{"model":"claude-opus-4","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            // Synthetic after evidence inherits instead of becoming identity.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:02:00Z","sessionId":"sess-1","message":{"model":"<synthetic>"}}"#,
+            // Model-less turns inherit the running model too.
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:03:00Z","sessionId":"sess-1","message":{"usage":{"input_tokens":3}}}"#,
+        ]
+        .join("\n");
+
+        let result = parse_claude_model_usage_jsonl(&contents, claude_context("sk-claude", &hint));
+
+        assert_eq!(result.observations.len(), 4);
+        assert_eq!(result.observations[0].raw_model_id(), Some("<synthetic>"));
+        assert_eq!(result.observations[0].derived_model_id(), None);
+        assert_eq!(
+            result.observations[1].derived_model_id(),
+            Some("claude-opus-4")
+        );
+        assert_eq!(result.observations[2].raw_model_id(), Some("<synthetic>"));
+        assert_eq!(
+            result.observations[2].derived_model_id(),
+            Some("claude-opus-4")
+        );
+        assert_eq!(result.observations[3].raw_model_id(), None);
+        assert_eq!(
+            result.observations[3].derived_model_id(),
+            Some("claude-opus-4")
+        );
     }
 }

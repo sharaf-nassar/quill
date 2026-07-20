@@ -9,18 +9,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
 	ModelAnalyticsError,
-	ModelAnalyticsResponse,
 	ModelAnalyticsUpdatedEvent,
 	ModelBackfillState,
 	ModelBackfillStatus,
-	ModelHistoryResponse,
-	ModelIdentity,
 	ModelRange,
+	ModelUsageOverviewResponse,
 } from "../types";
 import { normalizeModelAnalyticsError } from "./modelAnalyticsErrors";
 
 const EVENT_COALESCE_MS = 1_000;
 const FALLBACK_POLL_MS = 60_000;
+const SCOPE_DEBOUNCE_MS = 200;
+
+interface ScopeCacheEntry<T> {
+	data: T;
+	serialized: string;
+}
 
 interface ScopedRequestState<T> {
 	identity: string;
@@ -47,8 +51,7 @@ export interface ModelBackfillRequestState {
 }
 
 export interface UseModelAnalyticsResult {
-	aggregate: ModelAnalyticsRequestState<ModelAnalyticsResponse>;
-	history: ModelAnalyticsRequestState<ModelHistoryResponse>;
+	overview: ModelAnalyticsRequestState<ModelUsageOverviewResponse>;
 	backfill: ModelBackfillRequestState;
 	refreshGeneration: number;
 }
@@ -195,6 +198,12 @@ function useScopedModelRequest<T>(
 		identity: string;
 		timer: ReturnType<typeof setTimeout>;
 	} | null>(null);
+	// Identity-keyed cache of the last good response per scope. Revisiting a
+	// scope renders its cached bytes instantly while a background refresh runs,
+	// and identical follow-up responses reuse the cached object reference so the
+	// overview ref stays stable and memoized sections skip re-rendering.
+	const scopeCacheRef = useRef<Map<string, ScopeCacheEntry<T>>>(new Map());
+	const hasIssuedRequestRef = useRef(false);
 
 	const refresh = useCallback(function refreshScopedRequest() {
 		const activeRequest = activeRequestRef.current;
@@ -219,10 +228,18 @@ function useScopedModelRequest<T>(
 			generation: requestGeneration,
 			phase: "in_flight",
 		};
+		// The first request of a hook instance issues immediately; every later
+		// one is debounced so rapid range/provider toggles collapse into a single
+		// backend query for the scope that settles last.
+		const shouldDebounce = hasIssuedRequestRef.current;
+		hasIssuedRequestRef.current = true;
 
 		setRequestState((previous) => {
+			const cached = scopeCacheRef.current.get(identity)?.data ?? null;
 			const retainedData =
-				previous.identity === identity ? previous.data : null;
+				previous.identity === identity
+					? (previous.data ?? cached)
+					: cached;
 			return {
 				identity,
 				generation: requestGeneration,
@@ -235,16 +252,33 @@ function useScopedModelRequest<T>(
 
 		void (async () => {
 			try {
+				if (shouldDebounce) {
+					await new Promise<void>((resolve) => {
+						setTimeout(resolve, SCOPE_DEBOUNCE_MS);
+					});
+					if (requestGeneration !== requestGenerationRef.current) return;
+				}
+
 				const data = await request();
 				if (requestGeneration !== requestGenerationRef.current) return;
 
-				onAcceptedData?.(data);
+				// Reuse the cached reference for byte-identical responses so the
+				// overview ref never churns on no-op refreshes.
+				const serialized = JSON.stringify(data);
+				const cachedEntry = scopeCacheRef.current.get(identity);
+				const nextData =
+					cachedEntry !== undefined && cachedEntry.serialized === serialized
+						? cachedEntry.data
+						: data;
+				scopeCacheRef.current.set(identity, { data: nextData, serialized });
+
+				onAcceptedData?.(nextData);
 				setRequestState((previous) =>
 					previous.identity === identity
 						? {
 								identity,
 								generation: requestGeneration,
-								data,
+								data: nextData,
 								initialLoading: false,
 								refreshing: false,
 								error: null,
@@ -334,10 +368,23 @@ function useScopedModelRequest<T>(
 		deferredRefreshRef.current = { identity, timer };
 	}, [identity, refresh, requestState]);
 
-	const state =
-		requestState.identity === identity
-			? requestState
-			: emptyRequestState<T>(identity);
+	// While a scope change is committing (before refresh reseeds requestState),
+	// project a cache-seeded snapshot so a revisited scope renders instantly
+	// instead of flashing a skeleton.
+	let state: ScopedRequestState<T>;
+	if (requestState.identity === identity) {
+		state = requestState;
+	} else {
+		const cached = scopeCacheRef.current.get(identity)?.data ?? null;
+		state = {
+			identity,
+			generation: requestState.generation,
+			data: cached,
+			initialLoading: cached === null,
+			refreshing: cached !== null,
+			error: null,
+		};
+	}
 
 	return {
 		state: {
@@ -355,17 +402,10 @@ function useScopedModelRequest<T>(
 export function useModelAnalytics(
 	range: ModelRange,
 	provider: string | null,
-	selectedModel: ModelIdentity | null,
+	active: boolean,
 ): UseModelAnalyticsResult {
-	const selectedProvider = selectedModel?.provider ?? null;
-	const selectedModelId = selectedModel?.modelId ?? null;
-	const aggregateIdentity = JSON.stringify([range, provider]);
-	const historyIdentity = JSON.stringify([
-		range,
-		provider,
-		selectedProvider,
-		selectedModelId,
-	]);
+	const overviewIdentity = JSON.stringify([range, provider]);
+	const pendingRefreshWhileHiddenRef = useRef(false);
 	const [backfillStatus, setBackfillStatus] =
 		useState<ModelBackfillStatus | null>(null);
 	const [isBackfillRetrying, setIsBackfillRetrying] = useState(false);
@@ -377,47 +417,27 @@ export function useModelAnalytics(
 	const acceptBackfillStatus = useCallback((status: ModelBackfillStatus) => {
 		setBackfillStatus((current) => latestBackfillStatus(current, status));
 	}, []);
-	const acceptAggregateData = useCallback(
-		(response: ModelAnalyticsResponse) => {
+	const acceptOverviewData = useCallback(
+		(response: ModelUsageOverviewResponse) => {
 			acceptBackfillStatus(response.backfill);
 		},
 		[acceptBackfillStatus],
 	);
 
-	const requestAggregate = useCallback(
+	const requestOverview = useCallback(
 		() =>
-			invoke<ModelAnalyticsResponse>("get_model_analytics", {
+			invoke<ModelUsageOverviewResponse>("get_model_usage_overview", {
 				range,
 				provider,
 			}),
 		[provider, range],
 	);
-	const requestHistory = useCallback(
-		() =>
-			invoke<ModelHistoryResponse>("get_model_history", {
-				range,
-				provider,
-				selectedModel:
-					selectedProvider === null || selectedModelId === null
-						? null
-						: {
-								provider: selectedProvider,
-								modelId: selectedModelId,
-							},
-			}),
-		[provider, range, selectedModelId, selectedProvider],
-	);
 
-	const aggregateRequest = useScopedModelRequest(
-		aggregateIdentity,
-		"aggregate",
-		requestAggregate,
-		acceptAggregateData,
-	);
-	const historyRequest = useScopedModelRequest(
-		historyIdentity,
-		"history",
-		requestHistory,
+	const overviewRequest = useScopedModelRequest(
+		overviewIdentity,
+		"usage overview",
+		requestOverview,
+		acceptOverviewData,
 	);
 	const [refreshGeneration, setRefreshGeneration] = useState(0);
 
@@ -464,9 +484,31 @@ export function useModelAnalytics(
 
 	const refreshFromExternalSignal = useEffectEvent(() => {
 		setRefreshGeneration((generation) => generation + 1);
-		aggregateRequest.refresh();
-		historyRequest.refresh();
+		overviewRequest.refresh();
 	});
+
+	// External signals (ingest events, poll) only refresh when the panel is
+	// observable — the Models tab is active and the document is visible. While
+	// hidden the signal is remembered and replayed once on the next activation,
+	// so a background tab never storms the backend or fans out to detail hooks.
+	const maybeRefreshFromSignal = useEffectEvent(() => {
+		if (active && document.visibilityState !== "hidden") {
+			refreshFromExternalSignal();
+		} else {
+			pendingRefreshWhileHiddenRef.current = true;
+		}
+	});
+
+	const flushPendingIfObservable = useEffectEvent(() => {
+		if (!active || document.visibilityState === "hidden") return;
+		if (!pendingRefreshWhileHiddenRef.current) return;
+		pendingRefreshWhileHiddenRef.current = false;
+		refreshFromExternalSignal();
+	});
+
+	useEffect(() => {
+		flushPendingIfObservable();
+	}, [active]);
 
 	useEffect(() => {
 		let disposed = false;
@@ -475,14 +517,17 @@ export function useModelAnalytics(
 
 		void listen<ModelAnalyticsUpdatedEvent>(
 			"model-analytics-updated",
-			() => {
+			(event) => {
 				if (disposed || eventTimer !== null) return;
+				// Backfill emits one event per committed source; no-op commits carry
+				// dataChanged=false. Ignore them so idle ingest cannot storm refetches.
+				if (event.payload.dataChanged === false) return;
 
-				// The first event owns the deadline. Later events join this window
-				// without clearing or extending its timer.
+				// The first data-changing event owns the deadline. Later events join
+				// this window without clearing or extending its timer.
 				eventTimer = setTimeout(() => {
 					eventTimer = null;
-					if (!disposed) refreshFromExternalSignal();
+					if (!disposed) maybeRefreshFromSignal();
 				}, EVENT_COALESCE_MS);
 			},
 		)
@@ -495,7 +540,7 @@ export function useModelAnalytics(
 					// gap where a commit event can land between initial fetch and the
 					// asynchronous Tauri listener registration. If the listener already
 					// captured an event, its fixed-window timer owns that refresh.
-					if (eventTimer === null) refreshFromExternalSignal();
+					if (eventTimer === null) maybeRefreshFromSignal();
 				}
 			})
 			.catch((error: unknown) => {
@@ -505,20 +550,25 @@ export function useModelAnalytics(
 			});
 
 		const pollTimer = setInterval(() => {
-			if (!disposed) refreshFromExternalSignal();
+			if (!disposed) maybeRefreshFromSignal();
 		}, FALLBACK_POLL_MS);
+
+		const handleVisibilityChange = () => {
+			if (!disposed) flushPendingIfObservable();
+		};
+		document.addEventListener("visibilitychange", handleVisibilityChange);
 
 		return () => {
 			disposed = true;
 			if (eventTimer !== null) clearTimeout(eventTimer);
 			clearInterval(pollTimer);
+			document.removeEventListener("visibilitychange", handleVisibilityChange);
 			unlisten?.();
 		};
 	}, []);
 
 	return {
-		aggregate: aggregateRequest.state,
-		history: historyRequest.state,
+		overview: overviewRequest.state,
 		backfill: {
 			status: backfillStatus,
 			isRetrying: isBackfillRetrying,

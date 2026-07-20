@@ -10,7 +10,9 @@
       "meter-green": { "role": "secondary", "displayName": "Meter Green", "canonical": "#34d399", "tonalRamp": ["#06241a", "#0a3a2a", "#0f5740", "#157a59", "#1fa074", "#34d399", "#6ee7b7", "#b5f3da"] },
       "meter-amber": { "role": "secondary", "displayName": "Caution Amber", "canonical": "#fbbf24", "tonalRamp": ["#2a1d02", "#3f2c05", "#5e420a", "#856010", "#b8851a", "#fbbf24", "#fcd569", "#fde9ad"] },
       "meter-red": { "role": "secondary", "displayName": "Master-Warning Red", "canonical": "#f87171", "tonalRamp": ["#2e0f0f", "#471717", "#6b2222", "#963030", "#c84444", "#f87171", "#fba5a5", "#fdd0d0"] },
-      "signal-cyan": { "role": "tertiary", "displayName": "Codex Cyan", "canonical": "#22d3ee", "tonalRamp": ["#04282e", "#063d46", "#0a5b68", "#0f7e90", "#1aa6bd", "#22d3ee", "#67e3f4", "#a9f0f9"] },
+      "signal-cyan": { "role": "tertiary", "displayName": "Signal Cyan (brand accent)", "canonical": "#22d3ee", "tonalRamp": ["#04282e", "#063d46", "#0a5b68", "#0f7e90", "#1aa6bd", "#22d3ee", "#67e3f4", "#a9f0f9"] },
+      "provider-claude": { "role": "tertiary", "displayName": "Claude Orange", "canonical": "#fb923c", "tonalRamp": ["#2b1204", "#431d07", "#66300c", "#8f4712", "#c4661f", "#fb923c", "#fdb87b", "#fedcba"] },
+      "provider-codex": { "role": "tertiary", "displayName": "Codex Blue", "canonical": "#60a5fa", "tonalRamp": ["#0b1f3a", "#102a4d", "#1b3e6b", "#2b5894", "#3f72bd", "#60a5fa", "#93c2fc", "#c7e0fe"] },
       "signal-violet": { "role": "tertiary", "displayName": "MiniMax Violet", "canonical": "#a78bfa", "tonalRamp": ["#1c1340", "#2b1d5e", "#3f2c84", "#5840ad", "#7660d4", "#a78bfa", "#c4b1fc", "#e0d6fe"] },
       "signal-orchid": { "role": "tertiary", "displayName": "Agent Orchid", "canonical": "#c084fc", "tonalRamp": ["#22113f", "#341a5e", "#4b2785", "#6738ad", "#8f57d8", "#c084fc", "#d6aefd", "#ebd7fe"] }
     },
@@ -83,9 +85,9 @@
       "name": "Provider Badge",
       "kind": "chip",
       "refersTo": "badge-provider",
-      "description": "The fixed provider color-code as a pill: Claude blue, Codex cyan, MiniMax violet, Agent orchid. One provider, one color, every surface.",
+      "description": "The fixed provider color-code as a pill: Claude orange, Codex blue, MiniMax violet, Agent orchid. One provider, one color, every surface.",
       "html": "<span class='ds-badge ds-badge--codex'>Codex</span>",
-      "css": ".ds-badge{display:inline-flex;align-items:center;border-radius:999px;padding:1px 6px;font-family:Geist,sans-serif;font-size:9px;font-weight:700;letter-spacing:0.11em;text-transform:uppercase;} .ds-badge--claude{background:rgba(96,165,250,0.12);color:#60a5fa;} .ds-badge--codex{background:rgba(34,211,238,0.12);color:#22d3ee;} .ds-badge--minimax{background:rgba(167,139,250,0.14);color:#a78bfa;} .ds-badge--agent{background:rgba(192,132,252,0.14);color:#c084fc;}"
+      "css": ".ds-badge{display:inline-flex;align-items:center;border-radius:999px;padding:1px 6px;font-family:Geist,sans-serif;font-size:9px;font-weight:700;letter-spacing:0.11em;text-transform:uppercase;} .ds-badge--claude{background:rgba(251,146,60,0.12);color:#fb923c;} .ds-badge--codex{background:rgba(96,165,250,0.12);color:#60a5fa;} .ds-badge--minimax{background:rgba(167,139,250,0.14);color:#a78bfa;} .ds-badge--agent{background:rgba(192,132,252,0.14);color:#c084fc;}"
     },
     {
       "name": "Search Input",
@@ -133,7 +135,8 @@
     ],
     "rules": [
       { "name": "The Severity Code Rule", "body": "Green, amber, and red are reserved for threshold state. They never decorate, brand, or indicate category. If a green thing is not 'healthy', it is a bug.", "section": "colors" },
-      { "name": "The Reserved-Status Rule", "body": "Provider identity (cyan / violet / orchid) is drawn from a cool set that never overlaps the severity meter. A provider hue rendering as green or amber is forbidden — the exact drift this system was built to kill.", "section": "colors" },
+      { "name": "The Reserved-Status Rule", "body": "Provider identity (Claude orange / Codex blue / MiniMax violet / Agent orchid) never overlaps the severity meter. Claude orange is deliberately redder than caution amber #fbbf24, which stays severity-only; a provider hue rendering as green or amber is forbidden.", "section": "colors" },
+      { "name": "The Model-Shade Rule", "body": "A model is a shade of its provider's family ramp, assigned by in-scope rank within the provider; rank seven and beyond folds to neutral. Identity always renders swatch + name, and the chart adjacency palette is validated against the canvas. The same model keeps the same shade on every surface of a page.", "section": "colors" },
       { "name": "The Dimming Ladder Rule", "body": "Hierarchy is built by brightness, not hue. Step down a ladder of white alpha or Readout to Label to Label-Faint. Reach for a new color only when it carries new meaning.", "section": "colors" },
       { "name": "The Tabular Rule", "body": "Every live or comparative number uses tabular figures. A readout that reflows as its value ticks is broken.", "section": "typography" },
       { "name": "The Mono-for-Truth Rule", "body": "Monospace is for things that are code or identifiers. It is never used on a label to look technical; jitter-free digits are tabular-nums, not a mono font.", "section": "typography" },
@@ -141,7 +144,7 @@
     ],
     "dos": [
       "Do reserve green / amber / red for status only, on the 50% / 80% thresholds.",
-      "Do give every provider exactly one fixed color from the cool identity ramp, never a severity hue.",
+      "Do give every provider exactly one fixed family hue (Claude orange, Codex blue, MiniMax violet, Agent orchid) — never a severity hue — and shade models within their provider family by in-scope rank.",
       "Do set font-variant-numeric: tabular-nums on every live or compared number.",
       "Do structure with 1px hairlines and flat graphite panels.",
       "Do make values bright and labels dim; build hierarchy with brightness and weight, not new hues.",

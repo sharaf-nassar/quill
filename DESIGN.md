@@ -23,6 +23,8 @@ colors:
   signal-cyan: "#22d3ee"
   signal-violet: "#a78bfa"
   signal-orchid: "#c084fc"
+  provider-claude: "#fb923c"
+  provider-codex: "#60a5fa"
 typography:
   data:
     fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
@@ -100,7 +102,7 @@ components:
     padding: "4px 10px"
   badge-provider:
     backgroundColor: "{colors.fill-ghost}"
-    textColor: "{colors.signal-cyan}"
+    textColor: "{colors.provider-codex}"
     rounded: "{rounded.pill}"
     padding: "1px 6px"
     typography: "{typography.label}"
@@ -168,9 +170,9 @@ a reserved traffic-light meter, and a small ramp of cool hues for category ident
 
 ### Primary
 - **Signal Blue** (`#60a5fa`): the live, interactive hue. Selection, focus, primary
-  actions, the active state of any control, the current-flight-display accent. It is
-  also the identity of the Claude provider — blue is Quill's primary, and Claude is
-  the flagship provider.
+  actions, the active state of any control, the current-flight-display accent. The
+  Codex provider family is based on this same blue; identity uses are always
+  disambiguated from selection chrome by riding a badge or swatch with a name.
 
 ### Secondary — The Severity Meter
 The instrument's spine. These three encode threshold state and **nothing else.**
@@ -181,13 +183,26 @@ The instrument's spine. These three encode threshold state and **nothing else.**
   unavailable provider; destructive intent.
 
 ### Tertiary — Provider Identity
-Category hues for telling agents apart. A deliberately cool set, kept clear of the
-severity ramp so a provider can never masquerade as a status.
-- **Codex Cyan** (`#22d3ee`): the Codex provider. (Also Quill's brand accent, tying
-  the app to the marketing surface.)
-- **MiniMax Violet** (`#a78bfa`): the MiniMax provider; doubles as the secondary
-  data-series color in charts.
+Category hues for telling agents apart: two maximally separated provider families
+plus violet, kept clear of the severity ramp so a provider can never masquerade
+as a status.
+- **Claude Orange** (`#fb923c`): the Claude provider family. Deliberately redder
+  than caution amber `#fbbf24` — amber remains severity-only.
+- **Codex Blue** (`#60a5fa`): the Codex provider family. Blue/orange is the
+  canonical colorblind-safe two-group pairing.
+- **MiniMax Violet** (`#a78bfa`): the MiniMax provider (and any additional
+  provider family); doubles as the secondary data-series color in charts.
 - **Agent Orchid** (`#c084fc`): sub-agents and orchestration rows.
+- **Signal Cyan** (`#22d3ee`): Quill's brand accent tying the app to the
+  marketing surface — no longer a provider identity.
+
+**The Model-Shade Rule.** A model is a shade of its provider's family ramp
+(Claude `#fb923c → #7c2d12`/`#ffedd5`, Codex `#60a5fa → #16308f`/`#a7cdfd`,
+others violet), assigned by in-scope rank within the provider; rank seven and
+beyond folds to neutral. Identity is always rendered swatch + name — a shade
+never stands alone — and the chart adjacency palette is validated for contrast
+against the canvas. The same model keeps the same shade on every surface of a
+page.
 
 ### Neutral — The Graphite Stack
 - **Console Black** (`#121216`): the canvas. Body, titlebar, the PFD ground.
@@ -205,10 +220,12 @@ severity ramp so a provider can never masquerade as a status.
 They never decorate, never brand, never indicate category. If a green thing is not
 "healthy," it is a bug.
 
-**The Reserved-Status Rule.** Provider identity (cyan / violet / orchid) is drawn from
-a cool set that never overlaps the severity meter. A provider hue rendering as green
-or amber is forbidden — it is the exact drift this system was built to kill (Claude
-once rendered blue, green, *and* purple across three surfaces).
+**The Reserved-Status Rule.** Provider identity (Claude orange / Codex blue /
+MiniMax violet / Agent orchid) never overlaps the severity meter. Claude orange
+is deliberately redder than caution amber `#fbbf24`, which stays severity-only;
+a provider hue rendering as green or amber is forbidden — the exact drift this
+system was built to kill (Claude once rendered blue, green, *and* purple across
+three surfaces).
 
 **The Dimming Ladder Rule.** Hierarchy is built by brightness, not hue. Step down a
 ladder of white alpha (`rgba(255,255,255, .92 → .55 → .40 → .25)`) for chrome, or
@@ -320,8 +337,8 @@ shape, color logic, and states never change between the two.
 ### Chips & Badges
 - **Provider badge:** a 999px pill, 9px uppercase, 1px 6px. Background is a ~10% tint of
   the provider's identity hue; text is the hue at full strength. The fixed code —
-  Claude blue, Codex cyan, MiniMax violet, Agent orchid — is law (see The Reserved-Status
-  Rule). One provider, one color, every surface.
+  Claude orange, Codex blue, MiniMax violet, Agent orchid — is law (see The
+  Reserved-Status Rule). One provider, one color, every surface.
 - **Outlined glyph chip (e.g. ∞ ALL TIME):** transparent with a 1px `hairline` border,
   2px radius, 9px uppercase. Active inverts to a filled `signal-blue` with dark text.
 - **Lifecycle badge:** 3px radius, 10px uppercase, a 12%-alpha tint of its state hue.
@@ -357,8 +374,9 @@ gradient interpolation so the number itself carries severity. Fills transition w
 ### Do:
 - **Do** reserve green / amber / red for status only, on the 50% / 80% thresholds. The
   meter is the spine.
-- **Do** give every provider exactly one fixed color, drawn from the cool identity ramp
-  (Claude blue, Codex cyan, MiniMax violet, Agent orchid) — never a severity hue.
+- **Do** give every provider exactly one fixed family hue (Claude orange, Codex blue,
+  MiniMax violet, Agent orchid) — never a severity hue — and shade models within
+  their provider's family by in-scope rank.
 - **Do** set `font-variant-numeric: tabular-nums` on every live or compared number so
   readouts never reflow.
 - **Do** structure with 1px hairlines and flat graphite panels. Borders define surfaces.
@@ -379,7 +397,7 @@ gradient interpolation so the number itself carries severity. Fills transition w
 - **Don't** drift corporate-enterprise: no stock-photo blue, no gray-on-gray with acres
   of padding and three real numbers on the screen.
 - **Don't** let a provider change color between panels, and don't let any category hue
-  borrow a status color. Claude is blue everywhere or it's broken.
+  borrow a status color. Claude is orange everywhere or it's broken.
 - **Don't** focus inputs in green (it collides with the meter) — focus is `signal-blue`.
 - **Don't** use proportional figures for live numbers; jittering digits are an instrument
   defect.

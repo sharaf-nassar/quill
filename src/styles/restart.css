@@ -155,15 +155,15 @@
 }
 
 .restart-row__provider--claude {
-	color: var(--signal-blue);
-	background: rgba(96, 165, 250, 0.1);
-	border-color: rgba(96, 165, 250, 0.35);
+	color: var(--provider-claude);
+	background: rgba(251, 146, 60, 0.1);
+	border-color: rgba(251, 146, 60, 0.35);
 }
 
 .restart-row__provider--codex {
-	color: var(--meter-green);
-	background: rgba(52, 211, 153, 0.1);
-	border-color: rgba(52, 211, 153, 0.35);
+	color: var(--provider-codex);
+	background: rgba(96, 165, 250, 0.1);
+	border-color: rgba(96, 165, 250, 0.35);
 }
 
 .restart-row__cwd {

@@ -35,15 +35,15 @@ use models::{
     ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown, LearnedRule, LearningRun,
     LearningSettings, LlmRuntimeStats, ModelAnalyticsError, ModelAnalyticsErrorCode,
     ModelAnalyticsResponse, ModelAnalyticsUpdatedEvent, ModelBackfillState, ModelBackfillStatus,
-    ModelHistoryResponse, ModelIdentity, ModelRange, ModelSessionsResponse, ProjectBreakdown,
-    ProjectTokens, ProviderErrorKind, ProviderStatus, RuntimeSettings, SessionBreakdown,
-    SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats, SkillBreakdown,
-    SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint, TokenStats,
-    ToolCount, UsageBucket, UsageData, UsageProviderError,
+    ModelHistoryResponse, ModelIdentity, ModelRange, ModelSessionsResponse,
+    ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens, ProviderErrorKind, ProviderStatus,
+    RuntimeSettings, SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef,
+    SessionStats, SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode,
+    TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{
     Arc, OnceLock, Weak,
     atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -440,29 +440,18 @@ async fn reconcile_queued_model_usage_sources(
         committed: ModelUsageLiveReconciliationProgress::default(),
     })?;
     let prepare_result = tauri::async_runtime::spawn_blocking(move || {
-        let requested_roots = queued
-            .iter()
-            .map(|source| (source.provider.as_str(), source.source_root_key))
-            .collect::<HashSet<_>>();
-        let roots = sessions::enumerate_retained_jsonl_source_roots()
-            .into_iter()
-            .filter(|root| {
-                requested_roots.contains(&(root.provider.as_str(), root.source_root_key))
-            })
-            .collect::<Vec<_>>();
-
-        if roots.len() != requested_roots.len() {
-            return Err("Retained model source root is no longer configured".to_string());
-        }
-
         let generation = storage.get_model_backfill_status()?.generation;
-        let plan = model_usage::prepare_model_source_reconciliation(
+        // Scope preparation to the exact changed sources the live queue carries.
+        // The whole-root enumeration and per-transcript fingerprint stays on the
+        // backfill path; a live edit to one transcript must not re-stat and
+        // reparse all of history to reconcile that one change.
+        let plan = model_usage::prepare_scoped_model_source_reconciliation(
             storage,
-            &roots,
+            &queued,
             generation,
             &mut permit,
         )?;
-        Ok((plan, permit))
+        Ok::<_, String>((plan, permit))
     })
     .await;
 
@@ -1946,7 +1935,7 @@ fn normalize_model_sessions_limit(
 }
 
 /// Return provider-qualified model aggregates from one retained-evidence snapshot.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
 #[tauri::command]
 async fn get_model_analytics(
     range: String,
@@ -1975,8 +1964,38 @@ async fn get_model_analytics(
     }
 }
 
+/// Return the usage-frequency Models overview from one retained-evidence snapshot.
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
+#[tauri::command]
+async fn get_model_usage_overview(
+    range: String,
+    provider: Option<String>,
+) -> Result<ModelUsageOverviewResponse, ModelAnalyticsError> {
+    let range = ModelRange::try_from(range.as_str())?;
+    let provider = validate_model_analytics_provider(provider)?;
+    let storage = get_storage().map_err(|error| {
+        model_analytics_storage_error("Model overview storage unavailable", error)
+    })?;
+
+    match tauri::async_runtime::spawn_blocking(move || {
+        storage.get_model_usage_overview(range, provider.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(model_analytics_storage_error(
+            "Failed to read model usage overview",
+            error,
+        )),
+        Err(error) => Err(model_analytics_storage_error(
+            "Model usage overview blocking task failed",
+            error,
+        )),
+    }
+}
+
 /// Return fixed-bucket model history, optionally scoped to one exact identity.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
 #[tauri::command]
 async fn get_model_history(
     range: String,
@@ -2008,7 +2027,7 @@ async fn get_model_history(
 }
 
 /// Page sessions that contain one exact provider-qualified raw model identity.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
 #[tauri::command]
 async fn get_model_sessions(
     range: String,
@@ -2048,7 +2067,7 @@ async fn get_model_sessions(
 }
 
 /// Return chain-separated model history for one provider-owned session.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
 #[tauri::command]
 async fn get_session_model_history(
     provider: String,
@@ -2082,7 +2101,7 @@ async fn get_session_model_history(
 }
 
 /// Start a fresh retained-history generation unless one is already scheduled.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (5)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
 #[tauri::command]
 async fn retry_model_history_backfill(
     app_handle: tauri::AppHandle,
@@ -4027,6 +4046,7 @@ pub fn run() {
             get_all_bucket_stats,
             get_snapshot_count,
             get_model_analytics,
+            get_model_usage_overview,
             get_model_history,
             get_model_sessions,
             get_session_model_history,

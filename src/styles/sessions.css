@@ -257,14 +257,14 @@
 
 .sessions-provider-badge.claude {
   color: var(--provider-claude);
-  background: rgba(96, 165, 250, 0.12);
-  border-color: rgba(96, 165, 250, 0.22);
+  background: rgba(251, 146, 60, 0.12);
+  border-color: rgba(251, 146, 60, 0.22);
 }
 
 .sessions-provider-badge.codex {
   color: var(--provider-codex);
-  background: rgba(34, 211, 238, 0.12);
-  border-color: rgba(34, 211, 238, 0.22);
+  background: rgba(96, 165, 250, 0.12);
+  border-color: rgba(96, 165, 250, 0.22);
 }
 
 .sessions-result-snippet {

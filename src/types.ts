@@ -723,56 +723,100 @@ export interface ModelAnalyticsScope {
   scopeFinal: boolean;
 }
 
-export interface ModelAnalyticsSummary {
+export interface ModelUsageOverviewTotals {
+  sessions: number;
+  projects: number;
+  turns: number;
   attributedTokens: number;
-  unattributedTokens: number;
   totalTokens: number;
-  attributedCoveragePercent: number | null;
+  coveragePercent: number | null;
   distinctModels: number;
   multiModelSessions: number;
 }
 
-export interface ModelUsageRow {
+export interface ModelRunningNowEntry {
+  provider: string;
+  modelId: string;
+  lastSeenAt: string;
+  runningSinceAt: string;
+  previousModelId: string | null;
+}
+
+export interface ModelUsageOverviewRow {
   identity: ModelIdentity;
+  sessions: number;
+  sessionPercent: number | null;
+  projects: number;
+  turns: number;
+  primaryIn: number;
+  daysActive: number;
   attributedTokens: number;
-  attributedSharePercent: number | null;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-  observedTurns: number;
-  sessionCount: number;
-  cacheReadSharePercent: number | null;
+  sharePercent: number | null;
   firstSeen: string;
   lastSeen: string;
 }
 
-export interface ModelAnalyticsResponse {
+export interface ModelActivitySeries {
+  identity: ModelIdentity;
+  sessionsPerBucket: number[];
+}
+
+export interface ModelActivity {
+  bucketSeconds: number;
+  bucketStarts: string[];
+  series: ModelActivitySeries[];
+}
+
+export interface ModelProjectMatrixCell {
+  identity: ModelIdentity;
+  sessions: number;
+}
+
+export interface ModelProjectMatrixRow {
+  project: string;
+  totalSessions: number;
+  cells: ModelProjectMatrixCell[];
+}
+
+export interface ModelCombinationPair {
+  a: ModelIdentity;
+  b: ModelIdentity;
+  sharedSessions: number;
+}
+
+export interface ModelCombinations {
+  single: number;
+  dual: number;
+  threePlus: number;
+  topPairs: ModelCombinationPair[];
+}
+
+export interface ModelDelegationTop {
+  identity: ModelIdentity;
+  sharePercent: number;
+}
+
+export interface ModelDelegation {
+  parentTokens: number;
+  subagentTokens: number;
+  parentTop: ModelDelegationTop | null;
+  subagentTop: ModelDelegationTop | null;
+}
+
+export interface ModelUsageOverviewResponse {
   generatedAt: string;
   range: ModelRange;
   provider: string | null;
   representedProviders: string[];
   scope: ModelAnalyticsScope;
-  summary: ModelAnalyticsSummary;
-  models: ModelUsageRow[];
   backfill: ModelBackfillStatus;
-}
-
-export interface ModelHistoryPoint {
-  bucketStart: string;
-  bucketEnd: string;
-  attributedTokens: number;
-  unattributedTokens: number;
-  selectedModelTokens: number | null;
-}
-
-export interface ModelHistoryResponse {
-  generatedAt: string;
-  range: ModelRange;
-  provider: string | null;
-  selectedModel: ModelIdentity | null;
-  bucketSeconds: number;
-  points: ModelHistoryPoint[];
+  totals: ModelUsageOverviewTotals;
+  runningNow: ModelRunningNowEntry[];
+  models: ModelUsageOverviewRow[];
+  activity: ModelActivity;
+  projectMatrix: ModelProjectMatrixRow[];
+  combinations: ModelCombinations;
+  delegation: ModelDelegation;
 }
 
 export interface ModelSessionRow {

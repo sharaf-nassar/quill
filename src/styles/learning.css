@@ -708,12 +708,12 @@
 }
 
 .learning-provider-badge--claude {
-  background: rgba(96, 165, 250, 0.14);
+  background: rgba(251, 146, 60, 0.14);
   color: var(--provider-claude);
 }
 
 .learning-provider-badge--codex {
-  background: rgba(34, 211, 238, 0.14);
+  background: rgba(96, 165, 250, 0.14);
   color: var(--provider-codex);
 }
 

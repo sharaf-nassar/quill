@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
 use std::fs::Metadata;
@@ -28,8 +28,12 @@ use crate::models::{
     LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
     LearningStatus, LlmRuntimeStats, ModelAnalyticsResponse, ModelAnalyticsScope,
     ModelAnalyticsSummary, ModelBackfillDiagnostic, ModelBackfillState, ModelBackfillStatus,
-    ModelBackfillTrigger, ModelHistoryPoint, ModelHistoryResponse, ModelIdentity, ModelRange,
-    ModelSessionRow, ModelSessionsResponse, ModelUsageRow, ObservationPayload, ObservationSummary,
+    ModelBackfillTrigger, ModelHistoryPoint, ModelHistoryResponse, ModelIdentity,
+    ModelOverviewActivity, ModelOverviewActivitySeries, ModelOverviewCombinations,
+    ModelOverviewDelegation, ModelOverviewDelegationTop, ModelOverviewPair,
+    ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
+    ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse,
+    ModelUsageOverviewResponse, ModelUsageRow, ObservationPayload, ObservationSummary,
     ProjectBreakdown, ProjectTokens, RunInferenceCall, RunInferenceConfinement,
     RunInferenceSummary, SessionBreakdown, SessionCodeStats, SessionModelChain,
     SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment, SessionRef,
@@ -1943,7 +1947,7 @@ struct ModelAnalyticsAggregateRow {
 
 struct ModelUsageAggregateRow {
     provider: String,
-    raw_model_id: String,
+    derived_model_id: String,
     attributed_tokens: i64,
     input_tokens: i64,
     output_tokens: i64,
@@ -1965,6 +1969,10 @@ struct ModelHistoryAggregateRow {
 
 const MODEL_SESSIONS_DEFAULT_LIMIT: usize = 20;
 const MODEL_SESSIONS_MAX_LIMIT: usize = 100;
+/// Top projects retained in the overview project matrix.
+const MODEL_OVERVIEW_PROJECT_LIMIT: usize = 8;
+/// Top co-occurring model pairs retained in the overview combinations.
+const MODEL_OVERVIEW_PAIR_LIMIT: usize = 5;
 const MODEL_SESSIONS_CURSOR_PREFIX: &str = "quill-model-sessions-v1";
 const MODEL_SESSIONS_CURSOR_MAX_BYTES: usize = 16_384;
 
@@ -2005,6 +2013,7 @@ struct SessionModelObservationRow {
     observed_at_ms: i64,
     observation_kind: String,
     raw_model_id: Option<String>,
+    derived_model_id: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     cache_creation_tokens: Option<i64>,
@@ -2084,13 +2093,13 @@ impl SessionModelChainAccumulator {
 
     fn add_tokens(
         &mut self,
-        raw_model_id: Option<&str>,
+        attributed_model_id: Option<&str>,
         token_amount: Option<i64>,
     ) -> Result<(), String> {
         let Some(token_amount) = token_amount else {
             return Ok(());
         };
-        let total = if raw_model_id.is_some() {
+        let total = if attributed_model_id.is_some() {
             &mut self.attributed_tokens
         } else {
             &mut self.unattributed_tokens
@@ -2421,6 +2430,28 @@ fn model_history_bucket_seconds(range: ModelRange) -> i64 {
         ModelRange::SevenDays => 6 * 60 * 60,
         ModelRange::ThirtyDays => 24 * 60 * 60,
     }
+}
+
+/// Fixed activity bucket widths for the Models overview: session-count series
+/// use one-day buckets for both week and month ranges.
+fn model_overview_bucket_seconds(range: ModelRange) -> i64 {
+    match range {
+        ModelRange::OneHour => 5 * 60,
+        ModelRange::TwentyFourHours => 60 * 60,
+        ModelRange::SevenDays | ModelRange::ThirtyDays => 24 * 60 * 60,
+    }
+}
+
+/// Derive the display project for one session: the final path component of the
+/// session's effective cwd, or `unknown` when no cwd was observed.
+fn model_overview_project(cwd: Option<&str>) -> String {
+    cwd.filter(|value| !value.is_empty())
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("unknown")
+        .to_owned()
 }
 
 fn model_observation_millis_to_rfc3339(value: i64, field: &str) -> Result<String, String> {
@@ -4002,6 +4033,105 @@ impl Storage {
                 .map_err(|e| format!("Migration 28 commit: {e}"))?;
         }
 
+        // Migration 29: carry-forward model attribution. Adds the nullable
+        // `derived_model_id` column that analytics aggregation keys on, plus
+        // its aggregation index. Existing rows are not backfilled here —
+        // instead the backfill singleton is re-armed to a fresh pending
+        // migration generation (the same seed shape migration 28 used) so a
+        // fresh retained backfill re-attributes evidence on upgrade.
+        if current_version < 29 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 29 transaction begin: {e}"))?;
+
+            let has_column = tx
+                .prepare("SELECT derived_model_id FROM model_usage_observations LIMIT 0")
+                .is_ok();
+            if !has_column {
+                tx.execute_batch(
+                    "ALTER TABLE model_usage_observations
+                         ADD COLUMN derived_model_id TEXT;",
+                )
+                .map_err(|e| format!("Migration 29 (derived_model_id column): {e}"))?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_model_observations_derived_model_time
+                     ON model_usage_observations(
+                         provider, derived_model_id, observed_at_ms
+                     );",
+            )
+            .map_err(|e| format!("Migration 29 (derived model index): {e}"))?;
+
+            // Re-arming the backfill to pending is not enough on its own: an
+            // `ok` source whose fast fingerprint still matches classifies as
+            // `FastUnchanged` and is never re-parsed, so its pre-migration
+            // observations keep a NULL `derived_model_id` forever. Clear the
+            // fast (`mtime_ns`) and content (`content_sha256`) fingerprints on
+            // every active `ok` source so reconciliation is forced down the
+            // full re-parse path (`FastUnchanged` needs a matching fast
+            // fingerprint, `ContentUnchanged` a matching content hash). The
+            // real parser then re-runs `apply_carry_forward_attribution`,
+            // guaranteeing recomputed attribution matches parse semantics
+            // exactly rather than an approximate in-SQL carry-forward. Rows are
+            // replaced atomically, so evidence is never left partially cleared.
+            tx.execute(
+                "UPDATE model_observation_sources
+                 SET mtime_ns = NULL,
+                     content_sha256 = NULL
+                 WHERE processing_status = 'ok'
+                   AND suppressed_sha256 IS NULL",
+                [],
+            )
+            .map_err(|e| format!("Migration 29 (re-arm source fingerprints): {e}"))?;
+
+            let now_ms = Utc::now().timestamp_millis();
+            tx.execute(
+                "INSERT OR IGNORE INTO model_backfill_state (
+                    id, generation, trigger, status,
+                    total_roots, completed_roots, failed_roots,
+                    inventory_complete, total_sources, source_total_published,
+                    processed_sources, failed_sources, skipped_sources,
+                    remaining_sources, observations_written, started_at_ms,
+                    updated_at_ms, finished_at_ms, last_error
+                 ) VALUES (
+                    1, 0, 'migration', 'pending',
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, ?1, NULL, NULL
+                 )",
+                params![now_ms],
+            )
+            .map_err(|e| format!("Migration 29 (seed backfill state): {e}"))?;
+            tx.execute(
+                "UPDATE model_backfill_state
+                 SET generation = generation + 1,
+                     trigger = 'migration',
+                     status = 'pending',
+                     total_roots = 0,
+                     completed_roots = 0,
+                     failed_roots = 0,
+                     inventory_complete = 0,
+                     total_sources = 0,
+                     source_total_published = 0,
+                     processed_sources = 0,
+                     failed_sources = 0,
+                     skipped_sources = 0,
+                     remaining_sources = 0,
+                     observations_written = 0,
+                     started_at_ms = NULL,
+                     updated_at_ms = ?1,
+                     finished_at_ms = NULL,
+                     last_error = NULL
+                 WHERE id = 1",
+                params![now_ms],
+            )
+            .map_err(|e| format!("Migration 29 (re-arm backfill state): {e}"))?;
+
+            tx.execute("INSERT INTO schema_version (version) VALUES (29)", [])
+                .map_err(|e| format!("Failed to record migration 29: {e}"))?;
+
+            tx.commit()
+                .map_err(|e| format!("Migration 29 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -4057,8 +4187,18 @@ impl Storage {
         .map_err(|error| format!("Open model analytics read connection: {error}"))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|error| format!("Configure model analytics read timeout: {error}"))?;
-        conn.pragma_update(None, "query_only", true)
-            .map_err(|error| format!("Configure model analytics read-only mode: {error}"))?;
+        // Keep transient work (the overview's scoped temp table, sort spills)
+        // resident in memory and let the reader map/cache more of the database
+        // so repeated aggregate scans are not served cold. The connection is
+        // already opened `SQLITE_OPEN_READ_ONLY`, which is what protects the
+        // main database from writes; `query_only` is intentionally not set
+        // because it also blocks the in-memory temp table the overview builds.
+        conn.execute_batch(
+            "PRAGMA temp_store = MEMORY;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA cache_size = -65536;",
+        )
+        .map_err(|error| format!("Configure model analytics reader pragmas: {error}"))?;
         Ok(conn)
     }
 
@@ -4561,7 +4701,7 @@ impl Storage {
                     "WITH scoped_observations AS MATERIALIZED (
                      SELECT observation.provider,
                             observation.analytics_session_id,
-                            observation.raw_model_id,
+                            observation.derived_model_id,
                             observation.input_tokens,
                             observation.output_tokens,
                             observation.cache_creation_tokens,
@@ -4588,7 +4728,7 @@ impl Storage {
                      (
                          SELECT COUNT(*)
                          FROM scoped_observations
-                         WHERE raw_model_id IS NOT NULL
+                         WHERE derived_model_id IS NOT NULL
                      ),
                      COALESCE((
                          SELECT SUM(
@@ -4607,16 +4747,16 @@ impl Storage {
                              + COALESCE(cache_read_tokens, 0)
                          )
                          FROM scoped_observations
-                         WHERE raw_model_id IS NOT NULL
+                         WHERE derived_model_id IS NOT NULL
                      ), 0),
                      (
                          SELECT COUNT(*)
                          FROM (
-                             SELECT provider, raw_model_id
+                             SELECT provider, derived_model_id
                              FROM scoped_observations
-                             WHERE raw_model_id IS NOT NULL
+                             WHERE derived_model_id IS NOT NULL
                              GROUP BY provider COLLATE BINARY,
-                                      raw_model_id COLLATE BINARY
+                                      derived_model_id COLLATE BINARY
                          ) AS scoped_models
                      ),
                      (
@@ -4624,12 +4764,12 @@ impl Storage {
                          FROM (
                              SELECT provider, analytics_session_id
                              FROM (
-                                 SELECT provider, analytics_session_id, raw_model_id
+                                 SELECT provider, analytics_session_id, derived_model_id
                                  FROM scoped_observations
-                                 WHERE raw_model_id IS NOT NULL
+                                 WHERE derived_model_id IS NOT NULL
                                  GROUP BY provider COLLATE BINARY,
                                           analytics_session_id COLLATE BINARY,
-                                          raw_model_id COLLATE BINARY
+                                          derived_model_id COLLATE BINARY
                              ) AS session_model_identities
                              GROUP BY provider COLLATE BINARY,
                                       analytics_session_id COLLATE BINARY
@@ -4682,7 +4822,7 @@ impl Storage {
             .prepare_cached(&format!(
                 "SELECT
                      observation.provider,
-                     observation.raw_model_id,
+                     observation.derived_model_id,
                      SUM(
                          COALESCE(observation.input_tokens, 0)
                          + COALESCE(observation.output_tokens, 0)
@@ -4724,19 +4864,19 @@ impl Storage {
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
                    AND (?3 IS NULL OR observation.provider = ?3)
-                   AND observation.raw_model_id IS NOT NULL
+                   AND observation.derived_model_id IS NOT NULL
                  GROUP BY observation.provider COLLATE BINARY,
-                          observation.raw_model_id COLLATE BINARY
+                          observation.derived_model_id COLLATE BINARY
                  ORDER BY attributed_tokens DESC,
                           observation.provider COLLATE BINARY ASC,
-                          observation.raw_model_id COLLATE BINARY ASC",
+                          observation.derived_model_id COLLATE BINARY ASC",
             ))
             .map_err(|error| format!("Prepare model usage rows query: {error}"))?;
         let model_aggregate_rows = model_statement
             .query_map(params![range_start_ms, range_end_ms, provider], |row| {
                 Ok(ModelUsageAggregateRow {
                     provider: row.get(0)?,
-                    raw_model_id: row.get(1)?,
+                    derived_model_id: row.get(1)?,
                     attributed_tokens: row.get(2)?,
                     input_tokens: row.get(3)?,
                     output_tokens: row.get(4)?,
@@ -4772,7 +4912,7 @@ impl Storage {
             models.push(ModelUsageRow {
                 identity: ModelIdentity {
                     provider: row.provider,
-                    model_id: row.raw_model_id,
+                    model_id: row.derived_model_id,
                 },
                 attributed_tokens: row.attributed_tokens,
                 attributed_share_percent: model_percentage(
@@ -4839,6 +4979,902 @@ impl Storage {
         })
     }
 
+    /// Aggregate the redesigned Models tab usage-frequency overview.
+    ///
+    /// Every attribution fact keys on carry-forward `derived_model_id` over
+    /// unsuppressed sources in the half-open range, while raw evidence stays
+    /// stored untouched. One deferred read-only transaction on an independent
+    /// read connection snapshots the whole response, matching
+    /// `get_model_analytics`.
+    pub(crate) fn get_model_usage_overview(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+    ) -> Result<ModelUsageOverviewResponse, String> {
+        let range_end = Utc::now();
+        let range_end_ms = range_end.timestamp_millis();
+        let range_millis = model_range_duration(range).num_milliseconds();
+        let range_start_ms = range_end_ms
+            .checked_sub(range_millis)
+            .ok_or_else(|| "Model overview range boundary overflow".to_string())?;
+        let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
+        let bucket_seconds = model_overview_bucket_seconds(range);
+        let bucket_millis = bucket_seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| "Model overview bucket width overflow".to_string())?;
+        let bucket_count = range_millis
+            .checked_div(bucket_millis)
+            .filter(|count| *count > 0 && range_millis % bucket_millis == 0)
+            .ok_or_else(|| "Model overview range does not divide into fixed buckets".to_string())?;
+        let bucket_capacity = usize::try_from(bucket_count)
+            .map_err(|_| "Model overview bucket count exceeds platform capacity".to_string())?;
+        let mut bucket_starts = Vec::with_capacity(bucket_capacity);
+        for bucket_index in 0..bucket_count {
+            let bucket_offset = bucket_index
+                .checked_mul(bucket_millis)
+                .ok_or_else(|| "Model overview bucket offset overflow".to_string())?;
+            let bucket_start_ms = range_start_ms
+                .checked_add(bucket_offset)
+                .ok_or_else(|| "Model overview bucket start overflow".to_string())?;
+            bucket_starts.push(model_observation_millis_to_rfc3339(
+                bucket_start_ms,
+                "bucket_start",
+            )?);
+        }
+
+        let mut conn = self.open_model_analytics_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin model overview read snapshot: {error}"))?;
+
+        let backfill = read_model_backfill_status(&tx)?;
+        let global_session_count = tx
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*)
+                 FROM (
+                     SELECT source.provider, source.analytics_session_id
+                     FROM model_observation_sources AS source
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                       AND source.analytics_session_id IS NOT NULL
+                     GROUP BY source.provider COLLATE BINARY,
+                              source.analytics_session_id COLLATE BINARY
+                 ) AS retained_sessions"
+                ),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Query global model overview session scope: {error}"))?;
+
+        // Materialize the scoped observation set ONCE instead of re-scanning
+        // `model_usage_observations` (join + suppression predicate + range +
+        // token re-sum) for every overview section. Each downstream aggregate
+        // reads this small in-memory temp table (see `open_model_analytics_reader`,
+        // which sets `temp_store = MEMORY`). Token amount, activity bucket
+        // index, and the day string are precomputed here so no section repeats
+        // that work. The provider filter is appended (not `?N IS NULL OR ...`)
+        // only when scoped, keeping the single base-table scan sargable.
+        let provider_filter = if provider.is_some() {
+            " AND observation.provider = ?4"
+        } else {
+            ""
+        };
+        let create_scoped_sql = format!(
+            "CREATE TEMP TABLE scoped_overview AS
+             SELECT observation.provider AS provider,
+                    observation.analytics_session_id AS analytics_session_id,
+                    observation.derived_model_id AS derived_model_id,
+                    observation.observation_kind AS observation_kind,
+                    source.is_sidechain AS is_sidechain,
+                    COALESCE(
+                        NULLIF(observation.cwd, ''),
+                        NULLIF(source.cwd, '')
+                    ) AS effective_cwd,
+                    observation.observed_at_ms AS observed_at_ms,
+                    observation.source_ordinal AS source_ordinal,
+                    observation.source_record_key AS source_record_key,
+                    observation.source_key AS source_key,
+                    observation.id AS obs_id,
+                    (COALESCE(observation.input_tokens, 0)
+                     + COALESCE(observation.output_tokens, 0)
+                     + COALESCE(observation.cache_creation_tokens, 0)
+                     + COALESCE(observation.cache_read_tokens, 0)) AS token_amount,
+                    (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
+                    date(observation.observed_at_ms / 1000, 'unixepoch') AS day_string
+             FROM model_usage_observations AS observation
+             JOIN model_observation_sources AS source
+               ON source.provider = observation.provider
+              AND source.source_key = observation.source_key
+             WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+               AND observation.observed_at_ms >= ?1
+               AND observation.observed_at_ms < ?2{provider_filter}"
+        );
+        let mut create_params: Vec<&dyn rusqlite::ToSql> =
+            vec![&range_start_ms, &range_end_ms, &bucket_millis];
+        if let Some(provider_value) = provider.as_ref() {
+            create_params.push(provider_value);
+        }
+        tx.execute(&create_scoped_sql, create_params.as_slice())
+            .map_err(|error| format!("Materialize model overview scoped rows: {error}"))?;
+        tx.execute_batch(
+            "CREATE INDEX temp.scoped_overview_provider_session
+                 ON scoped_overview(provider, analytics_session_id);
+             CREATE INDEX temp.scoped_overview_provider_model
+                 ON scoped_overview(provider, derived_model_id);",
+        )
+        .map_err(|error| format!("Index model overview scoped rows: {error}"))?;
+
+        struct OverviewTotalsRow {
+            sessions: i64,
+            turns: i64,
+            total_tokens: i64,
+            attributed_tokens: i64,
+            distinct_models: i64,
+            evidence_count: i64,
+        }
+        let totals_row = tx
+            .query_row(
+                "SELECT
+                     (
+                         SELECT COUNT(*)
+                         FROM (
+                             SELECT provider, analytics_session_id
+                             FROM scoped_overview
+                             GROUP BY provider COLLATE BINARY,
+                                      analytics_session_id COLLATE BINARY
+                         ) AS scoped_sessions
+                     ),
+                     (
+                         SELECT COUNT(*)
+                         FROM scoped_overview
+                         WHERE observation_kind = 'turn'
+                     ),
+                     COALESCE((
+                         SELECT SUM(token_amount) FROM scoped_overview
+                     ), 0),
+                     COALESCE((
+                         SELECT SUM(token_amount)
+                         FROM scoped_overview
+                         WHERE derived_model_id IS NOT NULL
+                     ), 0),
+                     (
+                         SELECT COUNT(*)
+                         FROM (
+                             SELECT provider, derived_model_id
+                             FROM scoped_overview
+                             WHERE derived_model_id IS NOT NULL
+                             GROUP BY provider COLLATE BINARY,
+                                      derived_model_id COLLATE BINARY
+                         ) AS scoped_models
+                     ),
+                     (
+                         SELECT COUNT(*)
+                         FROM scoped_overview
+                         WHERE derived_model_id IS NOT NULL
+                     )",
+                [],
+                |row| {
+                    Ok(OverviewTotalsRow {
+                        sessions: row.get(0)?,
+                        turns: row.get(1)?,
+                        total_tokens: row.get(2)?,
+                        attributed_tokens: row.get(3)?,
+                        distinct_models: row.get(4)?,
+                        evidence_count: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|error| format!("Query model overview totals: {error}"))?;
+
+        let mut represented_provider_statement = tx
+            .prepare_cached(&format!(
+                "SELECT observation.provider
+                 FROM model_usage_observations AS observation
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                 GROUP BY observation.provider COLLATE BINARY
+                 ORDER BY observation.provider COLLATE BINARY ASC",
+            ))
+            .map_err(|error| format!("Prepare represented overview providers query: {error}"))?;
+        let represented_provider_rows = represented_provider_statement
+            .query_map(params![range_start_ms, range_end_ms], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("Query represented overview providers: {error}"))?;
+        let mut represented_providers = Vec::new();
+        for row in represented_provider_rows {
+            represented_providers.push(
+                row.map_err(|error| format!("Read represented overview provider row: {error}"))?,
+            );
+        }
+        drop(represented_provider_statement);
+
+        // Per-session representative project: the latest non-null effective
+        // cwd inside the range, matching the `get_model_sessions` convention
+        // (observation cwd first, then owning source cwd).
+        let mut session_projects = BTreeMap::<(String, String), String>::new();
+        {
+            let mut statement = tx
+                .prepare_cached(
+                    "WITH ranked AS (
+                         SELECT provider,
+                                analytics_session_id,
+                                effective_cwd,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY provider COLLATE BINARY,
+                                                 analytics_session_id COLLATE BINARY
+                                    ORDER BY CASE WHEN effective_cwd IS NULL
+                                                  THEN 1 ELSE 0 END,
+                                             observed_at_ms DESC,
+                                             source_ordinal DESC,
+                                             source_record_key COLLATE BINARY DESC,
+                                             source_key COLLATE BINARY DESC,
+                                             obs_id DESC
+                                ) AS cwd_rank
+                         FROM scoped_overview
+                     )
+                     SELECT provider, analytics_session_id, effective_cwd
+                     FROM ranked
+                     WHERE cwd_rank = 1",
+                )
+                .map_err(|error| format!("Prepare model overview projects query: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview projects: {error}"))?;
+            for row in rows {
+                let (session_provider, session_id, cwd) =
+                    row.map_err(|error| format!("Read model overview project row: {error}"))?;
+                session_projects.insert(
+                    (session_provider, session_id),
+                    model_overview_project(cwd.as_deref()),
+                );
+            }
+        }
+
+        // Per-(session, model) attributed stats drive model reach, primary
+        // attribution, combinations, and the project matrix.
+        struct SessionModelUsage {
+            attributed_turns: i64,
+            attributed_tokens: i64,
+        }
+        let mut session_models =
+            BTreeMap::<(String, String), BTreeMap<(String, String), SessionModelUsage>>::new();
+        {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider,
+                            analytics_session_id,
+                            derived_model_id,
+                            SUM(CASE WHEN observation_kind = 'turn'
+                                     THEN 1 ELSE 0 END) AS attributed_turns,
+                            SUM(token_amount) AS attributed_tokens
+                     FROM scoped_overview
+                     WHERE derived_model_id IS NOT NULL
+                     GROUP BY provider COLLATE BINARY,
+                              analytics_session_id COLLATE BINARY,
+                              derived_model_id COLLATE BINARY",
+                )
+                .map_err(|error| format!("Prepare model overview session stats query: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview session stats: {error}"))?;
+            for row in rows {
+                let (row_provider, session_id, model_id, attributed_turns, attributed_tokens) =
+                    row.map_err(|error| format!("Read model overview session stats row: {error}"))?;
+                if attributed_turns < 0 || attributed_tokens < 0 {
+                    return Err(
+                        "Model overview session stats contained negative values".to_string()
+                    );
+                }
+                session_models
+                    .entry((row_provider.clone(), session_id))
+                    .or_default()
+                    .insert(
+                        (row_provider, model_id),
+                        SessionModelUsage {
+                            attributed_turns,
+                            attributed_tokens,
+                        },
+                    );
+            }
+        }
+
+        // Per-model activity days and first/last attributed evidence.
+        struct ModelMetaRow {
+            days_active: i64,
+            first_seen_ms: i64,
+            last_seen_ms: i64,
+        }
+        let mut model_meta = BTreeMap::<(String, String), ModelMetaRow>::new();
+        {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider,
+                            derived_model_id,
+                            COUNT(DISTINCT CASE
+                                WHEN observation_kind = 'turn'
+                                THEN day_string
+                            END) AS days_active,
+                            MIN(observed_at_ms) AS first_seen_ms,
+                            MAX(observed_at_ms) AS last_seen_ms
+                     FROM scoped_overview
+                     WHERE derived_model_id IS NOT NULL
+                     GROUP BY provider COLLATE BINARY,
+                              derived_model_id COLLATE BINARY",
+                )
+                .map_err(|error| format!("Prepare model overview meta query: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview meta: {error}"))?;
+            for row in rows {
+                let (row_provider, model_id, days_active, first_seen_ms, last_seen_ms) =
+                    row.map_err(|error| format!("Read model overview meta row: {error}"))?;
+                model_meta.insert(
+                    (row_provider, model_id),
+                    ModelMetaRow {
+                        days_active,
+                        first_seen_ms,
+                        last_seen_ms,
+                    },
+                );
+            }
+        }
+
+        // Fixed-bucket distinct-session activity per model.
+        let mut activity_buckets = HashMap::<(String, String), Vec<i64>>::new();
+        {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT bucket_index,
+                            provider,
+                            derived_model_id,
+                            COUNT(DISTINCT analytics_session_id COLLATE BINARY)
+                                AS session_count
+                     FROM scoped_overview
+                     WHERE observation_kind = 'turn'
+                       AND derived_model_id IS NOT NULL
+                     GROUP BY bucket_index,
+                              provider COLLATE BINARY,
+                              derived_model_id COLLATE BINARY",
+                )
+                .map_err(|error| format!("Prepare model overview activity query: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview activity: {error}"))?;
+            for row in rows {
+                let (bucket_index, row_provider, model_id, session_count) =
+                    row.map_err(|error| format!("Read model overview activity row: {error}"))?;
+                let bucket_index = usize::try_from(bucket_index)
+                    .map_err(|_| format!("Invalid model overview bucket index: {bucket_index}"))?;
+                if bucket_index >= bucket_capacity {
+                    return Err(format!(
+                        "Model overview bucket index outside fixed axis: {bucket_index}"
+                    ));
+                }
+                let series = activity_buckets
+                    .entry((row_provider, model_id))
+                    .or_insert_with(|| vec![0; bucket_capacity]);
+                series[bucket_index] = session_count;
+            }
+        }
+
+        // Attributed tokens split by owning-source sidechain flag.
+        let mut parent_tokens = 0_i64;
+        let mut subagent_tokens = 0_i64;
+        let mut parent_best: Option<((String, String), i64)> = None;
+        let mut subagent_best: Option<((String, String), i64)> = None;
+        {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT is_sidechain,
+                            provider,
+                            derived_model_id,
+                            SUM(token_amount) AS attributed_tokens
+                     FROM scoped_overview
+                     WHERE derived_model_id IS NOT NULL
+                     GROUP BY is_sidechain,
+                              provider COLLATE BINARY,
+                              derived_model_id COLLATE BINARY",
+                )
+                .map_err(|error| format!("Prepare model overview delegation query: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview delegation: {error}"))?;
+            for row in rows {
+                let (is_sidechain, row_provider, model_id, attributed_tokens) =
+                    row.map_err(|error| format!("Read model overview delegation row: {error}"))?;
+                if attributed_tokens < 0 {
+                    return Err("Model overview delegation contained negative tokens".to_string());
+                }
+                let identity_key = (row_provider, model_id);
+                let (group_total, group_best) = if is_sidechain != 0 {
+                    (&mut subagent_tokens, &mut subagent_best)
+                } else {
+                    (&mut parent_tokens, &mut parent_best)
+                };
+                checked_add_session_model_value(
+                    group_total,
+                    attributed_tokens,
+                    "delegation group tokens",
+                )?;
+                let replace = match group_best.as_ref() {
+                    None => true,
+                    Some((best_key, best_tokens)) => {
+                        attributed_tokens > *best_tokens
+                            || (attributed_tokens == *best_tokens && identity_key < *best_key)
+                    }
+                };
+                if replace {
+                    *group_best = Some((identity_key, attributed_tokens));
+                }
+            }
+        }
+
+        // Latest contiguous attributed-model run per provider. One window pass
+        // over the scoped temp table replaces the previous per-provider
+        // statement re-execution loop. `turns` ranks each provider's attributed
+        // turns newest-first on the same total order the old loop walked; the
+        // leading contiguous run is every row before `first_diff` (the highest-
+        // ranked turn whose model differs from rank 1). `running_since` is the
+        // earliest timestamp still inside that run, and `previous_model_id` is
+        // the model at the break — matching the old walk exactly.
+        struct RunningNowRow {
+            model_id: String,
+            last_seen_ms: i64,
+            running_since_ms: i64,
+            previous_model_id: Option<String>,
+        }
+        let mut running_by_provider = HashMap::<String, RunningNowRow>::new();
+        {
+            let mut statement = tx
+                .prepare_cached(
+                    "WITH turns AS (
+                         SELECT provider,
+                                derived_model_id AS model_id,
+                                observed_at_ms,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY provider COLLATE BINARY
+                                    ORDER BY observed_at_ms DESC,
+                                             source_ordinal DESC,
+                                             source_record_key COLLATE BINARY DESC,
+                                             source_key COLLATE BINARY DESC,
+                                             obs_id DESC
+                                ) AS rn
+                         FROM scoped_overview
+                         WHERE observation_kind = 'turn'
+                           AND derived_model_id IS NOT NULL
+                     ),
+                     latest AS (
+                         SELECT provider,
+                                model_id AS latest_model,
+                                observed_at_ms AS last_seen_ms
+                         FROM turns
+                         WHERE rn = 1
+                     ),
+                     first_diff AS (
+                         SELECT turns.provider, MIN(turns.rn) AS diff_rn
+                         FROM turns
+                         JOIN latest
+                           ON latest.provider = turns.provider
+                         WHERE turns.model_id COLLATE BINARY
+                               != latest.latest_model COLLATE BINARY
+                         GROUP BY turns.provider COLLATE BINARY
+                     )
+                     SELECT latest.provider,
+                            latest.latest_model,
+                            latest.last_seen_ms,
+                            (
+                                SELECT run_row.observed_at_ms
+                                FROM turns AS run_row
+                                WHERE run_row.provider COLLATE BINARY
+                                      = latest.provider COLLATE BINARY
+                                  AND run_row.rn = COALESCE(
+                                        (
+                                            SELECT first_diff.diff_rn - 1
+                                            FROM first_diff
+                                            WHERE first_diff.provider COLLATE BINARY
+                                                  = latest.provider COLLATE BINARY
+                                        ),
+                                        (
+                                            SELECT MAX(max_row.rn)
+                                            FROM turns AS max_row
+                                            WHERE max_row.provider COLLATE BINARY
+                                                  = latest.provider COLLATE BINARY
+                                        )
+                                    )
+                            ) AS running_since_ms,
+                            (
+                                SELECT prev_row.model_id
+                                FROM turns AS prev_row
+                                JOIN first_diff
+                                  ON first_diff.provider COLLATE BINARY
+                                     = prev_row.provider COLLATE BINARY
+                                WHERE prev_row.provider COLLATE BINARY
+                                      = latest.provider COLLATE BINARY
+                                  AND prev_row.rn = first_diff.diff_rn
+                            ) AS previous_model_id
+                     FROM latest",
+                )
+                .map_err(|error| format!("Prepare model overview running query: {error}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview running turns: {error}"))?;
+            for row in rows {
+                let (row_provider, model_id, last_seen_ms, running_since_ms, previous_model_id) =
+                    row.map_err(|error| format!("Read model overview running row: {error}"))?;
+                running_by_provider.insert(
+                    row_provider,
+                    RunningNowRow {
+                        model_id,
+                        last_seen_ms,
+                        running_since_ms,
+                        previous_model_id,
+                    },
+                );
+            }
+        }
+        // Emit in represented-provider order, honoring the provider filter, so
+        // the response ordering matches the previous loop over the sorted list.
+        let mut running_now = Vec::new();
+        for provider_name in &represented_providers {
+            if provider.is_some_and(|filter| filter != provider_name) {
+                continue;
+            }
+            if let Some(run) = running_by_provider.get(provider_name) {
+                running_now.push(ModelRunningNow {
+                    provider: provider_name.clone(),
+                    model_id: run.model_id.clone(),
+                    last_seen_at: model_observation_millis_to_rfc3339(
+                        run.last_seen_ms,
+                        "running last_seen_ms",
+                    )?,
+                    running_since_at: model_observation_millis_to_rfc3339(
+                        run.running_since_ms,
+                        "running running_since_ms",
+                    )?,
+                    previous_model_id: run.previous_model_id.clone(),
+                });
+            }
+        }
+
+        tx.commit()
+            .map_err(|error| format!("Commit model overview read snapshot: {error}"))?;
+
+        // Fold per-(session, model) stats into model reach, primary counts,
+        // combinations, and the project matrix.
+        #[derive(Default)]
+        struct OverviewModelAccumulator {
+            sessions: i64,
+            turns: i64,
+            attributed_tokens: i64,
+            primary_in: i64,
+            projects: BTreeSet<String>,
+        }
+        let mut model_accumulators = BTreeMap::<(String, String), OverviewModelAccumulator>::new();
+        for identity_key in model_meta.keys() {
+            model_accumulators.insert(identity_key.clone(), OverviewModelAccumulator::default());
+        }
+
+        let mut single_model_sessions = 0_i64;
+        let mut dual_model_sessions = 0_i64;
+        let mut three_plus_model_sessions = 0_i64;
+        let mut pair_counts = BTreeMap::<((String, String), (String, String)), i64>::new();
+        let mut project_model_sessions = HashMap::<String, BTreeMap<(String, String), i64>>::new();
+
+        for (session_key, models_in_session) in &session_models {
+            let session_project = session_projects
+                .get(session_key)
+                .cloned()
+                .unwrap_or_else(|| model_overview_project(None));
+
+            let mut turn_models = Vec::new();
+            let mut primary: Option<(&(String, String), &SessionModelUsage)> = None;
+            for (identity_key, usage) in models_in_session {
+                let accumulator = model_accumulators.entry(identity_key.clone()).or_default();
+                checked_add_session_model_value(
+                    &mut accumulator.turns,
+                    usage.attributed_turns,
+                    "model turn total",
+                )?;
+                checked_add_session_model_value(
+                    &mut accumulator.attributed_tokens,
+                    usage.attributed_tokens,
+                    "model token total",
+                )?;
+                if usage.attributed_turns > 0 {
+                    checked_add_session_model_value(
+                        &mut accumulator.sessions,
+                        1,
+                        "model session count",
+                    )?;
+                    accumulator.projects.insert(session_project.clone());
+                    turn_models.push(identity_key.clone());
+                }
+                let is_better = match primary {
+                    None => true,
+                    Some((primary_key, primary_usage)) => {
+                        usage.attributed_tokens > primary_usage.attributed_tokens
+                            || (usage.attributed_tokens == primary_usage.attributed_tokens
+                                && (usage.attributed_turns > primary_usage.attributed_turns
+                                    || (usage.attributed_turns == primary_usage.attributed_turns
+                                        && identity_key < primary_key)))
+                    }
+                };
+                if is_better {
+                    primary = Some((identity_key, usage));
+                }
+            }
+            if let Some((primary_key, primary_usage)) = primary
+                && primary_usage.attributed_tokens > 0
+            {
+                let accumulator = model_accumulators.entry(primary_key.clone()).or_default();
+                checked_add_session_model_value(
+                    &mut accumulator.primary_in,
+                    1,
+                    "model primary count",
+                )?;
+            }
+
+            match turn_models.len() {
+                0 => {}
+                1 => single_model_sessions += 1,
+                2 => dual_model_sessions += 1,
+                _ => three_plus_model_sessions += 1,
+            }
+            for (left_index, left) in turn_models.iter().enumerate() {
+                for right in turn_models.iter().skip(left_index + 1) {
+                    let pair_key = if left < right {
+                        (left.clone(), right.clone())
+                    } else {
+                        (right.clone(), left.clone())
+                    };
+                    *pair_counts.entry(pair_key).or_insert(0) += 1;
+                }
+            }
+            let project_cells = project_model_sessions.entry(session_project).or_default();
+            for identity_key in turn_models {
+                *project_cells.entry(identity_key).or_insert(0) += 1;
+            }
+        }
+
+        // Model rows sorted by sessions desc, attributed tokens desc, then
+        // binary provider/model identity.
+        let mut ordered_models = model_accumulators.iter().collect::<Vec<_>>();
+        ordered_models.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .sessions
+                .cmp(&left.sessions)
+                .then_with(|| right.attributed_tokens.cmp(&left.attributed_tokens))
+                .then_with(|| left_key.cmp(right_key))
+        });
+        let mut models = Vec::with_capacity(ordered_models.len());
+        let mut series = Vec::with_capacity(ordered_models.len());
+        for (identity_key, accumulator) in &ordered_models {
+            let meta = model_meta.get(*identity_key).ok_or_else(|| {
+                "Model overview meta row is missing for an attributed model".to_string()
+            })?;
+            let identity = ModelIdentity {
+                provider: identity_key.0.clone(),
+                model_id: identity_key.1.clone(),
+            };
+            let project_count = i64::try_from(accumulator.projects.len()).map_err(|_| {
+                "Model overview project count exceeds SQLite INTEGER range".to_string()
+            })?;
+            models.push(ModelOverviewRow {
+                identity: identity.clone(),
+                sessions: accumulator.sessions,
+                session_percent: model_percentage(accumulator.sessions, totals_row.sessions),
+                projects: project_count,
+                turns: accumulator.turns,
+                primary_in: accumulator.primary_in,
+                days_active: meta.days_active,
+                attributed_tokens: accumulator.attributed_tokens,
+                share_percent: model_percentage(
+                    accumulator.attributed_tokens,
+                    totals_row.attributed_tokens,
+                ),
+                first_seen: model_observation_millis_to_rfc3339(
+                    meta.first_seen_ms,
+                    "model first_seen_ms",
+                )?,
+                last_seen: model_observation_millis_to_rfc3339(
+                    meta.last_seen_ms,
+                    "model last_seen_ms",
+                )?,
+            });
+            series.push(ModelOverviewActivitySeries {
+                identity,
+                sessions_per_bucket: activity_buckets
+                    .get(*identity_key)
+                    .cloned()
+                    .unwrap_or_else(|| vec![0; bucket_capacity]),
+            });
+        }
+
+        // Top projects by total in-range sessions, then binary project name.
+        let mut project_totals = HashMap::<String, i64>::new();
+        for project in session_projects.values() {
+            *project_totals.entry(project.clone()).or_insert(0) += 1;
+        }
+        let mut ordered_projects = project_totals.into_iter().collect::<Vec<_>>();
+        ordered_projects.sort_by(|(left_name, left_count), (right_name, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_name.as_bytes().cmp(right_name.as_bytes()))
+        });
+        ordered_projects.truncate(MODEL_OVERVIEW_PROJECT_LIMIT);
+        let mut project_matrix = Vec::with_capacity(ordered_projects.len());
+        for (project, total_sessions) in ordered_projects {
+            let mut cells = Vec::new();
+            if let Some(project_cells) = project_model_sessions.get(&project) {
+                for (identity_key, _) in &ordered_models {
+                    if let Some(sessions) = project_cells.get(*identity_key)
+                        && *sessions > 0
+                    {
+                        cells.push(ModelOverviewProjectCell {
+                            identity: ModelIdentity {
+                                provider: identity_key.0.clone(),
+                                model_id: identity_key.1.clone(),
+                            },
+                            sessions: *sessions,
+                        });
+                    }
+                }
+            }
+            project_matrix.push(ModelOverviewProjectRow {
+                project,
+                total_sessions,
+                cells,
+            });
+        }
+
+        // Top unordered pairs by shared sessions, then binary pair identity.
+        let mut ordered_pairs = pair_counts.into_iter().collect::<Vec<_>>();
+        ordered_pairs.sort_by(|(left_pair, left_count), (right_pair, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_pair.cmp(right_pair))
+        });
+        ordered_pairs.truncate(MODEL_OVERVIEW_PAIR_LIMIT);
+        let top_pairs = ordered_pairs
+            .into_iter()
+            .map(|((first, second), shared_sessions)| ModelOverviewPair {
+                a: ModelIdentity {
+                    provider: first.0,
+                    model_id: first.1,
+                },
+                b: ModelIdentity {
+                    provider: second.0,
+                    model_id: second.1,
+                },
+                shared_sessions,
+            })
+            .collect::<Vec<_>>();
+
+        let delegation_top = |best: Option<((String, String), i64)>,
+                              group_tokens: i64|
+         -> Option<ModelOverviewDelegationTop> {
+            let ((provider_name, model_id), top_tokens) = best?;
+            let share_percent = model_percentage(top_tokens, group_tokens)?;
+            Some(ModelOverviewDelegationTop {
+                identity: ModelIdentity {
+                    provider: provider_name,
+                    model_id,
+                },
+                share_percent,
+            })
+        };
+        let delegation = ModelOverviewDelegation {
+            parent_tokens,
+            subagent_tokens,
+            parent_top: delegation_top(parent_best, parent_tokens),
+            subagent_top: delegation_top(subagent_best, subagent_tokens),
+        };
+
+        let multi_model_sessions = dual_model_sessions
+            .checked_add(three_plus_model_sessions)
+            .ok_or_else(|| "Model overview multi-model count overflow".to_string())?;
+        let scope_final = backfill.status == ModelBackfillState::Complete
+            && backfill.inventory_complete
+            && backfill.failed_roots == 0
+            && backfill.failed_sources == 0
+            && backfill.remaining_sources == 0;
+
+        Ok(ModelUsageOverviewResponse {
+            generated_at,
+            range,
+            provider: provider.map(str::to_owned),
+            represented_providers,
+            scope: ModelAnalyticsScope {
+                global_session_count,
+                scoped_session_count: totals_row.sessions,
+                scoped_evidence_count: totals_row.evidence_count,
+                inventory_complete: backfill.inventory_complete,
+                scope_final,
+            },
+            backfill,
+            totals: ModelOverviewTotals {
+                sessions: totals_row.sessions,
+                projects: i64::try_from(session_projects.values().collect::<BTreeSet<_>>().len())
+                    .map_err(|_| {
+                    "Model overview distinct project count exceeds SQLite INTEGER range".to_string()
+                })?,
+                turns: totals_row.turns,
+                attributed_tokens: totals_row.attributed_tokens,
+                total_tokens: totals_row.total_tokens,
+                coverage_percent: model_percentage(
+                    totals_row.attributed_tokens,
+                    totals_row.total_tokens,
+                ),
+                distinct_models: totals_row.distinct_models,
+                multi_model_sessions,
+            },
+            running_now,
+            models,
+            activity: ModelOverviewActivity {
+                bucket_seconds,
+                bucket_starts,
+                series,
+            },
+            project_matrix,
+            combinations: ModelOverviewCombinations {
+                single: single_model_sessions,
+                dual: dual_model_sessions,
+                three_plus: three_plus_model_sessions,
+                top_pairs,
+            },
+            delegation,
+        })
+    }
+
     /// Aggregate retained model evidence into a fixed, zero-filled UTC axis.
     ///
     /// Bucket membership uses actual observation timestamps in the half-open
@@ -4901,7 +5937,7 @@ impl Storage {
                 "SELECT
                      (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
                      SUM(
-                         CASE WHEN observation.raw_model_id IS NOT NULL THEN
+                         CASE WHEN observation.derived_model_id IS NOT NULL THEN
                              COALESCE(observation.input_tokens, 0)
                              + COALESCE(observation.output_tokens, 0)
                              + COALESCE(observation.cache_creation_tokens, 0)
@@ -4909,7 +5945,7 @@ impl Storage {
                          ELSE 0 END
                      ) AS attributed_tokens,
                      SUM(
-                         CASE WHEN observation.raw_model_id IS NULL THEN
+                         CASE WHEN observation.derived_model_id IS NULL THEN
                              COALESCE(observation.input_tokens, 0)
                              + COALESCE(observation.output_tokens, 0)
                              + COALESCE(observation.cache_creation_tokens, 0)
@@ -4920,7 +5956,7 @@ impl Storage {
                          CASE
                              WHEN ?5 IS NOT NULL
                               AND observation.provider COLLATE BINARY = ?5
-                              AND observation.raw_model_id COLLATE BINARY = ?6
+                              AND observation.derived_model_id COLLATE BINARY = ?6
                              THEN COALESCE(observation.input_tokens, 0)
                                   + COALESCE(observation.output_tokens, 0)
                                   + COALESCE(observation.cache_creation_tokens, 0)
@@ -5057,7 +6093,12 @@ impl Storage {
             .map(|cursor| cursor.session_id.as_str());
 
         (|| -> Result<ModelSessionsResponse, ModelSessionsQueryError> {
-            let mut conn = self.conn.lock();
+            // Read from an independent read-only connection like the other
+            // model-analytics read paths so paging never serializes behind
+            // ingestion writes holding the primary connection mutex. WAL still
+            // gives this deferred transaction a consistent snapshot, and the
+            // cursor/revision guard below preserves stale-page rejection.
+            let mut conn = self.open_model_analytics_reader()?;
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
                 .map_err(|error| format!("Begin model sessions read snapshot: {error}"))?;
@@ -5086,7 +6127,7 @@ impl Storage {
                            AND observation.observed_at_ms >= ?1
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
-                           AND observation.raw_model_id COLLATE BINARY = ?4
+                           AND observation.derived_model_id COLLATE BINARY = ?4
                          GROUP BY observation.provider COLLATE BINARY,
                                   observation.analytics_session_id COLLATE BINARY
                      ) AS matching_sessions"
@@ -5135,7 +6176,7 @@ impl Storage {
                                          THEN 1 ELSE 0 END)
                                     AS selected_model_turns
                          FROM scoped
-                         WHERE raw_model_id COLLATE BINARY = ?4
+                         WHERE derived_model_id COLLATE BINARY = ?4
                          GROUP BY provider COLLATE BINARY,
                                   analytics_session_id COLLATE BINARY
                      ),
@@ -5177,7 +6218,7 @@ impl Storage {
                      model_stats AS (
                          SELECT provider,
                                 analytics_session_id AS session_id,
-                                raw_model_id,
+                                derived_model_id AS model_id,
                                 SUM(
                                     COALESCE(input_tokens, 0)
                                     + COALESCE(output_tokens, 0)
@@ -5187,10 +6228,10 @@ impl Storage {
                                 SUM(CASE WHEN observation_kind = 'turn'
                                          THEN 1 ELSE 0 END) AS observed_turns
                          FROM page_scope
-                         WHERE raw_model_id IS NOT NULL
+                         WHERE derived_model_id IS NOT NULL
                          GROUP BY provider COLLATE BINARY,
                                   analytics_session_id COLLATE BINARY,
-                                  raw_model_id COLLATE BINARY
+                                  derived_model_id COLLATE BINARY
                      ),
                      ranked_models AS (
                          SELECT model_stats.*,
@@ -5204,7 +6245,7 @@ impl Storage {
                                     ORDER BY attributed_tokens DESC,
                                              observed_turns DESC,
                                              provider COLLATE BINARY ASC,
-                                             raw_model_id COLLATE BINARY ASC
+                                             model_id COLLATE BINARY ASC
                                 ) AS primary_rank
                          FROM model_stats
                      ),
@@ -5305,7 +6346,7 @@ impl Storage {
                             page.selected_model_turns,
                             page.last_activity_ms,
                             primary_model.provider,
-                            primary_model.raw_model_id,
+                            primary_model.model_id,
                             primary_model.distinct_models,
                             COALESCE(switches.has_within_chain_switches, 0),
                             chains.chain_count
@@ -5478,6 +6519,7 @@ impl Storage {
                             observation.observed_at_ms,
                             observation.observation_kind,
                             observation.raw_model_id,
+                            observation.derived_model_id,
                             observation.input_tokens,
                             observation.output_tokens,
                             observation.cache_creation_tokens,
@@ -5514,11 +6556,12 @@ impl Storage {
                             observed_at_ms: row.get(4)?,
                             observation_kind: row.get(5)?,
                             raw_model_id: row.get(6)?,
-                            input_tokens: row.get(7)?,
-                            output_tokens: row.get(8)?,
-                            cache_creation_tokens: row.get(9)?,
-                            cache_read_tokens: row.get(10)?,
-                            effective_cwd: row.get(11)?,
+                            derived_model_id: row.get(7)?,
+                            input_tokens: row.get(8)?,
+                            output_tokens: row.get(9)?,
+                            cache_creation_tokens: row.get(10)?,
+                            cache_read_tokens: row.get(11)?,
+                            effective_cwd: row.get(12)?,
                         })
                     },
                 )
@@ -5545,7 +6588,7 @@ impl Storage {
 
                 let token_amount = session_model_observation_token_amount(&row)?;
                 if let Some(token_amount) = token_amount {
-                    let total = if row.raw_model_id.is_some() {
+                    let total = if row.derived_model_id.is_some() {
                         &mut attributed_tokens
                     } else {
                         &mut unattributed_tokens
@@ -5562,7 +6605,7 @@ impl Storage {
                         ));
                     }
                 };
-                if let Some(model_id) = row.raw_model_id.as_deref() {
+                if let Some(model_id) = row.derived_model_id.as_deref() {
                     let stats = model_stats
                         .entry((provider.to_owned(), model_id.to_owned()))
                         .or_default();
@@ -5586,7 +6629,7 @@ impl Storage {
                     .entry(row.chain_id.clone())
                     .or_insert_with(|| SessionModelChainAccumulator::new(&row));
                 chain.merge_metadata(&row)?;
-                chain.add_tokens(row.raw_model_id.as_deref(), token_amount)?;
+                chain.add_tokens(row.derived_model_id.as_deref(), token_amount)?;
                 if is_turn {
                     chain.add_turn(
                         row.raw_model_id.as_deref(),
@@ -6084,14 +7127,15 @@ impl Storage {
                         provider, source_key, source_record_key, source_ordinal,
                         observation_kind, source_session_id,
                         analytics_session_id, chain_id, parent_chain_id,
-                        agent_id, turn_id, raw_model_id, cwd, hostname,
+                        agent_id, turn_id, raw_model_id, derived_model_id,
+                        cwd, hostname,
                         is_sidechain, observed_at_ms, input_tokens,
                         output_tokens, cache_creation_tokens, cache_read_tokens,
                         model_evidence, token_evidence
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                         ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                        ?22
+                        ?22, ?23
                      )",
                 )
                 .map_err(|error| format!("Prepare model source observation insert: {error}"))?;
@@ -6111,6 +7155,7 @@ impl Storage {
                     metadata.agent_id,
                     metadata.turn_id,
                     observation.raw_model_id(),
+                    observation.derived_model_id(),
                     prepared.cwd,
                     metadata.hostname,
                     i64::from(metadata.is_sidechain),
@@ -17443,6 +18488,68 @@ mod tests {
             .expect("replace model source");
     }
 
+    /// Seed one active Codex model source through the real parse + replace
+    /// write path. Codex token deltas never carry raw model identity, but
+    /// carry-forward attribution derives their model from preceding
+    /// `turn_context` evidence in the same chain.
+    fn seed_codex_model_source(
+        storage: &Storage,
+        dir: &TempDir,
+        source_key: &str,
+        session_id: &str,
+        jsonl: &str,
+    ) {
+        let parse_hint = crate::sessions::RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let context = crate::model_usage::CodexAdapterContext {
+            source_key,
+            layout_hint: &parse_hint,
+            hostname: Some("host-a"),
+        };
+        let observations =
+            crate::model_usage::parse_codex_model_usage_jsonl(jsonl, context).observations;
+        let observation_count = i64::try_from(observations.len()).expect("observation count");
+
+        let path = dir.path().join(format!("{source_key}.jsonl"));
+        std::fs::write(&path, jsonl).expect("write transcript");
+        let metadata = std::fs::metadata(&path).expect("stat transcript");
+        let fast = model_source_fast_fingerprint(&path, &metadata).expect("fast fingerprint");
+        let fingerprint = ModelSourceFingerprint::from_content(fast, jsonl.as_bytes());
+
+        let now_ms = Utc::now().timestamp_millis();
+        let source = NormalizedSource {
+            provider: IntegrationProvider::Codex,
+            source_root_key: "root-codex".to_string(),
+            source_key: source_key.to_string(),
+            path,
+            layout_hint: crate::sessions::RetainedJsonlSourceLayoutHint::CodexTranscript,
+            source_session_id: Some(session_id.to_string()),
+            analytics_session_id: Some(session_id.to_string()),
+            chain_id: Some(session_id.to_string()),
+            parent_chain_id: None,
+            is_sidechain: false,
+            agent_id: None,
+            cwd: None,
+            hostname: Some("host-a".to_string()),
+            first_activity_at_ms: Some(now_ms - 3_600_000),
+            last_activity_at_ms: Some(now_ms),
+            mtime_ns: None,
+            size_bytes: None,
+            content_sha256: None,
+            last_error: None,
+            suppressed_sha256: None,
+            suppressed_at_ms: None,
+            seen_generation: 1,
+            processing_status: SourceProcessingStatus::Ok,
+            observation_count,
+            last_attempt_at_ms: Some(now_ms),
+            last_success_at_ms: Some(now_ms),
+        };
+
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("replace model source");
+    }
+
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Sessions Cursor Codec]]
     #[test]
     fn model_sessions_cursor_round_trips_and_rejects_tampering() {
@@ -17554,33 +18661,71 @@ mod tests {
         let analytics = storage
             .get_model_analytics(ModelRange::OneHour, None)
             .expect("analytics");
+        // Carry-forward attribution derives the model-less obs3 turn from the
+        // preceding claude-opus-4 evidence in the same chain, so every claude
+        // token is attributed.
         assert_eq!(analytics.summary.total_tokens, 350);
-        assert_eq!(analytics.summary.attributed_tokens, 320);
-        assert_eq!(analytics.summary.unattributed_tokens, 30);
+        assert_eq!(analytics.summary.attributed_tokens, 350);
+        assert_eq!(analytics.summary.unattributed_tokens, 0);
         assert_eq!(analytics.summary.distinct_models, 1);
         let coverage = analytics
             .summary
             .attributed_coverage_percent
             .expect("coverage present");
-        assert!(
-            (coverage - (100.0 * 320.0 / 350.0)).abs() < 1e-9,
-            "coverage {coverage}"
-        );
+        assert!((coverage - 100.0).abs() < 1e-9, "coverage {coverage}");
         assert_eq!(
             analytics.models.len(),
             1,
             "suppressed model row must be excluded"
         );
         assert_eq!(analytics.models[0].identity.model_id, "claude-opus-4");
-        assert_eq!(analytics.models[0].attributed_tokens, 320);
+        assert_eq!(analytics.models[0].attributed_tokens, 350);
+
+        // Cross-provider evidence seeded after the analytics assertions: one
+        // pre-evidence Codex token delta (stays unattributed), turn_context
+        // model evidence, then two token deltas that inherit the chain model
+        // through carry-forward — one sharing obs3's bucket and one obs2's.
+        let obs_codex_pre = base - TimeDelta::minutes(52);
+        let codex_jsonl = [
+            format!(
+                r#"{{"type":"session_meta","timestamp":"{}","payload":{{"id":"sess-codex"}}}}"#,
+                (base - TimeDelta::minutes(55)).to_rfc3339()
+            ),
+            format!(
+                r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":10,"cached_input_tokens":0,"output_tokens":0,"cache_creation_tokens":0}}}}}}}}"#,
+                obs_codex_pre.to_rfc3339()
+            ),
+            format!(
+                r#"{{"type":"turn_context","timestamp":"{}","payload":{{"model":"gpt-5-codex"}}}}"#,
+                (base - TimeDelta::minutes(51)).to_rfc3339()
+            ),
+            format!(
+                r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":50,"cached_input_tokens":0,"output_tokens":10,"cache_creation_tokens":0}}}}}}}}"#,
+                obs3.to_rfc3339()
+            ),
+            format!(
+                r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":110,"cached_input_tokens":0,"output_tokens":30,"cache_creation_tokens":0}}}}}}}}"#,
+                obs2.to_rfc3339()
+            ),
+        ]
+        .join("\n");
+        seed_codex_model_source(&storage, &dir, "sk-codex", "sess-codex", &codex_jsonl);
+
+        let cross_provider = storage
+            .get_model_analytics(ModelRange::OneHour, None)
+            .expect("cross-provider analytics");
+        assert_eq!(cross_provider.summary.total_tokens, 490);
+        assert_eq!(cross_provider.summary.attributed_tokens, 480);
+        assert_eq!(cross_provider.summary.unattributed_tokens, 10);
+        assert_eq!(cross_provider.summary.distinct_models, 2);
 
         let history = storage
             .get_model_history(ModelRange::OneHour, None, None)
             .expect("history");
         let total_attributed: i64 = history.points.iter().map(|p| p.attributed_tokens).sum();
         let total_unattributed: i64 = history.points.iter().map(|p| p.unattributed_tokens).sum();
-        assert_eq!(total_attributed, 320);
-        assert_eq!(total_unattributed, 30);
+        assert_eq!(total_attributed, 480);
+        assert_eq!(total_unattributed, 10);
 
         let bucket_of = |points: &[ModelHistoryPoint], at_ms: i64| -> usize {
             points
@@ -17599,13 +18744,243 @@ mod tests {
         let bucket1 = bucket_of(&history.points, obs1.timestamp_millis());
         let bucket2 = bucket_of(&history.points, obs2.timestamp_millis());
         let bucket3 = bucket_of(&history.points, obs3.timestamp_millis());
+        let bucket_pre = bucket_of(&history.points, obs_codex_pre.timestamp_millis());
         assert_ne!(
             bucket1, bucket2,
             "distinct offsets land in distinct buckets"
         );
         assert_eq!(history.points[bucket1].attributed_tokens, 120);
-        assert_eq!(history.points[bucket2].attributed_tokens, 200);
-        assert_eq!(history.points[bucket3].unattributed_tokens, 30);
+        assert_eq!(history.points[bucket2].attributed_tokens, 280);
+        // The claude model-less turn and the codex deltas in obs3's bucket are
+        // all derived-attributed, so nothing there is unattributed.
+        assert_eq!(history.points[bucket3].attributed_tokens, 80);
+        assert_eq!(history.points[bucket3].unattributed_tokens, 0);
+        // Only the pre-evidence codex delta stays unattributed.
+        assert_eq!(history.points[bucket_pre].unattributed_tokens, 10);
+
+        clear_env();
+    }
+
+    fn claude_overview_turn(
+        timestamp: &DateTime<Utc>,
+        session_id: &str,
+        model: &str,
+        input_tokens: i64,
+        cwd: &str,
+    ) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","sessionId":"{session_id}","cwd":"{cwd}","message":{{"model":"{model}","usage":{{"input_tokens":{input_tokens}}}}}}}"#,
+            timestamp.to_rfc3339()
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn get_model_usage_overview_aggregates_reach_primary_and_combinations() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = Utc::now();
+        let t = |minutes: i64| base - TimeDelta::minutes(minutes);
+
+        // sess-1 (alpha): model-a twice (100 tokens) ties model-b (100 tokens)
+        // on tokens, so the turn-count tiebreak must make model-a primary.
+        let s1 = [
+            claude_overview_turn(&t(50), "sess-1", "model-a", 50, "/work/alpha"),
+            claude_overview_turn(&t(45), "sess-1", "model-a", 50, "/work/alpha"),
+            claude_overview_turn(&t(40), "sess-1", "model-b", 100, "/work/alpha"),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "sk-s1", "sess-1", &s1);
+        // sess-3 (beta): three models, model-c holds the most tokens.
+        let s3 = [
+            claude_overview_turn(&t(30), "sess-3", "model-a", 10, "/work/beta"),
+            claude_overview_turn(&t(25), "sess-3", "model-b", 20, "/work/beta"),
+            claude_overview_turn(&t(20), "sess-3", "model-c", 30, "/work/beta"),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "sk-s3", "sess-3", &s3);
+        // sess-2 (alpha): single model, latest provider activity.
+        let s2 = claude_overview_turn(&t(10), "sess-2", "model-a", 40, "/work/alpha");
+        seed_claude_model_source(&storage, &dir, "sk-s2", "sess-2", &s2);
+
+        let overview = storage
+            .get_model_usage_overview(ModelRange::OneHour, None)
+            .expect("overview");
+        let serialized = serde_json::to_value(&overview).expect("serialize overview");
+
+        assert_eq!(overview.represented_providers, ["claude"]);
+        assert_eq!(overview.scope.global_session_count, 3);
+        assert_eq!(overview.scope.scoped_session_count, 3);
+        assert_eq!(overview.scope.scoped_evidence_count, 7);
+
+        assert_eq!(
+            serialized["totals"],
+            serde_json::json!({
+                "sessions": 3,
+                "projects": 2,
+                "turns": 7,
+                "attributedTokens": 300,
+                "totalTokens": 300,
+                "coveragePercent": 100.0,
+                "distinctModels": 3,
+                "multiModelSessions": 2
+            })
+        );
+
+        // Model rows sort by sessions desc, tokens desc, binary identity.
+        let model_ids = overview
+            .models
+            .iter()
+            .map(|row| row.identity.model_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(model_ids, ["model-a", "model-b", "model-c"]);
+        let model_a = &overview.models[0];
+        assert_eq!(model_a.sessions, 3);
+        assert_eq!(model_a.projects, 2);
+        assert_eq!(model_a.turns, 4);
+        assert_eq!(model_a.attributed_tokens, 150);
+        // primaryIn uniqueness: sess-1 counts once for model-a via the
+        // turn-count tiebreak, and sess-2 is model-a outright.
+        assert_eq!(model_a.primary_in, 2);
+        let session_percent = model_a.session_percent.expect("session percent");
+        assert!((session_percent - 100.0).abs() < 1e-9);
+        let share_percent = model_a.share_percent.expect("share percent");
+        assert!((share_percent - 50.0).abs() < 1e-9);
+        assert!((1..=2).contains(&model_a.days_active));
+        let model_b = &overview.models[1];
+        assert_eq!(model_b.sessions, 2);
+        assert_eq!(model_b.turns, 2);
+        assert_eq!(model_b.attributed_tokens, 120);
+        assert_eq!(model_b.primary_in, 0, "model-b loses the sess-1 tiebreak");
+        let model_c = &overview.models[2];
+        assert_eq!(model_c.sessions, 1);
+        assert_eq!(model_c.projects, 1);
+        assert_eq!(model_c.attributed_tokens, 30);
+        assert_eq!(model_c.primary_in, 1);
+        let primary_total: i64 = overview.models.iter().map(|row| row.primary_in).sum();
+        assert_eq!(
+            primary_total, 3,
+            "each session counts for exactly one model"
+        );
+
+        // Activity: fixed 12x5-minute axis, series in model order, one
+        // distinct session per touched bucket.
+        assert_eq!(overview.activity.bucket_seconds, 300);
+        assert_eq!(overview.activity.bucket_starts.len(), 12);
+        assert_eq!(overview.activity.series.len(), 3);
+        for series in &overview.activity.series {
+            assert_eq!(series.sessions_per_bucket.len(), 12);
+        }
+        let bucket_sums = overview
+            .activity
+            .series
+            .iter()
+            .map(|series| series.sessions_per_bucket.iter().sum::<i64>())
+            .collect::<Vec<_>>();
+        assert_eq!(bucket_sums, [4, 2, 1]);
+
+        // Project matrix: alpha (2 sessions) before beta (1), cells only for
+        // models that reached the project, ordered like the model rows.
+        assert_eq!(overview.project_matrix.len(), 2);
+        let alpha = &overview.project_matrix[0];
+        assert_eq!(alpha.project, "alpha");
+        assert_eq!(alpha.total_sessions, 2);
+        let alpha_cells = alpha
+            .cells
+            .iter()
+            .map(|cell| (cell.identity.model_id.as_str(), cell.sessions))
+            .collect::<Vec<_>>();
+        assert_eq!(alpha_cells, [("model-a", 2), ("model-b", 1)]);
+        let beta = &overview.project_matrix[1];
+        assert_eq!(beta.project, "beta");
+        assert_eq!(beta.total_sessions, 1);
+        assert_eq!(beta.cells.len(), 3);
+
+        assert_eq!(
+            serialized["combinations"],
+            serde_json::json!({
+                "single": 1,
+                "dual": 1,
+                "threePlus": 1,
+                "topPairs": [
+                    {
+                        "a": {"provider": "claude", "modelId": "model-a"},
+                        "b": {"provider": "claude", "modelId": "model-b"},
+                        "sharedSessions": 2
+                    },
+                    {
+                        "a": {"provider": "claude", "modelId": "model-a"},
+                        "b": {"provider": "claude", "modelId": "model-c"},
+                        "sharedSessions": 1
+                    },
+                    {
+                        "a": {"provider": "claude", "modelId": "model-b"},
+                        "b": {"provider": "claude", "modelId": "model-c"},
+                        "sharedSessions": 1
+                    }
+                ]
+            })
+        );
+
+        assert_eq!(
+            serialized["delegation"],
+            serde_json::json!({
+                "parentTokens": 300,
+                "subagentTokens": 0,
+                "parentTop": {
+                    "identity": {"provider": "claude", "modelId": "model-a"},
+                    "sharePercent": 50.0
+                },
+                "subagentTop": null
+            })
+        );
+
+        assert_eq!(overview.running_now.len(), 1);
+        let running = &overview.running_now[0];
+        assert_eq!(running.provider, "claude");
+        assert_eq!(running.model_id, "model-a");
+        assert_eq!(running.previous_model_id.as_deref(), Some("model-c"));
+
+        clear_env();
+    }
+
+    #[test]
+    #[serial]
+    fn get_model_usage_overview_running_now_tracks_contiguous_runs() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = Utc::now();
+        let t = |minutes: i64| base - TimeDelta::minutes(minutes);
+
+        // model-b's latest contiguous run spans the last two turns, so the
+        // run start is the middle turn and model-a is the previous model.
+        let jsonl = [
+            claude_overview_turn(&t(30), "sess-run", "model-a", 10, "/work/run"),
+            claude_overview_turn(&t(20), "sess-run", "model-b", 10, "/work/run"),
+            claude_overview_turn(&t(10), "sess-run", "model-b", 10, "/work/run"),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "sk-run", "sess-run", &jsonl);
+
+        let overview = storage
+            .get_model_usage_overview(ModelRange::OneHour, None)
+            .expect("overview");
+
+        assert_eq!(overview.running_now.len(), 1);
+        let running = &overview.running_now[0];
+        assert_eq!(running.provider, "claude");
+        assert_eq!(running.model_id, "model-b");
+        assert_eq!(running.previous_model_id.as_deref(), Some("model-a"));
+        let running_since = DateTime::parse_from_rfc3339(&running.running_since_at)
+            .expect("running since")
+            .timestamp_millis();
+        let last_seen = DateTime::parse_from_rfc3339(&running.last_seen_at)
+            .expect("last seen")
+            .timestamp_millis();
+        assert_eq!(running_since, t(20).timestamp_millis());
+        assert_eq!(last_seen, t(10).timestamp_millis());
 
         clear_env();
     }

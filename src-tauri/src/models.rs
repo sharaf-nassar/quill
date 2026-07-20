@@ -1463,6 +1463,140 @@ pub struct ModelSessionsResponse {
     pub sessions: Vec<ModelSessionRow>,
 }
 
+// --- Model usage overview (redesigned Models tab) ---
+
+/// Range-scoped reach/frequency totals over every in-range observation.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewTotals {
+    pub sessions: i64,
+    pub projects: i64,
+    pub turns: i64,
+    pub attributed_tokens: i64,
+    pub total_tokens: i64,
+    pub coverage_percent: Option<f64>,
+    pub distinct_models: i64,
+    pub multi_model_sessions: i64,
+}
+
+/// Latest contiguous attributed-model run for one represented provider.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRunningNow {
+    pub provider: String,
+    pub model_id: String,
+    pub last_seen_at: String,
+    pub running_since_at: String,
+    pub previous_model_id: Option<String>,
+}
+
+/// Per-model reach row keyed on carry-forward derived attribution.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewRow {
+    pub identity: ModelIdentity,
+    pub sessions: i64,
+    pub session_percent: Option<f64>,
+    pub projects: i64,
+    pub turns: i64,
+    pub primary_in: i64,
+    pub days_active: i64,
+    pub attributed_tokens: i64,
+    pub share_percent: Option<f64>,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// One model's distinct-session counts across the fixed activity buckets.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewActivitySeries {
+    pub identity: ModelIdentity,
+    pub sessions_per_bucket: Vec<i64>,
+}
+
+/// Fixed zero-filled UTC bucket axis plus per-model session series.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewActivity {
+    pub bucket_seconds: i64,
+    pub bucket_starts: Vec<String>,
+    pub series: Vec<ModelOverviewActivitySeries>,
+}
+
+/// Sessions a model reached inside one project.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewProjectCell {
+    pub identity: ModelIdentity,
+    pub sessions: i64,
+}
+
+/// One top project with its per-model session cells.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewProjectRow {
+    pub project: String,
+    pub total_sessions: i64,
+    pub cells: Vec<ModelOverviewProjectCell>,
+}
+
+/// Unordered model pair co-occurring in shared sessions.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewPair {
+    pub a: ModelIdentity,
+    pub b: ModelIdentity,
+    pub shared_sessions: i64,
+}
+
+/// Per-session distinct-model composition buckets plus top pairs.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewCombinations {
+    pub single: i64,
+    pub dual: i64,
+    pub three_plus: i64,
+    pub top_pairs: Vec<ModelOverviewPair>,
+}
+
+/// Dominant model within one delegation group (parent or subagent).
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewDelegationTop {
+    pub identity: ModelIdentity,
+    pub share_percent: f64,
+}
+
+/// Attributed tokens split by owning-source sidechain flag.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelOverviewDelegation {
+    pub parent_tokens: i64,
+    pub subagent_tokens: i64,
+    pub parent_top: Option<ModelOverviewDelegationTop>,
+    pub subagent_top: Option<ModelOverviewDelegationTop>,
+}
+
+/// Complete usage-frequency overview for the redesigned Models tab.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageOverviewResponse {
+    pub generated_at: String,
+    pub range: ModelRange,
+    pub provider: Option<String>,
+    pub represented_providers: Vec<String>,
+    pub scope: ModelAnalyticsScope,
+    pub backfill: ModelBackfillStatus,
+    pub totals: ModelOverviewTotals,
+    pub running_now: Vec<ModelRunningNow>,
+    pub models: Vec<ModelOverviewRow>,
+    pub activity: ModelOverviewActivity,
+    pub project_matrix: Vec<ModelOverviewProjectRow>,
+    pub combinations: ModelOverviewCombinations,
+    pub delegation: ModelOverviewDelegation,
+}
+
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionModelChainKind {

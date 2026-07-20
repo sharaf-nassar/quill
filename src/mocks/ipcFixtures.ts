@@ -19,14 +19,12 @@ import type {
   LlmRuntimeStats,
   ModelAnalyticsError,
   ModelAnalyticsErrorCode,
-  ModelAnalyticsResponse,
   ModelBackfillStatus,
-  ModelHistoryResponse,
   ModelIdentity,
   ModelRange,
   ModelSessionRow,
   ModelSessionsResponse,
-  ModelUsageRow,
+  ModelUsageOverviewResponse,
   ProjectBreakdown,
   ProjectTokensRaw,
   ProviderStatus,
@@ -383,32 +381,11 @@ interface MockModelObservation {
   detailMissing?: boolean;
 }
 
-interface MockModelUsageAggregate {
-  identity: ModelIdentity;
-  attributedTokens: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-  observedTurns: number;
-  sessionIds: Set<string>;
-  cacheShareComplete: boolean;
-  firstSeen: number;
-  lastSeen: number;
-}
-
 const MODEL_RANGE_MS: Record<ModelRange, number> = {
   "1h": H,
   "24h": D,
   "7d": 7 * D,
   "30d": 30 * D,
-};
-
-const MODEL_BUCKET_SECONDS: Record<ModelRange, number> = {
-  "1h": 5 * 60,
-  "24h": 60 * 60,
-  "7d": 6 * 60 * 60,
-  "30d": 24 * 60 * 60,
 };
 
 const modelProviders = new Set(providerStatuses.map(({ provider }) => provider));
@@ -773,8 +750,7 @@ type ModelFixtureScenario =
   | "no-model-evidence";
 
 type ModelFixtureFailure =
-  | "aggregate"
-  | "history"
+  | "overview"
   | "sessions"
   | "detail"
   | "retry"
@@ -793,8 +769,7 @@ const MODEL_FIXTURE_SCENARIOS = new Set<ModelFixtureScenario>([
 ]);
 
 const MODEL_FIXTURE_FAILURES = new Set<ModelFixtureFailure>([
-  "aggregate",
-  "history",
+  "overview",
   "sessions",
   "detail",
   "retry",
@@ -1180,17 +1155,6 @@ function modelObservationTokens(observation: MockModelObservation): number {
   );
 }
 
-function isTokenBearingModelObservation(
-  observation: MockModelObservation,
-): boolean {
-  return (
-    observation.inputTokens !== null ||
-    observation.outputTokens !== null ||
-    observation.cacheCreationTokens !== null ||
-    observation.cacheReadTokens !== null
-  );
-}
-
 function getModelFixtureObservations(
   scenario: ModelFixtureScenario,
   range: ModelRange,
@@ -1267,13 +1231,37 @@ function getScopedModelObservations(
   );
 }
 
-function createModelAnalyticsFixture(
+const ACTIVITY_BUCKET_SECONDS: Record<ModelRange, number> = {
+  "1h": 10 * 60,
+  "24h": 60 * 60,
+  "7d": 24 * 60 * 60,
+  "30d": 24 * 60 * 60,
+};
+
+const OVERVIEW_MATRIX_PROJECT_LIMIT = 8;
+const OVERVIEW_TOP_PAIR_LIMIT = 5;
+
+function observationProject(observation: MockModelObservation): string {
+  const cwd = observation.cwd;
+  if (typeof cwd === "string" && cwd.length > 0) {
+    const segments = cwd.split("/").filter((segment) => segment.length > 0);
+    const tail = segments[segments.length - 1];
+    if (tail !== undefined) return tail;
+  }
+  return observation.sessionId.split("-")[0] ?? observation.sessionId;
+}
+
+function utcDayKey(timestampMs: number): string {
+  return new Date(timestampMs).toISOString().slice(0, 10);
+}
+
+function createModelUsageOverviewFixture(
   args: Record<string, unknown> | undefined,
-): ModelAnalyticsResponse {
+): ModelUsageOverviewResponse {
   const range = readModelRange(args);
   const provider = readModelProvider(args?.provider);
   const scenario = readModelFixtureScenario();
-  rejectRequestedModelFixture("aggregate");
+  rejectRequestedModelFixture("overview");
   const backfill = getModelBackfillFixture(scenario);
   const observations = getModelFixtureObservations(scenario, range, provider);
   const scoped = getScopedModelObservations(observations, range, provider);
@@ -1282,100 +1270,331 @@ function createModelAnalyticsFixture(
     range,
     null,
   );
-  const modelAggregates = new Map<string, MockModelUsageAggregate>();
-  const sessionModels = new Map<string, Set<string>>();
 
+  interface OverviewModelAggregate {
+    identity: ModelIdentity;
+    sessionIds: Set<string>;
+    projects: Set<string>;
+    turns: number;
+    attributedTokens: number;
+    days: Set<string>;
+    firstSeen: number;
+    lastSeen: number;
+  }
+
+  interface OverviewSessionAggregate {
+    sessionKey: string;
+    project: string;
+    modelKeys: Set<string>;
+    tokensByModel: Map<string, number>;
+    turnsByModel: Map<string, number>;
+  }
+
+  const modelAggregates = new Map<string, OverviewModelAggregate>();
+  const sessionAggregates = new Map<string, OverviewSessionAggregate>();
+  const identitiesByKey = new Map<string, ModelIdentity>();
+  const projectSessions = new Map<string, Set<string>>();
   let attributedTokens = 0;
   let totalTokens = 0;
+  let totalTurns = 0;
   let scopedEvidenceCount = 0;
+  let parentTokens = 0;
+  let subagentTokens = 0;
+  const parentAttributedByModel = new Map<string, number>();
+  const subagentAttributedByModel = new Map<string, number>();
+
   for (const observation of scoped) {
     const tokens = modelObservationTokens(observation);
     totalTokens += tokens;
-    if (observation.modelId === null) continue;
+    totalTurns += observation.kind === "turn" ? 1 : 0;
+    const isSubagent =
+      observation.parentChainId !== undefined &&
+      observation.parentChainId !== null;
+    if (isSubagent) subagentTokens += tokens;
+    else parentTokens += tokens;
 
+    const sessionKey = modelSessionFixtureKey(observation);
+    const project = observationProject(observation);
+    const projectSet = projectSessions.get(project) ?? new Set<string>();
+    projectSet.add(sessionKey);
+    projectSessions.set(project, projectSet);
+
+    if (observation.modelId === null) continue;
     scopedEvidenceCount += 1;
     attributedTokens += tokens;
+
     const identity = {
       provider: observation.provider,
       modelId: observation.modelId,
     } satisfies ModelIdentity;
     const identityKey = modelIdentityFixtureKey(identity);
-    const sessionKey = modelSessionFixtureKey(observation);
-    const modelsForSession = sessionModels.get(sessionKey) ?? new Set<string>();
-    modelsForSession.add(identityKey);
-    sessionModels.set(sessionKey, modelsForSession);
+    identitiesByKey.set(identityKey, identity);
+    const sideMap = isSubagent
+      ? subagentAttributedByModel
+      : parentAttributedByModel;
+    sideMap.set(identityKey, (sideMap.get(identityKey) ?? 0) + tokens);
 
     const aggregate = modelAggregates.get(identityKey) ?? {
       identity,
-      attributedTokens: 0,
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheCreationTokens: 0,
-      cacheReadTokens: 0,
-      observedTurns: 0,
       sessionIds: new Set<string>(),
-      cacheShareComplete: true,
+      projects: new Set<string>(),
+      turns: 0,
+      attributedTokens: 0,
+      days: new Set<string>(),
       firstSeen: observation.observedAt,
       lastSeen: observation.observedAt,
     };
+    aggregate.sessionIds.add(sessionKey);
+    aggregate.projects.add(project);
+    aggregate.turns += observation.kind === "turn" ? 1 : 0;
     aggregate.attributedTokens += tokens;
-    aggregate.inputTokens += observation.inputTokens ?? 0;
-    aggregate.outputTokens += observation.outputTokens ?? 0;
-    aggregate.cacheCreationTokens += observation.cacheCreationTokens ?? 0;
-    aggregate.cacheReadTokens += observation.cacheReadTokens ?? 0;
-    aggregate.observedTurns += observation.kind === "turn" ? 1 : 0;
-    aggregate.sessionIds.add(observation.sessionId);
+    aggregate.days.add(utcDayKey(observation.observedAt));
     aggregate.firstSeen = Math.min(aggregate.firstSeen, observation.observedAt);
     aggregate.lastSeen = Math.max(aggregate.lastSeen, observation.observedAt);
-    if (
-      isTokenBearingModelObservation(observation) &&
-      (observation.inputTokens === null ||
-        observation.cacheCreationTokens === null ||
-        observation.cacheReadTokens === null)
-    ) {
-      aggregate.cacheShareComplete = false;
-    }
     modelAggregates.set(identityKey, aggregate);
+
+    const session = sessionAggregates.get(sessionKey) ?? {
+      sessionKey,
+      project,
+      modelKeys: new Set<string>(),
+      tokensByModel: new Map<string, number>(),
+      turnsByModel: new Map<string, number>(),
+    };
+    session.modelKeys.add(identityKey);
+    session.tokensByModel.set(
+      identityKey,
+      (session.tokensByModel.get(identityKey) ?? 0) + tokens,
+    );
+    session.turnsByModel.set(
+      identityKey,
+      (session.turnsByModel.get(identityKey) ?? 0) +
+        (observation.kind === "turn" ? 1 : 0),
+    );
+    sessionAggregates.set(sessionKey, session);
   }
 
-  const models: ModelUsageRow[] = Array.from(modelAggregates.values())
-    .map((aggregate) => {
-      const cacheReadDenominator =
-        aggregate.inputTokens +
-        aggregate.cacheCreationTokens +
-        aggregate.cacheReadTokens;
-      return {
-        identity: aggregate.identity,
-        attributedTokens: aggregate.attributedTokens,
-        attributedSharePercent:
-          attributedTokens === 0
-            ? null
-            : (100 * aggregate.attributedTokens) / attributedTokens,
-        inputTokens: aggregate.inputTokens,
-        outputTokens: aggregate.outputTokens,
-        cacheCreationTokens: aggregate.cacheCreationTokens,
-        cacheReadTokens: aggregate.cacheReadTokens,
-        observedTurns: aggregate.observedTurns,
-        sessionCount: aggregate.sessionIds.size,
-        cacheReadSharePercent:
-          aggregate.cacheShareComplete && cacheReadDenominator > 0
-            ? (100 * aggregate.cacheReadTokens) / cacheReadDenominator
-            : null,
-        firstSeen: new Date(aggregate.firstSeen).toISOString(),
-        lastSeen: new Date(aggregate.lastSeen).toISOString(),
-      };
-    })
+  // Primary-in counts: the model with the most attributed work per session.
+  const primaryIn = new Map<string, number>();
+  for (const session of sessionAggregates.values()) {
+    let bestKey: string | null = null;
+    let bestTokens = -1;
+    let bestTurns = -1;
+    for (const key of session.modelKeys) {
+      const tokens = session.tokensByModel.get(key) ?? 0;
+      const turns = session.turnsByModel.get(key) ?? 0;
+      if (
+        tokens > bestTokens ||
+        (tokens === bestTokens && turns > bestTurns) ||
+        (tokens === bestTokens &&
+          turns === bestTurns &&
+          (bestKey === null || compareUnicodeScalars(key, bestKey) < 0))
+      ) {
+        bestKey = key;
+        bestTokens = tokens;
+        bestTurns = turns;
+      }
+    }
+    if (bestKey !== null) {
+      primaryIn.set(bestKey, (primaryIn.get(bestKey) ?? 0) + 1);
+    }
+  }
+
+  const scopedSessions = new Set(scoped.map(modelSessionFixtureKey));
+  const totalSessions = scopedSessions.size;
+  const models = Array.from(modelAggregates.entries())
     .sort(
-      (left, right) =>
+      ([, left], [, right]) =>
+        right.sessionIds.size - left.sessionIds.size ||
         right.attributedTokens - left.attributedTokens ||
         compareModelIdentities(left.identity, right.identity),
+    )
+    .map(([identityKey, aggregate]) => ({
+      identity: aggregate.identity,
+      sessions: aggregate.sessionIds.size,
+      sessionPercent:
+        totalSessions === 0
+          ? null
+          : (100 * aggregate.sessionIds.size) / totalSessions,
+      projects: aggregate.projects.size,
+      turns: aggregate.turns,
+      primaryIn: primaryIn.get(identityKey) ?? 0,
+      daysActive: aggregate.days.size,
+      attributedTokens: aggregate.attributedTokens,
+      sharePercent:
+        attributedTokens === 0
+          ? null
+          : (100 * aggregate.attributedTokens) / attributedTokens,
+      firstSeen: new Date(aggregate.firstSeen).toISOString(),
+      lastSeen: new Date(aggregate.lastSeen).toISOString(),
+    }));
+
+  // Running now: latest attributed run per provider, with what it replaced.
+  const runningNow: ModelUsageOverviewResponse["runningNow"] = [];
+  const byProvider = new Map<string, MockModelObservation[]>();
+  for (const observation of scoped) {
+    if (observation.modelId === null) continue;
+    const entries = byProvider.get(observation.provider) ?? [];
+    entries.push(observation);
+    byProvider.set(observation.provider, entries);
+  }
+  for (const [observationProvider, entries] of byProvider) {
+    entries.sort((left, right) => left.observedAt - right.observedAt);
+    const last = entries[entries.length - 1];
+    if (last === undefined || last.modelId === null) continue;
+    let runStart = entries.length - 1;
+    while (
+      runStart > 0 &&
+      entries[runStart - 1].modelId === last.modelId
+    ) {
+      runStart -= 1;
+    }
+    runningNow.push({
+      provider: observationProvider,
+      modelId: last.modelId,
+      lastSeenAt: new Date(last.observedAt).toISOString(),
+      runningSinceAt: new Date(entries[runStart].observedAt).toISOString(),
+      previousModelId: runStart > 0 ? entries[runStart - 1].modelId : null,
+    });
+  }
+  runningNow.sort((left, right) =>
+    compareUnicodeScalars(left.provider, right.provider),
+  );
+
+  // Activity: distinct sessions per model per bucket.
+  const bucketSeconds = ACTIVITY_BUCKET_SECONDS[range];
+  const bucketMillis = bucketSeconds * 1_000;
+  const rangeStart = now - MODEL_RANGE_MS[range];
+  const bucketCount = Math.max(
+    1,
+    Math.ceil(MODEL_RANGE_MS[range] / bucketMillis),
+  );
+  const bucketStarts = Array.from({ length: bucketCount }, (_unused, index) =>
+    new Date(rangeStart + index * bucketMillis).toISOString(),
+  );
+  const activitySessions = new Map<string, Set<string>[]>();
+  for (const observation of scoped) {
+    if (observation.modelId === null) continue;
+    const bucketIndex = Math.floor(
+      (observation.observedAt - rangeStart) / bucketMillis,
+    );
+    if (bucketIndex < 0 || bucketIndex >= bucketCount) continue;
+    const identityKey = modelIdentityFixtureKey({
+      provider: observation.provider,
+      modelId: observation.modelId,
+    });
+    const buckets =
+      activitySessions.get(identityKey) ??
+      Array.from({ length: bucketCount }, () => new Set<string>());
+    buckets[bucketIndex].add(modelSessionFixtureKey(observation));
+    activitySessions.set(identityKey, buckets);
+  }
+  const activitySeries = models
+    .map(({ identity }) => {
+      const identityKey = modelIdentityFixtureKey(identity);
+      const buckets = activitySessions.get(identityKey);
+      return {
+        identity,
+        sessionsPerBucket:
+          buckets === undefined
+            ? Array.from({ length: bucketCount }, () => 0)
+            : buckets.map((bucket) => bucket.size),
+      };
+    })
+    .filter((entry) =>
+      entry.sessionsPerBucket.some((sessions) => sessions > 0),
     );
 
+  // Projects × models: distinct sessions per pairing, top projects first.
+  const projectMatrix = Array.from(projectSessions.entries())
+    .map(([project, sessions]) => {
+      const cells = models
+        .map(({ identity }) => {
+          const identityKey = modelIdentityFixtureKey(identity);
+          let cellSessions = 0;
+          for (const sessionKey of sessions) {
+            if (
+              sessionAggregates.get(sessionKey)?.modelKeys.has(identityKey)
+            ) {
+              cellSessions += 1;
+            }
+          }
+          return { identity, sessions: cellSessions };
+        })
+        .filter((cell) => cell.sessions > 0);
+      return { project, totalSessions: sessions.size, cells };
+    })
+    .filter((row) => row.cells.length > 0)
+    .sort(
+      (left, right) =>
+        right.totalSessions - left.totalSessions ||
+        compareUnicodeScalars(left.project, right.project),
+    )
+    .slice(0, OVERVIEW_MATRIX_PROJECT_LIMIT);
+
+  // Combinations: distinct-model counts per session + most-shared pairs.
+  let single = 0;
+  let dual = 0;
+  let threePlus = 0;
+  const pairSessions = new Map<string, number>();
+  for (const session of sessionAggregates.values()) {
+    const size = session.modelKeys.size;
+    if (size === 1) single += 1;
+    else if (size === 2) dual += 1;
+    else if (size >= 3) threePlus += 1;
+    if (size < 2) continue;
+    const keys = Array.from(session.modelKeys).sort(compareUnicodeScalars);
+    for (let a = 0; a < keys.length; a += 1) {
+      for (let b = a + 1; b < keys.length; b += 1) {
+        const pairKey = JSON.stringify([keys[a], keys[b]]);
+        pairSessions.set(pairKey, (pairSessions.get(pairKey) ?? 0) + 1);
+      }
+    }
+  }
+  const topPairs = Array.from(pairSessions.entries())
+    .sort(
+      ([leftKey, left], [rightKey, right]) =>
+        right - left || compareUnicodeScalars(leftKey, rightKey),
+    )
+    .slice(0, OVERVIEW_TOP_PAIR_LIMIT)
+    .flatMap(([pairKey, sharedSessions]) => {
+      const [aKey, bKey] = JSON.parse(pairKey) as [string, string];
+      const a = identitiesByKey.get(aKey);
+      const b = identitiesByKey.get(bKey);
+      return a === undefined || b === undefined
+        ? []
+        : [{ a, b, sharedSessions }];
+    });
+
+  const delegationTop = (
+    sideMap: Map<string, number>,
+  ): ModelUsageOverviewResponse["delegation"]["parentTop"] => {
+    let bestKey: string | null = null;
+    let bestTokens = 0;
+    let sideTotal = 0;
+    for (const [key, tokens] of sideMap) {
+      sideTotal += tokens;
+      if (
+        tokens > bestTokens ||
+        (tokens === bestTokens &&
+          bestKey !== null &&
+          compareUnicodeScalars(key, bestKey) < 0)
+      ) {
+        bestKey = key;
+        bestTokens = tokens;
+      }
+    }
+    const identity = bestKey === null ? undefined : identitiesByKey.get(bestKey);
+    if (identity === undefined || sideTotal === 0) return null;
+    return { identity, sharePercent: (100 * bestTokens) / sideTotal };
+  };
+
   const globalSessions = new Set(observations.map(modelSessionFixtureKey));
-  const scopedSessions = new Set(scoped.map(modelSessionFixtureKey));
   const representedProviders = Array.from(
     new Set(allProvidersInRange.map(({ provider: value }) => value)),
   ).sort(compareUnicodeScalars);
+  const multiModelSessions = Array.from(sessionAggregates.values()).filter(
+    (session) => session.modelKeys.size > 1,
+  ).length;
 
   return {
     generatedAt: new Date(now).toISOString(),
@@ -1384,7 +1603,7 @@ function createModelAnalyticsFixture(
     representedProviders,
     scope: {
       globalSessionCount: globalSessions.size,
-      scopedSessionCount: scopedSessions.size,
+      scopedSessionCount: totalSessions,
       scopedEvidenceCount,
       inventoryComplete: backfill.inventoryComplete,
       scopeFinal:
@@ -1394,79 +1613,33 @@ function createModelAnalyticsFixture(
         backfill.failedSources === 0 &&
         backfill.remainingSources === 0,
     },
-    summary: {
+    backfill: { ...backfill },
+    totals: {
+      sessions: totalSessions,
+      projects: projectSessions.size,
+      turns: totalTurns,
       attributedTokens,
-      unattributedTokens: totalTokens - attributedTokens,
       totalTokens,
-      attributedCoveragePercent:
+      coveragePercent:
         totalTokens === 0 ? null : (100 * attributedTokens) / totalTokens,
       distinctModels: modelAggregates.size,
-      multiModelSessions: Array.from(sessionModels.values()).filter(
-        (identities) => identities.size > 1,
-      ).length,
+      multiModelSessions,
     },
+    runningNow,
     models,
-    backfill: { ...backfill },
-  };
-}
-
-function createModelHistoryFixture(
-  args: Record<string, unknown> | undefined,
-): ModelHistoryResponse {
-  const range = readModelRange(args);
-  const provider = readModelProvider(args?.provider);
-  const selectedModel = readSelectedModel(args?.selectedModel, provider);
-  const scenario = readModelFixtureScenario();
-  rejectRequestedModelFixture("history");
-  const observations = getModelFixtureObservations(scenario, range, provider);
-  const rangeStart = now - MODEL_RANGE_MS[range];
-  const bucketSeconds = MODEL_BUCKET_SECONDS[range];
-  const bucketMillis = bucketSeconds * 1_000;
-  const bucketCount = MODEL_RANGE_MS[range] / bucketMillis;
-  const points = Array.from({ length: bucketCount }, (_unused, index) => {
-    const bucketStart = rangeStart + index * bucketMillis;
-    return {
-      bucketStart: new Date(bucketStart).toISOString(),
-      bucketEnd: new Date(bucketStart + bucketMillis).toISOString(),
-      attributedTokens: 0,
-      unattributedTokens: 0,
-      selectedModelTokens: selectedModel === null ? null : 0,
-    };
-  });
-
-  for (const observation of getScopedModelObservations(
-    observations,
-    range,
-    provider,
-  )) {
-    const bucketIndex = Math.floor(
-      (observation.observedAt - rangeStart) / bucketMillis,
-    );
-    const point = points[bucketIndex];
-    if (point === undefined) continue;
-
-    const tokens = modelObservationTokens(observation);
-    if (observation.modelId === null) {
-      point.unattributedTokens += tokens;
-    } else {
-      point.attributedTokens += tokens;
-      if (
-        selectedModel !== null &&
-        observation.provider === selectedModel.provider &&
-        observation.modelId === selectedModel.modelId
-      ) {
-        point.selectedModelTokens = (point.selectedModelTokens ?? 0) + tokens;
-      }
-    }
-  }
-
-  return {
-    generatedAt: new Date(now).toISOString(),
-    range,
-    provider,
-    selectedModel,
-    bucketSeconds,
-    points,
+    activity: {
+      bucketSeconds,
+      bucketStarts,
+      series: activitySeries,
+    },
+    projectMatrix,
+    combinations: { single, dual, threePlus, topPairs },
+    delegation: {
+      parentTokens,
+      subagentTokens,
+      parentTop: delegationTop(parentAttributedByModel),
+      subagentTop: delegationTop(subagentAttributedByModel),
+    },
   };
 }
 
@@ -2149,8 +2322,7 @@ const fixtures: Record<string, FixtureHandler> = {
   // context savings
   get_context_savings_analytics: () => contextSavings,
   // session model analytics
-  get_model_analytics: (args) => createModelAnalyticsFixture(args),
-  get_model_history: (args) => createModelHistoryFixture(args),
+  get_model_usage_overview: (args) => createModelUsageOverviewFixture(args),
   get_model_sessions: (args) => createModelSessionsFixture(args),
   get_session_model_history: (args) =>
     createSessionModelHistoryFixture(args),
