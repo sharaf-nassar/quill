@@ -259,7 +259,6 @@ impl Drop for ModelHistoryBackfillScheduleReservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // T015 reports whether a live source notification coalesced.
 pub(crate) enum ModelUsageLiveQueueAdmission {
     Queued,
     Coalesced,
@@ -305,9 +304,8 @@ fn model_usage_failure_retry_delay(consecutive_failures: u32) -> std::time::Dura
 
 /// Admit one already-discovered retained transcript without blocking its caller.
 ///
-/// T014/T015 own discovery and request validation. This boundary owns only
-/// source-keyed coalescing and background runner scheduling.
-#[allow(dead_code)] // T014/T015 call this shared scheduling boundary.
+/// Discovery and request validation own the upstream flow. This boundary owns
+/// only source-keyed coalescing and background runner scheduling.
 pub(crate) fn enqueue_model_usage_live_source(
     app_handle: &tauri::AppHandle,
     source: sessions::DiscoveredRetainedJsonlSource,
@@ -494,6 +492,7 @@ async fn reconcile_queued_model_usage_sources(
                 &batch_handle,
                 MODEL_USAGE_LIVE_COMMIT_BATCH_SIZE,
                 &mut permit,
+                model_usage::ModelSourceCommitMode::Live,
             );
             (plan, permit, result)
         })

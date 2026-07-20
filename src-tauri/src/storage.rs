@@ -1281,6 +1281,19 @@ const MODEL_SOURCE_STATE_COLUMNS: &str = "
     seen_generation, processing_status, observation_count,
     last_attempt_at_ms, last_success_at_ms";
 
+/// Read-path filter selecting active (non-suppressed) model-source ownership.
+/// Deletion keeps each removed fingerprint as durable suppression, so every
+/// aggregate, history, paging, and chain query joins
+/// `model_observation_sources` (aliased `source`) and applies this predicate;
+/// omitting it at any read site would leak suppressed evidence back into
+/// results. This single definition mirrors the write-side suppression
+/// invariant composed by [`suppress_model_sources_update_sql`]. It is a
+/// compile-time constant with no runtime values, so interpolating it via
+/// `format!` never widens SQL injection surface — callers keep their own
+/// `?N` bindings.
+const ACTIVE_MODEL_SOURCE_PREDICATE: &str =
+    "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
+
 struct RawStoredModelSource {
     source_key: String,
     source_root_key: String,
@@ -1772,6 +1785,36 @@ fn delete_model_observation_sources_for_root_in_transaction(
 /// The matching keys are captured before any child deletion. Each selected
 /// source then loses all observation children before its retained fingerprint
 /// is suppressed, preserving source-level replacement atomicity.
+///
+/// Composes the durable-suppression `UPDATE` shared verbatim by project, host,
+/// and session deletion — the single definition of the write-side suppression
+/// invariant. Every matched `model_observation_sources` row flips to
+/// `'suppressed'` while COALESCE preserves any earlier
+/// `suppressed_sha256`/`suppressed_at_ms` fingerprint, gated by a
+/// re-suppression guard so re-running a delete neither overwrites a preserved
+/// fingerprint nor rewrites rows that are already fully suppressed.
+/// `key_predicate` (the `WHERE` key) and `ts_placeholder` (the bind slot for
+/// the suppression timestamp) MUST be compile-time constants; every runtime
+/// value stays `?N`-bound by the caller. Companion to the read-side
+/// [`ACTIVE_MODEL_SOURCE_PREDICATE`].
+fn suppress_model_sources_update_sql(key_predicate: &str, ts_placeholder: &str) -> String {
+    format!(
+        "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed',
+                     suppressed_sha256 = COALESCE(
+                         suppressed_sha256, content_sha256
+                     ),
+                     suppressed_at_ms = COALESCE(suppressed_at_ms, {ts_placeholder})
+                 WHERE {key_predicate}
+                   AND (
+                       processing_status != 'suppressed'
+                       OR suppressed_at_ms IS NULL
+                       OR (suppressed_sha256 IS NULL
+                           AND content_sha256 IS NOT NULL)
+                   )"
+    )
+}
+
 fn suppress_project_model_sources_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     cwd: &str,
@@ -1811,23 +1854,10 @@ fn suppress_project_model_sources_in_transaction(
                  WHERE provider = ?1 AND source_key = ?2",
             )
             .map_err(|e| format!("Prepare project model observation delete: {e}"))?;
+        let suppress_sql =
+            suppress_model_sources_update_sql("provider = ?1 AND source_key = ?2", "?3");
         let mut suppress_source = tx
-            .prepare_cached(
-                "UPDATE model_observation_sources
-                 SET processing_status = 'suppressed',
-                     suppressed_sha256 = COALESCE(
-                         suppressed_sha256, content_sha256
-                     ),
-                     suppressed_at_ms = COALESCE(suppressed_at_ms, ?3)
-                 WHERE provider = ?1
-                   AND source_key = ?2
-                   AND (
-                       processing_status != 'suppressed'
-                       OR suppressed_at_ms IS NULL
-                       OR (suppressed_sha256 IS NULL
-                           AND content_sha256 IS NOT NULL)
-                   )",
-            )
+            .prepare_cached(&suppress_sql)
             .map_err(|e| format!("Prepare project model source suppression: {e}"))?;
 
         for (provider, source_key) in matching_sources {
@@ -4509,16 +4539,17 @@ impl Storage {
         let backfill = read_model_backfill_status(&tx)?;
         let global_session_count = tx
             .query_row(
-                "SELECT COUNT(*)
+                &format!(
+                    "SELECT COUNT(*)
                  FROM (
                      SELECT source.provider, source.analytics_session_id
                      FROM model_observation_sources AS source
-                     WHERE source.processing_status != 'suppressed'
-                       AND source.suppressed_sha256 IS NULL
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                        AND source.analytics_session_id IS NOT NULL
                      GROUP BY source.provider COLLATE BINARY,
                               source.analytics_session_id COLLATE BINARY
-                 ) AS retained_sessions",
+                 ) AS retained_sessions"
+                ),
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -4526,7 +4557,8 @@ impl Storage {
 
         let aggregate = tx
             .query_row(
-                "WITH scoped_observations AS MATERIALIZED (
+                &format!(
+                    "WITH scoped_observations AS MATERIALIZED (
                      SELECT observation.provider,
                             observation.analytics_session_id,
                             observation.raw_model_id,
@@ -4538,8 +4570,7 @@ impl Storage {
                      JOIN model_observation_sources AS source
                        ON source.provider = observation.provider
                       AND source.source_key = observation.source_key
-                     WHERE source.processing_status != 'suppressed'
-                       AND source.suppressed_sha256 IS NULL
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                        AND observation.observed_at_ms >= ?1
                        AND observation.observed_at_ms < ?2
                        AND (?3 IS NULL OR observation.provider = ?3)
@@ -4604,7 +4635,8 @@ impl Storage {
                                       analytics_session_id COLLATE BINARY
                              HAVING COUNT(*) > 1
                          ) AS multi_model_session_ids
-                     )",
+                     )"
+                ),
                 params![range_start_ms, range_end_ms, provider],
                 |row| {
                     Ok(ModelAnalyticsAggregateRow {
@@ -4620,19 +4652,18 @@ impl Storage {
             .map_err(|error| format!("Query model analytics aggregate scope: {error}"))?;
 
         let mut represented_provider_statement = tx
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT observation.provider
                  FROM model_usage_observations AS observation
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
                   AND source.source_key = observation.source_key
-                 WHERE source.processing_status != 'suppressed'
-                   AND source.suppressed_sha256 IS NULL
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
                  GROUP BY observation.provider COLLATE BINARY
                  ORDER BY observation.provider COLLATE BINARY ASC",
-            )
+            ))
             .map_err(|error| format!("Prepare represented model providers query: {error}"))?;
         let represented_provider_rows = represented_provider_statement
             .query_map(params![range_start_ms, range_end_ms], |row| {
@@ -4648,7 +4679,7 @@ impl Storage {
         drop(represented_provider_statement);
 
         let mut model_statement = tx
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT
                      observation.provider,
                      observation.raw_model_id,
@@ -4689,8 +4720,7 @@ impl Storage {
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
                   AND source.source_key = observation.source_key
-                 WHERE source.processing_status != 'suppressed'
-                   AND source.suppressed_sha256 IS NULL
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
                    AND (?3 IS NULL OR observation.provider = ?3)
@@ -4700,7 +4730,7 @@ impl Storage {
                  ORDER BY attributed_tokens DESC,
                           observation.provider COLLATE BINARY ASC,
                           observation.raw_model_id COLLATE BINARY ASC",
-            )
+            ))
             .map_err(|error| format!("Prepare model usage rows query: {error}"))?;
         let model_aggregate_rows = model_statement
             .query_map(params![range_start_ms, range_end_ms, provider], |row| {
@@ -4867,7 +4897,7 @@ impl Storage {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|error| format!("Begin model history read snapshot: {error}"))?;
         let mut statement = tx
-            .prepare_cached(
+            .prepare_cached(&format!(
                 "SELECT
                      (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
                      SUM(
@@ -4902,14 +4932,13 @@ impl Storage {
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
                   AND source.source_key = observation.source_key
-                 WHERE source.processing_status != 'suppressed'
-                   AND source.suppressed_sha256 IS NULL
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
                    AND (?4 IS NULL OR observation.provider = ?4)
                  GROUP BY bucket_index
                  ORDER BY bucket_index ASC",
-            )
+            ))
             .map_err(|error| format!("Prepare model history query: {error}"))?;
         let rows = statement
             .query_map(
@@ -5044,7 +5073,8 @@ impl Storage {
 
             let total = tx
                 .query_row(
-                    "SELECT COUNT(*)
+                    &format!(
+                        "SELECT COUNT(*)
                      FROM (
                          SELECT observation.provider,
                                 observation.analytics_session_id
@@ -5052,15 +5082,15 @@ impl Storage {
                          JOIN model_observation_sources AS source
                            ON source.provider = observation.provider
                           AND source.source_key = observation.source_key
-                         WHERE source.processing_status != 'suppressed'
-                           AND source.suppressed_sha256 IS NULL
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                            AND observation.observed_at_ms >= ?1
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
                            AND observation.raw_model_id COLLATE BINARY = ?4
                          GROUP BY observation.provider COLLATE BINARY,
                                   observation.analytics_session_id COLLATE BINARY
-                     ) AS matching_sessions",
+                     ) AS matching_sessions"
+                    ),
                     params![
                         range_start_ms,
                         range_end_ms,
@@ -5072,7 +5102,7 @@ impl Storage {
                 .map_err(|error| format!("Count selected-model sessions: {error}"))?;
 
             let mut statement = tx
-                .prepare_cached(
+                .prepare_cached(&format!(
                     "WITH scoped AS (
                          SELECT observation.*,
                                 COALESCE(
@@ -5087,8 +5117,7 @@ impl Storage {
                          JOIN model_observation_sources AS source
                            ON source.provider = observation.provider
                           AND source.source_key = observation.source_key
-                         WHERE source.processing_status != 'suppressed'
-                           AND source.suppressed_sha256 IS NULL
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                            AND observation.observed_at_ms >= ?1
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
@@ -5297,7 +5326,7 @@ impl Storage {
                      ORDER BY page.last_activity_ms DESC,
                               page.provider COLLATE BINARY ASC,
                               page.session_id COLLATE BINARY ASC",
-                )
+                ))
                 .map_err(|error| format!("Prepare selected-model sessions query: {error}"))?;
             let rows = statement
                 .query_map(
@@ -5441,7 +5470,7 @@ impl Storage {
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
                 .map_err(|error| format!("Begin model session history read snapshot: {error}"))?;
             let mut statement = tx
-                .prepare_cached(
+                .prepare_cached(&format!(
                     "SELECT observation.chain_id,
                             observation.parent_chain_id,
                             observation.agent_id,
@@ -5461,8 +5490,7 @@ impl Storage {
                      JOIN model_observation_sources AS source
                        ON source.provider = observation.provider
                       AND source.source_key = observation.source_key
-                     WHERE source.processing_status != 'suppressed'
-                       AND source.suppressed_sha256 IS NULL
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                        AND observation.provider COLLATE BINARY = ?1
                        AND observation.analytics_session_id COLLATE BINARY = ?2
                        AND observation.observed_at_ms >= ?3
@@ -5472,7 +5500,7 @@ impl Storage {
                               observation.source_record_key COLLATE BINARY ASC,
                               observation.source_key COLLATE BINARY ASC,
                               observation.id ASC",
-                )
+                ))
                 .map_err(|error| format!("Prepare model session history query: {error}"))?;
             let rows = statement
                 .query_map(
@@ -8189,19 +8217,7 @@ impl Storage {
         let suppressed_at_ms = Utc::now().timestamp_millis();
         let model_source_count = tx
             .execute(
-                "UPDATE model_observation_sources
-                 SET processing_status = 'suppressed',
-                     suppressed_sha256 = COALESCE(
-                         suppressed_sha256, content_sha256
-                     ),
-                     suppressed_at_ms = COALESCE(suppressed_at_ms, ?2)
-                 WHERE hostname = ?1
-                   AND (
-                       processing_status != 'suppressed'
-                       OR suppressed_at_ms IS NULL
-                       OR (suppressed_sha256 IS NULL
-                           AND content_sha256 IS NOT NULL)
-                   )",
+                &suppress_model_sources_update_sql("hostname = ?1", "?2"),
                 params![hostname, suppressed_at_ms],
             )
             .map_err(|e| format!("Suppress host model sources error: {e}"))?;
@@ -8303,20 +8319,10 @@ impl Storage {
         let suppressed_at_ms = Utc::now().timestamp_millis();
         let model_source_count = tx
             .execute(
-                "UPDATE model_observation_sources
-                 SET processing_status = 'suppressed',
-                     suppressed_sha256 = COALESCE(
-                         suppressed_sha256, content_sha256
-                     ),
-                     suppressed_at_ms = COALESCE(suppressed_at_ms, ?3)
-                 WHERE provider = ?1
-                   AND analytics_session_id = ?2
-                   AND (
-                       processing_status != 'suppressed'
-                       OR suppressed_at_ms IS NULL
-                       OR (suppressed_sha256 IS NULL
-                           AND content_sha256 IS NOT NULL)
-                   )",
+                &suppress_model_sources_update_sql(
+                    "provider = ?1 AND analytics_session_id = ?2",
+                    "?3",
+                ),
                 params![provider.as_str(), session_id, suppressed_at_ms],
             )
             .map_err(|e| format!("Suppress session model sources error: {e}"))?;
@@ -17369,5 +17375,262 @@ mod tests {
             "parent_only must still register parent activity"
         );
         clear_env();
+    }
+
+    /// Seed one active Claude model source through the real parse + replace
+    /// write path so query tests exercise persisted evidence, not synthetic
+    /// rows. The transcript is written to a real file only to derive a fast
+    /// fingerprint; observation timestamps come from the caller's JSONL.
+    fn seed_claude_model_source(
+        storage: &Storage,
+        dir: &TempDir,
+        source_key: &str,
+        session_id: &str,
+        jsonl: &str,
+    ) {
+        let parse_hint = crate::sessions::RetainedJsonlSourceLayoutHint::ClaudeParent {
+            default_project: "proj".to_string(),
+        };
+        let context = crate::model_usage::ClaudeAdapterContext {
+            source_key,
+            layout_hint: &parse_hint,
+            hostname: Some("host-a"),
+        };
+        let observations =
+            crate::model_usage::parse_claude_model_usage_jsonl(jsonl, context).observations;
+        let observation_count = i64::try_from(observations.len()).expect("observation count");
+
+        let path = dir.path().join(format!("{source_key}.jsonl"));
+        std::fs::write(&path, jsonl).expect("write transcript");
+        let metadata = std::fs::metadata(&path).expect("stat transcript");
+        let fast = model_source_fast_fingerprint(&path, &metadata).expect("fast fingerprint");
+        let fingerprint = ModelSourceFingerprint::from_content(fast, jsonl.as_bytes());
+
+        let now_ms = Utc::now().timestamp_millis();
+        let source = NormalizedSource {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-a".to_string(),
+            source_key: source_key.to_string(),
+            path,
+            layout_hint: crate::sessions::RetainedJsonlSourceLayoutHint::ClaudeParent {
+                default_project: "proj".to_string(),
+            },
+            source_session_id: Some(session_id.to_string()),
+            analytics_session_id: Some(session_id.to_string()),
+            chain_id: Some(session_id.to_string()),
+            parent_chain_id: None,
+            is_sidechain: false,
+            agent_id: None,
+            cwd: None,
+            hostname: Some("host-a".to_string()),
+            first_activity_at_ms: Some(now_ms - 3_600_000),
+            last_activity_at_ms: Some(now_ms),
+            mtime_ns: None,
+            size_bytes: None,
+            content_sha256: None,
+            last_error: None,
+            suppressed_sha256: None,
+            suppressed_at_ms: None,
+            seen_generation: 1,
+            processing_status: SourceProcessingStatus::Ok,
+            observation_count,
+            last_attempt_at_ms: Some(now_ms),
+            last_success_at_ms: Some(now_ms),
+        };
+
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("replace model source");
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Sessions Cursor Codec]]
+    #[test]
+    fn model_sessions_cursor_round_trips_and_rejects_tampering() {
+        let identity = ModelIdentity {
+            provider: "claude".to_string(),
+            model_id: "claude-opus-4".to_string(),
+        };
+        let range_end_ms = 2_000_000_000_000_i64;
+        let range_start_ms =
+            range_end_ms - model_range_duration(ModelRange::OneHour).num_milliseconds();
+        let cursor = ModelSessionsCursorV1 {
+            range: ModelRange::OneHour.as_str().to_string(),
+            model_provider: "claude".to_string(),
+            model_id: "claude-opus-4".to_string(),
+            data_revision: 7,
+            range_start_ms,
+            range_end_ms,
+            last_activity_ms: range_start_ms + 1_000,
+            provider: "claude".to_string(),
+            session_id: "sess-1".to_string(),
+        };
+
+        let encoded = encode_model_sessions_cursor(&cursor).expect("encode cursor");
+        let decoded = decode_model_sessions_cursor(&encoded, ModelRange::OneHour, &identity)
+            .expect("decode cursor");
+        assert_eq!(decoded.range, cursor.range);
+        assert_eq!(decoded.model_provider, cursor.model_provider);
+        assert_eq!(decoded.model_id, cursor.model_id);
+        assert_eq!(decoded.data_revision, cursor.data_revision);
+        assert_eq!(decoded.range_start_ms, cursor.range_start_ms);
+        assert_eq!(decoded.range_end_ms, cursor.range_end_ms);
+        assert_eq!(decoded.last_activity_ms, cursor.last_activity_ms);
+        assert_eq!(decoded.provider, cursor.provider);
+        assert_eq!(decoded.session_id, cursor.session_id);
+
+        // Flip the final checksum nibble: the envelope stays well-formed but the
+        // checksum no longer matches the payload.
+        let mut flipped = encoded.clone();
+        let last = flipped.pop().expect("non-empty cursor");
+        flipped.push(if last == '0' { '1' } else { '0' });
+        assert!(matches!(
+            decode_model_sessions_cursor(&flipped, ModelRange::OneHour, &identity),
+            Err(ModelSessionsQueryError::InvalidCursor(_))
+        ));
+
+        // Truncation corrupts the checksum length/value.
+        let truncated = &encoded[..encoded.len() - 2];
+        assert!(matches!(
+            decode_model_sessions_cursor(truncated, ModelRange::OneHour, &identity),
+            Err(ModelSessionsQueryError::InvalidCursor(_))
+        ));
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model History Bucketing and Suppression]]
+    #[test]
+    #[serial]
+    fn get_model_history_and_analytics_bucket_and_exclude_suppressed_sources() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        let base = Utc::now();
+        let obs1 = base - TimeDelta::minutes(50);
+        let obs2 = base - TimeDelta::minutes(10);
+        let obs3 = base - TimeDelta::minutes(30);
+        // Active source: two attributed turns and one model-less (unattributed) turn.
+        let active_jsonl = [
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-active","message":{{"model":"claude-opus-4","usage":{{"input_tokens":100,"output_tokens":20}}}}}}"#,
+                obs1.to_rfc3339()
+            ),
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-active","message":{{"model":"claude-opus-4","usage":{{"input_tokens":200,"output_tokens":0}}}}}}"#,
+                obs2.to_rfc3339()
+            ),
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-active","message":{{"usage":{{"input_tokens":30}}}}}}"#,
+                obs3.to_rfc3339()
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "sk-active", "sess-active", &active_jsonl);
+
+        // Suppressed source: its tokens must never contribute to either query.
+        let suppressed_jsonl = format!(
+            r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-suppressed","message":{{"model":"claude-sonnet","usage":{{"input_tokens":999,"output_tokens":999}}}}}}"#,
+            (base - TimeDelta::minutes(20)).to_rfc3339()
+        );
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "sk-suppressed",
+            "sess-suppressed",
+            &suppressed_jsonl,
+        );
+        // Flip the source to suppressed while leaving its observation rows in
+        // place, exercising ACTIVE_MODEL_SOURCE_PREDICATE directly.
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed', suppressed_sha256 = 'deadbeef'
+                 WHERE provider = 'claude' AND source_key = 'sk-suppressed'",
+                [],
+            )
+            .expect("suppress source");
+
+        let analytics = storage
+            .get_model_analytics(ModelRange::OneHour, None)
+            .expect("analytics");
+        assert_eq!(analytics.summary.total_tokens, 350);
+        assert_eq!(analytics.summary.attributed_tokens, 320);
+        assert_eq!(analytics.summary.unattributed_tokens, 30);
+        assert_eq!(analytics.summary.distinct_models, 1);
+        let coverage = analytics
+            .summary
+            .attributed_coverage_percent
+            .expect("coverage present");
+        assert!(
+            (coverage - (100.0 * 320.0 / 350.0)).abs() < 1e-9,
+            "coverage {coverage}"
+        );
+        assert_eq!(
+            analytics.models.len(),
+            1,
+            "suppressed model row must be excluded"
+        );
+        assert_eq!(analytics.models[0].identity.model_id, "claude-opus-4");
+        assert_eq!(analytics.models[0].attributed_tokens, 320);
+
+        let history = storage
+            .get_model_history(ModelRange::OneHour, None, None)
+            .expect("history");
+        let total_attributed: i64 = history.points.iter().map(|p| p.attributed_tokens).sum();
+        let total_unattributed: i64 = history.points.iter().map(|p| p.unattributed_tokens).sum();
+        assert_eq!(total_attributed, 320);
+        assert_eq!(total_unattributed, 30);
+
+        let bucket_of = |points: &[ModelHistoryPoint], at_ms: i64| -> usize {
+            points
+                .iter()
+                .position(|point| {
+                    let start = DateTime::parse_from_rfc3339(&point.bucket_start)
+                        .unwrap()
+                        .timestamp_millis();
+                    let end = DateTime::parse_from_rfc3339(&point.bucket_end)
+                        .unwrap()
+                        .timestamp_millis();
+                    at_ms >= start && at_ms < end
+                })
+                .expect("observation lands inside a fixed bucket")
+        };
+        let bucket1 = bucket_of(&history.points, obs1.timestamp_millis());
+        let bucket2 = bucket_of(&history.points, obs2.timestamp_millis());
+        let bucket3 = bucket_of(&history.points, obs3.timestamp_millis());
+        assert_ne!(
+            bucket1, bucket2,
+            "distinct offsets land in distinct buckets"
+        );
+        assert_eq!(history.points[bucket1].attributed_tokens, 120);
+        assert_eq!(history.points[bucket2].attributed_tokens, 200);
+        assert_eq!(history.points[bucket3].unattributed_tokens, 30);
+
+        clear_env();
+    }
+
+    #[test]
+    fn checked_model_arithmetic_errors_instead_of_panicking_at_bounds() {
+        assert!(checked_model_backfill_sum(i64::MAX, 1, "backfill").is_err());
+        assert_eq!(
+            checked_model_backfill_sum(i64::MAX, 0, "backfill").expect("no overflow"),
+            i64::MAX
+        );
+
+        let mut overflowing = i64::MAX;
+        assert!(checked_add_session_model_value(&mut overflowing, 1, "session").is_err());
+        assert_eq!(
+            overflowing,
+            i64::MAX,
+            "overflow must leave the accumulator unchanged"
+        );
+
+        let mut negative = 0_i64;
+        assert!(checked_add_session_model_value(&mut negative, -1, "session").is_err());
+
+        let mut running = 10_i64;
+        checked_add_session_model_value(&mut running, 5, "session").expect("valid add");
+        assert_eq!(running, 15);
     }
 }

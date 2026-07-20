@@ -18,7 +18,6 @@ use tauri::Emitter;
 use crate::integrations::IntegrationProvider;
 use crate::models::{
     ModelAnalyticsUpdatedEvent, ModelBackfillDiagnostic, ModelBackfillState, ModelBackfillStatus,
-    ModelBackfillTrigger,
 };
 use crate::sessions::{
     DiscoveredRetainedJsonlSource, ProviderRootEnumerationOutcome, ProviderSourceRoot,
@@ -37,40 +36,9 @@ const SOURCE_RECORD_KEY_VERSION: &str = "v1";
 const RETAINED_SOURCE_COMMIT_BATCH_SIZE: usize = 32;
 
 /// Emitted after model analytics changes have been committed.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
 pub const MODEL_ANALYTICS_UPDATED_EVENT: &str = "model-analytics-updated";
 
-/// Backfill has not started yet.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_STATE_PENDING: &str = ModelBackfillState::PENDING;
-/// Backfill is currently processing transcripts.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_STATE_RUNNING: &str = ModelBackfillState::RUNNING;
-/// Backfill inventory is complete and no source failures occurred.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_STATE_COMPLETE: &str = ModelBackfillState::COMPLETE;
-/// Backfill made useful progress but some sources or provider roots failed.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_STATE_PARTIAL: &str = ModelBackfillState::PARTIAL;
-/// Backfill made no useful progress, even if rows from an older run exist.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_STATE_FAILED: &str = ModelBackfillState::FAILED;
-
-/// Migration creates pending state; application setup schedules the worker.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_TRIGGER_MIGRATION: &str = ModelBackfillTrigger::MIGRATION;
-/// Backfill resumed automatically during application startup.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_TRIGGER_STARTUP_RESUME: &str = ModelBackfillTrigger::STARTUP_RESUME;
-/// Backfill was explicitly retried after an incomplete attempt.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_TRIGGER_RETRY: &str = ModelBackfillTrigger::RETRY;
-/// Backfill was started to reconcile persisted analytics with source data.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
-pub const BACKFILL_TRIGGER_RECONCILE: &str = ModelBackfillTrigger::RECONCILE;
-
 /// Provider-neutral metadata for one locally discovered transcript source.
-#[allow(dead_code)] // Remove in T007/T008/T009/T010 when source processing consumes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NormalizedSource {
     pub provider: IntegrationProvider,
@@ -143,42 +111,34 @@ impl NormalizedObservation {
         }
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn metadata(&self) -> &NormalizedObservationMetadata {
         &self.metadata
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn raw_model_id(&self) -> Option<&str> {
         self.model_attribution.raw_model_id()
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn model_evidence(&self) -> ModelEvidence {
         self.model_attribution.evidence()
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn input_tokens(&self) -> Option<i64> {
         self.token_attribution.dimensions().input_tokens()
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn output_tokens(&self) -> Option<i64> {
         self.token_attribution.dimensions().output_tokens()
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn cache_creation_tokens(&self) -> Option<i64> {
         self.token_attribution.dimensions().cache_creation_tokens()
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn cache_read_tokens(&self) -> Option<i64> {
         self.token_attribution.dimensions().cache_read_tokens()
     }
 
-    #[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
     pub(crate) fn token_evidence(&self) -> TokenEvidence {
         self.token_attribution.evidence()
     }
@@ -191,7 +151,6 @@ pub(crate) enum ObservationKind {
     Token,
 }
 
-#[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
 impl ObservationKind {
     const TURN: &'static str = "turn";
     const TOKEN: &'static str = "token";
@@ -212,7 +171,6 @@ pub(crate) enum ModelEvidence {
     Invalid,
 }
 
-#[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
 impl ModelEvidence {
     const EXPLICIT: &'static str = "explicit";
     const MISSING: &'static str = "missing";
@@ -236,7 +194,6 @@ pub(crate) enum TokenEvidence {
 }
 
 /// Persisted lifecycle state for one discovered transcript source.
-#[allow(dead_code)] // Remove in T007/T008/T009/T010 when source processing consumes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SourceProcessingStatus {
     Pending,
@@ -246,7 +203,6 @@ pub(crate) enum SourceProcessingStatus {
     Suppressed,
 }
 
-#[allow(dead_code)] // Remove in T007/T008/T009/T010 when source processing consumes it.
 impl SourceProcessingStatus {
     const PENDING: &'static str = "pending";
     const OK: &'static str = "ok";
@@ -265,7 +221,6 @@ impl SourceProcessingStatus {
     }
 }
 
-#[allow(dead_code)] // Remove in T010 when persistence consumes adapter output.
 impl TokenEvidence {
     const DIRECT: &'static str = "direct";
     const CUMULATIVE_DELTA: &'static str = "cumulative_delta";
@@ -281,13 +236,11 @@ impl TokenEvidence {
 }
 
 /// Error returned when reading a canonical enum value from persistence.
-#[allow(dead_code)] // Remove in T010 when persistence reads these values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ParsePersistedValueError {
     value_kind: &'static str,
 }
 
-#[allow(dead_code)] // Remove in T010 when persistence reads these values.
 impl ParsePersistedValueError {
     const fn new(value_kind: &'static str) -> Self {
         Self { value_kind }
@@ -642,11 +595,7 @@ pub(crate) fn stable_source_record_key(
 /// Safe diagnostic categories emitted while inventorying or parsing sources.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelUsageDiagnosticKind {
-    #[allow(dead_code)] // Remove in T010 when provider-root failures are reconciled.
-    SourceRootUnavailable,
-    #[allow(dead_code)] // Remove in T010 when source reads are coordinated.
     SourceReadFailed,
-    #[allow(dead_code)] // Remove in T010 when source failures are reconciled.
     SourceParseFailed,
     RecordSkipped,
     InvalidModelValue,
@@ -660,7 +609,6 @@ pub(crate) enum ModelUsageDiagnosticKind {
 impl ModelUsageDiagnosticKind {
     const fn message(self) -> &'static str {
         match self {
-            Self::SourceRootUnavailable => "A model history source root could not be inspected.",
             Self::SourceReadFailed => "A model history source could not be read.",
             Self::SourceParseFailed => "A model history source could not be parsed.",
             Self::RecordSkipped => "A model history record was invalid and was skipped.",
@@ -704,12 +652,10 @@ impl ModelUsageDiagnostic {
     /// Bound a generic message that has already been stripped of raw details.
     ///
     /// Callers must not include source contents, paths, or underlying errors.
-    #[allow(dead_code)] // Remove in T010 when coordinator diagnostics are persisted.
     pub fn from_user_safe_message(message: &str) -> Self {
         Self(bound_diagnostic(message))
     }
 
-    #[allow(dead_code)] // Remove in T010 when coordinator diagnostics are persisted.
     pub fn as_str(&self) -> &str {
         self.0.as_ref()
     }
@@ -792,7 +738,7 @@ fn push_bounded_diagnostic_char(
     true
 }
 
-const CLAUDE_ADAPTER_MAX_DIAGNOSTICS: usize = 64;
+const ADAPTER_MAX_DIAGNOSTICS: usize = 64;
 
 /// Trusted source context supplied to the Claude transcript adapter.
 #[derive(Clone, Copy, Debug)]
@@ -811,7 +757,6 @@ pub(crate) struct CodexAdapterContext<'a> {
 }
 
 /// Adapter-owned source identity resolved from the first valid provider record.
-#[allow(dead_code)] // Remove in T010 when source reconciliation consumes adapter output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderNativeSourceMetadata {
     pub provider: IntegrationProvider,
@@ -836,7 +781,6 @@ impl ProviderNativeSourceMetadata {
 }
 
 /// Native identity evidence discovered within one provider transcript source.
-#[allow(dead_code)] // Remove in T010 when source reconciliation consumes adapter output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderNativeIdentityState {
     Absent,
@@ -845,7 +789,6 @@ pub(crate) enum ProviderNativeIdentityState {
 }
 
 /// Why an analytics root could not be stamped across one adapter result.
-#[allow(dead_code)] // Remove in T010 when source reconciliation resolves root graphs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnalyticsRootResolutionError {
     EmptyResolvedRoot,
@@ -875,7 +818,6 @@ impl fmt::Display for AnalyticsRootResolutionError {
 impl std::error::Error for AnalyticsRootResolutionError {}
 
 /// Bounded parse counters retained even when detailed diagnostics are capped.
-#[allow(dead_code)] // Remove in T010 when source reconciliation consumes adapter output.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProviderAdapterParseCounts {
     pub lines_seen: u64,
@@ -901,7 +843,6 @@ pub(crate) struct ProviderAdapterParseCounts {
 }
 
 /// Safe record-level diagnostic with no transcript, path, or raw error data.
-#[allow(dead_code)] // Remove in T010 when source reconciliation consumes adapter output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderAdapterDiagnostic {
     pub source_ordinal: u64,
@@ -909,7 +850,6 @@ pub(crate) struct ProviderAdapterDiagnostic {
 }
 
 /// Complete, non-mutating output from one provider transcript adapter.
-#[allow(dead_code)] // Remove in T010 when source reconciliation consumes adapter output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderAdapterParseResult {
     pub native_identity: ProviderNativeIdentityState,
@@ -935,7 +875,6 @@ impl ProviderAdapterParseResult {
 
     /// Atomically stamp a coordinator-resolved root after validating every
     /// duplicated native identity field across this adapter result.
-    #[allow(dead_code)] // Remove in T010 when source reconciliation resolves root graphs.
     pub(crate) fn resolve_analytics_root(
         &mut self,
         resolved_analytics_session_id: &str,
@@ -983,7 +922,6 @@ impl ProviderAdapterParseResult {
 }
 
 /// Parse complete Claude JSONL content without allowing one record to abort later records.
-#[allow(dead_code)] // Remove in T010 when source reconciliation invokes provider adapters.
 pub(crate) fn parse_claude_model_usage_jsonl(
     contents: &str,
     context: ClaudeAdapterContext<'_>,
@@ -1120,13 +1058,13 @@ pub(crate) fn parse_claude_model_usage_jsonl(
                 match attribution::ModelAttribution::explicit(model_id) {
                     Ok(model_attribution) => model_attribution,
                     Err(_) => {
-                        record_claude_invalid_model(&mut result, source_ordinal);
+                        record_invalid_model(&mut result, source_ordinal);
                         attribution::ModelAttribution::invalid()
                     }
                 }
             }
             Some(_) => {
-                record_claude_invalid_model(&mut result, source_ordinal);
+                record_invalid_model(&mut result, source_ordinal);
                 attribution::ModelAttribution::invalid()
             }
         };
@@ -1147,7 +1085,7 @@ pub(crate) fn parse_claude_model_usage_jsonl(
                 .counts
                 .invalid_token_dimension_values
                 .saturating_add(invalid_token_dimensions);
-            push_claude_adapter_diagnostic_kind(
+            push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::InvalidTokenDimension,
@@ -1202,19 +1140,19 @@ fn nonempty_record_string(value: Option<&Value>) -> Option<String> {
 }
 
 fn push_claude_adapter_diagnostic(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
-    push_claude_adapter_diagnostic_kind(
+    push_adapter_diagnostic(
         result,
         source_ordinal,
         ModelUsageDiagnosticKind::RecordSkipped,
     );
 }
 
-fn push_claude_adapter_diagnostic_kind(
+fn push_adapter_diagnostic(
     result: &mut ProviderAdapterParseResult,
     source_ordinal: u64,
     kind: ModelUsageDiagnosticKind,
 ) {
-    if result.diagnostics.len() < CLAUDE_ADAPTER_MAX_DIAGNOSTICS {
+    if result.diagnostics.len() < ADAPTER_MAX_DIAGNOSTICS {
         result.diagnostics.push(ProviderAdapterDiagnostic {
             source_ordinal,
             diagnostic: ModelUsageDiagnostic::new(kind),
@@ -1224,9 +1162,9 @@ fn push_claude_adapter_diagnostic_kind(
     }
 }
 
-fn record_claude_invalid_model(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
+fn record_invalid_model(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
     result.counts.invalid_model_values = result.counts.invalid_model_values.saturating_add(1);
-    push_claude_adapter_diagnostic_kind(
+    push_adapter_diagnostic(
         result,
         source_ordinal,
         ModelUsageDiagnosticKind::InvalidModelValue,
@@ -1275,8 +1213,6 @@ fn accept_claude_native_source(
     true
 }
 
-const CODEX_ADAPTER_MAX_DIAGNOSTICS: usize = 64;
-
 #[derive(Clone, Copy, Debug, Default)]
 struct CodexCumulativeBaselines {
     raw_inclusive_input_tokens: Option<i64>,
@@ -1299,7 +1235,6 @@ struct CodexInputCacheDeltas {
 
 /// Parse complete Codex JSONL content using provider-native metadata and
 /// independent cumulative-token baselines.
-#[allow(dead_code)] // Remove in T010 when source reconciliation invokes provider adapters.
 pub(crate) fn parse_codex_model_usage_jsonl(
     contents: &str,
     context: CodexAdapterContext<'_>,
@@ -1312,8 +1247,10 @@ pub(crate) fn parse_codex_model_usage_jsonl(
     };
 
     // Resolve session_meta in a complete first pass so an observation can be
-    // attributed even when provider metadata appears later in the source. No
-    // parsed record is retained beyond its line.
+    // attributed even when provider metadata appears later in the source.
+    // Observation-bearing records are parsed once here and buffered for the
+    // second pass so no line is deserialized twice.
+    let mut deferred_records = Vec::<(u64, serde_json::Map<String, Value>)>::new();
     for (line_index, line) in contents.lines().enumerate() {
         result.counts.lines_seen = result.counts.lines_seen.saturating_add(1);
         let source_ordinal = u64::try_from(line_index).unwrap_or(u64::MAX);
@@ -1328,7 +1265,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
             Ok(_) => {
                 result.counts.unsupported_shape_records =
                     result.counts.unsupported_shape_records.saturating_add(1);
-                push_codex_adapter_diagnostic(
+                push_adapter_diagnostic(
                     &mut result,
                     source_ordinal,
                     ModelUsageDiagnosticKind::RecordSkipped,
@@ -1338,7 +1275,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
             Err(_) => {
                 result.counts.malformed_json_records =
                     result.counts.malformed_json_records.saturating_add(1);
-                push_codex_adapter_diagnostic(
+                push_adapter_diagnostic(
                     &mut result,
                     source_ordinal,
                     ModelUsageDiagnosticKind::RecordSkipped,
@@ -1350,7 +1287,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         let Some(record_type) = record.get("type").and_then(Value::as_str) else {
             result.counts.unsupported_shape_records =
                 result.counts.unsupported_shape_records.saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::RecordSkipped,
@@ -1359,7 +1296,11 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         };
 
         if record_type != "session_meta" {
-            if !matches!(record_type, "turn_context" | "event_msg") {
+            // Buffer observation records so the second pass can dispatch them
+            // without re-parsing; no other record type has second-pass work.
+            if matches!(record_type, "turn_context" | "event_msg") {
+                deferred_records.push((source_ordinal, record));
+            } else {
                 result.counts.ignored_records = result.counts.ignored_records.saturating_add(1);
             }
             continue;
@@ -1372,7 +1313,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         let Some(payload) = record.get("payload").and_then(Value::as_object) else {
             result.counts.unsupported_shape_records =
                 result.counts.unsupported_shape_records.saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::RecordSkipped,
@@ -1382,7 +1323,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         let Some(observed_at_ms) = codex_record_timestamp(&record) else {
             result.counts.invalid_timestamp_records =
                 result.counts.invalid_timestamp_records.saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::RecordSkipped,
@@ -1392,7 +1333,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         let Some(source_session_id) = nonempty_record_string(payload.get("id")) else {
             result.counts.invalid_identity_records =
                 result.counts.invalid_identity_records.saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::RecordSkipped,
@@ -1405,7 +1346,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
             Err(()) => {
                 result.counts.invalid_identity_records =
                     result.counts.invalid_identity_records.saturating_add(1);
-                push_codex_adapter_diagnostic(
+                push_adapter_diagnostic(
                     &mut result,
                     source_ordinal,
                     ModelUsageDiagnosticKind::RecordSkipped,
@@ -1435,7 +1376,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
                 .counts
                 .native_metadata_conflict_records
                 .saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::RecordSkipped,
@@ -1454,24 +1395,18 @@ pub(crate) fn parse_codex_model_usage_jsonl(
             result.counts.layout_hint_conflict_records.saturating_add(1);
     }
 
-    // Reparse one line at a time for observations. First-pass syntax and shape
-    // failures are skipped here because their counters were already recorded.
+    // Dispatch observations from the records buffered in the first pass so each
+    // line is deserialized only once. First-pass syntax and shape failures were
+    // already counted and never entered the buffer.
     let mut baselines = CodexCumulativeBaselines::default();
-    for (line_index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let source_ordinal = u64::try_from(line_index).unwrap_or(u64::MAX);
-        let Ok(Value::Object(record)) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
+    for (source_ordinal, record) in &deferred_records {
         match record.get("type").and_then(Value::as_str) {
             Some("turn_context") => {
-                parse_codex_turn_context(&record, source_ordinal, context, &mut result)
+                parse_codex_turn_context(record, *source_ordinal, context, &mut result)
             }
             Some("event_msg") => parse_codex_event_message(
-                &record,
-                source_ordinal,
+                record,
+                *source_ordinal,
                 context,
                 &mut baselines,
                 &mut result,
@@ -1516,7 +1451,7 @@ fn accept_codex_native_source(
             .counts
             .contextual_metadata_conflict_records
             .saturating_add(1);
-        push_codex_adapter_diagnostic(
+        push_adapter_diagnostic(
             result,
             source_ordinal,
             ModelUsageDiagnosticKind::ContextualMetadataConflict,
@@ -1567,12 +1502,12 @@ fn parse_codex_turn_context(
         Some(Value::String(model_id)) => match attribution::ModelAttribution::explicit(model_id) {
             Ok(model_attribution) => model_attribution,
             Err(_) => {
-                record_codex_invalid_model(result, source_ordinal);
+                record_invalid_model(result, source_ordinal);
                 attribution::ModelAttribution::invalid()
             }
         },
         Some(_) => {
-            record_codex_invalid_model(result, source_ordinal);
+            record_invalid_model(result, source_ordinal);
             attribution::ModelAttribution::invalid()
         }
     };
@@ -1637,7 +1572,7 @@ fn parse_codex_event_message(
                 .counts
                 .last_token_usage_only_records
                 .saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::LastTokenUsageUnavailable,
@@ -1667,7 +1602,7 @@ fn parse_codex_event_message(
             .counts
             .invalid_token_dimension_values
             .saturating_add(invalid_token_dimensions);
-        push_codex_adapter_diagnostic(
+        push_adapter_diagnostic(
             result,
             source_ordinal,
             ModelUsageDiagnosticKind::InvalidTokenDimension,
@@ -1700,7 +1635,7 @@ fn parse_codex_event_message(
         if reset {
             result.counts.cumulative_reset_dimensions =
                 result.counts.cumulative_reset_dimensions.saturating_add(1);
-            push_codex_adapter_diagnostic(
+            push_adapter_diagnostic(
                 result,
                 source_ordinal,
                 ModelUsageDiagnosticKind::CumulativeTokenReset,
@@ -1965,7 +1900,7 @@ fn update_codex_activity_bounds(result: &mut ProviderAdapterParseResult, observe
 fn record_codex_unsupported_shape(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
     result.counts.unsupported_shape_records =
         result.counts.unsupported_shape_records.saturating_add(1);
-    push_codex_adapter_diagnostic(
+    push_adapter_diagnostic(
         result,
         source_ordinal,
         ModelUsageDiagnosticKind::RecordSkipped,
@@ -1975,7 +1910,7 @@ fn record_codex_unsupported_shape(result: &mut ProviderAdapterParseResult, sourc
 fn record_codex_invalid_timestamp(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
     result.counts.invalid_timestamp_records =
         result.counts.invalid_timestamp_records.saturating_add(1);
-    push_codex_adapter_diagnostic(
+    push_adapter_diagnostic(
         result,
         source_ordinal,
         ModelUsageDiagnosticKind::RecordSkipped,
@@ -1985,19 +1920,10 @@ fn record_codex_invalid_timestamp(result: &mut ProviderAdapterParseResult, sourc
 fn record_codex_invalid_identity(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
     result.counts.invalid_identity_records =
         result.counts.invalid_identity_records.saturating_add(1);
-    push_codex_adapter_diagnostic(
+    push_adapter_diagnostic(
         result,
         source_ordinal,
         ModelUsageDiagnosticKind::RecordSkipped,
-    );
-}
-
-fn record_codex_invalid_model(result: &mut ProviderAdapterParseResult, source_ordinal: u64) {
-    result.counts.invalid_model_values = result.counts.invalid_model_values.saturating_add(1);
-    push_codex_adapter_diagnostic(
-        result,
-        source_ordinal,
-        ModelUsageDiagnosticKind::InvalidModelValue,
     );
 }
 
@@ -2009,26 +1935,11 @@ fn record_codex_invalid_token_relationship(
         .counts
         .invalid_token_relationship_records
         .saturating_add(1);
-    push_codex_adapter_diagnostic(
+    push_adapter_diagnostic(
         result,
         source_ordinal,
         ModelUsageDiagnosticKind::InvalidTokenRelationship,
     );
-}
-
-fn push_codex_adapter_diagnostic(
-    result: &mut ProviderAdapterParseResult,
-    source_ordinal: u64,
-    kind: ModelUsageDiagnosticKind,
-) {
-    if result.diagnostics.len() < CODEX_ADAPTER_MAX_DIAGNOSTICS {
-        result.diagnostics.push(ProviderAdapterDiagnostic {
-            source_ordinal,
-            diagnostic: ModelUsageDiagnostic::new(kind),
-        });
-    } else {
-        result.counts.diagnostics_dropped = result.counts.diagnostics_dropped.saturating_add(1);
-    }
 }
 
 // One permit covers both retained-history passes and live/startup reconciliation.
@@ -2037,7 +1948,6 @@ fn push_codex_adapter_diagnostic(
 static MODEL_USAGE_RUNNER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Exclusive process-wide permission to run model source reconciliation.
-#[allow(dead_code)] // T011 owns runner scheduling and passes this permit to the coordinator.
 pub(crate) struct ModelUsageRunnerPermit {
     _not_sync: PhantomData<Cell<()>>,
 }
@@ -2049,7 +1959,6 @@ impl Drop for ModelUsageRunnerPermit {
 }
 
 /// Acquire the model-usage runner without blocking a Tauri command thread.
-#[allow(dead_code)] // T011 owns runner scheduling.
 pub(crate) fn try_acquire_model_usage_runner() -> Option<ModelUsageRunnerPermit> {
     MODEL_USAGE_RUNNER_ACTIVE
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2059,14 +1968,7 @@ pub(crate) fn try_acquire_model_usage_runner() -> Option<ModelUsageRunnerPermit>
         })
 }
 
-/// Whether a retained-history or live reconciliation drain currently owns the runner.
-#[allow(dead_code)] // T011 uses this for idempotent scheduling and retry responses.
-pub(crate) fn model_usage_runner_is_active() -> bool {
-    MODEL_USAGE_RUNNER_ACTIVE.load(Ordering::Acquire)
-}
-
 /// Durable outcome for one discovered source in a reconciliation batch.
-#[allow(dead_code)] // T014/T015/T029 consume source outcomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelSourceReconciliationDisposition {
     Processed,
@@ -2075,7 +1977,6 @@ pub(crate) enum ModelSourceReconciliationDisposition {
 }
 
 /// Bounded, provider-qualified result for one source. Paths never enter this value.
-#[allow(dead_code)] // T014/T015/T029 consume source outcomes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelSourceReconciliationResult {
     pub(crate) provider: IntegrationProvider,
@@ -2088,7 +1989,6 @@ pub(crate) struct ModelSourceReconciliationResult {
 }
 
 /// Aggregate source results from one provider-root inventory snapshot.
-#[allow(dead_code)] // T014/T015/T029 consume batch outcomes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModelSourceReconciliationBatchResult {
     pub(crate) sources: Vec<ModelSourceReconciliationResult>,
@@ -2096,7 +1996,6 @@ pub(crate) struct ModelSourceReconciliationBatchResult {
 }
 
 impl ModelSourceReconciliationBatchResult {
-    #[allow(dead_code)] // T029 maps these counts into persisted progress.
     pub(crate) fn processed_sources(&self) -> usize {
         self.sources
             .iter()
@@ -2104,7 +2003,6 @@ impl ModelSourceReconciliationBatchResult {
             .count()
     }
 
-    #[allow(dead_code)] // T029 maps these counts into persisted progress.
     pub(crate) fn skipped_sources(&self) -> usize {
         self.sources
             .iter()
@@ -2112,7 +2010,6 @@ impl ModelSourceReconciliationBatchResult {
             .count()
     }
 
-    #[allow(dead_code)] // T029 maps these counts into persisted progress.
     pub(crate) fn failed_sources(&self) -> usize {
         self.sources
             .iter()
@@ -2120,7 +2017,6 @@ impl ModelSourceReconciliationBatchResult {
             .count()
     }
 
-    #[allow(dead_code)] // T029 maps committed observation progress.
     pub(crate) fn observations_written(&self) -> i64 {
         self.sources.iter().fold(0_i64, |total, source| {
             total.saturating_add(source.observations_written)
@@ -2136,7 +2032,6 @@ impl ModelSourceReconciliationBatchResult {
 }
 
 /// A bounded commit failure plus every source outcome already committed in the batch.
-#[allow(dead_code)] // T029 persists partial progress before resolving terminal state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelSourceReconciliationBatchError {
     pub(crate) error: String,
@@ -2232,7 +2127,6 @@ impl ProviderSourceKey {
 }
 
 /// Unforgeable proof captured only from a complete root in a prepared inventory.
-#[allow(dead_code)] // Storage consumes proofs held by the reconciliation plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompletedModelSourceRoot {
     provider: IntegrationProvider,
@@ -2393,9 +2287,8 @@ impl SourceRootGraph {
 
 /// Owned, fully parsed reconciliation work for one complete inventory snapshot.
 ///
-/// Keeping every graph decision in this plan lets T029 commit bounded batches
-/// and yield without dropping ancestors that were needed to resolve descendants.
-#[allow(dead_code)] // T014/T015/T029 commit this plan through the shared runner.
+/// Keeping every graph decision in this plan lets the runner commit bounded
+/// batches and yield without dropping ancestors needed to resolve descendants.
 pub(crate) struct PreparedModelSourceReconciliation {
     generation: i64,
     total_sources: usize,
@@ -2403,19 +2296,9 @@ pub(crate) struct PreparedModelSourceReconciliation {
     completed_root_proofs: HashMap<ProviderRootKey, CompletedModelSourceRoot>,
 }
 
-#[allow(dead_code)] // T029 uses these progress facts between bounded batches.
 impl PreparedModelSourceReconciliation {
     pub(crate) fn total_sources(&self) -> usize {
         self.total_sources
-    }
-
-    pub(crate) fn committed_sources(&self) -> usize {
-        self.total_sources
-            .saturating_sub(self.pending_sources.len())
-    }
-
-    pub(crate) fn remaining_sources(&self) -> usize {
-        self.pending_sources.len()
     }
 
     pub(crate) fn is_complete(&self) -> bool {
@@ -2429,7 +2312,6 @@ impl PreparedModelSourceReconciliation {
 /// Provider-native parent metadata is the only graph authority; layout hints are
 /// diagnostic only. Descendants whose resolved root changes are force-parsed
 /// before this function returns.
-#[allow(dead_code)] // T014/T015/T029 prepare work through the shared runner.
 pub(crate) fn prepare_model_source_reconciliation(
     storage: &Storage,
     roots: &[ProviderSourceRoot],
@@ -2517,18 +2399,31 @@ pub(crate) fn prepare_model_source_reconciliation(
     })
 }
 
+/// Whether a reconciliation commit belongs to a run that will later prune.
+///
+/// The retained backfill prunes stale sources, so it must re-stamp every seen
+/// source to the current generation to survive that prune. The live path never
+/// prunes, so a fast-unchanged source needs no `seen_generation`/
+/// `last_attempt_at_ms` re-stamp and can skip its per-source storage read and
+/// write entirely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelSourceCommitMode {
+    Live,
+    Backfill,
+}
+
 /// Commit at most `limit` prepared sources while retaining the full graph result.
 ///
 /// A zero limit is rejected so a worker cannot spin forever while reporting
 /// progress. Source work is removed only after its commit succeeds. Any
 /// pre-commit status-read failure leaves the current source queued for retry.
-#[allow(dead_code)] // T029 commits one bounded batch, yields, then resumes.
 pub(crate) fn commit_next_model_source_batch(
     plan: &mut PreparedModelSourceReconciliation,
     storage: &Storage,
     app_handle: &tauri::AppHandle,
     limit: usize,
     _permit: &mut ModelUsageRunnerPermit,
+    mode: ModelSourceCommitMode,
 ) -> Result<ModelSourceReconciliationBatchResult, ModelSourceReconciliationBatchError> {
     if limit == 0 {
         return Err(ModelSourceReconciliationBatchError {
@@ -2545,7 +2440,7 @@ pub(crate) fn commit_next_model_source_batch(
                 .pending_sources
                 .front()
                 .expect("batch size is bounded by pending source count");
-            commit_staged_model_source(storage, source, plan.generation)
+            commit_staged_model_source(storage, source, plan.generation, mode)
         };
         let committed = match outcome {
             Ok(committed) => committed,
@@ -2558,30 +2453,13 @@ pub(crate) fn commit_next_model_source_batch(
         };
         plan.pending_sources.pop_front();
         batch.data_changed |= committed.result.data_changed;
-        batch.sources.push(committed.result);
-        if let Some(data_changed) = committed.notify_data_changed {
-            emit_model_analytics_updated(app_handle, &committed.event_snapshot, data_changed);
+        if let Some(notify) = committed.notify {
+            emit_model_analytics_updated(app_handle, &notify.snapshot, notify.data_changed);
         }
+        batch.sources.push(committed.result);
     }
 
     Ok(batch)
-}
-
-/// Convenience path for callers that do not need to yield between source commits.
-#[allow(dead_code)] // T014/T015 may use this while T029 uses the plan API directly.
-pub(crate) fn reconcile_model_source_roots(
-    storage: &Storage,
-    app_handle: &tauri::AppHandle,
-    roots: &[ProviderSourceRoot],
-    generation: i64,
-    permit: &mut ModelUsageRunnerPermit,
-) -> Result<ModelSourceReconciliationBatchResult, ModelSourceReconciliationBatchError> {
-    let mut plan = prepare_model_source_reconciliation(storage, roots, generation, permit)
-        .map_err(|error| ModelSourceReconciliationBatchError {
-            error,
-            committed: ModelSourceReconciliationBatchResult::default(),
-        })?;
-    commit_next_model_source_batch(&mut plan, storage, app_handle, usize::MAX, permit)
 }
 
 #[derive(Default)]
@@ -2667,14 +2545,36 @@ async fn finish_retained_model_history_backfill_after_error(
     .await
 }
 
+/// Log a stage failure and drive the backfill to its recoverable terminal state.
+///
+/// Centralizes the log-and-finish tail shared by every fallible backfill stage.
+/// `context` is the exact message prefix; `inventory_complete` varies per stage
+/// (`false` mid-run, `failed_roots == 0` once every root is accounted for).
+async fn fail_backfill_stage(
+    storage: &'static Storage,
+    app_handle: &tauri::AppHandle,
+    progress: &RetainedBackfillProgress,
+    inventory_complete: bool,
+    context: &str,
+    error: impl fmt::Display,
+) -> Result<ModelBackfillStatus, String> {
+    log::error!("{context}: {error}");
+    finish_retained_model_history_backfill_after_error(
+        storage,
+        app_handle,
+        progress,
+        inventory_complete,
+    )
+    .await
+}
+
 /// Reconcile every retained Claude and Codex source without blocking Tauri's
 /// async command executor.
 ///
-/// The caller owns scheduling (T030) and supplies the process-wide permit. This
+/// The caller owns scheduling and supplies the process-wide permit. This
 /// worker persists discovery before publishing source totals, commits bounded
 /// source batches with durable progress, yields between them, and prunes only
 /// roots whose exact inventory completed.
-#[allow(dead_code)] // T030 schedules migration, resume, and retry passes.
 pub(crate) async fn run_retained_model_history_backfill(
     storage: &'static Storage,
     app_handle: tauri::AppHandle,
@@ -2700,12 +2600,13 @@ pub(crate) async fn run_retained_model_history_backfill(
         let root = match tauri::async_runtime::spawn_blocking(enumerate_root).await {
             Ok(root) => root,
             Err(error) => {
-                log::error!("Retained model root inventory task failed: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     false,
+                    "Retained model root inventory task failed",
+                    error,
                 )
                 .await;
             }
@@ -2734,22 +2635,24 @@ pub(crate) async fn run_retained_model_history_backfill(
         {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
-                log::error!("Could not persist retained model root progress: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     false,
+                    "Could not persist retained model root progress",
+                    error,
                 )
                 .await;
             }
             Err(error) => {
-                log::error!("Retained model root progress task failed: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     false,
+                    "Retained model root progress task failed",
+                    error,
                 )
                 .await;
             }
@@ -2771,12 +2674,13 @@ pub(crate) async fn run_retained_model_history_backfill(
     let (prepared, returned_permit) = match prepare {
         Ok(result) => result,
         Err(error) => {
-            log::error!("Retained model source preparation task failed: {error}");
-            return finish_retained_model_history_backfill_after_error(
+            return fail_backfill_stage(
                 storage,
                 &app_handle,
                 &progress,
                 false,
+                "Retained model source preparation task failed",
+                error,
             )
             .await;
         }
@@ -2785,12 +2689,13 @@ pub(crate) async fn run_retained_model_history_backfill(
     let mut plan = match prepared {
         Ok(plan) => plan,
         Err(error) => {
-            log::error!("Could not prepare retained model sources: {error}");
-            return finish_retained_model_history_backfill_after_error(
+            return fail_backfill_stage(
                 storage,
                 &app_handle,
                 &progress,
                 false,
+                "Could not prepare retained model sources",
+                error,
             )
             .await;
         }
@@ -2803,22 +2708,24 @@ pub(crate) async fn run_retained_model_history_backfill(
     {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            log::error!("Could not publish retained model source total: {error}");
-            return finish_retained_model_history_backfill_after_error(
+            return fail_backfill_stage(
                 storage,
                 &app_handle,
                 &progress,
                 false,
+                "Could not publish retained model source total",
+                error,
             )
             .await;
         }
         Err(error) => {
-            log::error!("Retained model source-total task failed: {error}");
-            return finish_retained_model_history_backfill_after_error(
+            return fail_backfill_stage(
                 storage,
                 &app_handle,
                 &progress,
                 false,
+                "Retained model source-total task failed",
+                error,
             )
             .await;
         }
@@ -2834,6 +2741,7 @@ pub(crate) async fn run_retained_model_history_backfill(
                 &batch_handle,
                 RETAINED_SOURCE_COMMIT_BATCH_SIZE,
                 &mut permit,
+                ModelSourceCommitMode::Backfill,
             );
             (plan, permit, result)
         })
@@ -2841,12 +2749,13 @@ pub(crate) async fn run_retained_model_history_backfill(
         let (returned_plan, returned_permit, result) = match commit {
             Ok(result) => result,
             Err(error) => {
-                log::error!("Retained model source commit task failed: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     false,
+                    "Retained model source commit task failed",
+                    error,
                 )
                 .await;
             }
@@ -2885,34 +2794,37 @@ pub(crate) async fn run_retained_model_history_backfill(
         {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
-                log::error!("Could not persist retained model batch progress: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     false,
+                    "Could not persist retained model batch progress",
+                    error,
                 )
                 .await;
             }
             Err(error) => {
-                log::error!("Retained model batch-progress task failed: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     false,
+                    "Retained model batch-progress task failed",
+                    error,
                 )
                 .await;
             }
         };
         emit_committed_backfill_status(&app_handle, &status, batch.data_changed);
         if let Some(error) = commit_error {
-            log::error!("Retained model source batch stopped after committed progress: {error}");
-            return finish_retained_model_history_backfill_after_error(
+            return fail_backfill_stage(
                 storage,
                 &app_handle,
                 &progress,
                 false,
+                "Retained model source batch stopped after committed progress",
+                error,
             )
             .await;
         }
@@ -2938,12 +2850,13 @@ pub(crate) async fn run_retained_model_history_backfill(
         let (returned_plan, returned_permit, result) = match prune {
             Ok(result) => result,
             Err(error) => {
-                log::error!("Retained model root-prune task failed: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     failed_roots == 0,
+                    "Retained model root-prune task failed",
+                    error,
                 )
                 .await;
             }
@@ -2955,12 +2868,13 @@ pub(crate) async fn run_retained_model_history_backfill(
                 progress.pruned_sources = progress.pruned_sources.saturating_add(pruned);
             }
             Err(error) => {
-                log::error!("Could not prune completed retained model root: {error}");
-                return finish_retained_model_history_backfill_after_error(
+                return fail_backfill_stage(
                     storage,
                     &app_handle,
                     &progress,
                     failed_roots == 0,
+                    "Could not prune completed retained model root",
+                    error,
                 )
                 .await;
             }
@@ -3103,12 +3017,44 @@ fn stage_source_content(staged: &mut StagedModelSource, hostname: &str) {
     }
 }
 
+/// Maximum retained transcript size accepted for model reconciliation.
+///
+/// A single `.jsonl` larger than this is treated as unreadable instead of being
+/// read into memory, so a pathological or corrupt transcript cannot OOM the
+/// indexer. Oversize sources fail like any other unreadable source, which
+/// conservatively suppresses pruning for their root until they shrink again.
+const MODEL_SOURCE_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 fn read_stable_source_bytes(
     discovered: &DiscoveredRetainedJsonlSource,
     expected_fast: ModelSourceFastFingerprint,
 ) -> Result<Vec<u8>, String> {
-    let contents = std::fs::read(&discovered.canonical_path)
+    use std::io::Read;
+
+    // Reject a known-oversize source from its already-collected fingerprint
+    // before opening it, so a huge transcript is never read into memory.
+    if u64::try_from(expected_fast.size_bytes()).is_ok_and(|size| size > MODEL_SOURCE_MAX_BYTES) {
+        return Err(format!(
+            "source exceeds {MODEL_SOURCE_MAX_BYTES}-byte model reconciliation cap"
+        ));
+    }
+
+    // Bound the read itself so a source that grows past the cap between
+    // fingerprinting and reading still cannot exhaust memory: read at most one
+    // byte beyond the cap and reject anything that reaches it, keeping the
+    // oversize path consistent with the read/re-fingerprint stability check.
+    let file = std::fs::File::open(&discovered.canonical_path)
+        .map_err(|error| format!("open complete source bytes: {error}"))?;
+    let mut contents = Vec::new();
+    file.take(MODEL_SOURCE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut contents)
         .map_err(|error| format!("read complete source bytes: {error}"))?;
+    if contents.len() as u64 > MODEL_SOURCE_MAX_BYTES {
+        return Err(format!(
+            "source grew past {MODEL_SOURCE_MAX_BYTES}-byte model reconciliation cap while reading"
+        ));
+    }
+
     let observed_fast = source_fast_fingerprint(discovered)?;
     if observed_fast != expected_fast {
         return Err("source changed while it was being read".to_string());
@@ -3379,7 +3325,6 @@ fn force_parse_model_source(source: &mut StagedModelSource, hostname: &str) {
 }
 
 /// Authoritative backfill event fields captured before a source mutation.
-#[allow(dead_code)] // T028/T029/T031 reuse snapshots around committed mutations.
 #[derive(Clone, Debug)]
 pub(crate) struct ModelAnalyticsEventSnapshot {
     generation: i64,
@@ -3388,7 +3333,6 @@ pub(crate) struct ModelAnalyticsEventSnapshot {
 }
 
 /// Capture every fallible event field before starting a source transaction.
-#[allow(dead_code)] // T028/T029/T031 reuse snapshots around committed mutations.
 pub(crate) fn read_model_analytics_event_snapshot(
     storage: &Storage,
 ) -> Result<ModelAnalyticsEventSnapshot, String> {
@@ -3402,17 +3346,47 @@ pub(crate) fn read_model_analytics_event_snapshot(
     })
 }
 
+/// A committed source's advisory refresh, captured only when something worth
+/// emitting actually changed.
+struct ModelAnalyticsNotify {
+    snapshot: ModelAnalyticsEventSnapshot,
+    data_changed: bool,
+}
+
 struct CommittedModelSource {
     result: ModelSourceReconciliationResult,
-    notify_data_changed: Option<bool>,
-    event_snapshot: ModelAnalyticsEventSnapshot,
+    notify: Option<ModelAnalyticsNotify>,
 }
 
 fn commit_staged_model_source(
     storage: &Storage,
     staged: &StagedModelSource,
     generation: i64,
+    mode: ModelSourceCommitMode,
 ) -> Result<CommittedModelSource, String> {
+    // A live fast-unchanged source causes no observation or status change and no
+    // refresh event. Its only effect is re-stamping seen_generation/
+    // last_attempt_at_ms, which is consumed solely by the backfill prune -- and
+    // the backfill re-stamps every source it sees before pruning. On the live
+    // path (which never prunes) that per-source read and write are pure
+    // amplification, so skip them and report the source as skipped.
+    if mode == ModelSourceCommitMode::Live
+        && matches!(staged.action, StagedSourceAction::FastUnchanged)
+    {
+        return Ok(CommittedModelSource {
+            result: ModelSourceReconciliationResult {
+                provider: staged.discovered.provider,
+                source_key: staged.discovered.source_key.clone(),
+                disposition: ModelSourceReconciliationDisposition::Skipped,
+                observations_written: 0,
+                data_changed: false,
+                diagnostic: None,
+                retained_last_good: false,
+            },
+            notify: None,
+        });
+    }
+
     let event_snapshot = read_model_analytics_event_snapshot(storage)?;
     let attempted_at_ms = Utc::now().timestamp_millis();
     let source_key = staged.discovered.source_key.clone();
@@ -3573,11 +3547,11 @@ fn commit_staged_model_source(
         }
     }
 
-    Ok(CommittedModelSource {
-        result,
-        notify_data_changed,
-        event_snapshot,
-    })
+    let notify = notify_data_changed.map(|data_changed| ModelAnalyticsNotify {
+        snapshot: event_snapshot,
+        data_changed,
+    });
+    Ok(CommittedModelSource { result, notify })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3664,7 +3638,6 @@ fn normalized_source_from_parse(
 }
 
 /// Prune one root only from an explicit complete-inventory proof, then notify.
-#[allow(dead_code)] // T029 invokes pruning after persisted root completion.
 pub(crate) fn prune_completed_model_source_root(
     storage: &Storage,
     app_handle: &tauri::AppHandle,
@@ -3690,7 +3663,6 @@ pub(crate) fn prune_completed_model_source_root(
 
 /// Emit the advisory refresh event from fields captured before the caller's commit.
 /// No fallible storage work occurs here; window delivery remains best-effort.
-#[allow(dead_code)] // T028/T029/T031 also emit after committed status/deletion changes.
 pub(crate) fn emit_model_analytics_updated(
     app_handle: &tauri::AppHandle,
     snapshot: &ModelAnalyticsEventSnapshot,
@@ -3704,5 +3676,392 @@ pub(crate) fn emit_model_analytics_updated(
     };
     if let Err(error) = app_handle.emit(MODEL_ANALYTICS_UPDATED_EVENT, event) {
         log::warn!("Model analytics update event could not be delivered: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude_context<'a>(
+        source_key: &'a str,
+        layout_hint: &'a RetainedJsonlSourceLayoutHint,
+    ) -> ClaudeAdapterContext<'a> {
+        ClaudeAdapterContext {
+            source_key,
+            layout_hint,
+            hostname: Some("host-a"),
+        }
+    }
+
+    fn codex_context<'a>(
+        source_key: &'a str,
+        layout_hint: &'a RetainedJsonlSourceLayoutHint,
+    ) -> CodexAdapterContext<'a> {
+        CodexAdapterContext {
+            source_key,
+            layout_hint,
+            hostname: Some("host-a"),
+        }
+    }
+
+    fn claude_parent_hint() -> RetainedJsonlSourceLayoutHint {
+        RetainedJsonlSourceLayoutHint::ClaudeParent {
+            default_project: "proj".to_string(),
+        }
+    }
+
+    fn codex_token_count_line(
+        timestamp: &str,
+        input_tokens: i64,
+        cached_input_tokens: i64,
+        output_tokens: i64,
+        cache_creation_tokens: i64,
+    ) -> String {
+        format!(
+            "{{\"type\":\"event_msg\",\"timestamp\":\"{timestamp}\",\"payload\":{{\
+             \"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\
+             \"input_tokens\":{input_tokens},\"cached_input_tokens\":{cached_input_tokens},\
+             \"output_tokens\":{output_tokens},\"cache_creation_tokens\":{cache_creation_tokens}}}}}}}}}"
+        )
+    }
+
+    fn codex_session_meta_line(timestamp: &str, session_id: &str) -> String {
+        format!(
+            "{{\"type\":\"session_meta\",\"timestamp\":\"{timestamp}\",\
+             \"payload\":{{\"id\":\"{session_id}\"}}}}"
+        )
+    }
+
+    fn codex_turn_context_line(timestamp: &str, model: &str) -> String {
+        format!(
+            "{{\"type\":\"turn_context\",\"timestamp\":\"{timestamp}\",\
+             \"payload\":{{\"model\":\"{model}\",\"turn_id\":\"turn-1\"}}}}"
+        )
+    }
+
+    fn token_observations(result: &ProviderAdapterParseResult) -> Vec<&NormalizedObservation> {
+        result
+            .observations
+            .iter()
+            .filter(|observation| observation.metadata().kind == ObservationKind::Token)
+            .collect()
+    }
+
+    fn has_diagnostic(result: &ProviderAdapterParseResult, kind: ModelUsageDiagnosticKind) -> bool {
+        let expected = ModelUsageDiagnostic::new(kind);
+        result
+            .diagnostics
+            .iter()
+            .any(|entry| entry.diagnostic.as_str() == expected.as_str())
+    }
+
+    // ---- Claude transcript adapter edge cases ---------------------------
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Claude Transcript Adapter Edge Cases]]
+    #[test]
+    fn claude_truncated_final_line_preserves_prior_observations() {
+        let hint = claude_parent_hint();
+        let contents = concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","message":{"model":"claude-opus-4","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:01:00Z","sessionId":"sess-1","message":{"model":"claude-opus-4","usage":{"input_tokens":7,"output_tokens":3}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-01-"#,
+        );
+
+        let result = parse_claude_model_usage_jsonl(contents, claude_context("sk-claude", &hint));
+
+        assert_eq!(result.observations.len(), 2);
+        assert_eq!(result.counts.malformed_json_records, 1);
+        assert_eq!(result.counts.observations_emitted, 2);
+    }
+
+    #[test]
+    fn claude_sidechain_without_agent_id_is_dropped() {
+        let hint = claude_parent_hint();
+        let contents = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","isSidechain":true,"message":{"model":"claude-opus-4"}}"#;
+
+        let result = parse_claude_model_usage_jsonl(contents, claude_context("sk-claude", &hint));
+
+        assert!(result.observations.is_empty());
+        assert_eq!(result.counts.invalid_identity_records, 1);
+    }
+
+    #[test]
+    fn claude_sidechain_maps_chain_and_parent_from_agent_and_session() {
+        let hint = RetainedJsonlSourceLayoutHint::ClaudeSubagent {
+            default_project: "proj".to_string(),
+        };
+        let contents = r#"{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","isSidechain":true,"agentId":"agent-x","message":{"model":"claude-opus-4"}}"#;
+
+        let result = parse_claude_model_usage_jsonl(contents, claude_context("sk-claude", &hint));
+
+        assert_eq!(result.observations.len(), 1);
+        let metadata = result.observations[0].metadata();
+        assert_eq!(metadata.chain_id, "agent-x");
+        assert_eq!(metadata.parent_chain_id.as_deref(), Some("sess-1"));
+        assert!(metadata.is_sidechain);
+        assert_eq!(metadata.agent_id.as_deref(), Some("agent-x"));
+    }
+
+    #[test]
+    fn claude_negative_epoch_timestamp_is_rejected() {
+        let hint = claude_parent_hint();
+        let contents = r#"{"type":"assistant","timestamp":"1969-01-01T00:00:00Z","sessionId":"sess-1","message":{"model":"claude-opus-4"}}"#;
+
+        let result = parse_claude_model_usage_jsonl(contents, claude_context("sk-claude", &hint));
+
+        assert!(result.observations.is_empty());
+        assert_eq!(result.counts.invalid_timestamp_records, 1);
+    }
+
+    #[test]
+    fn claude_missing_or_non_string_type_counts_unsupported_shape() {
+        let hint = claude_parent_hint();
+        let contents = concat!(
+            "{}",
+            "\n",
+            r#"{"type":123,"timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","message":{}}"#,
+        );
+
+        let result = parse_claude_model_usage_jsonl(contents, claude_context("sk-claude", &hint));
+
+        assert!(result.observations.is_empty());
+        assert_eq!(result.counts.unsupported_shape_records, 2);
+    }
+
+    #[test]
+    fn claude_invalid_token_dimension_emits_observation_with_unavailable_tokens() {
+        let hint = claude_parent_hint();
+        // Each row carries a single invalid dimension and no valid ones, so the
+        // observation still lands but with unavailable token evidence.
+        for usage in [r#"{"input_tokens":-5}"#, r#"{"input_tokens":1.5}"#] {
+            let contents = format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","message":{{"model":"claude-opus-4","usage":{usage}}}}}"#
+            );
+
+            let result =
+                parse_claude_model_usage_jsonl(&contents, claude_context("sk-claude", &hint));
+
+            assert_eq!(result.observations.len(), 1, "usage {usage}");
+            assert_eq!(
+                result.counts.invalid_token_dimension_values, 1,
+                "usage {usage}"
+            );
+            assert!(
+                has_diagnostic(&result, ModelUsageDiagnosticKind::InvalidTokenDimension),
+                "usage {usage} missing invalid-dimension diagnostic"
+            );
+            let observation = &result.observations[0];
+            assert_eq!(
+                observation.token_evidence(),
+                TokenEvidence::Unavailable,
+                "usage {usage}"
+            );
+            assert_eq!(observation.input_tokens(), None, "usage {usage}");
+            assert_eq!(
+                observation.raw_model_id(),
+                Some("claude-opus-4"),
+                "usage {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_model_id_trims_whitespace_and_keeps_blank_or_missing_as_none() {
+        let hint = claude_parent_hint();
+        struct Case {
+            model_field: &'static str,
+            expected_raw: Option<&'static str>,
+            expected_evidence: ModelEvidence,
+        }
+        let cases = [
+            Case {
+                model_field: r#","model":"  claude-opus-4  ""#,
+                expected_raw: Some("claude-opus-4"),
+                expected_evidence: ModelEvidence::Explicit,
+            },
+            Case {
+                model_field: r#","model":"   ""#,
+                expected_raw: None,
+                expected_evidence: ModelEvidence::Invalid,
+            },
+            Case {
+                model_field: "",
+                expected_raw: None,
+                expected_evidence: ModelEvidence::Missing,
+            },
+        ];
+
+        for case in cases {
+            let contents = format!(
+                r#"{{"type":"assistant","timestamp":"2026-01-01T00:00:00Z","sessionId":"sess-1","message":{{"usage":{{"input_tokens":1}}{}}}}}"#,
+                case.model_field
+            );
+
+            let result =
+                parse_claude_model_usage_jsonl(&contents, claude_context("sk-claude", &hint));
+
+            assert_eq!(result.observations.len(), 1, "field {}", case.model_field);
+            let observation = &result.observations[0];
+            assert_eq!(
+                observation.raw_model_id(),
+                case.expected_raw,
+                "field {}",
+                case.model_field
+            );
+            assert_eq!(
+                observation.model_evidence(),
+                case.expected_evidence,
+                "field {}",
+                case.model_field
+            );
+        }
+    }
+
+    // ---- Codex cumulative-delta reconstruction --------------------------
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Codex Cumulative Delta Reconstruction]]
+    #[test]
+    fn codex_monotonic_totals_reconstruct_per_turn_deltas() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let contents = [
+            codex_session_meta_line("2026-01-01T00:00:00Z", "sess-1"),
+            codex_token_count_line("2026-01-01T00:00:01Z", 100, 0, 50, 0),
+            codex_token_count_line("2026-01-01T00:00:02Z", 250, 40, 130, 0),
+            codex_token_count_line("2026-01-01T00:00:03Z", 400, 90, 200, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        let tokens = token_observations(&result);
+        assert_eq!(tokens.len(), 3);
+        // Inclusive input decomposes into new-input plus cache-read per interval.
+        let expected = [
+            (100_i64, 50_i64, 0_i64, 0_i64),
+            (110, 80, 0, 40),
+            (100, 70, 0, 50),
+        ];
+        for (index, (input, output, cache_creation, cache_read)) in expected.iter().enumerate() {
+            let observation = tokens[index];
+            assert_eq!(observation.token_evidence(), TokenEvidence::CumulativeDelta);
+            assert_eq!(
+                observation.input_tokens(),
+                Some(*input),
+                "turn {index} input"
+            );
+            assert_eq!(
+                observation.output_tokens(),
+                Some(*output),
+                "turn {index} output"
+            );
+            assert_eq!(
+                observation.cache_creation_tokens(),
+                Some(*cache_creation),
+                "turn {index} cache_creation"
+            );
+            assert_eq!(
+                observation.cache_read_tokens(),
+                Some(*cache_read),
+                "turn {index} cache_read"
+            );
+        }
+        assert_eq!(result.counts.cumulative_reset_dimensions, 0);
+    }
+
+    #[test]
+    fn codex_decreasing_counter_resets_baseline_without_negative_delta() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let contents = [
+            codex_session_meta_line("2026-01-01T00:00:00Z", "sess-1"),
+            codex_token_count_line("2026-01-01T00:00:01Z", 100, 0, 200, 0),
+            // Output counter drops from 200 to 50: baseline resets to the new
+            // value instead of underflowing into a negative delta.
+            codex_token_count_line("2026-01-01T00:00:02Z", 200, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        let tokens = token_observations(&result);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0].output_tokens(), Some(200));
+        assert_eq!(tokens[1].output_tokens(), Some(50));
+        assert_eq!(result.counts.cumulative_reset_dimensions, 1);
+        assert!(has_diagnostic(
+            &result,
+            ModelUsageDiagnosticKind::CumulativeTokenReset
+        ));
+        for observation in &result.observations {
+            for dimension in [
+                observation.input_tokens(),
+                observation.output_tokens(),
+                observation.cache_creation_tokens(),
+                observation.cache_read_tokens(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(dimension >= 0, "no reconstructed delta may be negative");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_session_meta_after_events_still_attributes_observations() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        // session_meta trails the observation records; the two-pass parser must
+        // still resolve native identity before attributing them.
+        let contents = [
+            codex_token_count_line("2026-01-01T00:00:01Z", 100, 0, 50, 0),
+            codex_turn_context_line("2026-01-01T00:00:02Z", "gpt-5-codex"),
+            codex_session_meta_line("2026-01-01T00:00:03Z", "sess-1"),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        assert_eq!(result.observations.len(), 2);
+        assert_eq!(result.counts.invalid_identity_records, 0);
+        assert!(matches!(
+            result.native_identity,
+            ProviderNativeIdentityState::Valid(_)
+        ));
+        for observation in &result.observations {
+            assert_eq!(observation.metadata().source_session_id, "sess-1");
+            assert_eq!(observation.metadata().analytics_session_id, "sess-1");
+        }
+    }
+
+    #[test]
+    fn codex_turn_context_model_stays_separate_from_token_deltas() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let contents = [
+            codex_session_meta_line("2026-01-01T00:00:00Z", "sess-1"),
+            codex_turn_context_line("2026-01-01T00:00:01Z", "gpt-5-codex"),
+            codex_token_count_line("2026-01-01T00:00:02Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+
+        assert_eq!(result.observations.len(), 2);
+        // turn_context carries model identity but never invents token deltas.
+        let turn = &result.observations[0];
+        assert_eq!(turn.metadata().kind, ObservationKind::Turn);
+        assert_eq!(turn.model_evidence(), ModelEvidence::Explicit);
+        assert_eq!(turn.raw_model_id(), Some("gpt-5-codex"));
+        assert_eq!(turn.token_evidence(), TokenEvidence::Unavailable);
+        assert_eq!(turn.input_tokens(), None);
+        // token_count carries deltas but never invents model identity.
+        let token = &result.observations[1];
+        assert_eq!(token.metadata().kind, ObservationKind::Token);
+        assert_eq!(token.model_evidence(), ModelEvidence::Missing);
+        assert_eq!(token.raw_model_id(), None);
+        assert_eq!(token.token_evidence(), TokenEvidence::CumulativeDelta);
+        assert_eq!(token.input_tokens(), Some(100));
+        assert_eq!(token.output_tokens(), Some(50));
     }
 }

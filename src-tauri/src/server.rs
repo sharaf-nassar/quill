@@ -1152,7 +1152,29 @@ async fn post_session_notify(
     {
         Ok(Ok(source)) => source,
         Ok(Err(sessions::RetainedNotifySourceValidationError::Invalid(message))) => {
-            return (StatusCode::BAD_REQUEST, message.to_string());
+            // Model-analytics enumeration must not change existing Session
+            // Search indexing. A path that fails the stricter model-source
+            // policy (wrong layout, symlinked outside the canonical root, a
+            // non-`.jsonl` name, and so on) is still indexed for search
+            // whenever the pre-analytics contract would have accepted it: a
+            // naive existence check. Only model admission is skipped for it.
+            if !std::path::Path::new(&payload.jsonl_path).exists() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "jsonl_path does not exist".to_string(),
+                );
+            }
+            if state.session_index.is_none() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Session index not available".to_string(),
+                );
+            }
+            log::debug!(
+                "Session notify source ineligible for model analytics; indexing for search only: {message}"
+            );
+            queue_session_notify(state.clone(), payload);
+            return (StatusCode::ACCEPTED, "queued".to_string());
         }
         Ok(Err(sessions::RetainedNotifySourceValidationError::Unavailable(message))) => {
             if state.session_index.is_some() {

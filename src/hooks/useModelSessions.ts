@@ -509,21 +509,25 @@ export function useModelSessions(
 					);
 				}
 				validateNextCursor(page.nextCursor, usedCursors);
-				finishRequest(requestScope, request, (latest) => ({
-					...latest,
-					data: {
-						identity: page.identity,
-						total: page.total,
-						nextCursor: page.nextCursor,
-						sessions: appendUniqueSessions(
-							retainedData.sessions,
-							page.sessions,
-						),
-					},
-					loadedPageCount: current.loadedPageCount + 1,
-					usedCursors: [...usedCursors],
-					loadMoreError: null,
-				}));
+				finishRequest(requestScope, request, (latest) => {
+					const retained = latest.data;
+					if (retained === null) return latest;
+					return {
+						...latest,
+						data: {
+							identity: page.identity,
+							total: page.total,
+							nextCursor: page.nextCursor,
+							sessions: appendUniqueSessions(
+								retained.sessions,
+								page.sessions,
+							),
+						},
+						loadedPageCount: latest.loadedPageCount + 1,
+						usedCursors: [...usedCursors],
+						loadMoreError: null,
+					};
+				});
 			})
 			.catch((error: unknown) => {
 				if (!acceptsResponse(requestScope, request)) return;

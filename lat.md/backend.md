@@ -124,6 +124,36 @@ The frontend issues aggregate and history commands together. Each command opens 
 
 Existing session, project, and host deletion transactions select model evidence through retained source ownership, delete observation children first, and leave each matching source suppressed at its last committed content hash. Session deletion matches the provider-qualified analytics/root session so parent and subagent sources are removed together. Project deletion selects a source when its retained `cwd` or any child observation `cwd` matches, then deletes every child of that source to preserve atomic replacement. Unchanged retries remain suppressed; only an atomic changed-content replacement restores evidence. Project rename updates exact-matching source and observation `cwd` fields independently in one transaction, preserving per-record cwd differences. Tauri wrappers perform snapshot reads and mutations off the async command worker, then emit `model-analytics-updated` only after commit. Model evidence has no independent TTL and is not coupled to token-hourly cleanup.
 
+#### Model Analytics Test Specs
+
+Behavior specs for the model-analytics parse and query paths, each covered by exactly one `// @lat:` reference at its representative test.
+
+These unit specs exercise the current working-tree parsers and storage queries directly, without a live Tauri app. They complement the lifecycle prose above by pinning the exact edge-case counters, reconstructed token numbers, and suppression exclusions that the reconciliation and read paths must preserve.
+
+##### Claude Transcript Adapter Edge Cases
+
+[[src-tauri/src/model_usage.rs#parse_claude_model_usage_jsonl]] never lets one bad record abort a source; each edge case degrades to a counter or a null field instead.
+
+Covers a truncated final line that preserves prior observations, sidechain turns missing an agent id, negative epoch timestamps, missing or non-string `type`, invalid token dimensions that still emit an unavailable-token observation, and model-id whitespace trimming where blank or missing ids stay null with no `unknown` synthesis.
+
+##### Codex Cumulative Delta Reconstruction
+
+[[src-tauri/src/model_usage.rs#parse_codex_model_usage_jsonl]] rebuilds per-turn deltas from cumulative `token_count` totals without underflowing or inventing identity.
+
+Asserts exact input and cache-read decomposition across three monotonic turns, a decreasing counter that resets its baseline and emits the reset diagnostic, a trailing `session_meta` that still attributes earlier records under the two-pass invariant, and `turn_context` model evidence kept separate from token-only deltas.
+
+##### Model Sessions Cursor Codec
+
+[[src-tauri/src/storage.rs#encode_model_sessions_cursor]] and its decoder round-trip every cursor field and reject tampered cursors.
+
+A flipped checksum nibble and a truncated envelope both decode to an [[src-tauri/src/storage.rs#ModelSessionsQueryError]] invalid-cursor error rather than a mismatched or partial page.
+
+##### Model History Bucketing and Suppression
+
+[[src-tauri/src/storage.rs#Storage#get_model_history]] and [[src-tauri/src/storage.rs#Storage#get_model_analytics]] bucket seeded evidence and exclude suppressed sources.
+
+Observations seeded through the real [[src-tauri/src/storage.rs#Storage#replace_model_source|replace write path]] land attributed and unattributed tokens in their timestamp-containing fixed buckets with matching aggregate totals and coverage, while a source flipped to suppressed contributes to neither query, guarding the shared [[src-tauri/src/storage.rs#ACTIVE_MODEL_SOURCE_PREDICATE]].
+
 #### Learning System
 
 Tables for the behavioral learning pipeline: observations, summaries, analysis runs, and discovered rules.
@@ -414,7 +444,7 @@ The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
 
-[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits that canonical source to model reconciliation before session-keyed search coalescing; direct `messages` payloads remain search-only.
+[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model reconciliation before session-keyed search coalescing; a resolvable path that fails that stricter model-source policy still coalesces for search only, preserving the pre-analytics indexing contract. Direct `messages` payloads remain search-only.
 
 ### Search Scoring
 

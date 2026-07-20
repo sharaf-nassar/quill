@@ -9,7 +9,6 @@ interface ModelSummaryStripProps {
 	summary: ModelAnalyticsSummary | null;
 	isLoading?: boolean;
 	isRefreshing?: boolean;
-	isProvisional?: boolean;
 }
 
 function formatCoverage(value: number | null): string {
@@ -21,7 +20,6 @@ function ModelSummaryStrip({
 	summary,
 	isLoading = false,
 	isRefreshing = false,
-	isProvisional = false,
 }: ModelSummaryStripProps) {
 	const initialLoading = isLoading && summary === null;
 	const refreshing = isRefreshing || (isLoading && summary !== null);
@@ -34,7 +32,6 @@ function ModelSummaryStrip({
 		"model-summary-strip",
 		initialLoading ? "model-summary-strip--loading" : null,
 		refreshing ? "model-summary-strip--refreshing" : null,
-		isProvisional ? "model-summary-strip--provisional" : null,
 		empty ? "model-summary-strip--empty" : null,
 	]
 		.filter(Boolean)
@@ -94,17 +91,14 @@ function ModelSummaryStrip({
 
 	return (
 		<section className={stateClasses} aria-label="Model usage summary">
-			{refreshing || isProvisional ? (
+			{refreshing ? (
 				<p
 					className="model-summary-strip__status"
 					role="status"
 					aria-live="polite"
 					aria-atomic="true"
 				>
-					{refreshing ? "Refreshing model summary. " : null}
-					{isProvisional
-						? "Results are provisional while retained history is incomplete."
-						: null}
+					Refreshing model summary.
 				</p>
 			) : null}
 

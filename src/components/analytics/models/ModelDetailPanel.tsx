@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useId, useMemo, useState } from "react";
 import type { UseModelSessionsResult } from "../../../hooks/useModelSessions";
 import type { UseSessionModelHistoryResult } from "../../../hooks/useSessionModelHistory";
 import type {
@@ -8,6 +8,7 @@ import type {
 	SessionModelHistoryResponse,
 	SessionModelSegment,
 } from "../../../types";
+import { modelIdentityKey } from "../../../types";
 
 const COUNT_FORMATTER = new Intl.NumberFormat("en-US");
 const DATE_TIME_FORMATTER = new Intl.DateTimeFormat(undefined, {
@@ -42,10 +43,6 @@ function formatDateTime(value: string): string {
 	return Number.isFinite(timestamp.getTime())
 		? DATE_TIME_FORMATTER.format(timestamp)
 		: value;
-}
-
-function modelIdentityKey(identity: ModelIdentity): string {
-	return JSON.stringify([identity.provider, identity.modelId]);
 }
 
 function sessionIdentityKey(session: ModelSessionRow): string {
@@ -356,12 +353,12 @@ function ModelSessionDisclosure({
 
 				<span className="model-detail-panel__session-usage">
 					<span>
-						{COUNT_FORMATTER.format(session.selectedModelTokens)} selected-model
-						tokens
+						{COUNT_FORMATTER.format(session.selectedModelTokens)} selected-model{" "}
+						{session.selectedModelTokens === 1 ? "token" : "tokens"}
 					</span>
 					<span>
-						{COUNT_FORMATTER.format(session.selectedModelTurns)} selected-model
-						turns
+						{COUNT_FORMATTER.format(session.selectedModelTurns)} selected-model{" "}
+						{session.selectedModelTurns === 1 ? "turn" : "turns"}
 					</span>
 					<span>
 						Last activity <Timestamp value={session.lastActivityAt} />
@@ -373,8 +370,10 @@ function ModelSessionDisclosure({
 						Primary <Identity identity={session.primaryModel} />
 					</span>
 					<span>
-						{COUNT_FORMATTER.format(session.distinctModels)} distinct models ·{" "}
-						{COUNT_FORMATTER.format(session.chainCount)} chains
+						{COUNT_FORMATTER.format(session.distinctModels)} distinct{" "}
+						{session.distinctModels === 1 ? "model" : "models"} ·{" "}
+						{COUNT_FORMATTER.format(session.chainCount)}{" "}
+						{session.chainCount === 1 ? "chain" : "chains"}
 					</span>
 					{session.hasWithinChainSwitches ? (
 						<span className="model-detail-panel__switch-indicator">
@@ -441,6 +440,37 @@ function ModelSessionDisclosure({
 				) : null}
 			</div>
 		</li>
+	);
+}
+
+interface RetryableErrorProps {
+	message: ReactNode;
+	actionLabel: string;
+	ariaLabel: string;
+	onRetry: () => void;
+	busy: boolean;
+}
+
+function RetryableError({
+	message,
+	actionLabel,
+	ariaLabel,
+	onRetry,
+	busy,
+}: RetryableErrorProps) {
+	return (
+		<div className="model-detail-panel__error" role="alert">
+			<span>{message}</span>
+			<button
+				type="button"
+				className="model-detail-panel__retry"
+				aria-label={ariaLabel}
+				onClick={onRetry}
+				disabled={busy}
+			>
+				{actionLabel}
+			</button>
+		</div>
 	);
 }
 
@@ -549,18 +579,13 @@ export function ModelDetailPanel({
 			) : null}
 
 			{modelSessions.initial.error !== null && modelSessions.data === null ? (
-				<div className="model-detail-panel__error" role="alert">
-					<span>{modelSessions.initial.error.message}</span>
-					<button
-						type="button"
-						className="model-detail-panel__retry"
-						aria-label="Retry loading selected model sessions"
-						onClick={modelSessions.initial.retry}
-						disabled={busy}
-					>
-						Retry loading sessions
-					</button>
-				</div>
+				<RetryableError
+					message={modelSessions.initial.error.message}
+					actionLabel="Retry loading sessions"
+					ariaLabel="Retry loading selected model sessions"
+					onRetry={modelSessions.initial.retry}
+					busy={busy}
+				/>
 			) : null}
 
 			{modelSessions.replay.loading && modelSessions.data !== null ? (
@@ -575,23 +600,20 @@ export function ModelDetailPanel({
 			) : null}
 
 			{modelSessions.replay.error !== null ? (
-				<div className="model-detail-panel__error" role="alert">
-					<span>
-						{modelSessions.replay.error.message}
-						{modelSessions.data === null
-							? ""
-							: " Last loaded sessions remain visible."}
-					</span>
-					<button
-						type="button"
-						className="model-detail-panel__retry"
-						aria-label="Retry refreshing selected model sessions"
-						onClick={modelSessions.replay.retry}
-						disabled={busy}
-					>
-						Retry refreshing sessions
-					</button>
-				</div>
+				<RetryableError
+					message={
+						<>
+							{modelSessions.replay.error.message}
+							{modelSessions.data === null
+								? ""
+								: " Last loaded sessions remain visible."}
+						</>
+					}
+					actionLabel="Retry refreshing sessions"
+					ariaLabel="Retry refreshing selected model sessions"
+					onRetry={modelSessions.replay.retry}
+					busy={busy}
+				/>
 			) : null}
 
 			{sessions !== null && sessions.length === 0 ? (
@@ -623,23 +645,20 @@ export function ModelDetailPanel({
 			) : null}
 
 			{modelSessions.loadMore.error !== null ? (
-				<div className="model-detail-panel__error" role="alert">
-					<span>
-						{modelSessions.loadMore.error.message}
-						{modelSessions.data === null
-							? ""
-							: " Loaded sessions remain visible."}
-					</span>
-					<button
-						type="button"
-						className="model-detail-panel__retry"
-						aria-label="Retry loading more selected model sessions"
-						onClick={modelSessions.loadMore.retry}
-						disabled={busy}
-					>
-						Retry loading more sessions
-					</button>
-				</div>
+				<RetryableError
+					message={
+						<>
+							{modelSessions.loadMore.error.message}
+							{modelSessions.data === null
+								? ""
+								: " Loaded sessions remain visible."}
+						</>
+					}
+					actionLabel="Retry loading more sessions"
+					ariaLabel="Retry loading more selected model sessions"
+					onRetry={modelSessions.loadMore.retry}
+					busy={busy}
+				/>
 			) : null}
 
 			{modelSessions.loadMore.hasMore ? (
