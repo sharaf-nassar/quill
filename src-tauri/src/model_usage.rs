@@ -28,6 +28,10 @@ use crate::storage::{
     ModelSourceReplacementOutcome, Storage, StoredModelSource, classify_model_source_change,
     model_source_fast_fingerprint,
 };
+use crate::transcript_identity::{
+    IdentityError, JsonlRecord, NativeChainIdentity, RETAINED_TRANSCRIPT_MAX_BYTES,
+    SourceRootGraph, resolve_codex_native_identity,
+};
 
 const MODEL_ID_MAX_SCALARS: usize = 256;
 const TOKEN_COUNT_MAX: i64 = 100_000_000;
@@ -1282,13 +1286,13 @@ pub(crate) fn parse_codex_model_usage_jsonl(
         counts: ProviderAdapterParseCounts::default(),
     };
 
-    // Resolve session_meta in a complete first pass so an observation can be
-    // attributed even when provider metadata appears later in the source.
-    // Observation-bearing records are parsed once here and buffered for the
-    // second pass so no line is deserialized twice.
+    // Decode once, then let the shared native resolver select the child chain
+    // before any observation is emitted. Model counters remain adapter-owned.
+    let mut identity_records = Vec::<JsonlRecord>::new();
     let mut deferred_records = Vec::<(u64, serde_json::Map<String, Value>)>::new();
-    // Ancestor thread ids a forked rollout may restate after the child's meta.
-    let mut expected_ancestors = Vec::<String>::new();
+    let mut metadata_activity = Vec::<i64>::new();
+    let mut first_metadata_session_id: Option<String> = None;
+    let mut first_metadata_cwd: Option<PathBuf> = None;
     for (line_index, line) in contents.lines().enumerate() {
         result.counts.lines_seen = result.counts.lines_seen.saturating_add(1);
         let source_ordinal = u64::try_from(line_index).unwrap_or(u64::MAX);
@@ -1321,7 +1325,6 @@ pub(crate) fn parse_codex_model_usage_jsonl(
                 continue;
             }
         };
-
         let Some(record_type) = record.get("type").and_then(Value::as_str) else {
             result.counts.unsupported_shape_records =
                 result.counts.unsupported_shape_records.saturating_add(1);
@@ -1405,41 +1408,69 @@ pub(crate) fn parse_codex_model_usage_jsonl(
                 continue;
             }
         };
-        let parent_chain_id = parent_thread_id.or(forked_from_id);
+        let _parent_chain_id = parent_thread_id.or(forked_from_id);
+        identity_records.push(JsonlRecord {
+            ordinal: source_ordinal,
+            value: Value::Object(record.clone()),
+        });
         let cwd = nonempty_record_string(payload.get("cwd")).map(PathBuf::from);
-        let is_sidechain = parent_chain_id.is_some();
-        let record_metadata = ProviderNativeSourceMetadata {
-            provider: IntegrationProvider::Codex,
-            source_key: context.source_key.to_owned(),
-            source_session_id: source_session_id.clone(),
-            analytics_session_id: source_session_id.clone(),
-            chain_id: source_session_id,
-            parent_chain_id,
-            is_sidechain,
-            agent_id: None,
-            cwd,
-            hostname: context.hostname.map(str::to_owned),
-            first_activity_at_ms: observed_at_ms,
-            last_activity_at_ms: observed_at_ms,
-        };
-
-        if !accept_codex_native_source(
-            &mut result,
-            &mut expected_ancestors,
-            record_metadata,
-            source_ordinal,
-        ) {
-            result.counts.native_metadata_conflict_records = result
+        let is_child_metadata = first_metadata_session_id
+            .as_ref()
+            .is_none_or(|first_id| first_id == &source_session_id);
+        if first_metadata_session_id.is_none() {
+            first_metadata_session_id = Some(source_session_id);
+        }
+        if is_child_metadata {
+            metadata_activity.push(observed_at_ms);
+        }
+        if is_child_metadata
+            && first_metadata_cwd.is_some()
+            && cwd.is_some()
+            && first_metadata_cwd != cwd
+        {
+            result.counts.contextual_metadata_conflict_records = result
                 .counts
-                .native_metadata_conflict_records
+                .contextual_metadata_conflict_records
                 .saturating_add(1);
             push_adapter_diagnostic(
                 &mut result,
                 source_ordinal,
-                ModelUsageDiagnosticKind::RecordSkipped,
+                ModelUsageDiagnosticKind::ContextualMetadataConflict,
             );
+        } else if is_child_metadata && first_metadata_cwd.is_none() {
+            first_metadata_cwd = cwd;
         }
     }
+
+    result.native_identity = match resolve_codex_native_identity(&identity_records) {
+        Ok(native) => {
+            let first_activity_at_ms = metadata_activity.iter().copied().min().unwrap_or(0);
+            let last_activity_at_ms = metadata_activity.iter().copied().max().unwrap_or(0);
+            ProviderNativeIdentityState::Valid(Box::new(ProviderNativeSourceMetadata {
+                provider: native.provider,
+                source_key: context.source_key.to_owned(),
+                source_session_id: native.source_session_id.clone(),
+                analytics_session_id: native.source_session_id,
+                chain_id: native.chain_id,
+                parent_chain_id: native.parent_chain_id,
+                is_sidechain: native.is_sidechain,
+                agent_id: native.agent_id,
+                cwd: native.cwd,
+                hostname: context.hostname.map(str::to_owned),
+                first_activity_at_ms,
+                last_activity_at_ms,
+            }))
+        }
+        Err(IdentityError::MissingNativeIdentity) => ProviderNativeIdentityState::Absent,
+        Err(IdentityError::ConflictingNativeIdentity) => {
+            result.counts.native_metadata_conflict_records = result
+                .counts
+                .native_metadata_conflict_records
+                .saturating_add(1);
+            push_adapter_diagnostic(&mut result, 0, ModelUsageDiagnosticKind::RecordSkipped);
+            ProviderNativeIdentityState::Conflicted
+        }
+    };
 
     if matches!(
         &result.native_identity,
@@ -1474,79 +1505,6 @@ pub(crate) fn parse_codex_model_usage_jsonl(
 
     apply_carry_forward_attribution(&mut result);
     result
-}
-
-fn accept_codex_native_source(
-    result: &mut ProviderAdapterParseResult,
-    expected_ancestors: &mut Vec<String>,
-    record_metadata: ProviderNativeSourceMetadata,
-    source_ordinal: u64,
-) -> bool {
-    match &result.native_identity {
-        ProviderNativeIdentityState::Absent => {
-            if let Some(parent_chain_id) = &record_metadata.parent_chain_id {
-                expected_ancestors.push(parent_chain_id.clone());
-            }
-            result.native_identity = ProviderNativeIdentityState::Valid(Box::new(record_metadata));
-            return true;
-        }
-        ProviderNativeIdentityState::Conflicted => return false,
-        ProviderNativeIdentityState::Valid(native_source)
-            if native_source.source_session_id != record_metadata.source_session_id
-                || native_source.parent_chain_id != record_metadata.parent_chain_id =>
-        {
-            // Forked subagent rollouts restate the whole ancestor chain after
-            // the child's own meta: each later record names an ancestor the
-            // previous link declared, and may declare its own parent in turn.
-            // Accept restatements and keep the child identity untouched.
-            if expected_ancestors.contains(&record_metadata.source_session_id) {
-                if let Some(parent_chain_id) = record_metadata.parent_chain_id
-                    && !expected_ancestors.contains(&parent_chain_id)
-                {
-                    expected_ancestors.push(parent_chain_id);
-                }
-                return true;
-            }
-            result.native_identity = ProviderNativeIdentityState::Conflicted;
-            return false;
-        }
-        ProviderNativeIdentityState::Valid(_) => {}
-    }
-
-    let cwd_conflicts = result.valid_native_source().is_some_and(|native_source| {
-        native_source.cwd.is_some()
-            && record_metadata.cwd.is_some()
-            && native_source.cwd != record_metadata.cwd
-    });
-    if cwd_conflicts {
-        // CWD is contextual rather than graph identity. Isolate the later
-        // value while retaining the valid thread and its observations.
-        result.counts.contextual_metadata_conflict_records = result
-            .counts
-            .contextual_metadata_conflict_records
-            .saturating_add(1);
-        push_adapter_diagnostic(
-            result,
-            source_ordinal,
-            ModelUsageDiagnosticKind::ContextualMetadataConflict,
-        );
-    }
-
-    let Some(native_source) = result.valid_native_source_mut() else {
-        return false;
-    };
-
-    native_source.first_activity_at_ms = native_source
-        .first_activity_at_ms
-        .min(record_metadata.first_activity_at_ms);
-    native_source.last_activity_at_ms = native_source
-        .last_activity_at_ms
-        .max(record_metadata.last_activity_at_ms);
-    if native_source.cwd.is_none() {
-        native_source.cwd = record_metadata.cwd;
-    }
-
-    true
 }
 
 fn parse_codex_turn_context(
@@ -2141,18 +2099,16 @@ struct StagedModelSource {
 }
 
 impl StagedModelSource {
-    fn native_graph_metadata(&self) -> Option<SourceGraphMetadata> {
+    fn native_graph_metadata(&self) -> Option<NativeChainIdentity> {
         if self.action == StagedSourceAction::Replace {
             return self
                 .parsed
                 .as_ref()
                 .and_then(ProviderAdapterParseResult::valid_native_source)
-                .map(SourceGraphMetadata::from_native);
+                .map(native_graph_metadata);
         }
 
-        self.existing
-            .as_ref()
-            .and_then(SourceGraphMetadata::from_stored)
+        self.existing.as_ref().and_then(stored_graph_metadata)
     }
 
     fn fail(&mut self, diagnostic: ModelUsageDiagnostic) {
@@ -2242,121 +2198,33 @@ impl CompletedModelSourceRoot {
     }
 }
 
-#[derive(Clone, Debug)]
-struct SourceGraphMetadata {
-    provider: IntegrationProvider,
-    chain_id: String,
-    parent_chain_id: Option<String>,
-}
-
-impl SourceGraphMetadata {
-    fn from_native(native: &ProviderNativeSourceMetadata) -> Self {
-        Self {
-            provider: native.provider,
-            chain_id: native.chain_id.clone(),
-            parent_chain_id: native.parent_chain_id.clone(),
-        }
-    }
-
-    fn from_stored(stored: &StoredModelSource) -> Option<Self> {
-        Some(Self {
-            provider: stored.provider,
-            chain_id: stored.last_good.chain_id.clone()?,
-            parent_chain_id: stored.last_good.parent_chain_id.clone(),
-        })
+fn native_graph_metadata(native: &ProviderNativeSourceMetadata) -> NativeChainIdentity {
+    NativeChainIdentity {
+        provider: native.provider,
+        source_session_id: native.source_session_id.clone(),
+        chain_id: native.chain_id.clone(),
+        parent_chain_id: native.parent_chain_id.clone(),
+        is_sidechain: native.is_sidechain,
+        agent_id: native.agent_id.clone(),
+        cwd: native.cwd.clone(),
     }
 }
 
-#[derive(Clone, Debug)]
-struct RootGraphNode {
-    parent_chain_id: Option<String>,
-    conflicted: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ProviderChainKey {
-    provider: &'static str,
-    chain_id: String,
-}
-
-impl ProviderChainKey {
-    fn new(provider: IntegrationProvider, chain_id: &str) -> Self {
-        Self {
-            provider: provider.as_str(),
-            chain_id: chain_id.to_owned(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RootGraphResolutionError {
-    ConflictingParents,
-    ParentCycle,
-}
-
-impl fmt::Display for RootGraphResolutionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::ConflictingParents => "provider-native chain has conflicting parents",
-            Self::ParentCycle => "provider-native parent graph contains a cycle",
-        })
-    }
-}
-
-struct SourceRootGraph {
-    nodes: HashMap<ProviderChainKey, RootGraphNode>,
-}
-
-impl SourceRootGraph {
-    fn from_metadata(metadata: impl IntoIterator<Item = SourceGraphMetadata>) -> Self {
-        let mut nodes = HashMap::<ProviderChainKey, RootGraphNode>::new();
-        for source in metadata {
-            let key = ProviderChainKey::new(source.provider, &source.chain_id);
-            match nodes.get_mut(&key) {
-                Some(node) if node.parent_chain_id != source.parent_chain_id => {
-                    node.conflicted = true;
-                }
-                Some(_) => {}
-                None => {
-                    nodes.insert(
-                        key,
-                        RootGraphNode {
-                            parent_chain_id: source.parent_chain_id,
-                            conflicted: false,
-                        },
-                    );
-                }
-            }
-        }
-        Self { nodes }
-    }
-
-    fn resolve(
-        &self,
-        provider: IntegrationProvider,
-        chain_id: &str,
-    ) -> Result<String, RootGraphResolutionError> {
-        let mut current = chain_id.to_owned();
-        let mut visited = HashSet::<String>::new();
-        loop {
-            if !visited.insert(current.clone()) {
-                return Err(RootGraphResolutionError::ParentCycle);
-            }
-            let key = ProviderChainKey::new(provider, &current);
-            let Some(node) = self.nodes.get(&key) else {
-                // A native parent ID remains reliable even when the parent's
-                // transcript has not been retained or discovered yet.
-                return Ok(current);
-            };
-            if node.conflicted {
-                return Err(RootGraphResolutionError::ConflictingParents);
-            }
-            let Some(parent) = &node.parent_chain_id else {
-                return Ok(current);
-            };
-            current.clone_from(parent);
-        }
-    }
+fn stored_graph_metadata(stored: &StoredModelSource) -> Option<NativeChainIdentity> {
+    let chain_id = stored.last_good.chain_id.clone()?;
+    Some(NativeChainIdentity {
+        provider: stored.provider,
+        source_session_id: stored
+            .last_good
+            .source_session_id
+            .clone()
+            .unwrap_or_else(|| chain_id.clone()),
+        chain_id,
+        parent_chain_id: stored.last_good.parent_chain_id.clone(),
+        is_sidechain: stored.last_good.is_sidechain,
+        agent_id: stored.last_good.agent_id.clone(),
+        cwd: stored.last_good.cwd.clone(),
+    })
 }
 
 /// Owned, fully parsed reconciliation work for one complete inventory snapshot.
@@ -3166,8 +3034,6 @@ fn stage_source_content(staged: &mut StagedModelSource, hostname: &str) {
 /// read into memory, so a pathological or corrupt transcript cannot OOM the
 /// indexer. Oversize sources fail like any other unreadable source, which
 /// conservatively suppresses pruning for their root until they shrink again.
-const MODEL_SOURCE_MAX_BYTES: u64 = 256 * 1024 * 1024;
-
 fn read_stable_source_bytes(
     discovered: &DiscoveredRetainedJsonlSource,
     expected_fast: ModelSourceFastFingerprint,
@@ -3176,9 +3042,11 @@ fn read_stable_source_bytes(
 
     // Reject a known-oversize source from its already-collected fingerprint
     // before opening it, so a huge transcript is never read into memory.
-    if u64::try_from(expected_fast.size_bytes()).is_ok_and(|size| size > MODEL_SOURCE_MAX_BYTES) {
+    if u64::try_from(expected_fast.size_bytes())
+        .is_ok_and(|size| size > RETAINED_TRANSCRIPT_MAX_BYTES)
+    {
         return Err(format!(
-            "source exceeds {MODEL_SOURCE_MAX_BYTES}-byte model reconciliation cap"
+            "source exceeds {RETAINED_TRANSCRIPT_MAX_BYTES}-byte model reconciliation cap"
         ));
     }
 
@@ -3189,12 +3057,12 @@ fn read_stable_source_bytes(
     let file = std::fs::File::open(&discovered.canonical_path)
         .map_err(|error| format!("open complete source bytes: {error}"))?;
     let mut contents = Vec::new();
-    file.take(MODEL_SOURCE_MAX_BYTES.saturating_add(1))
+    file.take(RETAINED_TRANSCRIPT_MAX_BYTES.saturating_add(1))
         .read_to_end(&mut contents)
         .map_err(|error| format!("read complete source bytes: {error}"))?;
-    if contents.len() as u64 > MODEL_SOURCE_MAX_BYTES {
+    if contents.len() as u64 > RETAINED_TRANSCRIPT_MAX_BYTES {
         return Err(format!(
-            "source grew past {MODEL_SOURCE_MAX_BYTES}-byte model reconciliation cap while reading"
+            "source grew past {RETAINED_TRANSCRIPT_MAX_BYTES}-byte model reconciliation cap while reading"
         ));
     }
 
@@ -3417,7 +3285,7 @@ fn build_source_root_graph(
         {
             continue;
         }
-        if let Some(source_metadata) = SourceGraphMetadata::from_stored(source) {
+        if let Some(source_metadata) = stored_graph_metadata(source) {
             metadata.push(source_metadata);
         }
     }
@@ -3487,7 +3355,7 @@ fn build_scoped_source_root_graph(
         if staged_keys.contains(key) {
             continue;
         }
-        if let Some(source_metadata) = SourceGraphMetadata::from_stored(source) {
+        if let Some(source_metadata) = stored_graph_metadata(source) {
             metadata.push(source_metadata);
         }
     }

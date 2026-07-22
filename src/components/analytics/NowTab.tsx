@@ -188,7 +188,7 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 							trend={null}
 							sparkline={runtimeStats.sparkline}
 							accentColor="#34d399"
-							description="Total active time across CC and Codex sessions in this window — model generation, reasoning, and tool execution counted together. User-idle gaps over 5 minutes are excluded; tool waits are not."
+							description="Total parent and sub-agent LLM work in this window. Concurrent chains are additive; model generation, reasoning, and tool execution count together. User-idle gaps over 5 minutes are excluded, while tool waits are capped."
 						/>
 						<InsightCard
 							label="Preserved"

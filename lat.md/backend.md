@@ -10,6 +10,8 @@ It communicates with the frontend through a broad Tauri IPC surface and document
 
 Tauri plugins configured: `tauri-plugin-log`, `tauri-plugin-updater`, `tauri-plugin-process`, `tauri-plugin-window-state`. Session transcript catch-up is no longer part of app launch; the Sessions window requests an incremental sync when search is opened.
 
+[[src-tauri/src/lib.rs#initialize_storage_or_report_fatal]] publishes the process-wide storage handle or returns `None`, and the setup path abandons the rest of startup rather than running against absent storage. It never calls `process::exit` itself: a bare exit made a failed migration look like an app that silently refuses to launch. [[src-tauri/src/lib.rs#report_fatal_storage_failure]] instead hides (not closes — a close on the last window requests app exit and would race the dialog away) every window and queues a `tauri-plugin-dialog` error dialog naming the failure and the database folder, exiting from the dialog callback. The dialog cannot be shown synchronously because setup runs inside the event loop's `Ready` handler and `blocking_show` would freeze the thread it needs. Because termination then hangs off a callback, a session with no working dialog backend would leave a hidden UI-less process alive forever, so a watchdog armed alongside the dialog exits after `FATAL_STORAGE_DIALOG_TIMEOUT` (60s) regardless. Callback and watchdog race for one function-scoped `AtomicBool`, so exactly one terminates and the loser is a no-op.
+
 ## HTTP API Server
 
 [[src-tauri/src/server.rs]] (995 lines) runs an Axum HTTP server on port 19876 (configurable via `QUILL_PORT` env var) to receive data from external hook scripts.
@@ -71,7 +73,7 @@ The SQLite database file path varies by operating system.
 
 ### Schema
 
-The database schema is versioned through migration 28 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
+The database schema is versioned through migration 32 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
 
 #### Usage Tracking
 
@@ -177,7 +179,7 @@ Startup also creates covering observation indexes for `(created_at, tool_name)` 
 
 Stores detailed tool invocation and response-time data for MCP-powered session search.
 
-- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. Startup and notify-driven reindexing batch these inserts per extracted message set so analytics queries do not wait behind one transaction per message.
+- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. Retained transcript rows are committed only through source-owned snapshot replacement.
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
 
 #### Skill Usages
@@ -188,13 +190,13 @@ Recognized `SKILL.md` loads derived during the same Session Indexing extraction 
 
 [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]] recognizes three ingest shapes: Codex `exec_command` calls that read a `SKILL.md` path with `cat`/`head`/`tail`/etc., Claude `Read` calls against a `SKILL.md` path, and Claude `Skill` tool calls. The `Skill` arm normalizes the `skill` input via [[src-tauri/src/sessions.rs#skill_access_from_skill_tool_input]] by stripping any `plugin:` prefix so Claude rows merge with Codex's bare folder names (e.g. Claude `superpowers:using-superpowers` collapses onto Codex `using-superpowers`), and synthesizes a `skill://<raw>` path that preserves the original identifier for forensic drilldowns without colliding with filesystem paths.
 
-`cwd` and `hostname` are populated at ingest from JSONL transcripts: Claude pulls `cwd` from each record's top-level field, Codex threads the session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and the hostname is captured once per batch via [[src-tauri/src/sessions.rs#SessionIndex#local_hostname]] inside [[src-tauri/src/storage.rs#Storage#store_skill_usages_for_messages]]. The HTTP message-ingest path leaves `cwd` null because the payload has no per-message cwd today.
+`cwd` and `hostname` are populated in source-owned snapshots: Claude pulls `cwd` from each record's top-level field, Codex threads session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and reconciliation captures the local hostname once per source. The HTTP message-ingest path leaves skill usage empty because its flattened payload has no tool-action detail.
 
 #### Hook Invocations
 
 Observed lifecycle-hook fires keyed for the Now-tab Hooks breakdown. Claude rows come from transcript extraction during the dual-emission pass; Codex rows arrive live via a dedicated HTTP endpoint because Codex rollouts do not log hook executions.
 
-- **hook_invocations** — One row per observed hook fire (provider, session_id, agent_id, is_sidechain, timestamp, hook_event, hook_matcher, tool_name, hook_identity, script_command_raw, exit_code, duration_ms, cwd, hostname, message_id). Unique on (provider, session_id, COALESCE(agent_id,''), timestamp, hook_identity). Indexed on provider+timestamp, provider+session, identity+timestamp, and identity+cwd for per-project drilldowns. Migration 27 creates the table and sets `hook_invocation_reingest_pending = '1'` so existing Claude transcripts backfill on the next mtime sweep.
+- **hook_invocations** — One row per observed hook fire (provider, session_id, chain_id, parent_chain_id, agent_id, is_sidechain, timestamp, hook_event, hook_matcher, tool_name, hook_identity, script_command_raw, exit_code, duration_ms, cwd, hostname, message_id). Owned hooks are unique on `(provider, source_key, chain_id, timestamp, hook_identity)`; source-less hooks use `(provider, session_id, chain_id, timestamp, hook_identity)`. `agent_id` remains attribution, not identity. Migration 30 rebuilds retained Claude rows through source reconciliation while preserving deduplicated source-less Codex observations.
 
 [[src-tauri/src/sessions.rs#extract_hook_invocation_from_attachment]] recognizes records whose `attachment.type` begins `hook_` (covering `hook_success`, `hook_failure`, `hook_timeout`, `hook_blocked`) and maps `hookEvent`, `hookName`, `command`, `exitCode`, and `durationMs` onto the row. The Claude attachment's matcher half of `hookName` (e.g., the `Bash` in `PreToolUse:Bash`) becomes `hook_matcher`, and when the event is `PreToolUse` or `PostToolUse` it also fills `tool_name` so per-tool breakdowns work without a separate column lookup.
 
@@ -202,9 +204,9 @@ Observed lifecycle-hook fires keyed for the Now-tab Hooks breakdown. Claude rows
 
 Codex rows are inserted by [[src-tauri/src/storage.rs#Storage#store_codex_hook_observation]] from the `POST /api/v1/hooks/observed` background blocking task. Codex identity is event-scoped (`hook_event` with an optional `:tool_name` suffix when the event is `PreToolUse` or `PostToolUse`) because the deployed `hook-observe.cjs` observer (`src-tauri/codex-integration/scripts/hook-observe.cjs`) fires on every event without per-script attribution — Codex registers multiple scripts per event and the observer cannot identify which sibling script ran. Quill ships its own Codex hooks (`session-sync.cjs`, `context-capture.cjs`, `context-router.cjs`, `observe.cjs`, `report-tokens.sh`, plus the new `hook-observe.cjs` itself when `activity_tracking` is on); third-party Codex hooks fire but are not attributed beyond the event level. Codex telemetry is gated on the same `activity_tracking` IntegrationFeatures flag that already gates `observe.cjs`.
 
-The endpoint accepts observations only for a ten-event whitelist (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest`) after the `SubagentStart`/`SubagentStop` lifecycle events were added, and length-caps `agent_id` exactly as it caps `tool_name`. [[src-tauri/src/models.rs#CodexHookObservation]] now carries a serde-defaulted `agent_id: Option<String>` that `hook-observe.cjs` sends on every payload, and `store_codex_hook_observation` threads it into the row insert — feeding the `COALESCE(agent_id,'')` uniqueness component — while the `hook_identity` computation stays event-scoped and unchanged.
+The endpoint accepts observations only for a ten-event whitelist (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest`) after the `SubagentStart`/`SubagentStop` lifecycle events were added, and length-caps `agent_id` exactly as it caps `tool_name`. [[src-tauri/src/models.rs#CodexHookObservation]] carries a serde-defaulted `agent_id: Option<String>` that `hook-observe.cjs` sends on every payload, and `store_codex_hook_observation` preserves that optional attribution while the source-less chain remains the incoming session id. The `hook_identity` computation stays event-scoped and unchanged.
 
-Session-deletion cascades into hook_invocations via [[src-tauri/src/storage.rs#Storage#delete_hook_invocations_for_session]], and per-cwd and per-host cleanups follow the same pattern as `skill_usages` and `session_events`.
+[[src-tauri/src/storage.rs#Storage#delete_session_data]] cascades direct deletion through all five analytics tables. Project and host deletion use retained registry ownership and recorded live origin instead of row-local guesses.
 
 Known limitation (Claude side): transcript extraction only sees hook fires that Claude Code records as `hook_*` attachment records, which it writes only for hooks that produce output or fail. Silent, always-on Quill hooks — `observe.cjs`, `session-sync.cjs`, `report-tokens.sh`, and `qbuild-guard.sh` — succeed without emitting output, so they never appear as attachments and are undercounted in the Hooks breakdown. Closing the gap needs a Claude-side live observer with a dedup design against the transcript-derived rows so the same fire is not double-counted; that observer is deliberately not shipped yet.
 
@@ -232,16 +234,192 @@ Tables for tracking memory files, optimization runs, and actionable suggestions 
 - **optimization_runs** — Optimization run records (project_path, trigger, memories_scanned, suggestions_created, status, timestamps).
 - **optimization_suggestions** — Suggestions with lifecycle (run_id FK, action_type, target_file, reasoning, proposed_content, status, backup_data, group_id). Indexed on run_id, project_path+status, group_id.
 
+#### Source-Owned Transcript Analytics
+
+Migration 30 establishes source and chain identity for transcript-derived analytics while preserving live rows as source-less data.
+
+`session_events`, `response_times`, `tool_actions`, `skill_usages`, and `hook_invocations` carry nullable `source_key`, required resolved-root `session_id`, required native `chain_id`, and nullable `parent_chain_id`. Events and tool actions also carry stable `event_key` and `action_key` identities; missing tool IDs fall back to message/block identity or source-record/block ordinals. Partial unique indexes separate source-owned replay identity from source-less live identity, and each table has a `(provider, source_key)` lookup index.
+
+Owned/live identities are respectively: `session_events` `(provider, source_key, event_key)` / `(provider, session_id, event_key)`; `response_times` `(provider, source_key, chain_id, timestamp)` / `(provider, session_id, chain_id, timestamp)`; `tool_actions` `(provider, source_key, action_key)` / `(provider, session_id, action_key)`; `skill_usages` substitutes `source_key` or `session_id` before `(message_id, skill_name, skill_path, timestamp)`; and `hook_invocations` substitutes the same owner before `(chain_id, timestamp, hook_identity)`.
+
+`transcript_analytics_sources` stores canonical root/path ownership, fingerprints, last-good native and resolved identity, origin, inventory generation, processing diagnostics, and durable suppression. `live_analytics_sessions` stores project, cwd, and host origin for source-less analytics. Migration 30 sets `transcript_analytics_reingest_pending` for the later retained-source rebuild.
+
+Migration 30 renames the five prior analytics tables to `*_legacy_v30` and rebuilds them around source identity. The archives are **retained**, not dropped: rows with no hostname, and local rows whose transcript Claude has since pruned, are neither provably remote nor guaranteed rebuildable, and retention beats copying a multi-GB database. Nothing queries an archive and no index is kept on one — legacy named indexes are dropped so a retained archive cannot collide with the rebuilt tables' index names. An archive holding no rows at all is dropped immediately, so fresh installs stay clean.
+
+Carry-forward is limited to rows this machine can never rebuild from a local transcript. `hook_invocations` carries forward `provider = 'codex'` (Codex rollouts are never transcript-derived) or any row stamped with a hostname other than the local one, folding v29's `agent_id`-qualified duplicates onto the lowest rowid. `skill_usages` carries forward on the remote-host predicate alone. Only those two tables have a `hostname` column (migrations 22 and 27), so the other three cannot discriminate and retain everything in the archive. Every carried-forward session with a known hostname gets one `live_analytics_sessions` origin row, because project and host deletion reach source-less rows only through recorded live origin.
+
+Migration 31 adds `project_path_renames`, the authoritative old-to-new path mapping used by retained replay and live ingestion, plus `(provider, chain_id, timestamp)` runtime ordering support. Rename chains collapse to one destination, so future transcript metadata cannot revert an explicit project rename.
+
+[[src-tauri/src/lib.rs#run]] schedules whole-root transcript reconciliation during app setup, independently of Session Search or Analytics-window mounting. Blocking inventory and parsing run in the background under the same provider/root permits as live source work. An existing empty root proves an empty inventory; a missing, unreadable, or unavailable configured root is incomplete and cannot authorize pruning or marker clearance.
+
+Reconciliation compares canonical source key/path and last-good status before reading content. Matching `mtime_ns` plus size advances only `seen_generation`; a changed fast fingerprint hashes one stable read and likewise preserves all five tables when the stored hash matches. Only new, changed, failed, or root-restamped sources parse and replace. Failures persist bounded retry diagnostics without changing the last-good fingerprint, identity, or child rows. While `transcript_analytics_reingest_pending` is set both short-circuits are bypassed, so an interrupted rebuild genuinely replays every retained source instead of trusting a stale fingerprint; the marker clears only after every root supplies complete inventory and prune proof.
+
+[[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] advances every unchanged source of one root in a single transaction rather than one per source — a real corpus collapses roughly 5,500 transactions into one. It returns the source keys whose rows did not update because the root generation moved under a concurrent run, so callers keep per-source stale-generation handling instead of one aggregate verdict; the single-source method is a thin wrapper over it.
+
+`replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; valid empty snapshots remove only that source, while suppression and any insert failure leave prior rows intact. Owned inserts use `INSERT OR IGNORE` through statements prepared once outside their loops, matching the source-less live paths — an owned identity is the table's own dedupe key, so a legitimate repeat must not roll back the whole five-table snapshot. Distinct `cwd` values are resolved through the rename map once into a lookup table instead of once per skill and hook row. Registry upserts advance `seen_generation`; stale prepared generations are rejected before owned rows change. Parse or identity conflicts retain last-good registry state.
+
+[[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] atomically writes source-less runtime or hook rows with durable project, full-cwd, and host origin. Origin upserts preserve known fields with `COALESCE`; live event rows require unique message UUID identity and always use the incoming session as both root and chain.
+
+Session, project, and host deletion removes all five analytics tables in one transaction. A retained project/host match expands through provider-qualified analytics roots before leaving every sibling source as a suppressed tombstone. Source-less project/host rows use only exact recorded live origin; direct session deletion also catches unmapped legacy live rows. Committed deletions emit `transcript-analytics-updated` only when transcript rows changed.
+
+#### Transcript Analytics Test Specs
+
+Behavior specs for the source-owned transcript pipeline — migrations, snapshot replacement, freshness classification, and identity resolution — each covered by exactly one `// @lat:` reference at its representative test.
+
+These unit specs run against a real migrated SQLite file and real on-disk JSONL fixtures, without a live Tauri app. They pin the invariants the prose above states as guarantees: that a failed write leaves last-known-good rows intact, that a superseded generation cannot overwrite newer data, that carry-forward is limited to unrebuildable rows, and that identity resolution degrades to a counter instead of discarding a source.
+
+##### Owned Snapshot Replacement Atomicity
+
+[[src-tauri/src/storage.rs#Storage#replace_transcript_analytics_snapshot]] is one transaction across all five owned tables plus the registry, so a failure at the last statement must undo every delete and insert before it.
+
+A replacement that violates the registry `CHECK` after the owned tables were already rewritten must restore the prior rows exactly, leave a sibling source of the same root untouched, and leave the registry generation unadvanced. The positive half asserts the other edge: an empty snapshot is a legal replacement that clears exactly one source and no sibling.
+
+##### Snapshot Generation Guards
+
+A snapshot prepared against generation `G` must never overwrite rows once the root has moved past `G`, however the advance was recorded.
+
+Both paths are covered: the root generation setting advancing under a concurrent run, and a registry row already stamped newer than the replay. Each returns the `StaleGeneration` verdict rather than an error, leaves prior owned rows byte-identical, and does not restamp the registry.
+
+##### Migration 30 Carry-Forward Scope
+
+Migration 30 must carry forward exactly the rows this machine can never rebuild from a local transcript, and nothing else.
+
+Codex hook rows and any row stamped with a foreign hostname survive as source-less data; local Claude rows, and rows with no hostname at all, exist only in the retained `*_legacy_v30` archives. The test also pins the v29 `agent_id` duplicate fold and the `live_analytics_sessions` origin row registered per carried-forward session, without which project and host deletion could never reach those rows.
+
+##### Migration 30 Idempotence
+
+Reopening a database that already ran migration 30 must skip it rather than renaming the rebuilt tables a second time.
+
+The version-gated loop records exactly one `schema_version` row for the migration and reaches the same final version on a re-open, which is the only thing standing between a normal restart and a second destructive rebuild.
+
+##### Migration 31 Idempotence
+
+Reopening a database that already ran migration 31 must not re-enter it.
+
+Migration 31 creates the rename table and the native-chain runtime index; re-entry must be a no-op that records no second `schema_version` row.
+
+##### Migration 32 Idempotence
+
+Reopening a database that already ran migration 32 must not re-enter it.
+
+Migration 32 only creates the covering runtime index, but the same gate protects it, and a second recorded version row would misreport the schema ceiling.
+
+##### Empty Legacy Archive Cleanup
+
+A fresh install renames five empty tables and has no history worth keeping, so migration 30 must drop those archives instead of leaving dead tables in every new database.
+
+Retention is a recovery mechanism for existing corpora only; without this the schema of every new install would permanently carry five unqueried tables.
+
+##### Schema Ceiling Refusal
+
+A database written by a newer build cannot be downgraded in place, so `Storage::init` refuses it instead of starting an app that would silently record nothing.
+
+A version at [[src-tauri/src/storage.rs#MAX_SUPPORTED_SCHEMA_VERSION]] still opens; anything above it fails with the machine-readable `SCHEMA_TOO_NEW:` prefix callers match on. The refusal is a hard stop — the refused database's `schema_version` must be unchanged afterwards.
+
+##### Project Rename Chain Collapse
+
+Explicit project renames are collapsed on write so later transcript replay resolves an original path in a single lookup.
+
+A chain `A → B → C` must resolve `A` straight to `C`, and the `A → B → A` round trip must terminate without leaving a self-referential row — the case that previously hard-errored on `CHECK(old_path != new_path)` because the collapse `UPDATE` rewrote its own predecessor into a self-row mid-statement. No surviving destination may itself be renamed.
+
+##### Batched Unchanged Source Refresh
+
+[[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] advances many sources in one transaction without losing the per-source stale detection the per-source transactions used to provide.
+
+It must return exactly the keys that did not update — including a row already stamped past the generation the batch was prepared against — while advancing the rest, and a mid-batch failure must roll the whole batch back rather than leaving a partially advanced root.
+
+##### Runtime Totals Across Native Chains
+
+`get_llm_runtime_stats` sums per native chain, so a parent and its sub-agent chains each contribute their own active interval.
+
+Sibling sub-agents whose windows overlap in wall-clock time must not be merged into one interval, and no chain may be counted twice. The same fixture pins the `INDEXED BY idx_se_timestamp_chain` plan: the pinned query must still return these totals.
+
+##### Workflow-Nested Sub-Agent Discovery
+
+[[src-tauri/src/sessions.rs#SessionIndex#discover_claude_session_files_in]] recurses the whole `subagents/` subtree, so Workflow-spawned agents nested at `subagents/workflows/wf_<id>/agent-*.jsonl` are discovered alongside flat `subagents/agent-*.jsonl`.
+
+A real projects dir with a parent `<uuid>.jsonl`, a flat sub-agent, and a workflow-nested sub-agent (leaner first record: no `cwd`/`gitBranch`/`version`) returns all three, tags only the two agents `is_subagent`, and drops a non-jsonl decoy at any depth. This is the discovery stage the direct-DB runtime test cannot exercise.
+
+##### Claude Identity Anomaly Skipping
+
+[[src-tauri/src/transcript_analytics.rs#resolve_claude_native_identity]] skips a stray record and counts it instead of rejecting the whole source.
+
+A record copied across a fork with its prior `sessionId` is counted into [[src-tauri/src/transcript_analytics.rs#TranscriptRecordDiagnostics]] with the ordinal of the offending line, never adopted as identity, while a later conforming record still backfills a `cwd` the first record omitted.
+
+##### Claude Layout Hint Mismatch
+
+A retained-layout disagreement is one anomalous fact about an otherwise usable source, so it is counted rather than discarding every row.
+
+A parent transcript discovered under the sub-agent layout hint still resolves its parent identity and records one `layout_hint_conflicts`; agreeing parent and sub-agent layouts record none. This replaced the former hard `LayoutConflict` rejection, mirroring `model_usage.rs::accept_claude_native_source`.
+
+##### Claude Source Without Identity
+
+Skipping anomalies must not degrade into accepting a source that has no valid identity at all.
+
+Records with no `sessionId`, and a sidechain record with no `agentId`, are individually skippable — but a source made only of those still fails with `MissingNativeIdentity` rather than being stamped under a guessed root.
+
+##### Freshness Fingerprint Short-Circuits
+
+[[src-tauri/src/transcript_analytics.rs#classify_transcript_source_freshness]] decides reparse without extracting rows, and each short-circuit must fire on exactly its own condition.
+
+Eight cases pin the ladder: identical mtime and size skip the digest entirely (including an in-place rewrite that preserves both, which stays trusted by design); mtime drift falls through to a digest that may match or reparse; and a missing stored digest, a `failed` status, a row with no last-good identity, or a row recorded for another path all refuse the fast path. Every unchanged verdict carries the current run's generation on its owed refresh.
+
+##### Fast Path Avoids Source Reads
+
+The fingerprint short-circuit must return without opening the file, not merely without parsing it.
+
+A sparse fixture larger than [[src-tauri/src/transcript_identity.rs#RETAINED_TRANSCRIPT_MAX_BYTES]] would raise `SourceTooLarge` on any read, so an unchanged verdict is proof the contents were never touched — the property that makes startup reconciliation cheap on a corpus of thousands of unchanged sources.
+
+##### Forced Reparse Bypasses Short-Circuits
+
+`force_full_reparse` threads the durable reingest marker through classification and must bypass both short-circuits, without ever bypassing suppression.
+
+The fingerprint fast path and a matching content digest both yield `Changed` under force while the same fixture short-circuits without it — otherwise the flag would prove nothing. Suppressed status and a suppressed digest marker are honoured under force, because suppression is a user deletion, not a staleness verdict.
+
+##### Forced Reparse Reads The Source
+
+Under force, classification must actually read a source whose fingerprint matches.
+
+An oversized fixture with a matching stored fingerprint raises `SourceTooLarge`, which only an actual read can produce — distinguishing a real bypass from a flag that merely relabels the verdict.
+
+##### Retained Transcript Size Cap
+
+[[src-tauri/src/transcript_analytics.rs#read_stable_transcript]] enforces the 256 MiB retained cap from `metadata().len()` before allocating anything.
+
+The guard is what keeps one pathological transcript from exhausting memory during a whole-root pass, and it must reject on apparent length rather than after a partial read.
+
+##### Identity Comparison Excludes Cwd
+
+[[src-tauri/src/transcript_analytics.rs#native_identity_matches]] compares only the fields that decide cross-source root membership.
+
+A differing or absent `cwd` still matches, because `cwd` is descriptive origin and a last-good registry row can legitimately carry a different one than a fresh parse. Chain id, source session id, parent chain id, and agent id each independently break the match.
+
+##### Commit-Time Identity Drift
+
+Because the two reconciliation phases read at different times, a file that changes in between must not be stamped with the root resolved from its old identity.
+
+Committing a source whose parsed identity no longer matches the inventoried one fails with `SourceIdentityDrift`, retaining last-known-good rows instead of silently reparenting them. A source that differs only by `cwd` still commits, so a moved checkout is not mistaken for drift.
+
+##### Codex Identity Restatement And Cycles
+
+[[src-tauri/src/transcript_identity.rs#resolve_codex_native_identity]] keeps the first child identity while tolerating consistent ancestor restatements and refusing everything else.
+
+Thirteen cases cover root sessions, a collapsed ancestor chain, a restated child that fills a missing `cwd`, `forked_from_id` standing in for `parent_thread_id`, conflicting or dropped parents, unrelated second sessions, `A → B → A` and self-parent cycles that must terminate as conflicts rather than hang, and metadata too degenerate to yield any identity.
+
 #### Code and Runtime Metrics
 
 Tables for tracking active LLM session time, per-turn response latency, and cached git commit history per project.
 
-- **session_events** — One row per non-meta `user`/`assistant` JSONL line from CC and Codex transcripts (provider, session_id, agent_id, is_sidechain, timestamp, kind, uuid, parent_uuid). `kind` is one of `user_text`, `user_tool_result`, `asst_text`, `asst_thinking`, `asst_tool_use`. A unique index over `(provider, session_id, COALESCE(agent_id,''), timestamp, kind)` makes ingestion idempotent under `INSERT OR IGNORE`. Added by migration 26 and populated by the same session indexer pass that fills `tool_actions` and `response_times`.
-- **response_times** (legacy for runtime card; still consumed by Sessions breakdown and sub-agent tree) — Per-turn assistant response latency keyed by (provider, session_id, timestamp) with `is_sidechain`/`agent_id`/`parent_uuid` from migration 20.
+- **session_events** — Runtime events carry `(provider, source_key, event_key, session_id, chain_id, parent_chain_id)` plus agent, timestamp, kind, UUID, and sidechain attribution. Migration 30 deduplicates owned rows by `(provider, source_key, event_key)` and source-less rows by `(provider, session_id, event_key)` through separate partial unique indexes.
+- **response_times** (legacy for runtime card; still consumed by Sessions breakdown and sub-agent tree) — Per-turn latency carries the same source/root/chain lineage. Owned identity is `(provider, source_key, chain_id, timestamp)`; source-less identity substitutes `session_id` for `source_key`.
 
-`get_llm_runtime_stats(range, scope)` sources from `session_events`. It walks events ordered by `(provider, session_id, COALESCE(agent_id,''), timestamp)` and sums per-chain logical turns. A gap between an `asst_tool_use` and the next `user_tool_result` always counts as active time (clamped at 6 hours); any other gap above 300 seconds splits the current turn. Each sub-agent forms its own chain so siblings spawned from the same parent message do not stitch together into a single timeline. The `parent_only` scope adds `WHERE is_sidechain = 0` so the headline card can show parent-thread cost without sub-agent inflation.
+Migration 32 adds `idx_se_timestamp_chain(timestamp, provider, chain_id, is_sidechain, kind, session_id)`. Migration 31's `(provider, chain_id, timestamp)` index satisfies the runtime query's `ORDER BY` but buries `timestamp` third, so the range filter could never seek and every tick scanned the whole index with one rowid lookup per row. Leading with `timestamp` turns the filter into a range seek, and carrying the other five columns makes the index covering. The trade is a sort over the bounded window instead of a per-row heap fetch across the whole corpus. `get_llm_runtime_stats` pins the index with `INDEXED BY` because Quill never runs `ANALYZE`: with no `sqlite_stat1` the planner always prefers the sort-free migration-31 index. [[src-tauri/src/storage.rs#ensure_startup_indexes]] recreates `idx_se_timestamp_chain` on every open so the pin cannot fail on a database that lost it.
 
-Codex transcripts emit only `user_text` and `asst_text` events because Codex keeps tool activity on assistant-side records; the existing `tool_actions` enrichment pipeline is unaffected.
+`get_llm_runtime_stats(range, scope)` sources from `session_events`. It walks events ordered by native `(provider, chain_id, timestamp)` and sums per-chain logical turns without unioning concurrent wall-clock intervals. A gap between an `asst_tool_use` and the next `user_tool_result` always counts as active time (clamped at 6 hours); any other gap above 300 seconds splits the current turn. Distinct sessions use provider-qualified resolved roots, while `parent_only` adds `WHERE is_sidechain = 0` so lineage metadata, not nullable agent fields, controls exclusion.
+
+Codex extraction maps user and agent text, non-empty assistant `output_text`, reasoning, function/custom calls, and call outputs into the five runtime event kinds. Developer, user, administrative, and empty message items do not become assistant runtime events. Stable native identities or source record ordinals keep source replay deterministic.
+
+Claude records may emit multiple ordered runtime events when one content array combines thinking, text, and tool blocks. Stable per-record ordinals distinguish each event. User tool results precede same-record text and assistant tool use follows thinking/text, preserving the tool-wait transition while retaining every semantic marker.
 
 - **git_snapshots** — Cached git history per project (project unique, commit_hash, commit_count, raw_data).
 
@@ -250,7 +428,9 @@ Codex transcripts emit only `user_text` and `asst_text` events because Codex kee
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v29). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts. Migration 27 adds the [[backend#Database#Schema#Hook Invocations]] `hook_invocations` table with one UNIQUE expression index (identity + agent_id COALESCE) plus four secondary indices (provider+timestamp, provider+session, identity+timestamp, identity+cwd), and sets a `hook_invocation_reingest_pending` flag so the same sweep replays the new attachment extractor across every Claude transcript. Migration 28 adds normalized model observations, retained-source ownership, and the singleton state that separates backfill lifecycle, root completeness, source-total publication, and bounded progress counters. Migration 29 adds the nullable indexed `derived_model_id` attribution column to `model_usage_observations`, nulls the `mtime_ns`/`content_sha256` fingerprints on active `ok` sources so their transcripts are treated as changed, and re-arms `model_backfill_state` to pending under a bumped generation with a `migration` trigger so the next startup pass genuinely re-parses and re-attributes existing evidence. All four reingest-pending flags share the same sweep handler: the mtime cache clears once at the start of the sweep, every flag-driven extractor runs against every transcript, and each flag is deleted only after the sweep completes cleanly so a mid-sweep abort retries on the next boot.
+- **schema_version** — Migration version tracking (currently v32). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts. Migration 27 adds the [[backend#Database#Schema#Hook Invocations]] `hook_invocations` table with one UNIQUE expression index (identity + agent_id COALESCE) plus four secondary indices (provider+timestamp, provider+session, identity+timestamp, identity+cwd), and sets a `hook_invocation_reingest_pending` flag so the same sweep replays the new attachment extractor across every Claude transcript. Migration 28 adds normalized model observations, retained-source ownership, and the singleton state that separates backfill lifecycle, root completeness, source-total publication, and bounded progress counters. Migration 29 adds the nullable indexed `derived_model_id` attribution column to `model_usage_observations`, nulls the `mtime_ns`/`content_sha256` fingerprints on active `ok` sources so their transcripts are treated as changed, and re-arms `model_backfill_state` to pending under a bumped generation with a `migration` trigger so the next startup pass genuinely re-parses and re-attributes existing evidence. Migration 30 adds [[backend#Database#Schema#Source-Owned Transcript Analytics]] and its durable rebuild marker. Migration 31 adds authoritative project rename aliases and the native-chain runtime index. Migration 32 adds the covering runtime-window index described in [[backend#Database#Schema#Code and Runtime Metrics]]. Existing extractor flags remain until source reconciliation replaces their shared sweep lifecycle.
+
+[[src-tauri/src/storage.rs#MAX_SUPPORTED_SCHEMA_VERSION]] is the highest migration this build knows how to apply, and `Storage::init` compares it against the recorded version before running any migration gate. A database written by a newer build fails initialization with a `SCHEMA_TOO_NEW:`-prefixed error rather than silently skipping every unknown migration and then failing every insert against columns it cannot satisfy. Nothing is written on the way past the guard.
 
 ## Tauri IPC Commands
 
@@ -304,7 +484,7 @@ Storage and blocking-task failures stay in local logs. All five commands return 
 
 `get_project_tokens`, `get_session_stats`, `get_project_breakdown`, `delete_project_data`, `rename_project`, `delete_host_data`, `delete_session_data`.
 
-`delete_session_data` deletes token snapshots and skill-use rows for the selected `(provider, session_id)` pair, plus every model source owned by that provider-qualified analytics/root session. Model observation children are removed before retained source fingerprints become suppressed, preventing a retry from resurrecting unchanged deleted evidence.
+`delete_session_data` deletes token snapshots and all five transcript analytics tables for the selected `(provider, session_id)` pair, plus every model source owned by that provider-qualified analytics/root session. Model observation children are removed before retained source fingerprints become suppressed, preventing a retry from resurrecting unchanged deleted evidence. Project rename updates retained/live ownership and cwd-bearing analytics in the same transaction, then preserves that choice through `project_path_renames` on future replay.
 
 ### Integration Commands (12)
 
@@ -420,6 +600,7 @@ The backend pushes real-time updates to the frontend via Tauri's emit system.
 | `runtime-settings-updated` | lib.rs | `RuntimeSettings` | Live-usage / plugin-update / rule-watcher / always-on-top toggle changed |
 | `ui-prefs-updated` | useUiPrefs (frontend) | `UiPrefs` | Layout, time mode, or panel-visibility preference changed in the Settings window |
 | `indicator-updated` | lib.rs | `StatusIndicatorState` | Shared usage refresh or primary-provider change recomputed indicator state |
+| `transcript-analytics-updated` | lib.rs | `()` | Transcript analytics committed, renamed, or deleted |
 | `memory-optimizer-log` | memory_optimizer.rs | `{message}` | Optimization run progress |
 | `memory-optimizer-updated` | memory_optimizer.rs | `{run_id, status}` | Run completed |
 | `memory-files-updated` | memory_optimizer.rs | `{project_path}` | Memory files changed |
@@ -440,15 +621,15 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
 
-When a transcript is reprocessed, Quill now coalesces repeated `notify` requests per session and applies each rewrite under one Tantivy writer lock with a single commit. This avoids overlapping delete-and-reindex batches while keeping SQLite `tool_actions` and `skill_usages` writes batched per extracted file or payload. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven `notify` ingestion that ran before the file was tracked in `index_state.json` cannot stack duplicate copies on top.
+When a transcript is reprocessed, Quill coalesces repeated `notify` requests per session and applies each Tantivy rewrite under one writer lock with a single commit. Retained SQLite analytics are independently coalesced by canonical `(provider, source_key)` and replaced across all five tables in one transaction. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven `notify` ingestion that ran before the file was tracked in `index_state.json` cannot stack duplicate copies on top.
 
-Skill usage is derived during the same extraction pass by [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]], which recognizes read-like loads of a `SKILL.md` file and derives the skill name from that file's parent directory. The indexer deletes and replaces `skill_usages` per `(provider, session_id)` so repeated transcript walks do not duplicate counts, and it does not infer skills from assistant prose, available-skill lists, or skill-file maintenance edits.
+Skill usage is derived by [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]], which recognizes read-like loads of a `SKILL.md` file and derives the skill name from that file's parent directory. Retained rows are owned and replayed by canonical source, and the extractor does not infer skills from assistant prose, available-skill lists, or skill-file maintenance edits. Flattened `/sessions/messages` payloads contain no tool-action detail and emit no skill rows.
 
-The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript at `<projectSlug>/*.jsonl`, and each `DiscoveredSessionFile` carries an `is_subagent` flag so downstream extraction can tell the two apart. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid` from each JSON record; Codex extraction writes the provider-agnostic defaults (`is_sidechain=0`, `agent_id=NULL`, `parent_uuid=NULL`) so today's Codex CLI inherits the same code path the day OpenAI ships a sub-agent feature. Per-session sub-agent files live in one flat directory — multi-level hierarchy is reconstructed at query time via `parent_uuid` chains rather than nested filesystem layout.
+The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript at `<projectSlug>/*.jsonl`, and each `DiscoveredSessionFile` carries an `is_subagent` flag so downstream extraction can tell the two apart. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid` from each JSON record. Codex retained analytics preserves the first child `session_meta.id` as `chain_id` and resolves `parent_thread_id`, falling back to `forked_from_id`, as `parent_chain_id`; later ancestor restatements cannot replace child identity. Per-session Claude sub-agent files live in one flat directory — multi-level hierarchy is reconstructed at query time via `parent_uuid` chains rather than nested filesystem layout.
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
 
-[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model reconciliation before session-keyed search coalescing; a resolvable path that fails that stricter model-source policy still coalesces for search only, preserving the pre-analytics indexing contract. Direct `messages` payloads remain search-only.
+[[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model and transcript reconciliation before session-keyed search coalescing; a resolvable path that fails the stricter retained-source policy still coalesces for search only, preserving the indexing contract. Direct message payloads append Tantivy documents and atomically store source-less runtime rows plus recorded live origin through [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]].
 
 ### Search Scoring
 

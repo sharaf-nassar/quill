@@ -122,6 +122,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
     const unlistenPromises = [
       listen("tokens-updated", scheduleRefresh),
       listen("sessions-index-updated", scheduleRefresh),
+      listen("transcript-analytics-updated", scheduleRefresh),
     ];
     // Feature 009: only subscribe to the Codex hook live-fire channel
     // while the user is actually viewing the Hooks breakdown. A Codex

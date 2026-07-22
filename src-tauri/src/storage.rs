@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
 use std::fs::Metadata;
@@ -20,6 +20,15 @@ use crate::model_usage::{
     CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
     SourceProcessingStatus,
 };
+use crate::transcript_analytics::TranscriptAnalyticsSnapshot;
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TranscriptAnalyticsReplacement {
+    Replaced,
+    SuppressedUnchanged,
+    StaleGeneration,
+}
 use crate::models::{
     BucketStats, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
     ContextSavingsBreakdownItem, ContextSavingsBreakdowns, ContextSavingsEvent,
@@ -37,9 +46,16 @@ use crate::models::{
     ProjectBreakdown, ProjectTokens, RunInferenceCall, RunInferenceConfinement,
     RunInferenceSummary, SessionBreakdown, SessionCodeStats, SessionModelChain,
     SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment, SessionRef,
-    SessionStats, SkillBreakdown, SkillProjectBreakdown, SkillUsage, SubagentNode, TokenDataPoint,
+    SessionStats, SkillBreakdown, SkillProjectBreakdown, SubagentNode, TokenDataPoint,
     TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
+
+/// Highest migration this build knows how to apply. Every migration gate is a
+/// `current_version < N` test, so an older binary opening a database written by
+/// a newer build would silently skip every unknown migration, start clean, and
+/// then fail every analytics insert on a column it cannot satisfy. `init`
+/// refuses to open anything above this instead.
+const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 32;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -231,6 +247,7 @@ FROM source_activity
 /// timestamp the turn detector needs, plus the per-message sub-agent
 /// attribution propagated onto the assistant row that closes the turn.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub struct ResponseTimeInput<'a> {
     pub role: &'a str,
     pub timestamp: &'a str,
@@ -239,9 +256,11 @@ pub struct ResponseTimeInput<'a> {
     pub parent_uuid: Option<&'a str>,
 }
 
+#[cfg(test)]
 impl<'a> ResponseTimeInput<'a> {
     /// Build an input from a (role, timestamp) tuple where no sub-agent
     /// attribution is available (e.g., HTTP API pushes).
+    #[allow(dead_code)] // Retained for direct storage callers and test fixtures.
     pub fn new(role: &'a str, timestamp: &'a str) -> Self {
         Self {
             role,
@@ -260,6 +279,7 @@ impl<'a> ResponseTimeInput<'a> {
 /// loop. See specs/008-runtime-redesign/contracts/session-events.md.
 // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Legacy attribution fields remain in test-only ingest fixtures.
 pub struct SessionEventInput<'a> {
     pub timestamp: &'a str,
     pub kind: crate::sessions::SessionEventKind,
@@ -267,6 +287,129 @@ pub struct SessionEventInput<'a> {
     pub agent_id: Option<&'a str>,
     pub uuid: Option<&'a str>,
     pub parent_uuid: Option<&'a str>,
+}
+
+/// Provider-qualified ownership and chain attribution shared by every row in
+/// one transcript analytics snapshot. `source_key = None` is reserved for
+/// live, non-transcript writes.
+#[allow(dead_code)] // Consumed by transcript analytics reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptAnalyticsAttribution<'a> {
+    pub(crate) source_key: Option<&'a str>,
+    pub(crate) chain_id: &'a str,
+    pub(crate) parent_chain_id: Option<&'a str>,
+}
+
+/// Last-good source registry values committed alongside a source-owned
+/// analytics snapshot.
+#[allow(dead_code)] // Consumed by transcript analytics reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptAnalyticsSourceInput<'a> {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: &'a str,
+    pub(crate) source_root_key: &'a str,
+    pub(crate) source_path: &'a Path,
+    pub(crate) source_session_id: Option<&'a str>,
+    pub(crate) analytics_session_id: Option<&'a str>,
+    pub(crate) chain_id: Option<&'a str>,
+    pub(crate) parent_chain_id: Option<&'a str>,
+    pub(crate) agent_id: Option<&'a str>,
+    pub(crate) is_sidechain: bool,
+    pub(crate) project: Option<&'a str>,
+    pub(crate) cwd: Option<&'a Path>,
+    pub(crate) hostname: Option<&'a str>,
+    pub(crate) mtime_ns: Option<i64>,
+    pub(crate) size_bytes: Option<i64>,
+    pub(crate) content_sha256: Option<&'a str>,
+    pub(crate) seen_generation: i64,
+    pub(crate) processing_status: &'a str,
+    pub(crate) last_attempt_at_ms: Option<i64>,
+    pub(crate) last_success_at_ms: Option<i64>,
+    pub(crate) last_error: Option<&'a str>,
+    pub(crate) suppressed_sha256: Option<&'a str>,
+    pub(crate) suppressed_at_ms: Option<i64>,
+}
+
+/// Persisted transcript analytics source state used to seed later inventory
+/// and root-resolution passes without reparsing unchanged files.
+#[allow(dead_code)] // Consumed by transcript analytics reconciliation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredTranscriptAnalyticsSource {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: String,
+    pub(crate) source_root_key: String,
+    pub(crate) source_path: PathBuf,
+    pub(crate) source_session_id: Option<String>,
+    pub(crate) analytics_session_id: Option<String>,
+    pub(crate) chain_id: Option<String>,
+    pub(crate) parent_chain_id: Option<String>,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) is_sidechain: bool,
+    pub(crate) project: Option<String>,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) mtime_ns: Option<i64>,
+    pub(crate) size_bytes: Option<i64>,
+    pub(crate) content_sha256: Option<String>,
+    pub(crate) seen_generation: i64,
+    pub(crate) processing_status: String,
+    pub(crate) last_attempt_at_ms: Option<i64>,
+    pub(crate) last_success_at_ms: Option<i64>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) suppressed_sha256: Option<String>,
+    pub(crate) suppressed_at_ms: Option<i64>,
+}
+
+pub(crate) struct UnchangedTranscriptAnalyticsSource<'a> {
+    pub(crate) provider: IntegrationProvider,
+    pub(crate) source_key: &'a str,
+    pub(crate) source_root_key: &'a str,
+    pub(crate) source_path: &'a Path,
+    pub(crate) generation: i64,
+    pub(crate) mtime_ns: i64,
+    pub(crate) size_bytes: i64,
+    pub(crate) content_sha256: Option<&'a str>,
+}
+
+/// Durable origin supplied by a live analytics producer. Missing fields stay
+/// unknown; callers must not infer them from another analytics table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveAnalyticsOrigin<'a> {
+    pub(crate) project: Option<&'a str>,
+    pub(crate) cwd: Option<&'a Path>,
+    pub(crate) hostname: Option<&'a str>,
+}
+
+/// One stable live message identity used to derive response-time rows.
+#[derive(Clone, Copy)]
+pub(crate) struct LiveSessionMessageInput<'a> {
+    pub(crate) message_id: &'a str,
+    pub(crate) role: &'a str,
+    pub(crate) timestamp: &'a str,
+    pub(crate) chain_id: &'a str,
+    pub(crate) parent_chain_id: Option<&'a str>,
+    pub(crate) is_sidechain: bool,
+    pub(crate) agent_id: Option<&'a str>,
+    pub(crate) parent_uuid: Option<&'a str>,
+}
+
+/// One stable event belonging to an original live message. The producer
+/// supplies the canonical per-message ordinal so replay identity does not
+/// depend on batch iteration state.
+#[derive(Clone, Copy)]
+pub(crate) struct LiveSessionEventInput<'a> {
+    pub(crate) message_id: &'a str,
+    pub(crate) event_ordinal: usize,
+    pub(crate) timestamp: &'a str,
+    pub(crate) kind: crate::sessions::SessionEventKind,
+}
+
+/// Complete source-less analytics batch committed beside its origin mapping.
+#[derive(Clone, Copy)]
+pub(crate) struct LiveSessionAnalyticsRows<'a> {
+    pub(crate) messages: &'a [LiveSessionMessageInput<'a>],
+    pub(crate) session_events: &'a [LiveSessionEventInput<'a>],
+    pub(crate) hook_invocations: &'a [HookInvocationInput<'a>],
 }
 
 /// One observed lifecycle-hook fire borrowed for the `hook_invocations`
@@ -280,7 +423,6 @@ pub struct SessionEventInput<'a> {
 pub struct HookInvocationInput<'a> {
     pub session_id: &'a str,
     pub agent_id: Option<&'a str>,
-    pub is_sidechain: bool,
     pub timestamp: &'a str,
     pub hook_event: &'a str,
     pub hook_matcher: Option<&'a str>,
@@ -420,6 +562,7 @@ pub(crate) struct ModelSourcePruneResult {
 pub(crate) struct DataMutationResult {
     affected_rows: u64,
     model_data_changed: bool,
+    transcript_data_changed: bool,
 }
 
 impl DataMutationResult {
@@ -430,47 +573,10 @@ impl DataMutationResult {
     pub(crate) const fn model_data_changed(self) -> bool {
         self.model_data_changed
     }
-}
 
-/// Sub-agent attribution triple carried alongside a tool action row.
-/// Bundled into a struct to keep `insert_tool_actions` under clippy's
-/// `too_many_arguments` threshold and to mirror the `ResponseTimeInput`
-/// pattern used for the response-times pipeline.
-#[derive(Clone, Copy, Default)]
-struct ToolActionAttribution<'a> {
-    is_sidechain: bool,
-    agent_id: Option<&'a str>,
-    parent_uuid: Option<&'a str>,
-}
-
-fn insert_tool_actions(
-    stmt: &mut rusqlite::CachedStatement<'_>,
-    provider: IntegrationProvider,
-    actions: &[crate::sessions::ToolAction],
-    message_id: &str,
-    session_id: &str,
-    attribution: ToolActionAttribution<'_>,
-) -> Result<(), String> {
-    for action in actions {
-        stmt.execute(rusqlite::params![
-            provider.as_str(),
-            message_id,
-            session_id,
-            action.tool_name,
-            action.category,
-            action.file_path,
-            action.summary,
-            action.full_input,
-            action.full_output,
-            action.timestamp,
-            attribution.is_sidechain as i32,
-            attribution.agent_id,
-            attribution.parent_uuid,
-        ])
-        .map_err(|e| format!("Insert tool_action: {e}"))?;
+    pub(crate) const fn transcript_data_changed(self) -> bool {
+        self.transcript_data_changed
     }
-
-    Ok(())
 }
 
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
@@ -1251,6 +1357,15 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
             "skill usage indexes",
         ),
         (
+            table_has_column(conn, "session_events", "chain_id"),
+            "CREATE INDEX IF NOT EXISTS idx_se_timestamp_chain
+                 ON session_events(
+                     timestamp, provider, chain_id, is_sidechain,
+                     kind, session_id
+                 );",
+            "runtime window index",
+        ),
+        (
             table_has_column(conn, "context_savings_events", "event_id"),
             "CREATE INDEX IF NOT EXISTS idx_context_savings_timestamp
                  ON context_savings_events(timestamp);
@@ -1879,6 +1994,114 @@ fn suppress_project_model_sources_in_transaction(
     }
 
     Ok((observations_deleted, sources_suppressed))
+}
+
+const TRANSCRIPT_ANALYTICS_TABLES: [&str; 5] = [
+    "session_events",
+    "response_times",
+    "tool_actions",
+    "skill_usages",
+    "hook_invocations",
+];
+
+/// Resolve an explicit project rename inside the caller's transaction.
+/// Rename rows are collapsed when written, so one lookup is authoritative
+/// for transcript replays and later live observations.
+fn resolve_project_path_rename(
+    tx: &rusqlite::Transaction<'_>,
+    path: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    tx.query_row(
+        "SELECT new_path FROM project_path_renames WHERE old_path = ?1",
+        params![path],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|renamed| Some(renamed.unwrap_or_else(|| path.to_string())))
+    .map_err(|e| format!("Resolve project rename: {e}"))
+}
+
+/// Delete source-owned analytics for exact registry keys and retain each
+/// registry row as a durable suppression tombstone.
+fn suppress_transcript_analytics_sources_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    sources: &[(String, String)],
+    suppressed_at_ms: i64,
+) -> Result<usize, String> {
+    let mut deleted = 0_usize;
+    for table in TRANSCRIPT_ANALYTICS_TABLES {
+        let mut statement = tx
+            .prepare_cached(&format!(
+                "DELETE FROM {table} WHERE provider = ?1 AND source_key = ?2"
+            ))
+            .map_err(|e| format!("Prepare {table} source delete: {e}"))?;
+        for (provider, source_key) in sources {
+            deleted = deleted.saturating_add(
+                statement
+                    .execute(params![provider, source_key])
+                    .map_err(|e| format!("Delete {table} source rows: {e}"))?,
+            );
+        }
+    }
+
+    let mut suppress = tx
+        .prepare_cached(
+            "UPDATE transcript_analytics_sources
+             SET processing_status = 'suppressed',
+                 suppressed_sha256 = COALESCE(
+                     suppressed_sha256, content_sha256
+                 ),
+                 suppressed_at_ms = COALESCE(suppressed_at_ms, ?3)
+             WHERE provider = ?1 AND source_key = ?2",
+        )
+        .map_err(|e| format!("Prepare transcript source suppression: {e}"))?;
+    for (provider, source_key) in sources {
+        suppress
+            .execute(params![provider, source_key, suppressed_at_ms])
+            .map_err(|e| format!("Suppress transcript analytics source: {e}"))?;
+    }
+    Ok(deleted)
+}
+
+/// Delete only source-less rows belonging to exact live-origin session pairs,
+/// then remove those mappings. Provider qualification is preserved throughout.
+fn delete_live_analytics_sessions_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    sessions: &[(String, String)],
+) -> Result<usize, String> {
+    let mut deleted = 0_usize;
+    for table in TRANSCRIPT_ANALYTICS_TABLES {
+        let mut statement = tx
+            .prepare_cached(&format!(
+                "DELETE FROM {table}
+                 WHERE provider = ?1 AND session_id = ?2
+                   AND source_key IS NULL"
+            ))
+            .map_err(|e| format!("Prepare live {table} delete: {e}"))?;
+        for (provider, session_id) in sessions {
+            deleted = deleted.saturating_add(
+                statement
+                    .execute(params![provider, session_id])
+                    .map_err(|e| format!("Delete live {table} rows: {e}"))?,
+            );
+        }
+    }
+
+    let mut delete_mapping = tx
+        .prepare_cached(
+            "DELETE FROM live_analytics_sessions
+             WHERE provider = ?1 AND session_id = ?2",
+        )
+        .map_err(|e| format!("Prepare live analytics mapping delete: {e}"))?;
+    for (provider, session_id) in sessions {
+        delete_mapping
+            .execute(params![provider, session_id])
+            .map_err(|e| format!("Delete live analytics mapping: {e}"))?;
+    }
+    Ok(deleted)
 }
 
 fn model_backfill_millis_to_rfc3339(value: i64, field: &str) -> Result<String, String> {
@@ -2564,7 +2787,642 @@ pub struct Storage {
     db_path: PathBuf,
 }
 
+fn transcript_analytics_generation_key(provider: IntegrationProvider, root: &str) -> String {
+    format!(
+        "transcript_analytics_generation:{}:{root}",
+        provider.as_str()
+    )
+}
+
 impl Storage {
+    /// Enumerate last-good transcript analytics identities for one exact root.
+    ///
+    /// Live reconciliation uses this indexed registry read to resolve a changed
+    /// source against its persisted siblings without walking the provider tree.
+    pub(crate) fn list_transcript_analytics_sources_for_root(
+        &self,
+        provider: IntegrationProvider,
+        source_root_key: &str,
+    ) -> Result<Vec<StoredTranscriptAnalyticsSource>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT source_key, source_root_key, source_path,
+                        source_session_id, analytics_session_id, chain_id,
+                        parent_chain_id, agent_id, is_sidechain, project, cwd,
+                        hostname, mtime_ns, size_bytes, content_sha256,
+                        seen_generation, processing_status, last_attempt_at_ms,
+                        last_success_at_ms, last_error, suppressed_sha256,
+                        suppressed_at_ms
+                 FROM transcript_analytics_sources
+                 WHERE provider = ?1 AND source_root_key = ?2
+                 ORDER BY source_key",
+            )
+            .map_err(|error| format!("Prepare transcript source root inventory: {error}"))?;
+        let rows = stmt
+            .query_map(params![provider.as_str(), source_root_key], |row| {
+                Ok(StoredTranscriptAnalyticsSource {
+                    provider,
+                    source_key: row.get(0)?,
+                    source_root_key: row.get(1)?,
+                    source_path: PathBuf::from(row.get::<_, String>(2)?),
+                    source_session_id: row.get(3)?,
+                    analytics_session_id: row.get(4)?,
+                    chain_id: row.get(5)?,
+                    parent_chain_id: row.get(6)?,
+                    agent_id: row.get(7)?,
+                    is_sidechain: row.get::<_, i64>(8)? != 0,
+                    project: row.get(9)?,
+                    cwd: row.get::<_, Option<String>>(10)?.map(PathBuf::from),
+                    hostname: row.get(11)?,
+                    mtime_ns: row.get(12)?,
+                    size_bytes: row.get(13)?,
+                    content_sha256: row.get(14)?,
+                    seen_generation: row.get(15)?,
+                    processing_status: row.get(16)?,
+                    last_attempt_at_ms: row.get(17)?,
+                    last_success_at_ms: row.get(18)?,
+                    last_error: row.get(19)?,
+                    suppressed_sha256: row.get(20)?,
+                    suppressed_at_ms: row.get(21)?,
+                })
+            })
+            .map_err(|error| format!("Read transcript source root inventory: {error}"))?;
+        let mut sources = Vec::new();
+        for row in rows {
+            sources.push(
+                row.map_err(|error| format!("Read transcript source inventory row: {error}"))?,
+            );
+        }
+        Ok(sources)
+    }
+
+    /// Advance inventory state for a source whose last-good snapshot is still
+    /// authoritative. A content-hash match may refresh only the fast
+    /// fingerprint; no child analytics rows are deleted or inserted.
+    pub(crate) fn refresh_unchanged_transcript_analytics_source(
+        &self,
+        source: UnchangedTranscriptAnalyticsSource<'_>,
+    ) -> Result<bool, String> {
+        self.refresh_unchanged_transcript_analytics_sources(std::slice::from_ref(&source))
+            .map(|stale| stale.is_empty())
+    }
+
+    /// Advance inventory state for every source whose last-good snapshot is
+    /// still authoritative, in one transaction for the whole batch.
+    ///
+    /// Startup reconciliation walks thousands of unchanged sources per root, so
+    /// a per-source transaction would cost one WAL round-trip and one
+    /// connection-mutex acquisition each. Returns the source keys whose rows
+    /// did not update because the root generation advanced under a concurrent
+    /// run, so callers keep per-source stale-generation handling instead of one
+    /// aggregate verdict.
+    pub(crate) fn refresh_unchanged_transcript_analytics_sources(
+        &self,
+        sources: &[UnchangedTranscriptAnalyticsSource<'_>],
+    ) -> Result<Vec<String>, String> {
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin unchanged transcript refresh: {error}"))?;
+        let mut stale = Vec::new();
+        {
+            let mut generations: HashMap<String, i64> = HashMap::new();
+            let mut statement = tx
+                .prepare_cached(
+                    "UPDATE transcript_analytics_sources
+                     SET source_root_key = ?3,
+                         source_path = ?4,
+                         mtime_ns = ?6,
+                         size_bytes = ?7,
+                         content_sha256 = COALESCE(?8, content_sha256),
+                         seen_generation = ?5,
+                         last_attempt_at_ms = ?9,
+                         last_error = NULL
+                     WHERE provider = ?1 AND source_key = ?2
+                       AND seen_generation <= ?5",
+                )
+                .map_err(|error| format!("Prepare unchanged transcript refresh: {error}"))?;
+            for source in sources {
+                let key =
+                    transcript_analytics_generation_key(source.provider, source.source_root_key);
+                let current_generation = match generations.get(&key) {
+                    Some(generation) => *generation,
+                    None => {
+                        let generation = tx
+                            .query_row(
+                                "SELECT value FROM settings WHERE key = ?1",
+                                params![key],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .optional()
+                            .map_err(|error| {
+                                format!("Read unchanged transcript generation: {error}")
+                            })?
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        generations.insert(key, generation);
+                        generation
+                    }
+                };
+                if current_generation > source.generation {
+                    stale.push(source.source_key.to_owned());
+                    continue;
+                }
+                let updated = statement
+                    .execute(params![
+                        source.provider.as_str(),
+                        source.source_key,
+                        source.source_root_key,
+                        source.source_path.to_string_lossy(),
+                        source.generation,
+                        source.mtime_ns,
+                        source.size_bytes,
+                        source.content_sha256,
+                        now,
+                    ])
+                    .map_err(|error| format!("Refresh unchanged transcript source: {error}"))?;
+                if updated != 1 {
+                    stale.push(source.source_key.to_owned());
+                }
+            }
+        }
+        tx.commit()
+            .map_err(|error| format!("Commit unchanged transcript refresh: {error}"))?;
+        Ok(stale)
+    }
+
+    /// Persist a bounded retry diagnostic without modifying the last-good
+    /// identity, fingerprint, or any source-owned analytics rows.
+    pub(crate) fn record_transcript_analytics_source_failure(
+        &self,
+        provider: IntegrationProvider,
+        source_key: &str,
+        source_root_key: &str,
+        source_path: &Path,
+        generation: i64,
+        error: &str,
+    ) -> Result<(), String> {
+        let bounded_error = error.chars().take(1024).collect::<String>();
+        let now = chrono::Utc::now().timestamp_millis();
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO transcript_analytics_sources (
+                 provider, source_key, source_root_key, source_path,
+                 seen_generation, processing_status, last_attempt_at_ms,
+                 last_error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'failed', ?6, ?7)
+             ON CONFLICT(provider, source_key) DO UPDATE SET
+                 source_root_key = excluded.source_root_key,
+                 source_path = excluded.source_path,
+                 seen_generation = excluded.seen_generation,
+                 processing_status = CASE
+                     WHEN transcript_analytics_sources.processing_status = 'suppressed'
+                       OR transcript_analytics_sources.suppressed_sha256 IS NOT NULL
+                     THEN 'suppressed'
+                     ELSE 'failed'
+                 END,
+                 last_attempt_at_ms = excluded.last_attempt_at_ms,
+                 last_error = excluded.last_error
+             WHERE transcript_analytics_sources.seen_generation
+                   <= excluded.seen_generation",
+            params![
+                provider.as_str(),
+                source_key,
+                source_root_key,
+                source_path.to_string_lossy(),
+                generation,
+                now,
+                bounded_error,
+            ],
+        )
+        .map_err(|error| format!("Record transcript analytics failure: {error}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_transcript_analytics_generation(
+        &self,
+        provider: IntegrationProvider,
+        root: &str,
+    ) -> Result<i64, String> {
+        let key = transcript_analytics_generation_key(provider, root);
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin transcript generation: {error}"))?;
+        let stored = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![&key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read transcript analytics generation: {error}"))?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let registry_max = tx
+            .query_row(
+                "SELECT COALESCE(MAX(seen_generation), 0)
+                 FROM transcript_analytics_sources
+                 WHERE provider = ?1 AND source_root_key = ?2",
+                params![provider.as_str(), root],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Read transcript registry generation: {error}"))?;
+        let generation = stored.max(registry_max).saturating_add(1);
+        tx.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, generation.to_string()],
+        )
+        .map_err(|error| format!("Persist transcript analytics generation: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Commit transcript analytics generation: {error}"))?;
+        Ok(generation)
+    }
+
+    pub(crate) fn prune_transcript_analytics_sources_for_root(
+        &self,
+        proof: &crate::transcript_analytics::CompletedTranscriptSourceRoot,
+    ) -> Result<usize, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin transcript prune: {e}"))?;
+        let generation_key =
+            transcript_analytics_generation_key(proof.provider, &proof.source_root_key);
+        let current_generation = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![generation_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read transcript prune generation: {error}"))?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if current_generation > proof.generation {
+            return Ok(0);
+        }
+        let mut stmt = tx.prepare("SELECT source_key FROM transcript_analytics_sources WHERE provider=?1 AND source_root_key=?2 AND seen_generation < ?3 AND processing_status != 'suppressed'")
+            .map_err(|e| format!("Prepare transcript prune: {e}"))?;
+        let keys: Vec<String> = stmt
+            .query_map(
+                params![
+                    proof.provider.as_str(),
+                    proof.source_root_key,
+                    proof.generation
+                ],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("Query transcript prune: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Read transcript prune key: {e}"))?;
+        drop(stmt);
+        for key in &keys {
+            for table in [
+                "session_events",
+                "response_times",
+                "tool_actions",
+                "skill_usages",
+                "hook_invocations",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE provider=?1 AND source_key=?2"),
+                    params![proof.provider.as_str(), key],
+                )
+                .map_err(|e| format!("Delete transcript rows: {e}"))?;
+            }
+            tx.execute(
+                "DELETE FROM transcript_analytics_sources WHERE provider=?1 AND source_key=?2",
+                params![proof.provider.as_str(), key],
+            )
+            .map_err(|e| format!("Delete transcript source: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("Commit transcript prune: {e}"))?;
+        Ok(keys.len())
+    }
+
+    // @lat: [[backend#Database#Schema#Source-Owned Transcript Analytics]]
+    pub(crate) fn replace_transcript_analytics_snapshot(
+        &self,
+        snapshot: &TranscriptAnalyticsSnapshot,
+    ) -> Result<TranscriptAnalyticsReplacement, String> {
+        let source = &snapshot.source;
+        if source.source_key.is_empty()
+            || source.source_root_key.is_empty()
+            || source.analytics_session_id.is_empty()
+            || source.chain_id.is_empty()
+        {
+            return Err("Transcript analytics source identity is incomplete".into());
+        }
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin transcript analytics replacement: {e}"))?;
+        let source_project = resolve_project_path_rename(&tx, source.project.as_deref())?;
+        let source_cwd_raw = source
+            .cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+        let source_cwd = resolve_project_path_rename(&tx, source_cwd_raw.as_deref())?;
+        let generation_key =
+            transcript_analytics_generation_key(source.provider, &source.source_root_key);
+        let current_generation = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![generation_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read current transcript generation: {error}"))?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if current_generation > source.seen_generation {
+            return Ok(TranscriptAnalyticsReplacement::StaleGeneration);
+        }
+        let existing = tx
+            .query_row(
+                "SELECT processing_status, suppressed_sha256, seen_generation
+                 FROM transcript_analytics_sources
+                 WHERE provider=?1 AND source_key=?2",
+                params![source.provider.as_str(), source.source_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Read transcript source generation: {e}"))?;
+        if existing
+            .as_ref()
+            .is_some_and(|(_, _, generation)| *generation > source.seen_generation)
+        {
+            return Ok(TranscriptAnalyticsReplacement::StaleGeneration);
+        }
+        let suppressed =
+            existing.is_some_and(|(status, hash, _)| status == "suppressed" || hash.is_some());
+        let seen_generation = source.seen_generation;
+        let owned_ok = snapshot
+            .session_events
+            .iter()
+            .all(|r| r.provider == source.provider && r.source_key == source.source_key)
+            && snapshot
+                .response_times
+                .iter()
+                .all(|r| r.provider == source.provider && r.source_key == source.source_key)
+            && snapshot
+                .tool_actions
+                .iter()
+                .all(|r| r.provider == source.provider && r.source_key == source.source_key)
+            && snapshot
+                .skill_usages
+                .iter()
+                .all(|r| r.provider == source.provider && r.source_key == source.source_key)
+            && snapshot
+                .hook_invocations
+                .iter()
+                .all(|r| r.provider == source.provider && r.source_key == source.source_key);
+        if !owned_ok {
+            return Err("Transcript analytics row ownership mismatch".into());
+        }
+        if suppressed {
+            tx.execute("UPDATE transcript_analytics_sources SET seen_generation=?3,last_attempt_at_ms=?4,processing_status='suppressed' WHERE provider=?1 AND source_key=?2",
+                params![source.provider.as_str(), source.source_key, seen_generation, chrono::Utc::now().timestamp_millis()])
+                .map_err(|e| format!("Refresh suppressed transcript source: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Commit suppressed transcript source: {e}"))?;
+            return Ok(TranscriptAnalyticsReplacement::SuppressedUnchanged);
+        }
+        for table in [
+            "session_events",
+            "response_times",
+            "tool_actions",
+            "skill_usages",
+            "hook_invocations",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE provider=?1 AND source_key=?2"),
+                params![source.provider.as_str(), source.source_key],
+            )
+            .map_err(|e| format!("Delete {table} source rows: {e}"))?;
+        }
+        // `cwd` is near-constant across a source's rows, so resolve each
+        // distinct value once instead of once per skill and hook row.
+        let mut cwd_renames: HashMap<Option<&str>, Option<String>> = HashMap::new();
+        for cwd in snapshot
+            .skill_usages
+            .iter()
+            .map(|row| row.cwd.as_deref())
+            .chain(
+                snapshot
+                    .hook_invocations
+                    .iter()
+                    .map(|row| row.cwd.as_deref()),
+            )
+        {
+            if let std::collections::hash_map::Entry::Vacant(entry) = cwd_renames.entry(cwd) {
+                entry.insert(resolve_project_path_rename(&tx, cwd)?);
+            }
+        }
+        {
+            // Every owned identity here IS the table's dedupe key, so a
+            // repeat is benign and must not roll back the whole five-table
+            // snapshot: one assistant message can legitimately emit two
+            // identical skill accesses (same `message.uuid`, same skill,
+            // same timestamp) or repeat a `tool_use_id`. `INSERT OR IGNORE`
+            // matches the source-less live paths above. Genuine ownership
+            // failures are still hard errors — they surface on the registry
+            // upsert's `registry_updated != 1` stale-generation abort, which
+            // is unaffected by this.
+            let mut session_event_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO session_events (
+                         provider, source_key, event_key, session_id, chain_id,
+                         parent_chain_id, agent_id, is_sidechain, timestamp,
+                         kind, uuid, parent_uuid
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                     )",
+                )
+                .map_err(|e| format!("Prepare owned session events: {e}"))?;
+            for row in &snapshot.session_events {
+                session_event_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.event_key,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.agent_id,
+                        i64::from(row.is_sidechain),
+                        row.timestamp,
+                        row.kind.as_str(),
+                        row.uuid,
+                        row.parent_uuid,
+                    ])
+                    .map_err(|e| format!("Insert session event: {e}"))?;
+            }
+
+            let mut response_time_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO response_times (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, timestamp, response_secs, idle_secs,
+                         is_sidechain, agent_id, parent_uuid
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                     )",
+                )
+                .map_err(|e| format!("Prepare owned response times: {e}"))?;
+            for row in &snapshot.response_times {
+                response_time_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.timestamp,
+                        row.response_secs,
+                        row.idle_secs,
+                        i64::from(row.is_sidechain),
+                        row.agent_id,
+                        row.parent_uuid,
+                    ])
+                    .map_err(|e| format!("Insert response time: {e}"))?;
+            }
+
+            let mut tool_action_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO tool_actions (
+                         provider, source_key, action_key, message_id,
+                         session_id, chain_id, parent_chain_id, tool_name,
+                         category, file_path, summary, full_input, full_output,
+                         timestamp, is_sidechain, agent_id, parent_uuid
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17
+                     )",
+                )
+                .map_err(|e| format!("Prepare owned tool actions: {e}"))?;
+            for row in &snapshot.tool_actions {
+                tool_action_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.action_key,
+                        row.message_id,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.tool_name,
+                        row.category,
+                        row.file_path,
+                        row.summary,
+                        row.full_input,
+                        row.full_output,
+                        row.timestamp,
+                        i64::from(row.is_sidechain),
+                        row.agent_id,
+                        row.parent_uuid,
+                    ])
+                    .map_err(|e| format!("Insert tool action: {e}"))?;
+            }
+
+            let mut skill_usage_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO skill_usages (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, message_id, skill_name, skill_path,
+                         timestamp, tool_name, cwd, hostname
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                     )",
+                )
+                .map_err(|e| format!("Prepare owned skill usages: {e}"))?;
+            for row in &snapshot.skill_usages {
+                let cwd = cwd_renames
+                    .get(&row.cwd.as_deref())
+                    .expect("resolved skill usage cwd rename");
+                skill_usage_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.message_id,
+                        row.skill_name,
+                        row.skill_path,
+                        row.timestamp,
+                        row.tool_name,
+                        cwd,
+                        row.hostname,
+                    ])
+                    .map_err(|e| format!("Insert skill usage: {e}"))?;
+            }
+
+            let mut hook_invocation_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO hook_invocations (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, agent_id, is_sidechain, timestamp,
+                         hook_event, hook_matcher, tool_name, hook_identity,
+                         script_command_raw, exit_code, duration_ms, cwd,
+                         hostname, message_id
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17, ?18
+                     )",
+                )
+                .map_err(|e| format!("Prepare owned hook invocations: {e}"))?;
+            for row in &snapshot.hook_invocations {
+                let cwd = cwd_renames
+                    .get(&row.cwd.as_deref())
+                    .expect("resolved hook invocation cwd rename");
+                hook_invocation_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.agent_id,
+                        i64::from(row.is_sidechain),
+                        row.timestamp,
+                        row.hook_event,
+                        row.hook_matcher,
+                        row.tool_name,
+                        row.hook_identity,
+                        row.script_command_raw,
+                        row.exit_code,
+                        row.duration_ms,
+                        cwd,
+                        row.hostname,
+                        row.message_id,
+                    ])
+                    .map_err(|e| format!("Insert hook invocation: {e}"))?;
+            }
+        }
+        let registry_updated = tx.execute("INSERT INTO transcript_analytics_sources (provider,source_key,source_root_key,source_path,source_session_id,analytics_session_id,chain_id,parent_chain_id,agent_id,is_sidechain,project,cwd,hostname,mtime_ns,size_bytes,content_sha256,seen_generation,processing_status,last_attempt_at_ms,last_success_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,'ok',?18,?18) ON CONFLICT(provider,source_key) DO UPDATE SET source_root_key=excluded.source_root_key,source_path=excluded.source_path,source_session_id=excluded.source_session_id,analytics_session_id=excluded.analytics_session_id,chain_id=excluded.chain_id,parent_chain_id=excluded.parent_chain_id,agent_id=excluded.agent_id,is_sidechain=excluded.is_sidechain,project=excluded.project,cwd=excluded.cwd,hostname=excluded.hostname,mtime_ns=excluded.mtime_ns,size_bytes=excluded.size_bytes,content_sha256=excluded.content_sha256,seen_generation=excluded.seen_generation,processing_status='ok',last_attempt_at_ms=excluded.last_attempt_at_ms,last_success_at_ms=excluded.last_success_at_ms,suppressed_sha256=NULL,suppressed_at_ms=NULL,last_error=NULL WHERE transcript_analytics_sources.seen_generation <= excluded.seen_generation",
+             params![source.provider.as_str(),source.source_key,source.source_root_key,source.source_path.to_string_lossy(),source.source_session_id,source.analytics_session_id,source.chain_id,source.parent_chain_id,source.agent_id,i64::from(source.is_sidechain),source_project,source_cwd,source.hostname,source.mtime_ns,source.size_bytes,source.content_sha256,seen_generation,chrono::Utc::now().timestamp_millis()]).map_err(|e| format!("Upsert transcript source registry: {e}"))?;
+        if registry_updated != 1 {
+            return Err("Transcript analytics generation advanced during replacement".into());
+        }
+        tx.commit()
+            .map_err(|e| format!("Commit transcript analytics replacement: {e}"))?;
+        Ok(TranscriptAnalyticsReplacement::Replaced)
+    }
     pub fn init() -> Result<Self, String> {
         let path = db_path()?;
         let mut conn =
@@ -2747,6 +3605,17 @@ impl Storage {
                 |row| row.get(0),
             )
             .unwrap_or(0);
+
+        // A database written by a newer build cannot be downgraded in place:
+        // the migration gates below would all be skipped and later inserts
+        // would fail against columns this build never learned about. Refuse
+        // the open instead of starting a healthy-looking app that records
+        // nothing.
+        if current_version > MAX_SUPPORTED_SCHEMA_VERSION {
+            return Err(format!(
+                "SCHEMA_TOO_NEW: database schema version {current_version} was created by a newer version of Quill (this build supports up to {MAX_SUPPORTED_SCHEMA_VERSION}). Upgrade Quill to open it."
+            ));
+        }
 
         // Migration 1: add cwd column to token_snapshots
         if current_version < 1 {
@@ -4130,6 +4999,542 @@ impl Storage {
 
             tx.commit()
                 .map_err(|e| format!("Migration 29 commit: {e}"))?;
+        }
+
+        // Migration 30: transcript-derived analytics are owned by canonical
+        // retained sources instead of a shared root session. The five tables
+        // are rebuilt together so source replacement can later be atomic
+        // across runtime, response, tool, skill, and hook rows.
+        //
+        // Pre-30 rows carry no source identity, so the rebuilt tables start
+        // empty and startup reconciliation refills them from the transcripts
+        // still readable on this disk. Two classes of legacy row can never be
+        // rebuilt that way and are carried forward as source-less data
+        // (`source_key = NULL`, `chain_id = session_id`) instead:
+        //   * rows pushed from another machine through
+        //     `POST /api/v1/sessions/messages` — those transcripts are not on
+        //     this disk at all;
+        //   * live Codex hook observations, which only ever arrive through the
+        //     observer endpoint and are never derived from a transcript.
+        // `hostname` is the only remote/local discriminator the v29 schema
+        // offers, and it exists on just two of the five tables: `skill_usages`
+        // (migration 22) and `hook_invocations` (migration 27). `source_key`
+        // is added by this migration, so it cannot discriminate anything here.
+        //
+        // Carrying those rows forward cannot double count. Reconciliation only
+        // parses transcripts under the locally configured provider roots and
+        // stamps every row it produces with this machine's hostname, writing
+        // them as source-OWNED. Every carried-forward row is source-LESS and
+        // is either a Codex hook (never transcript-derived) or provably
+        // stamped with a different hostname, so the rebuilt set and the
+        // carried-forward set are disjoint by construction.
+        //
+        // Everything else — rows with no hostname, and local rows whose
+        // transcript has since been pruned by Claude's `cleanupPeriodDays` —
+        // is neither provably remote nor guaranteed rebuildable, so the
+        // renamed `*_legacy_v30` tables are RETAINED rather than dropped. They
+        // are recovery archives only: nothing queries them, no index is kept
+        // on them, and a later migration may reclaim the space once the
+        // rebuild is known good. Retention beats copying the whole database,
+        // which would double a multi-GB file on disk. A legacy table holding
+        // no rows at all is dropped immediately, so fresh installs stay clean.
+        // @lat: [[backend#Database#Schema#Source-Owned Transcript Analytics]]
+        if current_version < 30 {
+            let local_hostname = crate::sessions::SessionIndex::local_hostname();
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 30 transaction begin: {e}"))?;
+
+            tx.execute_batch(
+                "ALTER TABLE session_events RENAME TO session_events_legacy_v30;
+                 ALTER TABLE response_times RENAME TO response_times_legacy_v30;
+                 ALTER TABLE tool_actions RENAME TO tool_actions_legacy_v30;
+                 ALTER TABLE skill_usages RENAME TO skill_usages_legacy_v30;
+                 ALTER TABLE hook_invocations RENAME TO hook_invocations_legacy_v30;",
+            )
+            .map_err(|e| format!("Migration 30 (retain legacy analytics tables): {e}"))?;
+
+            // A renamed table keeps its indexes under their original names,
+            // which collide with the names the rebuilt tables need. Drop them
+            // so the archives can survive; the archives are never queried, so
+            // losing their indexes costs nothing. Implicit UNIQUE constraint
+            // auto-indexes have `sql IS NULL`, are not addressable by
+            // `DROP INDEX`, and never collide, so they are skipped.
+            let legacy_indexes: Vec<String> = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT name FROM sqlite_master
+                         WHERE type = 'index' AND sql IS NOT NULL
+                           AND tbl_name IN (
+                               'session_events_legacy_v30',
+                               'response_times_legacy_v30',
+                               'tool_actions_legacy_v30',
+                               'skill_usages_legacy_v30',
+                               'hook_invocations_legacy_v30'
+                           )
+                         ORDER BY name",
+                    )
+                    .map_err(|e| format!("Migration 30 (prepare legacy index scan): {e}"))?;
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("Migration 30 (query legacy indexes): {e}"))?;
+                let mut names = Vec::new();
+                for row in rows {
+                    names.push(
+                        row.map_err(|e| format!("Migration 30 (read legacy index name): {e}"))?,
+                    );
+                }
+                names
+            };
+            for name in &legacy_indexes {
+                // SQL identifiers cannot be bound as parameters. These names
+                // come from our own migrations by way of `sqlite_master`;
+                // doubling any embedded quote keeps the identifier literal
+                // regardless.
+                let quoted = name.replace('"', "\"\"");
+                tx.execute_batch(&format!("DROP INDEX IF EXISTS \"{quoted}\";"))
+                    .map_err(|e| format!("Migration 30 (drop legacy index {name}): {e}"))?;
+            }
+
+            tx.execute_batch(
+                "CREATE TABLE session_events (
+                     provider        TEXT NOT NULL,
+                     source_key      TEXT,
+                     event_key       TEXT NOT NULL CHECK(length(event_key) > 0),
+                     session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+                     chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+                     parent_chain_id TEXT,
+                     agent_id        TEXT,
+                     is_sidechain    INTEGER NOT NULL DEFAULT 0,
+                     timestamp       TEXT NOT NULL,
+                     kind            TEXT NOT NULL,
+                     uuid            TEXT,
+                     parent_uuid     TEXT,
+                     CHECK(source_key IS NULL OR length(source_key) > 0)
+                 );
+
+                 CREATE TABLE response_times (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     provider        TEXT NOT NULL DEFAULT 'claude',
+                     source_key      TEXT,
+                     session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+                     chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+                     parent_chain_id TEXT,
+                     timestamp       TEXT NOT NULL,
+                     response_secs   REAL,
+                     idle_secs       REAL,
+                     created_at      TEXT DEFAULT (datetime('now')),
+                     is_sidechain    INTEGER NOT NULL DEFAULT 0,
+                     agent_id        TEXT,
+                     parent_uuid     TEXT,
+                     CHECK(source_key IS NULL OR length(source_key) > 0)
+                 );
+
+                 CREATE TABLE tool_actions (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     provider        TEXT NOT NULL DEFAULT 'claude',
+                     source_key      TEXT,
+                     action_key      TEXT NOT NULL CHECK(length(action_key) > 0),
+                     message_id      TEXT NOT NULL,
+                     session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+                     chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+                     parent_chain_id TEXT,
+                     tool_name       TEXT NOT NULL,
+                     category        TEXT NOT NULL,
+                     file_path       TEXT,
+                     summary         TEXT NOT NULL,
+                     full_input      TEXT,
+                     full_output     TEXT,
+                     timestamp       TEXT NOT NULL,
+                     is_sidechain    INTEGER NOT NULL DEFAULT 0,
+                     agent_id        TEXT,
+                     parent_uuid     TEXT,
+                     CHECK(source_key IS NULL OR length(source_key) > 0)
+                 );
+
+                 CREATE TABLE skill_usages (
+                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                     provider        TEXT NOT NULL,
+                     source_key      TEXT,
+                     session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+                     chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+                     parent_chain_id TEXT,
+                     message_id      TEXT NOT NULL,
+                     skill_name      TEXT NOT NULL,
+                     skill_path      TEXT NOT NULL,
+                     timestamp       TEXT NOT NULL,
+                     tool_name       TEXT,
+                     created_at      TEXT DEFAULT (datetime('now')),
+                     cwd             TEXT,
+                     hostname        TEXT,
+                     CHECK(source_key IS NULL OR length(source_key) > 0)
+                 );
+
+                 CREATE TABLE hook_invocations (
+                     provider           TEXT NOT NULL,
+                     source_key         TEXT,
+                     session_id         TEXT NOT NULL CHECK(length(session_id) > 0),
+                     chain_id           TEXT NOT NULL CHECK(length(chain_id) > 0),
+                     parent_chain_id    TEXT,
+                     agent_id           TEXT,
+                     is_sidechain       INTEGER NOT NULL DEFAULT 0,
+                     timestamp          TEXT NOT NULL,
+                     hook_event         TEXT NOT NULL,
+                     hook_matcher       TEXT,
+                     tool_name          TEXT,
+                     hook_identity      TEXT NOT NULL,
+                     script_command_raw TEXT,
+                     exit_code          INTEGER,
+                     duration_ms        INTEGER,
+                     cwd                TEXT,
+                     hostname           TEXT,
+                     message_id         TEXT,
+                     CHECK(source_key IS NULL OR length(source_key) > 0)
+                 );
+
+                 CREATE UNIQUE INDEX uidx_hi_live
+                     ON hook_invocations(
+                         provider, session_id, chain_id, timestamp,
+                         hook_identity
+                     ) WHERE source_key IS NULL;
+
+                 CREATE UNIQUE INDEX uidx_se_owned
+                     ON session_events(provider, source_key, event_key)
+                     WHERE source_key IS NOT NULL;
+                 CREATE UNIQUE INDEX uidx_se_live
+                     ON session_events(provider, session_id, event_key)
+                     WHERE source_key IS NULL;
+                 CREATE UNIQUE INDEX uidx_rt_owned
+                     ON response_times(provider, source_key, chain_id, timestamp)
+                     WHERE source_key IS NOT NULL;
+                 CREATE UNIQUE INDEX uidx_rt_live
+                     ON response_times(provider, session_id, chain_id, timestamp)
+                     WHERE source_key IS NULL;
+                 CREATE UNIQUE INDEX uidx_ta_owned
+                     ON tool_actions(provider, source_key, action_key)
+                     WHERE source_key IS NOT NULL;
+                 CREATE UNIQUE INDEX uidx_ta_live
+                     ON tool_actions(provider, session_id, action_key)
+                     WHERE source_key IS NULL;
+                 CREATE UNIQUE INDEX uidx_su_owned
+                     ON skill_usages(
+                         provider, source_key, message_id, skill_name,
+                         skill_path, timestamp
+                     ) WHERE source_key IS NOT NULL;
+                 CREATE UNIQUE INDEX uidx_su_live
+                     ON skill_usages(
+                         provider, session_id, message_id, skill_name,
+                         skill_path, timestamp
+                     ) WHERE source_key IS NULL;
+                 CREATE UNIQUE INDEX uidx_hi_owned
+                     ON hook_invocations(
+                         provider, source_key, chain_id, timestamp,
+                         hook_identity
+                     ) WHERE source_key IS NOT NULL;
+                 CREATE INDEX idx_session_events_provider_source
+                     ON session_events(provider, source_key);
+                 CREATE INDEX idx_response_times_provider_source
+                     ON response_times(provider, source_key);
+                 CREATE INDEX idx_tool_actions_provider_source
+                     ON tool_actions(provider, source_key);
+                 CREATE INDEX idx_skill_usages_provider_source
+                     ON skill_usages(provider, source_key);
+                 CREATE INDEX idx_hook_invocations_provider_source
+                     ON hook_invocations(provider, source_key);
+
+                 CREATE INDEX idx_se_timestamp
+                     ON session_events(timestamp);
+                 CREATE INDEX idx_se_chain
+                     ON session_events(
+                         provider, session_id, chain_id, timestamp
+                     );
+                 CREATE INDEX idx_se_provider_session_sidechain
+                     ON session_events(
+                         provider, session_id, is_sidechain, timestamp
+                     );
+                 CREATE INDEX idx_rt_provider_session
+                     ON response_times(provider, session_id);
+                 CREATE INDEX idx_rt_session
+                     ON response_times(session_id);
+                 CREATE INDEX idx_rt_timestamp
+                     ON response_times(timestamp);
+                 CREATE INDEX idx_rt_provider_session_sidechain
+                     ON response_times(provider, session_id, is_sidechain);
+                 CREATE INDEX idx_rt_provider_session_agent
+                     ON response_times(provider, session_id, agent_id);
+                 CREATE INDEX idx_tool_actions_provider_session
+                     ON tool_actions(provider, session_id);
+                 CREATE INDEX idx_tool_actions_session
+                     ON tool_actions(session_id);
+                 CREATE INDEX idx_tool_actions_message
+                     ON tool_actions(message_id);
+                 CREATE INDEX idx_tool_actions_file
+                     ON tool_actions(file_path);
+                 CREATE INDEX idx_tool_actions_category
+                     ON tool_actions(category);
+                 CREATE INDEX idx_tool_actions_provider_session_sidechain
+                     ON tool_actions(provider, session_id, is_sidechain);
+                 CREATE INDEX idx_tool_actions_provider_session_agent
+                     ON tool_actions(provider, session_id, agent_id);
+                 CREATE INDEX idx_skill_usages_provider_ts
+                     ON skill_usages(provider, timestamp);
+                 CREATE INDEX idx_skill_usages_provider_session
+                     ON skill_usages(provider, session_id);
+                 CREATE INDEX idx_skill_usages_skill_ts
+                     ON skill_usages(skill_name, timestamp);
+                 CREATE INDEX idx_skill_usages_skill_cwd
+                     ON skill_usages(skill_name, cwd);
+                 CREATE INDEX idx_hook_invocations_provider_ts
+                     ON hook_invocations(provider, timestamp);
+                 CREATE INDEX idx_hook_invocations_provider_session
+                     ON hook_invocations(provider, session_id);
+                 CREATE INDEX idx_hook_invocations_identity_ts
+                     ON hook_invocations(hook_identity, timestamp);
+                 CREATE INDEX idx_hook_invocations_identity_cwd
+                     ON hook_invocations(hook_identity, cwd);
+
+                 CREATE TABLE transcript_analytics_sources (
+                     provider             TEXT NOT NULL,
+                     source_key           TEXT NOT NULL,
+                     source_root_key      TEXT NOT NULL,
+                     source_path          TEXT NOT NULL,
+                     source_session_id    TEXT,
+                     analytics_session_id TEXT,
+                     chain_id             TEXT,
+                     parent_chain_id      TEXT,
+                     agent_id             TEXT,
+                     is_sidechain         INTEGER NOT NULL DEFAULT 0,
+                     project              TEXT,
+                     cwd                  TEXT,
+                     hostname             TEXT,
+                     mtime_ns             INTEGER,
+                     size_bytes           INTEGER,
+                     content_sha256       TEXT,
+                     seen_generation      INTEGER NOT NULL DEFAULT 0,
+                     processing_status    TEXT NOT NULL DEFAULT 'pending',
+                     last_attempt_at_ms   INTEGER,
+                     last_success_at_ms   INTEGER,
+                     last_error           TEXT,
+                     suppressed_sha256    TEXT,
+                     suppressed_at_ms     INTEGER,
+                     PRIMARY KEY(provider, source_key),
+                     CHECK(length(source_key) > 0),
+                     CHECK(length(source_root_key) > 0),
+                     CHECK(length(source_path) > 0),
+                     CHECK(source_session_id IS NULL
+                           OR length(source_session_id) > 0),
+                     CHECK(analytics_session_id IS NULL
+                           OR length(analytics_session_id) > 0),
+                     CHECK(chain_id IS NULL OR length(chain_id) > 0),
+                     CHECK(is_sidechain IN (0, 1)),
+                     CHECK(mtime_ns IS NULL OR mtime_ns >= 0),
+                     CHECK(size_bytes IS NULL OR size_bytes >= 0),
+                     CHECK(seen_generation >= 0),
+                     CHECK(processing_status IN
+                           ('pending', 'ok', 'stale', 'failed', 'suppressed')),
+                     CHECK(last_attempt_at_ms IS NULL
+                           OR last_attempt_at_ms >= 0),
+                     CHECK(last_success_at_ms IS NULL
+                           OR last_success_at_ms >= 0),
+                     CHECK(suppressed_at_ms IS NULL
+                           OR suppressed_at_ms >= 0)
+                 );
+                 CREATE INDEX idx_tas_root_generation
+                     ON transcript_analytics_sources(
+                         provider, source_root_key, seen_generation
+                     );
+                 CREATE INDEX idx_tas_session
+                     ON transcript_analytics_sources(
+                         provider, analytics_session_id
+                     );
+                 CREATE INDEX idx_tas_project
+                     ON transcript_analytics_sources(project);
+                 CREATE INDEX idx_tas_cwd
+                     ON transcript_analytics_sources(cwd);
+                 CREATE INDEX idx_tas_host
+                     ON transcript_analytics_sources(hostname);
+
+                 CREATE TABLE live_analytics_sessions (
+                     provider   TEXT NOT NULL,
+                     session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+                     project    TEXT,
+                     cwd        TEXT,
+                     hostname   TEXT,
+                     updated_at TEXT NOT NULL,
+                     PRIMARY KEY(provider, session_id)
+                 );
+                 CREATE INDEX idx_las_project
+                     ON live_analytics_sessions(project);
+                 CREATE INDEX idx_las_cwd
+                     ON live_analytics_sessions(cwd);
+                 CREATE INDEX idx_las_host
+                     ON live_analytics_sessions(hostname);",
+            )
+            .map_err(|e| format!("Migration 30 (source-owned analytics schema): {e}"))?;
+
+            // Carry forward hook rows this machine can never rebuild: live
+            // Codex observations, and any hook recorded on another host. The
+            // v29 hook identity keyed on `COALESCE(agent_id, '')` while the
+            // source-less identity does not, so two legacy rows can fold into
+            // one here; keep the lowest rowid of each fold.
+            tx.execute(
+                "INSERT OR IGNORE INTO hook_invocations (
+                     provider, source_key, session_id, chain_id,
+                     parent_chain_id, agent_id, is_sidechain, timestamp,
+                     hook_event, hook_matcher, tool_name, hook_identity,
+                     script_command_raw, exit_code, duration_ms, cwd,
+                     hostname, message_id
+                 )
+                 SELECT provider, NULL, session_id, session_id,
+                        NULL, agent_id, is_sidechain, timestamp,
+                        hook_event, hook_matcher, tool_name, hook_identity,
+                        script_command_raw, exit_code, duration_ms, cwd,
+                        hostname, message_id
+                 FROM hook_invocations_legacy_v30 AS legacy
+                 WHERE (legacy.provider = 'codex'
+                        OR (legacy.hostname IS NOT NULL
+                            AND legacy.hostname <> ?1))
+                   AND legacy.rowid = (
+                       SELECT MIN(candidate.rowid)
+                       FROM hook_invocations_legacy_v30 AS candidate
+                       WHERE candidate.provider = legacy.provider
+                         AND candidate.session_id = legacy.session_id
+                         AND candidate.timestamp = legacy.timestamp
+                         AND candidate.hook_identity = legacy.hook_identity
+                   )",
+                params![local_hostname],
+            )
+            .map_err(|e| format!("Migration 30 (retain source-less hook rows): {e}"))?;
+
+            // Same reasoning for skill usage rows pushed from another machine.
+            // The v29 UNIQUE constraint already matched `uidx_su_live` exactly,
+            // so no fold is possible and no rowid tie-break is needed.
+            tx.execute(
+                "INSERT OR IGNORE INTO skill_usages (
+                     provider, source_key, session_id, chain_id,
+                     parent_chain_id, message_id, skill_name, skill_path,
+                     timestamp, tool_name, cwd, hostname
+                 )
+                 SELECT provider, NULL, session_id, session_id,
+                        NULL, message_id, skill_name, skill_path,
+                        timestamp, tool_name, cwd, hostname
+                 FROM skill_usages_legacy_v30
+                 WHERE hostname IS NOT NULL AND hostname <> ?1",
+                params![local_hostname],
+            )
+            .map_err(|e| format!("Migration 30 (retain source-less skill rows): {e}"))?;
+
+            // Project and host deletion reach source-less rows only through
+            // their recorded live origin, so register one origin per carried
+            // forward session. `project` stays NULL because the v29 rows never
+            // stored it; the COALESCE upsert in `store_live_session_analytics`
+            // fills it in on the next live push.
+            tx.execute(
+                "INSERT OR IGNORE INTO live_analytics_sessions (
+                     provider, session_id, project, cwd, hostname, updated_at
+                 )
+                 SELECT provider, session_id, NULL, MIN(cwd), hostname, ?1
+                 FROM (
+                     SELECT provider, session_id, cwd, hostname
+                     FROM hook_invocations
+                     WHERE source_key IS NULL
+                     UNION ALL
+                     SELECT provider, session_id, cwd, hostname
+                     FROM skill_usages
+                     WHERE source_key IS NULL
+                 )
+                 WHERE hostname IS NOT NULL
+                 GROUP BY provider, session_id, hostname",
+                params![Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| format!("Migration 30 (register carried-forward origins): {e}"))?;
+
+            // Drop only the archives that provably hold nothing — a fresh
+            // install renames five empty tables and has no history to keep.
+            // Every other archive is retained for recovery.
+            for table in TRANSCRIPT_ANALYTICS_TABLES {
+                let archive = format!("{table}_legacy_v30");
+                let remaining: i64 = tx
+                    .query_row(&format!("SELECT COUNT(*) FROM {archive}"), [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| format!("Migration 30 (count {archive}): {e}"))?;
+                if remaining == 0 {
+                    tx.execute_batch(&format!("DROP TABLE {archive};"))
+                        .map_err(|e| format!("Migration 30 (drop empty {archive}): {e}"))?;
+                }
+            }
+
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["transcript_analytics_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 30 (set reingest flag): {e}"))?;
+
+            tx.execute("INSERT INTO schema_version (version) VALUES (30)", [])
+                .map_err(|e| format!("Failed to record migration 30: {e}"))?;
+
+            tx.commit()
+                .map_err(|e| format!("Migration 30 commit: {e}"))?;
+        }
+
+        if current_version < 31 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 31 transaction: {e}"))?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS project_path_renames (
+                     old_path  TEXT PRIMARY KEY CHECK(length(old_path) > 0),
+                     new_path  TEXT NOT NULL CHECK(length(new_path) > 0),
+                     updated_at TEXT NOT NULL,
+                     CHECK(old_path != new_path)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_project_path_renames_new
+                     ON project_path_renames(new_path);
+                 CREATE INDEX IF NOT EXISTS idx_se_provider_chain_timestamp
+                     ON session_events(provider, chain_id, timestamp);",
+            )
+            .map_err(|e| format!("Migration 31 (rename and runtime indexes): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (31)", [])
+                .map_err(|e| format!("Failed to record migration 31: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 31 commit: {e}"))?;
+        }
+
+        // Migration 32: bound the runtime walker's scan. `get_llm_runtime_stats`
+        // filters `timestamp >= ?` and reads `timestamp, kind, provider,
+        // session_id, chain_id` (plus `is_sidechain` for the parent-only
+        // scope). Migration 31's `(provider, chain_id, timestamp)` index
+        // satisfies the ORDER BY but puts `timestamp` third, so the filter can
+        // never seek: every tick scanned the whole index and did one rowid
+        // lookup per row. Leading with `timestamp` turns the filter into a
+        // range seek, and carrying the other five columns makes the index
+        // covering, so no table rows are touched at all. The query sorts the
+        // matched slice to satisfy `ORDER BY provider, chain_id, timestamp,
+        // rowid`, which is the right trade: the sort is over the bounded
+        // window instead of the whole corpus, and it replaces a per-row heap
+        // fetch with an in-memory sort of index entries. `get_llm_runtime_stats`
+        // pins this index with `INDEXED BY` because without `sqlite_stat1`
+        // the planner always prefers the sort-free migration-31 index.
+        // Migration 31 is left untouched because it has already run on user
+        // machines.
+        // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+        if current_version < 32 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 32 transaction: {e}"))?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_se_timestamp_chain
+                     ON session_events(
+                         timestamp, provider, chain_id, is_sidechain,
+                         kind, session_id
+                     );",
+            )
+            .map_err(|e| format!("Migration 32 (runtime window index): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (32)", [])
+                .map_err(|e| format!("Failed to record migration 32: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 32 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -9267,47 +10672,54 @@ impl Storage {
             )
             .map_err(|e| format!("Suppress host model sources error: {e}"))?;
 
-        // Feature 008: cascade session_events for every session that lived
-        // on this host. session_events keys on (provider, session_id), so
-        // we resolve the set via a subquery against `token_snapshots`
-        // (the authoritative source for "what sessions ran on this host").
-        // The subquery is evaluated inside the same transaction as the
-        // deletes — no separate lock acquisition — so a concurrent indexer
-        // run cannot slip new session_events rows past us, and the order
-        // (session_events delete BEFORE token_snapshots delete) ensures
-        // the subquery still sees the pre-delete state. See
-        // specs/008-runtime-redesign/contracts/session-events.md.
-        let event_count = tx
-            .execute(
-                "DELETE FROM session_events
-                 WHERE (provider, session_id) IN (
-                     SELECT DISTINCT provider, session_id
-                     FROM token_snapshots
+        let transcript_sources = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT source.provider, source.source_key
+                     FROM transcript_analytics_sources source
+                     JOIN (
+                         SELECT provider, analytics_session_id
+                         FROM transcript_analytics_sources
+                         WHERE hostname = ?1
+                           AND analytics_session_id IS NOT NULL
+                         GROUP BY provider, analytics_session_id
+                     ) matching_root
+                       ON matching_root.provider = source.provider
+                      AND matching_root.analytics_session_id =
+                          source.analytics_session_id
+                     ORDER BY source.provider, source.source_key",
+                )
+                .map_err(|e| format!("Prepare host transcript sources: {e}"))?;
+            let rows = statement
+                .query_map(params![hostname], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Query host transcript sources: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read host transcript sources: {e}"))?
+        };
+        let live_sessions = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider, session_id
+                     FROM live_analytics_sessions
                      WHERE hostname = ?1
-                 )",
-                params![hostname],
-            )
-            .map_err(|e| format!("Delete session_events cascade error: {e}"))?;
-
-        // Feature 009: cascade hook_invocations rows for every session
-        // that lived on this host, using the same token_snapshots
-        // subquery pattern as the session_events cascade. Sequenced
-        // before the token_snapshots delete so the subquery still sees
-        // the source rows. Also drops any rows the observer captured
-        // with an explicit hostname column match (Codex side).
-        // @lat: [[backend#Database#Schema#Hook Invocations]]
-        let hook_count = tx
-            .execute(
-                "DELETE FROM hook_invocations
-                 WHERE (provider, session_id) IN (
-                     SELECT DISTINCT provider, session_id
-                     FROM token_snapshots
-                     WHERE hostname = ?1
-                 )
-                 OR hostname = ?1",
-                params![hostname],
-            )
-            .map_err(|e| format!("Delete hook_invocations cascade error: {e}"))?;
+                     ORDER BY provider, session_id",
+                )
+                .map_err(|e| format!("Prepare host live sessions: {e}"))?;
+            let rows = statement
+                .query_map(params![hostname], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Query host live sessions: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read host live sessions: {e}"))?
+        };
+        let analytics_count = suppress_transcript_analytics_sources_in_transaction(
+            &tx,
+            &transcript_sources,
+            suppressed_at_ms,
+        )?
+        .saturating_add(delete_live_analytics_sessions_in_transaction(
+            &tx,
+            &live_sessions,
+        )?);
 
         let snap_count = tx
             .execute(
@@ -9330,8 +10742,9 @@ impl Storage {
         tx.commit().map_err(|e| format!("Commit error: {e}"))?;
 
         Ok(DataMutationResult {
-            affected_rows: (snap_count + hourly_count + event_count + hook_count) as u64,
+            affected_rows: (snap_count + hourly_count + analytics_count) as u64,
             model_data_changed: model_observation_count != 0 || model_source_count != 0,
+            transcript_data_changed: analytics_count != 0,
         })
     }
 
@@ -9372,38 +10785,39 @@ impl Storage {
             )
             .map_err(|e| format!("Suppress session model sources error: {e}"))?;
 
+        let transcript_sources = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider, source_key
+                     FROM transcript_analytics_sources
+                     WHERE provider = ?1 AND analytics_session_id = ?2
+                     ORDER BY source_key",
+                )
+                .map_err(|e| format!("Prepare session transcript sources: {e}"))?;
+            let rows = statement
+                .query_map(params![provider.as_str(), session_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .map_err(|e| format!("Query session transcript sources: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read session transcript sources: {e}"))?
+        };
+        let analytics_count = suppress_transcript_analytics_sources_in_transaction(
+            &tx,
+            &transcript_sources,
+            suppressed_at_ms,
+        )?
+        .saturating_add(delete_live_analytics_sessions_in_transaction(
+            &tx,
+            &[(provider.as_str().to_string(), session_id.to_string())],
+        )?);
+
         let token_count = tx
             .execute(
                 "DELETE FROM token_snapshots WHERE provider = ?1 AND session_id = ?2",
                 params![provider.as_str(), session_id],
             )
             .map_err(|e| format!("Delete token snapshots error: {e}"))?;
-
-        let skill_count = tx
-            .execute(
-                "DELETE FROM skill_usages WHERE provider = ?1 AND session_id = ?2",
-                params![provider.as_str(), session_id],
-            )
-            .map_err(|e| format!("Delete skill usages error: {e}"))?;
-
-        // Feature 008: cascade session_events for this session. See
-        // specs/008-runtime-redesign/contracts/session-events.md (FR-012).
-        let event_count = tx
-            .execute(
-                "DELETE FROM session_events WHERE provider = ?1 AND session_id = ?2",
-                params![provider.as_str(), session_id],
-            )
-            .map_err(|e| format!("Delete session_events error: {e}"))?;
-
-        // Feature 009: cascade hook_invocations for this session so the
-        // Hooks breakdown stays consistent with the visible session list.
-        // @lat: [[backend#Database#Schema#Hook Invocations]]
-        let hook_count = tx
-            .execute(
-                "DELETE FROM hook_invocations WHERE provider = ?1 AND session_id = ?2",
-                params![provider.as_str(), session_id],
-            )
-            .map_err(|e| format!("Delete hook_invocations error: {e}"))?;
 
         if model_observation_count != 0 || model_source_count != 0 {
             bump_model_data_revision(&tx)?;
@@ -9413,8 +10827,9 @@ impl Storage {
             .map_err(|e| format!("Delete session commit error: {e}"))?;
 
         Ok(DataMutationResult {
-            affected_rows: (token_count + skill_count + event_count + hook_count) as u64,
+            affected_rows: (token_count + analytics_count) as u64,
             model_data_changed: model_observation_count != 0 || model_source_count != 0,
+            transcript_data_changed: analytics_count != 0,
         })
     }
 
@@ -9428,37 +10843,58 @@ impl Storage {
         let (model_observation_count, model_source_count) =
             suppress_project_model_sources_in_transaction(&tx, cwd, suppressed_at_ms)?;
 
-        // Feature 008: cascade session_events for every session that lived
-        // under this cwd. As in `delete_host_data`, the subquery resolving
-        // (provider, session_id) runs inside the same transaction as the
-        // deletes so concurrent indexer writes cannot race us, and the
-        // session_events delete is sequenced BEFORE the token_snapshots
-        // delete so the subquery still observes the source rows.
-        let event_count = tx
-            .execute(
-                "DELETE FROM session_events
-                 WHERE (provider, session_id) IN (
-                     SELECT DISTINCT provider, session_id
-                     FROM token_snapshots
-                     WHERE cwd = ?1
-                 )",
-                params![cwd],
-            )
-            .map_err(|e| format!("Delete session_events cascade error: {e}"))?;
+        let transcript_sources = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT source.provider, source.source_key
+                     FROM transcript_analytics_sources source
+                     JOIN (
+                         SELECT provider, analytics_session_id
+                         FROM transcript_analytics_sources
+                         WHERE (cwd = ?1 OR project = ?1)
+                           AND analytics_session_id IS NOT NULL
+                         GROUP BY provider, analytics_session_id
+                     ) matching_root
+                       ON matching_root.provider = source.provider
+                      AND matching_root.analytics_session_id =
+                          source.analytics_session_id
+                     ORDER BY source.provider, source.source_key",
+                )
+                .map_err(|e| format!("Prepare project transcript sources: {e}"))?;
+            let rows = statement
+                .query_map(params![cwd], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Query project transcript sources: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read project transcript sources: {e}"))?
+        };
+        let live_sessions = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider, session_id
+                     FROM live_analytics_sessions
+                     WHERE cwd = ?1 OR project = ?1
+                     ORDER BY provider, session_id",
+                )
+                .map_err(|e| format!("Prepare project live sessions: {e}"))?;
+            let rows = statement
+                .query_map(params![cwd], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Query project live sessions: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read project live sessions: {e}"))?
+        };
+        let analytics_count = suppress_transcript_analytics_sources_in_transaction(
+            &tx,
+            &transcript_sources,
+            suppressed_at_ms,
+        )?
+        .saturating_add(delete_live_analytics_sessions_in_transaction(
+            &tx,
+            &live_sessions,
+        )?);
 
         let token_count = tx
             .execute("DELETE FROM token_snapshots WHERE cwd = ?1", params![cwd])
             .map_err(|e| format!("Delete token_snapshots error: {e}"))?;
-
-        let skill_count = tx
-            .execute("DELETE FROM skill_usages WHERE cwd = ?1", params![cwd])
-            .map_err(|e| format!("Delete skill_usages error: {e}"))?;
-
-        // Feature 009: cascade hook_invocations rows for this cwd.
-        // @lat: [[backend#Database#Schema#Hook Invocations]]
-        let hook_count = tx
-            .execute("DELETE FROM hook_invocations WHERE cwd = ?1", params![cwd])
-            .map_err(|e| format!("Delete hook_invocations error: {e}"))?;
 
         if model_observation_count != 0 || model_source_count != 0 {
             bump_model_data_revision(&tx)?;
@@ -9468,8 +10904,9 @@ impl Storage {
             .map_err(|e| format!("Commit delete_project_data: {e}"))?;
 
         Ok(DataMutationResult {
-            affected_rows: (token_count + skill_count + event_count + hook_count) as u64,
+            affected_rows: (token_count + analytics_count) as u64,
             model_data_changed: model_observation_count != 0 || model_source_count != 0,
+            transcript_data_changed: analytics_count != 0,
         })
     }
 
@@ -9517,6 +10954,80 @@ impl Storage {
             )
             .map_err(|e| format!("Update model sources error: {e}"))?;
 
+        // Explicit project renames are authoritative for later transcript
+        // replay and live ingestion. Collapse predecessors onto the newest
+        // destination so resolution remains one bounded lookup, including
+        // rename chains and reversals.
+        // A reversal (`A -> B` then `B -> A`) would collapse its own
+        // predecessor onto itself, and `CHECK(old_path != new_path)` rejects
+        // that mid-statement — the trailing self-row sweep never gets to run.
+        // Retire those rows first so the collapse below only ever rewrites
+        // predecessors that still point somewhere else.
+        tx.execute(
+            "DELETE FROM project_path_renames
+             WHERE new_path = ?1 AND old_path = ?2",
+            params![old_cwd, new_cwd],
+        )
+        .map_err(|e| format!("Retire reversed project renames: {e}"))?;
+        tx.execute(
+            "UPDATE project_path_renames
+             SET new_path = ?2, updated_at = ?3
+             WHERE new_path = ?1",
+            params![old_cwd, new_cwd, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Collapse prior project renames: {e}"))?;
+        tx.execute(
+            "INSERT INTO project_path_renames(old_path, new_path, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(old_path) DO UPDATE SET
+                 new_path = excluded.new_path,
+                 updated_at = excluded.updated_at",
+            params![old_cwd, new_cwd, Utc::now().to_rfc3339()],
+        )
+        .map_err(|e| format!("Record project rename: {e}"))?;
+        tx.execute(
+            "DELETE FROM project_path_renames WHERE old_path = new_path",
+            [],
+        )
+        .map_err(|e| format!("Remove no-op project renames: {e}"))?;
+
+        let mut transcript_count = 0_usize;
+        transcript_count = transcript_count.saturating_add(
+            tx.execute(
+                "UPDATE transcript_analytics_sources
+                 SET project = CASE WHEN project = ?1 THEN ?2 ELSE project END,
+                     cwd = CASE WHEN cwd = ?1 THEN ?2 ELSE cwd END
+                 WHERE project = ?1 OR cwd = ?1",
+                params![old_cwd, new_cwd],
+            )
+            .map_err(|e| format!("Update transcript source ownership: {e}"))?,
+        );
+        transcript_count = transcript_count.saturating_add(
+            tx.execute(
+                "UPDATE live_analytics_sessions
+                 SET project = CASE WHEN project = ?1 THEN ?2 ELSE project END,
+                     cwd = CASE WHEN cwd = ?1 THEN ?2 ELSE cwd END,
+                     updated_at = ?3
+                 WHERE project = ?1 OR cwd = ?1",
+                params![old_cwd, new_cwd, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| format!("Update live analytics ownership: {e}"))?,
+        );
+        transcript_count = transcript_count.saturating_add(
+            tx.execute(
+                "UPDATE skill_usages SET cwd = ?2 WHERE cwd = ?1",
+                params![old_cwd, new_cwd],
+            )
+            .map_err(|e| format!("Update skill usage project: {e}"))?,
+        );
+        transcript_count = transcript_count.saturating_add(
+            tx.execute(
+                "UPDATE hook_invocations SET cwd = ?2 WHERE cwd = ?1",
+                params![old_cwd, new_cwd],
+            )
+            .map_err(|e| format!("Update hook invocation project: {e}"))?,
+        );
+
         if model_observation_count != 0 || model_source_count != 0 {
             bump_model_data_revision(&tx)?;
         }
@@ -9524,8 +11035,9 @@ impl Storage {
         tx.commit().map_err(|e| format!("Commit error: {e}"))?;
 
         Ok(DataMutationResult {
-            affected_rows: snap_count as u64,
+            affected_rows: (snap_count + transcript_count) as u64,
             model_data_changed: model_observation_count != 0 || model_source_count != 0,
+            transcript_data_changed: transcript_count != 0,
         })
     }
 
@@ -12946,233 +14458,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Delete all tool_actions for a session (used before re-indexing to prevent duplicates).
-    pub fn delete_tool_actions_for_session(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM tool_actions WHERE provider = ?1 AND session_id = ?2",
-            rusqlite::params![provider.as_str(), session_id],
-        )
-        .map_err(|e| format!("Delete tool_actions for session: {e}"))?;
-        Ok(())
-    }
-
-    pub fn delete_skill_usages_for_session(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM skill_usages WHERE provider = ?1 AND session_id = ?2",
-            params![provider.as_str(), session_id],
-        )
-        .map_err(|e| format!("Delete skill_usages for session: {e}"))?;
-        Ok(())
-    }
-
-    /// Delete every `hook_invocations` row for a single session
-    /// (feature 009). Called from the session-delete cascade in
-    /// `delete_session_data` and from the per-session reindex path so
-    /// transcript replays don't accumulate duplicates beyond what
-    /// `INSERT OR IGNORE` absorbs.
-    // @lat: [[backend#Database#Schema#Hook Invocations]]
-    pub fn delete_hook_invocations_for_session(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM hook_invocations WHERE provider = ?1 AND session_id = ?2",
-            params![provider.as_str(), session_id],
-        )
-        .map_err(|e| format!("Delete hook_invocations for session: {e}"))?;
-        Ok(())
-    }
-
-    pub fn store_tool_actions_for_messages(
-        &self,
-        provider: IntegrationProvider,
-        messages: &[crate::sessions::ExtractedMessage],
-    ) -> Result<(), String> {
-        if !messages
-            .iter()
-            .any(|message| !message.tool_actions.is_empty())
-        {
-            return Ok(());
-        }
-
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Begin tool_actions batch transaction: {e}"))?;
-
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category, file_path, summary, full_input, full_output, timestamp, is_sidechain, agent_id, parent_uuid)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                )
-                .map_err(|e| format!("Prepare store_tool_actions batch: {e}"))?;
-
-            for message in messages {
-                if message.tool_actions.is_empty() {
-                    continue;
-                }
-
-                insert_tool_actions(
-                    &mut stmt,
-                    provider,
-                    &message.tool_actions,
-                    &message.uuid,
-                    &message.session_id,
-                    ToolActionAttribution {
-                        is_sidechain: message.is_sidechain,
-                        agent_id: message.agent_id.as_deref(),
-                        parent_uuid: message.parent_uuid.as_deref(),
-                    },
-                )?;
-            }
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Commit tool_actions batch: {e}"))?;
-        Ok(())
-    }
-
-    pub fn store_skill_usages_for_messages(
-        &self,
-        provider: IntegrationProvider,
-        messages: &[crate::sessions::ExtractedMessage],
-    ) -> Result<(), String> {
-        let hostname = Some(crate::sessions::SessionIndex::local_hostname());
-        let usages: Vec<SkillUsage> = messages
-            .iter()
-            .flat_map(|message| {
-                let message_cwd = message.cwd.clone();
-                let hostname = hostname.clone();
-                message.tool_actions.iter().flat_map(move |action| {
-                    let cwd = message_cwd.clone();
-                    let hostname = hostname.clone();
-                    crate::sessions::extract_skill_accesses_from_tool_action(action)
-                        .into_iter()
-                        .map(move |access| SkillUsage {
-                            session_id: message.session_id.clone(),
-                            message_id: message.uuid.clone(),
-                            skill_name: access.skill_name,
-                            skill_path: access.skill_path,
-                            timestamp: action.timestamp.clone(),
-                            tool_name: Some(action.tool_name.clone()),
-                            cwd: cwd.clone(),
-                            hostname: hostname.clone(),
-                        })
-                })
-            })
-            .collect();
-
-        if usages.is_empty() {
-            return Ok(());
-        }
-
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Begin skill_usages batch transaction: {e}"))?;
-
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO skill_usages
-                     (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name, cwd, hostname)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )
-                .map_err(|e| format!("Prepare store skill_usages batch: {e}"))?;
-
-            for usage in usages {
-                stmt.execute(params![
-                    provider.as_str(),
-                    usage.session_id,
-                    usage.message_id,
-                    usage.skill_name,
-                    usage.skill_path,
-                    usage.timestamp,
-                    usage.tool_name,
-                    usage.cwd,
-                    usage.hostname,
-                ])
-                .map_err(|e| format!("Insert skill_usage: {e}"))?;
-            }
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Commit skill_usages batch: {e}"))?;
-        Ok(())
-    }
-
-    /// Insert observed lifecycle-hook fires into `hook_invocations`
-    /// (feature 009). Single transaction, prepared statement,
-    /// `INSERT OR IGNORE` against the UNIQUE identity index so
-    /// re-extraction of the same Claude transcript is idempotent. See
-    /// specs/009-hooks-breakdown-tab/contracts/hook-invocations.md
-    /// (§ Insert path).
-    // @lat: [[backend#Database#Schema#Hook Invocations]]
-    pub fn store_hook_invocations_for_messages(
-        &self,
-        provider: IntegrationProvider,
-        invocations: &[HookInvocationInput<'_>],
-    ) -> Result<(), String> {
-        if invocations.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Begin hook_invocations batch transaction: {e}"))?;
-
-        {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO hook_invocations (
-                        provider, session_id, agent_id, is_sidechain, timestamp,
-                        hook_event, hook_matcher, tool_name, hook_identity,
-                        script_command_raw, exit_code, duration_ms, cwd, hostname,
-                        message_id
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                )
-                .map_err(|e| format!("Prepare store_hook_invocations: {e}"))?;
-
-            for inv in invocations {
-                stmt.execute(params![
-                    provider.as_str(),
-                    inv.session_id,
-                    inv.agent_id,
-                    inv.is_sidechain as i64,
-                    inv.timestamp,
-                    inv.hook_event,
-                    inv.hook_matcher,
-                    inv.tool_name,
-                    inv.hook_identity,
-                    inv.script_command_raw,
-                    inv.exit_code,
-                    inv.duration_ms,
-                    inv.cwd,
-                    inv.hostname,
-                    inv.message_id,
-                ])
-                .map_err(|e| format!("Insert hook_invocation: {e}"))?;
-            }
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Commit hook_invocations batch: {e}"))?;
-        Ok(())
-    }
-
     /// Insert a single Codex hook observation submitted via
     /// `POST /api/v1/hooks/observed`. The endpoint validates the
     /// payload and acknowledges synchronously; this insert runs on a
@@ -13197,30 +14482,340 @@ impl Storage {
             Some(t) if !t.is_empty() => format!("{}:{}", obs.hook_event, t),
             _ => obs.hook_event.clone(),
         };
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached(
-                "INSERT OR IGNORE INTO hook_invocations (
-                    provider, session_id, agent_id, is_sidechain, timestamp,
-                    hook_event, hook_matcher, tool_name, hook_identity,
-                    script_command_raw, exit_code, duration_ms, cwd, hostname,
-                    message_id
-                ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, NULL, NULL)",
-            )
-            .map_err(|e| format!("Prepare store_codex_hook_observation: {e}"))?;
-        stmt.execute(params![
-            obs.provider.as_str(),
-            obs.session_id,
-            obs.agent_id,
-            obs.ts,
-            obs.hook_event,
-            obs.hook_matcher,
-            obs.tool_name,
-            identity,
-            obs.cwd,
-        ])
-        .map_err(|e| format!("Insert codex hook observation: {e}"))?;
-        Ok(())
+        let invocation = HookInvocationInput {
+            session_id: &obs.session_id,
+            agent_id: obs.agent_id.as_deref(),
+            timestamp: &obs.ts,
+            hook_event: &obs.hook_event,
+            hook_matcher: obs.hook_matcher.as_deref(),
+            tool_name: obs.tool_name.as_deref(),
+            hook_identity: &identity,
+            script_command_raw: None,
+            exit_code: None,
+            duration_ms: None,
+            cwd: obs.cwd.as_deref(),
+            hostname: None,
+            message_id: None,
+        };
+        self.store_live_session_analytics(
+            obs.provider,
+            &obs.session_id,
+            LiveAnalyticsOrigin {
+                project: None,
+                cwd: obs.cwd.as_deref().map(Path::new),
+                hostname: None,
+            },
+            LiveSessionAnalyticsRows {
+                messages: &[],
+                session_events: &[],
+                hook_invocations: std::slice::from_ref(&invocation),
+            },
+        )
+    }
+
+    /// Atomically persist one source-less analytics batch and the exact origin
+    /// fields supplied by its producer. Null origin values never erase a known
+    /// value from an earlier endpoint.
+    // @lat: [[data-flow#Session Indexing Pipeline#Live Analytics Origin]]
+    pub(crate) fn store_live_session_analytics(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+        origin: LiveAnalyticsOrigin<'_>,
+        rows: LiveSessionAnalyticsRows<'_>,
+    ) -> Result<(), String> {
+        if session_id.trim().is_empty() {
+            return Err("Live analytics session_id must not be empty".to_string());
+        }
+        let mut message_ids = HashSet::with_capacity(rows.messages.len());
+        for message in rows.messages {
+            let stable_id = message.message_id.trim();
+            if stable_id.is_empty()
+                || stable_id != message.message_id
+                || !message_ids.insert(stable_id)
+            {
+                return Err("Live analytics messages require unique stable message ids".to_string());
+            }
+            let chain_id = message.chain_id.trim();
+            if chain_id.is_empty() || chain_id != message.chain_id {
+                return Err("Live analytics messages require a stable chain id".to_string());
+            }
+            if message.is_sidechain {
+                let parent_chain_id = message
+                    .parent_chain_id
+                    .filter(|value| !value.trim().is_empty() && value.trim() == *value);
+                let agent_id = message
+                    .agent_id
+                    .filter(|value| !value.trim().is_empty() && value.trim() == *value);
+                if parent_chain_id != Some(session_id)
+                    || agent_id != Some(message.chain_id)
+                    || message.chain_id == session_id
+                {
+                    return Err("Live sidechain identity is incomplete or inconsistent".to_string());
+                }
+            } else if message.chain_id != session_id
+                || message.parent_chain_id.is_some()
+                || message.agent_id.is_some()
+            {
+                return Err("Live parent identity is inconsistent".to_string());
+            }
+            if message
+                .parent_uuid
+                .is_some_and(|value| value.trim().is_empty() || value.trim() != value)
+            {
+                return Err("Live message parent uuid is invalid".to_string());
+            }
+        }
+        let message_by_id: HashMap<&str, LiveSessionMessageInput<'_>> = rows
+            .messages
+            .iter()
+            .map(|message| (message.message_id, *message))
+            .collect();
+        let mut event_identities = HashSet::with_capacity(rows.session_events.len());
+        let mut event_counts: HashMap<&str, usize> = HashMap::new();
+        for event in rows.session_events {
+            let Some(message) = message_by_id.get(event.message_id) else {
+                return Err("Live runtime events require a stable message id".to_string());
+            };
+            if event.timestamp != message.timestamp
+                || DateTime::parse_from_rfc3339(event.timestamp).is_err()
+                || !event_identities.insert((event.message_id, event.event_ordinal))
+            {
+                return Err("Live runtime event identity is inconsistent".to_string());
+            }
+            *event_counts.entry(event.message_id).or_default() += 1;
+        }
+        for message_id in &message_ids {
+            let count = event_counts.get(message_id).copied().unwrap_or(0);
+            if count == 0
+                || (0..count).any(|ordinal| !event_identities.contains(&(*message_id, ordinal)))
+            {
+                return Err("Live runtime event ordinals must be contiguous".to_string());
+            }
+        }
+        if rows.hook_invocations.iter().any(|invocation| {
+            invocation.session_id != session_id
+                || invocation.timestamp.trim().is_empty()
+                || invocation.hook_identity.trim().is_empty()
+        }) {
+            return Err("Live hook invocation identity is incomplete".to_string());
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin live analytics transaction: {e}"))?;
+        let origin_project = resolve_project_path_rename(&tx, origin.project)?;
+        let origin_cwd_raw = origin.cwd.map(|cwd| cwd.to_string_lossy().to_string());
+        let origin_cwd = resolve_project_path_rename(&tx, origin_cwd_raw.as_deref())?;
+        let updated_at = Utc::now().to_rfc3339();
+        tx.execute(
+            "INSERT INTO live_analytics_sessions (
+                 provider, session_id, project, cwd, hostname, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(provider, session_id) DO UPDATE SET
+                 project = COALESCE(
+                     excluded.project, live_analytics_sessions.project
+                 ),
+                 cwd = COALESCE(excluded.cwd, live_analytics_sessions.cwd),
+                 hostname = COALESCE(
+                     excluded.hostname, live_analytics_sessions.hostname
+                 ),
+                 updated_at = excluded.updated_at",
+            params![
+                provider.as_str(),
+                session_id,
+                origin_project,
+                origin_cwd,
+                origin.hostname,
+                updated_at,
+            ],
+        )
+        .map_err(|e| format!("Upsert live analytics origin: {e}"))?;
+
+        if !rows.messages.is_empty() {
+            let response_max_secs = if provider == IntegrationProvider::Codex {
+                6.0 * 60.0 * 60.0
+            } else {
+                600.0
+            };
+            let mut statement = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO response_times (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, timestamp, response_secs, idle_secs,
+                         is_sidechain, agent_id, parent_uuid
+                     ) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )
+                .map_err(|e| format!("Prepare live response times: {e}"))?;
+            let mut messages_by_chain: HashMap<&str, Vec<LiveSessionMessageInput<'_>>> =
+                HashMap::new();
+            for message in rows.messages {
+                messages_by_chain
+                    .entry(message.chain_id)
+                    .or_default()
+                    .push(*message);
+            }
+            for (chain_id, mut sorted) in messages_by_chain {
+                sorted.sort_by(|left, right| left.timestamp.cmp(right.timestamp));
+                let last_assistant_ts = tx
+                    .query_row(
+                        "SELECT timestamp FROM response_times
+                         WHERE provider = ?1 AND session_id = ?2 AND chain_id = ?3
+                           AND source_key IS NULL AND response_secs IS NOT NULL
+                         ORDER BY timestamp DESC LIMIT 1",
+                        params![provider.as_str(), session_id, chain_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Read prior live response time: {e}"))?;
+                let mut pending_user: Option<LiveSessionMessageInput<'_>> = None;
+                let mut pending_assistant: Option<LiveSessionMessageInput<'_>> = None;
+                let mut previous_assistant = last_assistant_ts;
+                let mut turns: Vec<(
+                    LiveSessionMessageInput<'_>,
+                    LiveSessionMessageInput<'_>,
+                    Option<String>,
+                )> = Vec::new();
+
+                for message in sorted {
+                    match message.role {
+                        "user" => {
+                            if provider == IntegrationProvider::Codex
+                                && let (Some(user), Some(assistant)) =
+                                    (pending_user.take(), pending_assistant.take())
+                            {
+                                turns.push((user, assistant, previous_assistant.clone()));
+                                previous_assistant = Some(assistant.timestamp.to_string());
+                            }
+                            pending_user = Some(message);
+                        }
+                        "assistant" => {
+                            if provider == IntegrationProvider::Codex {
+                                if pending_user.is_some() {
+                                    pending_assistant = Some(message);
+                                } else {
+                                    previous_assistant = Some(message.timestamp.to_string());
+                                }
+                            } else {
+                                if let Some(user) = pending_user.take() {
+                                    turns.push((user, message, previous_assistant.clone()));
+                                }
+                                previous_assistant = Some(message.timestamp.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if provider == IntegrationProvider::Codex
+                    && let (Some(user), Some(assistant)) = (pending_user, pending_assistant)
+                {
+                    turns.push((user, assistant, previous_assistant));
+                }
+
+                for (user, assistant, prior_assistant_ts) in turns {
+                    let response_secs = parse_ts_diff(assistant.timestamp, user.timestamp)
+                        .filter(|seconds| *seconds > 0.0 && *seconds <= response_max_secs);
+                    let idle_secs = prior_assistant_ts
+                        .as_deref()
+                        .and_then(|prior| parse_ts_diff(user.timestamp, prior))
+                        .filter(|seconds| *seconds > 0.0 && *seconds <= 600.0);
+                    if response_secs.is_none() && idle_secs.is_none() {
+                        continue;
+                    }
+                    statement
+                        .execute(params![
+                            provider.as_str(),
+                            session_id,
+                            chain_id,
+                            assistant.parent_chain_id,
+                            assistant.timestamp,
+                            response_secs,
+                            idle_secs,
+                            assistant.is_sidechain,
+                            assistant.agent_id,
+                            assistant.parent_uuid,
+                        ])
+                        .map_err(|e| format!("Insert live response time: {e}"))?;
+                }
+            }
+        }
+
+        if !rows.session_events.is_empty() {
+            let mut statement = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO session_events (
+                         provider, source_key, event_key, session_id, chain_id,
+                         parent_chain_id, agent_id, is_sidechain, timestamp,
+                         kind, uuid, parent_uuid
+                     ) VALUES (
+                         ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                     )",
+                )
+                .map_err(|e| format!("Prepare live session events: {e}"))?;
+            for event in rows.session_events {
+                let message = message_by_id
+                    .get(event.message_id)
+                    .expect("validated live event message identity");
+                let event_key = format!("{}:{}", event.message_id, event.event_ordinal);
+                statement
+                    .execute(params![
+                        provider.as_str(),
+                        event_key,
+                        session_id,
+                        message.chain_id,
+                        message.parent_chain_id,
+                        message.agent_id,
+                        message.is_sidechain,
+                        event.timestamp,
+                        event.kind.as_str(),
+                        event.message_id,
+                        message.parent_uuid,
+                    ])
+                    .map_err(|e| format!("Insert live session event: {e}"))?;
+            }
+        }
+
+        if !rows.hook_invocations.is_empty() {
+            let mut statement = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO hook_invocations (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, agent_id, is_sidechain, timestamp,
+                         hook_event, hook_matcher, tool_name, hook_identity,
+                         script_command_raw, exit_code, duration_ms, cwd,
+                         hostname, message_id
+                     ) VALUES (
+                         ?1, NULL, ?2, ?2, NULL, ?3, 0, ?4, ?5, ?6, ?7,
+                         ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                     )",
+                )
+                .map_err(|e| format!("Prepare live hook invocations: {e}"))?;
+            for invocation in rows.hook_invocations {
+                let cwd = resolve_project_path_rename(&tx, invocation.cwd)?;
+                statement
+                    .execute(params![
+                        provider.as_str(),
+                        session_id,
+                        invocation.agent_id,
+                        invocation.timestamp,
+                        invocation.hook_event,
+                        invocation.hook_matcher,
+                        invocation.tool_name,
+                        invocation.hook_identity,
+                        invocation.script_command_raw,
+                        invocation.exit_code,
+                        invocation.duration_ms,
+                        cwd,
+                        invocation.hostname,
+                        invocation.message_id,
+                    ])
+                    .map_err(|e| format!("Insert live hook invocation: {e}"))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Commit live analytics transaction: {e}"))
     }
 
     // --- Memory optimizer storage methods ---
@@ -14070,20 +15665,7 @@ impl Storage {
         Ok(result)
     }
 
-    pub fn delete_response_times_for_session(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM response_times WHERE provider = ?1 AND session_id = ?2",
-            params![provider.as_str(), session_id],
-        )
-        .map_err(|e| format!("Failed to delete response_times for session: {e}"))?;
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub fn ingest_response_times(
         &self,
         provider: IntegrationProvider,
@@ -14219,8 +15801,13 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT OR IGNORE INTO response_times (provider, session_id, timestamp, response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    "INSERT OR IGNORE INTO response_times (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, timestamp, response_secs, idle_secs,
+                         is_sidechain, agent_id, parent_uuid
+                     ) VALUES (
+                         ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                     )",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
@@ -14243,9 +15830,18 @@ impl Storage {
                     continue;
                 }
 
+                let chain_id = turn
+                    .agent_id
+                    .as_deref()
+                    .filter(|agent_id| turn.is_sidechain && !agent_id.is_empty())
+                    .unwrap_or(session_id);
+                let parent_chain_id = (chain_id != session_id).then_some(session_id);
+
                 stmt.execute(params![
                     provider.as_str(),
                     session_id,
+                    chain_id,
+                    parent_chain_id,
                     turn.assistant_ts,
                     response_val,
                     idle_val,
@@ -14261,13 +15857,14 @@ impl Storage {
         Ok(())
     }
 
-    /// Bulk-insert per-event rows for the active-interval runtime
-    /// pipeline (feature 008). Idempotent — uses `INSERT OR IGNORE`
-    /// against the `(provider, session_id, COALESCE(agent_id, ''),
-    /// timestamp, kind)` primary key. See
+    /// Bulk-insert source-less per-event rows for the active-interval runtime
+    /// pipeline (feature 008). Idempotent — stable native UUID-local event
+    /// keys feed the migration-30 `(provider, session_id, event_key)` live
+    /// partial unique index. See
     /// specs/008-runtime-redesign/contracts/session-events.md
     /// (ING-1..ING-5).
     // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+    #[cfg(test)]
     pub fn ingest_session_events(
         &self,
         provider: IntegrationProvider,
@@ -14289,11 +15886,15 @@ impl Storage {
             .transaction()
             .map_err(|e| format!("session_events transaction: {e}"))?;
         {
+            let mut native_event_ordinals: HashMap<&str, usize> = HashMap::new();
+            let mut fallback_event_ordinals: HashMap<(&str, &str, &str), usize> = HashMap::new();
             let mut stmt = tx
                 .prepare_cached(
                     "INSERT OR IGNORE INTO session_events
-                     (provider, session_id, agent_id, is_sidechain, timestamp, kind, uuid, parent_uuid)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (provider, source_key, event_key, session_id, chain_id,
+                      parent_chain_id, agent_id, is_sidechain, timestamp, kind,
+                      uuid, parent_uuid)
+                     VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .map_err(|e| format!("session_events prepare: {e}"))?;
 
@@ -14306,9 +15907,39 @@ impl Storage {
                     );
                     continue;
                 }
+
+                let chain_id = ev
+                    .agent_id
+                    .filter(|agent_id| ev.is_sidechain && !agent_id.is_empty())
+                    .unwrap_or(session_id);
+                let parent_chain_id = (chain_id != session_id).then_some(session_id);
+                let event_key = match ev.uuid.filter(|uuid| !uuid.is_empty()) {
+                    Some(uuid) => {
+                        let event_ordinal = native_event_ordinals.entry(uuid).or_default();
+                        let event_key = format!("native:{uuid}:{event_ordinal}");
+                        *event_ordinal += 1;
+                        event_key
+                    }
+                    None => {
+                        let fallback_identity = (chain_id, ev.timestamp, ev.kind.as_str());
+                        let event_ordinal = fallback_event_ordinals
+                            .entry(fallback_identity)
+                            .or_default();
+                        let event_key = format!(
+                            "legacy:{chain_id}:{}:{}:{event_ordinal}",
+                            ev.timestamp,
+                            ev.kind.as_str()
+                        );
+                        *event_ordinal += 1;
+                        event_key
+                    }
+                };
                 stmt.execute(params![
                     provider.as_str(),
+                    event_key,
                     session_id,
+                    chain_id,
+                    parent_chain_id,
                     ev.agent_id,
                     ev.is_sidechain as i64,
                     ev.timestamp,
@@ -14324,26 +15955,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Drop every `session_events` row for one `(provider, session_id)`.
-    /// Called from `process_discovered_file` before re-ingest and from
-    /// the `delete_session_data` / `delete_host_data` /
-    /// `delete_project_data` cascades. See
-    /// specs/008-runtime-redesign/contracts/session-events.md.
-    // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
-    pub fn delete_session_events_for_session(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM session_events WHERE provider = ?1 AND session_id = ?2",
-            params![provider.as_str(), session_id],
-        )
-        .map_err(|e| format!("Failed to delete session_events for session: {e}"))?;
-        Ok(())
-    }
-
     /// Compute LLM runtime stats. `scope` controls whether sub-agent
     /// (`is_sidechain = 1`) rows are folded in:
     /// * `None` or `Some("all")`: include parent + sub-agent rows (default,
@@ -14355,10 +15966,10 @@ impl Storage {
     /// implement the active-interval semantics specified in
     /// specs/008-runtime-redesign/contracts/llm-runtime-stats.md
     /// (STAT-1..STAT-7). A "logical turn" is a contiguous run of events
-    /// on a single chain `(provider, session_id, agent_id)` where every
+    /// on a single native chain `(provider, chain_id)` where every
     /// between-event gap is either <= IDLE_THRESHOLD_SECS or a tool-loop
     /// gap (asst_tool_use -> user_tool_result) up to TOOL_WAIT_MAX_SECS.
-    // @lat: [[backend#Tauri IPC Commands#Code and Response Stats (5)]]
+    // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
     pub fn get_llm_runtime_stats(
         &self,
         range: &str,
@@ -14384,18 +15995,19 @@ impl Storage {
 
         let mut total_runtime_secs: f64 = 0.0;
         let mut turn_count: i64 = 0;
-        let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut sessions: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         let mut bucket_sums: [f64; 7] = [0.0; 7];
 
-        // Walker state: a "chain" is (provider, session_id, agent_id).
-        // We track its parts separately so that detecting a chain change
-        // does not require formatting a composite key on every row — a hot
-        // path on multi-thousand-event queries.
+        // Walker state: a "chain" is (provider, chain_id). `session_id`
+        // remains the provider-qualified resolved-root identity used only
+        // for the distinct session count. We track the chain parts
+        // separately so detecting a change does not require formatting a
+        // composite key on every row — a hot path on large event queries.
         // turn_start_ms holds the first event in the current logical turn;
         // prev_ms / prev_kind capture the most recent event on the chain.
         let mut cur_provider: Option<String> = None;
-        let mut cur_session_id: Option<String> = None;
-        let mut cur_agent_id: Option<String> = None;
+        let mut cur_chain_id: Option<String> = None;
         let mut turn_start_ms: f64 = 0.0;
         let mut prev_ms: f64 = 0.0;
         let mut prev_kind: Option<String> = None;
@@ -14424,18 +16036,35 @@ impl Storage {
 
         {
             // STAT-2: parent_only adds `is_sidechain = 0` to the WHERE.
-            // Order matches the chain key so the walker can process each
-            // (provider, session_id, agent_id) chain contiguously.
+            // Order matches the native chain key so the walker can process
+            // each (provider, chain_id) timeline contiguously.
+            //
+            // `INDEXED BY idx_se_timestamp_chain` (migration 32) pins the
+            // bounded plan. Left free, SQLite prefers migration 31's
+            // `(provider, chain_id, timestamp)` index purely because it
+            // satisfies the ORDER BY — but `timestamp` is third there, so the
+            // range filter cannot seek and the tick scans the whole corpus
+            // plus one rowid lookup per row. Quill never runs `ANALYZE`, so
+            // there is no `sqlite_stat1` for the planner to reconsider with;
+            // the choice is fixed regardless of how large the table grows.
+            // The pinned index leads with `timestamp` and carries every
+            // column this query reads, so the scan is a covering range seek
+            // and the only added cost is sorting the matched window — far
+            // cheaper than an unbounded scan with random heap fetches, and it
+            // shrinks with the requested range instead of staying constant.
+            // Migration 32 always creates the index and
+            // `ensure_startup_indexes` re-creates it on every open, so the
+            // directive cannot fail to resolve.
             let sql = if parent_only {
-                "SELECT timestamp, kind, provider, session_id, agent_id, is_sidechain
-                 FROM session_events
+                "SELECT timestamp, kind, provider, session_id, chain_id
+                 FROM session_events INDEXED BY idx_se_timestamp_chain
                  WHERE timestamp >= ?1 AND is_sidechain = 0
-                 ORDER BY provider, session_id, COALESCE(agent_id, ''), timestamp"
+                 ORDER BY provider, chain_id, timestamp, rowid"
             } else {
-                "SELECT timestamp, kind, provider, session_id, agent_id, is_sidechain
-                 FROM session_events
+                "SELECT timestamp, kind, provider, session_id, chain_id
+                 FROM session_events INDEXED BY idx_se_timestamp_chain
                  WHERE timestamp >= ?1
-                 ORDER BY provider, session_id, COALESCE(agent_id, ''), timestamp"
+                 ORDER BY provider, chain_id, timestamp, rowid"
             };
             let mut stmt = conn
                 .prepare_cached(sql)
@@ -14447,26 +16076,24 @@ impl Storage {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(|e| format!("Runtime query error: {e}"))?;
 
             for row in rows.flatten() {
-                let (ts_str, kind, provider, session_id, agent_id, _is_sc) = row;
+                let (ts_str, kind, provider, session_id, chain_id) = row;
                 let ts = match DateTime::parse_from_rfc3339(&ts_str) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
                 let ms = ts.timestamp_millis() as f64;
-                // STAT-3: chain identity is (provider, session_id, agent_id).
+                // STAT-3: chain identity is (provider, chain_id).
                 // Compare slices first to avoid allocating a composite key
                 // on every row; the borrow ends before we move the owned
                 // strings into the trackers below.
                 let chain_changed = cur_provider.as_deref() != Some(provider.as_str())
-                    || cur_session_id.as_deref() != Some(session_id.as_str())
-                    || cur_agent_id.as_deref() != agent_id.as_deref();
+                    || cur_chain_id.as_deref() != Some(chain_id.as_str());
 
                 if chain_changed {
                     if cur_provider.is_some() {
@@ -14480,15 +16107,13 @@ impl Storage {
                             bucket_secs,
                         );
                     }
-                    // STAT-6: session_count is keyed on (provider,
-                    // session_id) only, so a parent and its sub-agents
-                    // count as one session. Inserting at chain-change
-                    // boundaries (instead of every row) caps allocations
-                    // at O(distinct chains).
-                    sessions.insert(format!("{provider}|{session_id}"));
+                    // STAT-6: session_count is keyed on the
+                    // provider-qualified resolved root, so a parent and its
+                    // sub-agents count as one session while equal ids from
+                    // different providers remain separate.
+                    sessions.insert((provider.clone(), session_id));
                     cur_provider = Some(provider);
-                    cur_session_id = Some(session_id);
-                    cur_agent_id = agent_id;
+                    cur_chain_id = Some(chain_id);
                     turn_start_ms = ms;
                 } else {
                     // STAT-4: classify the gap from the previous event.
@@ -15056,8 +16681,8 @@ mod tests {
                 .expect("read schema_version");
             assert!(v >= 26, "schema_version must reach 26, got {v}");
 
-            // The session_events table and its unique-identity index must
-            // exist after the migration runs.
+            // The session_events table and its current source-aware unique
+            // identity indexes must exist after all migrations run.
             let has_table: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master
@@ -15070,39 +16695,28 @@ mod tests {
                 has_table, 1,
                 "session_events table missing after migration 26"
             );
-            let has_unique_idx: i64 = conn
+            let unique_idx_count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master
-                     WHERE type='index' AND name='uidx_se_identity'",
+                     WHERE type='index'
+                       AND name IN ('uidx_se_owned', 'uidx_se_live')",
                     [],
                     |row| row.get(0),
                 )
-                .expect("query sqlite_master for unique index");
+                .expect("query sqlite_master for source-aware unique indexes");
             assert_eq!(
-                has_unique_idx, 1,
-                "uidx_se_identity missing after migration 26"
+                unique_idx_count, 2,
+                "source-aware session event indexes missing after migration 30"
             );
 
-            // Replay the migration-26 DDL directly against the already-
-            // migrated DB. Every CREATE is `IF NOT EXISTS`, so this must
-            // be a clean no-op.
+            // Replay the surviving migration-26 query indexes against the
+            // current table. Every CREATE is `IF NOT EXISTS`, so this stays a
+            // clean no-op after migration 30 supersedes the old identity.
             conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS session_events (
-                    provider     TEXT NOT NULL,
-                    session_id   TEXT NOT NULL,
-                    agent_id     TEXT,
-                    is_sidechain INTEGER NOT NULL DEFAULT 0,
-                    timestamp    TEXT NOT NULL,
-                    kind         TEXT NOT NULL,
-                    uuid         TEXT,
-                    parent_uuid  TEXT
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_identity
-                    ON session_events(provider, session_id, COALESCE(agent_id, ''), timestamp, kind);
-                CREATE INDEX IF NOT EXISTS idx_se_timestamp
+                "CREATE INDEX IF NOT EXISTS idx_se_timestamp
                     ON session_events(timestamp);
                 CREATE INDEX IF NOT EXISTS idx_se_chain
-                    ON session_events(provider, session_id, agent_id, timestamp);
+                    ON session_events(provider, session_id, chain_id, timestamp);
                 CREATE INDEX IF NOT EXISTS idx_se_provider_session_sidechain
                     ON session_events(provider, session_id, is_sidechain, timestamp);",
             )
@@ -15293,16 +16907,26 @@ mod tests {
 
             // One parent turn + one sub-agent turn ⇒ rolled-up turn_count = 2.
             conn.execute(
-                "INSERT INTO response_times (provider, session_id, timestamp,
-                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
-                 VALUES ('claude', 'sess-rollup', ?1, 5.0, NULL, 0, NULL, NULL)",
+                "INSERT INTO response_times (
+                     provider, session_id, chain_id, timestamp, response_secs,
+                     idle_secs, is_sidechain, agent_id, parent_uuid
+                 ) VALUES (
+                     'claude', 'sess-rollup', 'sess-rollup', ?1,
+                     5.0, NULL, 0, NULL, NULL
+                 )",
                 params![&earlier],
             )
             .expect("insert parent response_time");
             conn.execute(
-                "INSERT INTO response_times (provider, session_id, timestamp,
-                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
-                 VALUES ('claude', 'sess-rollup', ?1, 4.5, NULL, 1, 'aaaabbbbccccdddd', 'pmsg1')",
+                "INSERT INTO response_times (
+                     provider, session_id, chain_id, parent_chain_id,
+                     timestamp, response_secs, idle_secs, is_sidechain,
+                     agent_id, parent_uuid
+                 ) VALUES (
+                     'claude', 'sess-rollup', 'aaaabbbbccccdddd',
+                     'sess-rollup', ?1, 4.5, NULL, 1,
+                     'aaaabbbbccccdddd', 'pmsg1'
+                 )",
                 params![&middle],
             )
             .expect("insert sub-agent response_time");
@@ -15372,17 +16996,26 @@ mod tests {
                   VALUES ('claude', 'sess-tree', 'h', '{t_a}',
                           10, 20, 1, 2, NULL, 1, 'a11111111111aaaa', 'pmsg-A');
 
-                INSERT INTO response_times (provider, session_id, timestamp,
-                    response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', '{t_a}', 1.5, NULL, 1, 'a11111111111aaaa', 'pmsg-A');
-                INSERT INTO response_times (provider, session_id, timestamp,
-                    response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', '{t_a_end}', 2.5, 0.3, 1, 'a11111111111aaaa', 'msg-A2');
+                INSERT INTO response_times (provider, session_id, chain_id,
+                    parent_chain_id, timestamp, response_secs, idle_secs,
+                    is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', 'a11111111111aaaa',
+                          'sess-tree', '{t_a}', 1.5, NULL, 1,
+                          'a11111111111aaaa', 'pmsg-A');
+                INSERT INTO response_times (provider, session_id, chain_id,
+                    parent_chain_id, timestamp, response_secs, idle_secs,
+                    is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', 'a11111111111aaaa',
+                          'sess-tree', '{t_a_end}', 2.5, 0.3, 1,
+                          'a11111111111aaaa', 'msg-A2');
 
-                INSERT INTO tool_actions (provider, message_id, session_id, tool_name, category,
+                INSERT INTO tool_actions (provider, action_key, message_id,
+                    session_id, chain_id, parent_chain_id, tool_name, category,
                     summary, timestamp, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'msg-A2', 'sess-tree', 'Read', 'fs', 'read file',
-                          '{t_a_end}', 1, 'a11111111111aaaa', 'pmsg-A');
+                  VALUES ('claude', 'msg-A2:0', 'msg-A2', 'sess-tree',
+                          'a11111111111aaaa', 'sess-tree', 'Read', 'fs',
+                          'read file', '{t_a_end}', 1,
+                          'a11111111111aaaa', 'pmsg-A');
 
                 -- Agent B — later, simpler shape.
                 INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
@@ -15391,9 +17024,12 @@ mod tests {
                   VALUES ('claude', 'sess-tree', 'h', '{t_b}',
                           5, 5, 0, 0, NULL, 1, 'b22222222222bbbb', 'pmsg-B');
 
-                INSERT INTO response_times (provider, session_id, timestamp,
-                    response_secs, idle_secs, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', '{t_b_end}', 1.0, NULL, 1, 'b22222222222bbbb', 'pmsg-B');
+                INSERT INTO response_times (provider, session_id, chain_id,
+                    parent_chain_id, timestamp, response_secs, idle_secs,
+                    is_sidechain, agent_id, parent_uuid)
+                  VALUES ('claude', 'sess-tree', 'b22222222222bbbb',
+                          'sess-tree', '{t_b_end}', 1.0, NULL, 1,
+                          'b22222222222bbbb', 'pmsg-B');
                 "#
             ))
             .expect("seed tree fixtures");
@@ -18282,10 +19918,9 @@ mod tests {
     }
 
     /// Feature 008 / US2: two sub-agent chains sharing the same parent
-    /// session_id but different agent_id must produce two independent
-    /// turns rather than one merged turn. Verifies STAT-3 from
-    /// specs/008-runtime-redesign/contracts/llm-runtime-stats.md and the
-    /// agent_id inclusion in the chain key.
+    /// session_id but carrying distinct native chain ids must produce two
+    /// independent turns rather than one merged turn. The legacy ingest
+    /// helper derives those chain ids from each sub-agent's agent id.
     #[test]
     #[serial]
     fn session_events_sibling_subagents_form_independent_turns() {
@@ -19007,5 +20642,1491 @@ mod tests {
         let mut running = 10_i64;
         checked_add_session_model_value(&mut running, 5, "session").expect("valid add");
         assert_eq!(running, 15);
+    }
+
+    // ------------------------------------------------------------------
+    // Source-owned transcript analytics fixtures
+    // ------------------------------------------------------------------
+
+    /// One caller-controlled column per owned analytics table. The snapshot
+    /// fixtures stamp each with the same marker token, so a replacement that
+    /// only partially landed is visible as a changed marker set and not only
+    /// as a changed row count.
+    const OWNED_MARKER_COLUMNS: [(&str, &str); 5] = [
+        ("session_events", "agent_id"),
+        ("response_times", "agent_id"),
+        ("tool_actions", "agent_id"),
+        ("skill_usages", "tool_name"),
+        ("hook_invocations", "tool_name"),
+    ];
+
+    /// Identity of one retained transcript source plus the shape of the
+    /// five-table snapshot it owns. Bundled so the fixture builders stay
+    /// single-argument as the owned identity grows.
+    #[derive(Clone, Copy)]
+    struct TranscriptSourceSpec<'a> {
+        provider: IntegrationProvider,
+        source_root_key: &'a str,
+        source_key: &'a str,
+        session_id: &'a str,
+        generation: i64,
+        marker: &'a str,
+        rows: usize,
+    }
+
+    impl TranscriptSourceSpec<'_> {
+        fn state(&self) -> crate::transcript_analytics::TranscriptAnalyticsSourceState {
+            crate::transcript_analytics::TranscriptAnalyticsSourceState {
+                provider: self.provider,
+                source_root_key: self.source_root_key.to_string(),
+                source_key: self.source_key.to_string(),
+                source_path: PathBuf::from(format!("/quill-fixture/{}.jsonl", self.source_key)),
+                source_session_id: self.session_id.to_string(),
+                analytics_session_id: self.session_id.to_string(),
+                chain_id: self.session_id.to_string(),
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                project: None,
+                cwd: None,
+                hostname: "fixture-host".to_string(),
+                mtime_ns: 1_000,
+                size_bytes: 64,
+                content_sha256: format!("sha-{}-{}", self.source_key, self.marker),
+                seen_generation: self.generation,
+            }
+        }
+
+        /// A snapshot holding `rows` rows in each of the five owned tables.
+        /// Dedupe keys embed the marker so consecutive snapshots of one
+        /// source produce distinguishable row sets.
+        fn snapshot(&self) -> TranscriptAnalyticsSnapshot {
+            let provider = self.provider;
+            let source_key = self.source_key.to_string();
+            let session_id = self.session_id.to_string();
+            let marker = self.marker.to_string();
+            // Fixed fixture timestamps: these rows are only ever counted, so
+            // anchoring them to a wall clock would buy nothing and could rot.
+            let at = |index: usize| format!("2026-01-0{}T00:00:00+00:00", index + 1);
+
+            TranscriptAnalyticsSnapshot {
+                source: self.state(),
+                session_events: (0..self.rows)
+                    .map(|index| crate::transcript_analytics::OwnedSessionEvent {
+                        provider,
+                        source_key: source_key.clone(),
+                        event_key: format!("{marker}-event-{index}"),
+                        session_id: session_id.clone(),
+                        chain_id: session_id.clone(),
+                        parent_chain_id: None,
+                        agent_id: Some(marker.clone()),
+                        is_sidechain: false,
+                        timestamp: at(index),
+                        kind: crate::sessions::SessionEventKind::AsstText,
+                        uuid: None,
+                        parent_uuid: None,
+                    })
+                    .collect(),
+                response_times: (0..self.rows)
+                    .map(|index| crate::transcript_analytics::OwnedResponseTime {
+                        provider,
+                        source_key: source_key.clone(),
+                        session_id: session_id.clone(),
+                        chain_id: session_id.clone(),
+                        parent_chain_id: None,
+                        timestamp: at(index),
+                        response_secs: Some(1.5),
+                        idle_secs: Some(0.5),
+                        is_sidechain: false,
+                        agent_id: Some(marker.clone()),
+                        parent_uuid: None,
+                    })
+                    .collect(),
+                tool_actions: (0..self.rows)
+                    .map(|index| crate::transcript_analytics::OwnedToolAction {
+                        provider,
+                        source_key: source_key.clone(),
+                        action_key: format!("{marker}-action-{index}"),
+                        message_id: format!("{marker}-message-{index}"),
+                        session_id: session_id.clone(),
+                        chain_id: session_id.clone(),
+                        parent_chain_id: None,
+                        tool_name: "Read".to_string(),
+                        category: "read".to_string(),
+                        file_path: None,
+                        summary: format!("{marker} summary {index}"),
+                        full_input: None,
+                        full_output: None,
+                        timestamp: at(index),
+                        is_sidechain: false,
+                        agent_id: Some(marker.clone()),
+                        parent_uuid: None,
+                    })
+                    .collect(),
+                skill_usages: (0..self.rows)
+                    .map(|index| crate::transcript_analytics::OwnedSkillUsage {
+                        provider,
+                        source_key: source_key.clone(),
+                        session_id: session_id.clone(),
+                        chain_id: session_id.clone(),
+                        parent_chain_id: None,
+                        message_id: format!("{marker}-message-{index}"),
+                        skill_name: "fixture-skill".to_string(),
+                        skill_path: "/skills/fixture".to_string(),
+                        timestamp: at(index),
+                        tool_name: marker.clone(),
+                        cwd: None,
+                        hostname: "fixture-host".to_string(),
+                    })
+                    .collect(),
+                hook_invocations: (0..self.rows)
+                    .map(|index| crate::transcript_analytics::OwnedHookInvocation {
+                        provider,
+                        source_key: source_key.clone(),
+                        session_id: session_id.clone(),
+                        chain_id: session_id.clone(),
+                        parent_chain_id: None,
+                        agent_id: None,
+                        is_sidechain: false,
+                        timestamp: at(index),
+                        hook_event: "PreToolUse".to_string(),
+                        hook_matcher: None,
+                        tool_name: Some(marker.clone()),
+                        hook_identity: format!("{marker}-hook-{index}"),
+                        script_command_raw: None,
+                        exit_code: Some(0),
+                        duration_ms: Some(1),
+                        cwd: None,
+                        hostname: "fixture-host".to_string(),
+                        message_id: None,
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    /// Write one source's five-table snapshot through the real replacement
+    /// path and assert it landed, so tests start from persisted evidence
+    /// rather than hand-inserted rows.
+    fn seed_transcript_source(storage: &Storage, spec: &TranscriptSourceSpec<'_>) {
+        assert_eq!(
+            storage
+                .replace_transcript_analytics_snapshot(&spec.snapshot())
+                .expect("seed transcript source"),
+            TranscriptAnalyticsReplacement::Replaced,
+            "fixture seed for {} must replace cleanly",
+            spec.source_key
+        );
+    }
+
+    /// Per-table `(table, row count, distinct marker tokens)` for one owned
+    /// source. Comparing two of these detects both dropped rows and rows
+    /// left behind by a half-applied replacement.
+    fn owned_source_rows(
+        storage: &Storage,
+        provider: IntegrationProvider,
+        source_key: &str,
+    ) -> Vec<(&'static str, i64, String)> {
+        let conn = storage.conn.lock();
+        OWNED_MARKER_COLUMNS
+            .iter()
+            .map(|(table, column)| {
+                let count: i64 = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table}
+                             WHERE provider = ?1 AND source_key = ?2"
+                        ),
+                        params![provider.as_str(), source_key],
+                        |row| row.get(0),
+                    )
+                    .expect("count owned rows");
+                let markers: String = conn
+                    .query_row(
+                        &format!(
+                            "SELECT COALESCE(GROUP_CONCAT(DISTINCT {column}), '')
+                             FROM {table}
+                             WHERE provider = ?1 AND source_key = ?2"
+                        ),
+                        params![provider.as_str(), source_key],
+                        |row| row.get(0),
+                    )
+                    .expect("read owned markers");
+                (*table, count, markers)
+            })
+            .collect()
+    }
+
+    fn registry_generation(
+        storage: &Storage,
+        provider: IntegrationProvider,
+        source_key: &str,
+    ) -> i64 {
+        let conn = storage.conn.lock();
+        conn.query_row(
+            "SELECT seen_generation FROM transcript_analytics_sources
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider.as_str(), source_key],
+            |row| row.get(0),
+        )
+        .expect("read registry generation")
+    }
+
+    fn registry_mtime(storage: &Storage, provider: IntegrationProvider, source_key: &str) -> i64 {
+        let conn = storage.conn.lock();
+        conn.query_row(
+            "SELECT mtime_ns FROM transcript_analytics_sources
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider.as_str(), source_key],
+            |row| row.get(0),
+        )
+        .expect("read registry mtime")
+    }
+
+    /// A five-table replacement is one transaction: a snapshot that fails on
+    /// the registry upsert must leave every prior row of that source intact,
+    /// and a valid empty snapshot must clear only its own source.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Owned Snapshot Replacement Atomicity]]
+    #[test]
+    #[serial]
+    fn transcript_snapshot_replacement_is_atomic_across_owned_tables() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        let target = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-atomic",
+            source_key: "source-target",
+            session_id: "session-target",
+            generation: 1,
+            marker: "v1",
+            rows: 2,
+        };
+        let sibling = TranscriptSourceSpec {
+            source_key: "source-sibling",
+            session_id: "session-sibling",
+            marker: "sib",
+            ..target
+        };
+        seed_transcript_source(&storage, &target);
+        seed_transcript_source(&storage, &sibling);
+
+        let before = owned_source_rows(&storage, target.provider, target.source_key);
+        let sibling_before = owned_source_rows(&storage, sibling.provider, sibling.source_key);
+        for (table, count, markers) in &before {
+            assert_eq!(*count, 2, "{table} must hold both seeded rows");
+            assert_eq!(markers, "v1", "{table} must hold only v1 markers");
+        }
+
+        // A replacement that deletes and re-inserts every owned table, then
+        // fails on the registry upsert. `mtime_ns = -1` violates the registry
+        // CHECK, which is the last statement in the transaction — so the
+        // deletes and the three-row inserts have already run when it aborts.
+        let replacement = TranscriptSourceSpec {
+            marker: "v2",
+            rows: 3,
+            ..target
+        };
+        let broken = TranscriptAnalyticsSnapshot {
+            source: crate::transcript_analytics::TranscriptAnalyticsSourceState {
+                mtime_ns: -1,
+                ..replacement.state()
+            },
+            ..replacement.snapshot()
+        };
+        let error = storage
+            .replace_transcript_analytics_snapshot(&broken)
+            .expect_err("registry CHECK violation must fail the replacement");
+        assert!(
+            error.contains("Upsert transcript source registry"),
+            "expected a registry upsert failure, got {error}"
+        );
+
+        assert_eq!(
+            owned_source_rows(&storage, target.provider, target.source_key),
+            before,
+            "a failed replacement must roll back all five owned tables"
+        );
+        assert_eq!(
+            owned_source_rows(&storage, sibling.provider, sibling.source_key),
+            sibling_before,
+            "a failed replacement must not touch a sibling source"
+        );
+        assert_eq!(
+            registry_generation(&storage, target.provider, target.source_key),
+            1,
+            "a failed replacement must not advance the registry generation"
+        );
+
+        // The positive path: an empty snapshot is a legal replacement that
+        // clears exactly one source.
+        let emptied = TranscriptSourceSpec {
+            marker: "v2",
+            rows: 0,
+            ..target
+        };
+        assert_eq!(
+            storage
+                .replace_transcript_analytics_snapshot(&emptied.snapshot())
+                .expect("empty snapshot replacement"),
+            TranscriptAnalyticsReplacement::Replaced
+        );
+        for (table, count, markers) in
+            owned_source_rows(&storage, target.provider, target.source_key)
+        {
+            assert_eq!(count, 0, "{table} must be emptied for the replaced source");
+            assert!(markers.is_empty(), "{table} must retain no markers");
+        }
+        assert_eq!(
+            owned_source_rows(&storage, sibling.provider, sibling.source_key),
+            sibling_before,
+            "an empty replacement must not reach a sibling source"
+        );
+
+        clear_env();
+    }
+
+    /// A snapshot prepared against generation `G` must not overwrite rows once
+    /// the root has moved past `G`, whether the advance is recorded in the
+    /// generation setting or already stamped on the registry row.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Snapshot Generation Guards]]
+    #[test]
+    #[serial]
+    fn transcript_snapshot_replacement_rejects_stale_generations() {
+        clear_env();
+
+        // (case, seeded generation, whether to advance the root setting,
+        //  generation the replay was prepared against)
+        let cases = [
+            ("root generation advanced", 1_i64, true, 1_i64),
+            ("registry row already newer", 5, false, 3),
+        ];
+
+        for (case, seeded_generation, advance_root, replay_generation) in cases {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = init_storage_in(&dir);
+            let spec = TranscriptSourceSpec {
+                provider: IntegrationProvider::Claude,
+                source_root_key: "root-stale",
+                source_key: "source-stale",
+                session_id: "session-stale",
+                generation: seeded_generation,
+                marker: "kept",
+                rows: 2,
+            };
+            seed_transcript_source(&storage, &spec);
+            let before = owned_source_rows(&storage, spec.provider, spec.source_key);
+
+            if advance_root {
+                let advanced = storage
+                    .begin_transcript_analytics_generation(spec.provider, spec.source_root_key)
+                    .expect("advance root generation");
+                assert!(
+                    advanced > replay_generation,
+                    "{case}: root generation must move past the prepared snapshot"
+                );
+            }
+
+            let stale = TranscriptSourceSpec {
+                generation: replay_generation,
+                marker: "stale",
+                rows: 1,
+                ..spec
+            };
+            assert_eq!(
+                storage
+                    .replace_transcript_analytics_snapshot(&stale.snapshot())
+                    .expect("stale replacement is a verdict, not an error"),
+                TranscriptAnalyticsReplacement::StaleGeneration,
+                "{case}: a snapshot from a superseded generation must be rejected"
+            );
+            assert_eq!(
+                owned_source_rows(&storage, spec.provider, spec.source_key),
+                before,
+                "{case}: rejected replacements must leave prior rows untouched"
+            );
+            assert_eq!(
+                registry_generation(&storage, spec.provider, spec.source_key),
+                seeded_generation,
+                "{case}: rejected replacements must not restamp the registry"
+            );
+
+            drop(storage);
+        }
+
+        clear_env();
+    }
+
+    // ------------------------------------------------------------------
+    // Migration 30 fixtures
+    // ------------------------------------------------------------------
+
+    /// Pin the hostname migration 30 compares against, so the remote/local
+    /// carry-forward rule is exercised against literals rather than whatever
+    /// this machine happens to be called. Restores the prior value on drop.
+    struct HostnameGuard(Option<String>);
+
+    impl HostnameGuard {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var("HOSTNAME").ok();
+            // SAFETY: env mutation; tests are serialized via `#[serial]`.
+            unsafe { std::env::set_var("HOSTNAME", value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for HostnameGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation; tests are serialized via `#[serial]`.
+            unsafe {
+                match self.0.as_deref() {
+                    Some(previous) => std::env::set_var("HOSTNAME", previous),
+                    None => std::env::remove_var("HOSTNAME"),
+                }
+            }
+        }
+    }
+
+    /// Rewind a migrated database to the v29 analytics shape: the five tables
+    /// exactly as migrations 5/10/12/20/21/22/26/27 left them, under their v29
+    /// index names, with `schema_version` stamped back to 29. Re-opening then
+    /// replays migration 30 against a realistic pre-30 database.
+    fn downgrade_to_v29_analytics(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS session_events;
+             DROP TABLE IF EXISTS response_times;
+             DROP TABLE IF EXISTS tool_actions;
+             DROP TABLE IF EXISTS skill_usages;
+             DROP TABLE IF EXISTS hook_invocations;
+             DROP TABLE IF EXISTS session_events_legacy_v30;
+             DROP TABLE IF EXISTS response_times_legacy_v30;
+             DROP TABLE IF EXISTS tool_actions_legacy_v30;
+             DROP TABLE IF EXISTS skill_usages_legacy_v30;
+             DROP TABLE IF EXISTS hook_invocations_legacy_v30;
+             DROP TABLE IF EXISTS transcript_analytics_sources;
+             DROP TABLE IF EXISTS live_analytics_sessions;
+
+             CREATE TABLE session_events (
+                 provider     TEXT NOT NULL,
+                 session_id   TEXT NOT NULL,
+                 agent_id     TEXT,
+                 is_sidechain INTEGER NOT NULL DEFAULT 0,
+                 timestamp    TEXT NOT NULL,
+                 kind         TEXT NOT NULL,
+                 uuid         TEXT,
+                 parent_uuid  TEXT
+             );
+             CREATE UNIQUE INDEX uidx_se_identity
+                 ON session_events(provider, session_id, COALESCE(agent_id, ''),
+                                   timestamp, kind);
+             CREATE INDEX idx_se_timestamp ON session_events(timestamp);
+             CREATE INDEX idx_se_chain
+                 ON session_events(provider, session_id, agent_id, timestamp);
+             CREATE INDEX idx_se_provider_session_sidechain
+                 ON session_events(provider, session_id, is_sidechain, timestamp);
+
+             CREATE TABLE response_times (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 provider      TEXT NOT NULL DEFAULT 'claude',
+                 session_id    TEXT NOT NULL,
+                 timestamp     TEXT NOT NULL,
+                 response_secs REAL,
+                 idle_secs     REAL,
+                 created_at    TEXT DEFAULT (datetime('now')),
+                 is_sidechain  INTEGER NOT NULL DEFAULT 0,
+                 agent_id      TEXT,
+                 parent_uuid   TEXT,
+                 UNIQUE(provider, session_id, timestamp)
+             );
+             CREATE INDEX idx_rt_provider_session
+                 ON response_times(provider, session_id);
+             CREATE INDEX idx_rt_session ON response_times(session_id);
+             CREATE INDEX idx_rt_timestamp ON response_times(timestamp);
+             CREATE INDEX idx_rt_provider_session_sidechain
+                 ON response_times(provider, session_id, is_sidechain);
+             CREATE INDEX idx_rt_provider_session_agent
+                 ON response_times(provider, session_id, agent_id);
+
+             CREATE TABLE tool_actions (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 provider     TEXT NOT NULL DEFAULT 'claude',
+                 message_id   TEXT NOT NULL,
+                 session_id   TEXT NOT NULL,
+                 tool_name    TEXT NOT NULL,
+                 category     TEXT NOT NULL,
+                 file_path    TEXT,
+                 summary      TEXT NOT NULL,
+                 full_input   TEXT,
+                 full_output  TEXT,
+                 timestamp    TEXT NOT NULL,
+                 is_sidechain INTEGER NOT NULL DEFAULT 0,
+                 agent_id     TEXT,
+                 parent_uuid  TEXT
+             );
+             CREATE INDEX idx_tool_actions_provider_session
+                 ON tool_actions(provider, session_id);
+             CREATE INDEX idx_tool_actions_session ON tool_actions(session_id);
+             CREATE INDEX idx_tool_actions_message ON tool_actions(message_id);
+             CREATE INDEX idx_tool_actions_file ON tool_actions(file_path);
+             CREATE INDEX idx_tool_actions_category ON tool_actions(category);
+             CREATE INDEX idx_tool_actions_provider_session_sidechain
+                 ON tool_actions(provider, session_id, is_sidechain);
+             CREATE INDEX idx_tool_actions_provider_session_agent
+                 ON tool_actions(provider, session_id, agent_id);
+
+             CREATE TABLE skill_usages (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 provider   TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 message_id TEXT NOT NULL,
+                 skill_name TEXT NOT NULL,
+                 skill_path TEXT NOT NULL,
+                 timestamp  TEXT NOT NULL,
+                 tool_name  TEXT,
+                 created_at TEXT DEFAULT (datetime('now')),
+                 cwd        TEXT,
+                 hostname   TEXT,
+                 UNIQUE(provider, session_id, message_id, skill_name,
+                        skill_path, timestamp)
+             );
+             CREATE INDEX idx_skill_usages_provider_ts
+                 ON skill_usages(provider, timestamp);
+             CREATE INDEX idx_skill_usages_provider_session
+                 ON skill_usages(provider, session_id);
+             CREATE INDEX idx_skill_usages_skill_ts
+                 ON skill_usages(skill_name, timestamp);
+             CREATE INDEX idx_skill_usages_skill_cwd
+                 ON skill_usages(skill_name, cwd);
+
+             CREATE TABLE hook_invocations (
+                 provider           TEXT NOT NULL,
+                 session_id         TEXT NOT NULL,
+                 agent_id           TEXT,
+                 is_sidechain       INTEGER NOT NULL DEFAULT 0,
+                 timestamp          TEXT NOT NULL,
+                 hook_event         TEXT NOT NULL,
+                 hook_matcher       TEXT,
+                 tool_name          TEXT,
+                 hook_identity      TEXT NOT NULL,
+                 script_command_raw TEXT,
+                 exit_code          INTEGER,
+                 duration_ms        INTEGER,
+                 cwd                TEXT,
+                 hostname           TEXT,
+                 message_id         TEXT
+             );
+             CREATE UNIQUE INDEX uidx_hook_invocations_identity
+                 ON hook_invocations(provider, session_id, COALESCE(agent_id, ''),
+                                     timestamp, hook_identity);
+             CREATE INDEX idx_hook_invocations_provider_ts
+                 ON hook_invocations(provider, timestamp);
+             CREATE INDEX idx_hook_invocations_provider_session
+                 ON hook_invocations(provider, session_id);
+             CREATE INDEX idx_hook_invocations_identity_ts
+                 ON hook_invocations(hook_identity, timestamp);
+             CREATE INDEX idx_hook_invocations_identity_cwd
+                 ON hook_invocations(hook_identity, cwd);
+
+             DELETE FROM schema_version WHERE version > 29;",
+        )
+        .expect("rewind analytics schema to v29");
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("query sqlite_master for table")
+            > 0
+    }
+
+    fn scalar_count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0))
+            .unwrap_or_else(|error| panic!("count query failed ({sql}): {error}"))
+    }
+
+    /// Migration 30 rebuilds the five analytics tables around source identity.
+    /// Only rows this machine can never rebuild from a local transcript —
+    /// Codex hooks and anything stamped with a foreign hostname — carry
+    /// forward as source-less data; everything else survives only in the
+    /// retained `*_legacy_v30` archives.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 30 Carry-Forward Scope]]
+    #[test]
+    #[serial]
+    fn migration_30_carries_forward_only_unrebuildable_rows() {
+        clear_env();
+        let _hostname = HostnameGuard::set("quill-local-host");
+        let local = "quill-local-host";
+        let remote = "quill-remote-host";
+        let ts = "2026-01-01T00:00:00+00:00";
+
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = {
+            let storage = init_storage_in(&dir);
+            let path = storage.db_path.clone();
+            drop(storage);
+            path
+        };
+
+        {
+            let conn = Connection::open(&db_path).expect("open db for downgrade");
+            downgrade_to_v29_analytics(&conn);
+
+            // Neither table can discriminate remote from local (no hostname
+            // column before migration 30), so nothing here may carry forward.
+            for index in 0..2 {
+                conn.execute(
+                    "INSERT INTO session_events
+                        (provider, session_id, agent_id, is_sidechain, timestamp, kind)
+                     VALUES ('claude', 'session-events-only', NULL, 0, ?1, 'asst_text')",
+                    params![format!("2026-01-0{}T00:00:00+00:00", index + 1)],
+                )
+                .expect("seed legacy session_events");
+                conn.execute(
+                    "INSERT INTO response_times
+                        (provider, session_id, timestamp, response_secs, idle_secs)
+                     VALUES ('claude', 'session-response-only', ?1, 1.0, 0.0)",
+                    params![format!("2026-01-0{}T00:00:00+00:00", index + 1)],
+                )
+                .expect("seed legacy response_times");
+                conn.execute(
+                    "INSERT INTO tool_actions
+                        (provider, message_id, session_id, tool_name, category,
+                         summary, timestamp)
+                     VALUES ('claude', ?1, 'session-tool-only', 'Read', 'read',
+                             'legacy', ?2)",
+                    params![
+                        format!("message-{index}"),
+                        format!("2026-01-0{}T00:00:00+00:00", index + 1)
+                    ],
+                )
+                .expect("seed legacy tool_actions");
+            }
+
+            // (session_id, message_id, hostname) — remote carries forward,
+            // local and unknown-host rows do not.
+            let legacy_skills = [
+                ("session-remote", "skill-remote", Some(remote)),
+                ("session-local", "skill-local", Some(local)),
+                ("session-null-host", "skill-null", None),
+            ];
+            for (session_id, message_id, hostname) in legacy_skills {
+                conn.execute(
+                    "INSERT INTO skill_usages
+                        (provider, session_id, message_id, skill_name, skill_path,
+                         timestamp, tool_name, cwd, hostname)
+                     VALUES ('claude', ?1, ?2, 'fixture-skill', '/skills/fixture',
+                             ?3, 'Skill', '/cwd/remote', ?4)",
+                    params![session_id, message_id, ts, hostname],
+                )
+                .expect("seed legacy skill_usages");
+            }
+
+            // (provider, session_id, agent_id, hook_identity, hostname).
+            // Codex carries forward regardless of hostname; the two
+            // `session-fold` rows share the source-less identity and must
+            // fold to the lowest rowid.
+            let legacy_hooks = [
+                ("codex", "session-codex", None, "hook-codex", None),
+                (
+                    "claude",
+                    "session-remote",
+                    None,
+                    "hook-remote",
+                    Some(remote),
+                ),
+                ("claude", "session-local", None, "hook-local", Some(local)),
+                ("claude", "session-null-host", None, "hook-null", None),
+                (
+                    "claude",
+                    "session-fold",
+                    Some("agent-1"),
+                    "hook-fold",
+                    Some(remote),
+                ),
+                (
+                    "claude",
+                    "session-fold",
+                    Some("agent-2"),
+                    "hook-fold",
+                    Some(remote),
+                ),
+            ];
+            for (provider, session_id, agent_id, hook_identity, hostname) in legacy_hooks {
+                conn.execute(
+                    "INSERT INTO hook_invocations
+                        (provider, session_id, agent_id, is_sidechain, timestamp,
+                         hook_event, hook_identity, cwd, hostname)
+                     VALUES (?1, ?2, ?3, 0, ?4, 'PreToolUse', ?5, '/cwd/remote', ?6)",
+                    params![provider, session_id, agent_id, ts, hook_identity, hostname],
+                )
+                .expect("seed legacy hook_invocations");
+            }
+        }
+
+        let storage = init_storage_in(&dir);
+        let conn = storage.conn.lock();
+
+        let version: i32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read schema_version");
+        assert_eq!(
+            version, MAX_SUPPORTED_SCHEMA_VERSION,
+            "a v29 database must migrate all the way to the supported ceiling"
+        );
+
+        // Carried-forward rows are source-less and self-rooted.
+        let carried_hooks: Vec<(String, String, String, Option<String>)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT provider, session_id, chain_id, agent_id
+                     FROM hook_invocations
+                     ORDER BY provider, session_id, hook_identity",
+                )
+                .expect("prepare carried hooks");
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .expect("query carried hooks");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("read carried hooks")
+        };
+        assert_eq!(
+            carried_hooks,
+            vec![
+                (
+                    "claude".to_string(),
+                    "session-fold".to_string(),
+                    "session-fold".to_string(),
+                    Some("agent-1".to_string()),
+                ),
+                (
+                    "claude".to_string(),
+                    "session-remote".to_string(),
+                    "session-remote".to_string(),
+                    None,
+                ),
+                (
+                    "codex".to_string(),
+                    "session-codex".to_string(),
+                    "session-codex".to_string(),
+                    None,
+                ),
+            ],
+            "only Codex hooks and foreign-host hooks carry forward, folded to \
+             the lowest rowid, with chain_id seeded from session_id"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM hook_invocations WHERE source_key IS NOT NULL"
+            ),
+            0,
+            "carried-forward hook rows must stay source-less"
+        );
+
+        let carried_skills: Vec<(String, String)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT session_id, chain_id FROM skill_usages
+                     WHERE source_key IS NULL ORDER BY session_id",
+                )
+                .expect("prepare carried skills");
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query carried skills");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("read carried skills")
+        };
+        assert_eq!(
+            carried_skills,
+            vec![("session-remote".to_string(), "session-remote".to_string())],
+            "only the foreign-host skill row carries forward"
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM skill_usages"),
+            1,
+            "local and unknown-host skill rows must not carry forward"
+        );
+
+        // The three tables with no hostname column cannot prove anything is
+        // remote, so every row of theirs stays in the archive.
+        for table in ["session_events", "response_times", "tool_actions"] {
+            assert_eq!(
+                scalar_count(&conn, &format!("SELECT COUNT(*) FROM {table}")),
+                0,
+                "{table} has no remote/local discriminator and must rebuild empty"
+            );
+        }
+
+        // Archives are recovery data: they keep every original row.
+        let archived = [
+            ("session_events_legacy_v30", 2),
+            ("response_times_legacy_v30", 2),
+            ("tool_actions_legacy_v30", 2),
+            ("skill_usages_legacy_v30", 3),
+            ("hook_invocations_legacy_v30", 6),
+        ];
+        for (archive, expected) in archived {
+            assert!(
+                table_exists(&conn, archive),
+                "{archive} must be retained when it holds recoverable rows"
+            );
+            assert_eq!(
+                scalar_count(&conn, &format!("SELECT COUNT(*) FROM {archive}")),
+                expected,
+                "{archive} must retain every original row"
+            );
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master
+                         WHERE type = 'index' AND sql IS NOT NULL
+                           AND tbl_name = '{archive}'"
+                    )
+                ),
+                0,
+                "{archive} must keep no named index"
+            );
+        }
+
+        // Deletion by project or host reaches source-less rows only through a
+        // recorded live origin, so each carried-forward session needs one.
+        // A carried row with no hostname has no origin to record.
+        let origins: Vec<(String, String, Option<String>, Option<String>)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT provider, session_id, cwd, hostname
+                     FROM live_analytics_sessions ORDER BY provider, session_id",
+                )
+                .expect("prepare origins");
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .expect("query origins");
+            rows.collect::<Result<Vec<_>, _>>().expect("read origins")
+        };
+        assert_eq!(
+            origins,
+            vec![
+                (
+                    "claude".to_string(),
+                    "session-fold".to_string(),
+                    Some("/cwd/remote".to_string()),
+                    Some(remote.to_string()),
+                ),
+                (
+                    "claude".to_string(),
+                    "session-remote".to_string(),
+                    Some("/cwd/remote".to_string()),
+                    Some(remote.to_string()),
+                ),
+            ],
+            "every carried-forward session with a known host gets one origin row"
+        );
+
+        drop(conn);
+        clear_env();
+    }
+
+    /// Apply every migration, reopen the same database, and assert the
+    /// version-gated loop skipped `migration` without error and without
+    /// recording it a second time.
+    fn assert_migration_is_idempotent(migration: i64) {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+
+        let recorded_rows = |storage: &Storage| -> (i32, i64) {
+            let conn = storage.conn.lock();
+            let version: i32 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("read schema_version");
+            let recorded: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_version WHERE version = ?1",
+                    params![migration],
+                    |row| row.get(0),
+                )
+                .expect("count schema_version rows");
+            (version, recorded)
+        };
+
+        let storage = init_storage_in(&dir);
+        assert_eq!(
+            recorded_rows(&storage),
+            (MAX_SUPPORTED_SCHEMA_VERSION, 1),
+            "the first open must apply migration {migration} exactly once"
+        );
+        drop(storage);
+
+        // Re-init reopens the same database; the version-gated loop must skip
+        // the already-applied migration without error.
+        let storage = init_storage_in(&dir);
+        assert_eq!(
+            recorded_rows(&storage),
+            (MAX_SUPPORTED_SCHEMA_VERSION, 1),
+            "re-running migrations must not re-enter migration {migration}"
+        );
+        drop(storage);
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 30 Idempotence]]
+    #[test]
+    #[serial]
+    fn migration_30_is_idempotent() {
+        assert_migration_is_idempotent(30);
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 31 Idempotence]]
+    #[test]
+    #[serial]
+    fn migration_31_is_idempotent() {
+        assert_migration_is_idempotent(31);
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 32 Idempotence]]
+    #[test]
+    #[serial]
+    fn migration_32_is_idempotent() {
+        assert_migration_is_idempotent(32);
+    }
+
+    /// A fresh install renames five empty tables and has no history worth
+    /// keeping, so migration 30 must drop the empty archives instead of
+    /// leaving dead tables in every new database.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Empty Legacy Archive Cleanup]]
+    #[test]
+    #[serial]
+    fn migration_30_drops_empty_legacy_archives_on_fresh_install() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let conn = storage.conn.lock();
+        for table in TRANSCRIPT_ANALYTICS_TABLES {
+            let archive = format!("{table}_legacy_v30");
+            assert!(
+                !table_exists(&conn, &archive),
+                "{archive} must be dropped when it holds nothing"
+            );
+        }
+        drop(conn);
+        clear_env();
+    }
+
+    /// A database written by a newer build cannot be downgraded in place, so
+    /// `init` refuses it with a machine-readable prefix instead of starting an
+    /// app that would silently record nothing.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Schema Ceiling Refusal]]
+    #[test]
+    #[serial]
+    fn schema_version_above_max_supported_refuses_to_open() {
+        clear_env();
+
+        // (stamped version, expected to open)
+        let cases = [
+            (MAX_SUPPORTED_SCHEMA_VERSION, true),
+            (MAX_SUPPORTED_SCHEMA_VERSION + 1, false),
+            (MAX_SUPPORTED_SCHEMA_VERSION + 10, false),
+        ];
+
+        for (stamped, expect_open) in cases {
+            let dir = TempDir::new().expect("tempdir");
+            let db_path = {
+                let storage = init_storage_in(&dir);
+                let path = storage.db_path.clone();
+                drop(storage);
+                path
+            };
+            {
+                let conn = Connection::open(&db_path).expect("open db to stamp version");
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_version (version) VALUES (?1)",
+                    params![stamped],
+                )
+                .expect("stamp schema version");
+            }
+
+            // SAFETY: env mutation; tests are serialized via `#[serial]`.
+            unsafe {
+                std::env::set_var("QUILL_DEMO_MODE", "1");
+                std::env::set_var("QUILL_DATA_DIR", dir.path());
+            }
+            let result = Storage::init();
+
+            if expect_open {
+                let opened = result.expect("a database at the supported ceiling must open");
+                drop(opened);
+            } else {
+                let error = result
+                    .err()
+                    .unwrap_or_else(|| panic!("schema {stamped} must be refused"));
+                assert!(
+                    error.starts_with("SCHEMA_TOO_NEW:"),
+                    "callers match on the prefix; got {error}"
+                );
+                // The refusal must be a hard stop, not a warning: nothing may
+                // have been written on the way past the guard.
+                let conn = Connection::open(&db_path).expect("reopen refused db");
+                assert_eq!(
+                    scalar_count(
+                        &conn,
+                        "SELECT COALESCE(MAX(version), 0) FROM schema_version"
+                    ),
+                    i64::from(stamped),
+                    "a refused open must not rewrite schema_version"
+                );
+            }
+        }
+
+        clear_env();
+    }
+
+    /// One rename scenario: `(case name, renames applied in order, the
+    /// one-hop resolution each original path must end up with)`.
+    type RenameCase = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        &'static [(&'static str, &'static str)],
+    );
+
+    /// Explicit project renames are collapsed on write so resolution stays a
+    /// single lookup: a chain `A -> B -> C` must resolve `A` straight to `C`,
+    /// and the `A -> B -> A` round trip must terminate without leaving a
+    /// self-referential row behind.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Project Rename Chain Collapse]]
+    #[test]
+    #[serial]
+    fn project_rename_chains_collapse_to_a_single_hop() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        // Rename sequences applied in order, then the resolution each
+        // original path must produce for later transcript replays.
+        const RENAME_CASES: &[RenameCase] = &[
+            (
+                "single-hop",
+                &[("/p/a1", "/p/b1")],
+                &[("/p/a1", "/p/b1"), ("/p/b1", "/p/b1")],
+            ),
+            (
+                "collapsed-chain",
+                &[("/p/a2", "/p/b2"), ("/p/b2", "/p/c2")],
+                &[("/p/a2", "/p/c2"), ("/p/b2", "/p/c2"), ("/p/c2", "/p/c2")],
+            ),
+            (
+                "round-trip",
+                &[("/p/a3", "/p/b3"), ("/p/b3", "/p/a3")],
+                &[("/p/a3", "/p/a3"), ("/p/b3", "/p/a3")],
+            ),
+            (
+                "three-step-cycle",
+                &[("/p/a4", "/p/b4"), ("/p/b4", "/p/c4"), ("/p/c4", "/p/a4")],
+                &[("/p/a4", "/p/a4"), ("/p/b4", "/p/a4"), ("/p/c4", "/p/a4")],
+            ),
+        ];
+
+        for (case, renames, expected) in RENAME_CASES.iter().copied() {
+            for (old_path, new_path) in renames {
+                storage
+                    .rename_project(old_path, new_path)
+                    .unwrap_or_else(|error| panic!("{case}: rename {old_path} failed: {error}"));
+            }
+
+            for (index, (project, resolved)) in expected.iter().enumerate() {
+                let source_key = format!("source-{case}-{index}");
+                let session_id = format!("session-{case}-{index}");
+                let spec = TranscriptSourceSpec {
+                    provider: IntegrationProvider::Claude,
+                    source_root_key: "root-rename",
+                    source_key: &source_key,
+                    session_id: &session_id,
+                    generation: 1,
+                    marker: "rename",
+                    rows: 0,
+                };
+                let snapshot = TranscriptAnalyticsSnapshot {
+                    source: crate::transcript_analytics::TranscriptAnalyticsSourceState {
+                        project: Some((*project).to_string()),
+                        ..spec.state()
+                    },
+                    ..spec.snapshot()
+                };
+                assert_eq!(
+                    storage
+                        .replace_transcript_analytics_snapshot(&snapshot)
+                        .expect("write renamed source"),
+                    TranscriptAnalyticsReplacement::Replaced
+                );
+                let stored: Option<String> = {
+                    let conn = storage.conn.lock();
+                    conn.query_row(
+                        "SELECT project FROM transcript_analytics_sources
+                         WHERE provider = 'claude' AND source_key = ?1",
+                        params![spec.source_key],
+                        |row| row.get(0),
+                    )
+                    .expect("read stored project")
+                };
+                assert_eq!(
+                    stored.as_deref(),
+                    Some(*resolved),
+                    "{case}: {project} must resolve to {resolved} in one hop"
+                );
+            }
+        }
+
+        // The CHECK plus the `old_path = new_path` sweep guarantee resolution
+        // always terminates: no row may point at itself.
+        let conn = storage.conn.lock();
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM project_path_renames WHERE old_path = new_path"
+            ),
+            0,
+            "a self-referential rename row would make resolution non-terminating"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM project_path_renames AS source
+                 JOIN project_path_renames AS destination
+                   ON destination.old_path = source.new_path"
+            ),
+            0,
+            "every rename must be fully collapsed, so no destination is itself renamed"
+        );
+        drop(conn);
+
+        clear_env();
+    }
+
+    /// The batched unchanged-source refresh advances many sources in one
+    /// transaction while keeping per-source stale detection: it returns
+    /// exactly the keys that did not update, and a mid-batch failure rolls the
+    /// whole batch back.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Batched Unchanged Source Refresh]]
+    #[test]
+    #[serial]
+    fn batched_unchanged_source_refresh_reports_per_source_staleness() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let provider = IntegrationProvider::Claude;
+        let root = "root-batch";
+
+        let current = TranscriptSourceSpec {
+            provider,
+            source_root_key: root,
+            source_key: "source-current",
+            session_id: "session-current",
+            generation: 5,
+            marker: "batch",
+            rows: 1,
+        };
+        let behind = TranscriptSourceSpec {
+            source_key: "source-behind",
+            session_id: "session-behind",
+            ..current
+        };
+        seed_transcript_source(&storage, &current);
+        seed_transcript_source(&storage, &behind);
+
+        // Root generation advances to 6 (max seen 5, plus one).
+        let generation = storage
+            .begin_transcript_analytics_generation(provider, root)
+            .expect("advance root generation");
+        assert_eq!(generation, 6);
+
+        // A third source whose registry row is already stamped past the
+        // generation the batch was prepared against.
+        let ahead = TranscriptSourceSpec {
+            source_key: "source-ahead",
+            session_id: "session-ahead",
+            generation: 8,
+            ..current
+        };
+        seed_transcript_source(&storage, &ahead);
+
+        let path = PathBuf::from("/quill-fixture/refresh.jsonl");
+        let descriptor = |source_key: &'static str, generation: i64, mtime_ns: i64| {
+            UnchangedTranscriptAnalyticsSource {
+                provider,
+                source_key,
+                source_root_key: root,
+                source_path: &path,
+                generation,
+                mtime_ns,
+                size_bytes: 128,
+                content_sha256: Some("sha-refresh"),
+            }
+        };
+
+        let stale = storage
+            .refresh_unchanged_transcript_analytics_sources(&[
+                descriptor("source-current", generation, 4_242),
+                // Prepared before the root advanced: the generation setting
+                // has moved past it.
+                descriptor("source-behind", 4, 9_999),
+                // The registry row itself is newer than this batch.
+                descriptor("source-ahead", 7, 9_999),
+            ])
+            .expect("batched refresh");
+        assert_eq!(
+            stale,
+            vec!["source-behind".to_string(), "source-ahead".to_string()],
+            "the batch must name every source that did not update"
+        );
+        assert_eq!(
+            registry_generation(&storage, provider, "source-current"),
+            generation,
+            "a current source must advance to the batch generation"
+        );
+        assert_eq!(registry_mtime(&storage, provider, "source-current"), 4_242);
+        assert_eq!(
+            registry_generation(&storage, provider, "source-behind"),
+            5,
+            "a stale source must keep its previous generation"
+        );
+        assert_eq!(
+            registry_generation(&storage, provider, "source-ahead"),
+            8,
+            "a source ahead of the batch must not be rolled back"
+        );
+
+        // The single-source wrapper still reports the boolean form.
+        assert!(
+            storage
+                .refresh_unchanged_transcript_analytics_source(descriptor(
+                    "source-current",
+                    generation,
+                    5_555
+                ))
+                .expect("single refresh"),
+            "a current source refreshes successfully"
+        );
+        assert_eq!(registry_mtime(&storage, provider, "source-current"), 5_555);
+        assert!(
+            !storage
+                .refresh_unchanged_transcript_analytics_source(descriptor(
+                    "source-behind",
+                    4,
+                    7_777
+                ))
+                .expect("single stale refresh"),
+            "a stale source reports failure rather than silently updating"
+        );
+
+        // One transaction for the whole batch: a source whose update violates
+        // a registry CHECK must roll back the sources processed before it.
+        let broken = UnchangedTranscriptAnalyticsSource {
+            source_root_key: "",
+            ..descriptor("source-behind", 9, 1)
+        };
+        let error = storage
+            .refresh_unchanged_transcript_analytics_sources(&[
+                descriptor("source-current", generation, 8_888),
+                broken,
+            ])
+            .expect_err("an invalid root key must fail the batch");
+        assert!(
+            error.contains("Refresh unchanged transcript source"),
+            "expected the refresh update to fail, got {error}"
+        );
+        assert_eq!(
+            registry_mtime(&storage, provider, "source-current"),
+            5_555,
+            "a failed batch must roll back the sources already processed"
+        );
+
+        // An empty batch is a no-op rather than an empty transaction.
+        assert!(
+            storage
+                .refresh_unchanged_transcript_analytics_sources(&[])
+                .expect("empty batch")
+                .is_empty()
+        );
+
+        clear_env();
+    }
+
+    /// Identity of one native chain seeded as a source-owned transcript.
+    #[derive(Clone, Copy)]
+    struct OwnedChainSpec<'a> {
+        source_key: &'a str,
+        session_id: &'a str,
+        chain_id: &'a str,
+        parent_chain_id: Option<&'a str>,
+        is_sidechain: bool,
+    }
+
+    /// Persist one native chain's session events through the real owned write
+    /// path, so runtime queries read exactly the rows reconciliation writes.
+    fn seed_owned_chain(
+        storage: &Storage,
+        chain: &OwnedChainSpec<'_>,
+        events: &[(String, crate::sessions::SessionEventKind)],
+    ) {
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime",
+            source_key: chain.source_key,
+            session_id: chain.session_id,
+            generation: 1,
+            marker: chain.source_key,
+            rows: 0,
+        };
+        let session_events = events
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (timestamp, kind))| crate::transcript_analytics::OwnedSessionEvent {
+                    provider: IntegrationProvider::Claude,
+                    source_key: chain.source_key.to_string(),
+                    event_key: format!("{}-event-{index}", chain.source_key),
+                    session_id: chain.session_id.to_string(),
+                    chain_id: chain.chain_id.to_string(),
+                    parent_chain_id: chain.parent_chain_id.map(str::to_string),
+                    agent_id: None,
+                    is_sidechain: chain.is_sidechain,
+                    timestamp: timestamp.clone(),
+                    kind: *kind,
+                    uuid: None,
+                    parent_uuid: None,
+                },
+            )
+            .collect();
+        let snapshot = TranscriptAnalyticsSnapshot {
+            source: crate::transcript_analytics::TranscriptAnalyticsSourceState {
+                chain_id: chain.chain_id.to_string(),
+                parent_chain_id: chain.parent_chain_id.map(str::to_string),
+                is_sidechain: chain.is_sidechain,
+                ..spec.state()
+            },
+            session_events,
+            ..spec.snapshot()
+        };
+        assert_eq!(
+            storage
+                .replace_transcript_analytics_snapshot(&snapshot)
+                .expect("seed owned chain"),
+            TranscriptAnalyticsReplacement::Replaced
+        );
+    }
+
+    /// Runtime is summed per native chain, so a parent and its two sub-agent
+    /// chains each contribute their own active interval. Sibling sub-agents
+    /// that overlap in wall-clock time must not be merged into one interval,
+    /// and no chain may be counted twice. Also pins the `INDEXED BY
+    /// idx_se_timestamp_chain` plan: the query must still return these totals.
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Runtime Totals Across Native Chains]]
+    #[test]
+    #[serial]
+    fn llm_runtime_stats_sum_across_native_chains_without_double_counting() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        // Anchored to now so the fixture never ages out of the query window.
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let at = |secs: i64| (base + chrono::Duration::seconds(secs)).to_rfc3339();
+        let user = crate::sessions::SessionEventKind::UserText;
+        let asst = crate::sessions::SessionEventKind::AsstText;
+
+        // Three chains, one session. The sub-agent windows overlap each other
+        // and the parent, but each chain's active interval stands alone.
+        let chains = [
+            (
+                OwnedChainSpec {
+                    source_key: "source-parent",
+                    session_id: "session-runtime",
+                    chain_id: "chain-parent",
+                    parent_chain_id: None,
+                    is_sidechain: false,
+                },
+                [(at(0), user), (at(30), asst)],
+                30.0_f64,
+            ),
+            (
+                OwnedChainSpec {
+                    source_key: "source-agent-a",
+                    session_id: "session-runtime",
+                    chain_id: "chain-agent-a",
+                    parent_chain_id: Some("chain-parent"),
+                    is_sidechain: true,
+                },
+                [(at(5), user), (at(40), asst)],
+                35.0,
+            ),
+            (
+                OwnedChainSpec {
+                    source_key: "source-agent-b",
+                    session_id: "session-runtime",
+                    chain_id: "chain-agent-b",
+                    parent_chain_id: Some("chain-parent"),
+                    is_sidechain: true,
+                },
+                [(at(10), user), (at(50), asst)],
+                40.0,
+            ),
+        ];
+        let expected_total: f64 = chains.iter().map(|(_, _, secs)| secs).sum();
+        for (chain, events, _) in &chains {
+            seed_owned_chain(&storage, chain, events);
+        }
+
+        let all = storage
+            .get_llm_runtime_stats("30d", None)
+            .expect("runtime stats");
+        assert!(
+            (all.total_runtime_secs - expected_total).abs() < 1e-6,
+            "runtime must sum each native chain exactly once: expected {expected_total}, got {}",
+            all.total_runtime_secs
+        );
+        assert_eq!(
+            all.turn_count, 3,
+            "overlapping sibling sub-agents must stay three independent turns"
+        );
+        assert_eq!(
+            all.session_count, 1,
+            "a parent and its sub-agents resolve to one session"
+        );
+        assert!(
+            (all.avg_per_turn_secs - expected_total / 3.0).abs() < 1e-6,
+            "average per turn must follow the summed total"
+        );
+        assert!(
+            (all.sparkline.iter().sum::<f64>() - expected_total).abs() < 1e-6,
+            "the sparkline must account for the same total"
+        );
+
+        let parent = storage
+            .get_llm_runtime_stats("30d", Some("parent_only"))
+            .expect("parent-only runtime stats");
+        assert!(
+            (parent.total_runtime_secs - 30.0).abs() < 1e-6,
+            "parent_only must drop both sub-agent chains, got {}",
+            parent.total_runtime_secs
+        );
+        assert_eq!(parent.turn_count, 1);
+        assert_eq!(parent.session_count, 1);
+
+        clear_env();
     }
 }

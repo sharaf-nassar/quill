@@ -53,16 +53,22 @@ export function useLlmRuntimeStats(range: RangeType): LlmRuntimeStatsResult {
 	useEffect(() => {
 		let mounted = true;
 		let timer: ReturnType<typeof setTimeout> | null = null;
-		const unlistenPromise = listen("sessions-index-updated", () => {
+		const scheduleRefresh = () => {
 			if (!mounted) return;
 			if (timer) clearTimeout(timer);
 			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
-		});
+		};
+		const unlistenPromises = [
+			listen("sessions-index-updated", scheduleRefresh),
+			listen("transcript-analytics-updated", scheduleRefresh),
+		];
 
 		return () => {
 			mounted = false;
 			if (timer) clearTimeout(timer);
-			unlistenPromise.then((fn) => fn());
+			for (const unlistenPromise of unlistenPromises) {
+				unlistenPromise.then((fn) => fn());
+			}
 		};
 	}, [fetchData]);
 	useEffect(() => {

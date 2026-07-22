@@ -109,7 +109,7 @@ Re-launching Quill while it's already running focuses the existing main window i
 
 The plugin is registered before every other Tauri plugin so its DBus dispatch handler is in place when the secondary process starts. On a duplicate launch, the secondary process exits and the primary's callback runs [[src-tauri/src/lib.rs#show_main_window]] (`show()` + restore last position + `set_focus()`).
 
-Primary-only startup work that mutates local state runs inside Tauri `.setup()` after plugin setup has completed. This keeps duplicate processes from reaching [[src-tauri/src/lib.rs#initialize_storage_or_exit]] or [[src-tauri/src/lib.rs#cleanup_interrupted_learning_runs]], so an active learning run in the primary cannot be marked `interrupted` by a re-launch.
+Primary-only startup work that mutates local state runs inside Tauri `.setup()` after plugin setup has completed. This keeps duplicate processes from reaching [[src-tauri/src/lib.rs#initialize_storage_or_report_fatal]] or [[src-tauri/src/lib.rs#cleanup_interrupted_learning_runs]], so an active learning run in the primary cannot be marked `interrupted` by a re-launch.
 
 Without this guard, GTK's `Application` forwards an `activate` signal to the primary, which surfaces as a second `RuntimeRunEvent::Ready` and makes Tauri re-run its internal `setup()`. The second `setup()` rebuilds windows from `tauri.conf.json` and panics with `a webview with label \`main\` already exists`. The primary dies, and the secondary is left orphaned with no webview, no tray icon, and no `tauri::async_runtime::spawn` tasks running.
 

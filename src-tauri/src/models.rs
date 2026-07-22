@@ -224,18 +224,6 @@ pub struct SessionBreakdown {
     pub subagent_count: u32,
 }
 
-#[derive(Clone, Debug)]
-pub struct SkillUsage {
-    pub session_id: String,
-    pub message_id: String,
-    pub skill_name: String,
-    pub skill_path: String,
-    pub timestamp: String,
-    pub tool_name: Option<String>,
-    pub cwd: Option<String>,
-    pub hostname: Option<String>,
-}
-
 #[derive(Serialize, Clone, Debug)]
 pub struct SkillBreakdown {
     pub skill_name: String,
@@ -842,11 +830,11 @@ pub struct SessionNotifyPayload {
 }
 
 /// A single message pushed via the HTTP API
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SessionMessagePayload {
     pub uuid: String,
     #[serde(rename = "type")]
-    #[allow(dead_code)]
+    #[serde(default)]
     pub msg_type: String,
     pub timestamp: String,
     pub content: String,
@@ -855,10 +843,26 @@ pub struct SessionMessagePayload {
     pub tools_used: Vec<String>,
     #[serde(default)]
     pub files_modified: Vec<String>,
+    /// Ordered runtime roles emitted by this original provider record.
+    /// Empty preserves the legacy one-event heuristic for older clients.
+    #[serde(default)]
+    pub event_kinds: Vec<String>,
+    /// Provider-native chain identity. Older bridge payloads omit these
+    /// fields and are treated as top-level messages in `session_id`.
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    #[serde(default)]
+    pub parent_chain_id: Option<String>,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub is_sidechain: Option<bool>,
+    #[serde(default)]
+    pub parent_uuid: Option<String>,
 }
 
 /// Batch of messages pushed via the HTTP API
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SessionMessagesPayload {
     #[serde(default = "default_provider")]
     pub provider: IntegrationProvider,
@@ -866,7 +870,9 @@ pub struct SessionMessagesPayload {
     pub session_id: String,
     pub project: String,
     #[serde(default)]
-    pub git_branch: String,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
     pub messages: Vec<SessionMessagePayload>,
 }
 

@@ -27,6 +27,8 @@ mod rule_watcher;
 mod server;
 pub(crate) mod sessions;
 mod storage;
+mod transcript_analytics;
+mod transcript_identity;
 mod tray_keepalive;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -69,6 +71,17 @@ const MODEL_USAGE_PERMIT_RETRY_DELAY: std::time::Duration = std::time::Duration:
 const MODEL_USAGE_FAILURE_RETRY_BASE_SECS: u64 = 1;
 const MODEL_USAGE_FAILURE_RETRY_CAP_SECS: u64 = 30;
 const MODEL_USAGE_LIVE_COMMIT_BATCH_SIZE: usize = 32;
+const TRANSCRIPT_ANALYTICS_LIVE_BATCH_SIZE: usize = 16;
+// Shared with `server.rs`, which emits the same event from the notify path.
+pub(crate) const TRANSCRIPT_ANALYTICS_UPDATED_EVENT: &str = "transcript-analytics-updated";
+// Marker prefix `storage::Storage::init` puts in front of a schema upper-bound
+// rejection. It is an internal wire marker, never user-facing text.
+const SCHEMA_TOO_NEW_ERROR_PREFIX: &str = "SCHEMA_TOO_NEW:";
+// How long the fatal-storage dialog gets to come back with an answer before
+// the watchdog terminates the process anyway. Long enough to read the dialog
+// and click, short enough that a session with no working dialog backend (no
+// XDG portal, headless, misconfigured GTK) cannot hang forever.
+const FATAL_STORAGE_DIALOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const MODEL_SESSIONS_MIN_LIMIT: i64 = 1;
 const MODEL_SESSIONS_MAX_LIMIT: i64 = 100;
 const LIVE_USAGE_REFRESH_INTERVAL_SECS: i64 = 3 * 60;
@@ -119,6 +132,122 @@ const PLUGIN_UPDATES_INTERVAL_MAX_HOURS: i64 = 24;
 struct ModelUsageLiveSourceKey {
     provider: &'static str,
     source_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct TranscriptAnalyticsLiveSourceKey {
+    provider: &'static str,
+    source_key: String,
+}
+
+#[derive(Default)]
+struct TranscriptAnalyticsRunnerInner {
+    live_sources: HashMap<TranscriptAnalyticsLiveSourceKey, QueuedTranscriptAnalyticsSource>,
+    drain_scheduled: bool,
+}
+
+#[derive(Clone)]
+struct QueuedTranscriptAnalyticsSource {
+    source: sessions::DiscoveredRetainedJsonlSource,
+    consecutive_failures: u32,
+    ready_at: std::time::Instant,
+}
+
+pub(crate) struct TranscriptAnalyticsRunnerState {
+    inner: Mutex<TranscriptAnalyticsRunnerInner>,
+    wake: tokio::sync::Notify,
+}
+
+impl TranscriptAnalyticsRunnerState {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(TranscriptAnalyticsRunnerInner::default()),
+            wake: tokio::sync::Notify::new(),
+        }
+    }
+    fn enqueue(&self, source: sessions::DiscoveredRetainedJsonlSource) -> Result<bool, String> {
+        if !matches!(
+            source.provider,
+            integrations::IntegrationProvider::Claude | integrations::IntegrationProvider::Codex
+        ) || source.source_key.is_empty()
+            || source.source_root_key.is_empty()
+            || !source.canonical_path.is_absolute()
+        {
+            return Err("Invalid retained transcript analytics source identity".into());
+        }
+        let key = TranscriptAnalyticsLiveSourceKey {
+            provider: source.provider.as_str(),
+            source_key: source.source_key.clone(),
+        };
+        let mut inner = self.inner.lock();
+        inner.live_sources.insert(
+            key,
+            QueuedTranscriptAnalyticsSource {
+                source,
+                consecutive_failures: 0,
+                ready_at: std::time::Instant::now(),
+            },
+        );
+        self.wake.notify_one();
+        if inner.drain_scheduled {
+            Ok(false)
+        } else {
+            inner.drain_scheduled = true;
+            Ok(true)
+        }
+    }
+    fn take_batch(&self) -> Vec<QueuedTranscriptAnalyticsSource> {
+        let mut inner = self.inner.lock();
+        let now = std::time::Instant::now();
+        let keys: Vec<_> = inner
+            .live_sources
+            .iter()
+            .filter(|(_, queued)| queued.ready_at <= now)
+            .map(|(key, _)| key)
+            .take(TRANSCRIPT_ANALYTICS_LIVE_BATCH_SIZE)
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| inner.live_sources.remove(&key))
+            .collect()
+    }
+
+    fn requeue_failed(&self, queued: QueuedTranscriptAnalyticsSource) {
+        let mut inner = self.inner.lock();
+        let key = TranscriptAnalyticsLiveSourceKey {
+            provider: queued.source.provider.as_str(),
+            source_key: queued.source.source_key.clone(),
+        };
+        // Preserve a fresher notification admitted while this attempt ran.
+        inner.live_sources.entry(key).or_insert_with(|| {
+            let consecutive_failures = queued.consecutive_failures.saturating_add(1);
+            QueuedTranscriptAnalyticsSource {
+                source: queued.source,
+                consecutive_failures,
+                ready_at: std::time::Instant::now()
+                    + model_usage_failure_retry_delay(consecutive_failures),
+            }
+        });
+        self.wake.notify_one();
+    }
+
+    fn finish_or_next_delay(&self) -> Option<std::time::Duration> {
+        let mut inner = self.inner.lock();
+        if inner.live_sources.is_empty() {
+            inner.drain_scheduled = false;
+            None
+        } else {
+            let now = std::time::Instant::now();
+            Some(
+                inner
+                    .live_sources
+                    .values()
+                    .map(|queued| queued.ready_at.saturating_duration_since(now))
+                    .min()
+                    .unwrap_or_default(),
+            )
+        }
+    }
 }
 
 impl ModelUsageLiveSourceKey {
@@ -319,6 +448,157 @@ pub(crate) fn enqueue_model_usage_live_source(
         spawn_model_usage_live_queue_drain(app_handle.clone(), Arc::downgrade(&state));
     }
     Ok(admission)
+}
+
+pub(crate) fn enqueue_transcript_analytics_live_source(
+    app: &tauri::AppHandle,
+    source: sessions::DiscoveredRetainedJsonlSource,
+) -> Result<(), String> {
+    let state = app
+        .try_state::<Arc<TranscriptAnalyticsRunnerState>>()
+        .ok_or_else(|| "Transcript analytics runner state is not initialized".to_string())?;
+    let state = Arc::clone(state.inner());
+    if state.enqueue(source)? {
+        spawn_transcript_analytics_live_queue_drain(app.clone(), Arc::downgrade(&state));
+    }
+    Ok(())
+}
+
+fn spawn_startup_transcript_analytics_reconciliation(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let result = tauri::async_runtime::spawn_blocking(|| {
+            let storage = get_storage()?;
+            transcript_analytics::run_startup_transcript_analytics_reconciliation(
+                storage,
+                &sessions::SessionIndex::local_hostname(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(summary)) => {
+                log::info!(
+                    "Startup transcript analytics reconciliation complete: replaced={} pruned={} roots_complete={}",
+                    summary.replaced_sources,
+                    summary.pruned_sources,
+                    summary.completed_all_roots,
+                );
+                if let Some(error) = &summary.failure {
+                    log::error!("Startup transcript analytics reconciliation incomplete: {error}");
+                }
+                if (summary.replaced_sources > 0 || summary.pruned_sources > 0)
+                    && let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ())
+                {
+                    log::warn!("Failed to emit startup transcript analytics update: {error}");
+                }
+            }
+            Ok(Err(error)) => {
+                log::error!("Startup transcript analytics reconciliation failed: {error}");
+            }
+            Err(error) => {
+                log::error!("Startup transcript analytics worker failed: {error}");
+            }
+        }
+    });
+}
+
+fn spawn_transcript_analytics_live_queue_drain(
+    app: tauri::AppHandle,
+    state: Weak<TranscriptAnalyticsRunnerState>,
+) {
+    tauri::async_runtime::spawn(async move {
+        drain_transcript_analytics_live_queue(app, state).await;
+    });
+}
+
+/// Drain the live transcript analytics queue until it is empty.
+///
+/// The runner state arrives as a `Weak` handle instead of being resolved from
+/// managed state on every pass, mirroring [`drain_model_usage_live_queue`]. A
+/// missing handle would otherwise leave `drain_scheduled` latched true, so
+/// every later notification would coalesce into a drain that no longer runs.
+/// The only exit that does not reset the flag is the one where the state
+/// itself is already gone.
+async fn drain_transcript_analytics_live_queue(
+    app: tauri::AppHandle,
+    state: Weak<TranscriptAnalyticsRunnerState>,
+) {
+    loop {
+        let Some(state_ref) = state.upgrade() else {
+            return;
+        };
+        let batch = state_ref.take_batch();
+        if batch.is_empty() {
+            let Some(delay) = state_ref.finish_or_next_delay() else {
+                return;
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = state_ref.wake.notified() => {}
+            }
+            continue;
+        }
+        let retry_batch = batch.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let storage = get_storage()?;
+            let hostname = sessions::SessionIndex::local_hostname();
+            Ok::<_, String>(
+                batch
+                    .into_iter()
+                    .map(|queued| {
+                        let outcome = transcript_analytics::reconcile_live_transcript_source(
+                            storage,
+                            &queued.source,
+                            &hostname,
+                        );
+                        (queued, outcome)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(outcomes)) => {
+                for (queued, outcome) in outcomes {
+                    match outcome {
+                        Ok(transcript_analytics::TranscriptSourceResult::Replaced) => {
+                            if let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ()) {
+                                log::warn!(
+                                    "Failed to emit committed transcript analytics update: {error}"
+                                );
+                            }
+                        }
+                        Ok(
+                            transcript_analytics::TranscriptSourceResult::SuppressedUnchanged
+                            | transcript_analytics::TranscriptSourceResult::StaleGeneration,
+                        ) => {}
+                        Err(error) => {
+                            log::error!(
+                                "Live transcript analytics failed for {}: {error}",
+                                queued.source.source_key
+                            );
+                            state_ref.requeue_failed(queued);
+                        }
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                log::error!("Live transcript analytics storage failed: {error}");
+                for queued in retry_batch {
+                    state_ref.requeue_failed(queued);
+                }
+            }
+            Err(error) => {
+                log::error!("Live transcript analytics worker failed: {error}");
+                for queued in retry_batch {
+                    state_ref.requeue_failed(queued);
+                }
+            }
+        }
+        if state_ref.finish_or_next_delay().is_none() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 fn spawn_model_usage_live_queue_drain(
@@ -933,10 +1213,164 @@ fn get_storage() -> Result<&'static Storage, String> {
         .ok_or_else(|| "Storage not initialized".to_string())
 }
 
-fn initialize_storage_or_exit() -> &'static Storage {
+/// Resolve the directory that holds `usage.db`, the session index, and the
+/// rest of Quill's local state.
+///
+/// Mirrors the resolution `storage::db_path` performs (including the demo-mode
+/// override) so anything reported to the user names the directory the database
+/// is actually opened from.
+fn app_data_dir() -> std::path::PathBuf {
+    let default_app_dir = dirs::data_local_dir()
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                if cfg!(target_os = "macos") {
+                    home.join("Library").join("Application Support")
+                } else {
+                    home.join(".local").join("share")
+                }
+            })
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("com.quilltoolkit.app");
+    crate::data_paths::resolve_data_dir_with_default(default_app_dir)
+}
+
+/// Reveal a directory in the platform file manager.
+///
+/// Quill depends on no shell/opener plugin, so the platform handler is spawned
+/// directly, the same way `spawn_delayed_relaunch` spawns the relaunch child.
+fn open_path_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(path);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Failed to launch the file manager: {error}"))
+}
+
+/// Build the user-facing copy for a fatal storage-initialization failure.
+///
+/// `SCHEMA_TOO_NEW:` means the database was written by a newer Quill build, so
+/// the remedy is an upgrade rather than an inspection. The marker itself is an
+/// internal prefix and is stripped before the detail reaches the dialog.
+fn fatal_storage_message(error: &str, data_dir: &std::path::Path) -> String {
+    match error.strip_prefix(SCHEMA_TOO_NEW_ERROR_PREFIX) {
+        Some(detail) => format!(
+            "Quill's database was created by a newer version of Quill and cannot be \
+             opened by this one.\n\n{}\n\nUpdate Quill to the latest version, or move \
+             the database folder aside to start over:\n{}",
+            detail.trim(),
+            data_dir.display()
+        ),
+        None => format!(
+            "Quill could not open its database and has to close.\n\n{error}\n\n\
+             Database folder:\n{}",
+            data_dir.display()
+        ),
+    }
+}
+
+/// Report an unrecoverable storage failure and terminate.
+///
+/// A desktop user has no operator and no recovery console, so a bare
+/// `exit(1)` would make a failed migration look like an app that silently
+/// refuses to launch, every launch. The dialog names the failure and the
+/// database folder, and offers to open that folder so the user can inspect,
+/// back up, or move the database before retrying.
+///
+/// Setup runs inside the event loop's `Ready` handler, so the dialog cannot be
+/// shown synchronously here: `blocking_show` would freeze the main thread it
+/// needs. The dialog is queued instead and the process exits from its
+/// callback, which runs on a worker thread.
+///
+/// Because termination hangs off that callback, a session with no working
+/// dialog backend would otherwise leave a hidden, UI-less process alive
+/// forever — a worse failure than the bare `exit(1)` this replaced. A watchdog
+/// armed alongside the dialog exits after [`FATAL_STORAGE_DIALOG_TIMEOUT`]
+/// regardless. Callback and watchdog race for a single claim flag, so exactly
+/// one of them terminates the process and the loser is a no-op.
+fn report_fatal_storage_failure(app: &tauri::AppHandle, error: &str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    // Scoped to this function so the watchdog can never be armed, and the flag
+    // never claimed, from the successful-startup path.
+    static TERMINATION_CLAIMED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    let data_dir = app_data_dir();
+    log::error!(
+        "Fatal: failed to initialize storage at {}: {error}",
+        data_dir.display()
+    );
+
+    // The configured main window was already built before setup ran. Hide it
+    // rather than close it: a close on the last window requests app exit and
+    // would race the dialog away before the user can read it.
+    for (_, window) in app.webview_windows() {
+        if let Err(error) = window.hide() {
+            log::warn!("Failed to hide window after fatal storage failure: {error}");
+        }
+    }
+
+    let watchdog_error = error.to_string();
+    let watchdog_data_dir = data_dir.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(FATAL_STORAGE_DIALOG_TIMEOUT).await;
+        if TERMINATION_CLAIMED.swap(true, AtomicOrdering::SeqCst) {
+            // The dialog callback already answered and owns the exit.
+            return;
+        }
+        log::error!(
+            "Fatal storage dialog did not respond within {}s; exiting without an \
+             answer. Failed to initialize storage at {}: {watchdog_error}",
+            FATAL_STORAGE_DIALOG_TIMEOUT.as_secs(),
+            watchdog_data_dir.display()
+        );
+        std::process::exit(1);
+    });
+
+    app.dialog()
+        .message(fatal_storage_message(error, &data_dir))
+        .title("Quill Cannot Start")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Open Database Folder".into(),
+            "Quit".into(),
+        ))
+        .show(move |open_folder| {
+            // Claim before acting: once the flag is ours the watchdog can no
+            // longer pull the process out from under the file-manager spawn.
+            if TERMINATION_CLAIMED.swap(true, AtomicOrdering::SeqCst) {
+                log::warn!("Fatal storage dialog answered after the watchdog already exited");
+                return;
+            }
+            if open_folder {
+                log::error!("Fatal storage failure: user chose Open Database Folder; exiting");
+                if let Err(error) = open_path_in_file_manager(&data_dir) {
+                    log::error!(
+                        "Failed to open database folder {}: {error}",
+                        data_dir.display()
+                    );
+                }
+            } else {
+                log::error!("Fatal storage failure: user chose Quit; exiting");
+            }
+            std::process::exit(1);
+        });
+}
+
+/// Publish the process-wide storage handle, or surface a fatal failure.
+///
+/// Returns `None` once the failure dialog owns termination; the caller must
+/// abandon the rest of startup instead of running against absent storage.
+fn initialize_storage_or_report_fatal(app: &tauri::AppHandle) -> Option<&'static Storage> {
     if let Some(storage) = STORAGE.get() {
         log::error!("BUG: storage initialization was requested more than once");
-        return storage;
+        return Some(storage);
     }
 
     match Storage::init() {
@@ -946,15 +1380,16 @@ fn initialize_storage_or_exit() -> &'static Storage {
             }
         }
         Err(error) => {
-            log::error!("Fatal: failed to initialize storage: {error}");
-            std::process::exit(1);
+            report_fatal_storage_failure(app, &error);
+            return None;
         }
     }
 
-    STORAGE.get().unwrap_or_else(|| {
-        log::error!("Fatal: storage initialization did not publish global state");
-        std::process::exit(1);
-    })
+    let storage = STORAGE.get();
+    if storage.is_none() {
+        report_fatal_storage_failure(app, "storage initialization did not publish global state");
+    }
+    storage
 }
 
 fn cleanup_interrupted_learning_runs(storage: &Storage) {
@@ -2304,6 +2739,9 @@ async fn delete_project_data(cwd: String, app: tauri::AppHandle) -> Result<u64, 
     if result.model_data_changed() {
         model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
     }
+    if result.transcript_data_changed() {
+        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
+    }
     Ok(result.affected_rows())
 }
 
@@ -2322,6 +2760,9 @@ async fn rename_project(
     if result.model_data_changed() {
         model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
     }
+    if result.transcript_data_changed() {
+        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
+    }
     Ok(result.affected_rows())
 }
 
@@ -2335,6 +2776,9 @@ async fn delete_host_data(hostname: String, app: tauri::AppHandle) -> Result<u64
     })?;
     if result.model_data_changed() {
         model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
+    }
+    if result.transcript_data_changed() {
+        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
     }
     Ok(result.affected_rows())
 }
@@ -2353,6 +2797,9 @@ async fn delete_session_data(
     })?;
     if result.model_data_changed() {
         model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
+    }
+    if result.transcript_data_changed() {
+        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
     }
     Ok(result.affected_rows())
 }
@@ -3630,7 +4077,12 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            let storage = initialize_storage_or_exit();
+            // A failed migration or an unreadable database is terminal, but the
+            // dialog that says so can only render once this handler returns, so
+            // abandon the rest of startup instead of exiting from here.
+            let Some(storage) = initialize_storage_or_report_fatal(app.handle()) else {
+                return Ok(());
+            };
             // Honor the crash-reporting opt-out before any other startup work
             // so a panic during initialization respects the user's preference.
             crash_reporting::set_enabled(read_bool_setting(
@@ -3651,6 +4103,12 @@ pub fn run() {
             app.manage(LearningCapability::generate());
             let model_usage_runner_state = Arc::new(ModelUsageRunnerState::new());
             app.manage(Arc::clone(&model_usage_runner_state));
+            app.manage(Arc::new(TranscriptAnalyticsRunnerState::new()));
+            // Retained runtime analytics are a startup responsibility, not a
+            // side effect of opening or manually syncing Session Search.
+            // Blocking inventory/parsing stays off the UI thread; shared root
+            // permits serialize this pass with any early live notifications.
+            spawn_startup_transcript_analytics_reconciliation(app.handle().clone());
 
             // Migration 28 starts pending. A prior process can also leave a
             // committed running state behind; reset that run to a fresh
@@ -3677,20 +4135,7 @@ pub fn run() {
 
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
-                let default_app_dir = dirs::data_local_dir()
-                    .or_else(|| {
-                        dirs::home_dir().map(|h| {
-                            if cfg!(target_os = "macos") {
-                                h.join("Library").join("Application Support")
-                            } else {
-                                h.join(".local").join("share")
-                            }
-                        })
-                    })
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                    .join("com.quilltoolkit.app");
-                let index_dir = crate::data_paths::resolve_data_dir_with_default(default_app_dir)
-                    .join("session-index");
+                let index_dir = app_data_dir().join("session-index");
 
                 match sessions::SessionIndex::open_or_create(&index_dir) {
                     Ok(idx) => {

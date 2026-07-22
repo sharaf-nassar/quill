@@ -217,6 +217,7 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 		const unlistenPromises = [
 			listen("tokens-updated", scheduleRefresh),
 			listen("sessions-index-updated", scheduleRefresh),
+			listen("transcript-analytics-updated", scheduleRefresh),
 		];
 
 		return () => {

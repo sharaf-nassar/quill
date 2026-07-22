@@ -12,6 +12,7 @@ use tantivy::snippet::SnippetGenerator;
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::integrations::IntegrationProvider;
+use crate::transcript_identity::{JsonlRecord, parse_jsonl_records, resolve_codex_native_identity};
 
 const CLAUDE_SOURCE_ROOT_KEY: &str = "claude:projects";
 const CODEX_SOURCE_ROOT_KEY: &str = "codex:sessions";
@@ -318,6 +319,17 @@ pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot>
     ]
 }
 
+/// Stable identities for every configured retained transcript root.
+///
+/// Callers that serialize whole-root work use these identities before walking
+/// the filesystem, so live reconciliation cannot interleave with inventory.
+pub(crate) fn retained_jsonl_source_root_identities() -> [(IntegrationProvider, &'static str); 2] {
+    [
+        (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
+        (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
+    ]
+}
+
 /// Enumerate the configured Claude transcript root as one independent outcome.
 pub(crate) fn enumerate_claude_retained_jsonl_source_root() -> ProviderSourceRoot {
     enumerate_provider_source_root(
@@ -384,14 +396,21 @@ fn enumerate_provider_source_root(
     match std::fs::symlink_metadata(&resolved_root_path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ProviderSourceRoot {
+            log_inventory_io_error(
+                provider,
+                "inspect root directory entry",
+                &resolved_root_path,
+                &error,
+            );
+            record_root_failure(&mut diagnostic, provider, "configured root does not exist.");
+            return finish_provider_source_root(
                 provider,
                 source_root_key,
                 resolved_root_path,
-                canonical_root_path: None,
-                outcome: ProviderRootEnumerationOutcome::Complete,
-                sources: Vec::new(),
-            };
+                None,
+                diagnostic,
+                Vec::new(),
+            );
         }
         Err(error) => {
             log_inventory_io_error(
@@ -1233,10 +1252,13 @@ impl SessionIndex {
     }
 
     /// Test-friendly variant: enumerate Claude transcripts (parent + sub-agent)
-    /// under the supplied `projects_dir`. Two explicit read_dir passes per
-    /// project: first picks up `<projectSlug>/*.jsonl` (parents), second
-    /// picks up `<projectSlug>/<session-uuid>/subagents/*.jsonl` (sub-agents).
-    /// We avoid walkdir so unrelated JSONLs nested elsewhere never sneak in.
+    /// under the supplied `projects_dir`. Two explicit passes per project:
+    /// first picks up `<projectSlug>/*.jsonl` (parents), second recurses the
+    /// whole `<projectSlug>/<session-uuid>/subagents/` subtree for every
+    /// `.jsonl` at any depth — both flat `subagents/agent-*.jsonl` and
+    /// Workflow-nested `subagents/workflows/wf_<id>/agent-*.jsonl`. We avoid
+    /// walkdir and stay bounded to that subtree so unrelated JSONLs nested
+    /// elsewhere never sneak in.
     fn discover_claude_session_files_in(
         projects_dir: &Path,
     ) -> Result<Vec<DiscoveredSessionFile>, String> {
@@ -1271,7 +1293,14 @@ impl SessionIndex {
                 });
             }
 
-            // (2) Sub-agent transcripts: <projectSlug>/<session-uuid>/subagents/*.jsonl
+            // (2) Sub-agent transcripts live somewhere under
+            // <projectSlug>/<session-uuid>/subagents/. They appear flat as
+            // `subagents/agent-*.jsonl`, and one level deeper for
+            // Workflow-spawned agents as
+            // `subagents/workflows/wf_<id>/agent-*.jsonl`. Walk the entire
+            // subagents/ subtree with an explicit stack (no walkdir) so every
+            // `.jsonl` at any depth is collected, staying bounded to that
+            // subtree so unrelated nested JSONLs never sneak in.
             for session_entry in std::fs::read_dir(&project_dir)
                 .map_err(|e| format!("Read project dir: {e}"))?
                 .filter_map(|e| e.ok())
@@ -1281,17 +1310,26 @@ impl SessionIndex {
                 if !subagents_dir.is_dir() {
                     continue;
                 }
-                for entry in std::fs::read_dir(&subagents_dir)
-                    .map_err(|e| format!("Read subagents dir: {e}"))?
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-                {
-                    files.push(DiscoveredSessionFile {
-                        provider: IntegrationProvider::Claude,
-                        path: entry.path(),
-                        default_project: project_name.clone(),
-                        is_subagent: true,
-                    });
+                let mut stack = vec![subagents_dir];
+                while let Some(dir) = stack.pop() {
+                    // Skip an unreadable directory rather than aborting the
+                    // whole scan, matching the entry-level filter_map below.
+                    let Ok(read_dir) = std::fs::read_dir(&dir) else {
+                        continue;
+                    };
+                    for entry in read_dir.filter_map(|e| e.ok()) {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            stack.push(path);
+                        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                            files.push(DiscoveredSessionFile {
+                                provider: IntegrationProvider::Claude,
+                                path,
+                                default_project: project_name.clone(),
+                                is_subagent: true,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1430,33 +1468,6 @@ impl SessionIndex {
                 } else {
                     index_changed = true;
                 }
-
-                if let Some(storage) = storage {
-                    if let Err(e) = storage
-                        .delete_tool_actions_for_session(discovered.provider, &extracted.session_id)
-                    {
-                        log::warn!("Failed to delete old tool_actions: {e}");
-                    }
-                    if let Err(e) = storage
-                        .delete_skill_usages_for_session(discovered.provider, &extracted.session_id)
-                    {
-                        log::warn!("Failed to delete old skill_usages: {e}");
-                    }
-                    if let Err(e) = storage.delete_response_times_for_session(
-                        discovered.provider,
-                        &extracted.session_id,
-                    ) {
-                        log::warn!("Failed to delete old response_times: {e}");
-                    }
-                    // Feature 009: drop any hook_invocations from a prior
-                    // ingest of this session before the re-emission below.
-                    if let Err(e) = storage.delete_hook_invocations_for_session(
-                        discovered.provider,
-                        &extracted.session_id,
-                    ) {
-                        log::warn!("Failed to delete old hook_invocations: {e}");
-                    }
-                }
             }
 
             for msg in &extracted.messages {
@@ -1470,112 +1481,6 @@ impl SessionIndex {
                     log::warn!("Failed to index message: {e}");
                 } else {
                     index_changed = true;
-                }
-            }
-
-            if let Some(storage) = storage
-                && let Err(e) = storage
-                    .store_tool_actions_for_messages(discovered.provider, &extracted.messages)
-            {
-                log::warn!("Failed to store tool actions: {e}");
-            }
-
-            if let Some(storage) = storage
-                && let Err(e) = storage
-                    .store_skill_usages_for_messages(discovered.provider, &extracted.messages)
-            {
-                log::warn!("Failed to store skill usages: {e}");
-            }
-
-            if let Some(storage) = storage
-                && !extracted.session_id.is_empty()
-                && !extracted.messages.is_empty()
-            {
-                let rt_pairs: Vec<crate::storage::ResponseTimeInput<'_>> = extracted
-                    .messages
-                    .iter()
-                    .map(|msg| crate::storage::ResponseTimeInput {
-                        role: msg.role.as_str(),
-                        timestamp: msg.timestamp.as_str(),
-                        is_sidechain: msg.is_sidechain,
-                        agent_id: msg.agent_id.as_deref(),
-                        parent_uuid: msg.parent_uuid.as_deref(),
-                    })
-                    .collect();
-                if let Err(e) = storage.ingest_response_times(
-                    discovered.provider,
-                    &extracted.session_id,
-                    &rt_pairs,
-                ) {
-                    log::warn!("Failed to store response times: {e}");
-                }
-            }
-
-            // Feature 008: dual-emit per-event rows into `session_events`.
-            // Delete-then-insert per session matches the pattern used for
-            // tool_actions / skill_usages / response_times above. See
-            // specs/008-runtime-redesign/contracts/session-events.md
-            // (IDX-1, IDX-2).
-            if let Some(storage) = storage
-                && !extracted.session_id.is_empty()
-            {
-                let rt_events: Vec<crate::storage::SessionEventInput<'_>> = extracted
-                    .events
-                    .iter()
-                    .map(|ev| crate::storage::SessionEventInput {
-                        timestamp: ev.timestamp.as_str(),
-                        kind: ev.kind,
-                        is_sidechain: ev.is_sidechain,
-                        agent_id: ev.agent_id.as_deref(),
-                        uuid: ev.uuid.as_deref(),
-                        parent_uuid: ev.parent_uuid.as_deref(),
-                    })
-                    .collect();
-                if let Err(e) = storage
-                    .delete_session_events_for_session(discovered.provider, &extracted.session_id)
-                {
-                    log::warn!("Failed to delete old session_events: {e}");
-                }
-                if let Err(e) = storage.ingest_session_events(
-                    discovered.provider,
-                    &extracted.session_id,
-                    &rt_events,
-                ) {
-                    log::warn!("Failed to store session_events: {e}");
-                }
-            }
-
-            // Feature 009: store hook fires extracted from
-            // `type:"attachment"` records. Hostname is the same value
-            // already attached to skill_usages and message rows in this
-            // batch. See contracts/hook-invocations.md.
-            if let Some(storage) = storage
-                && !extracted.hook_invocations.is_empty()
-            {
-                let invocations: Vec<crate::storage::HookInvocationInput<'_>> = extracted
-                    .hook_invocations
-                    .iter()
-                    .map(|inv| crate::storage::HookInvocationInput {
-                        session_id: inv.session_id.as_str(),
-                        agent_id: inv.agent_id.as_deref(),
-                        is_sidechain: inv.is_sidechain,
-                        timestamp: inv.timestamp.as_str(),
-                        hook_event: inv.hook_event.as_str(),
-                        hook_matcher: inv.hook_matcher.as_deref(),
-                        tool_name: inv.tool_name.as_deref(),
-                        hook_identity: inv.hook_identity.as_str(),
-                        script_command_raw: inv.script_command_raw.as_deref(),
-                        exit_code: inv.exit_code,
-                        duration_ms: inv.duration_ms,
-                        cwd: inv.cwd.as_deref(),
-                        hostname: Some(hostname.as_str()),
-                        message_id: inv.message_id.as_deref(),
-                    })
-                    .collect();
-                if let Err(e) =
-                    storage.store_hook_invocations_for_messages(discovered.provider, &invocations)
-                {
-                    log::warn!("Failed to store hook_invocations: {e}");
                 }
             }
 
@@ -2115,6 +2020,8 @@ struct DiscoveredSessionFile {
 #[allow(dead_code)]
 pub struct ToolAction {
     pub tool_use_id: String,
+    pub source_ordinal: u64,
+    pub block_ordinal: usize,
     pub tool_name: String,
     pub category: String, // "code_change", "command", "tool_detail"
     pub file_path: Option<String>,
@@ -2163,10 +2070,14 @@ impl SessionEventKind {
 /// [`ExtractedMessage`] during the same parse pass — see
 /// specs/008-runtime-redesign/contracts/session-events.md (EVT-CL-*).
 // @lat: [[data-flow#Session Indexing Pipeline#Dual Emission for Runtime Tracking]]
+#[allow(dead_code)] // Source-local identity fields are consumed in Task 3.
 pub struct ExtractedEvent {
+    pub source_ordinal: u64,
+    pub event_ordinal: usize,
     pub timestamp: String,
     pub kind: SessionEventKind,
     pub is_sidechain: bool,
+    #[allow(dead_code)] // Native source identity supplies analytics attribution.
     pub agent_id: Option<String>,
     pub uuid: Option<String>,
     pub parent_uuid: Option<String>,
@@ -2191,6 +2102,7 @@ pub struct ExtractedMessage {
     /// Claude Code sub-agent attribution. Always false/None for Codex (no
     /// sub-agent concept) and for top-level Claude messages.
     pub is_sidechain: bool,
+    #[allow(dead_code)] // Native source identity supplies analytics attribution.
     pub agent_id: Option<String>,
     pub parent_uuid: Option<String>,
     /// Working directory at the time of the message. Claude reads it from the
@@ -2219,15 +2131,17 @@ pub struct ExtractedSession {
 }
 
 /// Owned form of a hook fire extracted from a Claude transcript
-/// (feature 009). Held by [`ExtractedSession`] until the indexing pass
-/// converts it into a borrowed [`crate::storage::HookInvocationInput`]
-/// for the storage batch insert. See
+/// (feature 009). Held by [`ExtractedSession`] until source-owned transcript
+/// reconciliation builds the atomic analytics snapshot. See
 /// specs/009-hooks-breakdown-tab/contracts/hook-invocations.md.
 // @lat: [[backend#Database#Schema#Hook Invocations]]
 #[derive(Clone, Debug)]
 pub struct HookInvocation {
+    #[allow(dead_code)] // Native source identity supplies root and sidechain attribution.
     pub session_id: String,
+    #[allow(dead_code)]
     pub agent_id: Option<String>,
+    #[allow(dead_code)]
     pub is_sidechain: bool,
     pub timestamp: String,
     pub hook_event: String,
@@ -2954,6 +2868,22 @@ fn project_name_from_cwd(cwd: &str) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+fn has_nonempty_codex_assistant_output(payload: &serde_json::Value) -> bool {
+    payload.get("role").and_then(|value| value.as_str()) == Some("assistant")
+        && payload
+            .get("content")
+            .and_then(|value| value.as_array())
+            .is_some_and(|content| {
+                content.iter().any(|block| {
+                    block.get("type").and_then(|value| value.as_str()) == Some("output_text")
+                        && block
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+            })
+}
+
 fn make_tool_message(
     uuid: String,
     session_id: String,
@@ -2977,7 +2907,7 @@ fn make_tool_message(
 
     ExtractedMessage {
         uuid,
-        session_id,
+        session_id: session_id.clone(),
         role: "assistant".to_string(),
         content: String::new(),
         timestamp: timestamp.clone(),
@@ -3017,6 +2947,29 @@ pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -
     }
 }
 
+/// Parse already-read retained JSONL content without touching persistence.
+pub(crate) fn extract_messages_from_jsonl_contents(
+    provider: IntegrationProvider,
+    path: &Path,
+    contents: &str,
+) -> ExtractedSession {
+    let records = parse_jsonl_records(contents);
+    extract_messages_from_jsonl_records(provider, path, &records)
+}
+
+/// Extract search and analytics rows from one ordinal-preserving decode pass.
+pub(crate) fn extract_messages_from_jsonl_records(
+    provider: IntegrationProvider,
+    path: &Path,
+    records: &[JsonlRecord],
+) -> ExtractedSession {
+    match provider {
+        IntegrationProvider::Claude => extract_claude_messages_from_jsonl_records(path, records),
+        IntegrationProvider::Codex => extract_codex_messages_from_jsonl_records(records),
+        IntegrationProvider::MiniMax => extract_claude_messages_from_jsonl_records(path, records),
+    }
+}
+
 /// Extract indexable messages from a Claude Code JSONL session file.
 /// Only "user" and "assistant" type messages are extracted.
 /// isMeta messages and messages with empty content are skipped.
@@ -3043,6 +2996,13 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
         }
     };
 
+    extract_messages_from_jsonl_contents(IntegrationProvider::Claude, path, &contents)
+}
+
+fn extract_claude_messages_from_jsonl_records(
+    path: &Path,
+    records: &[JsonlRecord],
+) -> ExtractedSession {
     let mut messages: Vec<ExtractedMessage> = Vec::new();
     let mut events: Vec<ExtractedEvent> = Vec::new();
     // Feature 009: collect hook fires from `type:"attachment"` records
@@ -3054,14 +3014,9 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
     // Maps tool_use block id -> entry for cross-message correlation
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
 
-    for line in contents.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    for record in records {
+        let line_index = record.ordinal;
+        let obj = &record.value;
 
         let msg_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -3070,7 +3025,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
         // row shape and don't carry the message envelope the rest of
         // this loop expects. See contracts/hook-invocations.md.
         if msg_type == "attachment"
-            && let Some(invocation) = extract_hook_invocation_from_attachment(&obj)
+            && let Some(invocation) = extract_hook_invocation_from_attachment(obj)
         {
             hook_invocations.push(invocation);
             continue;
@@ -3169,7 +3124,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             }
             // Content is an array of blocks
             Some(serde_json::Value::Array(blocks)) => {
-                for block in blocks {
+                for (block_ordinal, block) in blocks.iter().enumerate() {
                     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     match block_type {
                         "text" => {
@@ -3229,6 +3184,8 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             // Store in map for later correlation with tool_result
                             let action = ToolAction {
                                 tool_use_id: tool_id.clone(),
+                                source_ordinal: line_index,
+                                block_ordinal,
                                 tool_name: name.clone(),
                                 category: category.clone(),
                                 file_path: file_path.clone(),
@@ -3330,35 +3287,36 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             _ => continue,
         }
 
-        // Feature 008: emit a SessionEvent for every non-meta user/assistant
-        // line with a non-empty timestamp, classified per EVT-CL-2..EVT-CL-5
-        // (contracts/session-events.md). This happens BEFORE the empty-content
-        // filter that gates messages.push — the runtime pipeline needs every
-        // timestamped line, even tool-result-only user lines that the search
-        // index discards.
+        // Emit every runtime-relevant role present in the record. Ordering is
+        // deliberate: a user tool result comes first so the preceding
+        // assistant tool-use gap keeps its longer runtime allowance, while an
+        // assistant tool use comes last so the next record sees that marker.
+        // Event ordinals make every sibling identity stable.
         if !timestamp.is_empty() {
-            let event_kind = if msg_type == "user" {
+            let mut event_kinds = Vec::with_capacity(3);
+            if msg_type == "user" {
+                if has_tool_result_block {
+                    event_kinds.push(SessionEventKind::UserToolResult);
+                }
                 if content_is_string || has_nonempty_text_block {
-                    Some(SessionEventKind::UserText)
-                } else if has_tool_result_block {
-                    Some(SessionEventKind::UserToolResult)
-                } else {
-                    None
+                    event_kinds.push(SessionEventKind::UserText);
                 }
             } else {
                 // msg_type == "assistant"
-                if content_is_string || has_nonempty_text_block {
-                    Some(SessionEventKind::AsstText)
-                } else if has_tool_use_block {
-                    Some(SessionEventKind::AsstToolUse)
-                } else if has_thinking_block {
-                    Some(SessionEventKind::AsstThinking)
-                } else {
-                    None
+                if has_thinking_block {
+                    event_kinds.push(SessionEventKind::AsstThinking);
                 }
-            };
-            if let Some(kind) = event_kind {
+                if content_is_string || has_nonempty_text_block {
+                    event_kinds.push(SessionEventKind::AsstText);
+                }
+                if has_tool_use_block {
+                    event_kinds.push(SessionEventKind::AsstToolUse);
+                }
+            }
+            for (event_ordinal, kind) in event_kinds.into_iter().enumerate() {
                 events.push(ExtractedEvent {
+                    source_ordinal: line_index,
+                    event_ordinal,
                     timestamp: timestamp.clone(),
                     kind,
                     is_sidechain,
@@ -3380,7 +3338,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
 
         messages.push(ExtractedMessage {
             uuid,
-            session_id,
+            session_id: session_id.clone(),
             role,
             content,
             timestamp,
@@ -3410,15 +3368,22 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
             .unwrap_or_default(),
         project_name: path
             .parent()
-            // For sub-agent transcripts the immediate parent is the
-            // <session-uuid>/subagents/ directory. Walk up to <projectSlug>
-            // so project_display_name produces the correct human label.
+            // For sub-agent transcripts the file lives under a
+            // <session-uuid>/subagents/ directory — flat, or nested one level
+            // deeper for Workflow agents (subagents/workflows/wf_<id>/). Find
+            // the `subagents` ancestor at any depth and step up to
+            // <projectSlug> so project_display_name yields the correct label.
             .and_then(|parent| {
-                if parent.file_name().and_then(|n| n.to_str()) == Some("subagents") {
-                    parent.parent().and_then(|grand| grand.parent())
-                } else {
-                    Some(parent)
+                let mut ancestor = Some(parent);
+                while let Some(dir) = ancestor {
+                    if dir.file_name().and_then(|n| n.to_str()) == Some("subagents") {
+                        // dir == <session-uuid>/subagents; two hops up to
+                        // <projectSlug>.
+                        return dir.parent().and_then(|grand| grand.parent());
+                    }
+                    ancestor = dir.parent();
                 }
+                Some(parent)
             })
             .and_then(|dir| dir.file_name())
             .and_then(|name| name.to_str())
@@ -3444,27 +3409,36 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
         }
     };
 
+    extract_messages_from_jsonl_contents(IntegrationProvider::Codex, path, &contents)
+}
+
+fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> ExtractedSession {
     let mut messages: Vec<ExtractedMessage> = Vec::new();
     let mut events: Vec<ExtractedEvent> = Vec::new();
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
-    let mut session_id = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.rsplit('-').next())
-        .unwrap_or_default()
-        .to_string();
-    let mut cwd: Option<String> = None;
+    let native_identity = match resolve_codex_native_identity(records) {
+        Ok(identity) => identity,
+        Err(error) => {
+            log::warn!("Cannot resolve Codex transcript identity: {error}");
+            return ExtractedSession {
+                session_id: String::new(),
+                project_name: None,
+                messages,
+                events,
+                hook_invocations: Vec::new(),
+            };
+        }
+    };
+    let session_id = native_identity.chain_id.clone();
+    let cwd = native_identity
+        .cwd
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
     let mut git_branch = String::new();
 
-    for (line_idx, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let obj: serde_json::Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
+    for record in records {
+        let line_idx = record.ordinal;
+        let obj = &record.value;
 
         let timestamp = obj
             .get("timestamp")
@@ -3481,19 +3455,16 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                 let Some(payload) = obj.get("payload") else {
                     continue;
                 };
-                if let Some(id) = payload.get("id").and_then(|value| value.as_str()) {
-                    session_id = id.to_string();
+                if payload.get("id").and_then(|value| value.as_str())
+                    == Some(native_identity.source_session_id.as_str())
+                {
+                    git_branch = payload
+                        .get("git")
+                        .and_then(|value| value.get("branch"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string();
                 }
-                cwd = payload
-                    .get("cwd")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string());
-                git_branch = payload
-                    .get("git")
-                    .and_then(|value| value.get("branch"))
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("")
-                    .to_string();
             }
             "event_msg" => {
                 let Some(payload) = obj.get("payload") else {
@@ -3513,22 +3484,26 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .and_then(|value| value.as_str())
                     .unwrap_or("")
                     .to_string();
-                // Feature 008: emit a SessionEvent for every kept user /
-                // assistant line. Codex transcripts only have user_text and
-                // asst_text per EVT-CX-1. We push the event BEFORE the
-                // empty-content filter that gates messages.push so the
-                // active-interval pipeline sees every timestamped line.
+                // Emit text events before the search-message empty-content
+                // filter. Response-item reasoning and tool-loop records add
+                // the other runtime event kinds in the sibling branch below.
                 if !timestamp.is_empty() {
                     let kind = match role {
                         "user" => SessionEventKind::UserText,
                         _ => SessionEventKind::AsstText,
                     };
                     events.push(ExtractedEvent {
+                        source_ordinal: line_idx,
+                        event_ordinal: 0,
                         timestamp: timestamp.clone(),
                         kind,
-                        is_sidechain: false,
+                        is_sidechain: native_identity.is_sidechain,
                         agent_id: None,
-                        uuid: None,
+                        uuid: payload
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned),
                         parent_uuid: None,
                     });
                 }
@@ -3548,8 +3523,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     commands_run: Vec::new(),
                     tool_details: Vec::new(),
                     tool_actions: Vec::new(),
-                    // Codex has no sub-agent concept; provider-agnostic NULLs.
-                    is_sidechain: false,
+                    is_sidechain: native_identity.is_sidechain,
                     agent_id: None,
                     parent_uuid: None,
                     cwd: cwd.clone(),
@@ -3586,13 +3560,10 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
 
                         let (category, summary, file_path) =
                             build_codex_function_tool_summary(&name, &arguments);
-                        let tool_use_id = if call_id.is_empty() {
-                            format!("{session_id}:tool:{line_idx}")
-                        } else {
-                            call_id.clone()
-                        };
                         let action = ToolAction {
-                            tool_use_id: tool_use_id.clone(),
+                            tool_use_id: call_id.clone(),
+                            source_ordinal: line_idx,
+                            block_ordinal: 0,
                             tool_name: name.clone(),
                             category: category.clone(),
                             file_path: file_path.clone(),
@@ -3609,6 +3580,18 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             action,
                             cwd.clone(),
                         ));
+                        if !timestamp.is_empty() {
+                            events.push(ExtractedEvent {
+                                source_ordinal: line_idx,
+                                event_ordinal: 0,
+                                timestamp: timestamp.clone(),
+                                kind: SessionEventKind::AsstToolUse,
+                                is_sidechain: native_identity.is_sidechain,
+                                agent_id: None,
+                                uuid: (!call_id.is_empty()).then(|| format!("call:{call_id}")),
+                                parent_uuid: None,
+                            });
+                        }
                         if !call_id.is_empty() {
                             tool_use_map.insert(
                                 call_id,
@@ -3646,13 +3629,10 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
 
                         let (category, summary, file_path) =
                             build_codex_custom_tool_summary(&name, &input);
-                        let tool_use_id = if call_id.is_empty() {
-                            format!("{session_id}:tool:{line_idx}")
-                        } else {
-                            call_id.clone()
-                        };
                         let action = ToolAction {
-                            tool_use_id: tool_use_id.clone(),
+                            tool_use_id: call_id.clone(),
+                            source_ordinal: line_idx,
+                            block_ordinal: 0,
                             tool_name: name.clone(),
                             category: category.clone(),
                             file_path: file_path.clone(),
@@ -3669,6 +3649,18 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             action,
                             cwd.clone(),
                         ));
+                        if !timestamp.is_empty() {
+                            events.push(ExtractedEvent {
+                                source_ordinal: line_idx,
+                                event_ordinal: 0,
+                                timestamp: timestamp.clone(),
+                                kind: SessionEventKind::AsstToolUse,
+                                is_sidechain: native_identity.is_sidechain,
+                                agent_id: None,
+                                uuid: (!call_id.is_empty()).then(|| format!("call:{call_id}")),
+                                parent_uuid: None,
+                            });
+                        }
                         if !call_id.is_empty() {
                             tool_use_map.insert(
                                 call_id,
@@ -3690,6 +3682,18 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             .and_then(|value| value.as_str())
                             .unwrap_or("")
                             .to_string();
+                        if !timestamp.is_empty() {
+                            events.push(ExtractedEvent {
+                                source_ordinal: line_idx,
+                                event_ordinal: 0,
+                                timestamp: timestamp.clone(),
+                                kind: SessionEventKind::UserToolResult,
+                                is_sidechain: native_identity.is_sidechain,
+                                agent_id: None,
+                                uuid: (!call_id.is_empty()).then(|| format!("output:{call_id}")),
+                                parent_uuid: None,
+                            });
+                        }
                         if call_id.is_empty() {
                             continue;
                         }
@@ -3716,11 +3720,52 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                             }
                         }
                     }
+                    "reasoning" if !timestamp.is_empty() => {
+                        events.push(ExtractedEvent {
+                            source_ordinal: line_idx,
+                            event_ordinal: 0,
+                            timestamp,
+                            kind: SessionEventKind::AsstThinking,
+                            is_sidechain: native_identity.is_sidechain,
+                            agent_id: None,
+                            uuid: payload
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_owned),
+                            parent_uuid: None,
+                        });
+                    }
+                    "message"
+                        if !timestamp.is_empty()
+                            && has_nonempty_codex_assistant_output(payload) =>
+                    {
+                        let uuid = payload
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                        events.push(ExtractedEvent {
+                            source_ordinal: line_idx,
+                            event_ordinal: 0,
+                            timestamp: timestamp.clone(),
+                            kind: SessionEventKind::AsstText,
+                            is_sidechain: native_identity.is_sidechain,
+                            agent_id: None,
+                            uuid: uuid.clone(),
+                            parent_uuid: None,
+                        });
+                    }
                     _ => {}
                 }
             }
             _ => {}
         }
+    }
+
+    for message in &mut messages {
+        message.session_id.clone_from(&native_identity.chain_id);
+        message.is_sidechain = native_identity.is_sidechain;
     }
 
     ExtractedSession {
@@ -3990,5 +4035,99 @@ mod tests {
             );
             assert!(msg.agent_id.is_none());
         }
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Workflow-Nested Sub-Agent Discovery]]
+    #[test]
+    fn discover_finds_flat_and_workflow_nested_subagents() {
+        let tmp = TempDir::new().expect("tempdir");
+        let session_id = "72acc77e-e91c-451f-80b2-748e85fffa1f";
+        let project_dir = tmp.path().join("-home-mamba-work-cue-terraform");
+        let subagents_dir = project_dir.join(session_id).join("subagents");
+        let workflow_dir = subagents_dir.join("workflows").join("wf_b857afa7-e8e");
+        fs::create_dir_all(&workflow_dir).expect("mkdir workflow subtree");
+
+        // Parent transcript: <projectSlug>/<uuid>.jsonl.
+        fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"p1\",\"parentUuid\":null,\"sessionId\":\"{session_id}\",\"timestamp\":\"2026-07-10T05:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n"
+            ),
+        )
+        .expect("write parent jsonl");
+
+        // Flat sub-agent: <uuid>/subagents/agent-a.jsonl.
+        fs::write(
+            subagents_dir.join("agent-a.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"a\",\"parentUuid\":null,\"uuid\":\"s1\",\"sessionId\":\"{session_id}\",\"timestamp\":\"2026-07-10T05:01:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"task a\"}}}}\n"
+            ),
+        )
+        .expect("write flat subagent jsonl");
+
+        // Workflow-nested sub-agent with the leaner first-record shape (no
+        // cwd/entrypoint/gitBranch/promptId/version):
+        // <uuid>/subagents/workflows/wf_<id>/agent-b.jsonl.
+        fs::write(
+            workflow_dir.join("agent-b.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"b\",\"parentUuid\":null,\"uuid\":\"s2\",\"sessionId\":\"{session_id}\",\"timestamp\":\"2026-07-10T05:02:00Z\"}}\n"
+            ),
+        )
+        .expect("write workflow subagent jsonl");
+
+        // Decoy non-jsonl file anywhere in the subtree must be ignored.
+        fs::write(
+            workflow_dir.join("agent-b.meta.json"),
+            r#"{"agentType":"x"}"#,
+        )
+        .expect("write decoy");
+
+        let files =
+            SessionIndex::discover_claude_session_files_in(tmp.path()).expect("discover ok");
+
+        assert_eq!(
+            files.len(),
+            3,
+            "expected parent + flat + workflow-nested transcripts, got {files:?}"
+        );
+
+        let parent = files.iter().filter(|f| !f.is_subagent).collect::<Vec<_>>();
+        assert_eq!(parent.len(), 1, "exactly one parent transcript");
+        assert!(
+            parent[0]
+                .path
+                .to_string_lossy()
+                .ends_with(&format!("{session_id}.jsonl"))
+        );
+
+        let flat = files
+            .iter()
+            .find(|f| f.path.to_string_lossy().ends_with("agent-a.jsonl"))
+            .expect("flat sub-agent discovered");
+        assert!(flat.is_subagent, "flat agent must be tagged is_subagent");
+
+        let nested = files
+            .iter()
+            .find(|f| f.path.to_string_lossy().ends_with("agent-b.jsonl"))
+            .expect("workflow-nested sub-agent discovered");
+        assert!(
+            nested.is_subagent,
+            "workflow-nested agent must be tagged is_subagent"
+        );
+        assert!(
+            nested
+                .path
+                .components()
+                .any(|c| c.as_os_str() == "workflows"),
+            "nested path must traverse subagents/workflows/"
+        );
+
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.path.to_string_lossy().ends_with("meta.json")),
+            "non-jsonl decoy must be filtered out at any depth"
+        );
     }
 }
