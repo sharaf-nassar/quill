@@ -55,7 +55,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 32;
+const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 33;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -704,34 +704,28 @@ fn ext_to_language(file_path: &str) -> &'static str {
     }
 }
 
+/// Legacy fallback that recomputes line counts from a stored `full_input`
+/// string for rows ingested before migration 33 populated the `lines_added` /
+/// `lines_removed` columns. Delegates structured tools (Edit, Write, MultiEdit,
+/// NotebookEdit, MCP file writers) to [`crate::sessions::count_code_change_lines`]
+/// so the ingest-time and fallback counts stay identical. Note that a
+/// `full_input` truncated to 10KB may fail to parse and yield `None` here —
+/// exactly the undercount the stored columns now avoid.
 fn parse_code_change(tool_name: &str, full_input: &str) -> Option<(i64, i64, String)> {
     if tool_name == "apply_patch" {
         return parse_apply_patch_change(full_input);
     }
 
     let parsed: serde_json::Value = serde_json::from_str(full_input).ok()?;
+    let (added, removed) = crate::sessions::count_code_change_lines(tool_name, &parsed)?;
 
-    let file_path = parsed
-        .get("file_path")
-        .and_then(|v| v.as_str())
+    let file_path = ["file_path", "notebook_path", "path"]
+        .into_iter()
+        .find_map(|key| parsed.get(key).and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string();
 
-    match tool_name {
-        "Edit" => {
-            let old = parsed.get("old_string").and_then(|v| v.as_str())?;
-            let new = parsed.get("new_string").and_then(|v| v.as_str())?;
-            let removed = old.lines().count() as i64;
-            let added = new.lines().count() as i64;
-            Some((added, removed, file_path))
-        }
-        "Write" => {
-            let content = parsed.get("content").and_then(|v| v.as_str())?;
-            let added = content.lines().count() as i64;
-            Some((added, 0, file_path))
-        }
-        _ => None,
-    }
+    Some((added, removed, file_path))
 }
 
 fn parse_apply_patch_change(patch: &str) -> Option<(i64, i64, String)> {
@@ -3308,10 +3302,11 @@ impl Storage {
                          provider, source_key, action_key, message_id,
                          session_id, chain_id, parent_chain_id, tool_name,
                          category, file_path, summary, full_input, full_output,
-                         timestamp, is_sidechain, agent_id, parent_uuid
+                         timestamp, is_sidechain, agent_id, parent_uuid,
+                         lines_added, lines_removed
                      ) VALUES (
                          ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                         ?13, ?14, ?15, ?16, ?17
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19
                      )",
                 )
                 .map_err(|e| format!("Prepare owned tool actions: {e}"))?;
@@ -3335,6 +3330,8 @@ impl Storage {
                         i64::from(row.is_sidechain),
                         row.agent_id,
                         row.parent_uuid,
+                        row.lines_added,
+                        row.lines_removed,
                     ])
                     .map_err(|e| format!("Insert tool action: {e}"))?;
             }
@@ -5535,6 +5532,37 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 32: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 32 commit: {e}"))?;
+        }
+
+        // Migration 33: store per-action line counts. `code_change` LOC was
+        // recomputed from `full_input` at query time, but `full_input` is
+        // truncated to 10KB at ingest, so large edits parsed as JSON failures
+        // and counted zero. `lines_added` / `lines_removed` are now computed
+        // from the FULL, untruncated tool input at ingest and read directly by
+        // the code-stats queries; legacy rows keep the `parse_code_change`
+        // fallback. The `current_version < 33` gate makes the ALTERs run once —
+        // reopening a migrated DB skips this block. The durable reingest marker
+        // (shared with migration 30) forces the next reconciliation to re-parse
+        // every transcript so historical rows are backfilled with real counts.
+        // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
+        if current_version < 33 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 33 transaction: {e}"))?;
+            tx.execute_batch(
+                "ALTER TABLE tool_actions ADD COLUMN lines_added INTEGER;
+                 ALTER TABLE tool_actions ADD COLUMN lines_removed INTEGER;",
+            )
+            .map_err(|e| format!("Migration 33 (tool_actions line counts): {e}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["transcript_analytics_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 33 (set reingest flag): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (33)", [])
+                .map_err(|e| format!("Failed to record migration 33: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 33 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -15413,7 +15441,8 @@ impl Storage {
 
         let mut stmt = conn
             .prepare(
-                "SELECT tool_name, file_path, full_input, session_id
+                "SELECT tool_name, file_path, full_input, session_id,
+				        lines_added, lines_removed
 				 FROM tool_actions
 				 WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL",
             )
@@ -15431,25 +15460,35 @@ impl Storage {
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(|e| format!("Query error: {e}"))?;
 
         for row in rows {
-            let (tool_name, file_path, full_input, session_id) =
+            let (tool_name, file_path, full_input, session_id, stored_added, stored_removed) =
                 row.map_err(|e| format!("Row error: {e}"))?;
 
-            if let Some((added, removed, parsed_path)) = parse_code_change(&tool_name, &full_input)
-            {
+            // Prefer the stored (untruncated) counts; fall back to re-parsing
+            // `full_input` for legacy rows written before migration 33.
+            let resolved = match (stored_added, stored_removed) {
+                (Some(a), Some(r)) => Some((a, r, file_path.clone().unwrap_or_default())),
+                _ => parse_code_change(&tool_name, &full_input).map(|(a, r, parsed_path)| {
+                    let path = if parsed_path.is_empty() {
+                        file_path.clone().unwrap_or_default()
+                    } else {
+                        parsed_path
+                    };
+                    (a, r, path)
+                }),
+            };
+
+            if let Some((added, removed, path)) = resolved {
                 total_added += added;
                 total_removed += removed;
                 sessions.insert(session_id);
 
-                let path = if parsed_path.is_empty() {
-                    file_path.unwrap_or_default()
-                } else {
-                    parsed_path
-                };
                 let lang = ext_to_language(&path);
                 *lang_lines.entry(lang).or_insert(0) += added + removed;
             }
@@ -15509,7 +15548,7 @@ impl Storage {
 
         let mut stmt = conn
             .prepare(
-                "SELECT tool_name, full_input, timestamp
+                "SELECT tool_name, full_input, timestamp, lines_added, lines_removed
 				 FROM tool_actions
 				 WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL
 				 ORDER BY timestamp ASC",
@@ -15529,14 +15568,23 @@ impl Storage {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             })
             .map_err(|e| format!("Query error: {e}"))?;
 
         for row in rows {
-            let (tool_name, full_input, timestamp) = row.map_err(|e| format!("Row error: {e}"))?;
+            let (tool_name, full_input, timestamp, stored_added, stored_removed) =
+                row.map_err(|e| format!("Row error: {e}"))?;
 
-            if let Some((added, removed, _)) = parse_code_change(&tool_name, &full_input)
+            // Prefer stored counts; re-parse `full_input` only for legacy rows.
+            let counts = match (stored_added, stored_removed) {
+                (Some(a), Some(r)) => Some((a, r)),
+                _ => parse_code_change(&tool_name, &full_input).map(|(a, r, _)| (a, r)),
+            };
+
+            if let Some((added, removed)) = counts
                 && let Ok(ts) = timestamp.parse::<DateTime<Utc>>()
             {
                 changes.push(RawChange { added, removed, ts });
@@ -15601,7 +15649,8 @@ impl Storage {
                 let provider_pos = idx * 2 + 1;
                 let session_pos = provider_pos + 1;
                 format!(
-                    "SELECT provider, session_id, tool_name, full_input
+                    "SELECT provider, session_id, tool_name, full_input,
+                            lines_added, lines_removed
                      FROM tool_actions
                      WHERE category = 'code_change'
                        AND full_input IS NOT NULL
@@ -15635,6 +15684,8 @@ impl Storage {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -15643,11 +15694,17 @@ impl Storage {
             std::collections::HashMap::new();
 
         for row in rows {
-            let (provider, session_id, tool_name, full_input) =
+            let (provider, session_id, tool_name, full_input, stored_added, stored_removed) =
                 row.map_err(|e| format!("Row error: {e}"))?;
             let provider: IntegrationProvider = provider.parse()?;
 
-            if let Some((added, removed, _)) = parse_code_change(&tool_name, &full_input) {
+            // Prefer stored counts; re-parse `full_input` only for legacy rows.
+            let counts = match (stored_added, stored_removed) {
+                (Some(a), Some(r)) => Some((a, r)),
+                _ => parse_code_change(&tool_name, &full_input).map(|(a, r, _)| (a, r)),
+            };
+
+            if let Some((added, removed)) = counts {
                 let entry =
                     result
                         .entry(session_key(provider, &session_id))
@@ -20757,6 +20814,8 @@ mod tests {
                         summary: format!("{marker} summary {index}"),
                         full_input: None,
                         full_output: None,
+                        lines_added: None,
+                        lines_removed: None,
                         timestamp: at(index),
                         is_sidechain: false,
                         agent_id: Some(marker.clone()),

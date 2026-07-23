@@ -106,7 +106,9 @@ Session transcripts are indexed for full-text search with enriched metadata, whi
 
 Each message is enriched during indexing by parsing tool call inputs and outputs.
 
-Claude Edit/Write tool calls become `code_changes`, Bash becomes `commands_run`, and Read/Grep/Glob become `tool_details`. Codex `apply_patch` calls become `code_changes`, `exec_command` and `write_stdin` become `commands_run`, and MCP or auxiliary tool calls become searchable `tool_details`.
+Claude `Edit`, `Write`, `MultiEdit`, and `NotebookEdit` tool calls become `code_changes`, Bash becomes `commands_run`, and Read/Grep/Glob become `tool_details`. Codex `apply_patch` (as either a custom-tool call or a function call), `exec_command`, and `write_stdin` map to `code_changes`/`commands_run` respectively, and MCP or auxiliary tool calls become searchable `tool_details` — except MCP tools whose input carries a clear file-write shape (`old_string`/`new_string`, or `file_path`/`path` plus `content`), which are classified `code_changes`.
+
+For every `code_change` action, per-action `lines_added`/`lines_removed` are computed here from the FULL, untruncated tool input before `full_input` is capped at 10KB, then stored in the `tool_actions` columns of the same names (migration 33). This avoids the prior undercount where large edits truncated past 10KB failed to re-parse and counted zero. MultiEdit sums line counts across its `edits`, NotebookEdit counts `new_source` lines (removed for `delete` mode, added otherwise), and apply_patch counts `+`/`-` patch lines.
 
 ### Dual Emission for Runtime Tracking
 

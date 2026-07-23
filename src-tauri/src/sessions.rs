@@ -2028,6 +2028,11 @@ pub struct ToolAction {
     pub summary: String,
     pub full_input: Option<String>,  // JSON string, max 10KB
     pub full_output: Option<String>, // JSON string, max 10KB, set later from tool_result
+    // Lines added/removed for `code_change` actions, computed at ingest from the
+    // FULL (untruncated) tool input before `full_input` is capped at 10KB. NULL
+    // for non-code-change actions and legacy rows ingested before migration 33.
+    pub lines_added: Option<i64>,
+    pub lines_removed: Option<i64>,
     pub timestamp: String,
 }
 
@@ -2203,6 +2208,27 @@ fn build_claude_tool_summary(
             let summary = format!("Write {file_path}: {content_preview}");
             ("code_change".to_string(), summary, Some(file_path))
         }
+        "MultiEdit" => {
+            let file_path = get_str("file_path");
+            let edit_count = inp
+                .and_then(|o| o.get("edits"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let summary = format!("MultiEdit {file_path}: {edit_count} edits");
+            ("code_change".to_string(), summary, Some(file_path))
+        }
+        "NotebookEdit" => {
+            let notebook_path = get_str("notebook_path");
+            let mode = get_str("edit_mode");
+            let mode = if mode.is_empty() {
+                "replace".to_string()
+            } else {
+                mode
+            };
+            let summary = format!("NotebookEdit {notebook_path} ({mode})");
+            ("code_change".to_string(), summary, Some(notebook_path))
+        }
         "Bash" => {
             let command = get_str("command");
             let summary = format!("$ {command}");
@@ -2231,6 +2257,19 @@ fn build_claude_tool_summary(
             let summary = format!("Agent: {prompt}");
             ("tool_detail".to_string(), summary, None)
         }
+        _ if tool_name.starts_with("mcp__")
+            && inp.is_some_and(|o| mcp_file_write_lines(o).is_some()) =>
+        {
+            let file_path = ["file_path", "path"]
+                .into_iter()
+                .map(get_str)
+                .find(|value| !value.is_empty());
+            let summary = match &file_path {
+                Some(path) => format!("{tool_name}: {path}"),
+                None => tool_name.to_string(),
+            };
+            ("code_change".to_string(), summary, file_path)
+        }
         _ => {
             let summary = tool_name.to_string();
             ("tool_detail".to_string(), summary, None)
@@ -2255,6 +2294,20 @@ fn build_codex_function_tool_summary(
     };
 
     match tool_name {
+        "apply_patch" => {
+            // Codex can surface `apply_patch` as a function call whose patch body
+            // rides in the arguments JSON; classify it like the custom-tool-call
+            // form so its lines are counted.
+            let patch = extract_function_apply_patch_text(arguments);
+            let files = extract_apply_patch_files(&patch);
+            let file_path = files.first().cloned();
+            let summary = if files.is_empty() {
+                "Patch".to_string()
+            } else {
+                format!("Patch {}", truncate(&files.join(", "), 160))
+            };
+            ("code_change".to_string(), summary, file_path)
+        }
         "exec_command" => {
             let command = get_str("cmd");
             ("command".to_string(), format!("$ {command}"), None)
@@ -2264,6 +2317,7 @@ fn build_codex_function_tool_summary(
             ("command".to_string(), format!("stdin {chars}"), None)
         }
         _ if tool_name.starts_with("mcp__") => {
+            let is_file_write = input.is_some_and(|o| mcp_file_write_lines(o).is_some());
             let detail = ["query", "text", "path", "uri", "url"]
                 .into_iter()
                 .map(&get_str)
@@ -2278,7 +2332,12 @@ fn build_codex_function_tool_summary(
                 .into_iter()
                 .map(&get_str)
                 .find(|value| !value.is_empty());
-            ("tool_detail".to_string(), summary, file_path)
+            let category = if is_file_write {
+                "code_change"
+            } else {
+                "tool_detail"
+            };
+            (category.to_string(), summary, file_path)
         }
         _ => {
             let detail = ["path", "file_path", "workdir", "query", "text"]
@@ -2335,6 +2394,166 @@ fn extract_apply_patch_files(patch: &str) -> Vec<String> {
     }
 
     files
+}
+
+/// Count (added, removed) lines from an MCP tool input that carries a
+/// recognizable file-write shape. Returns `None` when the shape is not clearly
+/// a file write/edit, so callers stay conservative about classifying MCP tools
+/// as code changes. Shared by both classifier and line-count paths so the two
+/// stay in agreement.
+pub(crate) fn mcp_file_write_lines(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(i64, i64)> {
+    let as_str = |key: &str| obj.get(key).and_then(|v| v.as_str());
+
+    // old/new string edit pair (Edit-like MCP tools).
+    if let (Some(old), Some(new)) = (as_str("old_string"), as_str("new_string")) {
+        return Some((new.lines().count() as i64, old.lines().count() as i64));
+    }
+
+    // path + content write (Write-like MCP tools). Only when a non-empty path
+    // accompanies a content field, to avoid counting unrelated payloads.
+    let has_path = as_str("file_path").is_some_and(|s| !s.is_empty())
+        || as_str("path").is_some_and(|s| !s.is_empty());
+    if has_path && let Some(content) = as_str("content") {
+        return Some((content.lines().count() as i64, 0));
+    }
+
+    None
+}
+
+/// Count (added, removed) lines for a structured code-change tool input,
+/// operating on the FULL untruncated value. Returns `None` for shapes that are
+/// not code changes. Kept in sync with [`crate::storage::parse_code_change`],
+/// which performs the same counting for legacy rows from `full_input`.
+pub(crate) fn count_code_change_lines(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<(i64, i64)> {
+    let obj = input.as_object()?;
+    let as_str = |key: &str| obj.get(key).and_then(|v| v.as_str());
+
+    match tool_name {
+        "Edit" => {
+            let old = as_str("old_string")?;
+            let new = as_str("new_string")?;
+            Some((new.lines().count() as i64, old.lines().count() as i64))
+        }
+        "Write" => {
+            let content = as_str("content")?;
+            Some((content.lines().count() as i64, 0))
+        }
+        "MultiEdit" => {
+            let edits = obj.get("edits").and_then(|v| v.as_array())?;
+            let mut added = 0i64;
+            let mut removed = 0i64;
+            for edit in edits {
+                let Some(edit_obj) = edit.as_object() else {
+                    continue;
+                };
+                if let Some(new) = edit_obj.get("new_string").and_then(|v| v.as_str()) {
+                    added += new.lines().count() as i64;
+                }
+                if let Some(old) = edit_obj.get("old_string").and_then(|v| v.as_str()) {
+                    removed += old.lines().count() as i64;
+                }
+            }
+            Some((added, removed))
+        }
+        "NotebookEdit" => {
+            let new_source = as_str("new_source").unwrap_or("");
+            let lines = new_source.lines().count() as i64;
+            match as_str("edit_mode").unwrap_or("replace") {
+                // Deleting a cell removes its content; without the old source we
+                // conservatively count the removed lines and add nothing.
+                "delete" => Some((0, lines)),
+                _ => Some((lines, 0)),
+            }
+        }
+        _ if tool_name.starts_with("mcp__") => mcp_file_write_lines(obj),
+        _ => None,
+    }
+}
+
+/// Count (added, removed) lines from an `apply_patch` patch body. Mirrors
+/// [`crate::storage::parse_code_change`]'s apply-patch counting so ingest-time
+/// and legacy-fallback totals match.
+pub(crate) fn count_apply_patch_lines(patch: &str) -> Option<(i64, i64)> {
+    let mut added = 0i64;
+    let mut removed = 0i64;
+    let mut mode = "";
+    let mut saw_file = false;
+
+    for line in patch.lines() {
+        if line.strip_prefix("*** Add File: ").is_some() {
+            mode = "add";
+            saw_file = true;
+            continue;
+        }
+        if line.strip_prefix("*** Update File: ").is_some() {
+            mode = "update";
+            saw_file = true;
+            continue;
+        }
+        if line.strip_prefix("*** Delete File: ").is_some() {
+            mode = "delete";
+            saw_file = true;
+            continue;
+        }
+        if line.starts_with("*** ") {
+            mode = "";
+            continue;
+        }
+        match mode {
+            "add" if line.starts_with('+') => added += 1,
+            "update" if line.starts_with('+') => added += 1,
+            "update" if line.starts_with('-') => removed += 1,
+            _ => {}
+        }
+    }
+
+    if !saw_file && added == 0 && removed == 0 {
+        return None;
+    }
+    Some((added, removed))
+}
+
+/// Extract the patch body from a Codex `apply_patch` function-call `arguments`
+/// JSON. Codex sends the patch under `input` (mirroring the custom-tool-call
+/// shape) or `patch`; if neither is present but the raw arguments already look
+/// like a patch, fall back to the raw string.
+fn extract_function_apply_patch_text(arguments: &str) -> String {
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(arguments)
+    {
+        for key in ["input", "patch"] {
+            if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
+                return text.to_string();
+            }
+        }
+    }
+    arguments.to_string()
+}
+
+/// Count (added, removed) lines for a Codex function-call code change from its
+/// full `arguments` string: `apply_patch` patch bodies and structured MCP
+/// file-write inputs.
+fn codex_function_change_lines(tool_name: &str, arguments: &str) -> Option<(i64, i64)> {
+    if tool_name == "apply_patch" {
+        let patch = extract_function_apply_patch_text(arguments);
+        return count_apply_patch_lines(&patch);
+    }
+    let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    count_code_change_lines(tool_name, &parsed)
+}
+
+/// Count (added, removed) lines for a Codex custom-tool-call code change. The
+/// only code-change custom tool is `apply_patch`, whose raw patch body is the
+/// `input` string.
+fn codex_custom_change_lines(tool_name: &str, input: &str) -> Option<(i64, i64)> {
+    if tool_name == "apply_patch" {
+        return count_apply_patch_lines(input);
+    }
+    None
 }
 
 pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<SkillAccess> {
@@ -3175,6 +3394,17 @@ fn extract_claude_messages_from_jsonl_records(
                                 _ => {}
                             }
 
+                            // Compute line counts from the FULL input before it
+                            // is truncated for storage below.
+                            let (lines_added, lines_removed) = if category == "code_change" {
+                                match input.and_then(|v| count_code_change_lines(&name, v)) {
+                                    Some((a, r)) => (Some(a), Some(r)),
+                                    None => (None, None),
+                                }
+                            } else {
+                                (None, None)
+                            };
+
                             // Serialize full input (capped at 10KB)
                             let full_input = input.map(|v| {
                                 let s = v.to_string();
@@ -3192,6 +3422,8 @@ fn extract_claude_messages_from_jsonl_records(
                                 summary: summary.clone(),
                                 full_input: full_input.clone(),
                                 full_output: None,
+                                lines_added,
+                                lines_removed,
                                 timestamp: timestamp.clone(),
                             };
                             tool_actions.push(action);
@@ -3560,6 +3792,15 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
 
                         let (category, summary, file_path) =
                             build_codex_function_tool_summary(&name, &arguments);
+                        // Count lines from the FULL arguments before truncation.
+                        let (lines_added, lines_removed) = if category == "code_change" {
+                            match codex_function_change_lines(&name, &arguments) {
+                                Some((a, r)) => (Some(a), Some(r)),
+                                None => (None, None),
+                            }
+                        } else {
+                            (None, None)
+                        };
                         let action = ToolAction {
                             tool_use_id: call_id.clone(),
                             source_ordinal: line_idx,
@@ -3570,6 +3811,8 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             summary: summary.clone(),
                             full_input: Some(truncate(&arguments, 10240)),
                             full_output: None,
+                            lines_added,
+                            lines_removed,
                             timestamp: timestamp.clone(),
                         };
                         let message_idx = messages.len();
@@ -3629,6 +3872,15 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
 
                         let (category, summary, file_path) =
                             build_codex_custom_tool_summary(&name, &input);
+                        // Count lines from the FULL patch/input before truncation.
+                        let (lines_added, lines_removed) = if category == "code_change" {
+                            match codex_custom_change_lines(&name, &input) {
+                                Some((a, r)) => (Some(a), Some(r)),
+                                None => (None, None),
+                            }
+                        } else {
+                            (None, None)
+                        };
                         let action = ToolAction {
                             tool_use_id: call_id.clone(),
                             source_ordinal: line_idx,
@@ -3639,6 +3891,8 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             summary: summary.clone(),
                             full_input: Some(truncate(&input, 10240)),
                             full_output: None,
+                            lines_added,
+                            lines_removed,
                             timestamp: timestamp.clone(),
                         };
                         let message_idx = messages.len();

@@ -79,7 +79,7 @@ Top-level UI chrome and live rate limit display shared across the main window.
 Analytics components in `src/components/analytics/` provide Now, Trends, Charts, Models, and an optional Context tab.
 
 - **NowTab** (214 lines) — Real-time metrics with range selector (1h/24h/7d/30d), six insight cards, a 24-hour activity heatmap, and a switchable breakdown panel (sessions/projects/hosts/skills).
-- `NowTab` shares one comparison-range code-history fetch between the efficiency and velocity cards via `src/hooks/useCodeInsights.ts`, which avoids firing the same `get_code_stats_history` IPC call twice per refresh.
+- `NowTab` shares one comparison-range code-history fetch between the efficiency and velocity cards via `src/hooks/useCodeInsights.ts`, which avoids firing the same `get_code_stats_history` IPC call twice per refresh. The same hook fetches `get_llm_runtime_stats` so velocity divides LOC by active LLM runtime (matching the LLM Runtime card) instead of the wall-clock span; the prior window's active seconds are recovered by prorating the comparison-range runtime sparkline, and both periods fall back to wall-clock when no runtime is recorded.
 - Selecting a session in `NowTab` now keeps provider identity alongside `session_id`, so token charts, compact token stats, and delete actions stay scoped to the correct Claude or Codex session.
 - **TrendsTab** (105 lines) — Token trends, code velocity, and cache efficiency charts with week-over-week comparison.
 - **ChartsTab** (454 lines) — Composite Recharts chart with three axes (utilization, tokens, LOC). Lazy-loaded with Suspense.
@@ -197,7 +197,7 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useActivityPattern` | 24-hour hourly token distribution | `get_token_history` (derived) |
 | `useLlmRuntimeStats` | Cumulative runtime, session count, turn count, avg per turn, sparkline | `get_llm_runtime_stats` |
 | `useEfficiencyStats` | Tokens-per-LOC ratio with trend | Derived from token + code stats |
-| `useVelocityStats` | LOC-per-hour with trend | Derived from code stats |
+| `useVelocityStats` | LOC per active LLM-runtime hour with trend | Derived from code stats + `get_llm_runtime_stats` |
 | `useLearningStats` | Rule counts by state, confidence buckets | `get_learned_rules` (derived) |
 | `useLearningData` | Rules, runs, settings, observations, logs | Multiple learning commands + events |
 | `useMemoryData` | Memory files, suggestions, projects | Multiple memory optimizer commands |

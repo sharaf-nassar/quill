@@ -7,6 +7,7 @@ import type {
 	CodeStatsHistoryPoint,
 	InsightTrend,
 	SparklinePoint,
+	LlmRuntimeStats,
 } from "../types";
 
 interface InsightMetric {
@@ -62,10 +63,47 @@ function computeEfficiency(tokens: number, loc: number): number | null {
 	return Math.round(tokens / loc);
 }
 
-function computeVelocity(loc: number, ms: number): number | null {
-	const hours = ms / (60 * 60 * 1000);
-	if (hours === 0) return null;
-	return Math.round(loc / hours);
+// Velocity denominator is active LLM runtime, not wall-clock span, so idle
+// nights/weekends no longer crush the number. When runtime is 0/unknown for
+// the window we fall back to the wall-clock span so the card still shows a
+// number instead of dropping to an em-dash.
+function computeVelocity(
+	loc: number,
+	activeSecs: number,
+	fallbackMs: number,
+): number | null {
+	const activeHours = activeSecs / 3600;
+	if (activeHours > 0) return Math.round(loc / activeHours);
+	const wallHours = fallbackMs / (60 * 60 * 1000);
+	if (wallHours === 0) return null;
+	return Math.round(loc / wallHours);
+}
+
+// Prorate a runtime sparkline (per-bucket active seconds spanning
+// [compStart, compStart + compMs]) into an arbitrary [windowStart, windowEnd)
+// sub-window by linear overlap. Lets us recover the previous period's active
+// runtime from the wider comparison-range fetch, since get_llm_runtime_stats
+// only accepts the four fixed ranges and cannot query the prior window
+// directly.
+function activeSecsInWindow(
+	sparkline: number[],
+	compStart: number,
+	compMs: number,
+	windowStart: number,
+	windowEnd: number,
+): number {
+	const buckets = sparkline.length;
+	if (buckets === 0) return 0;
+	const bucketMs = compMs / buckets;
+	if (bucketMs === 0) return 0;
+	let total = 0;
+	for (let i = 0; i < buckets; i++) {
+		const bStart = compStart + i * bucketMs;
+		const bEnd = bStart + bucketMs;
+		const overlap = Math.min(bEnd, windowEnd) - Math.max(bStart, windowStart);
+		if (overlap > 0) total += sparkline[i] * (overlap / bucketMs);
+	}
+	return total;
 }
 
 function computeTrend(
@@ -105,17 +143,29 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 	const fetchData = useCallback(async () => {
 		try {
 			const historyRange = comparisonRange(range);
-			const [tokenHistory, codeHistory] = await Promise.all([
-				invoke<TokenDataPoint[]>("get_token_history", {
-					range: historyRange,
-					hostname: null,
-					sessionId: null,
-					cwd: null,
-				}),
-				invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", {
-					range: historyRange,
-				}),
-			]);
+			const [tokenHistory, codeHistory, currentRuntime, comparisonRuntime] =
+				await Promise.all([
+					invoke<TokenDataPoint[]>("get_token_history", {
+						range: historyRange,
+						hostname: null,
+						sessionId: null,
+						cwd: null,
+					}),
+					invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", {
+						range: historyRange,
+					}),
+					// Current-window active runtime — matches the LLM Runtime card,
+					// which fetches the same command for the same range.
+					invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range }),
+					// Comparison-range runtime supplies the prior window's active
+					// seconds via proration. Skipped when it equals the current range
+					// (30d), where the previous window falls outside history anyway.
+					historyRange === range
+						? Promise.resolve<LlmRuntimeStats | null>(null)
+						: invoke<LlmRuntimeStats>("get_llm_runtime_stats", {
+								range: historyRange,
+							}),
+				]);
 
 			if (tokenHistory.length === 0 || codeHistory.length === 0) {
 				setResult({
@@ -175,10 +225,22 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 				});
 			}
 
+			const compMs = getRangeMs(historyRange);
+			const compStart = now - compMs;
+			const compRuntime = comparisonRuntime ?? currentRuntime;
+			const currentActiveSecs = currentRuntime.total_runtime_secs;
+			const prevActiveSecs = activeSecsInWindow(
+				compRuntime.sparkline,
+				compStart,
+				compMs,
+				prevStart,
+				currentStart,
+			);
+
 			const tokensPerLoc = computeEfficiency(currentTokens, currentLoc);
 			const prevEfficiency = computeEfficiency(prevTokens, prevLoc);
-			const locPerHour = computeVelocity(currentLoc, rangeMs);
-			const prevVelocity = computeVelocity(prevLoc, rangeMs);
+			const locPerHour = computeVelocity(currentLoc, currentActiveSecs, rangeMs);
+			const prevVelocity = computeVelocity(prevLoc, prevActiveSecs, rangeMs);
 
 			setResult({
 				efficiency: {

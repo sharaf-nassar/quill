@@ -236,11 +236,11 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 									? formatNumber(velocityStats.locPerHour)
 									: null
 							}
-							subtitle="lines changed per hour"
+							subtitle="lines changed per active hour"
 							trend={velocityStats.trend}
 							sparkline={velocityStats.sparkline}
 							accentColor="#a78bfa"
-							description="Lines of code added or modified per hour of wall-clock time in this window — higher is better. The percent badge compares this window to the prior equal-length window."
+							description="Lines of code added or modified per hour of active LLM runtime (not wall-clock) in this window, so idle nights and weekends don't dilute it — higher is better. Falls back to wall-clock time when no runtime is recorded. The percent badge compares this window to the prior equal-length window."
 						/>
 						<InsightCard
 							label="Routing cost"
