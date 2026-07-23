@@ -172,7 +172,7 @@ The [[features#Settings Window]] exposes a `Context` tab backed by `context_pres
 
 The Quill MCP server exposes context tools beside the single `search_history` session-history MCP tool.
 
-Tools in [[src-tauri/claude-integration/mcp/tools/context.py]] can index text or files, fetch and cache web pages, run bounded commands, search indexed chunks, retrieve focused sources, record continuity events, create compact snapshots, inspect stats, and purge stored context. File-based tools resolve paths under the selected working directory before reading or preserving content.
+Tools in [[src-tauri/claude-integration/mcp/tools/context.py]] can index text or files, fetch and cache web pages, run bounded commands, search indexed chunks, retrieve focused sources, inspect stats, and purge stored context. File-based tools resolve paths under the selected working directory before reading or preserving content.
 
 The session-history surface in [[src-tauri/claude-integration/mcp/tools/search.py]] is intentionally narrow: only `search_history` remains, after a 30-day usage audit showed the discovery, analytics, and drill-down tools (`list_projects`, `list_sessions`, `get_session_overview`, `get_session_context`, `get_file_history`, `get_branch_activity`, `find_related_sessions`, `get_token_usage`, `get_learned_rules`, `get_tool_details`, `get_index_status`) were called ≤20 times across all sessions tracked. Trimming the surface keeps the tool listing legible and reduces low-value tool-selection noise.
 

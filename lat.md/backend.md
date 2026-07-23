@@ -214,7 +214,7 @@ Known limitation (Claude side): transcript extraction only sees hook fires that 
 
 The MCP context store keeps large transient context out of the analytics database.
 
-The Python MCP tools in [[src-tauri/claude-integration/mcp/tools/context.py]] create `~/.config/quill/context/context.db` with `sources`, `chunks`, `executions`, `continuity_events`, `compaction_snapshots`, and `fetch_cache` tables. SQLite FTS5 is used when available, with a LIKE fallback so older SQLite builds still search indexed chunks. Context data stays on the machine running the MCP server.
+The Python MCP tools in [[src-tauri/claude-integration/mcp/tools/context.py]] create `~/.config/quill/context/context.db` with `sources`, `chunks`, `executions`, `continuity_events`, `compaction_snapshots`, and `fetch_cache` tables. SQLite FTS5 is used when available, with a LIKE fallback so older SQLite builds still search indexed chunks. The continuity tables remain inert historical storage after their MCP writers were retired. Context data stays on the machine running the MCP server.
 
 #### Context Savings Events
 

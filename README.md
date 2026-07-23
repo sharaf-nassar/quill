@@ -64,7 +64,7 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 ### Working context preservation
 - Optional, default-off feature toggled from the QUILL menu in the titlebar — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
-- **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_record_continuity_event`, `quill_create_compaction_snapshot` / `quill_get_compaction_snapshot`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
+- **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
 - **Routing hooks** — block raw `WebFetch` and noisy `curl`/`wget` dumps, nudge broad `Bash`/`Read`/`Grep`/build/test output toward `quill_*` tools, and use per-session marker files to avoid repeating guidance
 - **Continuity capture** — small task and decision hints recorded across sessions so a new session can resume context without writing to provider memory paths
 - **Telemetry** — every preservation event reports compact byte and token estimates to the Context tab; large content stays in the local context store and never enters the analytics database

@@ -48,9 +48,6 @@ output into the conversation.
   analysis and index large output
 - quill_fetch_and_index: fetch web content into Quill context storage
 - quill_search_context / quill_get_context_source: retrieve focused chunks by ref
-- quill_record_continuity_event / quill_create_compaction_snapshot: preserve
-  decisions, tasks, and compact resume snapshots
-
 Use working context tools before broad Read/Grep dumps, WebFetch page dumps, or
 unbounded curl/wget output.
 """
