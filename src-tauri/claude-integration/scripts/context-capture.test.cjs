@@ -44,6 +44,12 @@ function seedRecords(home, records) {
   fs.writeFileSync(path.join(dir, "events.jsonl"), records.map(jsonLine).join(""), "utf8");
 }
 
+function seedSnapshots(home, records) {
+  const dir = continuityPath(home);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "snapshots.jsonl"), records.map(jsonLine).join(""), "utf8");
+}
+
 function event(extra) {
   return {
     kind: "event",
@@ -246,6 +252,65 @@ it("steals stale aggregate locks and fails open when a live lock cannot be acqui
   capture.appendJsonLine(filePath, event({ prompt_summary: "Lock contention fails open." }));
   assert(fs.readFileSync(filePath, "utf8").includes("Lock contention fails open."), "capture must continue on lock contention");
   assert(fs.existsSync(`${filePath}.lock`), "live lock must remain held when capture fails open");
+}));
+
+it("anchors the 2026-05-18 mixed-hints shape to one coherent session", () => withFixture((home) => {
+  seedRecords(home, [
+    event({
+      session_id: "thread-a",
+      timestamp: "2026-07-23T12:02:00.000Z",
+      prompt_summary: "Implement the newest unrelated task.",
+    }),
+    event({
+      session_id: "thread-b",
+      timestamp: "2026-07-23T12:01:00.000Z",
+      prompt_summary: "Finish the coherent continuity migration.",
+      hints: { tasks: ["Thread B task."], decisions: ["Thread B decision."] },
+    }),
+  ]);
+  const text = directive(runCapture(home, {
+    hook_event_name: "SessionStart", provider: "claude", session_id: "new-session", cwd: "/project",
+  }));
+  assert(text.includes("last_prompt: Finish the coherent continuity migration."), `wrong anchor:\n${text}`);
+  assert(text.includes("Thread B task.") && text.includes("Thread B decision."), `missing coherent hints:\n${text}`);
+  assert(!text.includes("Implement the newest unrelated task."), `mixed thread prompt leaked:\n${text}`);
+}));
+
+it("uses snapshot fields first and fills empty snapshot hints from events", () => withFixture((home) => {
+  seedRecords(home, [event({
+    session_id: "anchor",
+    prompt_summary: "Implement the event fallback for missing hints.",
+    hints: { tasks: ["Event task fallback."], decisions: ["Event decision fallback."] },
+  })]);
+  seedSnapshots(home, [{
+    kind: "snapshot",
+    timestamp: "2026-07-23T12:01:00.000Z",
+    provider: "claude",
+    session_id: "anchor",
+    cwd: "/project",
+    prompt_summaries: ["Implement the snapshot-first directive."],
+    tasks: [],
+    decisions: [],
+  }]);
+  const text = directive(runCapture(home, {
+    hook_event_name: "SessionStart", provider: "claude", session_id: "new-session", cwd: "/project",
+  }));
+  assert(text.includes("last_prompt: Implement the snapshot-first directive."), `snapshot prompt missing:\n${text}`);
+  assert(text.includes("Event task fallback.") && text.includes("Event decision fallback."),
+    `empty snapshot did not degrade to event hints:\n${text}`);
+  assert(!text.includes("Implement the event fallback for missing hints."), `event prompt beat snapshot:\n${text}`);
+}));
+
+it("omits last_prompt but retains recent hints when every prompt is trivial", () => withFixture((home) => {
+  seedRecords(home, [event({
+    prompt_summary: "continue",
+    hints: { tasks: ["Resume captured work."], decisions: [] },
+  })]);
+  const text = directive(runCapture(home, {
+    hook_event_name: "SessionStart", provider: "claude", session_id: "new-session", cwd: "/project",
+  }));
+  assert(!text.includes("last_prompt:"), `trivial prompt was selected:\n${text}`);
+  assert(text.includes("task_hints: Resume captured work."), `recent hints missing:\n${text}`);
 }));
 
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
