@@ -125,6 +125,16 @@ const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
 
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
+
+// Backend-only keys for the periodic transcript rescan loop. These are read
+// from the settings table on every tick and are intentionally kept out of the
+// RuntimeSettings IPC struct and Settings UI.
+const TRANSCRIPT_RESCAN_ENABLED_KEY: &str = "transcript_rescan.enabled";
+const TRANSCRIPT_RESCAN_INTERVAL_KEY: &str = "transcript_rescan.interval_seconds";
+const TRANSCRIPT_RESCAN_ENABLED_DEFAULT: bool = true;
+const TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS: i64 = 120;
+const TRANSCRIPT_RESCAN_INTERVAL_MIN_SECS: i64 = 60;
+const TRANSCRIPT_RESCAN_INTERVAL_MAX_SECS: i64 = 600;
 const PLUGIN_UPDATES_INTERVAL_MIN_HOURS: i64 = 1;
 const PLUGIN_UPDATES_INTERVAL_MAX_HOURS: i64 = 24;
 
@@ -499,6 +509,115 @@ fn spawn_startup_transcript_analytics_reconciliation(app: tauri::AppHandle) {
             }
         }
     });
+}
+
+/// Periodically rescan both transcript roots and feed changed sources into the
+/// same live-reconcile queue the notify hook uses.
+///
+/// Live coverage no longer depends solely on the per-session notify hook: a
+/// session created after startup whose hook never fires (e.g. a long-running
+/// orchestrator mid-turn) is still ingested. Each tick enumerates candidates
+/// and enqueues only those whose mtime advanced past the previous tick's
+/// watermark; the queue's freshness classifier turns an unchanged source into a
+/// cheap stat-only no-op, so occasional over-enqueueing never re-parses a file.
+fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // Seed the watermark with startup time so the first tick does not redo
+        // the work the startup full walk already covered.
+        let mut watermark = std::time::SystemTime::now();
+        loop {
+            let (enabled, interval_secs) = STORAGE
+                .get()
+                .map(|storage| {
+                    (
+                        read_bool_setting(
+                            storage,
+                            TRANSCRIPT_RESCAN_ENABLED_KEY,
+                            TRANSCRIPT_RESCAN_ENABLED_DEFAULT,
+                        ),
+                        read_i64_setting(
+                            storage,
+                            TRANSCRIPT_RESCAN_INTERVAL_KEY,
+                            TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS,
+                        )
+                        .clamp(
+                            TRANSCRIPT_RESCAN_INTERVAL_MIN_SECS,
+                            TRANSCRIPT_RESCAN_INTERVAL_MAX_SECS,
+                        ),
+                    )
+                })
+                .unwrap_or((
+                    TRANSCRIPT_RESCAN_ENABLED_DEFAULT,
+                    TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS,
+                ));
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs as u64)).await;
+            if !enabled {
+                continue;
+            }
+
+            // Capture the tick start before enumerating so a source modified
+            // during the walk is caught by this tick or the next, never lost.
+            let tick_start = std::time::SystemTime::now();
+            let previous = watermark;
+            let changed = tauri::async_runtime::spawn_blocking(move || {
+                collect_rescan_changed_sources(previous)
+            })
+            .await;
+            let changed = match changed {
+                Ok(changed) => changed,
+                Err(error) => {
+                    log::warn!("Transcript rescan worker failed: {error}");
+                    continue;
+                }
+            };
+            watermark = tick_start;
+
+            if changed.is_empty() {
+                continue;
+            }
+            let mut claude = 0usize;
+            let mut codex = 0usize;
+            for source in &changed {
+                match source.provider {
+                    integrations::IntegrationProvider::Claude => claude += 1,
+                    integrations::IntegrationProvider::Codex => codex += 1,
+                    integrations::IntegrationProvider::MiniMax => {}
+                }
+            }
+            for source in changed {
+                if let Err(error) = enqueue_transcript_analytics_live_source(&app, source) {
+                    log::warn!("Transcript rescan failed to enqueue source: {error}");
+                }
+            }
+            log::info!(
+                "Transcript rescan enqueued {} changed sources (claude={claude} codex={codex})",
+                claude + codex,
+            );
+        }
+    });
+}
+
+/// Enumerate both transcript roots and return the sources whose mtime advanced
+/// past `watermark`. Runs on a blocking thread; the per-file stat mirrors the
+/// one enumeration already performs and stays negligible next to parsing.
+fn collect_rescan_changed_sources(
+    watermark: std::time::SystemTime,
+) -> Vec<sessions::DiscoveredRetainedJsonlSource> {
+    let mut changed = Vec::new();
+    for root in sessions::enumerate_retained_jsonl_source_roots() {
+        for source in root.sources {
+            let Ok(metadata) = std::fs::metadata(&source.canonical_path) else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if modified > watermark {
+                changed.push(source);
+            }
+        }
+    }
+    changed
 }
 
 fn spawn_transcript_analytics_live_queue_drain(
@@ -4109,6 +4228,10 @@ pub fn run() {
             // Blocking inventory/parsing stays off the UI thread; shared root
             // permits serialize this pass with any early live notifications.
             spawn_startup_transcript_analytics_reconciliation(app.handle().clone());
+            // Always-on incremental rescan so live coverage no longer depends
+            // solely on the per-session notify hook. Feeds changed sources into
+            // the same live-reconcile queue; spawned async to never block setup.
+            spawn_transcript_rescan_loop(app.handle().clone());
 
             // Migration 28 starts pending. A prior process can also leave a
             // committed running state behind; reset that run to a fresh

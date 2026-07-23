@@ -142,6 +142,8 @@ Failure is isolated per source. `RootReconciliationFault` separates a source-sco
 
 Live notifications use a separate provider-plus-source queue. Scoped reconciliation combines the changed source with persisted sibling identities and reparses only descendants whose resolved root moves. A provider/root permit serializes full inventory-through-prune and scoped prepare-through-commit lifecycles, while registry writes reject older generations.
 
+Live coverage no longer depends solely on the per-session `/sessions/notify` hook. The always-on transcript rescan loop ([[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]], see [[architecture#Background Tasks]]) re-enumerates both roots on an interval and enqueues sources whose mtime advanced past its in-memory watermark through the same [[src-tauri/src/lib.rs#enqueue_transcript_analytics_live_source]] path, so a session created after startup whose hook never fires is still ingested. Unchanged sources short-circuit to a stat-only `SuppressedUnchanged` verdict, so occasional over-enqueueing never re-parses a file.
+
 Per-source capped backoff lets healthy siblings continue after one source fails. A successful changed snapshot emits `transcript-analytics-updated`, refreshing runtime and breakdown views without relying on Session Search events.
 
 ### Live Analytics Origin
