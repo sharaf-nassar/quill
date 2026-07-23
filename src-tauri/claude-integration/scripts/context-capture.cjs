@@ -19,6 +19,9 @@ const RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const CONTINUITY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MAX_READ_BYTES = 256 * 1024;
+const LOCK_STALE_MS = 30 * 1000;
+const LOCK_RETRIES = 3;
+const LOCK_RETRY_MS = 10;
 const CONTEXT_TOOLS = [
   "mcp__quill__quill_search_context",
   "mcp__quill__quill_get_context_source",
@@ -71,20 +74,110 @@ function recordTimestamp(record) {
   return Date.parse(record?.timestamp || record?.ts || 0);
 }
 
-function pruneJsonlFile(filePath, sinceMs) {
+function aggregateLockPath(filePath) {
+  return `${filePath}.lock`;
+}
+
+function pause(ms) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function lockIsStale(lockPath, now) {
+  try {
+    const payload = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    const timestamp = Date.parse(payload.timestamp || 0);
+    return !Number.isFinite(timestamp) || now - timestamp > LOCK_STALE_MS;
+  } catch (_) {
+    return true;
+  }
+}
+
+function acquireAggregateLock(filePath) {
+  const lockPath = aggregateLockPath(filePath);
+  for (let attempt = 0; attempt <= LOCK_RETRIES; attempt += 1) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, timestamp: new Date().toISOString() }), "utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+      return lockPath;
+    } catch (err) {
+      if (err?.code !== "EEXIST") return null;
+      if (lockIsStale(lockPath, Date.now())) {
+        try {
+          fs.unlinkSync(lockPath);
+          continue;
+        } catch (_) {
+          // Another writer won the stale-lock race; retry normally.
+        }
+      }
+      if (attempt < LOCK_RETRIES) pause(LOCK_RETRY_MS);
+    }
+  }
+  return null;
+}
+
+function releaseAggregateLock(lockPath) {
+  if (!lockPath) return;
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (_) {
+    // A stale-lock contender may have already removed it.
+  }
+}
+
+function isAggregateFile(filePath) {
+  return ["events.jsonl", "snapshots.jsonl"].includes(path.basename(filePath));
+}
+
+function appendJsonLine(filePath, record) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const append = () => fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf8");
+  if (!isAggregateFile(filePath)) return append();
+
+  const lockPath = acquireAggregateLock(filePath);
+  if (!lockPath) return append(); // Best effort: never make capture fail on a lock problem.
+  try {
+    append();
+  } finally {
+    releaseAggregateLock(lockPath);
+  }
+}
+
+function pruneJsonlFile(filePath, sinceMs, options = {}) {
   try {
     if (!fs.existsSync(filePath)) return;
-    const lines = fs.readFileSync(filePath, "utf8").split(/\n+/).filter(Boolean);
-    const kept = [];
-    for (const line of lines) {
-      try {
-        const record = JSON.parse(line);
-        if (recordTimestamp(record) >= sinceMs) kept.push(line);
-      } catch (_) {
-        // Drop malformed continuity lines during cleanup.
+    const lockPath = acquireAggregateLock(filePath);
+    if (!lockPath) return;
+    try {
+      const lines = fs.readFileSync(filePath, "utf8").split(/\n+/).filter(Boolean);
+      const kept = [];
+      for (const line of lines) {
+        try {
+          const record = JSON.parse(line);
+          if (recordTimestamp(record) >= sinceMs) kept.push(line);
+        } catch (_) {
+          // Drop malformed continuity lines during cleanup.
+        }
       }
+      const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        fs.writeFileSync(tempPath, kept.length ? `${kept.join("\n")}\n` : "", "utf8");
+        if (typeof options.onLocked === "function") options.onLocked();
+        fs.renameSync(tempPath, filePath);
+      } finally {
+        try {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch (_) {
+          // The temporary file is best-effort cleanup only.
+        }
+      }
+    } finally {
+      releaseAggregateLock(lockPath);
     }
-    fs.writeFileSync(filePath, kept.length ? `${kept.join("\n")}\n` : "", "utf8");
   } catch (_) {
     // Cleanup is opportunistic; capture must keep working.
   }
@@ -268,11 +361,6 @@ function extractHints(summary) {
     decisions: unique(decisions, 3),
     tasks: unique(tasks, 3),
   };
-}
-
-function appendJsonLine(filePath, record) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf8");
 }
 
 function jsonLineBytes(record) {
@@ -527,4 +615,12 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { handleInput, isTrivialPrompt, selectAnchor, sourceHints };
+module.exports = {
+  acquireAggregateLock,
+  appendJsonLine,
+  handleInput,
+  isTrivialPrompt,
+  pruneJsonlFile,
+  selectAnchor,
+  sourceHints,
+};
