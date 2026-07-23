@@ -202,6 +202,11 @@ Continuity hooks record small task and decision hints without writing to provide
 
 The SessionStart `<quill_continuity>` directive only injects when at least one of `last_prompt`, `task_hints`, or `decision_hints` is non-empty for the scoped records (the `buildDirective` helper in `src-tauri/claude-integration/scripts/context-capture.cjs` returns `null` otherwise). Earlier the directive always rendered as long as any record existed, which produced empty injects (just `cwd:` + tool list + reminder line) that crowded the system prompt without carrying any actual continuity content.
 
+#### Fixture Harness
+
+`context-capture.test.cjs` runs deterministic stdin-JSON fixtures against the
+capture hook, including empty-gate and main-checkout/worktree project scoping.
+
 ### Context Savings Telemetry
 
 Context savings telemetry forwards compact measurements to Quill without copying large context into the main analytics database.
