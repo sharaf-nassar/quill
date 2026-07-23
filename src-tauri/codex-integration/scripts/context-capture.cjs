@@ -19,12 +19,12 @@ const RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const CONTINUITY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MAX_READ_BYTES = 256 * 1024;
+const LOCK_STALE_MS = 30 * 1000;
+const LOCK_RETRIES = 3;
+const LOCK_RETRY_MS = 10;
 const CONTEXT_TOOLS = [
   "mcp__quill__quill_search_context",
   "mcp__quill__quill_get_context_source",
-  "mcp__quill__quill_record_continuity_event",
-  "mcp__quill__quill_create_compaction_snapshot",
-  "mcp__quill__quill_get_compaction_snapshot",
   "mcp__quill__search_history",
 ];
 
@@ -74,20 +74,110 @@ function recordTimestamp(record) {
   return Date.parse(record?.timestamp || record?.ts || 0);
 }
 
-function pruneJsonlFile(filePath, sinceMs) {
+function aggregateLockPath(filePath) {
+  return `${filePath}.lock`;
+}
+
+function pause(ms) {
+  if (ms <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function lockIsStale(lockPath, now) {
+  try {
+    const payload = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    const timestamp = Date.parse(payload.timestamp || 0);
+    return !Number.isFinite(timestamp) || now - timestamp > LOCK_STALE_MS;
+  } catch (_) {
+    return true;
+  }
+}
+
+function acquireAggregateLock(filePath) {
+  const lockPath = aggregateLockPath(filePath);
+  for (let attempt = 0; attempt <= LOCK_RETRIES; attempt += 1) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, timestamp: new Date().toISOString() }), "utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+      return lockPath;
+    } catch (err) {
+      if (err?.code !== "EEXIST") return null;
+      if (lockIsStale(lockPath, Date.now())) {
+        try {
+          fs.unlinkSync(lockPath);
+          continue;
+        } catch (_) {
+          // Another writer won the stale-lock race; retry normally.
+        }
+      }
+      if (attempt < LOCK_RETRIES) pause(LOCK_RETRY_MS);
+    }
+  }
+  return null;
+}
+
+function releaseAggregateLock(lockPath) {
+  if (!lockPath) return;
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (_) {
+    // A stale-lock contender may have already removed it.
+  }
+}
+
+function isAggregateFile(filePath) {
+  return ["events.jsonl", "snapshots.jsonl"].includes(path.basename(filePath));
+}
+
+function appendJsonLine(filePath, record) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const append = () => fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf8");
+  if (!isAggregateFile(filePath)) return append();
+
+  const lockPath = acquireAggregateLock(filePath);
+  if (!lockPath) return append(); // Best effort: never make capture fail on a lock problem.
+  try {
+    append();
+  } finally {
+    releaseAggregateLock(lockPath);
+  }
+}
+
+function pruneJsonlFile(filePath, sinceMs, options = {}) {
   try {
     if (!fs.existsSync(filePath)) return;
-    const lines = fs.readFileSync(filePath, "utf8").split(/\n+/).filter(Boolean);
-    const kept = [];
-    for (const line of lines) {
-      try {
-        const record = JSON.parse(line);
-        if (recordTimestamp(record) >= sinceMs) kept.push(line);
-      } catch (_) {
-        // Drop malformed continuity lines during cleanup.
+    const lockPath = acquireAggregateLock(filePath);
+    if (!lockPath) return;
+    try {
+      const lines = fs.readFileSync(filePath, "utf8").split(/\n+/).filter(Boolean);
+      const kept = [];
+      for (const line of lines) {
+        try {
+          const record = JSON.parse(line);
+          if (recordTimestamp(record) >= sinceMs) kept.push(line);
+        } catch (_) {
+          // Drop malformed continuity lines during cleanup.
+        }
       }
+      const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+      try {
+        fs.writeFileSync(tempPath, kept.length ? `${kept.join("\n")}\n` : "", "utf8");
+        if (typeof options.onLocked === "function") options.onLocked();
+        fs.renameSync(tempPath, filePath);
+      } finally {
+        try {
+          if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+        } catch (_) {
+          // The temporary file is best-effort cleanup only.
+        }
+      }
+    } finally {
+      releaseAggregateLock(lockPath);
     }
-    fs.writeFileSync(filePath, kept.length ? `${kept.join("\n")}\n` : "", "utf8");
   } catch (_) {
     // Cleanup is opportunistic; capture must keep working.
   }
@@ -192,6 +282,123 @@ function shouldSkipPrompt(text) {
     trimmed.startsWith("<tool-result>");
 }
 
+function isTrivialPrompt(value) {
+  const prompt = String(value || "").trim();
+  return prompt.length < 12 || !/\s/.test(prompt);
+}
+
+function promptSignals(record) {
+  if (Array.isArray(record?.prompt_summaries)) return record.prompt_summaries;
+  return [record?.prompt_summary];
+}
+
+function selectAnchor(records) {
+  for (const record of newestSessionRecords(records)) {
+    const sourced = sourceSession(records, record.session_id);
+    if (sourced.lastPrompt && (sourced.tasks.length > 0 || sourced.decisions.length > 0)) {
+      return record;
+    }
+  }
+  return null;
+}
+
+function sourceHints(records, sessionId) {
+  const sessionRecords = records.filter((record) => record?.session_id === sessionId);
+  const snapshots = sessionRecords.filter((record) => record?.kind === "snapshot");
+  const events = sessionRecords.filter((record) => record?.kind !== "snapshot");
+  const source = snapshots.length > 0 ? "snapshot" : "event";
+  const primary = source === "snapshot" ? snapshots : events;
+  const fallback = source === "snapshot" ? events : [];
+  const collect = (field) => {
+    const primaryHints = unique(
+      primary.flatMap((record) => record[field] || record.hints?.[field] || []),
+      3,
+    );
+    return primaryHints.length > 0 ? primaryHints : unique(
+      fallback.flatMap((record) => record[field] || record.hints?.[field] || []),
+      3,
+    );
+  };
+
+  return { source, tasks: collect("tasks"), decisions: collect("decisions") };
+}
+
+function sourcePrompt(records, sessionId) {
+  const sessionRecords = records.filter((record) => record?.session_id === sessionId);
+  const snapshots = sessionRecords.filter((record) => record?.kind === "snapshot");
+  const events = sessionRecords.filter((record) => record?.kind !== "snapshot");
+  const source = snapshots.length > 0 ? "snapshot" : "event";
+  const primary = source === "snapshot" ? snapshots : events;
+  const fallback = source === "snapshot" ? events : [];
+  const firstUsefulPrompt = (items) => items
+    .flatMap(promptSignals)
+    .find((prompt) => prompt && !isTrivialPrompt(prompt));
+
+  return {
+    source,
+    lastPrompt: firstUsefulPrompt(primary) || firstUsefulPrompt(fallback) || null,
+  };
+}
+
+function sourceSession(records, sessionId) {
+  return { ...sourcePrompt(records, sessionId), ...sourceHints(records, sessionId) };
+}
+
+function newestSessionRecords(records) {
+  const seen = new Set();
+  return records.filter((record) => {
+    const id = record?.session_id;
+    if (!id || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+}
+
+function fillHints(target, sourced) {
+  for (const field of ["tasks", "decisions"]) {
+    target[field] = unique([...(target[field] || []), ...(sourced[field] || [])], 3);
+  }
+}
+
+function selectDirectiveContext(records) {
+  const sessions = newestSessionRecords(records);
+  const anchor = selectAnchor(records);
+  if (anchor) {
+    return {
+      ...sourceSession(records, anchor.session_id),
+      coherent: true,
+    };
+  }
+
+  const promptSession = sessions.find((record) => sourcePrompt(records, record.session_id).lastPrompt);
+  if (promptSession) {
+    const selected = sourceSession(records, promptSession.session_id);
+    const context = {
+      lastPrompt: selected.lastPrompt,
+      tasks: [],
+      decisions: [],
+      source: selected.source,
+      coherent: false,
+    };
+    for (const record of sessions) {
+      if (record.session_id === promptSession.session_id) continue;
+      fillHints(context, sourceHints(records, record.session_id));
+      if (context.tasks.length === 3 && context.decisions.length === 3) break;
+    }
+    return context;
+  }
+
+  const context = { lastPrompt: null, tasks: [], decisions: [], source: "event", coherent: false };
+  for (const record of sessions) {
+    const sourced = sourceHints(records, record.session_id);
+    if (context.tasks.length === 0 && context.decisions.length === 0 &&
+      (sourced.tasks.length > 0 || sourced.decisions.length > 0)) context.source = sourced.source;
+    fillHints(context, sourced);
+    if (context.tasks.length === 3 && context.decisions.length === 3) break;
+  }
+  return context;
+}
+
 function unique(values, max) {
   const seen = new Set();
   const out = [];
@@ -232,11 +439,6 @@ function extractHints(summary) {
     decisions: unique(decisions, 3),
     tasks: unique(tasks, 3),
   };
-}
-
-function appendJsonLine(filePath, record) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, "utf8");
 }
 
 function jsonLineBytes(record) {
@@ -395,11 +597,8 @@ function scopedRecentRecords(input, provider) {
 function buildDirective(input, provider) {
   const records = scopedRecentRecords(input, provider);
   if (records.length === 0) return null;
-
-  const lastPrompt = records.find((record) => record.prompt_summary)?.prompt_summary ||
-    records.find((record) => Array.isArray(record.prompt_summaries) && record.prompt_summaries[0])?.prompt_summaries[0];
-  const tasks = unique(records.flatMap((record) => record.tasks || record.hints?.tasks || []), 3);
-  const decisions = unique(records.flatMap((record) => record.decisions || record.hints?.decisions || []), 3);
+  const context = selectDirectiveContext(records);
+  const { lastPrompt, tasks, decisions } = context;
 
   // Skip the directive when it would carry no actual continuity content. Empty
   // injects (just cwd + tool list + reminder line) were ~free for the model
@@ -426,6 +625,8 @@ function buildDirective(input, provider) {
 
 function outputSessionStartDirective(input) {
   const provider = inferProvider(input);
+  const records = scopedRecentRecords(input, provider);
+  const context = selectDirectiveContext(records);
   const directive = buildDirective(input, provider);
   if (!directive) return;
   postContextSavingsEvents([
@@ -442,6 +643,10 @@ function outputSessionStartDirective(input) {
       metadata: {
         eventCount: 1,
         hookEvent: "SessionStart",
+        source: context.source,
+        trivialSkipped: records.flatMap(promptSignals)
+          .filter((prompt) => prompt && isTrivialPrompt(prompt)).length,
+        coherent: context.coherent,
       },
     }),
   ], "context-capture");
@@ -479,4 +684,14 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { handleInput };
+module.exports = {
+  acquireAggregateLock,
+  appendJsonLine,
+  handleInput,
+  isTrivialPrompt,
+  pruneJsonlFile,
+  selectAnchor,
+  sourceHints,
+  sourcePrompt,
+  selectDirectiveContext,
+};
