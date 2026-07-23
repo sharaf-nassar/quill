@@ -42,3 +42,9 @@ lat.md/.cache
 
 # Impeccable live-mode runtime journal (config.json + design.json stay tracked)
 .impeccable/live/sessions/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
