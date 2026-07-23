@@ -157,5 +157,46 @@ it("exercises the exported handler for ignored hook events", () => {
     "unhandled hook events must not produce side effects");
 });
 
+it("classifies prompts at the triviality boundary", () => {
+  const { isTrivialPrompt } = require("./context-capture.cjs");
+  assert(isTrivialPrompt("abcdefghijk"), "11 characters must be trivial");
+  assert(!isTrivialPrompt("abcde fghijk"), "12 characters with whitespace must be non-trivial");
+  assert(isTrivialPrompt("twelveletters"), "single tokens must be trivial regardless of length");
+});
+
+it("omits trivial prompts from SessionStart directives", () => withFixture((home) => {
+  seedRecords(home, [
+    event({ timestamp: "2026-07-23T12:01:00.000Z", prompt_summary: "ctc" }),
+    event({ prompt_summary: "Implement the continuity capture update." }),
+  ]);
+  const text = directive(runCapture(home, {
+    hook_event_name: "SessionStart", provider: "claude", session_id: "new-session", cwd: "/project",
+  }));
+  assert(text.includes("last_prompt: Implement the continuity capture update."), `missing fallback prompt:\n${text}`);
+  assert(!text.includes("last_prompt: ctc"), `trivial prompt leaked:\n${text}`);
+}));
+
+it("exports selection helpers for snapshot-first continuity sourcing", () => {
+  const { selectAnchor, sourceHints } = require("./context-capture.cjs");
+  const records = [
+    event({
+      kind: "snapshot",
+      session_id: "anchor",
+      prompt_summaries: ["Implement the context capture fixture."],
+      tasks: ["Use snapshot task."],
+      decisions: ["Prefer snapshot values."],
+    }),
+    event({
+      session_id: "anchor",
+      prompt_summary: "Implement the context capture fixture.",
+      hints: { tasks: ["Use event fallback."], decisions: [] },
+    }),
+  ];
+  assert(selectAnchor(records)?.session_id === "anchor", "must find coherent anchor");
+  const sourced = sourceHints(records, "anchor");
+  assert(sourced.source === "snapshot", "snapshot records must be preferred");
+  assert(sourced.tasks[0] === "Use snapshot task.", "snapshot task must lead sourced hints");
+});
+
 process.stdout.write(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

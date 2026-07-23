@@ -22,9 +22,6 @@ const MAX_READ_BYTES = 256 * 1024;
 const CONTEXT_TOOLS = [
   "mcp__quill__quill_search_context",
   "mcp__quill__quill_get_context_source",
-  "mcp__quill__quill_record_continuity_event",
-  "mcp__quill__quill_create_compaction_snapshot",
-  "mcp__quill__quill_get_compaction_snapshot",
   "mcp__quill__search_history",
 ];
 
@@ -190,6 +187,45 @@ function shouldSkipPrompt(text) {
     trimmed.startsWith("<system-reminder>") ||
     trimmed.startsWith("<context_guidance>") ||
     trimmed.startsWith("<tool-result>");
+}
+
+function isTrivialPrompt(value) {
+  const prompt = String(value || "").trim();
+  return prompt.length < 12 || !/\s/.test(prompt);
+}
+
+function recordPrompt(record) {
+  if (Array.isArray(record?.prompt_summaries)) return record.prompt_summaries[0] || null;
+  return record?.prompt_summary || null;
+}
+
+function recordHints(record) {
+  return [
+    ...(record?.tasks || record?.hints?.tasks || []),
+    ...(record?.decisions || record?.hints?.decisions || []),
+  ];
+}
+
+function selectAnchor(records) {
+  return records.find((record) => {
+    const prompt = recordPrompt(record);
+    return prompt && !isTrivialPrompt(prompt) && recordHints(record).length > 0;
+  }) || null;
+}
+
+function sourceHints(records, sessionId) {
+  const sessionRecords = records.filter((record) => record?.session_id === sessionId);
+  const snapshots = sessionRecords.filter((record) => record?.kind === "snapshot");
+  const events = sessionRecords.filter((record) => record?.kind !== "snapshot");
+  const source = snapshots.length > 0 ? "snapshot" : "event";
+  const primary = source === "snapshot" ? snapshots : events;
+  const fallback = source === "snapshot" ? events : [];
+  const collect = (field) => unique([
+    ...primary.flatMap((record) => record[field] || record.hints?.[field] || []),
+    ...fallback.flatMap((record) => record[field] || record.hints?.[field] || []),
+  ], 3);
+
+  return { source, tasks: collect("tasks"), decisions: collect("decisions") };
 }
 
 function unique(values, max) {
@@ -396,8 +432,9 @@ function buildDirective(input, provider) {
   const records = scopedRecentRecords(input, provider);
   if (records.length === 0) return null;
 
-  const lastPrompt = records.find((record) => record.prompt_summary)?.prompt_summary ||
-    records.find((record) => Array.isArray(record.prompt_summaries) && record.prompt_summaries[0])?.prompt_summaries[0];
+  const lastPrompt = records
+    .map(recordPrompt)
+    .find((prompt) => prompt && !isTrivialPrompt(prompt));
   const tasks = unique(records.flatMap((record) => record.tasks || record.hints?.tasks || []), 3);
   const decisions = unique(records.flatMap((record) => record.decisions || record.hints?.decisions || []), 3);
 
@@ -428,6 +465,11 @@ function outputSessionStartDirective(input) {
   const provider = inferProvider(input);
   const directive = buildDirective(input, provider);
   if (!directive) return;
+  const records = scopedRecentRecords(input, provider);
+  const selectedRecord = records.find((record) => {
+    const prompt = recordPrompt(record);
+    return prompt && !isTrivialPrompt(prompt);
+  }) || records.find((record) => recordHints(record).length > 0);
   postContextSavingsEvents([
     buildContextSavingsEvent(input, {
       source: "context-capture",
@@ -442,6 +484,12 @@ function outputSessionStartDirective(input) {
       metadata: {
         eventCount: 1,
         hookEvent: "SessionStart",
+        source: selectedRecord?.kind === "snapshot" ? "snapshot" : "event",
+        trivialSkipped: records.filter((record) => {
+          const prompt = recordPrompt(record);
+          return prompt && isTrivialPrompt(prompt);
+        }).length,
+        coherent: false,
       },
     }),
   ], "context-capture");
@@ -479,4 +527,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { handleInput };
+module.exports = { handleInput, isTrivialPrompt, selectAnchor, sourceHints };
