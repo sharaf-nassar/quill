@@ -16,24 +16,10 @@ import type {
 	ModelUsageOverviewResponse,
 } from "../types";
 import { normalizeModelAnalyticsError } from "./modelAnalyticsErrors";
+import { useCachedInvoke } from "./useCachedInvoke";
 
 const EVENT_COALESCE_MS = 1_000;
 const FALLBACK_POLL_MS = 60_000;
-const SCOPE_DEBOUNCE_MS = 200;
-
-interface ScopeCacheEntry<T> {
-	data: T;
-	serialized: string;
-}
-
-interface ScopedRequestState<T> {
-	identity: string;
-	generation: number;
-	data: T | null;
-	initialLoading: boolean;
-	refreshing: boolean;
-	error: ModelAnalyticsError | null;
-}
 
 export interface ModelAnalyticsRequestState<T> {
 	data: T | null;
@@ -72,17 +58,6 @@ type BackfillProgressComparison =
 
 function isTerminalBackfillState(state: ModelBackfillState): boolean {
 	return state === "complete" || state === "partial" || state === "failed";
-}
-
-function emptyRequestState<T>(identity: string): ScopedRequestState<T> {
-	return {
-		identity,
-		generation: 0,
-		data: null,
-		initialLoading: true,
-		refreshing: false,
-		error: null,
-	};
 }
 
 function compareBackfillProgress(
@@ -175,229 +150,6 @@ function latestBackfillStatus(
 	return candidate;
 }
 
-function useScopedModelRequest<T>(
-	identity: string,
-	label: string,
-	request: () => Promise<T>,
-	onAcceptedData?: (data: T) => void,
-): {
-	state: ModelAnalyticsRequestState<T>;
-	refresh: () => void;
-} {
-	const [requestState, setRequestState] = useState<ScopedRequestState<T>>(
-		() => emptyRequestState(identity),
-	);
-	const requestGenerationRef = useRef(0);
-	const activeRequestRef = useRef<{
-		identity: string;
-		generation: number;
-		phase: "in_flight" | "settled";
-	} | null>(null);
-	const pendingRefreshIdentityRef = useRef<string | null>(null);
-	const deferredRefreshRef = useRef<{
-		identity: string;
-		timer: ReturnType<typeof setTimeout>;
-	} | null>(null);
-	// Identity-keyed cache of the last good response per scope. Revisiting a
-	// scope renders its cached bytes instantly while a background refresh runs,
-	// and identical follow-up responses reuse the cached object reference so the
-	// overview ref stays stable and memoized sections skip re-rendering.
-	const scopeCacheRef = useRef<Map<string, ScopeCacheEntry<T>>>(new Map());
-	const hasIssuedRequestRef = useRef(false);
-
-	const refresh = useCallback(function refreshScopedRequest() {
-		const activeRequest = activeRequestRef.current;
-		if (activeRequest?.identity === identity) {
-			pendingRefreshIdentityRef.current = identity;
-			return;
-		}
-
-		if (pendingRefreshIdentityRef.current === identity) return;
-
-		const deferredRefresh = deferredRefreshRef.current;
-		if (deferredRefresh !== null) {
-			clearTimeout(deferredRefresh.timer);
-			deferredRefreshRef.current = null;
-		}
-		pendingRefreshIdentityRef.current = null;
-
-		const requestGeneration = requestGenerationRef.current + 1;
-		requestGenerationRef.current = requestGeneration;
-		activeRequestRef.current = {
-			identity,
-			generation: requestGeneration,
-			phase: "in_flight",
-		};
-		// The first request of a hook instance issues immediately; every later
-		// one is debounced so rapid range/provider toggles collapse into a single
-		// backend query for the scope that settles last.
-		const shouldDebounce = hasIssuedRequestRef.current;
-		hasIssuedRequestRef.current = true;
-
-		setRequestState((previous) => {
-			const cached = scopeCacheRef.current.get(identity)?.data ?? null;
-			const retainedData =
-				previous.identity === identity
-					? (previous.data ?? cached)
-					: cached;
-			return {
-				identity,
-				generation: requestGeneration,
-				data: retainedData,
-				initialLoading: retainedData === null,
-				refreshing: retainedData !== null,
-				error: null,
-			};
-		});
-
-		void (async () => {
-			try {
-				if (shouldDebounce) {
-					await new Promise<void>((resolve) => {
-						setTimeout(resolve, SCOPE_DEBOUNCE_MS);
-					});
-					if (requestGeneration !== requestGenerationRef.current) return;
-				}
-
-				const data = await request();
-				if (requestGeneration !== requestGenerationRef.current) return;
-
-				// Reuse the cached reference for byte-identical responses so the
-				// overview ref never churns on no-op refreshes.
-				const serialized = JSON.stringify(data);
-				const cachedEntry = scopeCacheRef.current.get(identity);
-				const nextData =
-					cachedEntry !== undefined && cachedEntry.serialized === serialized
-						? cachedEntry.data
-						: data;
-				scopeCacheRef.current.set(identity, { data: nextData, serialized });
-
-				onAcceptedData?.(nextData);
-				setRequestState((previous) =>
-					previous.identity === identity
-						? {
-								identity,
-								generation: requestGeneration,
-								data: nextData,
-								initialLoading: false,
-								refreshing: false,
-								error: null,
-							}
-						: previous,
-				);
-			} catch (error) {
-				if (requestGeneration !== requestGenerationRef.current) return;
-
-				console.error(`Model ${label} request failed:`, error);
-				const normalizedError = normalizeModelAnalyticsError(error);
-				setRequestState((previous) =>
-					previous.identity === identity
-						? {
-								...previous,
-								generation: requestGeneration,
-								initialLoading: false,
-								refreshing: false,
-								error: normalizedError,
-							}
-						: previous,
-				);
-			} finally {
-				const activeRequest = activeRequestRef.current;
-				if (
-					activeRequest?.identity === identity &&
-					activeRequest.generation === requestGeneration
-				) {
-					activeRequest.phase = "settled";
-				}
-			}
-		})();
-	}, [identity, label, onAcceptedData, request]);
-
-	useEffect(() => {
-		refresh();
-		return () => {
-			requestGenerationRef.current += 1;
-			activeRequestRef.current = null;
-			pendingRefreshIdentityRef.current = null;
-			const deferredRefresh = deferredRefreshRef.current;
-			if (deferredRefresh !== null) {
-				clearTimeout(deferredRefresh.timer);
-				deferredRefreshRef.current = null;
-			}
-		};
-	}, [refresh]);
-
-	useEffect(() => {
-		// A response settles before React commits its state update. Retain its
-		// active marker through that gap, then release it from matching committed
-		// state so accepted data can render before the one queued refresh.
-		const activeRequest = activeRequestRef.current;
-		if (
-			activeRequest === null ||
-			requestState.identity !== identity ||
-			requestState.generation !== activeRequest.generation ||
-			requestState.initialLoading ||
-			requestState.refreshing ||
-			activeRequest.identity !== identity ||
-			activeRequest.phase !== "settled"
-		) {
-			return;
-		}
-
-		activeRequestRef.current = null;
-		if (
-			pendingRefreshIdentityRef.current !== identity ||
-			deferredRefreshRef.current !== null
-		) {
-			return;
-		}
-
-		pendingRefreshIdentityRef.current = null;
-		const timer = setTimeout(() => {
-			const deferredRefresh = deferredRefreshRef.current;
-			if (
-				deferredRefresh?.identity !== identity ||
-				deferredRefresh.timer !== timer
-			) {
-				return;
-			}
-
-			deferredRefreshRef.current = null;
-			refresh();
-		}, 0);
-		deferredRefreshRef.current = { identity, timer };
-	}, [identity, refresh, requestState]);
-
-	// While a scope change is committing (before refresh reseeds requestState),
-	// project a cache-seeded snapshot so a revisited scope renders instantly
-	// instead of flashing a skeleton.
-	let state: ScopedRequestState<T>;
-	if (requestState.identity === identity) {
-		state = requestState;
-	} else {
-		const cached = scopeCacheRef.current.get(identity)?.data ?? null;
-		state = {
-			identity,
-			generation: requestState.generation,
-			data: cached,
-			initialLoading: cached === null,
-			refreshing: cached !== null,
-			error: null,
-		};
-	}
-
-	return {
-		state: {
-			data: state.data,
-			initialLoading: state.initialLoading,
-			refreshing: state.refreshing,
-			error: state.error,
-			retry: refresh,
-		},
-		refresh,
-	};
-}
-
 // @lat: [[frontend#Frontend#Custom Hooks#Model Analytics Hook]]
 export function useModelAnalytics(
 	range: ModelRange,
@@ -432,13 +184,17 @@ export function useModelAnalytics(
 			}),
 		[provider, range],
 	);
+	const logOverviewError = useCallback((error: unknown) => {
+		console.error("Model usage overview request failed:", error);
+	}, []);
 
-	const overviewRequest = useScopedModelRequest(
-		overviewIdentity,
-		"usage overview",
-		requestOverview,
-		acceptOverviewData,
-	);
+	const overviewRequest = useCachedInvoke({
+		identity: overviewIdentity,
+		request: requestOverview,
+		normalizeError: normalizeModelAnalyticsError,
+		onAcceptedData: acceptOverviewData,
+		onError: logOverviewError,
+	});
 	const [refreshGeneration, setRefreshGeneration] = useState(0);
 
 	const retryBackfill = useCallback(() => {
