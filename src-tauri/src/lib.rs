@@ -23,6 +23,10 @@ mod prompt_utils;
 mod redaction;
 mod releases;
 mod restart;
+/// Frozen synthetic corpus shared by the retention tests and the retention
+/// timing spike. Deliberately non-test code: `src/bin/retention_spike.rs` is a
+/// separate crate and cannot link `#[cfg(test)]` items.
+pub mod retention_fixture;
 mod rule_watcher;
 mod server;
 pub(crate) mod sessions;

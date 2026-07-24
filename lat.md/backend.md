@@ -121,6 +121,71 @@ an application window or a production-sized database.
 A successful preflight followed by VACUUM must report `completed`, preserve an
 empty skip reason, and return the actual before/after database footprint.
 
+### Retention fixture
+
+[[src-tauri/src/retention_fixture.rs#build_retention_fixture]] builds the one frozen synthetic corpus that every retention test and the retention timing spike run against, so acceptance numbers and budget numbers can never drift onto separate corpora.
+
+It is ordinary `pub` non-test code rather than a `#[cfg(test)]` helper because
+[[src-tauri/src/bin/retention_spike.rs]] is a separate crate that cannot link
+test-only items. The builder sets `QUILL_DEMO_MODE` and `QUILL_DATA_DIR` to a
+fresh temp directory and then creates the database through `Storage::init`, so
+the schema comes from the real migration path and carries every index a
+production database has — a hand-written `CREATE TABLE` would silently miss the
+partial unique indexes retention's query plans depend on. That env block is
+process-global, so **every consuming test must be annotated `#[serial]`**. The
+overrides are left set afterwards, matching the `init_storage_in` harness, so a
+consumer's own `Storage::init()` lands on the same database.
+
+Rows sit in fixed 30-day buckets counted back from an anchor instant, bucket 0
+being the most recent. Each bucket carries, per table, a known number of
+source-owned conforming rows, a known number of live `source_key IS NULL` rows,
+and — for the two retention target tables only — one row per
+[[src-tauri/src/retention_fixture.rs#NonConformingShape]]: a `+00:00` offset, a
+seconds-precision `Z`, and a 24-character `+0000` form. The three shapes fail
+the `length(timestamp) = 24 AND timestamp LIKE '%Z'` guard in different halves,
+so a guard implemented with only one half still fails a test. Every row instant
+is derived arithmetically from its bucket, table and population, which keeps
+per-month counts exact and guarantees no row ever lands on a cutoff produced by
+[[src-tauri/src/retention_fixture.rs#RetentionFixturePlan#boundary]]. Consumers
+assert against [[src-tauri/src/retention_fixture.rs#RetentionFixturePlan]]
+rather than hand-copied literals, so "the run deleted exactly the pre-cutoff
+rows and no others" is an exact equality.
+
+#### Retention Fixture Test Specs
+
+These specs pin the corpus contract the whole retention epic depends on: exact
+counts, a clean cutoff split, and a schema that really came from `Storage::init`.
+
+##### Exact Per-Month Counts
+
+Every table and population must hold exactly the number of rows the plan
+declares, and the three sibling tables must hold no planted non-conformance, so
+a later run can be proved to have left them alone without a caveat.
+
+##### Boundary Row Split
+
+For every retained-month count from zero through the full corpus, the owned
+conforming rows older than that boundary must equal the plan's own figure —
+this is the equality every delete-engine acceptance assertion is built on.
+
+##### Guard Straddling Rows
+
+Live rows must exist on both sides of a cutoff and non-conforming rows must be
+present in both target tables, so a filter that leaked into the live path or a
+guard missing one half cannot pass unnoticed.
+
+##### Migrated Schema And Reopen
+
+The fixture database must carry both migration-30 indexes and the startup-only
+`idx_se_timestamp_chain`, and a fresh `Storage::init()` must reopen the same
+database, proving the env-override contract rather than assuming it.
+
+##### Spec Validation
+
+A zero-valued spec field and a per-month row count that would push rows outside
+their own bucket must both be rejected with their specific error variants, not
+silently produce a corpus whose boundary math no longer holds.
+
 ### Schema
 
 The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
