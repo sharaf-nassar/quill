@@ -1495,6 +1495,11 @@ fn normalize_context_event_token_estimates(conn: &Connection) -> Result<(), Stri
     Ok(())
 }
 
+/// Creates the columns-dependent indexes on every open — and, despite the
+/// name, also *drops* `idx_session_events_provider_source`, which lives here
+/// rather than in a migration because this function is idempotent, never
+/// created that index (only migration 30 did, and only for databases below
+/// v30), and so the drop needs no schema bump and no `SCHEMA_TOO_NEW` lockout.
 fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
     let conditional_indexes = [
         (
@@ -1579,6 +1584,20 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
                 .map_err(|e| format!("Failed to create {label}: {e}"))?;
         }
     }
+
+    // `idx_session_events_provider_source(provider, source_key)` (migration 30)
+    // is a strict prefix of the partial `uidx_se_owned(provider, source_key,
+    // event_key) WHERE source_key IS NOT NULL`, and every statement that could
+    // want it constrains `source_key = ?`, which implies `source_key IS NOT
+    // NULL` and keeps the partial index usable — proved by
+    // `src-tauri/src/bin/eqp_index_drop_spike.rs`, pinned by
+    // `dropped_provider_source_index_leaves_owned_deletes_on_uidx_se_owned`.
+    // Retention drops exactly this one index and no other;
+    // `idx_se_timestamp_chain` above is recreated on every open because
+    // `get_llm_runtime_stats` pins it with `INDEXED BY`.
+    // @lat: [[backend#Backend#Database#Redundant provider/source index drop]]
+    conn.execute_batch("DROP INDEX IF EXISTS idx_session_events_provider_source;")
+        .map_err(|e| format!("Failed to drop redundant session event index: {e}"))?;
 
     Ok(())
 }
@@ -17016,6 +17035,114 @@ mod tests {
         assert_eq!(result.reason, None);
         assert_eq!(result.bytes_before, bytes_before);
         assert!(result.bytes_after > 0);
+        clear_env();
+    }
+
+    /// Count `sqlite_master` entries for one index name.
+    fn index_present(conn: &Connection, name: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .expect("probe sqlite_master for index");
+        count == 1
+    }
+
+    /// Collect the `detail` column of every `EXPLAIN QUERY PLAN` row. The plan
+    /// is fixed at prepare time, so the two bind slots are filled with `NULL`
+    /// purely to satisfy the arity.
+    fn query_plan_detail(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare explain query plan");
+        let rows: Vec<String> = stmt
+            .query_map([rusqlite::types::Null, rusqlite::types::Null], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("run explain query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read explain query plan detail");
+        rows.join("\n")
+    }
+
+    // @lat: [[backend#Backend#Database#Redundant provider/source index drop#Provider Source Index Drop Test Specs#Redundant Index Gone After Open]]
+    #[test]
+    #[serial]
+    fn startup_open_drops_provider_source_index_and_keeps_timestamp_chain() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        {
+            let conn = storage.conn.lock();
+            // Migration 30 creates the index on this very open, so the drop is
+            // exercised for real rather than passing vacuously.
+            assert!(
+                !index_present(&conn, "idx_session_events_provider_source"),
+                "redundant provider/source index survived the open"
+            );
+            assert!(
+                index_present(&conn, "idx_se_timestamp_chain"),
+                "retention must drop exactly one index and no other"
+            );
+            conn.prepare(
+                "SELECT timestamp, kind, provider, session_id, chain_id
+                 FROM session_events INDEXED BY idx_se_timestamp_chain
+                 WHERE timestamp >= ?1
+                 ORDER BY provider, chain_id, timestamp, rowid",
+            )
+            .expect("pinned runtime query still prepares");
+        }
+        drop(storage);
+
+        // Reopening an already-dropped database must be a no-op, not an error.
+        let reopened = Storage::init().expect("reopen storage");
+        {
+            let conn = reopened.conn.lock();
+            assert!(!index_present(&conn, "idx_session_events_provider_source"));
+            assert!(index_present(&conn, "idx_se_timestamp_chain"));
+        }
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Redundant provider/source index drop#Provider Source Index Drop Test Specs#Owned Deletes Keep Their Index Seek]]
+    #[test]
+    #[serial]
+    fn dropped_provider_source_index_leaves_owned_deletes_on_uidx_se_owned() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let conn = storage.conn.lock();
+
+        // Verbatim from the three `(provider, source_key)` `session_events`
+        // delete sites, which issue them through `format!("... {table} ...")`.
+        let sites = [
+            (
+                "suppress_transcript_analytics_sources_in_transaction",
+                "DELETE FROM session_events WHERE provider = ?1 AND source_key = ?2",
+            ),
+            (
+                "prune_transcript_analytics_sources_for_root",
+                "DELETE FROM session_events WHERE provider=?1 AND source_key=?2",
+            ),
+            (
+                "replace_transcript_analytics_snapshot",
+                "DELETE FROM session_events WHERE provider=?1 AND source_key=?2",
+            ),
+        ];
+        for (site, sql) in sites {
+            let detail = query_plan_detail(&conn, sql);
+            assert!(
+                detail.contains("uidx_se_owned"),
+                "{site} lost its partial-index seek: {detail}"
+            );
+            assert!(
+                !detail.contains("SCAN"),
+                "{site} degraded to a table scan: {detail}"
+            );
+        }
+        drop(conn);
         clear_env();
     }
 

@@ -99,6 +99,66 @@ Every `session_events` statement constrained on `(provider, source_key)` — the
 
 Plans are read from an in-memory replica so nothing is written. Setting `QUILL_EQP_DB` to a real `usage.db` opens it read-only, records whether `ANALYZE` statistics could be steering the planner, and rebuilds the replica from that database's own DDL instead of the vendored copy.
 
+### Redundant provider/source index drop
+
+[[src-tauri/src/storage.rs#ensure_startup_indexes]] drops `idx_session_events_provider_source(provider, source_key)` on every open, because the partial `uidx_se_owned` already serves every statement that index existed for.
+
+The drop lives in a function whose name says "ensure" rather than in a
+migration, and that is deliberate: `ensure_startup_indexes` is idempotent, runs
+on every open, and never created this index — only migration 30 did, and only
+for databases below v30. Putting the drop there needs no schema-version bump
+and so cannot cause a `SCHEMA_TOO_NEW` lockout; an older build that reopens the
+file simply finds one fewer index. Because the function's name now describes
+only half of what it does, the second responsibility is written down on the
+function itself.
+
+Correctness rests on `source_key = ?` implying `source_key IS NOT NULL`, which
+keeps the partial `uidx_se_owned(provider, source_key, event_key) WHERE
+source_key IS NOT NULL` usable for all three source-owned delete sites. That
+implication is SQLite-version-dependent, so it was proved by the
+[[backend#Backend#Database#Index-drop query plan spike]] before the drop
+shipped and is pinned permanently by the test specs below. Retention drops
+exactly this one index and no other — `idx_se_timestamp_chain` is recreated in
+the same function precisely because `get_llm_runtime_stats` pins it with
+`INDEXED BY`.
+
+#### Provider Source Index Drop Test Specs
+
+These specs keep the drop honest in both directions: the redundant index must
+really be gone, and nothing else may go with it or regress to a scan.
+
+##### Redundant Index Gone After Open
+
+A fresh open must leave no `idx_session_events_provider_source` in
+`sqlite_master`, while `idx_se_timestamp_chain` survives and the query pinning
+it with `INDEXED BY` still prepares.
+
+Reopening the already-dropped database must then be a silent no-op rather than
+an error, which is what makes the drop safe to run on every open.
+
+##### Owned Deletes Keep Their Index Seek
+
+All three `(provider, source_key)` `session_events` delete statements must
+still report a search through `uidx_se_owned` and never a `SCAN`, so a future
+query change cannot silently trade the drop for a full table scan.
+
+### Index-drop footprint spike
+
+[[src-tauri/src/bin/index_drop_measure_spike.rs]] measures what the index drop buys and what it costs on a production-sized copy: reclaimed whole-file bytes, `DROP INDEX` wall time, and the WAL the drop produces.
+
+It observes rather than asserts, since every figure is corpus-dependent; its
+only failure modes are a source database that never carried the index and an
+index that survived its own `DROP`. The source is opened read-only and copied
+with `VACUUM INTO`, which is safe while the app writes and yields an
+already-compacted baseline, so the before/after delta is the index's own
+footprint instead of that footprint plus unrelated free pages. The copy's WAL
+is truncated before the drop so the recorded WAL delta belongs to the drop
+alone, and the final `VACUUM` runs on a dedicated connection mirroring
+[[src-tauri/src/storage.rs#Storage#vacuum_database]]. Recorded results live in
+`specs/014-retention-pruning/index-drop-measurement.md`: on a 7.55 GB database
+the drop took 416 ms, dirtied 471 KiB of WAL, freed no filesystem bytes until
+compaction, and reclaimed 727 MB once VACUUM ran.
+
 ### Database compaction
 
 [[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.
