@@ -90,6 +90,7 @@ pub(crate) struct CacheKey {
     command: &'static str,
     range: ModelRange,
     provider: Option<String>,
+    selected_model: Option<(String, String)>,
     time_bucket: i64,
 }
 
@@ -105,8 +106,16 @@ impl CacheKey {
             command,
             range,
             provider: provider.map(str::to_owned),
+            selected_model: None,
             time_bucket: now.timestamp().div_euclid(ANALYTICS_CACHE_BUCKET_SECS),
         }
+    }
+
+    /// Add the selected model discriminator needed by the history command.
+    pub(crate) fn with_selected_model(mut self, selected_model: Option<&ModelIdentity>) -> Self {
+        self.selected_model =
+            selected_model.map(|identity| (identity.provider.clone(), identity.model_id.clone()));
+        self
     }
 }
 
@@ -157,6 +166,23 @@ impl CacheTable {
         }
     }
 }
+
+const MODEL_ANALYTICS_CACHE_TABLES: [CacheTable; 3] = [
+    CacheTable::Column {
+        table: "model_usage_observations",
+        high_water_column: "observed_at_ms",
+    },
+    CacheTable::RowId("model_observation_sources"),
+    CacheTable::RowId("model_backfill_state"),
+];
+
+const MODEL_HISTORY_CACHE_TABLES: [CacheTable; 2] = [
+    CacheTable::Column {
+        table: "model_usage_observations",
+        high_water_column: "observed_at_ms",
+    },
+    CacheTable::RowId("model_observation_sources"),
+];
 
 #[allow(dead_code)]
 impl TableVersions {
@@ -2934,6 +2960,9 @@ fn read_model_backfill_source_total_published(conn: &Connection) -> Result<bool,
 pub struct Storage {
     conn: Mutex<Connection>,
     db_path: PathBuf,
+    model_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelAnalyticsResponse>>>,
+    model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
+    model_history_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelHistoryResponse>>>,
 }
 
 fn transcript_analytics_generation_key(provider: IntegrationProvider, root: &str) -> String {
@@ -5743,6 +5772,9 @@ impl Storage {
         let storage = Self {
             conn: Mutex::new(conn),
             db_path: path,
+            model_analytics_cache: Mutex::new(HashMap::new()),
+            model_usage_overview_cache: Mutex::new(HashMap::new()),
+            model_history_cache: Mutex::new(HashMap::new()),
         };
 
         if let Err(e) = storage.aggregate_and_cleanup() {
@@ -6273,6 +6305,23 @@ impl Storage {
         provider: Option<&str>,
     ) -> Result<ModelAnalyticsResponse, String> {
         let range_end = Utc::now();
+        let probe_connection = self.open_model_analytics_reader()?;
+        let key = CacheKey::new("get_model_analytics", range, provider, range_end);
+        get_or_compute(
+            &self.model_analytics_cache,
+            key,
+            &probe_connection,
+            &MODEL_ANALYTICS_CACHE_TABLES,
+            || self.get_model_analytics_uncached(range, provider, range_end),
+        )
+    }
+
+    fn get_model_analytics_uncached(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+        range_end: DateTime<Utc>,
+    ) -> Result<ModelAnalyticsResponse, String> {
         let range_end_ms = range_end.timestamp_millis();
         let range_start_ms = (range_end - model_range_duration(range)).timestamp_millis();
         let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
@@ -6598,6 +6647,23 @@ impl Storage {
         provider: Option<&str>,
     ) -> Result<ModelUsageOverviewResponse, String> {
         let range_end = Utc::now();
+        let probe_connection = self.open_model_analytics_reader()?;
+        let key = CacheKey::new("get_model_usage_overview", range, provider, range_end);
+        get_or_compute(
+            &self.model_usage_overview_cache,
+            key,
+            &probe_connection,
+            &MODEL_ANALYTICS_CACHE_TABLES,
+            || self.get_model_usage_overview_uncached(range, provider, range_end),
+        )
+    }
+
+    fn get_model_usage_overview_uncached(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+        range_end: DateTime<Utc>,
+    ) -> Result<ModelUsageOverviewResponse, String> {
         let range_end_ms = range_end.timestamp_millis();
         let range_millis = model_range_duration(range).num_milliseconds();
         let range_start_ms = range_end_ms
@@ -7494,6 +7560,25 @@ impl Storage {
         selected_model: Option<&ModelIdentity>,
     ) -> Result<ModelHistoryResponse, String> {
         let range_end = Utc::now();
+        let probe_connection = self.open_model_analytics_reader()?;
+        let key = CacheKey::new("get_model_history", range, provider, range_end)
+            .with_selected_model(selected_model);
+        get_or_compute(
+            &self.model_history_cache,
+            key,
+            &probe_connection,
+            &MODEL_HISTORY_CACHE_TABLES,
+            || self.get_model_history_uncached(range, provider, selected_model, range_end),
+        )
+    }
+
+    fn get_model_history_uncached(
+        &self,
+        range: ModelRange,
+        provider: Option<&str>,
+        selected_model: Option<&ModelIdentity>,
+        range_end: DateTime<Utc>,
+    ) -> Result<ModelHistoryResponse, String> {
         let range_end_ms = range_end.timestamp_millis();
         let range_millis = model_range_duration(range).num_milliseconds();
         let range_start_ms = range_end_ms
