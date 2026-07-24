@@ -1156,7 +1156,7 @@ pub struct MemoryFilesUpdatedEvent {
 
 // --- Session model analytics models ---
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ModelRange {
     #[serde(rename = "1h")]
     OneHour,

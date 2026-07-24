@@ -257,13 +257,15 @@ version bump.
     .timestamp() / BUCKET_WIDTH_SECS` quantizes the sliding window so a
     boundary crossing is a cache miss (fixes Spec Review #2).
   - `CacheEntry { payload, inserted_at: Instant, versions: TableVersions }`.
-  - `TableVersions` = per-source-table `(count: i64, high_water: i64)`
-    from `SELECT COUNT(*), COALESCE(MAX(rowid)|MAX(observed_at_ms), 0) FROM
-    <table>`. Source-table sets differ per command (model commands probe
-    `model_usage_observations` + `model_observation_sources`; token/bucket
-    commands probe `token_snapshots`; context-savings probes its source
-    tables) so per-table granularity holds (Q3: context-savings ingest does
-    not invalidate the model cache).
+  - `TableVersions` = per-source-table `high_water: i64` from
+    `COALESCE(MAX(rowid)|MAX(observed_at_ms), 0)`. The probe uses an indexed
+    maximum only because the cache-probe spike found `COUNT(*)` too costly;
+    the TTL bounds delete staleness. Source-table sets differ per command
+    (model commands probe `model_usage_observations` +
+    `model_observation_sources`; token/bucket commands probe
+    `token_snapshots`; context-savings probes its source tables) so
+    per-table granularity holds (Q3: context-savings ingest does not
+    invalidate the model cache).
   - `TTL_SECS` const (30–60 s) — hard staleness cap when an ingest event is
     missed (Q3), and the definition of "stale" that makes S1's
     background-refresh criterion testable (Spec Review #3).

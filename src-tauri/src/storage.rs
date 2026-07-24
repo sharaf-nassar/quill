@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::time::Instant;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -75,6 +73,161 @@ const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
 // (the effective cutoff is `MIN(watermark, now - floor)`); it can never delete
 // inside the not-yet-analyzed window. SQLite `datetime` modifier form.
 const OBSERVATION_RETENTION_FLOOR: &str = "-30 days";
+
+// @lat: [[backend#Database#Schema#Model Analytics Evidence#Analytics Cache Primitive]]
+/// Upper bound on how long an analytics result can survive when an ingest
+/// writer changes data without changing a source table's observed version.
+#[allow(dead_code)] // Command-specific cache maps are wired by follow-on work.
+pub(crate) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(45);
+#[allow(dead_code)]
+const ANALYTICS_CACHE_BUCKET_SECS: i64 = 30;
+
+/// Identity for one cacheable analytics request. The bucket prevents a
+/// sliding `Utc::now()` range from being served past its next wall-clock step.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct CacheKey {
+    command: &'static str,
+    range: ModelRange,
+    provider: Option<String>,
+    time_bucket: i64,
+}
+
+#[allow(dead_code)]
+impl CacheKey {
+    pub(crate) fn new(
+        command: &'static str,
+        range: ModelRange,
+        provider: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            command,
+            range,
+            provider: provider.map(str::to_owned),
+            time_bucket: now.timestamp().div_euclid(ANALYTICS_CACHE_BUCKET_SECS),
+        }
+    }
+}
+
+/// Absolute high-water markers for every table read by a cacheable command.
+///
+/// A max-only probe stays index-backed on the large append-only analytics
+/// tables. Deletes do not advance a high-water marker, so the TTL bounds how
+/// long a deleted row can remain reflected in a cached result.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TableVersions(BTreeMap<&'static str, TableVersion>);
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TableVersion {
+    high_water: i64,
+}
+
+/// A fixed, trusted source-table probe. `rowid` is suitable for append-only
+/// tables; a monotonic ingest column is used where that is the cheaper index.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CacheTable {
+    RowId(&'static str),
+    Column {
+        table: &'static str,
+        high_water_column: &'static str,
+    },
+}
+
+#[allow(dead_code)]
+impl CacheTable {
+    const fn table_name(self) -> &'static str {
+        match self {
+            Self::RowId(table) | Self::Column { table, .. } => table,
+        }
+    }
+
+    fn probe_sql(self) -> String {
+        match self {
+            Self::RowId(table) => {
+                format!("SELECT COALESCE(MAX(rowid), 0) FROM {table}")
+            }
+            Self::Column {
+                table,
+                high_water_column,
+            } => format!("SELECT COALESCE(MAX({high_water_column}), 0) FROM {table}"),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl TableVersions {
+    fn read(conn: &Connection, tables: &[CacheTable]) -> Result<Self, String> {
+        let mut versions = BTreeMap::new();
+        for table in tables {
+            let high_water = conn
+                .query_row(&table.probe_sql(), [], |row| row.get(0))
+                .map_err(|error| {
+                    format!(
+                        "Probe analytics cache table {}: {error}",
+                        table.table_name()
+                    )
+                })?;
+            versions.insert(table.table_name(), TableVersion { high_water });
+        }
+        Ok(Self(versions))
+    }
+}
+
+/// One typed payload retained with the source-table state that produced it.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct CacheEntry<T> {
+    payload: T,
+    inserted_at: Instant,
+    versions: TableVersions,
+}
+
+/// Read a typed analytics result from an in-process cache or compute it fresh.
+///
+/// Probe failures deliberately bypass the cache: callers receive a fresh
+/// result, and a stale payload is never served when SQLite cannot verify it.
+#[allow(dead_code)]
+pub(crate) fn get_or_compute<T, F>(
+    cache: &Mutex<HashMap<CacheKey, CacheEntry<T>>>,
+    key: CacheKey,
+    probe_connection: &Connection,
+    source_tables: &[CacheTable],
+    compute: F,
+) -> Result<T, String>
+where
+    T: Clone,
+    F: FnOnce() -> Result<T, String>,
+{
+    let versions = match TableVersions::read(probe_connection, source_tables) {
+        Ok(versions) => versions,
+        Err(error) => {
+            log::warn!("Analytics cache probe failed; computing uncached result: {error}");
+            return compute();
+        }
+    };
+
+    if let Some(entry) = cache.lock().get(&key)
+        && entry.inserted_at.elapsed() <= ANALYTICS_CACHE_TTL
+        && entry.versions == versions
+    {
+        return Ok(entry.payload.clone());
+    }
+
+    let payload = compute()?;
+    cache.lock().insert(
+        key,
+        CacheEntry {
+            payload: payload.clone(),
+            inserted_at: Instant::now(),
+            versions,
+        },
+    );
+    Ok(payload)
+}
 
 // Feature 005 US5 T061/T062 (R-7.3/R-7.4 / M-2/M-1 / FR-026/FR-027). Specific
 // error signal for the observation-summary `error_count`. The legacy tally was
