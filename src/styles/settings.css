@@ -383,6 +383,106 @@
   border-color: rgba(248, 113, 113, 0.5);
 }
 
+/* The committed half of a two-step destructive confirmation (feature 014).
+   Deliberately not `--danger`: DESIGN.md reserves red for threshold state, and
+   a prune the user asked for is not an alarm. Weight comes from contrast on the
+   dimming ladder — a brighter keyline and brighter text than any control around
+   it — plus the copy and the second click, never from a severity hue. */
+.settings-button--confirm {
+  color: var(--readout-bright);
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.34);
+}
+
+.settings-button--confirm:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.5);
+}
+
+/* ─── Retention consent / terminal panel (feature 014) ───
+   Structure by hairline, never by card; Systems Pages density, so it is roomier
+   than the row that opens it. Chrome-grey throughout for the same reason
+   `.settings-button--confirm` is: the severity meter is not this surface's to
+   spend. */
+.retention-panel {
+  margin: 4px 4px 8px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-left: 2px solid rgba(255, 255, 255, 0.24);
+  border-radius: 4px;
+}
+
+.retention-panel-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--readout-bright);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+}
+
+.retention-panel-cutoff {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-panel-line,
+.retention-panel-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.62);
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-panel-note {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+.retention-panel-line strong {
+  color: var(--readout-bright);
+  font-weight: 600;
+}
+
+.retention-panel-list {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.retention-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* Narrow windows: the row's select + button pair is the only control group in
+   Settings wide enough to overflow, so it wraps under its label rather than
+   squeezing the description to nothing. */
+@media (max-width: 420px) {
+  .settings-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .settings-row-control {
+    flex-wrap: wrap;
+  }
+
+  .settings-select {
+    min-width: 0;
+  }
+}
+
 /* ─── Inline form (MiniMax key edit) ─── */
 .settings-inline-form {
   display: inline-flex;
