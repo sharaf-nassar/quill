@@ -159,6 +159,38 @@ alone, and the final `VACUUM` runs on a dedicated connection mirroring
 the drop took 416 ms, dirtied 471 KiB of WAL, freed no filesystem bytes until
 compaction, and reclaimed 727 MB once VACUUM ran.
 
+### Retention timing spike
+
+[[src-tauri/src/bin/retention_spike.rs]] measures a ~700k-row chunked delete on the frozen retention corpus and publishes the numeric budgets the delete engine and its preflight are built against. It is a measurement, not a test.
+
+It consumes the same `pub` builder the retention tests do, which is what keeps
+budget numbers and acceptance numbers on one corpus. Against a 2M-row, 1.29 GB
+database it sweeps five chunk sizes on a fresh copy each, and fixes: a
+**25,000-row chunk** (the largest whose p95 transaction hold stays under one
+second — the visible-progress threshold for a background job, not the
+instantaneous-response one), **789 WAL bytes per row**, **11 TEMP bytes per
+doomed row**, a **3-chunk** free-space re-check interval, and Counting-phase,
+stale-preview and total wall-time budgets at three times the measured value.
+
+Three results shape the engine beyond the constants. `PRAGMA temp_store` is
+pinned to `MEMORY`: both settings build the same 7.4 MB doomed-rowid b-tree at
+identical wall time, so the only question is whether those bytes land in RSS
+or on a temp filesystem the disk preflight may not have measured.
+`PRAGMA wal_checkpoint(TRUNCATE)` after each chunk holds post-checkpoint WAL at
+**zero bytes** at every chunk size, so WAL really is bounded by one chunk
+rather than by the run. And the Counting phase is **6.4%** of the run, which
+settles the design question the plan reserved for this spike: the second scan
+is cheap enough that `run_retention_maintenance` keeps rescanning under its own
+lease instead of `preview_retention` holding the lease across the user's
+confirmation dialog.
+
+Two incidental findings are recorded rather than acted on: `tool_actions` does
+not table-scan for the doomed set — the planner walks the partial unique index
+`uidx_ta_owned` — and `idx_se_timestamp` makes the `session_events` scan 2.37×
+*slower* than the `idx_se_timestamp_chain` plan SQLite falls back to without
+it, measured against a same-corpus control that cancels page-cache bias.
+Full numbers live in `specs/014-retention-pruning/retention-timing-spike.md`.
+
 ### Database compaction
 
 [[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.
