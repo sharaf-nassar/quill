@@ -116,6 +116,24 @@ pub(crate) fn begin_ingest_quiesce() -> IngestQuiesceGuard {
     IngestQuiesceGuard { _gate: gate }
 }
 
+/// Take the maintenance lease if it is free, or report that it is not.
+///
+/// [`begin_ingest_quiesce`] is a bare `RwLock::write()`: a second caller does
+/// not fail, it blocks unboundedly. With Compact on one button and Prune on
+/// another in the same settings section, a user who clicks both would get a
+/// frozen second command with no feedback and a doubled quiesce window. The
+/// retention commands therefore acquire through this `try_write()` variant and
+/// report a structured skip instead of waiting.
+///
+/// `MAINTENANCE_IN_PROGRESS` is set **only** on success, so a refused attempt
+/// cannot make the HTTP surface start returning 503s for a lease it does not
+/// hold.
+pub(crate) fn try_begin_ingest_quiesce() -> Option<IngestQuiesceGuard> {
+    let gate = ingest_gate().try_write()?;
+    MAINTENANCE_IN_PROGRESS.store(true, AtomicOrdering::Release);
+    Some(IngestQuiesceGuard { _gate: gate })
+}
+
 impl Drop for IngestQuiesceGuard {
     fn drop(&mut self) {
         MAINTENANCE_IN_PROGRESS.store(false, AtomicOrdering::Release);
@@ -3595,6 +3613,14 @@ async fn set_retention_policy(
     apply_retention_policy(get_storage()?, window_days)
 }
 
+// --- RETENTION MAINTENANCE PATH BEGIN ---
+//
+// Everything between these two markers is the retention command surface. The
+// markers are not decoration: `the_retention_path_registers_no_background_work`
+// slices this file on them and asserts the region spawns nothing. Retention is
+// explicitly not scheduled — it runs only from a user-initiated command — and a
+// timer quietly added here is the most likely way that non-goal would be lost.
+
 /// Wire value of a preview that produced a usable cutoff.
 const RETENTION_PREVIEW_READY: &str = "ready";
 
@@ -3815,23 +3841,412 @@ fn build_retention_preview(
 /// It runs under the ingest quiesce lease for the duration of the scan and
 /// under `spawn_blocking` like `compact_database`, because the scan is a full
 /// pass over both target tables and must not sit on the async runtime. The
-/// counting phase is the *whole* of this command, which is exactly where a
-/// progress bar pinned at zero would read as a hang, so its percentage goes
-/// out through the shared [`RETENTION_MAINTENANCE_PROGRESS_EVENT`] emitter —
-/// the same event the run uses, so the Settings UI needs one listener pair for
-/// both.
+/// lease is taken through [`try_begin_ingest_quiesce`], so a preview fired
+/// while another maintenance operation holds it returns the structured busy
+/// skip instead of freezing the Settings surface behind an unbounded
+/// `RwLock::write()`. The counting phase is the *whole* of this command, which
+/// is exactly where a progress bar pinned at zero would read as a hang, so its
+/// percentage goes out through the shared
+/// [`RETENTION_MAINTENANCE_PROGRESS_EVENT`] emitter — the same event the run
+/// uses, so the Settings UI needs one listener pair for both.
 #[tauri::command]
 async fn preview_retention(app: tauri::AppHandle) -> Result<RetentionPreview, String> {
     let storage = get_storage()?;
     let progress_app = app.clone();
     run_blocking(move || {
-        let _quiesce = begin_ingest_quiesce();
+        let Some(_quiesce) = try_begin_ingest_quiesce() else {
+            // The counts this command exists to produce were never taken, so
+            // the skip reports only what it can still answer without the lease:
+            // the configured window and the file size, neither of which is
+            // contended SQLite.
+            return Ok(RetentionPreview::skipped(
+                RETENTION_BUSY_REASON.to_string(),
+                None,
+                storage.read_retention_window_days().unwrap_or(None),
+                std::fs::metadata(storage.database_path())
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0),
+                retention::RetentionTableCounts::default(),
+            ));
+        };
         let sink: retention_engine::ScanProgressSink = Arc::new(move |pct| {
             emit_retention_maintenance_progress(&progress_app, RETENTION_PHASE_COUNTING_ROWS, pct);
         });
         build_retention_preview(storage, Utc::now(), Some(sink))
     })
 }
+
+/// How far a confirmed cutoff may trail a freshly derived one before the
+/// confirmation is refused as stale.
+///
+/// One Counting phase, from the retention timing spike
+/// (`specs/014-retention-pruning/retention-timing-spike.md`): past this point a
+/// preview costs more to trust than to redo, and the remedy — re-previewing —
+/// is cheap and honest. The bound is on the *confirmation*, not on the user:
+/// the confirm step re-previews to obtain a fresh token rather than holding one
+/// open while a dialog sits on screen.
+const RETENTION_STALE_PREVIEW_TOLERANCE_MS: i64 = 2_616;
+
+/// Skip reason for a confirmation that no longer binds the user's consent.
+///
+/// Deliberately a machine token rather than a sentence: it is the one skip
+/// whose remedy is an action the UI takes (re-preview) rather than copy it
+/// renders, so the frontend has to be able to match it exactly.
+const RETENTION_STALE_PREVIEW_REASON: &str = "stale_preview";
+
+/// Skip reason for a lease [`try_begin_ingest_quiesce`] refused.
+const RETENTION_BUSY_REASON: &str = "another maintenance operation is running";
+
+/// Why compaction is not attempted after a partial run.
+const RETENTION_COMPACTION_AFTER_PARTIAL_REASON: &str =
+    "compaction is not attempted after a partial run.";
+
+/// Why compaction is not attempted when the delete phase removed nothing.
+const RETENTION_COMPACTION_NOTHING_REMOVED_REASON: &str =
+    "no rows were removed, so there is nothing to reclaim.";
+
+/// Terminal result of [`run_retention_maintenance`], and the payload of
+/// [`RETENTION_MAINTENANCE_FINISHED_EVENT`].
+///
+/// The `status` / `reason` / `bytes_before` / `bytes_after` quartet mirrors
+/// `storage::DatabaseCompactionResult` so the Settings surface renders both
+/// maintenance paths with one component. `compaction_status` is reported
+/// **separately** from `status` on purpose: rows removed with bytes not yet
+/// reclaimed is a legitimate outcome, so `status: "completed"` with
+/// `compaction_status: "skipped"` and `bytes_after == bytes_before` has to stay
+/// expressible rather than collapsing into a failure.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RetentionMaintenanceResult {
+    /// `"completed" | "partial" | "skipped"`.
+    status: &'static str,
+    /// Skip reason; `None` otherwise.
+    reason: Option<String>,
+    /// Populated if and only if `status` is `"partial"`.
+    error_reason: Option<String>,
+    /// The confirmed cutoff the run actually used, `None` on a skip that never
+    /// reached the delete phase.
+    cutoff: Option<String>,
+    window_days: Option<i64>,
+    tool_actions_deleted: i64,
+    session_events_deleted: i64,
+    tool_actions_nonconforming: i64,
+    session_events_nonconforming: i64,
+    /// `"completed" | "skipped"`.
+    compaction_status: &'static str,
+    compaction_reason: Option<String>,
+    bytes_before: u64,
+    bytes_after: u64,
+}
+
+/// A run that removed nothing, for one of the structured skip reasons.
+///
+/// Returns a new value; no partially built result is ever observable.
+fn skipped_retention_maintenance(
+    reason: impl Into<String>,
+    window_days: Option<i64>,
+    bytes_before: u64,
+) -> RetentionMaintenanceResult {
+    RetentionMaintenanceResult {
+        status: retention::RetentionRunStatus::Skipped.as_str(),
+        reason: Some(reason.into()),
+        error_reason: None,
+        cutoff: None,
+        window_days,
+        tool_actions_deleted: 0,
+        session_events_deleted: 0,
+        tool_actions_nonconforming: 0,
+        session_events_nonconforming: 0,
+        compaction_status: retention::RetentionRunStatus::Skipped.as_str(),
+        compaction_reason: None,
+        bytes_before,
+        bytes_after: bytes_before,
+    }
+}
+
+/// Phase-and-percentage sink for the composite run.
+///
+/// An [`Arc`] rather than a borrow because the Counting heartbeat rides
+/// rusqlite's `progress_handler`, which requires a `'static` callback.
+type RetentionPhaseSink = Arc<dyn Fn(&'static str, u8) + Send + Sync>;
+
+/// Everything [`execute_retention_maintenance`] needs from its caller.
+///
+/// `now` and the delete-engine overrides are injection points so the composite
+/// invariants — stale refusal, the busy skip, the partial handoff — are
+/// provable without an application window or a real disk-full.
+struct RetentionMaintenanceContext<'a> {
+    /// Instant the confirmation is judged against and the audit record is
+    /// stamped with.
+    now: DateTime<Utc>,
+    progress: RetentionPhaseSink,
+    /// Forwards `transcript-analytics-updated` to the frontend.
+    emit_invalidation: &'a dyn Fn(&'static str),
+    /// Rows per chunk transaction; the spike's constant in production.
+    chunk_rows: u64,
+    /// Chunks between free-space re-checks.
+    free_space_recheck_chunks: u32,
+    /// `None` uses the real `statvfs`.
+    free_space: Option<retention_engine::FreeSpaceProbe<'a>>,
+    /// Called after every committed chunk. Nothing in production installs one.
+    after_chunk: Option<retention_engine::ChunkHook<'a>>,
+}
+
+impl<'a> RetentionMaintenanceContext<'a> {
+    fn new(
+        now: DateTime<Utc>,
+        progress: RetentionPhaseSink,
+        emit_invalidation: &'a dyn Fn(&'static str),
+    ) -> Self {
+        Self {
+            now,
+            progress,
+            emit_invalidation,
+            chunk_rows: retention_engine::RETENTION_CHUNK_ROWS,
+            free_space_recheck_chunks: retention_engine::RETENTION_FREE_SPACE_RECHECK_CHUNKS,
+            free_space: None,
+            after_chunk: None,
+        }
+    }
+}
+
+/// Whether a confirmation still binds the user's consent.
+///
+/// Two independent ways to go stale, and both must refuse: the preset changed
+/// after the preview (so the cutoff describes a window the user is no longer
+/// asking for), or the confirmation trails a freshly derived cutoff by more
+/// than [`RETENTION_STALE_PREVIEW_TOLERANCE_MS`]. A cutoff that cannot be
+/// parsed at all is refused for the same reason and with the same remedy — a
+/// token nothing can compare is a token nothing should delete on.
+fn retention_confirmation_is_fresh(
+    confirmed_cutoff: &str,
+    window_days: i64,
+    now: DateTime<Utc>,
+) -> bool {
+    if !retention::is_conforming_timestamp(confirmed_cutoff) {
+        return false;
+    }
+    let Ok(confirmed) = DateTime::parse_from_rfc3339(confirmed_cutoff) else {
+        return false;
+    };
+    let Ok(fresh) = retention::derive_retention_cutoff(now, window_days) else {
+        return false;
+    };
+    let Ok(fresh) = DateTime::parse_from_rfc3339(&fresh) else {
+        return false;
+    };
+    // A confirmation ahead of the freshly derived cutoff is not stale — it is a
+    // clock that moved backwards, and refusing it would strand the user.
+    fresh.signed_duration_since(confirmed).num_milliseconds()
+        <= RETENTION_STALE_PREVIEW_TOLERANCE_MS
+}
+
+/// Scan, delete, compact, record and invalidate, under one quiesce lease.
+///
+/// The testable core of [`run_retention_maintenance`]. The order is load
+/// bearing at both ends: the confirmation is validated **before** the lease is
+/// taken, so a refused run cannot hold the gate for a moment; and the lease is
+/// held until the function returns, so the VACUUM that turns freed pages into
+/// freed bytes runs inside the same window the deletes did.
+///
+/// `Err` is reserved for faults that leave the run's outcome indeterminate — a
+/// chunk-level SQL failure, a stalled chunk loop, an audit write that did not
+/// land. Everything a user can hit and recover from is a structured skip on the
+/// result instead, because a maintenance operation that reports "error" when it
+/// simply had nothing to do teaches people to ignore it.
+fn execute_retention_maintenance(
+    storage: &Storage,
+    confirmed_cutoff: &str,
+    confirmed_window_days: i64,
+    context: &RetentionMaintenanceContext<'_>,
+) -> Result<RetentionMaintenanceResult, String> {
+    let bytes_before = match std::fs::metadata(storage.database_path()) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return Ok(skipped_retention_maintenance(
+                format!("Could not inspect the database before pruning: {error}"),
+                None,
+                0,
+            ));
+        }
+    };
+
+    let policy = storage.get_retention_policy()?;
+    let Some(window_days) = policy.window_days else {
+        return Ok(skipped_retention_maintenance(
+            RETENTION_DISABLED_REASON,
+            None,
+            bytes_before,
+        ));
+    };
+    if window_days != confirmed_window_days
+        || !retention_confirmation_is_fresh(confirmed_cutoff, window_days, context.now)
+    {
+        return Ok(skipped_retention_maintenance(
+            RETENTION_STALE_PREVIEW_REASON,
+            Some(window_days),
+            bytes_before,
+        ));
+    }
+
+    // Nothing above this line touches the database, so a refused confirmation
+    // never contends for the lease it is not going to use.
+    let Some(_lease) = try_begin_ingest_quiesce() else {
+        return Ok(skipped_retention_maintenance(
+            RETENTION_BUSY_REASON,
+            Some(window_days),
+            bytes_before,
+        ));
+    };
+
+    let phases = Arc::clone(&context.progress);
+    let scan_progress: retention_engine::ScanProgressSink = Arc::new(move |pct: u8| {
+        phases(RETENTION_PHASE_COUNTING_ROWS, pct);
+        if pct >= 100 {
+            // The delete-phase preflight runs inside the engine call and owns
+            // no sink; the scan reaching 100 is exactly when it starts, so this
+            // is where the phase label has to turn over.
+            phases(RETENTION_PHASE_CHECKING_DISK_SPACE, 0);
+        }
+    });
+    let delete_progress = |pct: u8| (context.progress)(RETENTION_PHASE_REMOVING_OLD_ROWS, pct);
+    let controls = retention_engine::RetentionDeleteControls {
+        chunk_rows: context.chunk_rows,
+        free_space_recheck_chunks: context.free_space_recheck_chunks,
+        free_space: context.free_space,
+        after_chunk: context.after_chunk,
+        scan_progress: Some(scan_progress),
+        delete_progress: Some(&delete_progress),
+    };
+
+    let request = retention_engine::RetentionDeleteRequest {
+        // Verbatim: the confirmed token drives the scan, the deletes, the
+        // watermark advance and the audit record. Re-deriving it here would
+        // delete rows the preview never counted.
+        cutoff: confirmed_cutoff.to_string(),
+        window_days,
+        bytes_before,
+        ran_at: context.now,
+    };
+    let report = match retention_engine::run_retention_delete_phase(storage, &request, &controls) {
+        Ok(report) => report,
+        Err(error) => {
+            return match &error {
+                // All three fail before a single chunk transaction opens, so
+                // the database is provably untouched and the honest report is a
+                // skip with the reason.
+                retention_engine::RetentionDeleteError::MalformedCutoff { .. }
+                | retention_engine::RetentionDeleteError::Connection { .. }
+                | retention_engine::RetentionDeleteError::WatermarkAdvance { .. } => {
+                    Ok(skipped_retention_maintenance(
+                        error.to_string(),
+                        Some(window_days),
+                        bytes_before,
+                    ))
+                }
+                _ => Err(error.to_string()),
+            };
+        }
+    };
+
+    let (compaction_status, compaction_reason, bytes_after) = match report.status {
+        retention::RetentionRunStatus::Completed => {
+            (context.progress)(RETENTION_PHASE_COMPACTING_DATABASE, 0);
+            let outcome = match storage.preflight_database_compaction() {
+                Ok(measured) => {
+                    let compaction = storage.vacuum_database(measured);
+                    (compaction.status, compaction.reason, compaction.bytes_after)
+                }
+                // A refused VACUUM preflight is S2's "rows removed, bytes not
+                // yet reclaimed" outcome, not a failed prune.
+                Err(skipped) => (skipped.status, skipped.reason, bytes_before),
+            };
+            // Only this branch announces the phase, and only this branch closes
+            // it: a run that never reaches VACUUM must not report a compaction
+            // the user can see it did not get.
+            (context.progress)(RETENTION_PHASE_COMPACTING_DATABASE, 100);
+            outcome
+        }
+        retention::RetentionRunStatus::Partial => (
+            retention::RetentionRunStatus::Skipped.as_str(),
+            Some(RETENTION_COMPACTION_AFTER_PARTIAL_REASON.to_string()),
+            bytes_before,
+        ),
+        retention::RetentionRunStatus::Skipped => (
+            retention::RetentionRunStatus::Skipped.as_str(),
+            Some(RETENTION_COMPACTION_NOTHING_REMOVED_REASON.to_string()),
+            bytes_before,
+        ),
+    };
+
+    // The delete phase wrote the record with `bytes_after == bytes_before`,
+    // which was true then. A VACUUM that reclaimed bytes makes it false, so the
+    // record is rewritten with the number the user will see. A failed rewrite
+    // downgrades to a warning: the durable record is already correct about what
+    // was deleted, and losing the byte figure must not fail a finished run.
+    if bytes_after != bytes_before
+        && let Err(error) = storage.write_retention_audit_record(
+            &report.audit.clone().with_bytes(bytes_before, bytes_after),
+        )
+    {
+        log::warn!("Failed to record reclaimed bytes on the retention audit record: {error}");
+    }
+
+    invalidate_analytics_after_retention(storage, context.emit_invalidation);
+
+    Ok(RetentionMaintenanceResult {
+        status: report.status.as_str(),
+        reason: report.reason,
+        error_reason: report.error_reason,
+        cutoff: Some(request.cutoff),
+        window_days: Some(window_days),
+        tool_actions_deleted: report.deleted.tool_actions,
+        session_events_deleted: report.deleted.session_events,
+        tool_actions_nonconforming: report.nonconforming.tool_actions,
+        session_events_nonconforming: report.nonconforming.session_events,
+        compaction_status,
+        compaction_reason,
+        bytes_before,
+        bytes_after,
+    })
+}
+
+/// Prune transcript history older than a confirmed cutoff, then reclaim the
+/// bytes.
+///
+/// The only destructive retention entry point, and it cannot run without a
+/// confirmation: the sole source of a valid `confirmed_cutoff` is a preview, so
+/// the backend itself guarantees no prune the user was not shown the numbers
+/// for. Runs inside `run_blocking` like `compact_database`, because the SQL is
+/// synchronous and would otherwise stall the async runtime for the whole lease.
+#[tauri::command]
+async fn run_retention_maintenance(
+    app: tauri::AppHandle,
+    confirmed_cutoff: String,
+    confirmed_window_days: i64,
+) -> Result<RetentionMaintenanceResult, String> {
+    let storage = get_storage()?;
+    let progress_app = app.clone();
+    let invalidation_app = app.clone();
+    let result = run_blocking(move || {
+        let progress: RetentionPhaseSink = Arc::new(move |phase, pct| {
+            emit_retention_maintenance_progress(&progress_app, phase, pct);
+        });
+        let emit_invalidation = move |event: &'static str| {
+            emit_retention_analytics_invalidation(&invalidation_app, event)
+        };
+        execute_retention_maintenance(
+            storage,
+            &confirmed_cutoff,
+            confirmed_window_days,
+            &RetentionMaintenanceContext::new(Utc::now(), progress, &emit_invalidation),
+        )
+    })?;
+
+    emit_retention_maintenance_finished(&app, &result);
+    Ok(result)
+}
+
+// --- RETENTION MAINTENANCE PATH END ---
 
 #[tauri::command]
 async fn set_minimax_api_key(
@@ -5220,10 +5635,10 @@ pub fn run() {
             compact_database,
             // The retention commands register beside `compact_database`: one
             // maintenance surface, one quiesce lease, one progress-event shape.
-            // `run_retention_maintenance` joins them here too.
             get_retention_policy,
             set_retention_policy,
             preview_retention,
+            run_retention_maintenance,
             get_learning_settings,
             set_learning_settings,
             get_learning_capability,
@@ -5371,6 +5786,10 @@ mod tests {
 
     // @lat: [[backend#HTTP API Server#Maintenance quiesce#Maintenance Quiesce Test Specs#Deferred Ingest Is Preserved]]
     #[test]
+    // The ingest gate is process-wide, so any test that takes or probes it has
+    // to be serialized against every other one — a retention run holding the
+    // lease would otherwise make this test's own acquire block.
+    #[serial_test::serial]
     fn write_arriving_during_quiesce_lands_after_unquiesce() {
         use std::sync::{
             Arc,
@@ -5827,5 +6246,667 @@ mod tests {
 
         drop(storage);
         drop(fixture);
+    }
+    // --- Composite retention maintenance command -------------------------
+
+    /// Buckets the test cutoff retains; buckets 3..6 are doomed.
+    const RETENTION_MONTHS_RETAINED: u32 = 3;
+
+    /// The preset whose derived cutoff lands exactly on
+    /// `plan.boundary(RETENTION_MONTHS_RETAINED)` — 30-day buckets, three of
+    /// them retained — so the confirmed token and a freshly derived one agree
+    /// without any fudging.
+    const RETENTION_TEST_WINDOW_DAYS: i64 = 90;
+
+    /// Deliberately smaller than either table's doomed set, so every composite
+    /// test that deletes exercises the chunk loop rather than a single sweep.
+    const RETENTION_TEST_CHUNK_ROWS: u64 = 5;
+
+    /// Every `(phase, pct)` tick one composite run emitted.
+    type RetentionPhaseLog = Arc<Mutex<Vec<(&'static str, u8)>>>;
+
+    /// A phase sink plus the log it appends to, so a test can assert the phase
+    /// vocabulary the UI will observe.
+    fn retention_phase_probe() -> (RetentionPhaseSink, RetentionPhaseLog) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let sink: RetentionPhaseSink =
+            Arc::new(move |phase: &'static str, pct: u8| sink_log.lock().push((phase, pct)));
+        (sink, log)
+    }
+
+    fn retention_phase_order(log: &RetentionPhaseLog) -> Vec<&'static str> {
+        let mut ordered: Vec<&'static str> = Vec::new();
+        for (phase, _) in log.lock().iter() {
+            if ordered.last() != Some(phase) {
+                ordered.push(phase);
+            }
+        }
+        ordered
+    }
+
+    fn retention_owned_rows(
+        fixture: &retention_fixture::RetentionFixture,
+        table: retention_fixture::RetentionTable,
+    ) -> i64 {
+        fixture.plan().rows_before_boundary(
+            RETENTION_MONTHS_RETAINED,
+            table,
+            retention_fixture::RetentionRowKind::OwnedConforming,
+        ) as i64
+    }
+
+    fn retention_nonconforming_rows(
+        fixture: &retention_fixture::RetentionFixture,
+        table: retention_fixture::RetentionTable,
+    ) -> i64 {
+        fixture.plan().rows_before_boundary(
+            RETENTION_MONTHS_RETAINED,
+            table,
+            retention_fixture::RetentionRowKind::OwnedNonConforming,
+        ) as i64
+    }
+
+    fn retention_live_rows(
+        fixture: &retention_fixture::RetentionFixture,
+        table: retention_fixture::RetentionTable,
+    ) -> u64 {
+        let conn = fixture.open_connection().expect("open fixture connection");
+        retention_fixture::count_rows(&conn, table, retention_fixture::RetentionRowKind::Live)
+            .expect("count live rows")
+    }
+
+    fn retention_table_rows(
+        fixture: &retention_fixture::RetentionFixture,
+        table: retention_fixture::RetentionTable,
+    ) -> u64 {
+        let conn = fixture.open_connection().expect("open fixture connection");
+        retention_fixture::RetentionRowKind::ALL
+            .into_iter()
+            .map(|kind| retention_fixture::count_rows(&conn, table, kind).expect("count rows"))
+            .sum()
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#Deferred Ingest Survives The Retention Lease]]
+    #[test]
+    #[serial_test::serial]
+    fn retention_lease_defers_writes_until_it_releases() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        // The retention lease is the same gate compaction takes, acquired
+        // through `try_write` instead of `write`. The contract a user depends
+        // on is unchanged: an ingest write fired into the window is *deferred*,
+        // never dropped and never hard-rejected.
+        let lease = try_begin_ingest_quiesce().expect("retention lease is free");
+        assert!(ingest_is_quiesced());
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let worker_writes = Arc::clone(&writes);
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            with_ingest_write_permit(|| {
+                worker_writes.fetch_add(1, Ordering::SeqCst);
+                completed_tx.send(()).expect("signal write completion");
+            });
+        });
+
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "a write must remain pending for the whole retention window"
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+
+        drop(lease);
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the deferred write lands once retention releases the gate");
+        worker.join().expect("write worker joins");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(!ingest_is_quiesced());
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#A Held Lease Is A Skip Not A Wait]]
+    #[test]
+    #[serial_test::serial]
+    fn a_held_lease_turns_retention_into_a_structured_busy_skip() {
+        let fixture = retention_fixture::build_retention_fixture(&retention_preview_spec())
+            .expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        storage
+            .write_retention_window_days(Some(RETENTION_TEST_WINDOW_DAYS))
+            .expect("configure the retention window");
+
+        let plan_anchor = fixture.plan().anchor();
+        let cutoff = fixture.plan().boundary_timestamp(RETENTION_MONTHS_RETAINED);
+        let before = (
+            retention_table_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+            retention_table_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+        );
+
+        // Compaction holds the gate the blocking way; retention must not join
+        // the queue behind it. Both leased retention commands acquire through
+        // this one call — `preview_retention` for its scan, the composite run
+        // for the whole operation — so refusing here is what turns a stacked
+        // click into a skip for either of them.
+        let compaction_lease = begin_ingest_quiesce();
+        assert!(
+            try_begin_ingest_quiesce().is_none(),
+            "the lease must be refused, not queued"
+        );
+
+        let (progress, phases) = retention_phase_probe();
+        let invalidations: std::cell::RefCell<Vec<&'static str>> =
+            std::cell::RefCell::new(Vec::new());
+        let emit = |event: &'static str| invalidations.borrow_mut().push(event);
+
+        let started = std::time::Instant::now();
+        let result = execute_retention_maintenance(
+            &storage,
+            &cutoff,
+            RETENTION_TEST_WINDOW_DAYS,
+            &RetentionMaintenanceContext::new(plan_anchor, progress, &emit),
+        )
+        .expect("a busy lease is a skip, not an error");
+        let elapsed = started.elapsed();
+
+        // The policy read is the only database work a refused run performs, so
+        // the bound is generous and still nowhere near a blocked `write()`.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the busy skip must return promptly, took {elapsed:?}"
+        );
+        assert_eq!(
+            retention::RetentionRunStatus::Skipped.as_str(),
+            result.status
+        );
+        assert_eq!(Some(RETENTION_BUSY_REASON.to_string()), result.reason);
+        assert_eq!(0, result.tool_actions_deleted);
+        assert_eq!(0, result.session_events_deleted);
+        assert_eq!(None, result.cutoff);
+
+        // Nothing ran, so nothing announced itself and nothing was invalidated.
+        assert!(phases.lock().is_empty());
+        assert!(invalidations.borrow().is_empty());
+
+        // The policy commands take no lease at all — they are settings reads —
+        // so they must also come back promptly with the gate held.
+        let policy = storage
+            .get_retention_policy()
+            .expect("policy reads need no lease");
+        assert_eq!(Some(RETENTION_TEST_WINDOW_DAYS), policy.window_days);
+        assert_eq!(None, policy.watermark, "a refused run advances nothing");
+        assert_eq!(None, policy.last_run, "a refused run records nothing");
+        assert_eq!(
+            before,
+            (
+                retention_table_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+                retention_table_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+            ),
+            "a refused run must not delete a row"
+        );
+
+        drop(compaction_lease);
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#Stale Confirmations Are Refused]]
+    #[test]
+    #[serial_test::serial]
+    fn a_stale_confirmation_is_refused_without_touching_the_database() {
+        let fixture = retention_fixture::build_retention_fixture(&retention_preview_spec())
+            .expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        storage
+            .write_retention_window_days(Some(RETENTION_TEST_WINDOW_DAYS))
+            .expect("configure the retention window");
+
+        let plan_anchor = fixture.plan().anchor();
+        let cutoff = fixture.plan().boundary_timestamp(RETENTION_MONTHS_RETAINED);
+        let before = (
+            retention_table_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+            retention_table_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+        );
+
+        let stale_by_tolerance =
+            plan_anchor + TimeDelta::milliseconds(RETENTION_STALE_PREVIEW_TOLERANCE_MS + 1_000);
+        let cases: [(&str, DateTime<Utc>, i64); 3] = [
+            // The preset changed after the preview, so the cutoff describes a
+            // window the user is no longer asking for.
+            ("window changed", plan_anchor, 30),
+            // The confirmation aged past one Counting phase.
+            (
+                "confirmation aged out",
+                stale_by_tolerance,
+                RETENTION_TEST_WINDOW_DAYS,
+            ),
+            // A token nothing can compare is a token nothing may delete on.
+            ("unusable cutoff", plan_anchor, RETENTION_TEST_WINDOW_DAYS),
+        ];
+
+        for (label, now, window_days) in cases {
+            let (progress, phases) = retention_phase_probe();
+            let invalidations: std::cell::RefCell<Vec<&'static str>> =
+                std::cell::RefCell::new(Vec::new());
+            let emit = |event: &'static str| invalidations.borrow_mut().push(event);
+            let confirmed = if label == "unusable cutoff" {
+                "2026-04-02T00:00:00+0000".to_string()
+            } else {
+                cutoff.clone()
+            };
+
+            let result = execute_retention_maintenance(
+                &storage,
+                &confirmed,
+                window_days,
+                &RetentionMaintenanceContext::new(now, progress, &emit),
+            )
+            .expect("a stale confirmation is a skip, not an error");
+
+            assert_eq!(
+                retention::RetentionRunStatus::Skipped.as_str(),
+                result.status,
+                "{label}"
+            );
+            assert_eq!(
+                Some(RETENTION_STALE_PREVIEW_REASON.to_string()),
+                result.reason,
+                "{label}"
+            );
+            assert_eq!(0, result.tool_actions_deleted, "{label}");
+            assert_eq!(0, result.session_events_deleted, "{label}");
+            assert!(phases.lock().is_empty(), "{label}");
+            assert!(invalidations.borrow().is_empty(), "{label}");
+            assert_eq!(
+                None,
+                storage.read_retention_watermark().expect("read watermark"),
+                "{label}: a refusal must leave the watermark where it was"
+            );
+            assert_eq!(
+                before,
+                (
+                    retention_table_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+                    retention_table_rows(
+                        &fixture,
+                        retention_fixture::RetentionTable::SessionEvents
+                    ),
+                ),
+                "{label}: a refusal must not delete a row"
+            );
+        }
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#The Confirmed Cutoff Is Used Verbatim]]
+    #[test]
+    #[serial_test::serial]
+    fn a_fresh_confirmation_prunes_at_exactly_the_confirmed_cutoff() {
+        let fixture = retention_fixture::build_retention_fixture(&retention_preview_spec())
+            .expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        storage
+            .write_retention_window_days(Some(RETENTION_TEST_WINDOW_DAYS))
+            .expect("configure the retention window");
+
+        let cutoff = fixture.plan().boundary_timestamp(RETENTION_MONTHS_RETAINED);
+        // One second past the instant that derives the confirmed cutoff: still
+        // inside the tolerance, but far enough that a run which re-derived
+        // instead of honouring the token would record a different string.
+        let now = fixture.plan().anchor() + TimeDelta::seconds(1);
+        let live_before = (
+            retention_live_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+            retention_live_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+        );
+
+        let (progress, phases) = retention_phase_probe();
+        let invalidations: std::cell::RefCell<Vec<&'static str>> =
+            std::cell::RefCell::new(Vec::new());
+        let emit = |event: &'static str| invalidations.borrow_mut().push(event);
+        let context = RetentionMaintenanceContext {
+            chunk_rows: RETENTION_TEST_CHUNK_ROWS,
+            ..RetentionMaintenanceContext::new(now, progress, &emit)
+        };
+
+        let result =
+            execute_retention_maintenance(&storage, &cutoff, RETENTION_TEST_WINDOW_DAYS, &context)
+                .expect("a fresh confirmation runs");
+
+        assert_eq!(
+            retention::RetentionRunStatus::Completed.as_str(),
+            result.status
+        );
+        assert_eq!(None, result.reason);
+        assert_eq!(None, result.error_reason);
+        assert_eq!(
+            Some(cutoff.clone()),
+            result.cutoff,
+            "the confirmed token must be reported back verbatim, not re-derived"
+        );
+        assert_eq!(Some(RETENTION_TEST_WINDOW_DAYS), result.window_days);
+        assert_eq!(
+            retention_owned_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+            result.tool_actions_deleted
+        );
+        assert_eq!(
+            retention_owned_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+            result.session_events_deleted
+        );
+        assert_eq!(
+            retention_nonconforming_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+            result.tool_actions_nonconforming
+        );
+        assert_eq!(
+            retention_nonconforming_rows(
+                &fixture,
+                retention_fixture::RetentionTable::SessionEvents
+            ),
+            result.session_events_nonconforming
+        );
+        assert_eq!(
+            live_before,
+            (
+                retention_live_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+                retention_live_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+            ),
+            "live rows are outside retention's scope entirely"
+        );
+
+        // The watermark and the durable record both carry the confirmed token.
+        let policy = storage.get_retention_policy().expect("read policy");
+        assert_eq!(Some(cutoff.clone()), policy.watermark);
+        let audit = policy.last_run.expect("a run records itself");
+        assert_eq!(Some(cutoff), audit.cutoff);
+        assert_eq!(
+            result.bytes_after, audit.bytes_after,
+            "the record must carry the byte figure the user is shown"
+        );
+
+        // Compaction is reported separately, and it ran here.
+        assert_eq!(
+            retention::RetentionRunStatus::Completed.as_str(),
+            result.compaction_status
+        );
+        assert_eq!(None, result.compaction_reason);
+        assert!(result.bytes_after <= result.bytes_before);
+
+        assert_eq!(
+            vec![
+                RETENTION_PHASE_COUNTING_ROWS,
+                RETENTION_PHASE_CHECKING_DISK_SPACE,
+                RETENTION_PHASE_REMOVING_OLD_ROWS,
+                RETENTION_PHASE_COMPACTING_DATABASE,
+            ],
+            retention_phase_order(&phases),
+            "the phase vocabulary must arrive in order"
+        );
+        assert_eq!(
+            vec![TRANSCRIPT_ANALYTICS_UPDATED_EVENT],
+            invalidations.into_inner(),
+            "every completed run ends on the invalidation step"
+        );
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#Every Skip Path Leaves The Database Alone]]
+    #[test]
+    #[serial_test::serial]
+    fn every_composite_skip_path_leaves_the_database_alone() {
+        let fixture = retention_fixture::build_retention_fixture(&retention_preview_spec())
+            .expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        let plan_anchor = fixture.plan().anchor();
+        let before = (
+            retention_table_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+            retention_table_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+        );
+
+        let run = |now: DateTime<Utc>,
+                   cutoff: &str,
+                   window_days: i64,
+                   free_space: Option<retention_engine::FreeSpaceProbe<'_>>|
+         -> RetentionMaintenanceResult {
+            let (progress, _phases) = retention_phase_probe();
+            let invalidations: std::cell::RefCell<Vec<&'static str>> =
+                std::cell::RefCell::new(Vec::new());
+            let emit = |event: &'static str| invalidations.borrow_mut().push(event);
+            let context = RetentionMaintenanceContext {
+                chunk_rows: RETENTION_TEST_CHUNK_ROWS,
+                free_space,
+                ..RetentionMaintenanceContext::new(now, progress, &emit)
+            };
+            execute_retention_maintenance(&storage, cutoff, window_days, &context)
+                .expect("every skip path is a result, not an error")
+        };
+
+        // 1. Retention is disabled: no `retention.window_days` row at all.
+        let disabled = run(
+            plan_anchor,
+            &fixture.plan().boundary_timestamp(RETENTION_MONTHS_RETAINED),
+            RETENTION_TEST_WINDOW_DAYS,
+            None,
+        );
+        assert_eq!(
+            retention::RetentionRunStatus::Skipped.as_str(),
+            disabled.status
+        );
+        assert_eq!(Some(RETENTION_DISABLED_REASON.to_string()), disabled.reason);
+        assert_eq!(None, disabled.window_days);
+
+        // 2. Nothing is older than the cutoff: the widest preset outruns a
+        //    six-bucket corpus, so the scan finds an empty doomed set.
+        storage
+            .write_retention_window_days(Some(365))
+            .expect("configure a 365-day window");
+        let wide_cutoff =
+            retention::derive_retention_cutoff(plan_anchor, 365).expect("derive a 365-day cutoff");
+        let nothing_older = run(plan_anchor, &wide_cutoff, 365, None);
+        assert_eq!(
+            retention::RetentionRunStatus::Skipped.as_str(),
+            nothing_older.status
+        );
+        assert_eq!(
+            Some(retention_engine::RETENTION_NOTHING_OLDER_REASON.to_string()),
+            nothing_older.reason
+        );
+        assert_eq!(
+            retention::RetentionRunStatus::Skipped.as_str(),
+            nothing_older.compaction_status,
+            "a run that removed nothing has nothing to reclaim"
+        );
+        assert_eq!(
+            Some(RETENTION_COMPACTION_NOTHING_REMOVED_REASON.to_string()),
+            nothing_older.compaction_reason
+        );
+
+        // 3. The delete-phase preflight refuses: no free space at all.
+        storage
+            .write_retention_window_days(Some(RETENTION_TEST_WINDOW_DAYS))
+            .expect("configure the retention window");
+        let starved = |_: &std::path::Path| Ok(0_u64);
+        let preflight_skip = run(
+            plan_anchor,
+            &fixture.plan().boundary_timestamp(RETENTION_MONTHS_RETAINED),
+            RETENTION_TEST_WINDOW_DAYS,
+            Some(&starved),
+        );
+        assert_eq!(
+            retention::RetentionRunStatus::Skipped.as_str(),
+            preflight_skip.status
+        );
+        assert!(
+            preflight_skip
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Insufficient free disk space")),
+            "unexpected preflight reason: {:?}",
+            preflight_skip.reason
+        );
+
+        // No skip path may delete a row or advance the watermark; advancing it
+        // with nothing deleted is consent-free insert suppression.
+        assert_eq!(
+            None,
+            storage.read_retention_watermark().expect("read watermark")
+        );
+        assert_eq!(
+            before,
+            (
+                retention_table_rows(&fixture, retention_fixture::RetentionTable::ToolActions),
+                retention_table_rows(&fixture, retention_fixture::RetentionTable::SessionEvents),
+            )
+        );
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#A Partial Run Does Not Compact]]
+    #[test]
+    #[serial_test::serial]
+    fn a_partial_run_does_not_attempt_compaction() {
+        let fixture = retention_fixture::build_retention_fixture(&retention_preview_spec())
+            .expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        storage
+            .write_retention_window_days(Some(RETENTION_TEST_WINDOW_DAYS))
+            .expect("configure the retention window");
+
+        let cutoff = fixture.plan().boundary_timestamp(RETENTION_MONTHS_RETAINED);
+        let now = fixture.plan().anchor();
+
+        let (progress, phases) = retention_phase_probe();
+        let invalidations: std::cell::RefCell<Vec<&'static str>> =
+            std::cell::RefCell::new(Vec::new());
+        let emit = |event: &'static str| invalidations.borrow_mut().push(event);
+        // Stopping between chunks is what a killed process looks like from the
+        // engine's side, and it is the cheapest way to reach `partial`.
+        let stop_after_first_chunk = |_: &retention_engine::RetentionChunkReport| {
+            retention_engine::RetentionChunkControl::Interrupt
+        };
+        let context = RetentionMaintenanceContext {
+            chunk_rows: RETENTION_TEST_CHUNK_ROWS,
+            after_chunk: Some(&stop_after_first_chunk),
+            ..RetentionMaintenanceContext::new(now, progress, &emit)
+        };
+
+        let result =
+            execute_retention_maintenance(&storage, &cutoff, RETENTION_TEST_WINDOW_DAYS, &context)
+                .expect("an interrupted run reports itself");
+
+        assert_eq!(
+            retention::RetentionRunStatus::Partial.as_str(),
+            result.status
+        );
+        assert!(
+            result.error_reason.is_some(),
+            "a partial run must name what stopped it"
+        );
+        assert_eq!(None, result.reason);
+        assert_eq!(
+            RETENTION_TEST_CHUNK_ROWS as i64,
+            result.tool_actions_deleted + result.session_events_deleted,
+            "only the committed chunk counts"
+        );
+        assert_eq!(
+            retention::RetentionRunStatus::Skipped.as_str(),
+            result.compaction_status
+        );
+        assert_eq!(
+            Some(RETENTION_COMPACTION_AFTER_PARTIAL_REASON.to_string()),
+            result.compaction_reason
+        );
+        assert_eq!(
+            result.bytes_before, result.bytes_after,
+            "no VACUUM ran, so no bytes came back"
+        );
+        assert!(
+            !retention_phase_order(&phases).contains(&RETENTION_PHASE_COMPACTING_DATABASE),
+            "the compaction phase must never be announced after a partial run"
+        );
+
+        // The watermark advanced at the first chunk and stays advanced: those
+        // rows are irreversibly gone and must not be resurrected.
+        assert_eq!(
+            Some(cutoff),
+            storage.read_retention_watermark().expect("read watermark")
+        );
+        assert_eq!(
+            vec![TRANSCRIPT_ANALYTICS_UPDATED_EVENT],
+            invalidations.into_inner()
+        );
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Composite retention command#Composite Retention Command Test Specs#Retention Schedules Nothing]]
+    #[test]
+    fn the_retention_path_registers_no_background_work() {
+        // Retention runs only from an explicit command invocation. A timer,
+        // interval or detached task quietly added to this path is the most
+        // likely way that non-goal gets lost, so the guard is structural: it
+        // reads the source of the retention path itself.
+        const MARKER_BEGIN: &str = "--- RETENTION MAINTENANCE PATH BEGIN ---";
+        const MARKER_END: &str = "--- RETENTION MAINTENANCE PATH END ---";
+        // Call shapes, not bare words: the trailing paren keeps the guard from
+        // firing on prose in a doc comment. `spawn_blocking` is deliberately
+        // absent — handing a synchronous command body to the blocking pool is
+        // how every maintenance command runs, not background work.
+        const SCHEDULERS: [&str; 5] = [
+            "tokio::spawn(",
+            "tokio::task::spawn(",
+            "tokio::time::interval(",
+            "tokio::time::sleep(",
+            "thread::spawn(",
+        ];
+
+        // Test modules legitimately spawn threads to prove blocking behaviour,
+        // so only production source is scanned.
+        fn production_only(source: &str) -> &str {
+            source.split("#[cfg(test)]").next().unwrap_or(source)
+        }
+
+        let lib_source = include_str!("lib.rs");
+        let composite = lib_source
+            .split_once(MARKER_BEGIN)
+            .expect("the retention path is bracketed by its begin marker")
+            .1
+            .split_once(MARKER_END)
+            .expect("the retention path is bracketed by its end marker")
+            .0;
+        assert!(
+            composite.contains("fn run_retention_maintenance"),
+            "the marked region must actually contain the composite command"
+        );
+
+        for (name, source) in [
+            ("lib.rs retention path", composite),
+            (
+                "retention.rs",
+                production_only(include_str!("retention.rs")),
+            ),
+            (
+                "retention_engine.rs",
+                production_only(include_str!("retention_engine.rs")),
+            ),
+        ] {
+            for scheduler in SCHEDULERS {
+                assert!(
+                    !source.contains(scheduler),
+                    "{name} must not schedule background work, found {scheduler:?}"
+                );
+            }
+        }
     }
 }

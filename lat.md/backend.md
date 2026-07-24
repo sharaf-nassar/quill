@@ -64,6 +64,17 @@ Each endpoint validates input (length limits, range checks, type validation) bef
 
 The gate is process-wide and reader/writer based: maintenance obtains the writer side before setting its visible quiesce flag, while each guarded ingest or backfill mutation obtains a reader permit. A write already admitted completes before maintenance begins; a write that races after admission waits until the lease is released, so the system never drops history because of a transient maintenance lock. The `write_arriving_during_quiesce_lands_after_unquiesce` regression test proves that a blocked write remains absent during the active window and lands once maintenance ends.
 
+[[src-tauri/src/lib.rs#try_begin_ingest_quiesce]] is the non-blocking variant,
+and it exists because `begin_ingest_quiesce` is a bare `RwLock::write()`: a
+second caller does not fail, it waits unboundedly. With Compact on one button
+and Prune on another in the same settings section, a user who clicks both would
+get a frozen second command, no feedback, and a doubled quiesce window. The
+retention path therefore acquires through `try_write()` and reports a structured
+skip. `MAINTENANCE_IN_PROGRESS` is set only on success, so a refused attempt
+cannot make the HTTP surface start returning 503s for a lease it does not hold.
+`compact_database` deliberately keeps the blocking acquire — the frontend's
+shared busy state, not a backend change, is what stops the two from stacking.
+
 #### Maintenance Quiesce Test Specs
 
 These specs prove maintenance excludes writes without turning a transient
@@ -1282,8 +1293,10 @@ this preview never counted.
 
 The counts are exact, not estimated, because the preview runs the *same*
 [[src-tauri/src/retention_engine.rs#scan_doomed_rows]] pass the run does, under
-the same ingest quiesce lease and the same `spawn_blocking` treatment as
-`compact_database`. Consenting to this payload is therefore consenting to the
+the same ingest quiesce lease — taken through
+[[src-tauri/src/lib.rs#try_begin_ingest_quiesce]], so a preview fired while
+another maintenance operation holds it returns the shared busy skip rather than
+freezing — and the same `spawn_blocking` treatment as `compact_database`. Consenting to this payload is therefore consenting to the
 set the run deletes, which is the whole point of the counting being shared
 rather than approximated by a cheaper query.
 
@@ -1313,8 +1326,9 @@ full pass over both tables. `everything_older` is the flag that drives the blunt
 
 The skip vocabulary is [[src-tauri/src/lib.rs#RETENTION_DISABLED_REASON]] (no
 window configured — the one case with no cutoff to return at all),
-[[src-tauri/src/lib.rs#RETENTION_FRESH_INSTALL_REASON]], and the run's own
-[[src-tauri/src/retention_engine.rs#RETENTION_NOTHING_OLDER_REASON]]. Operational
+[[src-tauri/src/lib.rs#RETENTION_FRESH_INSTALL_REASON]], the run's own
+[[src-tauri/src/retention_engine.rs#RETENTION_NOTHING_OLDER_REASON]], and the
+shared [[src-tauri/src/lib.rs#RETENTION_BUSY_REASON]]. Operational
 failures a user can act on — a database that will not open, a file that cannot be
 stat'd — are structured skips too, matching the run; a SQL failure mid-scan is
 not, because it means the database is in a state neither the command nor the user
@@ -1375,6 +1389,166 @@ completed delete of exactly those rows.
 This is the case that needs the blunt confirmation copy, so a preview that
 reported it as an ordinary partial prune would understate what the user is
 agreeing to.
+
+### Composite retention command
+
+[[src-tauri/src/lib.rs#run_retention_maintenance]] is the only destructive retention entry point: one quiesce lease held across scan, delete-phase preflight, chunked deletes, VACUUM, audit write and cache invalidation, driven by a cutoff the user already confirmed.
+
+[[src-tauri/src/lib.rs#execute_retention_maintenance]] is the testable core; the
+command is a thin `run_blocking` wrapper that supplies `Utc::now()`, the two
+[[backend#Backend#Database#Retention maintenance events]] emitters, and the
+spike's chunk size. The SQL is synchronous, so running it on the async runtime
+would stall every other IPC for the whole lease — the same reason
+`compact_database` uses `run_blocking`.
+
+#### The confirmation is the consent
+
+The two parameters bind the run to a preview: a `confirmed_cutoff` and the
+`confirmed_window_days` it was derived under.
+
+A parameterless run would recompute `now - window` at invocation, which deletes
+strictly *more* than was previewed — including rows that aged past the boundary
+while the confirm step was on screen. Small in seconds, unbounded if the dialog
+sits open overnight, and a consent violation in every case, because the user
+approved a specific boundary date. The confirmed token is therefore used
+verbatim for the scan, the deletes, the watermark advance and the audit record,
+and is never re-derived.
+
+[[src-tauri/src/lib.rs#retention_confirmation_is_fresh]] refuses on either of
+two independent staleness conditions: the stored `retention.window_days` no
+longer equals `confirmed_window_days` (the user changed the preset after
+previewing), or the confirmation trails a freshly derived cutoff by more than
+[[src-tauri/src/lib.rs#RETENTION_STALE_PREVIEW_TOLERANCE_MS]] — one Counting
+phase from the [[backend#Backend#Database#Retention timing spike]], the point at
+which a preview costs more to trust than to redo. A cutoff that cannot be parsed
+is refused the same way, because a token nothing can compare is a token nothing
+may delete on. The skip reason is the machine token `stale_preview` rather than
+a sentence: it is the one skip whose remedy is an action the UI takes
+(re-preview) instead of copy it renders.
+
+This also closes a hole UI discipline alone cannot. The only source of a valid
+`confirmed_cutoff` is a preview, so no caller — a stray `invoke`, a future
+automation, a bug in the confirm flow — can prune without having produced the
+numbers the user was shown.
+
+#### Order of operations
+
+Validation happens **before** the lease is taken, and the lease is held until
+the function returns.
+
+Validating first means a refused confirmation never holds the gate for a moment,
+and it is what makes "a refusal mutates nothing" provable rather than hoped for:
+the only database work a refused run performs is the policy read. Holding the
+lease to the end means the VACUUM that turns freed pages into freed bytes runs
+inside the same quiesce window the deletes did, so no ingest write lands between
+the two halves of one maintenance operation.
+
+Between those two points the sequence is fixed: scan → delete preflight →
+chunked deletes → **close the maintenance connection** → VACUUM preflight →
+VACUUM → audit rewrite → cache clear. The connection close is not incidental —
+[[backend#Backend#Database#Retention delete engine]] owns two `TEMP TABLE`s and
+`vacuum_database` will not rebuild the file underneath another connection
+holding schema-visible temp state.
+
+#### Two statuses, not one
+
+`compaction_status` is reported separately from `status`, and the phase is only
+announced on the path that actually reaches VACUUM.
+
+S2 requires that a failed VACUUM preflight still reports the rows that were
+removed, so `status: "completed"` with `compaction_status: "skipped"` and
+`bytes_after == bytes_before` has to stay expressible — "rows removed, bytes not
+yet reclaimed" is a legitimate outcome, not a failure. A `partial` run does not
+attempt compaction at all and says so; a run that deleted nothing has nothing to
+reclaim and says that instead. Because the delete engine writes its record with
+`bytes_after == bytes_before` (true at the time — deletes free no filesystem
+bytes), a VACUUM that reclaims bytes rewrites the record with the figure the user
+is actually shown. A failed rewrite downgrades to a warning: the durable record
+is already correct about what was deleted.
+
+`Err` is reserved for faults that leave the outcome indeterminate — a chunk-level
+SQL failure, a stalled chunk loop, an audit write that did not land. The three
+[[src-tauri/src/retention_engine.rs#RetentionDeleteError]] variants that fail
+before any chunk transaction opens (`MalformedCutoff`, `Connection`,
+`WatermarkAdvance`) become structured skips instead, because the database is
+provably untouched and a maintenance operation that reports "error" when it
+simply had nothing to do teaches people to ignore it.
+
+#### Composite Retention Command Test Specs
+
+These specs pin what the composite layer alone owns: the consent binding, the
+lease's two-sided contract, and the fact that retention is invoked and never
+scheduled.
+
+##### Deferred Ingest Survives The Retention Lease
+
+An ingest write fired into an active retention window must stay pending for the
+whole window and land once the lease releases — never dropped, never rejected as
+a hard error.
+
+The retention lease is acquired differently from the compaction one, so the
+guarantee users depend on has to be re-proved against it rather than inherited.
+
+##### A Held Lease Is A Skip Not A Wait
+
+With the gate already held, the composite command must return promptly with the
+structured busy skip and mutate nothing — no rows, no watermark, no audit record,
+not even a progress tick.
+
+The failure this prevents is a second maintenance command blocking unboundedly on
+`RwLock::write()` with no feedback. Both leased retention commands acquire
+through the same refusable call, so the assertion covers the preview as well as
+the run; the policy reads are asserted in the same window because they hold no
+lease at all and must stay responsive while a prune runs.
+
+##### Stale Confirmations Are Refused
+
+A changed preset, a confirmation aged past the tolerance, and a cutoff that
+cannot be parsed must each yield the `stale_preview` skip with zero rows deleted
+and the watermark unmoved.
+
+All three mean the same thing — the token no longer binds the user's consent —
+and all three have the same cheap remedy, so all three must refuse identically
+rather than one of them silently proceeding.
+
+##### The Confirmed Cutoff Is Used Verbatim
+
+A fresh confirmation must delete exactly the rows older than the confirmed token
+and record that exact string as the cutoff and the watermark, with live rows
+untouched, the caches invalidated, and the phase vocabulary emitted in order.
+
+Running it from an instant *after* the one that derives the token is what makes
+the assertion sharp: a run that re-derived instead of honouring the confirmation
+would record a different string and still look plausible.
+
+##### Every Skip Path Leaves The Database Alone
+
+Retention disabled, nothing older than the cutoff, and a refused delete-phase
+preflight must each report a structured skip, delete no row, and leave the
+watermark exactly where it was.
+
+Advancing the watermark on a path that deleted nothing would suppress inserts the
+user never consented to lose — the one failure mode this design must not have.
+
+##### A Partial Run Does Not Compact
+
+A run stopped between chunks must report `partial` with an `error_reason`, count
+only what committed, keep the watermark advanced, and neither attempt nor
+announce compaction.
+
+Announcing the compaction phase and then not compacting is a worse lie than
+skipping it, so the phase emission and the compaction decision are asserted
+together.
+
+##### Retention Schedules Nothing
+
+Nothing in the retention path may register a timer, interval or detached task:
+retention runs only from an explicit command invocation.
+
+The guard is structural — it reads the bracketed retention command surface plus
+the two retention modules, matching call shapes rather than words so a doc
+comment cannot trip it — because a scheduler added later is the most likely way
+this non-goal gets lost, and no behavioural test would notice.
 
 ### Learning Commands (18)
 
