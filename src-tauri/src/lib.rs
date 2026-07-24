@@ -26,6 +26,14 @@ mod restart;
 /// Retention policy primitive: the three `settings` keys, their typed
 /// read/write helpers, cutoff derivation, and the monotonic watermark rule.
 pub mod retention;
+/// Chunked delete engine and delete-phase preflight: the dedicated maintenance
+/// connection, the one-pass doomed-rowid scan, and the bounded chunked delete
+/// that advances the watermark at its first chunk.
+///
+/// Private, unlike its two retention siblings: nothing outside this crate calls
+/// the delete engine, and exporting it would drag `Storage` into the crate's
+/// public surface through `run_retention_delete_phase`.
+mod retention_engine;
 /// Frozen synthetic corpus shared by the retention tests and the retention
 /// timing spike. Deliberately non-test code: `src/bin/retention_spike.rs` is a
 /// separate crate and cannot link `#[cfg(test)]` items.

@@ -440,7 +440,12 @@ The scan measurement is not a nice-to-have. The design pays for the scan
 **twice** — once in `preview_retention` and again in
 `run_retention_maintenance`, which deliberately rescans under its own lease
 rather than trusting the preview. `tool_actions` has no timestamp-leading
-index, so its pass is a full table scan every time. The spike therefore sets
+index, so its pass reads the whole table every time — **corrected by the
+spike's measurement**: the planner does not fall back to a raw table scan but
+walks the partial unique index `uidx_ta_owned`, which already encodes
+`source_key IS NOT NULL`. It is still a full index scan and still the most
+expensive single statement in the Counting phase (~693 ms of ~890 ms), so the
+conclusion below is unchanged. The spike therefore sets
 an explicit budget for the Counting phase, and **if scan time dominates the
 run**, that is a design signal, not a tuning detail: it reopens whether the
 preview should take the lease and hand the run its materialized doomed set

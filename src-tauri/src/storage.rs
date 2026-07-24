@@ -11187,6 +11187,16 @@ impl Storage {
 /// build on it, and pinning the invariants at this layer is the point.
 #[allow(dead_code)]
 impl Storage {
+    /// Filesystem path of the database this handle owns.
+    ///
+    /// The retention delete engine opens its own maintenance connection rather
+    /// than borrowing `self.conn` — the primary connection is a single
+    /// process-wide mutex, so a scan-and-delete on it would block every read
+    /// IPC for the whole run — and it needs this path to do so.
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.db_path
+    }
+
     /// Configured retention window, or `None` for "never prune".
     ///
     /// A stored value the primitive refuses to honour degrades to `None` with

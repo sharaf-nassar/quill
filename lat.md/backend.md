@@ -524,6 +524,194 @@ rather than being assumed to follow from the changed-source case.
 Live rows are outside retention's scope by design, so a watermark leaking into
 either live path would delete data the user was never asked about.
 
+### Retention delete engine
+
+[[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] is retention's destructive core: a dedicated maintenance connection, a one-pass doomed-rowid scan, a disk preflight, and a bounded chunked delete that advances the watermark at its first chunk and persists an audit record on every path.
+
+It owns no policy — the grammars, the cutoff and the monotonic rule live in the
+[[backend#Backend#Database#Retention policy primitive]] — and no UI. Every
+numeric constant it uses comes from the
+[[backend#Backend#Database#Retention timing spike]]; none was chosen here.
+
+#### Why a dedicated connection
+
+[[src-tauri/src/retention_engine.rs#open_maintenance_connection]] opens the database itself rather than borrowing `Storage`'s primary connection, and pins `PRAGMA temp_store = MEMORY`.
+
+The primary connection is a single process-wide mutex, so a scan-and-delete on
+it would block every read IPC — the always-on-top widget included — for the whole
+run. On its own WAL connection readers keep reading, and only writes are gated,
+by the quiesce lease the caller already holds. `temp_store` is pinned rather than
+inherited because the spike measured the same doomed-rowid b-tree under both
+settings at identical wall time: the only question is whether those bytes land in
+RSS or on a temp filesystem the disk preflight may never have measured, and under
+10 MB of RSS is the cheaper answer for a desktop app.
+
+The connection owns both `retention_doomed_*` `TEMP TABLE`s and is dropped before
+[[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] returns, because
+`vacuum_database` rebuilds the whole file on its own connection and does not
+tolerate another one holding schema-visible temp state.
+
+#### The doomed-rowid scan
+
+[[src-tauri/src/retention_engine.rs#scan_doomed_rows]] materializes both target tables' doomed rowids in one pass each, counts the rows the conformance guard kept, and drives a wall-clock heartbeat while it runs.
+
+`tool_actions` has no index leading with `timestamp`, so a per-chunk
+`WHERE timestamp < ?` would rescan the table on every chunk. The single pass
+yields the exact preview count for free, makes every chunk a rowid seek, and
+freezes the delete set so the result reported is the set that was previewed.
+
+Its two guards are both load-bearing. `source_key IS NOT NULL` excludes live rows,
+which no retention path may ever touch. `length(timestamp) = 24 AND timestamp
+LIKE '%Z'` excludes timestamps that are not byte-comparable — a `+00:00` form's
+`+` sorts before `.` and would mis-compare at the boundary. That second guard is
+the delete side of a symmetry with the insert-time filter: a row this scan
+refuses to delete is a row the filter must refuse to suppress, or a row could be
+dropped on reinsert with no delete to account for it. Guard-failing pre-cutoff
+rows are counted and reported as `skipped_nonconforming` instead, a *report*
+computed by a byte comparison the guard has already declared unreliable — no row
+is ever removed on its basis.
+
+The scan is one opaque `CREATE TEMP TABLE … AS SELECT` that emits no rows and
+runs for most of a second on a production corpus, so
+[[src-tauri/src/retention_engine.rs#install_scan_heartbeat]] registers a rusqlite
+`progress_handler` and nudges the percentage on wall time. It never returns
+`true` — that would abort the scan — and never climbs past a ceiling short of
+100, because a liveness signal that claims completion it cannot observe is worse
+than none. The handler is uninstalled before the delete phase, which has real
+per-chunk progress. This is the reason the crate enables rusqlite's `hooks`
+feature.
+
+#### The chunk boundary is a value
+
+[[src-tauri/src/retention_engine.rs#drain_target]] materializes one `:max` rowid per chunk transaction and drives both the target delete and the bookkeeping delete from it, then checkpoints the WAL after the commit.
+
+Two independent unordered `SELECT … LIMIT` scans over the same temp table carry
+no guarantee of agreeing on row order, so a single scalar boundary is what makes
+divergence impossible: no doomed rowid leaves the temp table without its row
+being deleted, and no row is deleted that the temp table still claims. The bound
+also keeps each `DELETE` a bounded rowid range rather than a full `IN`-subquery
+materialization. `DELETE … LIMIT` is not an option at all —
+`SQLITE_ENABLE_UPDATE_DELETE_LIMIT` is not compiled into the vendored build.
+
+Each chunk is its own transaction, so an interrupted run leaves committed chunks
+committed and no partial row written; the next run simply recomputes its doomed
+set. Deleting one row rewrites its entry in every surviving index, so WAL churn
+is index-dominated — `PRAGMA wal_checkpoint(TRUNCATE)` after each commit bounds
+WAL by one chunk rather than by the run, measured at zero post-checkpoint bytes
+at every swept chunk size.
+
+#### Preflight, and what it is not
+
+[[src-tauri/src/retention_engine.rs#preflight_delete_phase]] requires free disk for one chunk's WAL plus both doomed-rowid temp tables, doubled. Failing it is a skip with a reason, not an error, and it removes no rows and leaves the watermark alone.
+
+This is emphatically **not** the VACUUM preflight and does not subsume it: VACUUM
+needs twice the whole file, while the delete phase needs tens of megabytes. A
+database can comfortably pass this and fail that, which is the legitimate "rows
+removed, bytes not yet reclaimed" outcome the composite command reports as a
+completed run with a skipped compaction.
+[[src-tauri/src/retention_engine.rs#RetentionDeleteBudget#estimate]] keeps the
+TEMP term in the *disk* requirement even though `temp_store` is `MEMORY` and
+those bytes are really RSS: at 11.05 B per doomed row the term is a rounding
+error beside the WAL term, and carrying it keeps the requirement correct if the
+pinned `temp_store` is ever revisited.
+
+A preflight that passed at chunk 0 says nothing about chunk 400, so the loop
+re-checks free space every [[src-tauri/src/retention_engine.rs#RETENTION_FREE_SPACE_RECHECK_CHUNKS]]
+chunks — a 3.16 µs `statvfs` against a mean chunk hold of 417.7 ms. On failure
+the run does not panic and does not continue: it stops at the last committed
+chunk and reports `Partial` with the reason.
+
+#### Watermark advance and the audit write
+
+The watermark reaches the run's cutoff **before the first chunk transaction opens**, and the audit record is written on the completed, partial *and* skipped paths.
+
+Advancing it there rather than at the end of the run is what makes an interrupted
+destructive run durable: the rows are gone, and a later reparse must not restore
+them. It cannot move *inside* the chunk transaction, because the watermark rides
+[[src-tauri/src/storage.rs#Storage#advance_retention_watermark]] on the primary
+connection, WAL permits exactly one writer, and a primary-connection write issued
+while the maintenance connection holds an `IMMEDIATE` transaction would deadlock
+the run against itself until `busy_timeout` expired. Advancing just before the
+commit rather than just after also closes the only window in which rows could be
+gone while the watermark still permitted their reinsertion.
+
+The mirror rule is that a run which **skips at the preflight** must not advance
+it: nothing was deleted, so advancing would suppress inserts the user never
+consented to lose. Once a chunk commits the watermark stays where it is
+regardless of what happens next — a partial run, a skipped VACUUM, a failed one.
+
+The audit record's `bytes_after` equals `bytes_before` here, which is not a
+placeholder but the truth: deletes free no filesystem bytes, and only the VACUUM
+that may follow changes the file's size. Writing it on the error path too is the
+point — a run the user cannot account for afterwards is the failure the record
+exists to prevent, and the record must survive a process that never reaches
+compaction.
+
+#### Retention Delete Engine Test Specs
+
+These specs pin the destructive invariants: exact deletions, a database that is
+consistent at every interruption point, and a watermark that moves exactly when
+it should and never when it should not.
+
+##### Chunk Correctness And Idempotency
+
+A chunk size smaller than the doomed set must delete exactly the planned rows and
+no others, and drain each `retention_doomed_*` table in lockstep with its target
+under the shared `:max` bound.
+
+A row whose timestamp equals the cutoff must be retained — the predicate is
+strict `<` — and all three sibling tables must be untouched. An immediate re-run
+must then delete nothing and report a skip with a structured reason, because a
+second prune that quietly redid work would mean the first one had not finished.
+
+##### Interrupted Run Stays Consistent
+
+Stopping between chunks must leave every committed chunk deleted and no partial
+row behind, and the next run must finish the job with no special handling — it
+rescans, finds what is left, and drains it.
+
+##### Watermark Advances At First Chunk
+
+Stopping after the first chunk must leave `retention.watermark` already equal to
+the run's cutoff, with every removed row strictly older than that value, so an
+insert filter honouring the watermark cannot resurrect them.
+
+##### Preflight Skip Leaves The Watermark
+
+A failing delete-phase disk check must remove no row and leave the stored
+watermark byte-identical, because advancing it with nothing deleted is
+consent-free insert suppression — the one failure mode this design must not have.
+
+##### Mid Run Failure Reports Partial
+
+A free-space re-check that fails after some chunks have committed must stop
+cleanly with `partial`, a populated `error_reason`, an empty skip `reason`, and
+deleted counts matching what actually committed.
+
+The audit record must be persisted on that error path with unchanged before/after
+bytes, and the watermark, advanced at the first chunk, must still be advanced.
+
+##### Non Conforming Rows Retained
+
+Owned pre-cutoff rows whose timestamps fail the conformance guard must survive
+the run and be reported in the result and the audit record, so a guard that
+silently discarded them could not pass.
+
+##### Delete And Vacuum Budgets Are Distinct
+
+The delete budget must be satisfiable at a free-space figure the VACUUM 2× budget
+rejects, proving the two checks are genuinely separate rather than one check
+spelled twice.
+
+Running at exactly that figure must complete with rows deleted and before/after
+bytes unchanged — the "rows removed, bytes not yet reclaimed" outcome.
+
+##### Live Rows Are Never Doomed
+
+`source_key IS NULL` rows on both sides of the cutoff must be absent from the
+scan's doomed set and present in full after the run, which is the delete-side
+half of the live-rows invariant.
+
 ### Schema
 
 The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
