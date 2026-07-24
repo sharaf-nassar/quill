@@ -211,7 +211,21 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useModelSessions` | Selected provider-qualified model paging with atomic shared-refresh replay and operation-local recovery | `get_model_sessions` |
 | `useSessionModelHistory` | Per-`(provider, sessionId, range)` lazy model-chain history for expanded Models rows; shared refresh refetches expanded rows, invalidates collapsed caches, and preserves good data behind row-local errors | `get_session_model_history` |
 
-[[src/hooks/useCachedInvoke.ts#useCachedInvoke]] keeps analytics request results by identity while revalidating in the background. `AnalyticsView` owns the single snapshot-count request for every empty-state gate and passes it to the Now tab, while its runtime hook supplies `useCodeInsights` so the comparison cards do not duplicate the current-window runtime request.
+[[src/hooks/useCachedInvoke.ts#useCachedInvoke]] is the shared cache primitive
+for `useModelAnalytics`, `useTokenData`, `useCodeStats`, `useCodeInsights`,
+`useLlmRuntimeStats`, `useContextSavingsStats`, `useSessionHealth`,
+`useActivityPattern`, `useBreakdownData`, and `useAnalyticsData`. Each hook
+keeps identity-scoped accepted data, starts its first request immediately, and
+debounces later refreshes by 200 ms. A generation guard discards stale
+responses, a same-identity in-flight request coalesces refreshes, and equal
+JSON results retain their prior object identity. This gives every ported hook
+stale-while-revalidate rendering without duplicating request-lifecycle code.
+
+`AnalyticsView` owns the single snapshot-count request for every empty-state
+gate and passes it to the Now tab, while its runtime hook supplies
+`useCodeInsights` so the comparison cards do not duplicate the current-window
+runtime request. `useTokenData` also keeps range-independent hostnames in a
+separate cache identity, avoiding a hostname IPC call on range changes.
 
 `useLiveSummaryData` fetches provider-filtered token and session history on demand so the top workload rail can aggregate `Sessions`, `Projects`, and range-scoped `Tokens` across whichever providers are enabled, while the grouped row sections continue to consume the already-fetched `UsageData` snapshot from `fetch_usage_data`.
 

@@ -25,6 +25,27 @@ Analytics session drill-down uses the same provider plus session id pair when re
 
 Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the Now-tab card needs to exclude the sub-agent traffic instead.
 
+## Database Maintenance Pipeline
+
+Manual database compaction quiesces ingest before VACUUM so SQLite maintenance
+reclaims space without racing hook writes or background reconciliation.
+
+1. The Performance settings control invokes `compact_database` and subscribes
+   to `compact-database-progress` while its request is in flight.
+2. The backend takes [[src-tauri/src/lib.rs#begin_ingest_quiesce]], which
+   blocks app-owned mutations behind the reader/writer gate and makes new HTTP
+   ingest requests return retriable `503` responses.
+3. The command emits a disk-space progress phase, performs free-space
+   preflight, and reports a structured `skipped` result if there is not enough
+   room for a safe rebuild.
+4. On success, [[src-tauri/src/storage.rs#Storage#vacuum_database]] opens its
+   dedicated SQLite connection, emits the compaction phase, and runs VACUUM.
+5. Releasing the guard permits pending internal writes to continue; the
+   command then emits `compact-database-finished` with either the completed
+   before/after footprint or the safe skip reason.
+6. The settings surface renders progress and the terminal result inline;
+   external hook clients retry their rejected ingest instead of losing it.
+
 ## Learning Analysis Pipeline
 
 Tool-use observations, git history, and recent session history are analyzed by LLMs to discover reusable behavioral patterns.

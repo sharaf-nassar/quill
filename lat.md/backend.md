@@ -64,6 +64,16 @@ Each endpoint validates input (length limits, range checks, type validation) bef
 
 The gate is process-wide and reader/writer based: maintenance obtains the writer side before setting its visible quiesce flag, while each guarded ingest or backfill mutation obtains a reader permit. A write already admitted completes before maintenance begins; a write that races after admission waits until the lease is released, so the system never drops history because of a transient maintenance lock. The `write_arriving_during_quiesce_lands_after_unquiesce` regression test proves that a blocked write remains absent during the active window and lands once maintenance ends.
 
+#### Maintenance Quiesce Test Specs
+
+These specs prove maintenance excludes writes without turning a transient
+database operation into lost ingest history.
+
+##### Deferred Ingest Is Preserved
+
+An ingest write admitted while maintenance owns the writer gate must stay
+pending for the entire quiesce window, then execute after the guard releases.
+
 ## Database
 
 [[src-tauri/src/storage.rs]] manages a SQLite database with WAL mode and 5-second busy timeout. The largest backend module.
@@ -89,8 +99,19 @@ The command acquires [[src-tauri/src/lib.rs#begin_ingest_quiesce]] before it
 checks free disk space and runs [[src-tauri/src/storage.rs#Storage#vacuum_database]]
 on a dedicated SQLite connection. Its result reports the before/after database
 footprint on success, or a reason with unchanged size when preflight or VACUUM
-cannot proceed. The temporary-database regression test covers a successful
-preflight and completed compaction report.
+cannot proceed. It emits `compact-database-progress` for the disk-space and
+VACUUM phases, then emits `compact-database-finished` with the structured
+result after the maintenance lease is released.
+
+#### Database Compaction Test Specs
+
+These specs pin the user-triggered maintenance result contract without needing
+an application window or a production-sized database.
+
+##### Completed Footprint Report
+
+A successful preflight followed by VACUUM must report `completed`, preserve an
+empty skip reason, and return the actual before/after database footprint.
 
 ### Schema
 

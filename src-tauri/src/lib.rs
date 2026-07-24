@@ -4959,7 +4959,7 @@ mod tests {
         }
     }
 
-    // @lat: [[backend#HTTP API Server#Maintenance quiesce]]
+    // @lat: [[backend#HTTP API Server#Maintenance quiesce#Maintenance Quiesce Test Specs#Deferred Ingest Is Preserved]]
     #[test]
     fn write_arriving_during_quiesce_lands_after_unquiesce() {
         use std::sync::{

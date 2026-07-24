@@ -16890,7 +16890,7 @@ mod tests {
         }
     }
 
-    // @lat: [[backend#Database#Database compaction]]
+    // @lat: [[backend#Database#Database compaction#Database Compaction Test Specs#Completed Footprint Report]]
     #[test]
     #[serial]
     fn vacuum_database_reports_completed_footprint() {
