@@ -71,6 +71,10 @@ The SQLite database file path varies by operating system.
 - Linux: `~/.local/share/com.quilltoolkit.app/usage.db`
 - macOS: `~/Library/Application Support/com.quilltoolkit.app/usage.db`
 
+### VACUUM maintenance spike
+
+[[src-tauri/src/bin/vacuum_spike.rs]] creates and removes a 7.45 GB synthetic SQLite copy to measure VACUUM and demonstrate that a process-wide quiesce flag makes ingest retry during maintenance before the compact-database command is implemented.
+
 ### Schema
 
 The database schema is versioned through migration 33 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
