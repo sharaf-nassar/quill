@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useCachedInvoke } from "./useCachedInvoke";
 import type {
   BreakdownMode,
   HookBreakdown,
@@ -106,9 +107,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
     }
   }, [mode, days, requestKey, skillAllTime, skillProvider, hookAllTime, hookProvider]);
 
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+  useCachedInvoke({ identity: `breakdown:${requestKey}`, request: fetchData, normalizeError: String });
 
   // Auto-refresh when new token data arrives via Tauri event
   useEffect(() => {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useCachedInvoke } from "./useCachedInvoke";
 import type {
 	ContextSavingsAnalytics,
 	ContextSavingsAnalyticsResponse,
@@ -171,9 +172,11 @@ export function useContextSavingsStats(range: RangeType, limit = 40) {
 		}
 	}, [range, limit]);
 
-	useEffect(() => {
-		fetchData();
-	}, [fetchData]);
+	useCachedInvoke({
+		identity: `context-savings:${range}:${limit}`,
+		request: fetchData,
+		normalizeError: String,
+	});
 
 	useEffect(() => {
 		let mounted = true;

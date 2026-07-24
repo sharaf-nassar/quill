@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { RangeType, DataPoint, BucketStats, MergedBucket } from "../types";
 import { usageBucketRefKey } from "../types";
+import { useCachedInvoke } from "./useCachedInvoke";
 
 const REFRESH_INTERVAL_MS = 60_000; // Re-fetch every 60s to keep chart current
 
@@ -146,9 +147,7 @@ export function useAnalyticsData(
     }
   }, [bucketIdentity, range]);
 
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+  useCachedInvoke({ identity: `analytics:${bucketIdentity}:${range}`, request: fetchData, normalizeError: String });
 
   useEffect(() => {
     const interval = setInterval(fetchData, REFRESH_INTERVAL_MS);

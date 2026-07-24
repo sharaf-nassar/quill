@@ -1,70 +1,27 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { RangeType, CodeStats, CodeStatsHistoryPoint } from "../types";
+import { useCachedInvoke } from "./useCachedInvoke";
 
 const REFRESH_DEBOUNCE_MS = 1000;
+interface CodeStatsResult { stats: CodeStats; history: CodeStatsHistoryPoint[]; }
 
 export function useCodeStats(range: RangeType) {
-	const [stats, setStats] = useState<CodeStats | null>(null);
-	const [history, setHistory] = useState<CodeStatsHistoryPoint[]>([]);
-	const [loading, setLoading] = useState(true);
-	const [error, setError] = useState<string | null>(null);
-	const initialLoadDone = useRef(false);
-
-	const fetchData = useCallback(async () => {
-		if (!initialLoadDone.current) {
-			setLoading(true);
-		}
-		setError(null);
-
-		try {
-			const [statsData, historyData] = await Promise.all([
-				invoke<CodeStats>("get_code_stats", { range }),
-				invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", { range }),
-			]);
-			setStats(statsData);
-			setHistory(historyData);
-		} catch (e) {
-			console.error("Code stats fetch error:", e);
-			setError(String(e));
-		} finally {
-			setLoading(false);
-			initialLoadDone.current = true;
-		}
+	const request = useCallback(async (): Promise<CodeStatsResult> => {
+		const [stats, history] = await Promise.all([
+			invoke<CodeStats>("get_code_stats", { range }),
+			invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", { range }),
+		]);
+		return { stats, history };
 	}, [range]);
-
+	const { state, refresh } = useCachedInvoke({ identity: `code-stats:${range}`, request, normalizeError: String });
 	useEffect(() => {
-		fetchData();
-	}, [fetchData]);
-
-	useEffect(() => {
-		let mounted = true;
 		let timer: ReturnType<typeof setTimeout> | null = null;
-		const scheduleRefresh = () => {
-			if (!mounted) return;
-			if (timer) clearTimeout(timer);
-			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
-		};
-		const unlistenPromises = [
-			listen("sessions-index-updated", scheduleRefresh),
-			listen("transcript-analytics-updated", scheduleRefresh),
-		];
-
-		return () => {
-			mounted = false;
-			if (timer) clearTimeout(timer);
-			for (const unlistenPromise of unlistenPromises) {
-				unlistenPromise.then((fn) => fn());
-			}
-		};
-	}, [fetchData]);
-
-	// Periodic refresh every 60s
-	useEffect(() => {
-		const interval = setInterval(fetchData, 60_000);
-		return () => clearInterval(interval);
-	}, [fetchData]);
-
-	return { stats, history, loading, error, refresh: fetchData };
+		const schedule = () => { if (timer) clearTimeout(timer); timer = setTimeout(refresh, REFRESH_DEBOUNCE_MS); };
+		const unlisten = [listen("sessions-index-updated", schedule), listen("transcript-analytics-updated", schedule)];
+		return () => { if (timer) clearTimeout(timer); for (const promise of unlisten) promise.then((fn) => fn()); };
+	}, [refresh]);
+	useEffect(() => { const interval = setInterval(refresh, 60_000); return () => clearInterval(interval); }, [refresh]);
+	return { stats: state.data?.stats ?? null, history: state.data?.history ?? [], loading: state.initialLoading, error: state.error, refresh };
 }

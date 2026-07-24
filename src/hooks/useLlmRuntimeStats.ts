@@ -1,80 +1,25 @@
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { RangeType, LlmRuntimeStats, SparklinePoint } from "../types";
+import { useCachedInvoke } from "./useCachedInvoke";
 
 const REFRESH_DEBOUNCE_MS = 1000;
-
-interface LlmRuntimeStatsResult {
-	totalRuntimeSecs: number | null;
-	turnCount: number;
-	sessionCount: number;
-	avgPerTurnSecs: number | null;
-	sparkline: SparklinePoint[];
-	loading: boolean;
-}
+interface LlmRuntimeStatsResult { totalRuntimeSecs: number | null; turnCount: number; sessionCount: number; avgPerTurnSecs: number | null; sparkline: SparklinePoint[]; loading: boolean; }
+const EMPTY: Omit<LlmRuntimeStatsResult, "loading"> = { totalRuntimeSecs: null, turnCount: 0, sessionCount: 0, avgPerTurnSecs: null, sparkline: [] };
 
 export function useLlmRuntimeStats(range: RangeType): LlmRuntimeStatsResult {
-	const [result, setResult] = useState<LlmRuntimeStatsResult>({
-		totalRuntimeSecs: null, turnCount: 0, sessionCount: 0, avgPerTurnSecs: null,
-		sparkline: [], loading: true,
-	});
-
-	const fetchData = useCallback(async () => {
-		try {
-			const stats = await invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range });
-
-			if (stats.turn_count === 0) {
-				setResult({
-					totalRuntimeSecs: null, turnCount: 0, sessionCount: 0, avgPerTurnSecs: null,
-					sparkline: [], loading: false,
-				});
-				return;
-			}
-
-			setResult({
-				totalRuntimeSecs: stats.total_runtime_secs,
-				turnCount: stats.turn_count,
-				sessionCount: stats.session_count,
-				avgPerTurnSecs: stats.avg_per_turn_secs,
-				sparkline: stats.sparkline.map((v) => ({ value: v })),
-				loading: false,
-			});
-		} catch (e) {
-			console.error("LLM runtime stats error:", e);
-			setResult({
-				totalRuntimeSecs: null, turnCount: 0, sessionCount: 0, avgPerTurnSecs: null,
-				sparkline: [], loading: false,
-			});
-		}
+	const request = useCallback(async (): Promise<Omit<LlmRuntimeStatsResult, "loading">> => {
+		const stats = await invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range });
+		return stats.turn_count === 0 ? EMPTY : { totalRuntimeSecs: stats.total_runtime_secs, turnCount: stats.turn_count, sessionCount: stats.session_count, avgPerTurnSecs: stats.avg_per_turn_secs, sparkline: stats.sparkline.map((value) => ({ value })) };
 	}, [range]);
-
-	useEffect(() => { fetchData(); }, [fetchData]);
+	const { state, refresh } = useCachedInvoke({ identity: `llm-runtime:${range}`, request, normalizeError: String });
 	useEffect(() => {
-		let mounted = true;
 		let timer: ReturnType<typeof setTimeout> | null = null;
-		const scheduleRefresh = () => {
-			if (!mounted) return;
-			if (timer) clearTimeout(timer);
-			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
-		};
-		const unlistenPromises = [
-			listen("sessions-index-updated", scheduleRefresh),
-			listen("transcript-analytics-updated", scheduleRefresh),
-		];
-
-		return () => {
-			mounted = false;
-			if (timer) clearTimeout(timer);
-			for (const unlistenPromise of unlistenPromises) {
-				unlistenPromise.then((fn) => fn());
-			}
-		};
-	}, [fetchData]);
-	useEffect(() => {
-		const interval = setInterval(fetchData, 60_000);
-		return () => clearInterval(interval);
-	}, [fetchData]);
-
-	return result;
+		const schedule = () => { if (timer) clearTimeout(timer); timer = setTimeout(refresh, REFRESH_DEBOUNCE_MS); };
+		const unlisten = [listen("tokens-updated", schedule), listen("sessions-index-updated", schedule), listen("transcript-analytics-updated", schedule)];
+		return () => { if (timer) clearTimeout(timer); for (const promise of unlisten) promise.then((fn) => fn()); };
+	}, [refresh]);
+	useEffect(() => { const interval = setInterval(refresh, 60_000); return () => clearInterval(interval); }, [refresh]);
+	return { ...(state.data ?? EMPTY), loading: state.initialLoading };
 }

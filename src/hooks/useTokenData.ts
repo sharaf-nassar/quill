@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useCachedInvoke } from "./useCachedInvoke";
 import type {
   IntegrationProvider,
   RangeType,
@@ -75,9 +76,11 @@ export function useTokenData(
     }
   }, [range, provider, hostname, sessionId, cwd]);
 
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+	useCachedInvoke({
+		identity: `token-data:${range}:${provider ?? "all"}:${hostname ?? "all"}:${sessionId ?? "all"}:${cwd ?? "all"}`,
+		request: fetchData,
+		normalizeError: String,
+	});
 
   // Auto-refresh when new token data arrives via Tauri event
   useEffect(() => {

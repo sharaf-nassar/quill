@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { useCachedInvoke } from "./useCachedInvoke";
 import type {
 	RangeType,
 	TokenDataPoint,
@@ -264,9 +265,7 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 		}
 	}, [range]);
 
-	useEffect(() => {
-		fetchData();
-	}, [fetchData]);
+	useCachedInvoke({ identity: `code-insights:${range}`, request: fetchData, normalizeError: String });
 
 	useEffect(() => {
 		let mounted = true;
