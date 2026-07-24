@@ -43,7 +43,10 @@ function addMockBadge(): void {
  */
 export function installBrowserMock(): void {
   mockWindows("main");
-  mockIPC((cmd, args) => handleInvoke(cmd, args as Record<string, unknown> | undefined));
+  mockIPC(
+    (cmd, args) => handleInvoke(cmd, args as Record<string, unknown> | undefined),
+    { shouldMockEvents: true },
+  );
   (window as unknown as { __QUILL_BROWSER_MOCK__?: boolean }).__QUILL_BROWSER_MOCK__ = true;
   addMockBadge();
   console.info("[quill] browser mock IPC installed — running with fixture data");

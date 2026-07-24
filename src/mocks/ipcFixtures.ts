@@ -3,6 +3,7 @@
 // Rust backend. Dev-only; never bundled into production. Values are deterministic
 // (no Math.random at build) so design screenshots stay stable across reloads.
 
+import { emit } from "@tauri-apps/api/event";
 import type {
   BucketStats,
   CodeStats,
@@ -2290,6 +2291,20 @@ const fixtures: Record<string, FixtureHandler> = {
   set_runtime_settings: () => runtimeSettings,
   get_learning_settings: () => learningSettings,
   set_learning_settings: () => learningSettings,
+  compact_database: async () => {
+    await emit("compact-database-progress", { phase: "Checking disk space", pct: 15 });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await emit("compact-database-progress", { phase: "Preparing database", pct: 45 });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const result = {
+      status: "skipped" as const,
+      reason: "not enough free disk space for a safe compaction.",
+      bytes_before: 1_048_576_000,
+      bytes_after: 1_048_576_000,
+    };
+    await emit("compact-database-finished", result);
+    return result;
+  },
   // live usage
   fetch_usage_data: () => usageData,
   get_usage_history: () => usageHistory(),
