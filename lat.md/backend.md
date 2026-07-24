@@ -1268,6 +1268,114 @@ that errors after a partial write would leave the database configured with a
 window nobody consented to, which is exactly the failure the floor exists to
 prevent.
 
+### Retention preview command
+
+[[src-tauri/src/lib.rs#preview_retention]] is the consent gate: it counts exactly what a prune would remove and mints the `cutoff` token the destructive run demands, which is what makes a run backend-side unreachable without a preview.
+
+The guarantee is structural rather than procedural. `run_retention_maintenance`
+accepts only a `confirmed_cutoff`, and this command is the only thing that
+produces one, so a UI that forgot to ask cannot prune — the backend refuses on
+its own. [[src-tauri/src/retention.rs#derive_retention_cutoff]] is called
+**once**, here, and the value travels to the run verbatim; a cutoff re-derived
+inside the run would sit later than the one the user approved and delete rows
+this preview never counted.
+
+The counts are exact, not estimated, because the preview runs the *same*
+[[src-tauri/src/retention_engine.rs#scan_doomed_rows]] pass the run does, under
+the same ingest quiesce lease and the same `spawn_blocking` treatment as
+`compact_database`. Consenting to this payload is therefore consenting to the
+set the run deletes, which is the whole point of the counting being shared
+rather than approximated by a cheaper query.
+
+#### Why the counting phase is where progress matters most
+
+The preview is *nothing but* the counting phase, so a bar pinned at zero is not a cosmetic flaw here — it is the entire visible behaviour of the command.
+
+Percentages go out through [[src-tauri/src/lib.rs#emit_retention_maintenance_progress]]
+under [[src-tauri/src/lib.rs#RETENTION_PHASE_COUNTING_ROWS]] — the run's emitter
+and the run's phase vocabulary, not a third event — so the Settings UI keeps one
+listener pair for "previewing" and "running".
+[[src-tauri/src/lib.rs#build_retention_preview]] emits one tick before the scan
+opens so the phase is on screen from the first frame, and the scan's own
+wall-clock heartbeat plus its per-table completion nudges carry it to 100.
+
+#### Telling two zeroes apart
+
+A preview that counts nothing is a skip, and *which* skip is a different sentence to the user: an empty database has no history, while a populated one simply has none old enough yet.
+
+[[src-tauri/src/retention_engine.rs#count_owned_rows]] is what separates them. It
+also closes the partition the scan opens — owned rows are exactly the doomed set,
+plus the pre-cutoff rows the conformance guard kept, plus everything at or after
+the cutoff — so `everything_older` falls out by subtraction instead of a third
+full pass over both tables. `everything_older` is the flag that drives the blunt
+"this removes all of it" confirmation copy rather than the ordinary
+"older than N days" copy.
+
+The skip vocabulary is [[src-tauri/src/lib.rs#RETENTION_DISABLED_REASON]] (no
+window configured — the one case with no cutoff to return at all),
+[[src-tauri/src/lib.rs#RETENTION_FRESH_INSTALL_REASON]], and the run's own
+[[src-tauri/src/retention_engine.rs#RETENTION_NOTHING_OLDER_REASON]]. Operational
+failures a user can act on — a database that will not open, a file that cannot be
+stat'd — are structured skips too, matching the run; a SQL failure mid-scan is
+not, because it means the database is in a state neither the command nor the user
+can reason about.
+
+#### Consent to a capability, not to a row count
+
+[[src-tauri/src/lib.rs#RETENTION_AFFECTED_SURFACES]] rides on the ready payload because "delete 689,441 rows" is not something anybody has an intuition for.
+
+The three surfaces named — session drilldowns, subagent trees, batch session code
+stats — are the only readers a window at the 30-day floor can starve, since
+`range_to_duration` caps every range-based reader at 30 days. The list ships from
+the backend rather than living in the frontend so the copy and the cutoff that
+justifies it always arrive together. A skip carries an empty list: nothing is
+being removed, so nothing is being lost.
+
+#### Retention Preview Command Test Specs
+
+These specs pin the property the consent gate exists for — that the number a user
+approves is the number the run removes — and the three edge states where the
+honest answer is "nothing to do" or "all of it".
+
+##### Preview Accuracy
+
+The preview's exact counts must equal the run's deleted counts on a quiesced
+fixture with no interleaved writes, with the run driven by the preview's *own*
+cutoff rather than a re-derived one.
+
+The cutoff must land on the fixture's 90-day boundary, the per-table counts must
+match the plan's arithmetic for both doomed and non-conforming rows, and the
+counting phase must open at 0, pass through each table's half of the bar, and
+close at 100 without ever going backwards.
+
+##### Fresh Install Previews Nothing
+
+A database with no source-owned rows at all must preview zero and skip with the
+fresh-install reason, never with "nothing older than the cutoff" — a user with an
+empty database is not being told their history is too young.
+
+The cutoff such a preview still mints must drive a run that also skips, deleting
+nothing.
+
+##### Nothing Older Previews Nothing
+
+A populated database whose rows are all newer than the cutoff must preview zero
+and skip with the nothing-older reason, and the run driven by that cutoff must
+skip as well.
+
+The distinction from the fresh-install case is the assertion: the same zero
+counts must carry a different, correct explanation.
+
+##### Everything Older Is Reported As Total
+
+A cutoff newer than every source-owned row must set `everything_older`, report
+the whole owned corpus per table, and leave the run free to proceed to a
+completed delete of exactly those rows.
+
+This is the case that needs the blunt confirmation copy, so a preview that
+reported it as an ordinary partial prune would understate what the user is
+agreeing to.
+
 ### Learning Commands (18)
 
 Commands for managing the behavioral learning pipeline settings, rules, and observations.

@@ -558,6 +558,35 @@ fn nonconforming_count_sql(target: RetentionTarget) -> String {
     )
 }
 
+/// Every source-owned row in a target table, regardless of age.
+fn owned_count_sql(target: RetentionTarget) -> String {
+    format!(
+        "SELECT COUNT(*) FROM {} WHERE source_key IS NOT NULL",
+        target.table()
+    )
+}
+
+/// Count the source-owned rows both target tables hold, at any age.
+///
+/// This exists for the preview, which has to tell two zero-row outcomes apart
+/// that a run has no reason to distinguish: a database with no owned rows at
+/// all — where "nothing older than the cutoff" is a misleading thing to say —
+/// and a populated database whose rows are simply all newer than the cutoff.
+///
+/// It also closes the partition the scan opens. Owned rows are exactly the
+/// doomed set, plus the pre-cutoff rows the conformance guard kept, plus
+/// everything at or after the cutoff, so a preview derives "the cutoff covers
+/// every owned row" by subtraction instead of paying for a third full pass
+/// over both tables.
+pub fn count_owned_rows(conn: &Connection) -> Result<RetentionTableCounts, RetentionDeleteError> {
+    let mut counts = RetentionTableCounts::default();
+    for target in RetentionTarget::ALL {
+        let rows: i64 = conn.query_row(&owned_count_sql(target), [], |row| row.get(0))?;
+        counts = target.with_count(&counts, rows.max(0));
+    }
+    Ok(counts)
+}
+
 /// Open the dedicated maintenance connection, pragmas pinned.
 ///
 /// The caller **must** drop the returned connection before invoking

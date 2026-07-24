@@ -3457,7 +3457,6 @@ fn emit_database_compaction_progress(app: &tauri::AppHandle, phase: &'static str
 /// Declared once here rather than at each emit site because two commands emit
 /// it — `preview_retention` reuses it for its counting phase so the Settings
 /// UI needs a single listener pair for preview and for a full run.
-#[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_MAINTENANCE_PROGRESS_EVENT: &str = "retention-maintenance-progress";
 
 /// Event carrying the terminal retention-maintenance result, including the
@@ -3470,7 +3469,6 @@ const RETENTION_MAINTENANCE_FINISHED_EVENT: &str = "retention-maintenance-finish
 /// The counting phase is one `CREATE TEMP TABLE … AS SELECT` with no natural
 /// progress signal, so its `pct` is driven by a wall-clock heartbeat rather
 /// than left pinned at zero.
-#[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_PHASE_COUNTING_ROWS: &str = "Counting rows";
 
 /// Phase label for the delete-phase disk/WAL/TEMP preflight.
@@ -3490,7 +3488,6 @@ const RETENTION_PHASE_COMPACTING_DATABASE: &str = "Compacting database";
 /// in shape to [`DatabaseCompactionProgress`] so the frontend can reuse the
 /// same progress rendering for both maintenance paths.
 #[derive(Clone, serde::Serialize)]
-#[allow(dead_code)] // Constructed by the retention commands, which land next.
 struct RetentionMaintenanceProgress {
     phase: &'static str,
     pct: u8,
@@ -3501,7 +3498,6 @@ struct RetentionMaintenanceProgress {
 /// `phase` is `&'static str` on purpose: callers pass a member of the shared
 /// phase vocabulary above rather than an ad-hoc string, so the phases the UI
 /// can observe stay enumerable from this file.
-#[allow(dead_code)] // Called by the retention commands, which land next.
 fn emit_retention_maintenance_progress(app: &tauri::AppHandle, phase: &'static str, pct: u8) {
     if let Err(error) = app.emit(
         RETENTION_MAINTENANCE_PROGRESS_EVENT,
@@ -3597,6 +3593,244 @@ async fn set_retention_policy(
     window_days: Option<i64>,
 ) -> Result<retention::RetentionPolicy, String> {
     apply_retention_policy(get_storage()?, window_days)
+}
+
+/// Wire value of a preview that produced a usable cutoff.
+const RETENTION_PREVIEW_READY: &str = "ready";
+
+/// Wire value of a preview that produced nothing to consent to.
+const RETENTION_PREVIEW_SKIPPED: &str = "skipped";
+
+/// Skip reason when no retention window is configured.
+const RETENTION_DISABLED_REASON: &str =
+    "Retention is set to never; nothing is eligible for pruning";
+
+/// Skip reason for a database that holds no source-owned rows at all.
+///
+/// Distinct from [`retention_engine::RETENTION_NOTHING_OLDER_REASON`] because
+/// the two say different things to a user: one means "your history is younger
+/// than the window", the other means "there is no history yet".
+const RETENTION_FRESH_INSTALL_REASON: &str =
+    "No transcript history has been recorded yet, so there is nothing to prune";
+
+/// The capability a prune costs, in product language, pre-cutoff only.
+///
+/// "Delete 689,441 rows" is not something anybody has an intuition for, so the
+/// consent step names surfaces rather than tables. These three are the only
+/// readers a window at the 30-day floor can starve — `get_session_breakdown`,
+/// `get_session_subagent_tree` and `get_batch_session_code_stats` — because
+/// `range_to_duration` caps every range-based reader at 30 days. The list rides
+/// on the preview payload rather than living in the frontend so the copy and
+/// the cutoff that justifies it always arrive together.
+const RETENTION_AFFECTED_SURFACES: [&str; 3] = [
+    "Session drilldowns for sessions older than the cutoff",
+    "Subagent trees for pre-cutoff sessions",
+    "Batch session code stats for pre-cutoff sessions",
+];
+
+/// What [`preview_retention`] returns, and the only source of the `cutoff`
+/// token [`run_retention_maintenance`] requires.
+///
+/// The counts are **exact**, not estimated: they come from the same one-pass
+/// doomed-rowid scan the run itself uses, so consenting to this payload is
+/// consenting to the set the run deletes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RetentionPreview {
+    /// [`RETENTION_PREVIEW_READY`] or [`RETENTION_PREVIEW_SKIPPED`].
+    status: &'static str,
+    /// Structured skip reason; `None` on a ready preview.
+    reason: Option<String>,
+    /// The token the confirm step hands back to the run. `None` only when no
+    /// window is configured, because there is then no cutoff to derive.
+    cutoff: Option<String>,
+    window_days: Option<i64>,
+    tool_actions_rows: i64,
+    session_events_rows: i64,
+    tool_actions_nonconforming: i64,
+    session_events_nonconforming: i64,
+    /// The cutoff covers every source-owned row, which is the case that needs
+    /// the blunt confirmation copy rather than the ordinary "older than N days"
+    /// copy.
+    everything_older: bool,
+    bytes_before: u64,
+    affected_surfaces: Vec<String>,
+}
+
+impl RetentionPreview {
+    /// A preview with nothing to consent to.
+    ///
+    /// The non-conformance counts are carried through even here: a database
+    /// whose only pre-cutoff rows failed the guard has nothing to delete *and*
+    /// something worth reporting, and zeroing that would hide it.
+    fn skipped(
+        reason: String,
+        cutoff: Option<String>,
+        window_days: Option<i64>,
+        bytes_before: u64,
+        nonconforming: retention::RetentionTableCounts,
+    ) -> Self {
+        Self {
+            status: RETENTION_PREVIEW_SKIPPED,
+            reason: Some(reason),
+            cutoff,
+            window_days,
+            tool_actions_rows: 0,
+            session_events_rows: 0,
+            tool_actions_nonconforming: nonconforming.tool_actions,
+            session_events_nonconforming: nonconforming.session_events,
+            everything_older: false,
+            bytes_before,
+            affected_surfaces: Vec::new(),
+        }
+    }
+}
+
+/// Derive the cutoff, scan for what it dooms, and price the consent.
+///
+/// Split out of [`preview_retention`] so the whole decision is testable
+/// without an application window: `now` is injected rather than read, and the
+/// counting-phase percentages go to a caller-supplied sink rather than to
+/// `tauri::Emitter`. The command supplies [`Utc::now`] and a sink that emits
+/// through [`emit_retention_maintenance_progress`].
+///
+/// Operational failures that a user can act on — no window configured, a
+/// database that will not open — are structured skips rather than errors,
+/// matching the run. A SQL failure mid-scan is *not*: it means the database is
+/// in a state neither this command nor the user can reason about, so it
+/// propagates.
+fn build_retention_preview(
+    storage: &Storage,
+    now: DateTime<Utc>,
+    scan_progress: Option<retention_engine::ScanProgressSink>,
+) -> Result<RetentionPreview, String> {
+    let window_days = storage.read_retention_window_days()?;
+    let bytes_before = match std::fs::metadata(storage.database_path()) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            return Ok(RetentionPreview::skipped(
+                format!("Could not inspect the database before previewing: {error}"),
+                None,
+                window_days,
+                0,
+                retention::RetentionTableCounts::default(),
+            ));
+        }
+    };
+    let Some(window_days) = window_days else {
+        return Ok(RetentionPreview::skipped(
+            RETENTION_DISABLED_REASON.to_string(),
+            None,
+            None,
+            bytes_before,
+            retention::RetentionTableCounts::default(),
+        ));
+    };
+
+    // Derived exactly once, here. The run is handed this value back and uses
+    // it verbatim; a cutoff re-derived inside the run would sit later than the
+    // one the user approved and delete rows this preview never counted.
+    let cutoff = retention::derive_retention_cutoff(now, window_days).map_err(|e| e.to_string())?;
+
+    let conn = match retention_engine::open_maintenance_connection(storage.database_path()) {
+        Ok(conn) => conn,
+        Err(error) => {
+            return Ok(RetentionPreview::skipped(
+                error.to_string(),
+                Some(cutoff),
+                Some(window_days),
+                bytes_before,
+                retention::RetentionTableCounts::default(),
+            ));
+        }
+    };
+
+    // One tick before the scan starts, so the phase is on screen from the
+    // first frame rather than appearing only once a table finishes.
+    if let Some(sink) = scan_progress.as_ref() {
+        sink(0);
+    }
+    let controls = retention_engine::RetentionDeleteControls {
+        scan_progress,
+        ..retention_engine::RetentionDeleteControls::default()
+    };
+
+    let scan = retention_engine::scan_doomed_rows(&conn, &cutoff, &controls)
+        .map_err(|error| error.to_string())?;
+    let owned = retention_engine::count_owned_rows(&conn).map_err(|error| error.to_string())?;
+    // Both `retention_doomed_*` temp tables live on this connection and are
+    // pure cost once counted, so the preview releases them before it returns
+    // rather than holding them until the caller drops the payload.
+    drop(conn);
+
+    let owned_total = owned.tool_actions + owned.session_events;
+    let nonconforming_total = scan.nonconforming.tool_actions + scan.nonconforming.session_events;
+    let doomed_total = scan.total_doomed();
+
+    if doomed_total == 0 {
+        let reason = if owned_total == 0 {
+            RETENTION_FRESH_INSTALL_REASON
+        } else {
+            retention_engine::RETENTION_NOTHING_OLDER_REASON
+        };
+        return Ok(RetentionPreview::skipped(
+            reason.to_string(),
+            Some(cutoff),
+            Some(window_days),
+            bytes_before,
+            scan.nonconforming,
+        ));
+    }
+
+    // Owned rows partition into doomed, pre-cutoff non-conforming, and
+    // everything at or after the cutoff, so the third term is a subtraction
+    // rather than another full scan of both tables.
+    let retained = owned_total - doomed_total - nonconforming_total;
+
+    Ok(RetentionPreview {
+        status: RETENTION_PREVIEW_READY,
+        reason: None,
+        cutoff: Some(cutoff),
+        window_days: Some(window_days),
+        tool_actions_rows: scan.doomed.tool_actions,
+        session_events_rows: scan.doomed.session_events,
+        tool_actions_nonconforming: scan.nonconforming.tool_actions,
+        session_events_nonconforming: scan.nonconforming.session_events,
+        everything_older: retained <= 0,
+        bytes_before,
+        affected_surfaces: RETENTION_AFFECTED_SURFACES
+            .iter()
+            .map(|surface| (*surface).to_string())
+            .collect(),
+    })
+}
+
+/// The consent gate: count exactly what a prune would remove, and mint the
+/// cutoff token the destructive run requires.
+///
+/// This is what makes a destructive run unreachable without a preview.
+/// `run_retention_maintenance` accepts only a `confirmed_cutoff`, and this
+/// command is the only thing that produces one, so the guarantee is enforced
+/// by the backend rather than by the UI remembering to ask.
+///
+/// It runs under the ingest quiesce lease for the duration of the scan and
+/// under `spawn_blocking` like `compact_database`, because the scan is a full
+/// pass over both target tables and must not sit on the async runtime. The
+/// counting phase is the *whole* of this command, which is exactly where a
+/// progress bar pinned at zero would read as a hang, so its percentage goes
+/// out through the shared [`RETENTION_MAINTENANCE_PROGRESS_EVENT`] emitter —
+/// the same event the run uses, so the Settings UI needs one listener pair for
+/// both.
+#[tauri::command]
+async fn preview_retention(app: tauri::AppHandle) -> Result<RetentionPreview, String> {
+    let storage = get_storage()?;
+    let progress_app = app.clone();
+    run_blocking(move || {
+        let _quiesce = begin_ingest_quiesce();
+        let sink: retention_engine::ScanProgressSink = Arc::new(move |pct| {
+            emit_retention_maintenance_progress(&progress_app, RETENTION_PHASE_COUNTING_ROWS, pct);
+        });
+        build_retention_preview(storage, Utc::now(), Some(sink))
+    })
 }
 
 #[tauri::command]
@@ -4984,12 +5218,12 @@ pub fn run() {
             get_runtime_settings,
             set_runtime_settings,
             compact_database,
-            // The remaining retention commands — `preview_retention` and
-            // `run_retention_maintenance` — register here too, beside
-            // `compact_database`: one maintenance surface, one quiesce lease,
-            // one progress-event shape.
+            // The retention commands register beside `compact_database`: one
+            // maintenance surface, one quiesce lease, one progress-event shape.
+            // `run_retention_maintenance` joins them here too.
             get_retention_policy,
             set_retention_policy,
+            preview_retention,
             get_learning_settings,
             set_learning_settings,
             get_learning_capability,
@@ -5290,6 +5524,306 @@ mod tests {
                 "rejecting {rejected} must leave the stored window unchanged"
             );
         }
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    /// Six 30-day buckets back from a fixed anchor, so a 90-day window lands
+    /// exactly on a bucket boundary and every expected count is arithmetic
+    /// over the plan rather than a copied literal.
+    fn retention_preview_spec() -> retention_fixture::RetentionFixtureSpec {
+        retention_fixture::RetentionFixtureSpec {
+            anchor: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .expect("parse anchor")
+                .with_timezone(&Utc),
+            months: 6,
+            owned_rows_per_month: 8,
+            live_rows_per_month: 3,
+            sources: 2,
+        }
+    }
+
+    /// A counting-phase sink that keeps every percentage it was handed, so a
+    /// test can assert the phase advanced instead of sitting at zero.
+    fn recording_scan_sink() -> (Arc<Mutex<Vec<u8>>>, retention_engine::ScanProgressSink) {
+        let recorded: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let target = Arc::clone(&recorded);
+        let sink: retention_engine::ScanProgressSink = Arc::new(move |pct| target.lock().push(pct));
+        (recorded, sink)
+    }
+
+    /// The delete request a confirm step would build from a preview: the
+    /// preview's own cutoff, verbatim, and nothing re-derived.
+    fn request_from_preview(
+        preview: &RetentionPreview,
+        ran_at: DateTime<Utc>,
+    ) -> retention_engine::RetentionDeleteRequest {
+        retention_engine::RetentionDeleteRequest {
+            cutoff: preview
+                .cutoff
+                .clone()
+                .expect("a preview past the disabled check always carries a cutoff"),
+            window_days: preview
+                .window_days
+                .expect("window days accompany the cutoff"),
+            bytes_before: preview.bytes_before,
+            ran_at,
+        }
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Retention preview command#Retention Preview Command Test Specs#Preview Accuracy]]
+    #[test]
+    #[serial_test::serial]
+    fn retention_preview_counts_equal_what_the_run_deletes() {
+        use retention_fixture::{RetentionRowKind, RetentionTable, build_retention_fixture};
+
+        let fixture = build_retention_fixture(&retention_preview_spec()).expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        storage
+            .write_retention_window_days(Some(90))
+            .expect("configure a 90-day window");
+
+        let now = fixture.plan().anchor();
+        let (progress, sink) = recording_scan_sink();
+        let preview =
+            build_retention_preview(&storage, now, Some(sink)).expect("preview must succeed");
+
+        // The cutoff is derived once, here, and lands on the fixture's own
+        // 90-day boundary — three buckets retained, three doomed.
+        assert_eq!(RETENTION_PREVIEW_READY, preview.status);
+        assert_eq!(None, preview.reason);
+        assert_eq!(Some(90), preview.window_days);
+        assert_eq!(
+            Some(fixture.plan().boundary_timestamp(3)),
+            preview.cutoff,
+            "the preview's cutoff must be the fixture's 90-day boundary"
+        );
+        assert!(
+            !preview.everything_older,
+            "three buckets are newer than the cutoff, so this is not a total loss"
+        );
+        assert_eq!(
+            RETENTION_AFFECTED_SURFACES.len(),
+            preview.affected_surfaces.len(),
+            "a ready preview carries the capability-loss copy the confirm step shows"
+        );
+
+        // Exact, not estimated: the counts are the plan's arithmetic.
+        for (table, previewed, nonconforming) in [
+            (
+                RetentionTable::ToolActions,
+                preview.tool_actions_rows,
+                preview.tool_actions_nonconforming,
+            ),
+            (
+                RetentionTable::SessionEvents,
+                preview.session_events_rows,
+                preview.session_events_nonconforming,
+            ),
+        ] {
+            assert_eq!(
+                fixture
+                    .plan()
+                    .rows_before_boundary(3, table, RetentionRowKind::OwnedConforming)
+                    as i64,
+                previewed,
+                "{} preview count",
+                table.as_str()
+            );
+            assert_eq!(
+                fixture
+                    .plan()
+                    .rows_before_boundary(3, table, RetentionRowKind::OwnedNonConforming)
+                    as i64,
+                nonconforming,
+                "{} non-conformance count",
+                table.as_str()
+            );
+        }
+
+        // The counting phase visibly advances: it opens at zero and closes at
+        // 100 through each table's half of the bar, never going backwards.
+        let recorded = progress.lock().clone();
+        assert_eq!(Some(&0), recorded.first(), "{recorded:?}");
+        assert_eq!(Some(&100), recorded.last(), "{recorded:?}");
+        assert!(recorded.contains(&50), "{recorded:?}");
+        assert!(
+            recorded.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the counting phase must never go backwards: {recorded:?}"
+        );
+
+        // Driving the run with the preview's own cutoff on a quiesced fixture
+        // must delete exactly the set the user consented to.
+        let request = request_from_preview(&preview, now);
+        let report = retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect("run the delete phase the preview authorized");
+
+        assert_eq!(retention::RetentionRunStatus::Completed, report.status);
+        assert_eq!(preview.tool_actions_rows, report.deleted.tool_actions);
+        assert_eq!(preview.session_events_rows, report.deleted.session_events);
+        assert_eq!(
+            preview.tool_actions_nonconforming,
+            report.nonconforming.tool_actions
+        );
+        assert_eq!(
+            preview.session_events_nonconforming,
+            report.nonconforming.session_events
+        );
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Retention preview command#Retention Preview Command Test Specs#Fresh Install Previews Nothing]]
+    #[test]
+    #[serial_test::serial]
+    fn retention_preview_skips_a_fresh_install() {
+        // A fresh install is the one corpus the shared fixture cannot express
+        // — it always plants non-conforming owned rows — so this test builds
+        // the genuinely empty database the builder's own contract describes.
+        let data_dir = tempfile::TempDir::new().expect("create temp data dir");
+        let canonical = std::fs::canonicalize(data_dir.path()).expect("canonicalize temp dir");
+        // SAFETY: the override is process-global; `#[serial]` holds the lock.
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_DATA_DIR", &canonical);
+        }
+        let storage = Storage::init().expect("open storage on an empty data dir");
+        storage
+            .write_retention_window_days(Some(30))
+            .expect("configure a 30-day window");
+
+        let now = Utc::now();
+        let preview = build_retention_preview(&storage, now, None).expect("preview must succeed");
+
+        assert_eq!(RETENTION_PREVIEW_SKIPPED, preview.status);
+        assert_eq!(
+            Some(RETENTION_FRESH_INSTALL_REASON.to_string()),
+            preview.reason,
+            "an empty database must not be told its history is too young"
+        );
+        assert_eq!(0, preview.tool_actions_rows);
+        assert_eq!(0, preview.session_events_rows);
+        assert!(!preview.everything_older);
+        assert!(
+            preview.affected_surfaces.is_empty(),
+            "a skip costs no capability, so it must not enumerate a loss"
+        );
+
+        // The cutoff a no-op preview still mints drives a run that also skips.
+        let request = request_from_preview(&preview, now);
+        let report = retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect("run the delete phase");
+        assert_eq!(retention::RetentionRunStatus::Skipped, report.status);
+        assert_eq!(
+            Some(retention_engine::RETENTION_NOTHING_OLDER_REASON.to_string()),
+            report.reason
+        );
+        assert_eq!(retention::RetentionTableCounts::default(), report.deleted);
+
+        drop(storage);
+        drop(data_dir);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Retention preview command#Retention Preview Command Test Specs#Nothing Older Previews Nothing]]
+    #[test]
+    #[serial_test::serial]
+    fn retention_preview_skips_when_nothing_is_older_than_the_cutoff() {
+        use retention_fixture::build_retention_fixture;
+
+        let fixture = build_retention_fixture(&retention_preview_spec()).expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        // Six 30-day buckets is 180 days of corpus, so a 365-day window cannot
+        // reach any of it.
+        storage
+            .write_retention_window_days(Some(365))
+            .expect("configure a 365-day window");
+
+        let now = fixture.plan().anchor();
+        let preview = build_retention_preview(&storage, now, None).expect("preview must succeed");
+
+        assert_eq!(RETENTION_PREVIEW_SKIPPED, preview.status);
+        assert_eq!(
+            Some(retention_engine::RETENTION_NOTHING_OLDER_REASON.to_string()),
+            preview.reason,
+            "a populated database must not be told it has no history"
+        );
+        assert_eq!(0, preview.tool_actions_rows);
+        assert_eq!(0, preview.session_events_rows);
+        assert!(!preview.everything_older);
+        assert_eq!(Some(365), preview.window_days);
+        assert!(preview.cutoff.is_some());
+
+        let request = request_from_preview(&preview, now);
+        let report = retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect("run the delete phase");
+        assert_eq!(retention::RetentionRunStatus::Skipped, report.status);
+        assert_eq!(retention::RetentionTableCounts::default(), report.deleted);
+
+        drop(storage);
+        drop(fixture);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Retention preview command#Retention Preview Command Test Specs#Everything Older Is Reported As Total]]
+    #[test]
+    #[serial_test::serial]
+    fn retention_preview_reports_everything_older_and_the_run_proceeds() {
+        use retention_fixture::{RetentionRowKind, RetentionTable, build_retention_fixture};
+
+        let fixture = build_retention_fixture(&retention_preview_spec()).expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+        storage
+            .write_retention_window_days(Some(365))
+            .expect("configure a 365-day window");
+
+        // Previewing 395 days after the anchor puts the cutoff 30 days newer
+        // than the newest row, so the window covers the entire corpus.
+        let now = fixture.plan().anchor() + chrono::TimeDelta::days(395);
+        let preview = build_retention_preview(&storage, now, None).expect("preview must succeed");
+
+        assert_eq!(RETENTION_PREVIEW_READY, preview.status);
+        assert!(
+            preview.everything_older,
+            "a cutoff newer than every owned row is a total loss and must say so"
+        );
+        for (table, previewed) in [
+            (RetentionTable::ToolActions, preview.tool_actions_rows),
+            (RetentionTable::SessionEvents, preview.session_events_rows),
+        ] {
+            assert_eq!(
+                fixture
+                    .plan()
+                    .total_rows(table, RetentionRowKind::OwnedConforming) as i64,
+                previewed,
+                "{} must preview its whole owned corpus",
+                table.as_str()
+            );
+        }
+
+        let request = request_from_preview(&preview, now);
+        let report = retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect("run the delete phase the preview authorized");
+
+        assert_eq!(retention::RetentionRunStatus::Completed, report.status);
+        assert_eq!(preview.tool_actions_rows, report.deleted.tool_actions);
+        assert_eq!(preview.session_events_rows, report.deleted.session_events);
 
         drop(storage);
         drop(fixture);
