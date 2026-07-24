@@ -224,6 +224,81 @@ an application window or a production-sized database.
 A successful preflight followed by VACUUM must report `completed`, preserve an
 empty skip reason, and return the actual before/after database footprint.
 
+### Retention pruning
+
+Feature 014's opt-in age window: the user picks a preset, previews, confirms, and Quill deletes source-owned rows older than the cutoff from `tool_actions` and `session_events` only, then compacts. Nothing is scheduled.
+
+This section is the map. Each part is documented where it lives — the durable
+grammar in [[backend#Backend#Database#Retention policy primitive]], the
+destructive core in [[backend#Backend#Database#Retention delete engine]], the
+durability half in [[backend#Backend#Database#Insert-time watermark filtering]],
+the push surface in [[backend#Backend#Database#Retention maintenance events]],
+the completion step in
+[[backend#Backend#Database#Analytics cache invalidation on prune]], the command
+boundary in [[backend#Backend#Tauri IPC Commands#Retention policy commands]],
+[[backend#Backend#Tauri IPC Commands#Retention preview command]] and
+[[backend#Backend#Tauri IPC Commands#Composite retention command]], and the
+reader-side honesty treatment in
+[[frontend#Frontend#Components#Retention Degradation]].
+
+**The data model is three rows of `settings`, not a table.**
+`retention.window_days` (a preset from `{30, 90, 180, 365}`),
+`retention.watermark` (a conforming 24-character `Z` timestamp) and
+`retention.last_run` (the JSON audit record) are independently absent-able, and
+absent on all three is the default state of every database that exists today.
+There is no migration and no schema-version bump, which is exactly what makes an
+older build's reopen a non-event, and it is why disabling retention *deletes*
+`retention.window_days` instead of writing a sentinel — one "never" state, not
+two. The 30-day floor is a guarantee rather than a suggestion: `range_to_duration`
+caps every range-based reader at 30 days, so a shorter window would silently
+starve `get_code_stats`, `get_code_stats_history` and `get_llm_runtime_stats`.
+
+**The watermark is the whole durability argument, and its timing is part of it.**
+It only ever moves forward — `max(existing, cutoff)`, applied with the read and
+the write inside one transaction — and it reaches the run's cutoff **before the
+first chunk transaction opens**, never at the end of the run and never after
+VACUUM. Rows deleted at a stricter cutoff must stay deleted even if the process
+dies mid-run, so a committed chunk leaves the watermark permanently advanced
+through a `"partial"` outcome, a skipped VACUUM or a failed one. The mirror rule
+is that a run which skips at the delete-phase preflight must **not** advance it:
+nothing was deleted, so suppressing future inserts would take away history the
+user never consented to lose.
+
+**Exactly one index is dropped, and it is not a retention index.** Phase 1
+removes `idx_session_events_provider_source` and nothing else — see
+[[backend#Backend#Database#Redundant provider/source index drop]].
+`idx_se_timestamp_chain` is recreated in the same startup function because
+`get_llm_runtime_stats` pins it with `INDEXED BY`, and no `idx_se_timestamp` is
+added for retention's benefit: the
+[[backend#Backend#Database#Retention timing spike]] measured that index making
+the `session_events` scan 2.37× slower than the plan SQLite picks without it.
+
+**Three statuses, and `"partial"` is a real one.** A run reports `completed`,
+`skipped` or `partial`. `partial` exists rather than `completed` plus an
+`interrupted` flag because its whole job is to say what went wrong, so the audit
+record refuses to validate a `partial` with no `error_reason`. Compaction
+reports separately: a run that removed rows but could not VACUUM is a completed
+prune with a skipped compaction, which is the legitimate "rows are gone, bytes
+are not back yet" outcome the UI has to state rather than hide.
+
+**Four commands and two events.** `get_retention_policy` and
+`set_retention_policy` read and write the window; `preview_retention` counts and
+mints the cutoff the user consents to; `run_retention_maintenance` takes that
+confirmed cutoff, deletes, compacts, and invalidates the analytics caches.
+`retention-maintenance-progress` and `retention-maintenance-finished` are the
+only two events, shared by preview and run so the frontend keeps one listener
+pair, and no third event enters the IPC surface for cache invalidation — that
+reuses `transcript-analytics-updated`.
+
+**Retention has no learning stakeholder, and here is when that expires.**
+[[src-tauri/src/learning.rs#analyze_sessions_stream]] builds its session digests
+by reading transcript JSONL through
+[[src-tauri/src/sessions.rs#extract_messages_from_jsonl]] and never touches
+`tool_actions`, so pruning cannot starve rule learning. That is a fact about
+today's code, not a design guarantee: **a future learning pipeline that sources
+observations from `tool_actions` becomes a retention stakeholder, and this entire
+analysis must be redone at that point.**
+
 ### Retention fixture
 
 [[src-tauri/src/retention_fixture.rs#build_retention_fixture]] builds the one frozen synthetic corpus that every retention test and the retention timing spike run against, so acceptance numbers and budget numbers can never drift onto separate corpora.
@@ -898,9 +973,17 @@ Startup also creates covering observation indexes for `(created_at, tool_name)` 
 
 #### Session Indexing
 
-Stores detailed tool invocation and response-time data for MCP-powered session search.
+Stores detailed tool invocation and response-time data extracted from transcripts, which backs the in-app code and session analytics.
 
-- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input; the code-stats queries prefer those columns and re-parse `full_input` only for legacy rows. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
+Neither table backs session *search*: search is Tantivy over indexed session
+messages ([[backend#Backend#Session Indexing]]), and the HTTP `/api/v1/sessions/search`
+path the MCP server calls never reads `tool_actions`. The distinction matters
+because retention prunes these two tables and leaves the full-text index alone —
+a search hit therefore survives the deletion of the rows behind its code stats,
+which is precisely the degradation
+[[frontend#Frontend#Components#Retention Degradation]] exists to state.
+
+- **tool_actions** — Tool invocation details behind `get_code_stats`, `get_batch_session_code_stats` and sub-agent discovery (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input; the code-stats queries prefer those columns and re-parse `full_input` only for legacy rows. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
 
 #### Skill Usages

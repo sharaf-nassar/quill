@@ -144,6 +144,47 @@ Full-text session search UI in `src/components/sessions/` for a shared Claude-pl
 - **ResultCard** — Search hit preview with provider badge, snippet, and per-session code-change pill. Takes the retention cutoff and swaps the line counts for a pruned marker when the hit predates it — see [[frontend#Frontend#Components#Retention Degradation]].
 - **DetailPanel** — Context message display with provider badge, match highlighting, and session-local code-change totals, with the same pruned marker as `ResultCard`.
 
+### Retention Control
+
+The Performance tab's prune control (feature 014): a preset selector, a preview step, an explicit second click, and a durable record of the last run — the only place in the product that can delete history.
+
+[[src/components/settings/PerformanceTab.tsx#PerformanceTab]] drives it from one
+`RetentionStage` union (`idle` → `previewing` → `confirm` → `running` → `done`,
+plus `declined`), so the panel below the row is a function of a single value
+rather than of four booleans that can contradict each other. Confirming
+**re-previews** before invoking `run_retention_maintenance`: the backend refuses
+a confirmation that no longer matches a freshly counted cutoff, so the token the
+user consents to is minted at the moment of consent instead of being held open
+while the panel sat on screen. Two backend reasons are matched exactly rather
+than rendered as prose — `stale_preview` and the lease refusal — because their
+remedy is an action (`Count again`), not copy.
+
+[[src/components/settings/PerformanceTab.tsx#RetentionPanel]] is the consent
+step and every terminal state. It names the capability loss from the preview's
+`affected_surfaces`, says outright that there is no undo and no export, flags
+the case where the cutoff covers *every* transcript row rather than the oldest
+part, reports the rows kept because their timestamps cannot be compared, and
+repeats [[src/components/settings/PerformanceTab.tsx#RECLAIM_SENTENCE]] wherever
+the rows/bytes distinction could mislead — a completed prune whose compaction
+was skipped otherwise reads to a user watching disk usage as nothing having
+happened. `partial` gets its own heading and states that what was removed is
+gone permanently.
+
+[[src/components/settings/PerformanceTab.tsx#RetentionAudit]] renders the
+durable `retention.last_run` record so the outcome survives the toast, and
+[[src/components/settings/PerformanceTab.tsx#retentionAgeLine]] is the only
+mitigation the no-scheduler decision gets: a window is a plan, not a timer, so
+the record states its own age beside the configured window ("last pruned 112
+days ago; window 90 days"). A `skipped` record says *attempted*, never *pruned*.
+
+A single `maintenanceBusy` expression disables both Compact and Prune, because
+both take the same process-wide ingest quiesce and the backend's non-blocking
+acquire turns a double-click into a skip the user would have to read rather than
+a button that could not be pressed. Styling stays chrome-grey and hairline-ruled
+throughout: `DESIGN.md` reserves green / amber / red for the severity meter, and
+a prune the user asked for is not a threshold breach — the weight of the action
+is carried by the copy and by the second click, never by a red button.
+
 ### Retention Degradation
 
 The consumer-side treatment for retention pruning (feature 014): the surfaces whose data retention can delete state the cutoff and mark pre-cutoff figures, so deleted history never renders as an honest zero.
@@ -253,7 +294,7 @@ It drives the [[features#Settings Window]]'s Integrations tab and blocked-window
 
 ### Settings Hooks
 
-Four hooks back the [[features#Settings Window]]: each owns one slice of state, calls Tauri IPC for mutations, and subscribes to the matching push event so multiple open Settings windows stay in sync.
+Five hooks back the [[features#Settings Window]]: each owns one slice of state, calls Tauri IPC for mutations, and subscribes to the matching push event so multiple open Settings windows stay in sync.
 
 | Hook | File | Source of truth | Listens for |
 |------|------|-----------------|-------------|
@@ -261,8 +302,26 @@ Four hooks back the [[features#Settings Window]]: each owns one slice of state, 
 | `useRuntimeSettings` | [[src/hooks/useRuntimeSettings.ts]] | `RuntimeSettings` background-task tunings (live-usage interval, plugin-update interval, rule watcher, always-on-top) | `runtime-settings-updated` |
 | `useLearningSettings` | [[src/hooks/useLearningSettings.ts]] | `LearningSettings` (trigger mode, periodic interval, thresholds) | None — read on mount and after save |
 | `useUiPrefs` | [[src/hooks/useUiPrefs.ts]] | `UiPrefs` localStorage values (layout mode, time mode, panel visibility) | `ui-prefs-updated` (frontend-emitted across windows) |
+| `useRetentionPolicy` | [[src/hooks/useRetentionPolicy.ts]] | `RetentionPolicy` (window, watermark, last run) via `get_retention_policy` / `set_retention_policy` | `retention-maintenance-finished` |
 
-`useIntegrationFeatures` exposes typed setters per flag that each invoke a dedicated `set_*_enabled` IPC, while `useRuntimeSettings` and `useLearningSettings` save the whole struct in one call. `useUiPrefs.update(patch)` writes localStorage and emits `ui-prefs-updated` so the main window's [[src/App.tsx]] re-applies layout / time-mode / panel-visibility without a reload.
+`useIntegrationFeatures` exposes typed setters per flag that each invoke a dedicated `set_*_enabled` IPC, while `useRuntimeSettings` and `useLearningSettings` save the whole struct in one call.
+
+[[src/hooks/useRetentionPolicy.ts#useRetentionPolicy]] is deliberately **not**
+part of `RuntimeSettings`. `PerformanceTab.update()` saves that struct wholesale
+(`{ ...settings, ...patch }`), which is right for a set of independent
+background-task tunings and wrong for a destructive boundary: a retention window
+is consented to one value at a time, and a wholesale save would let an unrelated
+toggle re-assert a window the user never looked at. So the policy travels on its
+own commands, and
+[[src/hooks/useRetentionPolicy.ts#RETENTION_WINDOW_PRESETS]] mirrors the backend
+preset set rather than offering a free-form number the command boundary would
+reject. `setWindowDays` stores the policy the backend *returns* instead of an
+optimistic one, so a rejected preset leaves the control holding the window the
+database actually has. It re-reads on `retention-maintenance-finished` because a
+completed run advances the watermark and rewrites the audit record. It is the
+only retention hook that can write; the read-only counterpart is
+[[src/hooks/useRetentionCutoff.ts#useRetentionCutoff]], described in
+[[frontend#Frontend#Components#Retention Degradation]]. `useUiPrefs.update(patch)` writes localStorage and emits `ui-prefs-updated` so the main window's [[src/App.tsx]] re-applies layout / time-mode / panel-visibility without a reload.
 
 ### Data Fetching Hooks
 

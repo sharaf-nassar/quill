@@ -27,8 +27,9 @@ Hook-reported tokens still flow into `token_snapshots` keyed by the parent `sess
 
 ## Database Maintenance Pipeline
 
-Manual database compaction quiesces ingest before VACUUM so SQLite maintenance
-reclaims space without racing hook writes or background reconciliation.
+Two manual paths quiesce ingest before touching SQLite: compaction reclaims
+space with VACUUM, and retention pruning deletes rows past an age window and
+then compacts inside the same lease.
 
 1. The Performance settings control invokes `compact_database` and subscribes
    to `compact-database-progress` while its request is in flight.
@@ -45,6 +46,50 @@ reclaims space without racing hook writes or background reconciliation.
    before/after footprint or the safe skip reason.
 6. The settings surface renders progress and the terminal result inline;
    external hook clients retry their rejected ingest instead of losing it.
+
+### Retention Pruning Path
+
+The same quiesce gate carries the destructive path: preview, explicit consent,
+chunked deletes bounded by an age cutoff, and a compaction that turns the freed
+pages into freed bytes without letting an ingest write land between the halves.
+
+1. The Performance control writes the window with `set_retention_policy`, then
+   invokes `preview_retention`. Both retention commands acquire through
+   [[src-tauri/src/lib.rs#try_begin_ingest_quiesce]], so a lease already held by
+   compaction is a structured skip rather than an unbounded wait.
+2. Preview derives the cutoff, scans both target tables under a `Counting rows`
+   heartbeat on [[src-tauri/src/lib.rs#RETENTION_MAINTENANCE_PROGRESS_EVENT]],
+   and returns exact per-table row counts, the counts it will keep because their
+   timestamps are not byte-comparable, the affected surfaces, and the cutoff the
+   run must echo back.
+3. The user confirms. The control re-previews to mint a fresh cutoff and calls
+   `run_retention_maintenance` with it; a confirmation that no longer matches a
+   freshly counted cutoff is refused as `stale_preview` before the lease is
+   taken, so consent is always consent to the numbers actually shown.
+4. [[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] opens its own
+   maintenance connection, materializes the doomed rowids, preflights free disk
+   for one chunk's WAL plus the temp tables, advances `retention.watermark` to
+   the cutoff before the first chunk commits, and deletes in chunks — WAL
+   checkpointed after each commit, free space re-checked every *N* chunks,
+   `Removing old rows` progress emitted per chunk.
+5. The maintenance connection is closed, then
+   [[src-tauri/src/storage.rs#Storage#vacuum_database]] runs under the same
+   lease and emits `Compacting database`. Its preflight is independent of the
+   delete preflight, so a run that removed rows but cannot afford a rebuild is a
+   completed prune with a skipped compaction, reported rather than hidden.
+6. The audit record is rewritten to `retention.last_run` on the completed,
+   partial *and* skipped paths, then
+   [[src-tauri/src/lib.rs#invalidate_analytics_after_retention]] drains the five
+   analytics caches and emits `transcript-analytics-updated` — a DELETE never
+   advances a cache high-water mark, so nothing else would retire a pre-prune
+   payload. The lease is released and `retention-maintenance-finished` carries
+   the structured result.
+7. Consumers pick it up from there: the settings panel renders the terminal
+   state and the durable audit record,
+   [[src/hooks/useRetentionCutoff.ts#useRetentionCutoff]] re-reads the policy on
+   the finished event so degradation banners state the new cutoff, and the
+   watermark makes the deletion durable by filtering the next snapshot
+   replacement's inserts rather than by trusting nothing to reparse.
 
 ## Learning Analysis Pipeline
 
