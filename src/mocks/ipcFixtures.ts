@@ -243,6 +243,11 @@ const sessionBreakdown: SessionBreakdown[] = [
   { provider: "claude", session_id: "a1b2c3d4", hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), project: "quill", has_subagents: true, subagent_count: 3 },
   { provider: "codex", session_id: "e5f6a7b8", hostname: "mbp.local", total_tokens: 88_400, turn_count: 71, first_seen: iso(20 * H), last_active: iso(2 * H), project: "stable-api", has_subagents: false, subagent_count: 0 },
   { provider: "claude", session_id: "c9d0e1f2", hostname: "devbox", total_tokens: 51_200, turn_count: 44, first_seen: iso(2 * D), last_active: iso(28 * H), project: "marketing-site", has_subagents: false, subagent_count: 0 },
+  // Feature 014: sits entirely before the 90-day mock retention watermark, so
+  // the browser mock exercises the degradation treatment — a daggered
+  // sub-agent count that expands into "Sub-agent detail pruned" rather than a
+  // count of 2 that expands into an honest-looking "No sub-agents".
+  { provider: "claude", session_id: "b7c8d9e0", hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), project: "quill", has_subagents: true, subagent_count: 2 },
 ];
 
 const skillBreakdown: SkillBreakdown[] = [

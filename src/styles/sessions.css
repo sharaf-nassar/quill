@@ -496,3 +496,16 @@
 	background: rgba(248, 113, 113, 0.15);
 	color: var(--meter-red);
 }
+
+/* ─── Retention degradation treatment (feature 014) ───
+   Base rules live in index.css; Session Search is a Systems Page, so the
+   banner takes the roomier density here rather than the PFD's. */
+.sessions-window .retention-banner {
+	margin: 0 var(--space-lg) var(--space-md);
+	padding: var(--space-lg) var(--space-xl);
+}
+
+.sessions-window .retention-banner-body,
+.sessions-window .retention-banner-footnote {
+	font-size: 11px;
+}

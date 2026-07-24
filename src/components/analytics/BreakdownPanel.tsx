@@ -4,7 +4,14 @@ import { useBreakdownData } from "../../hooks/useBreakdownData";
 import { useToast } from "../../hooks/useToast";
 import { useSessionSubagents } from "../../hooks/useSessionSubagents";
 import { useSkillProjects } from "../../hooks/useSkillProjects";
+import { useRetentionCutoff } from "../../hooks/useRetentionCutoff";
+import { RetentionBanner } from "../RetentionBanner";
 import { formatTokenCount } from "../../utils/tokens";
+import {
+  formatRetentionCutoff,
+  markPrunedRange,
+  type RetentionSpan,
+} from "../../utils/retention";
 import type {
   BreakdownMode,
   BreakdownSelection,
@@ -339,9 +346,39 @@ interface SessionTreeBranchProps {
   subState: import("../../hooks/useSessionSubagents").SessionSubagentState | null;
   groups: Map<string, SubagentNode[]> | null;
   expandedAgents: Record<string, boolean>;
+  /**
+   * Where this session sits against the retention cutoff (feature 014).
+   * `retained` for every row when retention has never pruned.
+   */
+  retentionSpan: RetentionSpan;
+  /** Formatted cutoff date, for the marked rows' explanatory titles. */
+  retentionCutoffLabel: string | null;
   onToggleSession: () => void;
   onRowClick: () => void;
   onToggleAgent: (agentId: string) => void;
+}
+
+/**
+ * Title text for a session whose sub-agent data sits wholly or partly below
+ * the retention cutoff. Spelled out rather than reduced to "pruned" because
+ * the mixed-horizon behaviour is the surprising part: the count survives in
+ * `token_snapshots` / `response_times` after the `tool_actions` rows behind
+ * the tree are gone.
+ */
+function retentionCountTitle(
+  span: RetentionSpan,
+  cutoffLabel: string | null,
+  count: number,
+): string {
+  const plain = `${count} sub-agents`;
+  if (span === "retained" || !cutoffLabel) {
+    return plain;
+  }
+  const scope =
+    span === "pruned"
+      ? `This session ended before the retention cutoff (${cutoffLabel})`
+      : `This session started before the retention cutoff (${cutoffLabel})`;
+  return `${plain} — incomplete. ${scope}, so its tool activity was pruned. The count is carried by other tables and can exceed the tree below.`;
 }
 
 /**
@@ -359,11 +396,15 @@ function SessionTreeBranch({
   subState,
   groups,
   expandedAgents,
+  retentionSpan,
+  retentionCutoffLabel,
   onToggleSession,
   onRowClick,
   onToggleAgent,
 }: SessionTreeBranchProps) {
   const projectLabel = projectName(row.project);
+  const subagentCount = row.subagent_count ?? 0;
+  const retentionMarked = retentionSpan !== "retained" && retentionCutoffLabel !== null;
   // Sample wall-clock once per render so every "active"/relative-time read
   // below is consistent. Hoisting matches `formatRelativeTime`'s pattern
   // and avoids `Date.now()` appearing inside JSX, which would re-evaluate
@@ -381,7 +422,7 @@ function SessionTreeBranch({
         role="listitem"
         tabIndex={0}
         aria-expanded={hasSubagents ? isExpanded : undefined}
-        aria-label={`Session ${row.session_id.slice(0, 8)}${projectLabel ? ` in ${projectLabel}` : ""} on ${row.hostname}: ${formatTokenCount(row.total_tokens)} tokens, ${row.turn_count} turns${hasSubagents ? `, ${row.subagent_count ?? 0} sub-agents` : ""}`}
+        aria-label={`Session ${row.session_id.slice(0, 8)}${projectLabel ? ` in ${projectLabel}` : ""} on ${row.hostname}: ${formatTokenCount(row.total_tokens)} tokens, ${row.turn_count} turns${hasSubagents ? `, ${subagentCount} sub-agents${retentionMarked ? " (incomplete, pruned by retention)" : ""}` : ""}`}
         onClick={onRowClick}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
@@ -429,10 +470,19 @@ function SessionTreeBranch({
           <span className="breakdown-host-tag">{row.hostname}</span>
           {hasSubagents && (
             <span
-              className="breakdown-session-count"
-              title={`${row.subagent_count ?? 0} sub-agents`}
+              className={`breakdown-session-count${retentionMarked ? " retention-marked" : ""}`}
+              title={retentionCountTitle(
+                retentionSpan,
+                retentionCutoffLabel,
+                subagentCount,
+              )}
             >
-              +{row.subagent_count ?? 0}
+              +{subagentCount}
+              {retentionMarked && (
+                <span className="retention-mark" aria-hidden>
+                  †
+                </span>
+              )}
             </span>
           )}
         </span>
@@ -482,8 +532,13 @@ function SessionTreeBranch({
                 role="listitem"
                 style={{ paddingLeft: `${10 + SUBAGENT_INDENT_PX}px` }}
               >
+                {/* An empty tree under a non-zero count is the mixed-horizon
+                    case made visible. Say which of the two it is rather than
+                    letting "No sub-agents" pass for a measurement. */}
                 <span className="breakdown-name breakdown-subagent-status-text">
-                  No sub-agents
+                  {retentionMarked
+                    ? `Sub-agent detail pruned (before ${retentionCutoffLabel})`
+                    : "No sub-agents"}
                 </span>
               </div>
             )}
@@ -588,6 +643,16 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   const { fetchTree: fetchSubagentTree, getState: getSubagentState } = useSessionSubagents();
   const { fetchProjects: fetchSkillProjects, stateFor: skillProjectsState } =
     useSkillProjects();
+  // Feature 014: the Sessions breakdown is one of the three readers retention
+  // can starve (`get_session_breakdown`'s subagent_count subquery and
+  // `get_session_subagent_tree` both read `tool_actions`). The other modes on
+  // this panel are safe — hosts/projects read token_snapshots, and the skills
+  // and hooks "All time" toggles read tables retention never prunes — so the
+  // banner and the row marking are scoped to `sessions` only.
+  const { cutoff: retentionCutoff } = useRetentionCutoff();
+  const retentionCutoffLabel = retentionCutoff
+    ? formatRetentionCutoff(retentionCutoff)
+    : null;
   const renameInputRef = useRef<HTMLInputElement | null>(null);
   const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const skillProviderArg: IntegrationProvider | null =
@@ -635,6 +700,21 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     });
     return rows;
   }, [data, mode, skillSort]);
+
+  // Feature 014: classify the whole session range against the retention
+  // cutoff in one pass, so each row can be marked rather than silently drawn
+  // with figures that are missing rather than zero. Returns new `{ row, span }`
+  // pairs; the breakdown rows themselves are never mutated.
+  const markedSessionRows = useMemo(() => {
+    if (mode !== "sessions") {
+      return [];
+    }
+    return markPrunedRange(
+      data as SessionBreakdown[],
+      retentionCutoff,
+      (row) => [row.first_seen, row.last_active] as const,
+    );
+  }, [data, mode, retentionCutoff]);
 
   const handleModeChange = (m: BreakdownMode) => {
     setMode(m);
@@ -1009,6 +1089,10 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
         </div>
       )}
 
+      {mode === "sessions" && (
+        <RetentionBanner cutoff={retentionCutoff} surface="sessions" />
+      )}
+
       {error && <div className="analytics-error">{error}</div>}
 
       {loading ? (
@@ -1283,7 +1367,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                         </div>
                       );
                     })
-                  : (data as SessionBreakdown[]).map((row) => {
+                  : markedSessionRows.map(({ row, span }) => {
                   const sessKey = sessionRefKey({
                     provider: row.provider,
                     session_id: row.session_id,
@@ -1305,6 +1389,8 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
                       subState={subState}
                       groups={groups}
                       expandedAgents={expandedAgents}
+                      retentionSpan={span}
+                      retentionCutoffLabel={retentionCutoffLabel}
                       onToggleSession={() =>
                         toggleSessionExpand(row.provider, row.session_id)
                       }

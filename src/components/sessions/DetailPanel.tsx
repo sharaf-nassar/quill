@@ -1,11 +1,14 @@
 import DOMPurify from "dompurify";
 import type { SearchHit, SessionContext, SessionCodeStats } from "../../types";
 import { providerLabel } from "../../utils/providers";
+import { isPruned, PRUNED_PLACEHOLDER } from "../../utils/retention";
 
 interface DetailPanelProps {
 	hit: SearchHit;
 	context: SessionContext | null;
 	locStats: SessionCodeStats | null;
+	/** Retention watermark, or null when nothing has been pruned (feature 014). */
+	retentionCutoff: string | null;
 }
 
 function timeAgo(timestamp: string): string {
@@ -19,12 +22,17 @@ function timeAgo(timestamp: string): string {
 	return `${days}d ago`;
 }
 
-function DetailPanel({ hit, context, locStats }: DetailPanelProps) {
+function DetailPanel({ hit, context, locStats, retentionCutoff }: DetailPanelProps) {
 	// Sanitize snippet HTML -- only <mark> tags allowed for search highlighting
 	const sanitized = DOMPurify.sanitize(hit.snippet, {
 		ALLOWED_TAGS: ["mark"],
 	});
 	const providerLabelText = providerLabel(hit.provider);
+	// Feature 014: an absent line count below the retention cutoff is missing
+	// data, so the drilldown says so instead of rendering nothing at all.
+	const locPruned =
+		isPruned(hit.timestamp, retentionCutoff) &&
+		(!locStats || (locStats.lines_added === 0 && locStats.lines_removed === 0));
 
 	return (
 		<div className="sessions-detail">
@@ -41,12 +49,22 @@ function DetailPanel({ hit, context, locStats }: DetailPanelProps) {
 					<span className={`sessions-provider-badge ${hit.provider}`}>
 						{providerLabelText}
 					</span>
-					{locStats && (locStats.lines_added > 0 || locStats.lines_removed > 0) && (
-						<span className="sessions-detail-loc">
-							<span style={{ color: "#22c55e" }}>+{locStats.lines_added}</span>
-							{" "}
-							<span style={{ color: "#f87171" }}>-{locStats.lines_removed}</span>
+					{locPruned ? (
+						<span
+							className="sessions-detail-loc sessions-loc-pruned"
+							title="Code stats for this session were pruned by retention. This is missing data, not a session that changed no code."
+						>
+							{PRUNED_PLACEHOLDER} pruned
 						</span>
+					) : (
+						locStats &&
+						(locStats.lines_added > 0 || locStats.lines_removed > 0) && (
+							<span className="sessions-detail-loc">
+								<span style={{ color: "#22c55e" }}>+{locStats.lines_added}</span>
+								{" "}
+								<span style={{ color: "#f87171" }}>-{locStats.lines_removed}</span>
+							</span>
+						)
 					)}
 				</div>
 				<div

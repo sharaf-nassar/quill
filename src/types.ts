@@ -126,12 +126,27 @@ export interface SessionBreakdown {
    * True when this session has at least one sub-agent chain in its
    * transcript. Drives the disclosure + expansion affordance in the Sessions
    * tab. Older backends may omit this; treat missing as `false`.
+   *
+   * Degrades under retention in the same mixed-horizon way as
+   * `subagent_count` below: a pre-cutoff session can still report
+   * `has_subagents: true` from its surviving token snapshots while
+   * `get_session_subagent_tree` returns nothing.
    */
   has_subagents?: boolean;
   /**
    * Distinct sub-agent count across token_snapshots ∪ response_times ∪
    * tool_actions for this session. Older backends may omit this; treat
    * missing as `0`.
+   *
+   * **Accepted retention limitation (feature 014).** Retention prunes only
+   * `tool_actions` of those three tables, so for a session older than the
+   * retention watermark this count is computed over *mixed horizons* and can
+   * disagree with its own drilldown — the badge says `+3`, the expanded tree
+   * says "no sub-agents". This is documented and rendered as a footnote
+   * (`RetentionBanner`, surface `sessions`), not fixed: the fix is rollup
+   * aggregates, which are a deferred follow-up. Consumers must mark
+   * pre-cutoff sessions via `retentionSpanFor` rather than present the count
+   * as exact.
    */
   subagent_count?: number;
 }
@@ -209,6 +224,26 @@ export type LayoutMode = "stacked" | "side-by-side";
 
 export type TimeMode = "marker" | "dual" | "background";
 
+/**
+ * The analytics range vocabulary. Note what is *absent*: there is no `all`
+ * member, and `range_to_duration` (src-tauri/src/storage.rs) has no `all` arm
+ * to feed one — every range reader is capped at 30 days.
+ *
+ * **Retention invariant (feature 014).** That cap is load-bearing. The
+ * retention preset floor is 30 days, so `get_code_stats`,
+ * `get_code_stats_history` and `get_llm_runtime_stats` provably cannot reach
+ * a pruned row and need no degradation treatment. Any future all-time or
+ * otherwise unbounded range added here that reads `tool_actions` or
+ * `session_events` breaks that proof, and must therefore:
+ *
+ * 1. be labelled "all retained" rather than "all time" — data below the
+ *    retention watermark is deleted, not zero; and
+ * 2. render `RetentionBanner` on every surface that draws it.
+ *
+ * The two "All time" toggles in `BreakdownPanel` are exempt and must stay
+ * labelled "All time": they read `skill_usages` and `hook_invocations`, which
+ * retention never prunes, so relabelling them would itself be a lie.
+ */
 export type RangeType = "1h" | "24h" | "7d" | "30d";
 export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
@@ -299,6 +334,15 @@ export interface CodeStatsHistoryPoint {
 	total_changed: number;
 }
 
+/**
+ * Per-session line counts from `get_batch_session_code_stats`.
+ *
+ * **Degrades under retention (feature 014).** The command reads `tool_actions`,
+ * so a session older than the retention watermark returns all-zero counts that
+ * are indistinguishable from "this session changed no code". Consumers must
+ * classify the session with `retentionSpanFor` and render `PRUNED_PLACEHOLDER`
+ * instead of a zero when the span is `pruned`.
+ */
 export interface SessionCodeStats {
 	lines_added: number;
 	lines_removed: number;

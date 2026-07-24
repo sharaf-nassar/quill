@@ -93,7 +93,7 @@ Analytics components in `src/components/analytics/` provide Now, Trends, Charts,
 - **ModelDelegation** — [[src/components/analytics/models/ModelDelegation.tsx#ModelDelegation]] splits attributed tokens between parent sessions and subagent chains as a proportion meter with each group's top model.
 - **ContextSavingsTab** — Context preservation analytics with a four-column stats strip (saved, indexed, returned, routing) over a stacked trend chart, breakdown table, and recent events feed. Breakdown rows render a relative-magnitude bar fill behind each row scaled to the largest event count, and recent events use a single-line log format with category swatches and a directional byte arrow (→ indexed, ← returned). Confidence is hidden for exact estimates. `AnalyticsView` shows this tab when context preservation is enabled or historical context-savings events exist; a persisted active Context tab remains mounted while that status is unresolved and resets only after a successful status read proves it unavailable.
 - **UsageChart** (456 lines) — `ComposedChart` with Area, Line, and custom Tooltip. Uses `ChartCrosshairContext` for tooltip synchronization.
-- **BreakdownPanel** — Sortable table showing sessions, projects, hosts, or skills with compact count columns. It renders all rows in a flexing scroll area that fills the available analytics pane height instead of paginating the breakdown. Session rows display provider badges and use provider-safe composite keys for selection. Hosts and projects show `<recency>` in their time column (e.g. `2h ago`); sessions show `<recency> · <duration>` (e.g. `23h ago · 23h 43m`, or `active · 6m` when `last_active` is within the last 5 minutes), so the SQL `last_active DESC` ordering is visible without hiding session length. Skills rows show recognized use count and `last_used` recency — provider breakdown lives in the filter strip rather than inline on each row, so the count column stays uncluttered; their controls render on a dedicated row directly beneath the breakdown mode tabs and intentionally use a different visual vocabulary than the chunky `.range-tab` container pills above: an underline-indicator text filter strip (`All / Codex / Claude`) sits left-aligned, and a right-justified outlined uppercase `∞ ALL TIME` chip toggles the all-history scope. A Skills-only header row labels Skill, Uses, and Last used as small sort buttons; the default is Uses descending, and clicking the active title flips direction without refetching from Tauri. The three shape languages (container pills, underline filters, outlined glyph chip) keep each control reading as its own thing instead of three stacked rows of identical buttons, and the Skills-specific filters never crowd the mode tabs or affect the Now range selector. Every skill row renders the shared tiny hairline disclosure caret and lazy-fetches per-(project, hostname) counts via [[src/hooks/useSkillProjects.ts#useSkillProjects]] when opened, including rows whose `project_count` is `1`; the drilldown renders indented sub-rows below the parent skill and labels null-project rows as `No project data` so child counts still sum to the parent. Sub-rows reuse the sub-agent tree-guide and indent CSS for visual consistency with session→sub-agent drilldowns and carry a dedicated `breakdown-row-skill-project` class for future styling overrides. Switching filter scope (provider/all-time) collapses every expanded skill so stale sub-rows cannot survive a filter change. Per-mode SQL caps bound the payload: hosts 50, projects 100 (pre-subdir-merge), sessions 200 (passed from `useBreakdownData`'s `SESSION_BREAKDOWN_LIMIT`), and skills 100 (from `SKILL_BREAKDOWN_LIMIT`). For sessions whose rollup reports `has_subagents = true`, [[src/components/analytics/BreakdownPanel.tsx#SessionTreeBranch]] manages the per-row expand state and renders the lazy-fetched sub-agent tree through [[src/components/analytics/BreakdownPanel.tsx#SubagentRow]] — a recursive renderer depth-bounded by `SUBAGENT_MAX_DEPTH = 10` that uses [[src/hooks/useSessionSubagents.ts#useSessionSubagents]] for caching; non-expandable session rows omit the disclosure slot so their ids stay flush with normal row padding.
+- **BreakdownPanel** — Sortable table showing sessions, projects, hosts, or skills with compact count columns. It renders all rows in a flexing scroll area that fills the available analytics pane height instead of paginating the breakdown. Session rows display provider badges and use provider-safe composite keys for selection. Hosts and projects show `<recency>` in their time column (e.g. `2h ago`); sessions show `<recency> · <duration>` (e.g. `23h ago · 23h 43m`, or `active · 6m` when `last_active` is within the last 5 minutes), so the SQL `last_active DESC` ordering is visible without hiding session length. Skills rows show recognized use count and `last_used` recency — provider breakdown lives in the filter strip rather than inline on each row, so the count column stays uncluttered; their controls render on a dedicated row directly beneath the breakdown mode tabs and intentionally use a different visual vocabulary than the chunky `.range-tab` container pills above: an underline-indicator text filter strip (`All / Codex / Claude`) sits left-aligned, and a right-justified outlined uppercase `∞ ALL TIME` chip toggles the all-history scope. A Skills-only header row labels Skill, Uses, and Last used as small sort buttons; the default is Uses descending, and clicking the active title flips direction without refetching from Tauri. The three shape languages (container pills, underline filters, outlined glyph chip) keep each control reading as its own thing instead of three stacked rows of identical buttons, and the Skills-specific filters never crowd the mode tabs or affect the Now range selector. Every skill row renders the shared tiny hairline disclosure caret and lazy-fetches per-(project, hostname) counts via [[src/hooks/useSkillProjects.ts#useSkillProjects]] when opened, including rows whose `project_count` is `1`; the drilldown renders indented sub-rows below the parent skill and labels null-project rows as `No project data` so child counts still sum to the parent. Sub-rows reuse the sub-agent tree-guide and indent CSS for visual consistency with session→sub-agent drilldowns and carry a dedicated `breakdown-row-skill-project` class for future styling overrides. Switching filter scope (provider/all-time) collapses every expanded skill so stale sub-rows cannot survive a filter change. Per-mode SQL caps bound the payload: hosts 50, projects 100 (pre-subdir-merge), sessions 200 (passed from `useBreakdownData`'s `SESSION_BREAKDOWN_LIMIT`), and skills 100 (from `SKILL_BREAKDOWN_LIMIT`). For sessions whose rollup reports `has_subagents = true`, [[src/components/analytics/BreakdownPanel.tsx#SessionTreeBranch]] manages the per-row expand state and renders the lazy-fetched sub-agent tree through [[src/components/analytics/BreakdownPanel.tsx#SubagentRow]] — a recursive renderer depth-bounded by `SUBAGENT_MAX_DEPTH = 10` that uses [[src/hooks/useSessionSubagents.ts#useSessionSubagents]] for caching; non-expandable session rows omit the disclosure slot so their ids stay flush with normal row padding. In `sessions` mode only, the panel renders the retention banner and marks every row whose span falls at or before the retention cutoff — see [[frontend#Frontend#Components#Retention Degradation]].
 - **Insight cards**: `InsightCard` (generic), `SessionHealthCard`, `ProjectFocusCard`, `LearningProgressCard` — each shows a metric with trend arrow and sparkline. `InsightCard` also accepts an optional `description` prop that renders a top-right `?` help button and a sibling `.insight-card-tooltip` span; the [[features#Analytics Dashboard#Now Tab]] right-column context-savings cards opt into this for in-place metric explanations.
 - **Sparklines**: `TokenSparkline`, `CodeSparkline`, `MiniChart` — small inline Recharts charts.
 - **Utility**: `TabBar`, `TogglePills` (range selector), `ActivityHeatmap`, `CompactStatsRow`, `shared.tsx` (getColor, TrendArrow).
@@ -141,8 +141,90 @@ Full-text session search UI in `src/components/sessions/` for a shared Claude-pl
 
 - **SearchBar** (42 lines) — Query input with real-time validation.
 - **FilterBar** — Multi-select filters for provider, project, host, role, date range, and git branch.
-- **ResultCard** — Search hit preview with provider badge, snippet, and per-session code-change pill.
-- **DetailPanel** — Context message display with provider badge, match highlighting, and session-local code-change totals.
+- **ResultCard** — Search hit preview with provider badge, snippet, and per-session code-change pill. Takes the retention cutoff and swaps the line counts for a pruned marker when the hit predates it — see [[frontend#Frontend#Components#Retention Degradation]].
+- **DetailPanel** — Context message display with provider badge, match highlighting, and session-local code-change totals, with the same pruned marker as `ResultCard`.
+
+### Retention Degradation
+
+The consumer-side treatment for retention pruning (feature 014): the surfaces whose data retention can delete state the cutoff and mark pre-cutoff figures, so deleted history never renders as an honest zero.
+
+[[src/hooks/useRetentionCutoff.ts#useRetentionCutoff]] is the read-only cutoff
+reader mounted by those surfaces. It reads [[backend#Backend#Tauri IPC Commands#Retention policy commands|get_retention_policy]] and exposes the **watermark**, not the
+configured window: the window is a standing intention, the watermark is the
+durable fact about what was actually removed, and only the fact may be shown to
+a user as a date. It re-reads on `retention-maintenance-finished` so a banner
+that appears mid-session states the new cutoff, and a failed read leaves the
+cutoff null — degrading to the pre-014 rendering rather than to a banner
+asserting a boundary that may not exist. It is deliberately separate from the
+Settings control's policy hook, which can also write.
+
+[[src/components/RetentionBanner.tsx#RetentionBanner]] renders the cutoff plus a
+per-surface footnote and returns nothing when the cutoff is null. Its
+`RetentionSurface` union is the scope of the whole treatment, and it is small on
+purpose: `range_to_duration` caps every range-based reader at 30 days and the
+retention preset floor is 30 days, so `get_code_stats`,
+`get_code_stats_history` and `get_llm_runtime_stats` provably cannot reach a
+pruned row and must **not** carry the banner — claiming loss where there is none
+is as dishonest as hiding loss where there is. Only the session-scoped readers
+degrade: `get_session_breakdown` and `get_session_subagent_tree` (surface
+`sessions`, in [[src/components/analytics/BreakdownPanel.tsx#BreakdownPanel]])
+and `get_batch_session_code_stats` (surface `session-search`, in
+[[src/windows/SessionsWindowView.tsx]]). Styling is chrome-grey by design:
+DESIGN.md reserves green/amber/red for the severity meter, and a boundary the
+user opted into is a fact about the instrument, not an alarm.
+
+[[src/utils/retention.ts]] holds the pure helpers.
+[[src/utils/retention.ts#retentionSpanFor]] classifies a `[first_seen,
+last_active]` span as `retained` / `straddles` / `pruned`;
+[[src/utils/retention.ts#markPrunedRange]] applies it across a whole
+time-ordered range, returning new `{ row, span }` pairs rather than mutating the
+rows; [[src/utils/retention.ts#isPruned]] is the single-instant form; and
+[[src/utils/retention.ts#PRUNED_PLACEHOLDER]] is the em dash that replaces a
+zero which is really absent data. Two conservatisms are deliberate, both erring
+towards *not* marking: an unparseable timestamp reports as retained (mirroring
+the delete engine's `length(timestamp) = 24 AND timestamp LIKE '%Z'` conformance
+guard, which refuses to delete rows it cannot compare), and "pruned" means
+*pre-cutoff*, never *provably empty* — live rows and non-conforming timestamps
+survive below the watermark, so all copy says "may be incomplete".
+
+#### Mixed-Horizon Sub-Agent Counts
+
+`SessionBreakdown.subagent_count` is an accepted, documented limitation rather than a bug to fix here: it can outlive the tree it summarises, so the Sessions breakdown renders it marked instead of exact.
+
+The count unions `token_snapshots ∪ response_times ∪ tool_actions` and retention
+prunes only the last of the three, so for a session older than the watermark it
+is computed over mixed horizons and can disagree with its own drilldown — the
+badge says `+2`, the expanded tree says nothing. The treatment is to dagger the
+badge, explain the mixed horizon in its title, and replace the tree's "No
+sub-agents" empty state with "Sub-agent detail pruned (before <date>)" so the
+contradiction is named rather than left for the user to discover. `has_subagents`
+degrades the same way. The real fix is rollup aggregates, which are a deferred
+follow-up.
+
+The same shape appears in session search from the other direction: the
+full-text index is never pruned, so a hit survives after the SQL rows behind its
+code stats are gone. That is why the `session-search` footnote says search
+itself is unaffected — the result is real, only its drilldown is empty.
+
+#### All-Range Retention Invariant
+
+A forward-looking rule recorded on `RangeType` in [[src/types.ts]] rather than shipped as an edit, because the edit S4 originally asked for would be a lie against today's code.
+
+S4 asked for any `all` range to be relabelled "all retained". Grounded against
+the code that is vacuous: `RangeType` is `"1h" | "24h" | "7d" | "30d"` with no
+`all` member, and `range_to_duration` has no `all` arm to feed one. The only
+"All time" affordances in the product are the two Breakdown toggles, and they
+read `skill_usages` and `hook_invocations` — tables retention never prunes — so
+relabelling *them* would itself be false. The requirement therefore survives as
+an invariant instead of an edit:
+
+> Any future all-time or otherwise unbounded range added to `RangeType` that
+> reads `tool_actions` or `session_events` must be labelled "all retained"
+> rather than "all time", and must render `RetentionBanner` on every surface
+> that draws it.
+
+The 30-day cap is what makes the three range-based readers provably unaffected,
+so an unbounded range is precisely the change that breaks the proof.
 
 ### Plugin Components
 
@@ -198,6 +280,7 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useLlmRuntimeStats` | Cumulative runtime, session count, turn count, avg per turn, sparkline | `get_llm_runtime_stats` |
 | `useEfficiencyStats` | Tokens-per-LOC ratio with trend | Derived from token + code stats |
 | `useVelocityStats` | LOC per active LLM-runtime hour with trend | Derived from code stats + `get_llm_runtime_stats` |
+| `useRetentionCutoff` | Read-only retention watermark + window for the degradation treatment; re-reads on `retention-maintenance-finished` | `get_retention_policy` |
 
 | `useLearningStats` | Rule counts by state, confidence buckets | `get_learned_rules` (derived) |
 | `useLearningData` | Rules, runs, settings, observations, logs | Multiple learning commands + events |
@@ -268,7 +351,9 @@ React Context providers used across the frontend for shared state.
 
 Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), context savings (`ContextSavingsAnalytics`, `ContextSavingsEvent`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
 
-Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`, `PluginsTab`.
+Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`, `PluginsTab`. `RangeType` carries the all-range retention invariant in its doc comment, and `SessionBreakdown.subagent_count` / `SessionCodeStats` carry their retention degradation notes — both described in [[frontend#Frontend#Components#Retention Degradation]].
+
+Retention types (`RetentionPolicy`, `RetentionPreview`, `RetentionAuditRecord`, `RetentionMaintenanceProgress`, `RetentionMaintenanceResult`) mirror [[src-tauri/src/retention.rs]] and keep snake_case because they arrive straight off `invoke()` with no mapping layer.
 
 ## Styling
 
@@ -327,3 +412,4 @@ Shared formatting and chart helper functions under `src/utils/`.
 | `src/utils/time.ts` | `timeAgo()` (ISO string to relative "5m ago") |
 | `src/utils/chartHelpers.ts` | `formatTime()`, `dedupeTickLabels()`, `anchorToNow()`, `getAreaColor()` |
 | `src/utils/providers.ts` | `providerLabel()`, `normalizeProviderScope()`, `providerFilterLabel()`, `providerBadgeClass()` |
+| `src/utils/retention.ts` | `retentionSpanFor()`, `markPrunedRange()`, `isPruned()`, `formatRetentionCutoff()`, `PRUNED_PLACEHOLDER` — see [[frontend#Frontend#Components#Retention Degradation]] |

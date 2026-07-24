@@ -6,6 +6,8 @@ import FilterBar from "../components/sessions/FilterBar";
 import ResultCard from "../components/sessions/ResultCard";
 import DetailPanel from "../components/sessions/DetailPanel";
 import { useSessionCodeStats } from "../hooks/useSessionCodeStats";
+import { useRetentionCutoff } from "../hooks/useRetentionCutoff";
+import { RetentionBanner } from "../components/RetentionBanner";
 import type {
 	SearchFilters,
 	SearchResults,
@@ -35,6 +37,10 @@ function SessionsWindowView() {
 		}, []);
 	}, [results]);
 	const locStatsMap = useSessionCodeStats(sessionRefs);
+	// Feature 014: `get_batch_session_code_stats` is one of the three readers
+	// retention can starve. The index behind the search itself is never pruned,
+	// so results keep appearing after their line counts are gone.
+	const { cutoff: retentionCutoff } = useRetentionCutoff();
 	const [totalHits, setTotalHits] = useState(0);
 	const [queryTimeMs, setQueryTimeMs] = useState(0);
 	const [facets, setFacets] = useState<SearchFacets>({
@@ -265,6 +271,10 @@ function SessionsWindowView() {
 										Session index refresh failed. Results may be stale.
 									</div>
 								)}
+								<RetentionBanner
+									cutoff={retentionCutoff}
+									surface="session-search"
+								/>
 								{query.trim() && !loading && (
 									<div className="sessions-results-header">
 										{totalHits} result{totalHits !== 1 ? "s" : ""} in {queryTimeMs}ms
@@ -286,6 +296,7 @@ function SessionsWindowView() {
 												session_id: hit.session_id,
 											})] ?? null
 										}
+										retentionCutoff={retentionCutoff}
 										onSelect={() => handleSelect(hit)}
 									/>
 								))}
@@ -314,6 +325,7 @@ function SessionsWindowView() {
 									session_id: selectedHit.session_id,
 								})] ?? null
 							}
+							retentionCutoff={retentionCutoff}
 						/>
 					) : (
 						<div className="sessions-detail-empty">

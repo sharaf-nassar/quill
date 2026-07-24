@@ -2313,6 +2313,70 @@ body {
   font-size: 9px;
 }
 
+/* ─── Retention degradation treatment (feature 014) ───
+   Chrome-grey throughout. DESIGN.md reserves green/amber/red for the severity
+   meter, and a retention cutoff the user opted into is a fact about the
+   instrument, not an alarm. Structure comes from a hairline, never a card. */
+
+.retention-banner {
+  margin: var(--space-md) 0 var(--space-sm);
+  padding: var(--space-md) var(--space-lg);
+  border: 1px solid var(--graphite-line);
+  border-left: 2px solid var(--label-faint);
+  border-radius: var(--radius-xs);
+  background: var(--panel-deep);
+}
+
+.retention-banner-lead {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-md);
+}
+
+.retention-banner-tag {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--label-faint);
+}
+
+.retention-banner-cutoff {
+  font-size: 11px;
+  color: var(--readout-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-banner-body,
+.retention-banner-footnote {
+  margin: var(--space-xs) 0 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--label);
+}
+
+.retention-banner-footnote {
+  color: var(--label-faint);
+}
+
+/* A marked figure is dimmed and daggered, never recoloured — the reading is
+   "incomplete", not "bad". */
+.breakdown-session-count.retention-marked {
+  color: var(--label-faint);
+  border-bottom: 1px dotted var(--label-faint);
+  cursor: help;
+}
+
+.retention-mark {
+  margin-left: 2px;
+}
+
+.sessions-loc-pruned {
+  color: var(--label-faint);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+
 .breakdown-skill-provider-counts {
   margin-left: 6px;
   color: rgba(255, 255, 255, 0.38);
