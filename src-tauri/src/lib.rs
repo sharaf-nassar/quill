@@ -3390,6 +3390,45 @@ async fn set_runtime_settings(
     Ok(resolved)
 }
 
+/// Completion path every retention run ends on: drop the analytics payloads
+/// the prune may have invalidated, then tell the frontend to revalidate.
+///
+/// The two halves are one step because either alone leaves a stale reader.
+/// [`storage::Storage::clear_analytics_caches`] handles the in-process side,
+/// where a pure DELETE moves no high-water marker; emitting
+/// [`TRANSCRIPT_ANALYTICS_UPDATED_EVENT`] handles the frontend side, where
+/// `useCodeStats`, `useBreakdownData`, `useLlmRuntimeStats` and
+/// `useCodeInsights` already listen for exactly this event.
+///
+/// The emitter is a closure rather than a `tauri::AppHandle` so the
+/// invalidation contract is provable without an application window; the
+/// composite `run_retention_maintenance` command passes one that forwards to
+/// [`tauri::Emitter::emit`]. It never returns an error: this runs after the
+/// run's own outcome is decided, and a failed notification must not turn a
+/// completed prune into a failed one.
+///
+/// `dead_code` is allowed because the completion path ships ahead of the
+/// composite command that calls it, which is a separate work item.
+#[allow(dead_code)]
+pub(crate) fn invalidate_analytics_after_retention(
+    storage: &storage::Storage,
+    emit: impl FnOnce(&'static str),
+) {
+    storage.clear_analytics_caches();
+    emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT);
+}
+
+/// Forward the retention invalidation event to the frontend.
+///
+/// Emission failure is logged rather than propagated — see
+/// [`invalidate_analytics_after_retention`].
+#[allow(dead_code)]
+pub(crate) fn emit_retention_analytics_invalidation(app: &tauri::AppHandle, event: &'static str) {
+    if let Err(error) = app.emit(event, ()) {
+        log::warn!("Failed to emit retention analytics invalidation: {error}");
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct DatabaseCompactionProgress {
     phase: &'static str,

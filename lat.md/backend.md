@@ -353,6 +353,50 @@ An unparseable `retention.last_run` must read as absent and must not block a
 subsequent write, so a truncated or hand-edited value degrades the audit trail
 rather than wedging retention.
 
+### Analytics cache invalidation on prune
+
+[[src-tauri/src/lib.rs#invalidate_analytics_after_retention]] is the single step every retention run ends on: it drains all five in-process analytics caches and emits `transcript-analytics-updated` so no reader keeps serving pre-prune counts.
+
+The in-process half exists because a prune is invisible to the cache's own
+freshness check. [[backend#Backend#Database#Schema#Model Analytics Evidence#Analytics Cache Primitive]]
+validates an entry against max-only high-water markers, and a DELETE never
+advances one, so a payload built before the prune still matches the post-prune
+database and the 45-second TTL is the only thing that would retire it.
+[[src-tauri/src/storage.rs#Storage#clear_analytics_caches]] therefore drops
+every entry unconditionally rather than reasoning about which command could
+have been affected. Neither `tool_actions` nor `session_events` is a
+`CacheTable` today, so the blast radius is currently zero — that is exactly why
+the drain is cheap, and why it is written now instead of being left as a trap
+for whichever command gets cached next.
+
+The frontend half reuses the event `useCodeStats`, `useBreakdownData`,
+`useLlmRuntimeStats` and `useCodeInsights` already listen for, so a prune
+revalidates those hooks through the same channel an ingest does and no new
+push event enters the IPC surface.
+
+The emitter is a closure rather than a `tauri::AppHandle` so the contract is
+provable without an application window;
+[[src-tauri/src/lib.rs#emit_retention_analytics_invalidation]] is the closure
+the composite command passes. Nothing here returns an error: invalidation runs
+after the run's outcome is already decided, and a failed notification must
+never turn a completed prune into a failed one.
+
+#### Analytics Cache Invalidation Test Specs
+
+This spec pins the contract at the layer that owns it, so a missed cache or a
+missing emission fails here rather than as an unexplained stale count in the UI.
+
+##### All Five Caches Drained And Event Emitted
+
+With all five caches warmed through their real read paths, the completion path
+must leave every one of them empty and must emit exactly
+`transcript-analytics-updated`.
+
+A drain that misses one cache and a drain that forgets to notify are the same
+defect to a user — a stale count — so both halves are asserted in one test.
+Warming through the real commands rather than by hand-inserting entries is what
+makes the emptiness assertion mean something.
+
 ### Schema
 
 The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.

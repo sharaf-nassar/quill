@@ -11190,6 +11190,24 @@ impl Storage {
             last_run: self.read_retention_audit_record()?,
         })
     }
+
+    /// Drop every cached analytics payload this `Storage` is holding.
+    ///
+    /// A retention run deletes rows without moving any of the max-only
+    /// high-water markers [`TableVersions`] probes, so a cached payload built
+    /// before the prune still validates against the post-prune database and
+    /// the 45-second [`ANALYTICS_CACHE_TTL`] is the only thing that would
+    /// retire it. Neither retention target table is a [`CacheTable`] today,
+    /// which makes this unconditional drain cheap and correct in advance:
+    /// the day one of these commands starts reading `tool_actions` or
+    /// `session_events`, the completion path is already right.
+    pub fn clear_analytics_caches(&self) {
+        self.model_analytics_cache.lock().clear();
+        self.model_usage_overview_cache.lock().clear();
+        self.model_history_cache.lock().clear();
+        self.bucket_stats_cache.lock().clear();
+        self.context_savings_analytics_cache.lock().clear();
+    }
 }
 
 impl Storage {
@@ -17035,6 +17053,65 @@ mod tests {
         assert_eq!(result.reason, None);
         assert_eq!(result.bytes_before, bytes_before);
         assert!(result.bytes_after > 0);
+        clear_env();
+    }
+
+    /// Populate all five analytics caches through their real read paths, so
+    /// the drain is proved against entries `get_or_compute` actually stored
+    /// rather than against hand-inserted ones.
+    fn warm_all_analytics_caches(storage: &Storage) {
+        storage
+            .get_model_analytics(ModelRange::TwentyFourHours, None)
+            .expect("warm model analytics cache");
+        storage
+            .get_model_usage_overview(ModelRange::TwentyFourHours, None)
+            .expect("warm model usage overview cache");
+        storage
+            .get_model_history(ModelRange::TwentyFourHours, None, None)
+            .expect("warm model history cache");
+        storage
+            .get_all_bucket_stats(&[], 30)
+            .expect("warm bucket stats cache");
+        storage
+            .get_context_savings_analytics("24h", None)
+            .expect("warm context savings analytics cache");
+    }
+
+    /// The five caches' current entry counts, in declaration order.
+    fn analytics_cache_lens(storage: &Storage) -> [usize; 5] {
+        [
+            storage.model_analytics_cache.lock().len(),
+            storage.model_usage_overview_cache.lock().len(),
+            storage.model_history_cache.lock().len(),
+            storage.bucket_stats_cache.lock().len(),
+            storage.context_savings_analytics_cache.lock().len(),
+        ]
+    }
+
+    // @lat: [[backend#Backend#Database#Analytics cache invalidation on prune#Analytics Cache Invalidation Test Specs#All Five Caches Drained And Event Emitted]]
+    #[test]
+    #[serial]
+    fn retention_completion_drains_every_analytics_cache_and_emits() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        warm_all_analytics_caches(&storage);
+        assert!(
+            analytics_cache_lens(&storage).iter().all(|len| *len > 0),
+            "every analytics cache must hold an entry before the drain, \
+             otherwise the assertion below proves nothing"
+        );
+
+        let mut emitted: Vec<&'static str> = Vec::new();
+        crate::invalidate_analytics_after_retention(&storage, |event| emitted.push(event));
+
+        assert_eq!(
+            analytics_cache_lens(&storage),
+            [0; 5],
+            "retention's completion path must leave no cached payload behind"
+        );
+        assert_eq!(emitted, vec![crate::TRANSCRIPT_ANALYTICS_UPDATED_EVENT]);
+
         clear_env();
     }
 
