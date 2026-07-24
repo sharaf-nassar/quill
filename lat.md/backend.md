@@ -397,6 +397,33 @@ defect to a user — a stale count — so both halves are asserted in one test.
 Warming through the real commands rather than by hand-inserting entries is what
 makes the emptiness assertion mean something.
 
+### Retention maintenance events
+
+[[src-tauri/src/lib.rs#emit_retention_maintenance_progress]] and [[src-tauri/src/lib.rs#emit_retention_maintenance_finished]] are the only writers of the two retention events, so the event names and the phase vocabulary have one definition.
+
+The pair mirrors database compaction deliberately:
+[[src-tauri/src/lib.rs#RetentionMaintenanceProgress]] has the same
+`{ phase, pct }` shape as `DatabaseCompactionProgress`, so the Settings UI
+renders both maintenance paths with one component. The scaffolding ships ahead
+of the commands that emit through it because *two* commands do — preview reuses
+[[src-tauri/src/lib.rs#RETENTION_MAINTENANCE_PROGRESS_EVENT]] for its counting
+phase rather than owning a third event, which is what lets the frontend keep a
+single listener pair for "previewing" and "running".
+
+The phase vocabulary is a fixed set — `Counting rows`, `Checking disk space`,
+`Removing old rows`, `Compacting database` — and `phase` is typed `&'static str`
+so a caller passes a member of that set instead of an ad-hoc string; the phases
+a user can observe stay enumerable from one place. Counting is a single
+`CREATE TEMP TABLE … AS SELECT` with no natural progress signal, so its `pct`
+comes from a wall-clock heartbeat instead of sitting at zero; the delete phase
+advances per chunk so a several-hundred-thousand-row run visibly moves.
+
+[[src-tauri/src/lib.rs#emit_retention_maintenance_finished]] is generic over its
+payload so the event name could land before the preview and maintenance result
+types exist. Both emitters log a failed emit and return: the run has already
+happened and its outcome is durable in `retention.last_run`, so a dropped event
+must not turn into a failed maintenance run.
+
 ### Schema
 
 The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.

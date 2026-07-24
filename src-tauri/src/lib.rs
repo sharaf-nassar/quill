@@ -3444,6 +3444,81 @@ fn emit_database_compaction_progress(app: &tauri::AppHandle, phase: &'static str
     }
 }
 
+/// Event carrying incremental retention-maintenance progress.
+///
+/// Declared once here rather than at each emit site because two commands emit
+/// it — `preview_retention` reuses it for its counting phase so the Settings
+/// UI needs a single listener pair for preview and for a full run.
+#[allow(dead_code)] // Emitted by the retention commands, which land next.
+const RETENTION_MAINTENANCE_PROGRESS_EVENT: &str = "retention-maintenance-progress";
+
+/// Event carrying the terminal retention-maintenance result, including the
+/// `"partial"` case.
+#[allow(dead_code)] // Emitted by the retention commands, which land next.
+const RETENTION_MAINTENANCE_FINISHED_EVENT: &str = "retention-maintenance-finished";
+
+/// Phase label for the pre-delete row count.
+///
+/// The counting phase is one `CREATE TEMP TABLE … AS SELECT` with no natural
+/// progress signal, so its `pct` is driven by a wall-clock heartbeat rather
+/// than left pinned at zero.
+#[allow(dead_code)] // Emitted by the retention commands, which land next.
+const RETENTION_PHASE_COUNTING_ROWS: &str = "Counting rows";
+
+/// Phase label for the delete-phase disk/WAL/TEMP preflight.
+#[allow(dead_code)] // Emitted by the retention commands, which land next.
+const RETENTION_PHASE_CHECKING_DISK_SPACE: &str = "Checking disk space";
+
+/// Phase label for the chunked delete, whose `pct` advances per chunk so a
+/// several-hundred-thousand-row delete visibly moves.
+#[allow(dead_code)] // Emitted by the retention commands, which land next.
+const RETENTION_PHASE_REMOVING_OLD_ROWS: &str = "Removing old rows";
+
+/// Phase label for the VACUUM handoff that turns freed pages into freed disk.
+#[allow(dead_code)] // Emitted by the retention commands, which land next.
+const RETENTION_PHASE_COMPACTING_DATABASE: &str = "Compacting database";
+
+/// Payload of [`RETENTION_MAINTENANCE_PROGRESS_EVENT`], deliberately identical
+/// in shape to [`DatabaseCompactionProgress`] so the frontend can reuse the
+/// same progress rendering for both maintenance paths.
+#[derive(Clone, serde::Serialize)]
+#[allow(dead_code)] // Constructed by the retention commands, which land next.
+struct RetentionMaintenanceProgress {
+    phase: &'static str,
+    pct: u8,
+}
+
+/// Emit one retention progress tick.
+///
+/// `phase` is `&'static str` on purpose: callers pass a member of the shared
+/// phase vocabulary above rather than an ad-hoc string, so the phases the UI
+/// can observe stay enumerable from this file.
+#[allow(dead_code)] // Called by the retention commands, which land next.
+fn emit_retention_maintenance_progress(app: &tauri::AppHandle, phase: &'static str, pct: u8) {
+    if let Err(error) = app.emit(
+        RETENTION_MAINTENANCE_PROGRESS_EVENT,
+        RetentionMaintenanceProgress { phase, pct },
+    ) {
+        log::warn!("Failed to emit retention maintenance progress: {error}");
+    }
+}
+
+/// Emit the terminal retention result.
+///
+/// Generic over the payload so this helper can ship ahead of the preview and
+/// maintenance result types without either of them having to own the event
+/// name. A failed emit is logged, never propagated: the run itself already
+/// succeeded and its record is durable in `retention.last_run`.
+#[allow(dead_code)] // Called by the retention commands, which land next.
+fn emit_retention_maintenance_finished<P: serde::Serialize + Clone>(
+    app: &tauri::AppHandle,
+    result: &P,
+) {
+    if let Err(error) = app.emit(RETENTION_MAINTENANCE_FINISHED_EVENT, result) {
+        log::warn!("Failed to emit retention maintenance result: {error}");
+    }
+}
+
 /// Compact SQLite through the user-triggered maintenance path.
 ///
 /// The maintenance writer gate quiesces app-owned ingest before preflight and
@@ -4901,6 +4976,10 @@ pub fn run() {
             get_runtime_settings,
             set_runtime_settings,
             compact_database,
+            // The remaining retention commands — `preview_retention` and
+            // `run_retention_maintenance` — register here too, beside
+            // `compact_database`: one maintenance surface, one quiesce lease,
+            // one progress-event shape.
             get_retention_policy,
             set_retention_policy,
             get_learning_settings,
