@@ -2445,10 +2445,20 @@ async fn get_usage_stats(
 
 #[tauri::command]
 async fn get_all_bucket_stats(buckets_json: String, days: i32) -> Result<Vec<BucketStats>, String> {
+    let started_at = std::time::Instant::now();
     let storage = get_storage()?;
     let buckets: Vec<models::UsageBucket> =
         serde_json::from_str(&buckets_json).map_err(|e| format!("Failed to parse buckets: {e}"))?;
-    run_blocking(move || storage.get_all_bucket_stats(&buckets, days))
+    let range_for_log = format!("{days}d");
+    let result = run_blocking(move || storage.get_all_bucket_stats(&buckets, days));
+    log_analytics_command_timing(
+        "get_all_bucket_stats",
+        &range_for_log,
+        None,
+        "miss",
+        started_at,
+    );
+    result
 }
 
 #[tauri::command]
@@ -2521,6 +2531,27 @@ fn model_analytics_storage_error(
     ModelAnalyticsError::storage_error()
 }
 
+/// Emit the stable observability record for a cacheable analytics IPC call.
+///
+/// Cache-backed commands currently report a miss until their command-specific
+/// cache maps are wired; subsequent cache work preserves this log shape and
+/// replaces that value with the actual hit state.
+fn log_analytics_command_timing(
+    command: &str,
+    range: &str,
+    provider: Option<&str>,
+    cache: &str,
+    started_at: std::time::Instant,
+) {
+    if log::log_enabled!(log::Level::Info) {
+        log::info!(
+            "analytics_cmd={command} range={range} provider={} cache={cache} elapsed_ms={}",
+            provider.unwrap_or("all"),
+            started_at.elapsed().as_millis(),
+        );
+    }
+}
+
 fn normalize_model_sessions_limit(
     limit: Option<i64>,
 ) -> Result<Option<usize>, ModelAnalyticsError> {
@@ -2544,13 +2575,16 @@ async fn get_model_analytics(
     range: String,
     provider: Option<String>,
 ) -> Result<ModelAnalyticsResponse, ModelAnalyticsError> {
+    let started_at = std::time::Instant::now();
     let range = ModelRange::try_from(range.as_str())?;
     let provider = validate_model_analytics_provider(provider)?;
+    let range_for_log = range.as_str();
+    let provider_for_log = provider.clone();
     let storage = get_storage().map_err(|error| {
         model_analytics_storage_error("Model analytics storage unavailable", error)
     })?;
 
-    match tauri::async_runtime::spawn_blocking(move || {
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         storage.get_model_analytics(range, provider.as_deref())
     })
     .await
@@ -2564,7 +2598,15 @@ async fn get_model_analytics(
             "Model analytics blocking task failed",
             error,
         )),
-    }
+    };
+    log_analytics_command_timing(
+        "get_model_analytics",
+        range_for_log,
+        provider_for_log.as_deref(),
+        "miss",
+        started_at,
+    );
+    result
 }
 
 /// Return the usage-frequency Models overview from one retained-evidence snapshot.
@@ -2574,13 +2616,16 @@ async fn get_model_usage_overview(
     range: String,
     provider: Option<String>,
 ) -> Result<ModelUsageOverviewResponse, ModelAnalyticsError> {
+    let started_at = std::time::Instant::now();
     let range = ModelRange::try_from(range.as_str())?;
     let provider = validate_model_analytics_provider(provider)?;
+    let range_for_log = range.as_str();
+    let provider_for_log = provider.clone();
     let storage = get_storage().map_err(|error| {
         model_analytics_storage_error("Model overview storage unavailable", error)
     })?;
 
-    match tauri::async_runtime::spawn_blocking(move || {
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         storage.get_model_usage_overview(range, provider.as_deref())
     })
     .await
@@ -2594,7 +2639,15 @@ async fn get_model_usage_overview(
             "Model usage overview blocking task failed",
             error,
         )),
-    }
+    };
+    log_analytics_command_timing(
+        "get_model_usage_overview",
+        range_for_log,
+        provider_for_log.as_deref(),
+        "miss",
+        started_at,
+    );
+    result
 }
 
 /// Return fixed-bucket model history, optionally scoped to one exact identity.
@@ -2605,14 +2658,17 @@ async fn get_model_history(
     provider: Option<String>,
     selected_model: Option<ModelIdentity>,
 ) -> Result<ModelHistoryResponse, ModelAnalyticsError> {
+    let started_at = std::time::Instant::now();
     let range = ModelRange::try_from(range.as_str())?;
     let provider = validate_model_analytics_provider(provider)?;
     let selected_model = validate_selected_model(selected_model, provider.as_deref())?;
+    let range_for_log = range.as_str();
+    let provider_for_log = provider.clone();
     let storage = get_storage().map_err(|error| {
         model_analytics_storage_error("Model history storage unavailable", error)
     })?;
 
-    match tauri::async_runtime::spawn_blocking(move || {
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         storage.get_model_history(range, provider.as_deref(), selected_model.as_ref())
     })
     .await
@@ -2626,7 +2682,15 @@ async fn get_model_history(
             "Model history blocking task failed",
             error,
         )),
-    }
+    };
+    log_analytics_command_timing(
+        "get_model_history",
+        range_for_log,
+        provider_for_log.as_deref(),
+        "miss",
+        started_at,
+    );
+    result
 }
 
 /// Page sessions that contain one exact provider-qualified raw model identity.
@@ -2977,8 +3041,18 @@ async fn get_context_savings_analytics(
     range: String,
     limit: Option<i64>,
 ) -> Result<ContextSavingsAnalytics, String> {
+    let started_at = std::time::Instant::now();
     let storage = get_storage()?;
-    run_blocking(move || storage.get_context_savings_analytics(&range, limit))
+    let range_for_log = range.clone();
+    let result = run_blocking(move || storage.get_context_savings_analytics(&range, limit));
+    log_analytics_command_timing(
+        "get_context_savings_analytics",
+        &range_for_log,
+        None,
+        "miss",
+        started_at,
+    );
+    result
 }
 
 #[tauri::command]

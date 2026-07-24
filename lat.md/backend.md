@@ -487,6 +487,12 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 
 `get_context_savings_analytics` returns range-scoped summary totals, timeseries buckets, grouped breakdowns, and recent append-only events for the Analytics Context tab. Token values are approximate `ceil(bytes / 4)` estimates, while byte counts and event counts are exact where producers can measure them.
 
+Cacheable analytics IPC calls emit an info-level `analytics_cmd` timing record
+with range, provider, cache state, and elapsed milliseconds. The record is
+gated by the info log level, so it adds no elapsed-time calculation when
+observability is disabled; before each command's cache map is wired it reports
+`cache=miss` and retains the same stable log shape for later cache work.
+
 ### Model Analytics Commands (6)
 
 Model analytics IPC exposes validated aggregate, overview, history, paged-session, session-detail, and backfill operations through one structured, user-safe error contract.
