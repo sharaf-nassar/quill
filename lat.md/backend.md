@@ -424,6 +424,106 @@ types exist. Both emitters log a failed emit and return: the run has already
 happened and its outcome is durable in `retention.last_run`, so a dropped event
 must not turn into a failed maintenance run.
 
+### Insert-time watermark filtering
+
+[[src-tauri/src/storage.rs#Storage#replace_transcript_analytics_snapshot]] reads `retention.watermark` inside its own transaction and filters the `session_events` and `tool_actions` insert loops against it. This — not the delete — is what makes a retention run durable.
+
+Resurrection is a normal-path behaviour, not an edge case. The replacement
+unconditionally deletes and reinserts a source's whole parse whenever its
+mtime, size or content hash changes, so one `--resume` append to a months-old
+transcript would restore that source's entire pre-cutoff history, and the
+`transcript_analytics_reingest_pending` marker would do it for every retained
+source at once. Reading the watermark beside the generation key costs one more
+primary-key lookup on a transaction that already reads a `settings` row, and it
+turns reconciliation from a threat into an ally: because the replace already
+deleted the source's rows, a filtered reinsert also prunes that source's stale
+pre-cutoff rows as a side effect.
+
+[[src-tauri/src/retention.rs#retention_insert_verdict]] is the delete guard
+inverted in effect: a row is suppressed exactly when
+`length(timestamp) = 24 AND timestamp LIKE '%Z' AND timestamp < watermark`
+holds — the predicate the delete phase uses. A non-conforming timestamp is
+therefore **always inserted**, never suppressed, because it is also never
+deleted. The two guards must agree or a row could be suppressed on reinsert
+while its original was retained, which is silent data loss with no delete to
+account for it. The three outcomes are an enum rather than a boolean so the
+pass-through case cannot be collapsed into "not suppressed" by accident.
+
+Scope is deliberately narrow. `response_times`, `skill_usages` and
+`hook_invocations` are inserted unfiltered and keep full history — they are not
+retention targets, and the "All time" Breakdown toggles read two of them. The
+`transcript_analytics_sources` registry row is written exactly as an unfiltered
+replacement writes it, so the source stays registered and reconcilable; a
+per-source `retained_through` column is ruled out because
+`prune_transcript_analytics_sources_for_root` deletes the registry row it would
+live on. Live rows never reach this path at all: every other insert site
+(`store_live_session_analytics`, `ingest_session_events`, and
+`server.rs::persist_remote_session_analytics` through the first of them)
+hard-codes `source_key NULL`, and live rows are excluded from retention.
+
+[[src-tauri/src/storage.rs#RetentionInsertFilterCounts]] rides back on
+`TranscriptAnalyticsReplacement::Replaced` and keeps the two figures separate,
+because they mean opposite things: suppressed rows are retention working, while
+non-conforming pass-throughs are rows retention cannot act on in either
+direction. `commit_transcript_snapshot` logs both whenever either is non-zero,
+so "suppressed 412, passed 3 non-conforming" appears in the reconciliation log
+rather than being inferred from a row count that changed.
+
+#### Insert-Time Watermark Test Specs
+
+These specs pin the durability argument end to end: the filter's blast radius,
+its conformance guard, and the two paths through which a pruned row could come
+back.
+
+##### Watermark Filters Snapshot Inserts
+
+Under an active watermark, only post-cutoff `session_events` and `tool_actions`
+rows may land, while every sibling-table row lands unfiltered and the registry
+row is written unchanged.
+
+The siblings are `response_times`, `skill_usages` and `hook_invocations`; the
+registry assertion covers its fingerprint, status and generation.
+
+This is the blast-radius spec: a filter that reached one table too far would
+silently delete history retention never promised to touch, and one that skipped
+the registry row would strand the source outside reconciliation.
+
+##### Conformance Guard Pass-Through
+
+Non-conforming pre-cutoff rows must all land, only conforming pre-cutoff rows may
+be suppressed, and the replacement summary must report the suppressed and
+non-conforming counts separately.
+
+The three planted shapes fail the guard in different halves — a `+00:00` offset,
+a seconds-precision `Z`, and a 24-character `+0000` form — so a guard written
+with only one half still fails here.
+
+##### Changed Source Does Not Resurrect
+
+After a prune, changing a source's fingerprint and re-driving reconciliation must
+not return the pruned rows, and the post-cutoff rows must be present exactly
+once.
+
+This is the normal path — an appended transcript — and the reason the watermark
+exists rather than a one-off delete.
+
+##### Forced Reparse Does Not Resurrect
+
+Setting `transcript_analytics_reingest_pending` and running startup
+reconciliation must produce the same result, because that marker bypasses every
+freshness short-circuit and reparses each retained source in full.
+
+It is the widest resurrection window in the system, so it gets its own spec
+rather than being assumed to follow from the changed-source case.
+
+##### Live Rows Ignore The Watermark
+
+`store_live_session_analytics` and `ingest_session_events` must insert their
+`source_key IS NULL` rows on both sides of the cutoff, and every one must land.
+
+Live rows are outside retention's scope by design, so a watermark leaking into
+either live path would delete data the user was never asked about.
+
 ### Schema
 
 The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
@@ -626,7 +726,7 @@ Reconciliation compares canonical source key/path and last-good status before re
 
 [[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] advances every unchanged source of one root in a single transaction rather than one per source — a real corpus collapses roughly 5,500 transactions into one. It returns the source keys whose rows did not update because the root generation moved under a concurrent run, so callers keep per-source stale-generation handling instead of one aggregate verdict; the single-source method is a thin wrapper over it.
 
-`replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; valid empty snapshots remove only that source, while suppression and any insert failure leave prior rows intact. Owned inserts use `INSERT OR IGNORE` through statements prepared once outside their loops, matching the source-less live paths — an owned identity is the table's own dedupe key, so a legitimate repeat must not roll back the whole five-table snapshot. Distinct `cwd` values are resolved through the rename map once into a lookup table instead of once per skill and hook row. Registry upserts advance `seen_generation`; stale prepared generations are rejected before owned rows change. Parse or identity conflicts retain last-good registry state.
+`replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; valid empty snapshots remove only that source, while suppression and any insert failure leave prior rows intact. Owned inserts use `INSERT OR IGNORE` through statements prepared once outside their loops, matching the source-less live paths — an owned identity is the table's own dedupe key, so a legitimate repeat must not roll back the whole five-table snapshot. Distinct `cwd` values are resolved through the rename map once into a lookup table instead of once per skill and hook row. Registry upserts advance `seen_generation`; stale prepared generations are rejected before owned rows change. Parse or identity conflicts retain last-good registry state. The `session_events` and `tool_actions` insert loops are additionally filtered by [[backend#Backend#Database#Insert-time watermark filtering]], which is what stops this delete-and-reinsert from resurrecting pruned history.
 
 [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] atomically writes source-less runtime or hook rows with durable project, full-cwd, and host origin. Origin upserts preserve known fields with `COALESCE`; live event rows require unique message UUID identity and always use the incoming session as both root and chain.
 

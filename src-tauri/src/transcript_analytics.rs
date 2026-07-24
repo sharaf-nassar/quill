@@ -700,7 +700,21 @@ fn commit_transcript_snapshot(
 ) -> Result<TranscriptSourceResult, String> {
     Ok(
         match storage.replace_transcript_analytics_snapshot(snapshot)? {
-            TranscriptAnalyticsReplacement::Replaced => TranscriptSourceResult::Replaced,
+            TranscriptAnalyticsReplacement::Replaced(retention) => {
+                // A reinsert the retention watermark changed is the one thing
+                // about reconciliation a user cannot otherwise observe, so it
+                // is logged rather than left to the row counts.
+                if !retention.is_unfiltered() {
+                    log::info!(
+                        "Retention watermark filtered a transcript replacement: provider={} source={} suppressed={} non_conforming={}",
+                        snapshot.source.provider.as_str(),
+                        snapshot.source.source_key,
+                        retention.suppressed(),
+                        retention.non_conforming(),
+                    );
+                }
+                TranscriptSourceResult::Replaced
+            }
             TranscriptAnalyticsReplacement::SuppressedUnchanged => {
                 TranscriptSourceResult::SuppressedUnchanged
             }

@@ -323,6 +323,48 @@ pub fn conforming_timestamp(at: DateTime<Utc>) -> String {
     at.format(CONFORMING_TIMESTAMP_FORMAT).to_string()
 }
 
+/// What the insert-time watermark does to one candidate row.
+///
+/// The three outcomes are exhaustive by construction, which is the point: a
+/// row is either inserted normally, suppressed, or inserted *and counted*
+/// because its timestamp is not byte-comparable. There is no fourth case where
+/// a row silently disappears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionInsertVerdict {
+    /// No watermark is set, or the row is at or after it.
+    Insert,
+    /// Conforming and older than the watermark, so the row is not reinserted.
+    Suppress,
+    /// Non-conforming, so the row is inserted and counted as a pass-through.
+    PassNonConforming,
+}
+
+/// Decide the fate of one row at insert time.
+///
+/// This is [`derive_retention_cutoff`]'s delete guard —
+/// `length(timestamp) = 24 AND timestamp LIKE '%Z' AND timestamp < cutoff` —
+/// inverted in effect: a row is suppressed exactly when the delete phase would
+/// have deleted it. The two guards must agree or a row could be suppressed on
+/// reinsert while its original was retained, which is silent data loss with no
+/// delete to account for it. A non-conforming timestamp is therefore *always*
+/// inserted, never suppressed, and counted so the pass-through is visible.
+pub fn retention_insert_verdict(
+    watermark: Option<&str>,
+    timestamp: &str,
+) -> RetentionInsertVerdict {
+    let Some(watermark) = watermark else {
+        return RetentionInsertVerdict::Insert;
+    };
+    if !is_conforming_timestamp(timestamp) {
+        return RetentionInsertVerdict::PassNonConforming;
+    }
+    if timestamp < watermark {
+        RetentionInsertVerdict::Suppress
+    } else {
+        RetentionInsertVerdict::Insert
+    }
+}
+
 /// Accept a window only if it is one of [`RETENTION_WINDOW_PRESETS`].
 pub fn validate_window_days(window_days: i64) -> Result<i64, RetentionPolicyError> {
     if RETENTION_WINDOW_PRESETS.contains(&window_days) {

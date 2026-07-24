@@ -22,15 +22,52 @@ use crate::model_usage::{
 };
 use crate::retention::{
     RETENTION_LAST_RUN_KEY, RETENTION_WATERMARK_KEY, RETENTION_WINDOW_DAYS_KEY,
-    RetentionAuditRecord, RetentionPolicy, advanced_watermark, parse_audit_record_setting,
-    parse_watermark_setting, parse_window_days_setting, window_days_setting_value,
+    RetentionAuditRecord, RetentionInsertVerdict, RetentionPolicy, advanced_watermark,
+    parse_audit_record_setting, parse_watermark_setting, parse_window_days_setting,
+    retention_insert_verdict, window_days_setting_value,
 };
 use crate::transcript_analytics::TranscriptAnalyticsSnapshot;
+
+/// What the insert-time retention watermark did to one snapshot replacement.
+///
+/// Both halves are reported, and they are reported separately, because they
+/// mean opposite things: `suppressed_*` rows were deliberately not reinserted
+/// because a run already deleted them, while `non_conforming_*` rows were
+/// reinserted *despite* an active watermark because their timestamps are not
+/// byte-comparable and the delete guard skips them too. Folding the two into
+/// one number would hide the only case where retention is not doing what the
+/// user configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetentionInsertFilterCounts {
+    pub(crate) suppressed_session_events: u64,
+    pub(crate) suppressed_tool_actions: u64,
+    pub(crate) non_conforming_session_events: u64,
+    pub(crate) non_conforming_tool_actions: u64,
+}
+
+impl RetentionInsertFilterCounts {
+    /// Conforming pre-watermark rows the filter did not reinsert.
+    pub(crate) fn suppressed(&self) -> u64 {
+        self.suppressed_session_events
+            .saturating_add(self.suppressed_tool_actions)
+    }
+
+    /// Non-conforming rows that landed even though a watermark was active.
+    pub(crate) fn non_conforming(&self) -> u64 {
+        self.non_conforming_session_events
+            .saturating_add(self.non_conforming_tool_actions)
+    }
+
+    /// Whether the watermark changed nothing about this replacement.
+    pub(crate) fn is_unfiltered(&self) -> bool {
+        self.suppressed() == 0 && self.non_conforming() == 0
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptAnalyticsReplacement {
-    Replaced,
+    Replaced(RetentionInsertFilterCounts),
     SuppressedUnchanged,
     StaleGeneration,
 }
@@ -3483,6 +3520,28 @@ impl Storage {
             )
             .map_err(|e| format!("Delete {table} source rows: {e}"))?;
         }
+        // Retention's durability hinges on this one read. The replace above
+        // has just deleted every owned row for the source, so an unfiltered
+        // reinsert would resurrect the whole pre-cutoff history a run already
+        // deleted the moment the transcript's mtime, size or hash changes.
+        // Reading the watermark inside this transaction — beside the
+        // generation key, one more primary-key lookup — is what makes the
+        // deletion durable, and a filtered reinsert prunes the source's stale
+        // pre-cutoff rows as a side effect.
+        let watermark = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RETENTION_WATERMARK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read retention watermark: {error}"))?
+            .as_deref()
+            .and_then(parse_watermark_setting);
+        let mut suppressed_session_events = 0_u64;
+        let mut suppressed_tool_actions = 0_u64;
+        let mut non_conforming_session_events = 0_u64;
+        let mut non_conforming_tool_actions = 0_u64;
         // `cwd` is near-constant across a source's rows, so resolve each
         // distinct value once instead of once per skill and hook row.
         let mut cwd_renames: HashMap<Option<&str>, Option<String>> = HashMap::new();
@@ -3523,6 +3582,17 @@ impl Storage {
                 )
                 .map_err(|e| format!("Prepare owned session events: {e}"))?;
             for row in &snapshot.session_events {
+                match retention_insert_verdict(watermark.as_deref(), &row.timestamp) {
+                    RetentionInsertVerdict::Suppress => {
+                        suppressed_session_events = suppressed_session_events.saturating_add(1);
+                        continue;
+                    }
+                    RetentionInsertVerdict::PassNonConforming => {
+                        non_conforming_session_events =
+                            non_conforming_session_events.saturating_add(1);
+                    }
+                    RetentionInsertVerdict::Insert => {}
+                }
                 session_event_stmt
                     .execute(params![
                         row.provider.as_str(),
@@ -3585,6 +3655,16 @@ impl Storage {
                 )
                 .map_err(|e| format!("Prepare owned tool actions: {e}"))?;
             for row in &snapshot.tool_actions {
+                match retention_insert_verdict(watermark.as_deref(), &row.timestamp) {
+                    RetentionInsertVerdict::Suppress => {
+                        suppressed_tool_actions = suppressed_tool_actions.saturating_add(1);
+                        continue;
+                    }
+                    RetentionInsertVerdict::PassNonConforming => {
+                        non_conforming_tool_actions = non_conforming_tool_actions.saturating_add(1);
+                    }
+                    RetentionInsertVerdict::Insert => {}
+                }
                 tool_action_stmt
                     .execute(params![
                         row.provider.as_str(),
@@ -3692,7 +3772,14 @@ impl Storage {
         }
         tx.commit()
             .map_err(|e| format!("Commit transcript analytics replacement: {e}"))?;
-        Ok(TranscriptAnalyticsReplacement::Replaced)
+        Ok(TranscriptAnalyticsReplacement::Replaced(
+            RetentionInsertFilterCounts {
+                suppressed_session_events,
+                suppressed_tool_actions,
+                non_conforming_session_events,
+                non_conforming_tool_actions,
+            },
+        ))
     }
     pub fn init() -> Result<Self, String> {
         let path = db_path()?;
@@ -17034,6 +17121,11 @@ mod tests {
         unsafe {
             std::env::remove_var("QUILL_DEMO_MODE");
             std::env::remove_var("QUILL_DATA_DIR");
+            // The transcript-root overrides are reaped here too: a leaked
+            // value would silently redirect a later test's reconciliation at
+            // a deleted temp directory.
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
         }
     }
 
@@ -21768,10 +21860,131 @@ mod tests {
             storage
                 .replace_transcript_analytics_snapshot(&spec.snapshot())
                 .expect("seed transcript source"),
-            TranscriptAnalyticsReplacement::Replaced,
+            TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts::default()),
             "fixture seed for {} must replace cleanly",
             spec.source_key
         );
+    }
+
+    /// The same five-table snapshot the spec describes, with one row per
+    /// supplied timestamp in every table.
+    ///
+    /// The insert filter is a per-row timestamp decision, so its fixtures have
+    /// to be timestamp-shaped rather than count-shaped. Struct-update syntax
+    /// restamps each row into a new value rather than mutating the base
+    /// snapshot in place.
+    fn snapshot_at_timestamps(
+        spec: &TranscriptSourceSpec<'_>,
+        timestamps: &[&str],
+    ) -> TranscriptAnalyticsSnapshot {
+        assert_eq!(
+            spec.rows,
+            timestamps.len(),
+            "a timestamped snapshot needs one timestamp per row"
+        );
+        let base = spec.snapshot();
+        let stamp = |index: usize| timestamps[index].to_string();
+        TranscriptAnalyticsSnapshot {
+            source: base.source,
+            session_events: base
+                .session_events
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedSessionEvent {
+                        timestamp: stamp(index),
+                        ..row
+                    },
+                )
+                .collect(),
+            response_times: base
+                .response_times
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedResponseTime {
+                        timestamp: stamp(index),
+                        ..row
+                    },
+                )
+                .collect(),
+            tool_actions: base
+                .tool_actions
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedToolAction {
+                        timestamp: stamp(index),
+                        ..row
+                    },
+                )
+                .collect(),
+            skill_usages: base
+                .skill_usages
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedSkillUsage {
+                        timestamp: stamp(index),
+                        ..row
+                    },
+                )
+                .collect(),
+            hook_invocations: base
+                .hook_invocations
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedHookInvocation {
+                        timestamp: stamp(index),
+                        ..row
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    /// Every owned timestamp one source holds in `table`, in stored order.
+    fn owned_timestamps(
+        storage: &Storage,
+        provider: IntegrationProvider,
+        source_key: &str,
+        table: &str,
+    ) -> Vec<String> {
+        let conn = storage.conn.lock();
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT timestamp FROM {table}
+                 WHERE provider = ?1 AND source_key = ?2
+                 ORDER BY timestamp"
+            ))
+            .expect("prepare owned timestamp read");
+        statement
+            .query_map(params![provider.as_str(), source_key], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("read owned timestamps")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect owned timestamps")
+    }
+
+    /// Every source-less timestamp in `table`, in stored order. Live rows are
+    /// excluded from retention entirely, so the assertion is that this set is
+    /// unaffected by an active watermark.
+    fn live_timestamps(storage: &Storage, table: &str) -> Vec<String> {
+        let conn = storage.conn.lock();
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT timestamp FROM {table}
+                 WHERE source_key IS NULL
+                 ORDER BY timestamp"
+            ))
+            .expect("prepare live timestamp read");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("read live timestamps")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect live timestamps")
     }
 
     /// Per-table `(table, row count, distinct marker tokens)` for one owned
@@ -21925,7 +22138,7 @@ mod tests {
             storage
                 .replace_transcript_analytics_snapshot(&emptied.snapshot())
                 .expect("empty snapshot replacement"),
-            TranscriptAnalyticsReplacement::Replaced
+            TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts::default())
         );
         for (table, count, markers) in
             owned_source_rows(&storage, target.provider, target.source_key)
@@ -21939,6 +22152,482 @@ mod tests {
             "an empty replacement must not reach a sibling source"
         );
 
+        clear_env();
+    }
+
+    /// Watermark used by every insert-filter test. Fixed rather than derived
+    /// from the wall clock so each fixture timestamp sits unambiguously on one
+    /// side of it.
+    const INSERT_FILTER_WATERMARK: &str = "2026-03-01T00:00:00.000Z";
+
+    /// Retention prunes `tool_actions` and `session_events` only, so a
+    /// replacement under an active watermark must reinsert only the post-cutoff
+    /// rows of those two while every sibling table and the registry row come
+    /// back whole.
+    // @lat: [[backend#Backend#Database#Insert-time watermark filtering#Insert-Time Watermark Test Specs#Watermark Filters Snapshot Inserts]]
+    #[test]
+    #[serial]
+    fn watermark_filters_target_table_inserts_but_no_sibling_or_registry_row() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        assert_eq!(
+            storage
+                .advance_retention_watermark(INSERT_FILTER_WATERMARK)
+                .expect("advance watermark"),
+            INSERT_FILTER_WATERMARK
+        );
+
+        let timestamps = [
+            "2026-01-01T00:00:00.000Z",
+            "2026-02-01T00:00:00.000Z",
+            "2026-04-01T00:00:00.000Z",
+            "2026-05-01T00:00:00.000Z",
+        ];
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-watermark",
+            source_key: "source-watermark",
+            session_id: "session-watermark",
+            generation: 1,
+            marker: "wm",
+            rows: timestamps.len(),
+        };
+
+        assert_eq!(
+            storage
+                .replace_transcript_analytics_snapshot(&snapshot_at_timestamps(&spec, &timestamps))
+                .expect("filtered replacement"),
+            TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts {
+                suppressed_session_events: 2,
+                suppressed_tool_actions: 2,
+                non_conforming_session_events: 0,
+                non_conforming_tool_actions: 0,
+            }),
+            "the replacement summary must report exactly the suppressed rows"
+        );
+
+        for table in ["session_events", "tool_actions"] {
+            assert_eq!(
+                owned_timestamps(&storage, spec.provider, spec.source_key, table),
+                timestamps[2..],
+                "{table} must hold only the post-cutoff rows"
+            );
+        }
+        for table in ["response_times", "skill_usages", "hook_invocations"] {
+            assert_eq!(
+                owned_timestamps(&storage, spec.provider, spec.source_key, table),
+                timestamps,
+                "{table} is not a retention target and must keep full history"
+            );
+        }
+
+        // The source has to stay registered and reconcilable, so the registry
+        // row is written exactly as an unfiltered replacement would write it.
+        let registry: (String, i64, i64, String, i64) = {
+            let conn = storage.conn.lock();
+            conn.query_row(
+                "SELECT processing_status, mtime_ns, size_bytes, content_sha256,
+                        seen_generation
+                 FROM transcript_analytics_sources
+                 WHERE provider = ?1 AND source_key = ?2",
+                params![spec.provider.as_str(), spec.source_key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("registry row must survive a filtered replacement")
+        };
+        let expected = spec.state();
+        assert_eq!(
+            registry,
+            (
+                "ok".to_string(),
+                expected.mtime_ns,
+                expected.size_bytes,
+                expected.content_sha256.clone(),
+                expected.seen_generation,
+            ),
+            "a filtered replacement must leave the registry row untouched"
+        );
+
+        clear_env();
+    }
+
+    /// The insert filter's conformance guard is the delete guard inverted, so a
+    /// timestamp the delete phase cannot compare must always land — and must be
+    /// counted separately from the rows that were genuinely suppressed.
+    // @lat: [[backend#Backend#Database#Insert-time watermark filtering#Insert-Time Watermark Test Specs#Conformance Guard Pass-Through]]
+    #[test]
+    #[serial]
+    fn watermark_passes_non_conforming_rows_and_counts_them_separately() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        storage
+            .advance_retention_watermark(INSERT_FILTER_WATERMARK)
+            .expect("advance watermark");
+
+        // Two conforming pre-cutoff rows, the three non-conforming shapes the
+        // retention fixture plants (each failing a different half of
+        // `length(timestamp) = 24 AND timestamp LIKE '%Z'`), all dated before
+        // the cutoff, and one conforming row after it.
+        let timestamps = [
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-02T00:00:00.000Z",
+            "2026-01-03T00:00:00.000+00:00",
+            "2026-01-04T00:00:00Z",
+            "2026-01-05T00:00:00+0000",
+            "2026-04-01T00:00:00.000Z",
+        ];
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-conformance",
+            source_key: "source-conformance",
+            session_id: "session-conformance",
+            generation: 1,
+            marker: "cg",
+            rows: timestamps.len(),
+        };
+
+        assert_eq!(
+            storage
+                .replace_transcript_analytics_snapshot(&snapshot_at_timestamps(&spec, &timestamps))
+                .expect("conformance-guarded replacement"),
+            TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts {
+                suppressed_session_events: 2,
+                suppressed_tool_actions: 2,
+                non_conforming_session_events: 3,
+                non_conforming_tool_actions: 3,
+            }),
+            "suppressed and non-conforming pass-through counts must be separate"
+        );
+
+        let mut landed = timestamps[2..].to_vec();
+        landed.sort_unstable();
+        for table in ["session_events", "tool_actions"] {
+            assert_eq!(
+                owned_timestamps(&storage, spec.provider, spec.source_key, table),
+                landed,
+                "{table} must retain every non-conforming row the delete guard skips"
+            );
+        }
+
+        clear_env();
+    }
+
+    /// Live rows carry `source_key IS NULL` and are outside retention's scope
+    /// entirely, so neither live insert path may consult the watermark.
+    // @lat: [[backend#Backend#Database#Insert-time watermark filtering#Insert-Time Watermark Test Specs#Live Rows Ignore The Watermark]]
+    #[test]
+    #[serial]
+    fn live_analytics_inserts_land_on_both_sides_of_the_watermark() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        storage
+            .advance_retention_watermark(INSERT_FILTER_WATERMARK)
+            .expect("advance watermark");
+
+        let live_session = "live-session";
+        let live_stamps = [
+            "2026-01-10T00:00:00.000Z",
+            "2026-01-10T00:01:00.000Z",
+            "2026-05-10T00:00:00.000Z",
+            "2026-05-10T00:01:00.000Z",
+        ];
+        let messages: Vec<LiveSessionMessageInput<'_>> = live_stamps
+            .iter()
+            .enumerate()
+            .map(|(index, timestamp)| LiveSessionMessageInput {
+                message_id: if index % 2 == 0 {
+                    ["live-user-a", "live-user-b"][index / 2]
+                } else {
+                    ["live-asst-a", "live-asst-b"][index / 2]
+                },
+                role: if index % 2 == 0 { "user" } else { "assistant" },
+                timestamp,
+                chain_id: live_session,
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            })
+            .collect();
+        let events: Vec<LiveSessionEventInput<'_>> = messages
+            .iter()
+            .map(|message| LiveSessionEventInput {
+                message_id: message.message_id,
+                event_ordinal: 0,
+                timestamp: message.timestamp,
+                kind: crate::sessions::SessionEventKind::AsstText,
+            })
+            .collect();
+        storage
+            .store_live_session_analytics(
+                IntegrationProvider::Claude,
+                live_session,
+                LiveAnalyticsOrigin {
+                    project: None,
+                    cwd: None,
+                    hostname: Some("live-host"),
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &messages,
+                    session_events: &events,
+                    hook_invocations: &[],
+                },
+            )
+            .expect("store live analytics");
+
+        let ingest_session = "ingest-session";
+        let ingest_stamps = ["2026-02-01T00:00:00.000Z", "2026-06-01T00:00:00.000Z"];
+        let ingested: Vec<SessionEventInput<'_>> = ingest_stamps
+            .iter()
+            .enumerate()
+            .map(|(index, timestamp)| SessionEventInput {
+                timestamp,
+                kind: crate::sessions::SessionEventKind::UserText,
+                is_sidechain: false,
+                agent_id: None,
+                uuid: Some(["ingest-uuid-a", "ingest-uuid-b"][index]),
+                parent_uuid: None,
+            })
+            .collect();
+        storage
+            .ingest_session_events(IntegrationProvider::Claude, ingest_session, &ingested)
+            .expect("ingest live session events");
+
+        let mut expected = live_stamps.to_vec();
+        expected.extend_from_slice(&ingest_stamps);
+        expected.sort_unstable();
+        assert_eq!(
+            live_timestamps(&storage, "session_events"),
+            expected,
+            "every source-less event must land regardless of the watermark"
+        );
+
+        clear_env();
+    }
+
+    /// Instants the two resurrection regressions are built around: one record
+    /// pair before a simulated prune's cutoff and one after it.
+    const RESURRECTION_CUTOFF: &str = "2026-03-01T00:00:00.000Z";
+    const RESURRECTION_PRUNED_USER: &str = "2026-01-01T00:00:00.000Z";
+    const RESURRECTION_PRUNED_TOOL: &str = "2026-01-01T00:01:00.000Z";
+    const RESURRECTION_KEPT_USER: &str = "2026-06-01T00:00:00.000Z";
+    const RESURRECTION_KEPT_TOOL: &str = "2026-06-01T00:01:00.000Z";
+
+    fn claude_user_record(uuid: &str, timestamp: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "sessionId": "sess-a",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "isSidechain": false,
+            "cwd": "/work/a",
+            "message": { "role": "user", "content": "hello" },
+        })
+        .to_string()
+    }
+
+    fn claude_tool_record(uuid: &str, timestamp: &str, tool_use_id: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "sessionId": "sess-a",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "isSidechain": false,
+            "cwd": "/work/a",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "Read",
+                    "input": { "file_path": "/work/a/file.rs" },
+                }],
+            },
+        })
+        .to_string()
+    }
+
+    /// A reconciled Claude transcript root whose pre-cutoff owned rows have
+    /// been deleted and whose watermark has been advanced — the durable state
+    /// a completed retention run leaves behind.
+    struct PrunedTranscriptRoot {
+        _data_dir: TempDir,
+        _projects_dir: TempDir,
+        _codex_dir: TempDir,
+        storage: Storage,
+        transcript: PathBuf,
+    }
+
+    /// Count rows in `table` bearing exactly `timestamp`, across every source.
+    fn rows_at(storage: &Storage, table: &str, timestamp: &str) -> i64 {
+        let conn = storage.conn.lock();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE timestamp = ?1"),
+            params![timestamp],
+            |row| row.get(0),
+        )
+        .expect("count rows at timestamp")
+    }
+
+    /// Reconcile a real on-disk transcript, then apply the exact durable
+    /// effects of a retention run: delete the conforming pre-cutoff owned rows
+    /// and advance the watermark to that cutoff.
+    fn seed_pruned_transcript_root() -> PrunedTranscriptRoot {
+        clear_env();
+        let data_dir = TempDir::new().expect("tempdir");
+        let projects_dir = TempDir::new().expect("tempdir");
+        let codex_dir = TempDir::new().expect("tempdir");
+        let project_dir = projects_dir.path().join("proj");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let transcript = project_dir.join("sess-a.jsonl");
+        let body = [
+            claude_user_record("uuid-1", RESURRECTION_PRUNED_USER),
+            claude_tool_record("uuid-2", RESURRECTION_PRUNED_TOOL, "toolu-1"),
+            claude_user_record("uuid-3", RESURRECTION_KEPT_USER),
+            claude_tool_record("uuid-4", RESURRECTION_KEPT_TOOL, "toolu-2"),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&transcript, body).expect("write transcript");
+
+        // SAFETY: env mutation; every consuming test is `#[serial]`.
+        unsafe {
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", projects_dir.path());
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", codex_dir.path());
+        }
+        let storage = init_storage_in(&data_dir);
+        crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+            &storage, "host-a",
+        )
+        .expect("seed reconciliation");
+
+        for (table, timestamp) in [
+            ("session_events", RESURRECTION_PRUNED_USER),
+            ("session_events", RESURRECTION_KEPT_USER),
+            ("tool_actions", RESURRECTION_PRUNED_TOOL),
+            ("tool_actions", RESURRECTION_KEPT_TOOL),
+        ] {
+            assert_eq!(
+                rows_at(&storage, table, timestamp),
+                1,
+                "{table} must hold the seeded row at {timestamp} before the prune"
+            );
+        }
+
+        {
+            let conn = storage.conn.lock();
+            for table in ["session_events", "tool_actions"] {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table}
+                         WHERE source_key IS NOT NULL
+                           AND length(timestamp) = 24 AND timestamp LIKE '%Z'
+                           AND timestamp < ?1"
+                    ),
+                    params![RESURRECTION_CUTOFF],
+                )
+                .expect("simulate the retention delete phase");
+            }
+        }
+        storage
+            .advance_retention_watermark(RESURRECTION_CUTOFF)
+            .expect("advance watermark with the run's cutoff");
+
+        PrunedTranscriptRoot {
+            _data_dir: data_dir,
+            _projects_dir: projects_dir,
+            _codex_dir: codex_dir,
+            storage,
+            transcript,
+        }
+    }
+
+    /// Assert the post-prune invariant: nothing pre-cutoff came back, and the
+    /// rows that were never pruned are present exactly once rather than
+    /// duplicated by the reparse.
+    fn assert_no_resurrection(storage: &Storage) {
+        for (table, timestamp) in [
+            ("session_events", RESURRECTION_PRUNED_USER),
+            ("session_events", RESURRECTION_PRUNED_TOOL),
+            ("tool_actions", RESURRECTION_PRUNED_TOOL),
+        ] {
+            assert_eq!(
+                rows_at(storage, table, timestamp),
+                0,
+                "{table} resurrected the pruned row at {timestamp}"
+            );
+        }
+        for (table, timestamp) in [
+            ("session_events", RESURRECTION_KEPT_USER),
+            ("tool_actions", RESURRECTION_KEPT_TOOL),
+        ] {
+            assert_eq!(
+                rows_at(storage, table, timestamp),
+                1,
+                "{table} must hold the post-cutoff row at {timestamp} exactly once"
+            );
+        }
+    }
+
+    /// The normal path: one `--resume` append to a months-old transcript
+    /// changes its fingerprint, and the unconditional delete-and-reinsert that
+    /// follows must not restore the history a run already deleted.
+    // @lat: [[backend#Backend#Database#Insert-time watermark filtering#Insert-Time Watermark Test Specs#Changed Source Does Not Resurrect]]
+    #[test]
+    #[serial]
+    fn a_changed_source_does_not_resurrect_pruned_rows() {
+        let fixture = seed_pruned_transcript_root();
+
+        let appended = std::fs::read_to_string(&fixture.transcript).expect("read transcript")
+            + &claude_user_record("uuid-5", "2026-06-01T00:02:00.000Z")
+            + "\n";
+        std::fs::write(&fixture.transcript, appended).expect("append to transcript");
+
+        crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+            &fixture.storage,
+            "host-a",
+        )
+        .expect("reconcile the changed source");
+
+        assert_no_resurrection(&fixture.storage);
+        clear_env();
+    }
+
+    /// The forced path: `transcript_analytics_reingest_pending` bypasses every
+    /// freshness short-circuit, so an unchanged file is reparsed in full. That
+    /// is the widest possible resurrection window and it must stay closed.
+    // @lat: [[backend#Backend#Database#Insert-time watermark filtering#Insert-Time Watermark Test Specs#Forced Reparse Does Not Resurrect]]
+    #[test]
+    #[serial]
+    fn a_forced_reparse_does_not_resurrect_pruned_rows() {
+        let fixture = seed_pruned_transcript_root();
+
+        fixture
+            .storage
+            .set_setting("transcript_analytics_reingest_pending", "1")
+            .expect("set the forced-reparse marker");
+
+        crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+            &fixture.storage,
+            "host-a",
+        )
+        .expect("reconcile under a forced reparse");
+
+        assert_no_resurrection(&fixture.storage);
         clear_env();
     }
 
@@ -22731,7 +23420,7 @@ mod tests {
                     storage
                         .replace_transcript_analytics_snapshot(&snapshot)
                         .expect("write renamed source"),
-                    TranscriptAnalyticsReplacement::Replaced
+                    TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts::default())
                 );
                 let stored: Option<String> = {
                     let conn = storage.conn.lock();
@@ -22986,7 +23675,7 @@ mod tests {
             storage
                 .replace_transcript_analytics_snapshot(&snapshot)
                 .expect("seed owned chain"),
-            TranscriptAnalyticsReplacement::Replaced
+            TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts::default())
         );
     }
 
