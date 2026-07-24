@@ -57,7 +57,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 33;
+const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 34;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -5565,6 +5565,24 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 33: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 33 commit: {e}"))?;
+        }
+
+        // Migration 34 permanently removes the unused v30 tool-actions
+        // archive. This is a one-way schema change: after recording v34,
+        // older builds refuse the database and the dropped data cannot be
+        // restored. DROP only frees SQLite pages; the separate user-triggered
+        // Compact database operation runs VACUUM to reclaim filesystem bytes.
+        // @lat: [[backend#Database#Schema#Metadata]]
+        if current_version < 34 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 34 transaction: {e}"))?;
+            tx.execute_batch("DROP TABLE IF EXISTS tool_actions_legacy_v30;")
+                .map_err(|e| format!("Migration 34 (drop legacy tool actions): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (34)", [])
+                .map_err(|e| format!("Failed to record migration 34: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 34 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -21451,7 +21469,7 @@ mod tests {
     /// Only rows this machine can never rebuild from a local transcript —
     /// Codex hooks and anything stamped with a foreign hostname — carry
     /// forward as source-less data; everything else survives only in the
-    /// retained `*_legacy_v30` archives.
+    /// retained `*_legacy_v30` archives, except tool actions which v34 drops.
     // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 30 Carry-Forward Scope]]
     #[test]
     #[serial]
@@ -21657,7 +21675,8 @@ mod tests {
         );
 
         // The three tables with no hostname column cannot prove anything is
-        // remote, so every row of theirs stays in the archive.
+        // remote, so every row of theirs stays in its archive until a later
+        // migration explicitly retires it.
         for table in ["session_events", "response_times", "tool_actions"] {
             assert_eq!(
                 scalar_count(&conn, &format!("SELECT COUNT(*) FROM {table}")),
@@ -21666,11 +21685,11 @@ mod tests {
             );
         }
 
-        // Archives are recovery data: they keep every original row.
+        // Archives are recovery data: they keep every original row, except
+        // the dead tool-actions archive that migration 34 retires.
         let archived = [
             ("session_events_legacy_v30", 2),
             ("response_times_legacy_v30", 2),
-            ("tool_actions_legacy_v30", 2),
             ("skill_usages_legacy_v30", 3),
             ("hook_invocations_legacy_v30", 6),
         ];
@@ -21697,6 +21716,10 @@ mod tests {
                 "{archive} must keep no named index"
             );
         }
+        assert!(
+            !table_exists(&conn, "tool_actions_legacy_v30"),
+            "migration 34 must permanently remove the dead tool-actions archive"
+        );
 
         // Deletion by project or host reaches source-less rows only through a
         // recorded live origin, so each carried-forward session needs one.
