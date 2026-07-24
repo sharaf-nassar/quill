@@ -3475,6 +3475,47 @@ async fn compact_database(
     Ok(result)
 }
 
+/// Write the retention window and return the refreshed policy.
+///
+/// The command boundary is where the 30-day floor is enforced, so validation
+/// happens **before** the write: only [`retention::RETENTION_WINDOW_PRESETS`]
+/// and `None` (never prune) are accepted, and anything else returns an error
+/// with `retention.window_days` left exactly as it was. The floor is what makes
+/// `get_code_stats`, `get_code_stats_history` and `get_llm_runtime_stats`
+/// provably unaffected by retention — `range_to_duration` caps every
+/// range-based reader at 30 days — so a shorter window slipping through here
+/// would silently revoke that guarantee.
+///
+/// This never touches `retention.watermark` and never deletes a row.
+fn apply_retention_policy(
+    storage: &Storage,
+    window_days: Option<i64>,
+) -> Result<retention::RetentionPolicy, String> {
+    if let Some(window_days) = window_days {
+        retention::validate_window_days(window_days).map_err(|error| error.to_string())?;
+    }
+    storage.write_retention_window_days(window_days)?;
+    storage.get_retention_policy()
+}
+
+/// Read the three retention `settings` rows as one policy.
+///
+/// Cheap settings reads only: no scan, no quiesce lease, no `spawn_blocking`.
+#[tauri::command]
+async fn get_retention_policy() -> Result<retention::RetentionPolicy, String> {
+    get_storage()?.get_retention_policy()
+}
+
+/// Set the configured retention window, rejecting anything off the preset list.
+///
+/// See [`apply_retention_policy`] for why the rejection lives at this boundary.
+#[tauri::command]
+async fn set_retention_policy(
+    window_days: Option<i64>,
+) -> Result<retention::RetentionPolicy, String> {
+    apply_retention_policy(get_storage()?, window_days)
+}
+
 #[tauri::command]
 async fn set_minimax_api_key(
     api_key: String,
@@ -4860,6 +4901,8 @@ pub fn run() {
             get_runtime_settings,
             set_runtime_settings,
             compact_database,
+            get_retention_policy,
+            set_retention_policy,
             get_learning_settings,
             set_learning_settings,
             get_learning_capability,
@@ -5085,5 +5128,83 @@ mod tests {
         );
         assert_eq!(classify_minimax_error_kind(RateLimited), None);
         assert_eq!(classify_minimax_error_kind(Request), None);
+    }
+
+    // @lat: [[backend#Backend#Tauri IPC Commands#Retention policy commands#Retention Policy Command Test Specs#Preset Rejection]]
+    #[test]
+    #[serial_test::serial]
+    fn set_retention_policy_accepts_only_the_presets() {
+        use retention::{RETENTION_WINDOW_DAYS_KEY, RETENTION_WINDOW_PRESETS};
+        use retention_fixture::{RetentionFixtureSpec, build_retention_fixture};
+
+        // The fixture owns the QUILL_DEMO_MODE / QUILL_DATA_DIR override, so
+        // `Storage::init` lands in its temp dir. Held to the end of the test.
+        let fixture = build_retention_fixture(&RetentionFixtureSpec {
+            anchor: DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+                .expect("parse anchor")
+                .with_timezone(&Utc),
+            months: 2,
+            owned_rows_per_month: 1,
+            live_rows_per_month: 1,
+            sources: 1,
+        })
+        .expect("build fixture");
+        let storage = Storage::init().expect("open storage on fixture");
+
+        // A fresh database has no row at all, which is the "never" state.
+        assert_eq!(
+            None,
+            storage
+                .get_setting(RETENTION_WINDOW_DAYS_KEY)
+                .expect("read window row")
+        );
+
+        // Every preset is accepted and reflected back in the refreshed policy.
+        for preset in RETENTION_WINDOW_PRESETS {
+            let policy = apply_retention_policy(&storage, Some(preset))
+                .unwrap_or_else(|error| panic!("preset {preset} must be accepted: {error}"));
+            assert_eq!(Some(preset), policy.window_days);
+            assert_eq!(
+                Some(preset.to_string()),
+                storage
+                    .get_setting(RETENTION_WINDOW_DAYS_KEY)
+                    .expect("read window row")
+            );
+        }
+
+        // `None` is accepted and clears the row rather than writing a literal.
+        let cleared = apply_retention_policy(&storage, None).expect("never must be accepted");
+        assert_eq!(None, cleared.window_days);
+        assert_eq!(
+            None,
+            storage
+                .get_setting(RETENTION_WINDOW_DAYS_KEY)
+                .expect("read window row")
+        );
+
+        // Everything else is rejected, and rejection leaves the stored window
+        // exactly as it was — including the sub-30 values the floor exists to
+        // keep out, and the boundary values around the preset list.
+        storage
+            .write_retention_window_days(Some(90))
+            .expect("seed a known window");
+        for rejected in [7_i64, 1, 0, -90, 45, 29, 31, 366, i64::MIN, i64::MAX] {
+            let error = apply_retention_policy(&storage, Some(rejected))
+                .expect_err("a non-preset window must be rejected");
+            assert!(
+                error.contains("Unsupported retention window"),
+                "window {rejected} rejected with an unexpected error: {error}"
+            );
+            assert_eq!(
+                Some("90".to_string()),
+                storage
+                    .get_setting(RETENTION_WINDOW_DAYS_KEY)
+                    .expect("read window row"),
+                "rejecting {rejected} must leave the stored window unchanged"
+            );
+        }
+
+        drop(storage);
+        drop(fixture);
     }
 }

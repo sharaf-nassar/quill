@@ -30,6 +30,11 @@ import type {
   ProjectTokensRaw,
   ProviderStatus,
   RestartStatus,
+  RetentionAuditRecord,
+  RetentionMaintenanceProgress,
+  RetentionMaintenanceResult,
+  RetentionPolicy,
+  RetentionPreview,
   RuntimeSettings,
   SearchFacets,
   SearchResults,
@@ -2275,6 +2280,292 @@ function retryModelHistoryBackfillFixture(): ModelBackfillStatus {
   return { ...pendingRetry };
 }
 
+// --- Retention pruning (feature 014) ------------------------------------------
+//
+// Every terminal state the settings surface has to render is reachable from the
+// browser without a Rust backend, selected by a `?retentionFixture=<scenario>`
+// query param in the same style as `?modelFixture=`. Browser-demo controls stay
+// outside IPC payloads so the command contracts remain exact.
+
+type RetentionScenario =
+  // Preview returns exact counts and the run completes with a real VACUUM.
+  | "preview"
+  // Fresh install / nothing older than the cutoff: the structured no-op skip.
+  | "noop"
+  // Preview succeeds; the confirmation is refused because it went stale.
+  | "stale_preview"
+  // The quiesce lease is held, so both commands return the busy skip.
+  | "busy"
+  // Rows removed, but the VACUUM preflight refused: bytes_after == bytes_before.
+  | "skipped_compaction"
+  // Chunks committed, then the run stopped. Carries error_reason.
+  | "partial"
+  // The cutoff covers every owned row — drives the explicit-loss copy.
+  | "everything_older";
+
+const RETENTION_SCENARIOS: ReadonlySet<RetentionScenario> = new Set([
+  "preview",
+  "noop",
+  "stale_preview",
+  "busy",
+  "skipped_compaction",
+  "partial",
+  "everything_older",
+]);
+
+const warnedInvalidRetentionScenarios = new Set<string>();
+
+function readRetentionScenario(): RetentionScenario {
+  if (typeof window === "undefined") return "preview";
+  const requested = new URLSearchParams(window.location.search).get(
+    "retentionFixture",
+  );
+  if (requested === null || requested.length === 0) return "preview";
+  if (RETENTION_SCENARIOS.has(requested as RetentionScenario)) {
+    return requested as RetentionScenario;
+  }
+  if (!warnedInvalidRetentionScenarios.has(requested)) {
+    warnedInvalidRetentionScenarios.add(requested);
+    console.warn("[mock] invalid retentionFixture browser control:", requested);
+  }
+  return "preview";
+}
+
+// The backend rejects anything off this list at the command boundary; the mock
+// mirrors it so the preset selector cannot look more permissive in the browser
+// than it is in the app.
+const RETENTION_WINDOW_PRESETS = [30, 90, 180, 365] as const;
+
+// Conforming timestamps: exactly 24 characters ending in "Z", byte-comparable
+// against stored transcript timestamps. `toISOString()` produces this form.
+const retentionCutoff = (windowDays: number) => iso(windowDays * D);
+
+// Reassigned, never mutated, so `set_retention_policy` in the browser behaves
+// like the real write-then-reread.
+let retentionWindowDays: number | null = 90;
+
+const affectedSurfaces = [
+  "Session drilldowns for sessions older than the cutoff",
+  "Subagent trees for pre-cutoff sessions",
+  "Batch session code stats for pre-cutoff sessions",
+];
+
+function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord | null {
+  if (scenario === "noop") return null;
+  const cutoff = retentionCutoff(90);
+  const base: RetentionAuditRecord = {
+    schema: 1,
+    status: "completed",
+    reason: null,
+    error_reason: null,
+    window_days: 90,
+    cutoff,
+    ran_at: iso(112 * D),
+    deleted: { tool_actions: 165_912, session_events: 523_847 },
+    skipped_nonconforming: { tool_actions: 3, session_events: 5 },
+    bytes_before: 8_106_127_360,
+    bytes_after: 6_442_450_944,
+  };
+  if (scenario !== "partial") return base;
+  return {
+    ...base,
+    status: "partial",
+    error_reason:
+      "free space fell below the delete-phase budget after 41 chunks",
+    deleted: { tool_actions: 61_440, session_events: 190_512 },
+    bytes_after: base.bytes_before,
+  };
+}
+
+function retentionPolicy(): RetentionPolicy {
+  const scenario = readRetentionScenario();
+  return {
+    window_days: retentionWindowDays,
+    watermark: retentionWindowDays === null ? null : retentionCutoff(90),
+    last_run: retentionAuditRecord(scenario),
+  };
+}
+
+function retentionPreview(scenario: RetentionScenario): RetentionPreview {
+  const windowDays = retentionWindowDays;
+  const empty = {
+    tool_actions_rows: 0,
+    session_events_rows: 0,
+    tool_actions_nonconforming: 0,
+    session_events_nonconforming: 0,
+    everything_older: false,
+    bytes_before: 8_106_127_360,
+    affected_surfaces: [],
+  };
+  if (windowDays === null) {
+    return {
+      status: "skipped",
+      reason: "Retention is set to never; nothing is eligible for pruning.",
+      cutoff: null,
+      window_days: null,
+      ...empty,
+    };
+  }
+  if (scenario === "busy") {
+    return {
+      status: "skipped",
+      reason: "another maintenance operation is running",
+      cutoff: null,
+      window_days: windowDays,
+      ...empty,
+    };
+  }
+  if (scenario === "noop") {
+    return {
+      status: "skipped",
+      reason: `No transcript rows are older than ${windowDays} days yet.`,
+      cutoff: retentionCutoff(windowDays),
+      window_days: windowDays,
+      ...empty,
+    };
+  }
+  return {
+    status: "ready",
+    reason: null,
+    cutoff: retentionCutoff(windowDays),
+    window_days: windowDays,
+    tool_actions_rows: 165_912,
+    session_events_rows: 523_847,
+    tool_actions_nonconforming: 3,
+    session_events_nonconforming: 5,
+    // The cutoff covering every owned row is the case that needs the blunter
+    // confirmation copy, so it gets its own scenario rather than a flag nobody
+    // can reach from the browser.
+    everything_older: scenario === "everything_older",
+    bytes_before: 8_106_127_360,
+    affected_surfaces: affectedSurfaces,
+  };
+}
+
+function retentionResult(scenario: RetentionScenario): RetentionMaintenanceResult {
+  const windowDays = retentionWindowDays;
+  const bytesBefore = 8_106_127_360;
+  const skipped = (reason: string): RetentionMaintenanceResult => ({
+    status: "skipped",
+    reason,
+    error_reason: null,
+    cutoff: null,
+    window_days: windowDays,
+    tool_actions_deleted: 0,
+    session_events_deleted: 0,
+    tool_actions_nonconforming: 0,
+    session_events_nonconforming: 0,
+    compaction_status: "skipped",
+    compaction_reason: null,
+    bytes_before: bytesBefore,
+    bytes_after: bytesBefore,
+  });
+
+  if (windowDays === null) {
+    return skipped("Retention is set to never; nothing was removed.");
+  }
+  if (scenario === "busy") return skipped("another maintenance operation is running");
+  if (scenario === "noop") {
+    return skipped(`No transcript rows are older than ${windowDays} days yet.`);
+  }
+  if (scenario === "stale_preview") {
+    return skipped("stale_preview");
+  }
+
+  const completed: RetentionMaintenanceResult = {
+    status: "completed",
+    reason: null,
+    error_reason: null,
+    cutoff: retentionCutoff(windowDays),
+    window_days: windowDays,
+    tool_actions_deleted: 165_912,
+    session_events_deleted: 523_847,
+    tool_actions_nonconforming: 3,
+    session_events_nonconforming: 5,
+    compaction_status: "completed",
+    compaction_reason: null,
+    bytes_before: bytesBefore,
+    bytes_after: 6_442_450_944,
+  };
+  if (scenario === "skipped_compaction") {
+    // Rows removed, bytes not yet reclaimed — a legitimate outcome, and the one
+    // the "deletion alone frees no filesystem bytes" copy exists for.
+    return {
+      ...completed,
+      compaction_status: "skipped",
+      compaction_reason: "not enough free disk space for a safe compaction.",
+      bytes_after: bytesBefore,
+    };
+  }
+  if (scenario === "partial") {
+    return {
+      ...completed,
+      status: "partial",
+      error_reason:
+        "free space fell below the delete-phase budget after 41 chunks",
+      tool_actions_deleted: 61_440,
+      session_events_deleted: 190_512,
+      compaction_status: "skipped",
+      compaction_reason: "compaction is not attempted after a partial run.",
+      bytes_after: bytesBefore,
+    };
+  }
+  return completed;
+}
+
+async function emitRetentionProgress(phase: string, pct: number) {
+  const progress: RetentionMaintenanceProgress = { phase, pct };
+  await emit("retention-maintenance-progress", progress);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+}
+
+async function previewRetentionFixture(): Promise<RetentionPreview> {
+  const scenario = readRetentionScenario();
+  // The counting phase is heartbeat-driven in the backend, so it visibly
+  // advances rather than sitting pinned at zero.
+  await emitRetentionProgress("Counting rows", 20);
+  await emitRetentionProgress("Counting rows", 70);
+  return retentionPreview(scenario);
+}
+
+async function runRetentionMaintenanceFixture(): Promise<RetentionMaintenanceResult> {
+  const scenario = readRetentionScenario();
+  const result = retentionResult(scenario);
+  if (result.status !== "skipped") {
+    await emitRetentionProgress("Counting rows", 10);
+    await emitRetentionProgress("Checking disk space", 25);
+    await emitRetentionProgress("Removing old rows", 45);
+    await emitRetentionProgress("Removing old rows", 80);
+    if (result.compaction_status === "completed") {
+      await emitRetentionProgress("Compacting database", 92);
+    }
+  }
+  await emit("retention-maintenance-finished", result);
+  return result;
+}
+
+function setRetentionPolicyFixture(
+  args: Record<string, unknown> | undefined,
+): RetentionPolicy {
+  const requested = args?.windowDays ?? args?.window_days ?? null;
+  if (requested === null) {
+    retentionWindowDays = null;
+    return retentionPolicy();
+  }
+  if (
+    typeof requested !== "number" ||
+    !RETENTION_WINDOW_PRESETS.includes(requested as 30 | 90 | 180 | 365)
+  ) {
+    // Mirrors the backend's command-boundary rejection: the stored window is
+    // left exactly as it was, which is the half the 30-day floor depends on.
+    throw new Error(
+      `Unsupported retention window ${String(requested)}; expected one of ${RETENTION_WINDOW_PRESETS.join(", ")} or never`,
+    );
+  }
+  retentionWindowDays = requested;
+  return retentionPolicy();
+}
+
 // --- Command → fixture map ----------------------------------------------------
 
 type FixtureHandler = (args?: Record<string, unknown>) => unknown;
@@ -2305,6 +2596,11 @@ const fixtures: Record<string, FixtureHandler> = {
     await emit("compact-database-finished", result);
     return result;
   },
+  // retention pruning
+  get_retention_policy: () => retentionPolicy(),
+  set_retention_policy: (args) => setRetentionPolicyFixture(args),
+  preview_retention: () => previewRetentionFixture(),
+  run_retention_maintenance: () => runRetentionMaintenanceFixture(),
   // live usage
   fetch_usage_data: () => usageData,
   get_usage_history: () => usageHistory(),

@@ -859,6 +859,48 @@ Single IPC pair backing the [[features#Settings Window]]'s Performance, General 
 
 `get_runtime_settings` returns the resolved `RuntimeSettings` struct with `live_usage.enabled`, `live_usage.interval_seconds`, `plugin_updates.enabled`, `plugin_updates.interval_hours`, `rule_watcher.enabled`, and `always_on_top` clamped to safe ranges (live: 60–600s, plugin updates: 1–24h). `set_runtime_settings` persists each key, calls `WebviewWindow::set_always_on_top` on the main window when that flag changes, and emits `runtime-settings-updated` so any open Settings window observes the resolved values without a re-fetch.
 
+### Retention policy commands
+
+The read/write pair over [[backend#Backend#Database#Retention policy primitive]], kept out of the wholesale-saved `RuntimeSettings` because a retention window is consented to one value at a time, not saved alongside unrelated toggles.
+
+[[src-tauri/src/lib.rs#get_retention_policy]] returns the three `settings` rows
+as one [[src-tauri/src/retention.rs#RetentionPolicy]]. It is cheap settings
+reads only — no scan, no quiesce lease, no `spawn_blocking` — so the settings
+surface can render the configured window and the last-run audit record without
+contending with an in-flight maintenance operation.
+
+[[src-tauri/src/lib.rs#set_retention_policy]] writes `retention.window_days` and
+returns the refreshed policy. It never touches `retention.watermark` and never
+deletes a row. [[src-tauri/src/lib.rs#apply_retention_policy]] is the testable
+core: it validates **before** writing, so only
+[[src-tauri/src/retention.rs#RETENTION_WINDOW_PRESETS]] and `None` are accepted
+and every other value errors with the stored window untouched. This validation
+*is* the 30-day floor. The floor is what makes `get_code_stats`,
+`get_code_stats_history` and `get_llm_runtime_stats` provably unaffected by
+retention — `range_to_duration` caps every range-based reader at 30 days — so a
+`7` slipping through the command boundary would silently revoke that guarantee
+rather than merely prune more aggressively. The primitive re-checks the same
+list on write and on read; the command boundary is the outermost of the three.
+
+#### Retention Policy Command Test Specs
+
+The command layer owns one spec: that the preset list is a closed set at the
+boundary the frontend actually calls, since that is where a user-supplied value
+first enters.
+
+##### Preset Rejection
+
+`set_retention_policy` accepts exactly 30, 90, 180, 365 and `None`, and rejects
+every other value with an error that leaves `retention.window_days` unchanged.
+
+The rejected set covers 7, 1, 0, -90 and 45, the 29/31 and 366 boundaries
+either side of the preset list, and both `i64` extremes.
+
+Asserting the *unchanged* half matters as much as the rejection: a validator
+that errors after a partial write would leave the database configured with a
+window nobody consented to, which is exactly the failure the floor exists to
+prevent.
+
 ### Learning Commands (18)
 
 Commands for managing the behavioral learning pipeline settings, rules, and observations.

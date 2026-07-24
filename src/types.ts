@@ -1227,3 +1227,114 @@ export interface RestartStatus {
 	waiting_on: number;
 	elapsed_seconds: number;
 }
+
+// Retention pruning types (feature 014). These mirror the Rust shapes in
+// src-tauri/src/retention.rs and the four retention commands in
+// src-tauri/src/lib.rs; field names stay snake_case because they arrive
+// straight off `invoke()` / `listen()` with no camelCase mapping layer.
+//
+// The inline CompactDatabaseProgress / CompactDatabaseResult types in
+// src/components/settings/PerformanceTab.tsx stay where they are — retention
+// deliberately does not refactor the compaction control it sits beside.
+
+// Per-table counts, carried twice by an audit record and once by a result:
+// rows actually removed, and rows left in place because their timestamp did
+// not satisfy the conformance guard (`length = 24 AND LIKE '%Z'`).
+export interface RetentionTableCounts {
+	tool_actions: number;
+	session_events: number;
+}
+
+// "partial" means chunks committed and then the run stopped — mid-run disk
+// exhaustion or a chunk-level SQL error. It is a third status rather than
+// "completed" plus an `interrupted` flag because a status that has to be read
+// together with a boolean is a status that will be read wrong.
+export type RetentionRunStatus = "completed" | "partial" | "skipped";
+
+// Durable record of the most recent run, stored as the JSON value of the
+// `retention.last_run` setting. A skipped run is recorded exactly like a
+// completed one: "I tried on this date and nothing happened, because X" is the
+// question the record exists to answer once the toast is gone.
+export interface RetentionAuditRecord {
+	schema: number;
+	status: RetentionRunStatus;
+	// Skip reason. Null for a partial, whose explanation is `error_reason`.
+	reason: string | null;
+	// Populated if and only if `status` is "partial".
+	error_reason: string | null;
+	window_days: number | null;
+	cutoff: string | null;
+	// Conforming timestamp of the moment the run finished.
+	ran_at: string;
+	deleted: RetentionTableCounts;
+	skipped_nonconforming: RetentionTableCounts;
+	bytes_before: number;
+	bytes_after: number;
+}
+
+// Returned by `get_retention_policy` and `set_retention_policy`. Every field is
+// independently nullable because a fresh database carries none of the three
+// settings rows, and absent on all three is the default everywhere.
+export interface RetentionPolicy {
+	// null means never prune. Only 30, 90, 180 and 365 are accepted on write —
+	// the 30-day floor that keeps the range-capped readers provably unaffected.
+	window_days: number | null;
+	// Insert-time cutoff; null means no filtering.
+	watermark: string | null;
+	last_run: RetentionAuditRecord | null;
+}
+
+// Returned by `preview_retention`. `cutoff` is not decoration: it is the token
+// the confirm step hands back to `run_retention_maintenance`, and a preview is
+// the only way to obtain one, so the backend itself guarantees no destructive
+// run without a preview.
+export interface RetentionPreview {
+	status: "ready" | "skipped";
+	// Structured skip reason: retention disabled, nothing older than the
+	// cutoff, or another maintenance operation already holding the lease.
+	reason: string | null;
+	cutoff: string | null;
+	window_days: number | null;
+	tool_actions_rows: number;
+	session_events_rows: number;
+	tool_actions_nonconforming: number;
+	session_events_nonconforming: number;
+	// True when the cutoff covers every owned row — drives the explicit-loss
+	// confirmation copy rather than the ordinary "older than N days" copy.
+	everything_older: boolean;
+	bytes_before: number;
+	// Capability loss the confirm step must show, pre-cutoff only: session
+	// drilldowns, subagent trees, batch session code stats.
+	affected_surfaces: string[];
+}
+
+// Payload of `retention-maintenance-progress`, identical in shape to the
+// compaction progress event. `preview_retention` reuses this event for its
+// counting phase so the UI needs only one listener pair.
+export interface RetentionMaintenanceProgress {
+	phase: string;
+	pct: number;
+}
+
+// Payload of `retention-maintenance-finished` and the return of
+// `run_retention_maintenance`. `compaction_status` is reported separately from
+// `status` on purpose: rows removed with bytes not yet reclaimed is a
+// legitimate outcome, so "completed" with a skipped compaction and
+// `bytes_after === bytes_before` must stay expressible.
+export interface RetentionMaintenanceResult {
+	status: RetentionRunStatus;
+	// Skip reason; null otherwise.
+	reason: string | null;
+	// Populated if and only if `status` is "partial".
+	error_reason: string | null;
+	cutoff: string | null;
+	window_days: number | null;
+	tool_actions_deleted: number;
+	session_events_deleted: number;
+	tool_actions_nonconforming: number;
+	session_events_nonconforming: number;
+	compaction_status: "completed" | "skipped";
+	compaction_reason: string | null;
+	bytes_before: number;
+	bytes_after: number;
+}
