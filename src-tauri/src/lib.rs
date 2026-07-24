@@ -87,10 +87,6 @@ const SCHEMA_TOO_NEW_ERROR_PREFIX: &str = "SCHEMA_TOO_NEW:";
 /// so no write can overlap the maintenance window. HTTP handlers use the
 /// atomic flag to reject new requests with a retriable response instead of
 /// waiting on a maintenance operation.
-// The compact-database command consumes this guard in the following task. Keep
-// the primitive available without forcing unrelated maintenance into this
-// boundary change.
-#[allow(dead_code)]
 pub(crate) struct IngestQuiesceGuard {
     _gate: RwLockWriteGuard<'static, ()>,
 }
@@ -99,7 +95,6 @@ fn ingest_gate() -> &'static RwLock<()> {
     INGEST_GATE.get_or_init(|| RwLock::new(()))
 }
 
-#[allow(dead_code)]
 pub(crate) fn begin_ingest_quiesce() -> IngestQuiesceGuard {
     let gate = ingest_gate().write();
     MAINTENANCE_IN_PROGRESS.store(true, AtomicOrdering::Release);
@@ -3388,6 +3383,52 @@ async fn set_runtime_settings(
     Ok(resolved)
 }
 
+#[derive(Clone, serde::Serialize)]
+struct DatabaseCompactionProgress {
+    phase: &'static str,
+    pct: u8,
+}
+
+fn emit_database_compaction_progress(app: &tauri::AppHandle, phase: &'static str, pct: u8) {
+    if let Err(error) = app.emit(
+        "compact-database-progress",
+        DatabaseCompactionProgress { phase, pct },
+    ) {
+        log::warn!("Failed to emit database compaction progress: {error}");
+    }
+}
+
+/// Compact SQLite through the user-triggered maintenance path.
+///
+/// The maintenance writer gate quiesces app-owned ingest before preflight and
+/// VACUUM. Every operational failure becomes a structured `skipped` result so
+/// the Settings control can explain why no space was reclaimed.
+#[tauri::command]
+async fn compact_database(
+    app: tauri::AppHandle,
+) -> Result<storage::DatabaseCompactionResult, String> {
+    let storage = get_storage()?;
+    let maintenance_app = app.clone();
+    let result = run_blocking(move || {
+        let _quiesce = begin_ingest_quiesce();
+        emit_database_compaction_progress(&maintenance_app, "Checking disk space", 20);
+
+        let result = match storage.preflight_database_compaction() {
+            Ok(bytes_before) => {
+                emit_database_compaction_progress(&maintenance_app, "Compacting database", 65);
+                storage.vacuum_database(bytes_before)
+            }
+            Err(skipped) => skipped,
+        };
+        Ok(result)
+    })?;
+
+    if let Err(error) = app.emit("compact-database-finished", &result) {
+        log::warn!("Failed to emit database compaction result: {error}");
+    }
+    Ok(result)
+}
+
 #[tauri::command]
 async fn set_minimax_api_key(
     api_key: String,
@@ -4772,6 +4813,7 @@ pub fn run() {
             set_minimax_api_key,
             get_runtime_settings,
             set_runtime_settings,
+            compact_database,
             get_learning_settings,
             set_learning_settings,
             get_learning_capability,

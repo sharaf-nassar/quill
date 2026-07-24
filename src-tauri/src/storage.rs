@@ -2965,6 +2965,58 @@ pub struct Storage {
     model_history_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelHistoryResponse>>>,
 }
 
+/// Result of a user-triggered database compaction attempt.
+///
+/// A failed preflight or VACUUM is represented as `skipped` rather than an
+/// error so callers can report the reason without leaving maintenance state
+/// ambiguous.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DatabaseCompactionResult {
+    pub(crate) status: &'static str,
+    pub(crate) reason: Option<String>,
+    pub(crate) bytes_before: u64,
+    pub(crate) bytes_after: u64,
+}
+
+fn skipped_database_compaction(
+    bytes_before: u64,
+    reason: impl Into<String>,
+) -> DatabaseCompactionResult {
+    DatabaseCompactionResult {
+        status: "skipped",
+        reason: Some(reason.into()),
+        bytes_before,
+        bytes_after: bytes_before,
+    }
+}
+
+#[cfg(unix)]
+fn available_disk_space(path: &Path) -> Result<u64, String> {
+    use std::ffi::CString;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "Database directory contains an unsupported NUL byte".to_string())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.
+    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(format!(
+            "Read free disk space for database compaction: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stats = unsafe { stats.assume_init() };
+    stats
+        .f_bavail
+        .checked_mul(stats.f_frsize)
+        .ok_or_else(|| "Free disk space value overflowed during compaction preflight".to_string())
+}
+
+#[cfg(not(unix))]
+fn available_disk_space(_path: &Path) -> Result<u64, String> {
+    Err("Database compaction preflight is unavailable on this platform".to_string())
+}
+
 fn transcript_analytics_generation_key(provider: IntegrationProvider, root: &str) -> String {
     format!(
         "transcript_analytics_generation:{}:{root}",
@@ -5838,6 +5890,77 @@ impl Storage {
         )
         .map_err(|error| format!("Configure model analytics reader pragmas: {error}"))?;
         Ok(conn)
+    }
+
+    /// Check whether the database can be compacted without exhausting disk.
+    pub(crate) fn preflight_database_compaction(&self) -> Result<u64, DatabaseCompactionResult> {
+        let bytes_before = match std::fs::metadata(&self.db_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                return Err(skipped_database_compaction(
+                    0,
+                    format!("Could not inspect database before compaction: {error}"),
+                ));
+            }
+        };
+        let directory = self.db_path.parent().unwrap_or_else(|| Path::new("."));
+        let required_space = bytes_before.saturating_mul(2);
+        let available_space = match available_disk_space(directory) {
+            Ok(space) => space,
+            Err(error) => return Err(skipped_database_compaction(bytes_before, error)),
+        };
+        if available_space < required_space {
+            return Err(skipped_database_compaction(
+                bytes_before,
+                format!(
+                    "Insufficient free disk space: need {required_space} bytes, have {available_space} bytes"
+                ),
+            ));
+        }
+        Ok(bytes_before)
+    }
+
+    /// Rebuild the SQLite database into a compact file on a dedicated
+    /// connection after the caller has completed disk preflight and acquired
+    /// the ingest quiesce guard. Operational failures are safe skips.
+    pub(crate) fn vacuum_database(&self, bytes_before: u64) -> DatabaseCompactionResult {
+        let connection = match Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(connection) => connection,
+            Err(error) => {
+                return skipped_database_compaction(
+                    bytes_before,
+                    format!("Open dedicated database connection for compaction: {error}"),
+                );
+            }
+        };
+        if let Err(error) = connection.busy_timeout(Duration::from_secs(5)) {
+            return skipped_database_compaction(
+                bytes_before,
+                format!("Configure database compaction timeout: {error}"),
+            );
+        }
+        if let Err(error) = connection.execute_batch("VACUUM;") {
+            return skipped_database_compaction(
+                bytes_before,
+                format!("Database compaction failed: {error}"),
+            );
+        }
+
+        match std::fs::metadata(&self.db_path) {
+            Ok(metadata) => DatabaseCompactionResult {
+                status: "completed",
+                reason: None,
+                bytes_before,
+                bytes_after: metadata.len(),
+            },
+            Err(error) => skipped_database_compaction(
+                bytes_before,
+                format!("Could not inspect compacted database: {error}"),
+            ),
+        }
     }
 
     /// Read the migration-28 singleton without changing backfill state.
@@ -16721,6 +16844,25 @@ mod tests {
             std::env::remove_var("QUILL_DEMO_MODE");
             std::env::remove_var("QUILL_DATA_DIR");
         }
+    }
+
+    // @lat: [[backend#Database#Database compaction]]
+    #[test]
+    #[serial]
+    fn vacuum_database_reports_completed_footprint() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let bytes_before = storage
+            .preflight_database_compaction()
+            .expect("preflight has space for a temporary database");
+
+        let result = storage.vacuum_database(bytes_before);
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.reason, None);
+        assert_eq!(result.bytes_before, bytes_before);
+        assert!(result.bytes_after > 0);
+        clear_env();
     }
 
     /// The cache probe is intentionally an absolute value rather than a

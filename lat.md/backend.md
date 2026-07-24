@@ -79,7 +79,18 @@ The SQLite database file path varies by operating system.
 
 ### VACUUM maintenance spike
 
-[[src-tauri/src/bin/vacuum_spike.rs]] creates and removes a 7.45 GB synthetic SQLite copy to measure VACUUM and demonstrate that a process-wide quiesce flag makes ingest retry during maintenance before the compact-database command is implemented.
+[[src-tauri/src/bin/vacuum_spike.rs]] creates and removes a 7.45 GB synthetic SQLite copy to measure VACUUM and demonstrate that a process-wide quiesce flag makes ingest retry during maintenance.
+
+### Database compaction
+
+[[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.
+
+The command acquires [[src-tauri/src/lib.rs#begin_ingest_quiesce]] before it
+checks free disk space and runs [[src-tauri/src/storage.rs#Storage#vacuum_database]]
+on a dedicated SQLite connection. Its result reports the before/after database
+footprint on success, or a reason with unchanged size when preflight or VACUUM
+cannot proceed. The temporary-database regression test covers a successful
+preflight and completed compaction report.
 
 ### Schema
 
