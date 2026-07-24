@@ -524,6 +524,58 @@ rather than being assumed to follow from the changed-source case.
 Live rows are outside retention's scope by design, so a watermark leaking into
 either live path would delete data the user was never asked about.
 
+### tool_detail payload carve-out
+
+The same `tool_actions` insert loop binds NULL for `full_input` and
+`full_output` whenever the row's category is
+[[src-tauri/src/storage.rs#TOOL_DETAIL_CATEGORY]]. This is retention's second
+footprint lever: bytes no reader ever asks for, dropped at the bind.
+
+The grep behind it is closed. The only SQL readers of either column are
+`get_code_stats`, `get_code_stats_history` and `get_batch_session_code_stats`,
+and all three are gated on `category = 'code_change'`; the Tantivy
+`tool_details` field is built from `action.summary`, not from these columns; the
+MCP server never selects from `tool_actions` at all; and no frontend file
+references either name. A `tool_detail` row therefore carries up to 10KB of
+`full_input` plus 10KB of `full_output` that nothing in the product reads back.
+
+The row itself stays. `get_session_breakdown` and `get_session_subagent_tree`
+scan and `COUNT(*)` `tool_actions` with **no** category filter, so dropping
+`tool_detail` rows would deflate per-agent tool-call counts and could erase a
+sub-agent from the tree entirely whenever a `tool_detail` action is its only
+`agent_id`-bearing row. Omitting the two columns keeps every row-shaped
+invariant — row count, `action_key` uniqueness, `agent_id`, `message_id`,
+timestamps — and costs only the dead bytes.
+
+Scope is the SQL bind and nothing else. `ToolAction.full_input` must keep being
+populated by the parser, because
+`sessions.rs::extract_skill_accesses_from_tool_action` reads it **in memory**
+for `Read`, `exec_command` and `Skill` — all three of which classify as
+`tool_detail` — while building `skill_usages`, a table retention never prunes.
+That reader consumes the parsed action, never the table, so it is unaffected by
+what the bind writes. `code_change` keeps its payloads because the code-stats
+queries re-parse them for legacy rows, and `command` — the largest bucket — is
+deliberately left alone; this decision does not widen to it.
+
+The policy is forward-only. Existing rows keep their payloads and are never
+retroactively NULLed: `full_input IS NOT NULL` is load-bearing in all three
+code-stats queries, which read the column as a non-optional string.
+
+#### Tool Detail Payload Test Specs
+
+This spec pins the carve-out's two halves, since neither is visible in a row
+count: the payloads that must vanish and the row that must not.
+
+##### Tool Detail Rows Land Without Payloads
+
+Given one `tool_detail`, one `code_change` and one `command` row that all carry
+payloads, the `tool_detail` row must read back present but NULL in both payload
+columns while the other two keep their values.
+
+The row's presence is asserted alongside the NULLs because dropping the row
+would also satisfy a NULL-only check, and the category-agnostic subagent
+readers depend on it existing.
+
 ### Retention delete engine
 
 [[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] is retention's destructive core: a dedicated maintenance connection, a one-pass doomed-rowid scan, a disk preflight, and a bounded chunked delete that advances the watermark at its first chunk and persists an audit record on every path.
@@ -837,7 +889,7 @@ Startup also creates covering observation indexes for `(created_at, tool_name)` 
 
 Stores detailed tool invocation and response-time data for MCP-powered session search.
 
-- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input; the code-stats queries prefer those columns and re-parse `full_input` only for legacy rows. Retained transcript rows are committed only through source-owned snapshot replacement.
+- **tool_actions** — Tool invocation details for MCP (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input; the code-stats queries prefer those columns and re-parse `full_input` only for legacy rows. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
 
 #### Skill Usages
@@ -914,7 +966,7 @@ Reconciliation compares canonical source key/path and last-good status before re
 
 [[src-tauri/src/storage.rs#Storage#refresh_unchanged_transcript_analytics_sources]] advances every unchanged source of one root in a single transaction rather than one per source — a real corpus collapses roughly 5,500 transactions into one. It returns the source keys whose rows did not update because the root generation moved under a concurrent run, so callers keep per-source stale-generation handling instead of one aggregate verdict; the single-source method is a thin wrapper over it.
 
-`replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; valid empty snapshots remove only that source, while suppression and any insert failure leave prior rows intact. Owned inserts use `INSERT OR IGNORE` through statements prepared once outside their loops, matching the source-less live paths — an owned identity is the table's own dedupe key, so a legitimate repeat must not roll back the whole five-table snapshot. Distinct `cwd` values are resolved through the rename map once into a lookup table instead of once per skill and hook row. Registry upserts advance `seen_generation`; stale prepared generations are rejected before owned rows change. Parse or identity conflicts retain last-good registry state. The `session_events` and `tool_actions` insert loops are additionally filtered by [[backend#Backend#Database#Insert-time watermark filtering]], which is what stops this delete-and-reinsert from resurrecting pruned history.
+`replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; valid empty snapshots remove only that source, while suppression and any insert failure leave prior rows intact. Owned inserts use `INSERT OR IGNORE` through statements prepared once outside their loops, matching the source-less live paths — an owned identity is the table's own dedupe key, so a legitimate repeat must not roll back the whole five-table snapshot. Distinct `cwd` values are resolved through the rename map once into a lookup table instead of once per skill and hook row. Registry upserts advance `seen_generation`; stale prepared generations are rejected before owned rows change. Parse or identity conflicts retain last-good registry state. The `session_events` and `tool_actions` insert loops are additionally filtered by [[backend#Backend#Database#Insert-time watermark filtering]], which is what stops this delete-and-reinsert from resurrecting pruned history, and the `tool_actions` loop applies the [[backend#Backend#Database#tool_detail payload carve-out]] to the rows that do land.
 
 [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] atomically writes source-less runtime or hook rows with durable project, full-cwd, and host origin. Origin upserts preserve known fields with `COALESCE`; live event rows require unique message UUID identity and always use the incoming session as both root and chain.
 

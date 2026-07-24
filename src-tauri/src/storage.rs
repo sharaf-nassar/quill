@@ -109,6 +109,13 @@ const MODEL_SOURCE_PATH_UNICODE_PREFIX: &str = "\0quill-source-path-unicode-v1:"
 #[allow(dead_code)]
 const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
 
+// @lat: [[backend#Backend#Database#tool_detail payload carve-out]]
+/// `tool_actions.category` value whose rows carry no readable payload. Every
+/// SQL reader of `full_input` / `full_output` is gated on
+/// `category = 'code_change'`, so these two columns are dead weight on a
+/// `tool_detail` row — up to 10KB each, on the largest non-command bucket.
+const TOOL_DETAIL_CATEGORY: &str = "tool_detail";
+
 // Feature 005 US5 T061 (R-7.3 / M-2 / FR-026). Safety floor for observation
 // retention: cleanup never deletes observations newer than `now - this`, even
 // when the analyzed watermark is older. The floor only ever *adds* retention
@@ -3665,6 +3672,18 @@ impl Storage {
                     }
                     RetentionInsertVerdict::Insert => {}
                 }
+                // Forward-only payload carve-out: a `tool_detail` row is
+                // written whole except for its two payload columns, which
+                // nothing ever reads back. The row itself must stay — the
+                // subagent breakdown and tree count `tool_actions` rows with
+                // no category filter. New locals, so `row` is untouched and
+                // `ToolAction.full_input` still reaches the in-memory
+                // skill-access extractor.
+                let (full_input, full_output) = if row.category == TOOL_DETAIL_CATEGORY {
+                    (None, None)
+                } else {
+                    (row.full_input.as_deref(), row.full_output.as_deref())
+                };
                 tool_action_stmt
                     .execute(params![
                         row.provider.as_str(),
@@ -3678,8 +3697,8 @@ impl Storage {
                         row.category,
                         row.file_path,
                         row.summary,
-                        row.full_input,
-                        row.full_output,
+                        full_input,
+                        full_output,
                         row.timestamp,
                         i64::from(row.is_sidechain),
                         row.agent_id,
@@ -22160,6 +22179,99 @@ mod tests {
             owned_source_rows(&storage, sibling.provider, sibling.source_key),
             sibling_before,
             "an empty replacement must not reach a sibling source"
+        );
+
+        clear_env();
+    }
+
+    /// The payload carve-out is invisible in a row count, so it needs its own
+    /// assertion: the `tool_detail` row must still be there, and only its two
+    /// payload columns may have been dropped.
+    // @lat: [[backend#Backend#Database#tool_detail payload carve-out#Tool Detail Payload Test Specs#Tool Detail Rows Land Without Payloads]]
+    #[test]
+    #[serial]
+    fn tool_detail_rows_store_no_payload_while_siblings_keep_theirs() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-payload",
+            source_key: "source-payload",
+            session_id: "session-payload",
+            generation: 1,
+            marker: "pl",
+            rows: 3,
+        };
+        // Index order matches the `{marker}-action-{index}` dedupe keys the
+        // builder assigns, which is also the read-back order below.
+        let categories = ["tool_detail", "code_change", "command"];
+        let base = spec.snapshot();
+        let snapshot = TranscriptAnalyticsSnapshot {
+            tool_actions: base
+                .tool_actions
+                .into_iter()
+                .enumerate()
+                .map(
+                    |(index, row)| crate::transcript_analytics::OwnedToolAction {
+                        category: categories[index].to_string(),
+                        full_input: Some(format!("{{\"in\":{index}}}")),
+                        full_output: Some(format!("out-{index}")),
+                        ..row
+                    },
+                )
+                .collect(),
+            ..base
+        };
+
+        assert!(
+            matches!(
+                storage
+                    .replace_transcript_analytics_snapshot(&snapshot)
+                    .expect("replacement"),
+                TranscriptAnalyticsReplacement::Replaced(_)
+            ),
+            "the carve-out must not change whether the replacement succeeds"
+        );
+
+        let stored: Vec<(String, Option<String>, Option<String>)> = {
+            let conn = storage.conn.lock();
+            let mut statement = conn
+                .prepare(
+                    "SELECT category, full_input, full_output
+                     FROM tool_actions
+                     WHERE provider = ?1 AND source_key = ?2
+                     ORDER BY action_key",
+                )
+                .expect("prepare payload read-back");
+            statement
+                .query_map(params![spec.provider.as_str(), spec.source_key], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .expect("query payload read-back")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect payload read-back")
+        };
+
+        assert_eq!(
+            stored,
+            vec![
+                ("tool_detail".to_string(), None, None),
+                (
+                    "code_change".to_string(),
+                    Some("{\"in\":1}".to_string()),
+                    Some("out-1".to_string()),
+                ),
+                (
+                    "command".to_string(),
+                    Some("{\"in\":2}".to_string()),
+                    Some("out-2".to_string()),
+                ),
+            ],
+            "only the tool_detail row may lose its payloads, and it must still \
+             be present — the subagent breakdown counts tool_actions rows with \
+             no category filter"
         );
 
         clear_env();
