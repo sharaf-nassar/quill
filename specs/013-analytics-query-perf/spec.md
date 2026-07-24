@@ -246,6 +246,12 @@ Now/Trends/Context tab switches don't fan out linearly.
    CTE-based single-pass aggregation, or keep materialization but cache the
    result? (Materialization may still win when 6 subqueries genuinely reuse
    the scoped set — needs a benchmark.)
+
+   **Decision:** Keep the indexed temp table and cache. The production-size
+   benchmark in `timing-measurement.md` found the direct materialized-CTE
+   replacement slower while returning equivalent result sets. A future
+   single-statement response redesign is a separate, correctness-sensitive
+   optimization rather than a drop-in CTE substitution.
 8. **`SnapshotGate` duplicate.** Should the gate's fixed-24h
    `get_snapshot_count` share state with the tab-level hook via context, or is
    lifting the hook to a common parent enough?

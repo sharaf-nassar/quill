@@ -9,7 +9,7 @@
 | S2 race-free rapid switching | 200 ms debounce + generation guard in shared hook | full |
 | S3 Models backend cache, sliding-window-safe key | In-process cache keyed (command, range, provider, time-bucket) + TTL + per-table version probes (Architecture §1) | full |
 | S3 probes cover out-of-process writers + backfill | Absolute per-table probes (COUNT+MAX), reliability spike with <5% cost threshold and MAX-only fallback | full |
-| S3 cold-call cost reduction | Deferred pending benchmark: temp-table materialization retained; timing pass reopens CTE question (spec Open Q7) if cold misses guidance | partial (deliberate, recorded) |
+| S3 cold-call cost reduction | Benchmark rejects the direct per-statement CTE replacement: it takes 16,838 ms versus 5,803 ms for the indexed shared temp set and preserves identical result sets | full (decision recorded) |
 | S4 no duplicate command+args per switch | Dedupe items: `get_llm_runtime_stats` collapse, SnapshotGate lift-to-parent | full |
 | S4 `get_token_hostnames` not range-refetched | Hoist item | full |
 | S4 `useCodeInsights` series reuse | Concrete target: 0 new overlapping history queries when cache-warm | full (hedge removed) |
@@ -33,9 +33,9 @@
   by every writer (HTTP ingest, backfill worker). A missed writer during
   VACUUM risks a failed write past the 5 s busy timeout. Mitigated by the
   standalone quiesce bead with a paused/retried-never-dropped test.
-- **Cold Models-tab cost unchanged in MVP.** Materialization is retained
-  pending the timing benchmark; the ~1.5 s cold guidance target may not be
-  met by MVP alone. Mitigated by the explicit post-timing decision node.
+- **Cold Models-tab cost still misses guidance.** The direct CTE replacement
+  was materially slower and is rejected; a single-statement endpoint redesign
+  remains a separately scoped option if the ~1.5 s cold guidance is required.
 - **One-way schema door.** v34 bump means older builds refuse the DB; no
   downgrade. Accepted per Clarifications Q5 (single-user local app);
   documentation folded into the migration bead's acceptance.

@@ -22,8 +22,34 @@ record.
 | Models, 30d, all providers | 16,068 ms | 1 ms | ~1,500 ms cold / ~300 ms warm | Warm passes; cold misses |
 | Now Context, 30d | 242 ms | 238 ms | ~1,500 ms cold / ~300 ms warm | Passes |
 
-The Models cold call remains expensive because
-`get_model_usage_overview` still materializes its `scoped_overview` temporary
-table. This MVP intentionally does not reduce that cold cost; its cache makes
-warm repeats fast. The cold miss requires a follow-up that reopens the
-temp-table-to-CTE question in Open Q7.
+## Temp-table versus CTE follow-up
+
+The follow-up used the same read-only production database at 7,512,981,504
+bytes (7.51 GB), with a 30-day all-provider range ending at
+2026-07-24T05:49:49Z. It replayed the nine scoped-set aggregate shapes that
+drive the overview: session and token totals, session/model reach, model
+metadata, bucket activity, delegation, and running-model metadata.
+
+The control created `scoped_overview` once, created its two existing temp
+indexes, and then ran those shapes. The alternative prefixed every shape with
+the same `WITH scoped_overview AS MATERIALIZED (...)` definition. Both paths
+returned identical row counts and values for all nine result sets.
+
+| Workload | Cold | Warm endpoint | Decision |
+| --- | ---: | ---: | --- |
+| Existing temp table + indexes | 5,803 ms | 1 ms | Control |
+| Per-statement materialized CTE | 16,838 ms | 1 ms | Reject |
+
+`get_model_usage_overview` needs several separately consumed result sets.
+SQLite scopes a CTE to one statement, so the direct CTE replacement rescans and
+rematerializes the source rows for every statement. The indexed temp table
+shares that work once. A single-statement JSON/result-set redesign could change
+this tradeoff, but it would be a correctness-sensitive endpoint rewrite, not a
+replacement of the current materialization.
+
+The 1 ms warm figure is the actual same-process cache-hit timing recorded above;
+both alternatives have identical cache behavior because the cache lookup occurs
+before the uncached implementation. The CTE candidate is rejected. The existing
+cache and temp-table implementation remain unchanged, while a later
+optimization may pursue a deliberately designed single-statement response if the
+cold guidance remains important.
