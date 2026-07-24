@@ -160,6 +160,17 @@ A flipped checksum nibble and a truncated envelope both decode to an [[src-tauri
 
 Observations seeded through the real [[src-tauri/src/storage.rs#Storage#replace_model_source|replace write path]] land attributed and unattributed tokens in their timestamp-containing fixed buckets with matching aggregate totals and coverage, while a source flipped to suppressed contributes to neither query, guarding the shared [[src-tauri/src/storage.rs#ACTIVE_MODEL_SOURCE_PREDICATE]].
 
+##### Cache Probe Cross-Connection and Cost Spike
+
+The model cache probe records an absolute high-water timestamp, so it observes
+commits from independent SQLite connections without a connection-local counter.
+
+The normal test proves an independent writer's committed insert changes the
+probe. The ignored 250,000-row diagnostic measures both count-plus-max and
+max-only probes against a representative guarded aggregate. Count-plus-max
+exceeds the 5% budget, so the selected max-only probe must remain below it;
+deletes are bounded by the cache TTL.
+
 #### Learning System
 
 Tables for the behavioral learning pipeline: observations, summaries, analysis runs, and discovered rules.

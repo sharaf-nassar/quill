@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::time::Instant;
 use std::time::{Duration, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -16463,6 +16465,144 @@ mod tests {
             std::env::remove_var("QUILL_DEMO_MODE");
             std::env::remove_var("QUILL_DATA_DIR");
         }
+    }
+
+    /// The cache probe is intentionally an absolute value rather than a
+    /// connection-local `PRAGMA data_version`: independent hook, widget, and
+    /// HTTP-server writers can commit between cache reads. The cost spike
+    /// rejected `COUNT(*)`, so deletes rely on the cache TTL cap.
+    fn model_cache_probe(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(MAX(observed_at_ms), 0)
+             FROM model_usage_observations",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read absolute high-water cache probe")
+    }
+
+    fn create_model_cache_probe_fixture(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).expect("open model cache probe fixture");
+        conn.execute_batch(
+            "CREATE TABLE model_usage_observations (
+                observed_at_ms INTEGER NOT NULL,
+                analytics_session_id TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cache_creation_tokens INTEGER NOT NULL,
+                cache_read_tokens INTEGER NOT NULL
+            );
+            CREATE INDEX idx_model_probe_observed
+                ON model_usage_observations(observed_at_ms);",
+        )
+        .expect("create model cache probe fixture");
+        conn
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Cache Probe Cross-Connection and Cost Spike]]
+    #[test]
+    #[serial]
+    fn model_cache_probe_detects_a_committed_external_change() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("model-cache-probe.db");
+        let reader = create_model_cache_probe_fixture(&db_path);
+        let before = model_cache_probe(&reader);
+
+        let writer = Connection::open(&db_path).expect("open independent writer");
+        writer
+            .execute(
+                "INSERT INTO model_usage_observations
+                    (observed_at_ms, analytics_session_id, input_tokens,
+                     output_tokens, cache_creation_tokens, cache_read_tokens)
+                 VALUES (1, 'external-session', 1, 0, 0, 0)",
+                [],
+            )
+            .expect("write through independent connection");
+        drop(writer);
+
+        assert_eq!(before, 0);
+        assert_eq!(
+            model_cache_probe(&reader),
+            1,
+            "an absolute probe must observe a committed change from another connection"
+        );
+    }
+
+    // This diagnostic makes the cache design decision reproducible without
+    // adding Criterion or making normal Rust tests spend time building a large
+    // SQLite fixture. Run with `cargo test model_cache_probe_cost -- --ignored`.
+    #[test]
+    #[serial]
+    #[ignore = "diagnostic cache-probe benchmark"]
+    fn model_cache_probe_cost_stays_under_five_percent_of_guarded_query() {
+        const ROWS: i64 = 250_000;
+        const SAMPLES: u32 = 5;
+
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("model-cache-probe-cost.db");
+        let conn = create_model_cache_probe_fixture(&db_path);
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE rows(value) AS (
+                VALUES(1)
+                UNION ALL
+                SELECT value + 1 FROM rows WHERE value < {ROWS}
+            )
+            INSERT INTO model_usage_observations
+                (observed_at_ms, analytics_session_id, input_tokens,
+                 output_tokens, cache_creation_tokens, cache_read_tokens)
+            SELECT value, printf('session-%05d', value % 1000), 100, 20, 0, 10
+            FROM rows;"
+        ))
+        .expect("seed large model cache probe fixture");
+
+        let guarded_query = "SELECT COUNT(DISTINCT analytics_session_id),
+                                    SUM(input_tokens + output_tokens
+                                        + cache_creation_tokens + cache_read_tokens)
+                             FROM model_usage_observations
+                             WHERE observed_at_ms >= 1";
+        conn.query_row(guarded_query, [], |_| Ok(()))
+            .expect("warm guarded query");
+        model_cache_probe(&conn);
+
+        let mut guarded_total = Duration::ZERO;
+        let mut count_probe_total = Duration::ZERO;
+        let mut max_probe_total = Duration::ZERO;
+        for _ in 0..SAMPLES {
+            let guarded_started = Instant::now();
+            conn.query_row(guarded_query, [], |_| Ok(()))
+                .expect("run guarded query");
+            guarded_total += guarded_started.elapsed();
+
+            let count_probe_started = Instant::now();
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(MAX(observed_at_ms), 0)
+                 FROM model_usage_observations",
+                [],
+                |_| Ok(()),
+            )
+            .expect("run count cache probe");
+            count_probe_total += count_probe_started.elapsed();
+
+            let max_probe_started = Instant::now();
+            model_cache_probe(&conn);
+            max_probe_total += max_probe_started.elapsed();
+        }
+
+        let count_probe_ratio = count_probe_total.as_secs_f64() / guarded_total.as_secs_f64();
+        let max_probe_ratio = max_probe_total.as_secs_f64() / guarded_total.as_secs_f64();
+        println!(
+            "model cache probe: rows={ROWS}, count={:?} ({:.2}%), max={:?} ({:.2}%), guarded={:?}",
+            count_probe_total,
+            count_probe_ratio * 100.0,
+            max_probe_total,
+            max_probe_ratio * 100.0,
+            guarded_total,
+        );
+        assert!(
+            max_probe_ratio < 0.05,
+            "MAX(observed_at_ms) probe cost {:.2}% exceeds the 5% budget",
+            max_probe_ratio * 100.0
+        );
     }
 
     #[test]

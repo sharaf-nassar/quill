@@ -354,7 +354,14 @@ Backend (Rust — inline `#[cfg(test)]` / `src-tauri/tests/`):
   `time_bucket` boundary crossing → miss (no stale-boundary serve).
 - **Cache-probe cost spike (Risks).** A `#[ignore]` benchmark test /
   criterion-free timing assertion documenting probe latency on a large
-  fixture, so the probe's guard cost is known.
+  fixture, so the probe's guard cost is known. The spike uses a 250,000-row
+  SQLite fixture shaped like the model observation fact table and compares
+  five warm absolute probes against a representative filtered aggregate. It
+  also proves an independent connection's committed insert changes the
+  fingerprint. The measured `COUNT(*)` probe exceeded the 5% budget, so the
+  selected implementation uses `MAX(observed_at_ms)` only and requires that
+  it consume <5% of guarded aggregate time. The TTL cap, rather than the
+  probe, detects deletes.
 - **VACUUM path (S5).** Preflight rejects when free disk < 2× file (mock the
   disk check) → returns `skipped` with reason, DB untouched. Happy path on a
   small temp DB → `bytes_after < bytes_before` after dropping a table.
