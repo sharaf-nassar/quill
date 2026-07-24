@@ -464,6 +464,91 @@
   margin-top: 10px;
 }
 
+/* ─── Retention audit record (feature 014) ───
+   The durable "what did I delete, and when" readout. Deliberately quieter than
+   `.retention-panel`: that panel is a decision the user is in the middle of, so
+   it gets a keyline and a fill; this is a log line that is always on screen, so
+   it is a hairline rule and nothing else. Figures are tabular per DESIGN.md. */
+.retention-audit {
+  margin: 2px 4px 8px;
+  padding: 10px 12px 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.retention-audit-heading {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.retention-audit-status {
+  color: var(--readout-bright);
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: none;
+}
+
+.retention-audit-cutoff {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.3px;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-audit-line,
+.retention-audit-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.62);
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-audit-note {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+/* Wraps rather than scrolls: three short figures never need a scroll region,
+   and a wrapped column reads better on a narrow settings pane than a squeezed
+   row of truncated numbers. */
+.retention-audit-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin: 8px 0 0;
+}
+
+.retention-audit-figure {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.retention-audit-figure dt {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.38);
+}
+
+.retention-audit-figure dd {
+  margin: 0;
+  font-size: 12px;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--readout-bright);
+}
+
 /* Narrow windows: the row's select + button pair is the only control group in
    Settings wide enough to overflow, so it wraps under its label rather than
    squeezing the description to nothing. */

@@ -2371,15 +2371,38 @@ function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord
     bytes_before: 8_106_127_360,
     bytes_after: 6_442_450_944,
   };
-  if (scenario !== "partial") return base;
-  return {
-    ...base,
-    status: "partial",
-    error_reason:
-      "free space fell below the delete-phase budget after 41 chunks",
-    deleted: { tool_actions: 61_440, session_events: 190_512 },
-    bytes_after: base.bytes_before,
-  };
+  if (scenario === "partial") {
+    return {
+      ...base,
+      status: "partial",
+      error_reason:
+        "free space fell below the delete-phase budget after 41 chunks",
+      deleted: { tool_actions: 61_440, session_events: 190_512 },
+      bytes_after: base.bytes_before,
+    };
+  }
+  if (scenario === "busy") {
+    // A skipped run is recorded exactly like a completed one, so the audit
+    // surface needs a browser-reachable skip: "I tried on this date and nothing
+    // happened, because X" is the question the record exists to answer.
+    return {
+      ...base,
+      status: "skipped",
+      reason: "another maintenance operation was running",
+      cutoff: null,
+      ran_at: iso(2 * D),
+      deleted: { tool_actions: 0, session_events: 0 },
+      skipped_nonconforming: { tool_actions: 0, session_events: 0 },
+      bytes_after: base.bytes_before,
+    };
+  }
+  if (scenario === "skipped_compaction") {
+    // Rows removed, bytes not reclaimed — the audit repeats the rows-are-not-
+    // bytes sentence rather than letting an unchanged file size look like a
+    // failed prune.
+    return { ...base, bytes_after: base.bytes_before };
+  }
+  return base;
 }
 
 function retentionPolicy(): RetentionPolicy {

@@ -9,6 +9,7 @@ import {
 import type { UseRuntimeSettingsResult } from "../../hooks/useRuntimeSettings";
 import { useToast } from "../../hooks/useToast";
 import type {
+  RetentionAuditRecord,
   RetentionMaintenanceProgress,
   RetentionMaintenanceResult,
   RetentionPreview,
@@ -108,6 +109,59 @@ function formatRowPair(toolActions: number, sessionEvents: number): string {
   return `${tools} and ${events}`;
 }
 
+const MS_PER_DAY = 86_400_000;
+
+/**
+ * Whole days between a conforming timestamp and now, or null if the stored
+ * value cannot be parsed. Floored and clamped at zero: a record whose clock
+ * sits slightly ahead of this one reads as "today" rather than as a negative
+ * age nobody can act on.
+ */
+function daysSince(timestamp: string, now: number | null): number | null {
+  const parsed = Date.parse(timestamp);
+  if (now === null || !Number.isFinite(parsed)) {
+    return null;
+  }
+  return Math.max(0, Math.floor((now - parsed) / MS_PER_DAY));
+}
+
+/**
+ * The drift line, and the only mitigation the no-scheduler decision gets.
+ *
+ * A retention window is a plan, not a timer: a 90-day window bounds the
+ * database on the days it is actually run and on no others. Stating the run's
+ * age beside the configured window — "last pruned 112 days ago; window 90
+ * days" — makes that drift legible without a scheduler existing anywhere.
+ */
+function retentionAgeLine(
+  record: RetentionAuditRecord,
+  windowDays: number | null,
+  now: number | null,
+): string {
+  // A skipped run happened but removed nothing, so it must not claim a prune.
+  const verb = record.status === "skipped" ? "Last attempted" : "Last pruned";
+  const age = daysSince(record.ran_at, now);
+  const when =
+    age === null
+      ? `on ${formatRetentionCutoff(record.ran_at)}`
+      : age === 0
+        ? "today"
+        : `${formatCount(age)} day${age === 1 ? "" : "s"} ago`;
+  const configured =
+    windowDays === null ? "retention is now off" : `window ${windowDays} days`;
+  const drifted =
+    age !== null && windowDays !== null && age > windowDays
+      ? " Rows older than the window have accumulated since: pruning runs only when you ask."
+      : "";
+  return `${verb} ${when}; ${configured}.${drifted}`;
+}
+
+/** "Completed" / "Stopped part-way" / "Nothing removed". */
+function retentionStatusLabel(status: RetentionAuditRecord["status"]): string {
+  if (status === "completed") return "Completed";
+  return status === "partial" ? "Stopped part-way" : "Nothing removed";
+}
+
 export function PerformanceTab({ runtime }: PerformanceTabProps) {
   const { toast } = useToast();
   const { settings, saving } = runtime;
@@ -119,6 +173,14 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
   const [retentionStage, setRetentionStage] = useState<RetentionStage>(IDLE);
   const [retentionProgress, setRetentionProgress] =
     useState<RetentionMaintenanceProgress | null>(null);
+  // Day-resolution clock for the audit record's age line. `Date.now()` may not
+  // be read during render, so it is captured here and re-captured whenever a
+  // new record arrives — a run that just finished must not read as days old.
+  const [auditClock, setAuditClock] = useState<number | null>(null);
+  const lastRun = retention.policy.last_run;
+  useEffect(() => {
+    setAuditClock(Date.now());
+  }, [lastRun]);
 
   const finishCompaction = useCallback((result: CompactDatabaseResult) => {
     setCompactionProgress(null);
@@ -408,6 +470,16 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
         onPreview={() => void previewRetention()}
         onDismiss={() => setRetentionStage(IDLE)}
       />
+      {/* The terminal panel narrates the run that just finished, so the durable
+          record stays out of its way until it is dismissed rather than saying
+          the same thing twice. */}
+      {!retention.loading && retentionStage.kind !== "done" && (
+        <RetentionAudit
+          record={lastRun}
+          windowDays={retentionWindow}
+          now={auditClock}
+        />
+      )}
       {retention.error !== null && (
         <div className="settings-empty settings-empty--error">
           Retention policy unavailable: {retention.error}
@@ -646,6 +718,117 @@ function RetentionPanel({
           Dismiss
         </button>
       </div>
+    </div>
+  );
+}
+
+interface RetentionAuditProps {
+  /** `retention.last_run`; null on a database that has never run retention. */
+  record: RetentionAuditRecord | null;
+  /** The window configured *now*, which a past run need not have used. */
+  windowDays: number | null;
+  /**
+   * The clock the age line compares against, captured in an effect because
+   * reading it during render is impure. Null until that effect runs, which the
+   * line degrades to an absolute run date for.
+   */
+  now: number | null;
+}
+
+/**
+ * The durable answer to "what did I delete, and when" (feature 014).
+ *
+ * The toast and the terminal panel are both transient; this reads
+ * `retention.last_run` back and keeps every field of it on screen — cutoff, run
+ * date, status with its skip or error reason, rows removed per table, rows kept
+ * because their timestamps could not be compared, and the file size on either
+ * side of the run.
+ *
+ * Chrome-grey and hairline-ruled like {@link RetentionPanel}: a record of a
+ * deletion the user asked for is not a threshold breach, so it does not spend
+ * the reserved severity meter — not even on the `"partial"` status.
+ */
+function RetentionAudit({ record, windowDays, now }: RetentionAuditProps) {
+  if (record === null) {
+    // Nothing to account for yet. Worth saying only once a window is set: with
+    // retention off, "never pruned" is the setting, not news.
+    if (windowDays === null) {
+      return null;
+    }
+    return (
+      <div className="retention-audit" role="note">
+        <div className="retention-audit-heading">Last prune</div>
+        <p className="retention-audit-line">
+          Never — the {windowDays}-day window applies only when you preview and
+          confirm a run.
+        </p>
+      </div>
+    );
+  }
+
+  const nonconforming =
+    record.skipped_nonconforming.tool_actions +
+    record.skipped_nonconforming.session_events;
+  const reclaimed = record.bytes_before - record.bytes_after;
+
+  return (
+    <div className="retention-audit" role="note">
+      <div className="retention-audit-heading">
+        Last prune
+        <span className="retention-audit-status">
+          {retentionStatusLabel(record.status)}
+        </span>
+        {record.cutoff !== null && (
+          <span className="retention-audit-cutoff">
+            cutoff {formatRetentionCutoff(record.cutoff)}
+            {record.window_days === null ? "" : ` · ${record.window_days}-day window`}
+          </span>
+        )}
+      </div>
+      <p className="retention-audit-line">
+        {retentionAgeLine(record, windowDays, now)}
+      </p>
+      <dl className="retention-audit-figures">
+        <div className="retention-audit-figure">
+          <dt>Tool actions removed</dt>
+          <dd>{formatCount(record.deleted.tool_actions)}</dd>
+        </div>
+        <div className="retention-audit-figure">
+          <dt>Session events removed</dt>
+          <dd>{formatCount(record.deleted.session_events)}</dd>
+        </div>
+        <div className="retention-audit-figure">
+          <dt>On disk</dt>
+          <dd>
+            {formatBytes(record.bytes_before)} → {formatBytes(record.bytes_after)}
+          </dd>
+        </div>
+      </dl>
+      {record.status === "partial" && (
+        <p className="retention-audit-note">
+          Stopped because{" "}
+          {asSentence(record.error_reason ?? "the run could not continue")} What it
+          had already removed is gone permanently.
+        </p>
+      )}
+      {record.status === "skipped" && (
+        <p className="retention-audit-note">
+          {asSentence(record.reason ?? "Retention found nothing it could remove")}
+        </p>
+      )}
+      {nonconforming > 0 && (
+        <p className="retention-audit-note">
+          Kept:{" "}
+          {formatRowPair(
+            record.skipped_nonconforming.tool_actions,
+            record.skipped_nonconforming.session_events,
+          )}{" "}
+          carrying timestamps Quill cannot compare.
+        </p>
+      )}
+      {reclaimed <= 0 && record.deleted.tool_actions + record.deleted.session_events > 0 && (
+        <p className="retention-audit-note">{RECLAIM_SENTENCE}</p>
+      )}
     </div>
   );
 }
