@@ -117,6 +117,18 @@ impl CacheKey {
             selected_model.map(|identity| (identity.provider.clone(), identity.model_id.clone()));
         self
     }
+
+    /// Build a key for commands whose request dimensions do not match the
+    /// model-range/provider pair used by the model analytics endpoints.
+    pub(crate) fn for_request(command: &'static str, request: String, now: DateTime<Utc>) -> Self {
+        Self {
+            command,
+            range: ModelRange::OneHour,
+            provider: Some(request),
+            selected_model: None,
+            time_bucket: now.timestamp().div_euclid(ANALYTICS_CACHE_BUCKET_SECS),
+        }
+    }
 }
 
 /// Absolute high-water markers for every table read by a cacheable command.
@@ -2963,6 +2975,8 @@ pub struct Storage {
     model_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelAnalyticsResponse>>>,
     model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
     model_history_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelHistoryResponse>>>,
+    bucket_stats_cache: Mutex<HashMap<CacheKey, CacheEntry<Vec<BucketStats>>>>,
+    context_savings_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ContextSavingsAnalytics>>>,
 }
 
 /// Result of a user-triggered database compaction attempt.
@@ -5827,6 +5841,8 @@ impl Storage {
             model_analytics_cache: Mutex::new(HashMap::new()),
             model_usage_overview_cache: Mutex::new(HashMap::new()),
             model_history_cache: Mutex::new(HashMap::new()),
+            bucket_stats_cache: Mutex::new(HashMap::new()),
+            context_savings_analytics_cache: Mutex::new(HashMap::new()),
         };
 
         if let Err(e) = storage.aggregate_and_cleanup() {
@@ -9437,14 +9453,25 @@ impl Storage {
         days: i32,
     ) -> Result<Vec<BucketStats>, String> {
         let conn = self.conn.lock();
-        let mut results = Vec::new();
-        for bucket in current_buckets {
-            let mut stats =
-                Self::get_usage_stats_with_conn(&conn, bucket.provider, &bucket.key, days)?;
-            stats.current = bucket.utilization;
-            results.push(stats);
-        }
-        Ok(results)
+        let request = serde_json::to_string(&(current_buckets, days))
+            .map_err(|error| format!("Serialize bucket stats cache key: {error}"))?;
+        let key = CacheKey::for_request("get_all_bucket_stats", request, Utc::now());
+        get_or_compute(
+            &self.bucket_stats_cache,
+            key,
+            &conn,
+            &[CacheTable::RowId("usage_snapshots")],
+            || {
+                let mut results = Vec::new();
+                for bucket in current_buckets {
+                    let mut stats =
+                        Self::get_usage_stats_with_conn(&conn, bucket.provider, &bucket.key, days)?;
+                    stats.current = bucket.utilization;
+                    results.push(stats);
+                }
+                Ok(results)
+            },
+        )
     }
 
     pub fn get_latest_usage_buckets(
@@ -9942,6 +9969,23 @@ impl Storage {
         limit: Option<i64>,
     ) -> Result<ContextSavingsAnalytics, String> {
         let conn = self.conn.lock();
+        let request = serde_json::to_string(&(range, limit))
+            .map_err(|error| format!("Serialize context savings cache key: {error}"))?;
+        let key = CacheKey::for_request("get_context_savings_analytics", request, Utc::now());
+        get_or_compute(
+            &self.context_savings_analytics_cache,
+            key,
+            &conn,
+            &[CacheTable::RowId("context_savings_events")],
+            || Self::get_context_savings_analytics_with_conn(&conn, range, limit),
+        )
+    }
+
+    fn get_context_savings_analytics_with_conn(
+        conn: &Connection,
+        range: &str,
+        limit: Option<i64>,
+    ) -> Result<ContextSavingsAnalytics, String> {
         let from = context_savings_from_timestamp(range);
         let recent_limit = limit.unwrap_or(50).clamp(1, 500);
         let breakdown_limit = 20i64;
@@ -9956,8 +10000,8 @@ impl Storage {
                 context_savings_summary_from_row_at(row, 0)
             })
             .map_err(|e| format!("Query context savings summary error: {e}"))?;
-        apply_category_totals(&mut summary, &conn, &from)?;
-        apply_retention_metrics(&mut summary, &conn, &from)?;
+        apply_category_totals(&mut summary, conn, &from)?;
+        apply_retention_metrics(&mut summary, conn, &from)?;
 
         let bucket_expr = context_savings_bucket_expr(range);
         let timeseries_sql = format!(
@@ -9995,31 +10039,31 @@ impl Storage {
 
         let breakdowns = ContextSavingsBreakdowns {
             by_provider: Self::get_context_savings_breakdown_with_conn(
-                &conn,
+                conn,
                 "provider",
                 &from,
                 breakdown_limit,
             )?,
             by_event_type: Self::get_context_savings_breakdown_with_conn(
-                &conn,
+                conn,
                 "event_type",
                 &from,
                 breakdown_limit,
             )?,
             by_source: Self::get_context_savings_breakdown_with_conn(
-                &conn,
+                conn,
                 "source",
                 &from,
                 breakdown_limit,
             )?,
             by_decision: Self::get_context_savings_breakdown_with_conn(
-                &conn,
+                conn,
                 "decision",
                 &from,
                 breakdown_limit,
             )?,
             by_cwd: Self::get_context_savings_breakdown_with_conn(
-                &conn,
+                conn,
                 "cwd",
                 &from,
                 breakdown_limit,
@@ -10027,7 +10071,7 @@ impl Storage {
         };
 
         let recent_events =
-            Self::get_recent_context_savings_events_with_conn(&conn, &from, recent_limit)?;
+            Self::get_recent_context_savings_events_with_conn(conn, &from, recent_limit)?;
 
         Ok(ContextSavingsAnalytics {
             summary,
