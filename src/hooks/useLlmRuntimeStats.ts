@@ -5,7 +5,7 @@ import type { RangeType, LlmRuntimeStats, SparklinePoint } from "../types";
 import { useCachedInvoke } from "./useCachedInvoke";
 
 const REFRESH_DEBOUNCE_MS = 1000;
-interface LlmRuntimeStatsResult { totalRuntimeSecs: number | null; turnCount: number; sessionCount: number; avgPerTurnSecs: number | null; sparkline: SparklinePoint[]; loading: boolean; }
+export interface LlmRuntimeStatsResult { totalRuntimeSecs: number | null; turnCount: number; sessionCount: number; avgPerTurnSecs: number | null; sparkline: SparklinePoint[]; loading: boolean; }
 const EMPTY: Omit<LlmRuntimeStatsResult, "loading"> = { totalRuntimeSecs: null, turnCount: 0, sessionCount: 0, avgPerTurnSecs: null, sparkline: [] };
 
 export function useLlmRuntimeStats(range: RangeType): LlmRuntimeStatsResult {

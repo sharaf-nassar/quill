@@ -27,7 +27,6 @@ export function useTokenData(
 ) {
   const [history, setHistory] = useState<TokenDataPoint[]>([]);
   const [stats, setStats] = useState<TokenStats | null>(null);
-  const [hostnames, setHostnames] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -46,7 +45,7 @@ export function useTokenData(
       const sessionIdArg = sessionId || null;
       const cwdArg = cwd || null;
 
-      const [historyData, statsData, hostnameData] = await Promise.all([
+      const [historyData, statsData] = await Promise.all([
         invoke<TokenDataPoint[]>("get_token_history", {
           range,
           provider: providerArg,
@@ -61,12 +60,10 @@ export function useTokenData(
           sessionId: sessionIdArg,
           cwd: cwdArg,
         }),
-        invoke<string[]>("get_token_hostnames"),
       ]);
 
       setHistory(historyData);
       setStats(statsData);
-      setHostnames(hostnameData);
     } catch (e) {
       console.error("Token data fetch error:", e);
       setError(String(e));
@@ -75,6 +72,19 @@ export function useTokenData(
       initialLoadDone.current = true;
     }
   }, [range, provider, hostname, sessionId, cwd]);
+
+	// Hostnames are independent of the selected range and filters. Keep this
+	// request outside the range-keyed data refresh so changing a range never
+	// repeats it.
+	const fetchHostnames = useCallback(
+		() => invoke<string[]>("get_token_hostnames"),
+		[],
+	);
+	const { state: hostnameState } = useCachedInvoke({
+		identity: "token-hostnames",
+		request: fetchHostnames,
+		normalizeError: String,
+	});
 
 	useCachedInvoke({
 		identity: `token-data:${range}:${provider ?? "all"}:${hostname ?? "all"}:${sessionId ?? "all"}:${cwd ?? "all"}`,
@@ -104,5 +114,12 @@ export function useTokenData(
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  return { history, stats, hostnames, loading, error, refresh: fetchData };
+  return {
+		history,
+		stats,
+		hostnames: hostnameState.data ?? [],
+		loading,
+		error: error ?? hostnameState.error,
+		refresh: fetchData,
+	};
 }

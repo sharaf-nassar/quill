@@ -10,6 +10,7 @@ import type {
 	SparklinePoint,
 	LlmRuntimeStats,
 } from "../types";
+import type { LlmRuntimeStatsResult } from "./useLlmRuntimeStats";
 
 interface InsightMetric {
 	trend: InsightTrend | null;
@@ -138,13 +139,22 @@ const EMPTY_RESULT: CodeInsightsResult = {
 	loading: true,
 };
 
-export function useCodeInsights(range: RangeType): CodeInsightsResult {
+export function useCodeInsights(
+	range: RangeType,
+	currentRuntime: LlmRuntimeStatsResult,
+): CodeInsightsResult {
 	const [result, setResult] = useState<CodeInsightsResult>(EMPTY_RESULT);
+	const {
+		loading: runtimeLoading,
+		totalRuntimeSecs,
+		sparkline: runtimeSparkline,
+	} = currentRuntime;
 
 	const fetchData = useCallback(async () => {
+		if (runtimeLoading) return;
 		try {
 			const historyRange = comparisonRange(range);
-			const [tokenHistory, codeHistory, currentRuntime, comparisonRuntime] =
+			const [tokenHistory, codeHistory, comparisonRuntime] =
 				await Promise.all([
 					invoke<TokenDataPoint[]>("get_token_history", {
 						range: historyRange,
@@ -155,12 +165,9 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 					invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", {
 						range: historyRange,
 					}),
-					// Current-window active runtime — matches the LLM Runtime card,
-					// which fetches the same command for the same range.
-					invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range }),
 					// Comparison-range runtime supplies the prior window's active
-					// seconds via proration. Skipped when it equals the current range
-					// (30d), where the previous window falls outside history anyway.
+					// seconds via proration. The current window comes from the shared
+					// LLM Runtime hook, so this never duplicates that IPC request.
 					historyRange === range
 						? Promise.resolve<LlmRuntimeStats | null>(null)
 						: invoke<LlmRuntimeStats>("get_llm_runtime_stats", {
@@ -228,8 +235,10 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 
 			const compMs = getRangeMs(historyRange);
 			const compStart = now - compMs;
-			const compRuntime = comparisonRuntime ?? currentRuntime;
-			const currentActiveSecs = currentRuntime.total_runtime_secs;
+			const compRuntime = comparisonRuntime ?? {
+				sparkline: runtimeSparkline.map(({ value }) => value),
+			};
+			const currentActiveSecs = totalRuntimeSecs ?? 0;
 			const prevActiveSecs = activeSecsInWindow(
 				compRuntime.sparkline,
 				compStart,
@@ -263,7 +272,7 @@ export function useCodeInsights(range: RangeType): CodeInsightsResult {
 				loading: false,
 			});
 		}
-	}, [range]);
+	}, [range, runtimeLoading, runtimeSparkline, totalRuntimeSecs]);
 
 	useCachedInvoke({ identity: `code-insights:${range}`, request: fetchData, normalizeError: String });
 

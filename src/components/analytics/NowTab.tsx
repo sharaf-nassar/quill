@@ -79,9 +79,16 @@ function preservedRetention(summary: ContextSavingsSummary): string {
 interface NowTabProps {
 	range: RangeType;
 	onRangeChange: (r: RangeType) => void;
+	snapshotCount: number;
+	snapshotCountReady: boolean;
 }
 
-function NowTab({ range, onRangeChange }: NowTabProps) {
+function NowTab({
+	range,
+	onRangeChange,
+	snapshotCount,
+	snapshotCountReady,
+}: NowTabProps) {
 	const [breakdownSelection, setBreakdownSelection] =
 		useState<BreakdownSelection | null>(null);
 	const [breakdownCollapsed, setBreakdownCollapsed] = useState(() => {
@@ -100,6 +107,7 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 	const { loading, error } = useAnalyticsData(
 		null,
 		range,
+		{ count: snapshotCount, ready: snapshotCountReady },
 	);
 
 	const runtimeStats = useLlmRuntimeStats(range);
@@ -127,7 +135,10 @@ function NowTab({ range, onRangeChange }: NowTabProps) {
 	);
 
 	const { stats: codeStats, history: codeHistory } = useCodeStats(range);
-	const { efficiency: efficiencyStats, velocity: velocityStats } = useCodeInsights(range);
+	const { efficiency: efficiencyStats, velocity: velocityStats } = useCodeInsights(
+		range,
+		runtimeStats,
+	);
 
 	return (
 		<>

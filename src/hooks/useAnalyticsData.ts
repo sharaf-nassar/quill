@@ -6,6 +6,11 @@ import { useCachedInvoke } from "./useCachedInvoke";
 
 const REFRESH_INTERVAL_MS = 60_000; // Re-fetch every 60s to keep chart current
 
+export interface SnapshotCountState {
+  count: number;
+  ready: boolean;
+}
+
 const RANGES: Record<RangeType, { label: string; days: number }> = {
   "1h": { label: "1 Hour", days: 1 },
   "24h": { label: "24 Hours", days: 1 },
@@ -58,11 +63,10 @@ function mergeStats(all: BucketStats[], merged: MergedBucket): BucketStats {
 export function useAnalyticsData(
   bucket: MergedBucket | null,
   range: RangeType,
+  snapshotCountState?: SnapshotCountState,
 ) {
   const [history, setHistory] = useState<DataPoint[]>([]);
   const [stats, setStats] = useState<BucketStats | null>(null);
-  const [snapshotCount, setSnapshotCount] = useState(0);
-  const [snapshotCountReady, setSnapshotCountReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -108,20 +112,9 @@ export function useAnalyticsData(
           )
         : [];
 
-      const snapshotCountPromise = invoke<number>("get_snapshot_count").then(
-        (countData) => {
-          if (requestId === requestIdRef.current) {
-            setSnapshotCount(countData);
-            setSnapshotCountReady(true);
-          }
-          return countData;
-        },
-      );
-
-      const [historyArrays, , statsArrays] = await Promise.all([
-        Promise.all(historyPromises),
-        snapshotCountPromise,
-        Promise.all(statsPromises),
+		const [historyArrays, statsArrays] = await Promise.all([
+			Promise.all(historyPromises),
+			Promise.all(statsPromises),
       ]);
 
       if (requestId !== requestIdRef.current) return;
@@ -157,8 +150,8 @@ export function useAnalyticsData(
   return {
     history,
     stats,
-    snapshotCount,
-    snapshotCountReady,
+    snapshotCount: snapshotCountState?.count ?? 0,
+    snapshotCountReady: snapshotCountState?.ready ?? false,
     loading,
     error,
     refresh: fetchData,

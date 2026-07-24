@@ -1,5 +1,6 @@
-import React, { useEffect, useState, Suspense } from "react";
-import { useAnalyticsData } from "../../hooks/useAnalyticsData";
+import React, { useCallback, useEffect, useState, Suspense } from "react";
+import { useCachedInvoke } from "../../hooks/useCachedInvoke";
+import { invoke } from "@tauri-apps/api/core";
 import TabBar, { analyticsPanelId, analyticsTabId } from "./TabBar";
 import NowTab from "./NowTab";
 import TrendsTab from "./TrendsTab";
@@ -52,13 +53,17 @@ function SnapshotEmptyState() {
 
 interface SnapshotGateProps {
 	children: React.ReactNode;
+	snapshotCount: number;
+	snapshotCountReady: boolean;
+	error: string | null;
 }
 
-function SnapshotGate({ children }: SnapshotGateProps) {
-	const { snapshotCount, snapshotCountReady, error } = useAnalyticsData(
-		null,
-		"24h",
-	);
+function SnapshotGate({
+	children,
+	snapshotCount,
+	snapshotCountReady,
+	error,
+}: SnapshotGateProps) {
 	const hasSuccessfulEmptySnapshot =
 		snapshotCountReady && snapshotCount === 0 && error === null;
 
@@ -104,6 +109,17 @@ function AnalyticsView({
 		} catch { /* ignore */ }
 		return "1h";
 	});
+	const fetchSnapshotCount = useCallback(
+		() => invoke<number>("get_snapshot_count"),
+		[],
+	);
+	const { state: snapshotCountState } = useCachedInvoke({
+		identity: "analytics-snapshot-count",
+		request: fetchSnapshotCount,
+		normalizeError: String,
+	});
+	const snapshotCount = snapshotCountState.data ?? 0;
+	const snapshotCountReady = snapshotCountState.data !== null;
 
 	const handleChartsRangeChange = (r: RangeType) => {
 		setChartsRange(r);
@@ -149,8 +165,17 @@ function AnalyticsView({
 				tabIndex={effectiveActiveTab === "now" ? 0 : -1}
 			>
 				{effectiveActiveTab === "now" ? (
-					<SnapshotGate>
-						<NowTab range={nowRange} onRangeChange={setNowRange} />
+					<SnapshotGate
+						snapshotCount={snapshotCount}
+						snapshotCountReady={snapshotCountReady}
+						error={snapshotCountState.error}
+					>
+						<NowTab
+							range={nowRange}
+							onRangeChange={setNowRange}
+							snapshotCount={snapshotCount}
+							snapshotCountReady={snapshotCountReady}
+						/>
 					</SnapshotGate>
 				) : null}
 			</div>
@@ -163,7 +188,11 @@ function AnalyticsView({
 				tabIndex={effectiveActiveTab === "trends" ? 0 : -1}
 			>
 				{effectiveActiveTab === "trends" ? (
-					<SnapshotGate>
+					<SnapshotGate
+						snapshotCount={snapshotCount}
+						snapshotCountReady={snapshotCountReady}
+						error={snapshotCountState.error}
+					>
 						<TrendsTab
 							range={trendsRange}
 							onRangeChange={setTrendsRange}
@@ -180,7 +209,11 @@ function AnalyticsView({
 				tabIndex={effectiveActiveTab === "charts" ? 0 : -1}
 			>
 				{effectiveActiveTab === "charts" ? (
-					<SnapshotGate>
+					<SnapshotGate
+						snapshotCount={snapshotCount}
+						snapshotCountReady={snapshotCountReady}
+						error={snapshotCountState.error}
+					>
 						<Suspense
 							fallback={
 								<div

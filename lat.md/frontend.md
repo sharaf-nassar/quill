@@ -188,9 +188,9 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 
 | Hook | Returns | Tauri Commands |
 |------|---------|----------------|
-| `useAnalyticsData` | Snapshot count, loading, and error state for analytics empty-state gating | `get_snapshot_count` |
+| `useAnalyticsData` | Range-scoped usage history and stats; receives the parent-owned snapshot state for empty-state consumers | `get_usage_history`, `get_usage_stats` |
 | `useLiveSummaryData` | Aggregate live `Sessions`, `Projects`, and range-scoped `Tokens` cards across enabled providers | `get_session_breakdown`, `get_token_history` |
-| `useTokenData` | Token history with hostname/session filtering | `get_token_history`, `get_token_stats`, `get_token_hostnames` |
+| `useTokenData` | Token history with hostname/session filtering; hostnames load independently of range changes | `get_token_history`, `get_token_stats`, `get_token_hostnames` |
 | `useCodeStats` | Lines added/removed by language | `get_code_stats`, `get_code_stats_history` |
 | `useBreakdownData` | Host/project/session breakdown tables | `get_host_breakdown`, `get_project_breakdown`, `get_session_breakdown` |
 | `useSessionHealth` | Avg duration, tokens, sessions/day with trend | `get_session_stats` |
@@ -198,6 +198,7 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useLlmRuntimeStats` | Cumulative runtime, session count, turn count, avg per turn, sparkline | `get_llm_runtime_stats` |
 | `useEfficiencyStats` | Tokens-per-LOC ratio with trend | Derived from token + code stats |
 | `useVelocityStats` | LOC per active LLM-runtime hour with trend | Derived from code stats + `get_llm_runtime_stats` |
+
 | `useLearningStats` | Rule counts by state, confidence buckets | `get_learned_rules` (derived) |
 | `useLearningData` | Rules, runs, settings, observations, logs | Multiple learning commands + events |
 | `useMemoryData` | Memory files, suggestions, projects | Multiple memory optimizer commands |
@@ -209,6 +210,8 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useSkillProjects` | Per-`(skill_name, requestKey)` lazy project-breakdown state for the Skills breakdown's expandable rows; `requestKey` encodes `${mode}:${days}:${allTime}:${provider}` so cache slots invalidate on filter change while strictly lazy-fetching only on expand | `get_skill_project_breakdown` |
 | `useModelSessions` | Selected provider-qualified model paging with atomic shared-refresh replay and operation-local recovery | `get_model_sessions` |
 | `useSessionModelHistory` | Per-`(provider, sessionId, range)` lazy model-chain history for expanded Models rows; shared refresh refetches expanded rows, invalidates collapsed caches, and preserves good data behind row-local errors | `get_session_model_history` |
+
+[[src/hooks/useCachedInvoke.ts#useCachedInvoke]] keeps analytics request results by identity while revalidating in the background. `AnalyticsView` owns the single snapshot-count request for every empty-state gate and passes it to the Now tab, while its runtime hook supplies `useCodeInsights` so the comparison cards do not duplicate the current-window runtime request.
 
 `useLiveSummaryData` fetches provider-filtered token and session history on demand so the top workload rail can aggregate `Sessions`, `Projects`, and range-scoped `Tokens` across whichever providers are enabled, while the grouped row sections continue to consume the already-fetched `UsageData` snapshot from `fetch_usage_data`.
 
