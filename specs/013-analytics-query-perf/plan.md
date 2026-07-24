@@ -476,6 +476,18 @@ DAG. Names are descriptive; dependencies are stated inline.
   nothing in MVP directly (S6 deferred) but informs cache probe column
   choice.* Independent — run first, cheap.
 
+  **Result (2026-07-24):** Passed. A read-only scan of the real
+  `~/.local/share/com.quilltoolkit.app/usage.db` found every stored RFC3339
+  value with an explicit offset uses `+00:00`: `observations.timestamp`
+  (212,475 rows), `token_snapshots.timestamp` (2,319),
+  `usage_snapshots.timestamp` (67,837), `usage_snapshots.resets_at`
+  (64,189), `token_hourly.hour` (169), `usage_hourly.hour` (1,014), and
+  `learned_rules.created_at` (8). Other time-like columns currently use
+  SQLite's offset-free default format rather than RFC3339. Lexicographic
+  ordering is therefore safe for the RFC3339 values present in this DB;
+  cache probes should still prefer absolute numeric/count values so future
+  writers cannot invalidate that assumption.
+
 - **Cache-probe reliability spike.** Prove absolute per-table probes detect
   a second-connection commit and measure probe latency on a large fixture.
   Note that `SELECT COUNT(*)` is a **full-table scan** in SQLite (not
