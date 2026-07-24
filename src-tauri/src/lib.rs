@@ -23,6 +23,9 @@ mod prompt_utils;
 mod redaction;
 mod releases;
 mod restart;
+/// Retention policy primitive: the three `settings` keys, their typed
+/// read/write helpers, cutoff derivation, and the monotonic watermark rule.
+pub mod retention;
 /// Frozen synthetic corpus shared by the retention tests and the retention
 /// timing spike. Deliberately non-test code: `src/bin/retention_spike.rs` is a
 /// separate crate and cannot link `#[cfg(test)]` items.

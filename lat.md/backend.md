@@ -186,6 +186,81 @@ A zero-valued spec field and a per-month row count that would push rows outside
 their own bucket must both be rejected with their specific error variants, not
 silently produce a corpus whose boundary math no longer holds.
 
+### Retention policy primitive
+
+[[src-tauri/src/retention.rs]] owns everything durable about retention: three rows of the existing `settings` table, their value grammars, the two serialized shapes, cutoff derivation, and the monotonic watermark rule. There is no schema migration and no schema-version bump.
+
+The keys follow the backend-only dotted convention already used by
+`transcript_rescan.*`. `retention.window_days` holds the configured window as a
+decimal integer; `retention.watermark` holds the insert-time cutoff as a
+conforming 24-character timestamp; `retention.last_run` holds the JSON
+[[src-tauri/src/retention.rs#RetentionAuditRecord]]. Every row is
+independently absent-able, and absent on all three is the default state of every
+existing and new database — which is why disabling retention *deletes*
+`retention.window_days` rather than writing a literal: there is one "never"
+state, not two. Storing these in `settings` rather than in a new table is what
+makes an older build's reopen a non-event: it reads the table normally, does not
+know the keys, and opens without complaint.
+
+[[src-tauri/src/retention.rs#derive_retention_cutoff]] renders
+`now - window_days` as a 24-character millisecond-precision `Z` timestamp, so the
+scan, the deletes and the insert filter can all use a plain byte comparison
+against stored timestamps. It re-validates the window against
+[[src-tauri/src/retention.rs#RETENTION_WINDOW_PRESETS]] because the 30-day floor
+is the guarantee that `get_code_stats`, `get_code_stats_history` and
+`get_llm_runtime_stats` — all capped at 30 days by `range_to_duration` — can
+never ask for pruned data. A window that bypassed that floor at any boundary
+would silently revoke the guarantee, so it is rejected on write, on read, and
+again here.
+
+[[src-tauri/src/retention.rs#advanced_watermark]] is `max(existing, cutoff)` and
+returns a new value rather than mutating one.
+[[src-tauri/src/storage.rs#Storage#advance_retention_watermark]] applies it with
+the read and the write in a single transaction, so two callers cannot interleave
+into a retreat. Monotonicity is the whole durability argument: rows deleted at a
+stricter cutoff must stay deleted, so narrowing the configured window later — or
+clearing it to never — must never let the watermark move back and resurrect them
+on the next reparse.
+
+Reads are tolerant because these rows survive downgrades, hand edits and
+interrupted writes, and none of them may be able to block a run. A
+`retention.window_days` outside the preset set parses as "never" rather than as
+itself; a non-conforming `retention.watermark` is treated as absent so a value
+SQLite cannot order never becomes a filter; an unparseable or unknown-schema
+`retention.last_run` parses as `None`. All three log at `warn` and none returns
+an error. Writes are strict by contrast:
+[[src-tauri/src/retention.rs#RetentionAuditRecord#validate]] refuses a
+`"partial"` record with no `error_reason`, because the only reason `partial`
+exists as a third status — rather than `completed` plus an `interrupted` flag —
+is that it says what went wrong.
+
+#### Retention Policy Primitive Test Specs
+
+These specs pin the invariants at the layer that owns them, so a monotonicity or
+parsing bug fails here instead of surfacing as a baffling end-to-end failure.
+
+##### Watermark Monotonicity
+
+Advancing to a 90-day cutoff and then calling the advance helper with an earlier
+365-day cutoff must not retreat the watermark, and clearing the window to never
+must leave it in place — the two ways a resurrection bug would enter.
+
+##### Audit Record Round Trip
+
+A record written through the helper must read back through `get_retention_policy`
+with its cutoff, timestamp, status, error reason and per-table counts intact, and
+must survive a reopen.
+
+The record's entire purpose is to answer "what happened" long after the toast is
+gone, so a field that does not survive the round trip is a field that is not
+really there.
+
+##### Corrupted Audit Value
+
+An unparseable `retention.last_run` must read as absent and must not block a
+subsequent write, so a truncated or hand-edited value degrades the audit trail
+rather than wedging retention.
+
 ### Schema
 
 The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.

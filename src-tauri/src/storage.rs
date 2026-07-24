@@ -20,6 +20,11 @@ use crate::model_usage::{
     CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
     SourceProcessingStatus,
 };
+use crate::retention::{
+    RETENTION_LAST_RUN_KEY, RETENTION_WATERMARK_KEY, RETENTION_WINDOW_DAYS_KEY,
+    RetentionAuditRecord, RetentionPolicy, advanced_watermark, parse_audit_record_setting,
+    parse_watermark_setting, parse_window_days_setting, window_days_setting_value,
+};
 use crate::transcript_analytics::TranscriptAnalyticsSnapshot;
 
 #[allow(dead_code)]
@@ -11063,7 +11068,112 @@ impl Storage {
     pub fn get_provider_settings_json(&self) -> Result<Option<String>, String> {
         self.get_setting(PROVIDER_SETTINGS_KEY)
     }
+}
 
+/// Retention policy primitive — the database half of [`crate::retention`].
+///
+/// The value grammars, the monotonic rule and the tolerance policy live in
+/// that module; these methods only move the three `settings` rows through it.
+///
+/// `dead_code` is allowed for the block because the primitive is deliberately
+/// shipped ahead of its consumers: the insert-time watermark filter, the
+/// chunked delete engine and the four Tauri commands are separate items that
+/// build on it, and pinning the invariants at this layer is the point.
+#[allow(dead_code)]
+impl Storage {
+    /// Configured retention window, or `None` for "never prune".
+    ///
+    /// A stored value the primitive refuses to honour degrades to `None` with
+    /// a `warn` rather than an error — see [`parse_window_days_setting`].
+    pub fn read_retention_window_days(&self) -> Result<Option<i64>, String> {
+        Ok(self
+            .get_setting(RETENTION_WINDOW_DAYS_KEY)?
+            .as_deref()
+            .and_then(parse_window_days_setting))
+    }
+
+    /// Write the configured retention window.
+    ///
+    /// `None` **clears the row** rather than writing a literal, and
+    /// deliberately leaves `retention.watermark` alone: rows already deleted
+    /// at a stricter cutoff must stay deleted, so disabling retention stops
+    /// future pruning without resurrecting anything.
+    pub fn write_retention_window_days(&self, window_days: Option<i64>) -> Result<(), String> {
+        match window_days {
+            None => self.delete_setting(RETENTION_WINDOW_DAYS_KEY),
+            Some(window_days) => {
+                let value = window_days_setting_value(window_days).map_err(|e| e.to_string())?;
+                self.set_setting(RETENTION_WINDOW_DAYS_KEY, &value)
+            }
+        }
+    }
+
+    /// Insert-time watermark, or `None` when no filtering applies.
+    pub fn read_retention_watermark(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .get_setting(RETENTION_WATERMARK_KEY)?
+            .as_deref()
+            .and_then(parse_watermark_setting))
+    }
+
+    /// Advance the watermark to `max(existing, cutoff)` and return the value
+    /// now stored.
+    ///
+    /// Read and write share one transaction so two callers cannot interleave
+    /// into a retreat, which is the one outcome the watermark may never have.
+    pub fn advance_retention_watermark(&self, cutoff: &str) -> Result<String, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin retention watermark advance: {error}"))?;
+        let stored = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RETENTION_WATERMARK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read retention watermark: {error}"))?;
+        let advanced = advanced_watermark(stored.as_deref(), cutoff).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![RETENTION_WATERMARK_KEY, &advanced],
+        )
+        .map_err(|error| format!("Write retention watermark: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Commit retention watermark advance: {error}"))?;
+        Ok(advanced)
+    }
+
+    /// Audit record of the most recent run, or `None` when none is readable.
+    pub fn read_retention_audit_record(&self) -> Result<Option<RetentionAuditRecord>, String> {
+        Ok(self
+            .get_setting(RETENTION_LAST_RUN_KEY)?
+            .as_deref()
+            .and_then(parse_audit_record_setting))
+    }
+
+    /// Persist the audit record of a run, on the error path as well as the
+    /// success path.
+    pub fn write_retention_audit_record(
+        &self,
+        record: &RetentionAuditRecord,
+    ) -> Result<(), String> {
+        let value = record.to_setting_value().map_err(|e| e.to_string())?;
+        self.set_setting(RETENTION_LAST_RUN_KEY, &value)
+    }
+
+    /// Read all three retention settings rows as one policy.
+    pub fn get_retention_policy(&self) -> Result<RetentionPolicy, String> {
+        Ok(RetentionPolicy {
+            window_days: self.read_retention_window_days()?,
+            watermark: self.read_retention_watermark()?,
+            last_run: self.read_retention_audit_record()?,
+        })
+    }
+}
+
+impl Storage {
     pub fn set_provider_settings_json(&self, value: &str) -> Result<(), String> {
         self.set_setting(PROVIDER_SETTINGS_KEY, value)
     }
