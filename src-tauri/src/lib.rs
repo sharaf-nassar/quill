@@ -43,12 +43,12 @@ use models::{
     SessionStats, SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode,
     TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::{
     Arc, OnceLock, Weak,
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 };
 use storage::Storage;
 use subtle::ConstantTimeEq;
@@ -63,6 +63,8 @@ static STARTUP_CLEANUP_DONE: OnceLock<()> = OnceLock::new();
 static USAGE_CACHE: OnceLock<Mutex<Option<UsageCacheEntry>>> = OnceLock::new();
 static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static USAGE_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static INGEST_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+static MAINTENANCE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
 // Holds the tray's "Always on Top" CheckMenuItem so the Settings window can
 // keep the tray checkmark and the window state in sync after a toggle.
@@ -77,6 +79,53 @@ pub(crate) const TRANSCRIPT_ANALYTICS_UPDATED_EVENT: &str = "transcript-analytic
 // Marker prefix `storage::Storage::init` puts in front of a schema upper-bound
 // rejection. It is an internal wire marker, never user-facing text.
 const SCHEMA_TOO_NEW_ERROR_PREFIX: &str = "SCHEMA_TOO_NEW:";
+
+/// Process-wide exclusion for database maintenance and ingest writes.
+///
+/// Maintenance holds the writer side while a VACUUM owns SQLite. Ingest and
+/// background reconciliation take the reader side for every SQLite mutation,
+/// so no write can overlap the maintenance window. HTTP handlers use the
+/// atomic flag to reject new requests with a retriable response instead of
+/// waiting on a maintenance operation.
+// The compact-database command consumes this guard in the following task. Keep
+// the primitive available without forcing unrelated maintenance into this
+// boundary change.
+#[allow(dead_code)]
+pub(crate) struct IngestQuiesceGuard {
+    _gate: RwLockWriteGuard<'static, ()>,
+}
+
+fn ingest_gate() -> &'static RwLock<()> {
+    INGEST_GATE.get_or_init(|| RwLock::new(()))
+}
+
+#[allow(dead_code)]
+pub(crate) fn begin_ingest_quiesce() -> IngestQuiesceGuard {
+    let gate = ingest_gate().write();
+    MAINTENANCE_IN_PROGRESS.store(true, AtomicOrdering::Release);
+    IngestQuiesceGuard { _gate: gate }
+}
+
+impl Drop for IngestQuiesceGuard {
+    fn drop(&mut self) {
+        MAINTENANCE_IN_PROGRESS.store(false, AtomicOrdering::Release);
+    }
+}
+
+pub(crate) fn ingest_is_quiesced() -> bool {
+    MAINTENANCE_IN_PROGRESS.load(AtomicOrdering::Acquire)
+}
+
+/// Run one SQLite mutation outside an active maintenance window.
+///
+/// A writer that raced maintenance before the flag became visible completes
+/// before maintenance obtains its exclusive gate. A writer that arrives after
+/// the gate is held waits until it is released, preserving the write rather
+/// than dropping it on a transient SQLite lock.
+pub(crate) fn with_ingest_write_permit<T>(operation: impl FnOnce() -> T) -> T {
+    let _gate = ingest_gate().read();
+    operation()
+}
 // How long the fatal-storage dialog gets to come back with an answer before
 // the watchdog terminates the process anyway. Long enough to read the dialog
 // and click, short enough that a session with no working dialog backend (no
@@ -4792,6 +4841,43 @@ mod tests {
                 assert!(secs <= hi, "n={n}: {secs} > {hi}");
             }
         }
+    }
+
+    // @lat: [[backend#HTTP API Server#Maintenance quiesce]]
+    #[test]
+    fn write_arriving_during_quiesce_lands_after_unquiesce() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+
+        let quiesce = begin_ingest_quiesce();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let worker_writes = Arc::clone(&writes);
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            with_ingest_write_permit(|| {
+                worker_writes.fetch_add(1, Ordering::SeqCst);
+                completed_tx.send(()).expect("signal write completion");
+            });
+        });
+
+        assert!(
+            matches!(
+                completed_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "write must remain pending throughout the active quiesce window"
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+
+        drop(quiesce);
+        completed_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("write completes after maintenance releases the gate");
+        worker.join().expect("write worker joins");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     #[test]

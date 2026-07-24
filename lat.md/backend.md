@@ -58,6 +58,12 @@ The HTTP API exposes 15 endpoints for token ingestion, context savings, learning
 
 Each endpoint validates input (length limits, range checks, type validation) before processing. Provider-aware payloads default legacy callers to `claude`, while new Claude and Codex hooks send explicit provider tags for telemetry and session ingestion. Hook-facing observation and session-ingest POSTs acknowledge after validation and finish SQLite/Tantivy work on background blocking tasks so CLI hooks do not wait on local indexing. Local hook scripts treat receipt of response headers as the success boundary and use a short 1.5-second local timeout, which keeps the CLI path tolerant of slow response teardown without waiting on background indexing.
 
+### Maintenance quiesce
+
+[[src-tauri/src/lib.rs#begin_ingest_quiesce]] gives maintenance exclusive access to SQLite while HTTP token ingest returns retriable `503 Service Unavailable` responses and retained-model backfill waits to persist its next mutation.
+
+The gate is process-wide and reader/writer based: maintenance obtains the writer side before setting its visible quiesce flag, while each guarded ingest or backfill mutation obtains a reader permit. A write already admitted completes before maintenance begins; a write that races after admission waits until the lease is released, so the system never drops history because of a transient maintenance lock. The `write_arriving_during_quiesce_lands_after_unquiesce` regression test proves that a blocked write remains absent during the active window and lands once maintenance ends.
+
 ## Database
 
 [[src-tauri/src/storage.rs]] manages a SQLite database with WAL mode and 5-second busy timeout. The largest backend module.

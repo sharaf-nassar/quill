@@ -2527,7 +2527,9 @@ async fn finish_retained_model_history_backfill(
     diagnostic: Option<ModelBackfillDiagnostic>,
 ) -> Result<ModelBackfillStatus, String> {
     let status = tauri::async_runtime::spawn_blocking(move || {
-        storage.finish_model_backfill(terminal_state, inventory_complete, diagnostic.as_ref())
+        crate::with_ingest_write_permit(|| {
+            storage.finish_model_backfill(terminal_state, inventory_complete, diagnostic.as_ref())
+        })
     })
     .await
     .map_err(|error| format!("Model backfill terminal task failed: {error}"))??;
@@ -2591,9 +2593,11 @@ pub(crate) async fn run_retained_model_history_backfill(
     app_handle: tauri::AppHandle,
     mut permit: ModelUsageRunnerPermit,
 ) -> Result<ModelBackfillStatus, String> {
-    let started = tauri::async_runtime::spawn_blocking(move || storage.start_model_backfill())
-        .await
-        .map_err(|error| format!("Model backfill start task failed: {error}"))??;
+    let started = tauri::async_runtime::spawn_blocking(move || {
+        crate::with_ingest_write_permit(|| storage.start_model_backfill())
+    })
+    .await
+    .map_err(|error| format!("Model backfill start task failed: {error}"))??;
     emit_committed_backfill_status(&app_handle, &started, false);
     let generation = started.generation;
     let mut progress = RetainedBackfillProgress::default();
@@ -2635,12 +2639,14 @@ pub(crate) async fn run_retained_model_history_backfill(
         }
         let diagnostic = run_diagnostic.clone();
         let status = match tauri::async_runtime::spawn_blocking(move || {
-            storage.update_model_backfill_roots(
-                total_roots,
-                completed_roots,
-                failed_roots,
-                diagnostic.as_ref(),
-            )
+            crate::with_ingest_write_permit(|| {
+                storage.update_model_backfill_roots(
+                    total_roots,
+                    completed_roots,
+                    failed_roots,
+                    diagnostic.as_ref(),
+                )
+            })
         })
         .await
         {
@@ -2713,7 +2719,7 @@ pub(crate) async fn run_retained_model_history_backfill(
     };
     let total_sources = plan.total_sources();
     let source_total = match tauri::async_runtime::spawn_blocking(move || {
-        storage.set_model_backfill_source_total(total_sources)
+        crate::with_ingest_write_permit(|| storage.set_model_backfill_source_total(total_sources))
     })
     .await
     {
@@ -2746,15 +2752,17 @@ pub(crate) async fn run_retained_model_history_backfill(
     while !plan.is_complete() {
         let batch_handle = app_handle.clone();
         let commit = tauri::async_runtime::spawn_blocking(move || {
-            let result = commit_next_model_source_batch(
-                &mut plan,
-                storage,
-                &batch_handle,
-                RETAINED_SOURCE_COMMIT_BATCH_SIZE,
-                &mut permit,
-                ModelSourceCommitMode::Backfill,
-            );
-            (plan, permit, result)
+            crate::with_ingest_write_permit(|| {
+                let result = commit_next_model_source_batch(
+                    &mut plan,
+                    storage,
+                    &batch_handle,
+                    RETAINED_SOURCE_COMMIT_BATCH_SIZE,
+                    &mut permit,
+                    ModelSourceCommitMode::Backfill,
+                );
+                (plan, permit, result)
+            })
         })
         .await;
         let (returned_plan, returned_permit, result) = match commit {
@@ -2793,13 +2801,15 @@ pub(crate) async fn run_retained_model_history_backfill(
         let observations_written = batch.observations_written();
         let progress_diagnostic = batch_diagnostic.clone();
         let status = match tauri::async_runtime::spawn_blocking(move || {
-            storage.record_model_backfill_progress(
-                processed_sources,
-                failed_sources,
-                skipped_sources,
-                observations_written,
-                progress_diagnostic.as_ref(),
-            )
+            crate::with_ingest_write_permit(|| {
+                storage.record_model_backfill_progress(
+                    processed_sources,
+                    failed_sources,
+                    skipped_sources,
+                    observations_written,
+                    progress_diagnostic.as_ref(),
+                )
+            })
         })
         .await
         {
@@ -2847,15 +2857,17 @@ pub(crate) async fn run_retained_model_history_backfill(
     for (provider, source_root_key) in completed_root_keys {
         let prune_handle = app_handle.clone();
         let prune = tauri::async_runtime::spawn_blocking(move || {
-            let result = prune_completed_model_source_root(
-                storage,
-                &prune_handle,
-                &plan,
-                provider,
-                source_root_key,
-                &mut permit,
-            );
-            (plan, permit, result)
+            crate::with_ingest_write_permit(|| {
+                let result = prune_completed_model_source_root(
+                    storage,
+                    &prune_handle,
+                    &plan,
+                    provider,
+                    source_root_key,
+                    &mut permit,
+                );
+                (plan, permit, result)
+            })
         })
         .await;
         let (returned_plan, returned_permit, result) = match prune {

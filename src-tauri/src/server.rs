@@ -250,6 +250,13 @@ async fn report_tokens(
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
 
+    if crate::ingest_is_quiesced() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Database maintenance in progress; retry shortly".to_string(),
+        );
+    }
+
     if !check_rate_limit(&state.rate_limiter) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -296,7 +303,7 @@ async fn report_tokens(
         );
     }
 
-    match state.storage.store_token_snapshot(&payload) {
+    match crate::with_ingest_write_permit(|| state.storage.store_token_snapshot(&payload)) {
         Ok(()) => {
             let _ = state.app_handle.emit("tokens-updated", ());
             (StatusCode::OK, "ok".to_string())
