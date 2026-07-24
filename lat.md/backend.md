@@ -91,6 +91,14 @@ The SQLite database file path varies by operating system.
 
 [[src-tauri/src/bin/vacuum_spike.rs]] creates and removes a 7.45 GB synthetic SQLite copy to measure VACUUM and demonstrate that a process-wide quiesce flag makes ingest retry during maintenance.
 
+### Index-drop query plan spike
+
+[[src-tauri/src/bin/eqp_index_drop_spike.rs]] proves that dropping the plain `(provider, source_key)` index on `session_events` costs no query its index seek, by comparing `EXPLAIN QUERY PLAN` output before and after the drop.
+
+Every `session_events` statement constrained on `(provider, source_key)` — the three source-owned delete sites — must report a search through the partial `uidx_se_owned(provider, source_key, event_key) WHERE source_key IS NOT NULL`, because `source_key = ?` implies `source_key IS NOT NULL`. That implication is SQLite-version-dependent, so the spike proves it against the vendored build rather than assuming it. A single `SCAN` fails the run with a nonzero exit.
+
+Plans are read from an in-memory replica so nothing is written. Setting `QUILL_EQP_DB` to a real `usage.db` opens it read-only, records whether `ANALYZE` statistics could be steering the planner, and rebuilds the replica from that database's own DDL instead of the vendored copy.
+
 ### Database compaction
 
 [[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.
