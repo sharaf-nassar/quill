@@ -1036,6 +1036,9 @@ rows with their source-owned detail; snapshot replacement leaves already-pruned
 history intact because the retention watermark prevents an old replay from
 resurrecting raw rows.
 
+Migration 35 creates the table and indexes idempotently so a schema-version
+rewind can record version 35 without colliding with already-current objects.
+
 #### Skill Usages
 
 Recognized `SKILL.md` loads derived during the same Session Indexing extraction pass, keyed for analytics drilldowns by skill, provider, project, and host.

@@ -5990,7 +5990,7 @@ impl Storage {
                 .transaction()
                 .map_err(|e| format!("Migration 35 transaction: {e}"))?;
             tx.execute_batch(
-                "CREATE TABLE retention_daily_aggregates (
+                "CREATE TABLE IF NOT EXISTS retention_daily_aggregates (
                      provider           TEXT NOT NULL,
                      source_key         TEXT NOT NULL,
                      session_id         TEXT NOT NULL,
@@ -6004,9 +6004,9 @@ impl Storage {
                      lines_removed      INTEGER NOT NULL DEFAULT 0,
                      PRIMARY KEY(provider, source_key, session_id, day, agent_id, file_path)
                  );
-                 CREATE INDEX idx_retention_daily_session
+                 CREATE INDEX IF NOT EXISTS idx_retention_daily_session
                      ON retention_daily_aggregates(provider, session_id);
-                 CREATE INDEX idx_retention_daily_day
+                 CREATE INDEX IF NOT EXISTS idx_retention_daily_day
                      ON retention_daily_aggregates(day);",
             )
             .map_err(|e| format!("Migration 35 (retention aggregates): {e}"))?;
