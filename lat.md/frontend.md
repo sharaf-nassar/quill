@@ -161,14 +161,13 @@ remedy is an action (`Count again`), not copy.
 
 [[src/components/settings/PerformanceTab.tsx#RetentionPanel]] is the consent
 step and every terminal state. It names the capability loss from the preview's
-`affected_surfaces`, says outright that there is no undo and no export, flags
-the case where the cutoff covers *every* transcript row rather than the oldest
-part, reports the rows kept because their timestamps cannot be compared, and
-repeats [[src/components/settings/PerformanceTab.tsx#RECLAIM_SENTENCE]] wherever
-the rows/bytes distinction could mislead — a completed prune whose compaction
-was skipped otherwise reads to a user watching disk usage as nothing having
-happened. `partial` gets its own heading and states that what was removed is
-gone permanently.
+`affected_surfaces`, flags the case where the cutoff covers *every* transcript
+row, and offers `Archive & prune` beside `Prune without archive`. The archive
+choice includes the preview-reported non-conforming rows even though SQLite
+keeps them, and the terminal state reports its full local JSONL path and counts.
+The panel repeats [[src/components/settings/PerformanceTab.tsx#RECLAIM_SENTENCE]]
+wherever the rows/bytes distinction could mislead. `partial` gets its own
+heading and states that what was removed is gone permanently.
 
 [[src/components/settings/PerformanceTab.tsx#RetentionAudit]] renders the
 durable `retention.last_run` record so the outcome survives the toast, and

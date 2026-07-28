@@ -3459,6 +3459,9 @@ const RETENTION_PHASE_COUNTING_ROWS: &str = "Counting rows";
 #[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_PHASE_CHECKING_DISK_SPACE: &str = "Checking disk space";
 
+/// Phase label for the optional JSONL sidecar written before deletion.
+const RETENTION_PHASE_ARCHIVING_ROWS: &str = "Archiving rows";
+
 /// Phase label for the chunked delete, whose `pct` advances per chunk so a
 /// several-hundred-thousand-row delete visibly moves.
 #[allow(dead_code)] // Emitted by the retention commands, which land next.
@@ -3908,6 +3911,11 @@ pub(crate) struct RetentionMaintenanceResult {
     compaction_reason: Option<String>,
     bytes_before: u64,
     bytes_after: u64,
+    /// Completed local JSONL sidecar, when the user chose Archive & prune.
+    archive_path: Option<String>,
+    tool_actions_archived: i64,
+    session_events_archived: i64,
+    model_usage_observations_archived: i64,
 }
 
 /// A run that removed nothing, for one of the structured skip reasons.
@@ -3933,6 +3941,10 @@ fn skipped_retention_maintenance(
         compaction_reason: None,
         bytes_before,
         bytes_after: bytes_before,
+        archive_path: None,
+        tool_actions_archived: 0,
+        session_events_archived: 0,
+        model_usage_observations_archived: 0,
     }
 }
 
@@ -3962,6 +3974,8 @@ struct RetentionMaintenanceContext<'a> {
     free_space: Option<retention_engine::FreeSpaceProbe<'a>>,
     /// Called after every committed chunk. Nothing in production installs one.
     after_chunk: Option<retention_engine::ChunkHook<'a>>,
+    /// Write a local JSONL sidecar before the first delete transaction.
+    archive_before_delete: bool,
 }
 
 impl<'a> RetentionMaintenanceContext<'a> {
@@ -3978,6 +3992,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
             free_space_recheck_chunks: retention_engine::RETENTION_FREE_SPACE_RECHECK_CHUNKS,
             free_space: None,
             after_chunk: None,
+            archive_before_delete: false,
         }
     }
 }
@@ -4072,16 +4087,34 @@ fn execute_retention_maintenance(
     };
 
     let phases = Arc::clone(&context.progress);
+    let archive_before_delete = context.archive_before_delete;
     let scan_progress: retention_engine::ScanProgressSink = Arc::new(move |pct: u8| {
         phases(RETENTION_PHASE_COUNTING_ROWS, pct);
         if pct >= 100 {
-            // The delete-phase preflight runs inside the engine call and owns
-            // no sink; the scan reaching 100 is exactly when it starts, so this
-            // is where the phase label has to turn over.
-            phases(RETENTION_PHASE_CHECKING_DISK_SPACE, 0);
+            phases(
+                if archive_before_delete {
+                    RETENTION_PHASE_ARCHIVING_ROWS
+                } else {
+                    RETENTION_PHASE_CHECKING_DISK_SPACE
+                },
+                0,
+            );
         }
     });
+    let archive_progress = |pct: u8| {
+        (context.progress)(RETENTION_PHASE_ARCHIVING_ROWS, pct);
+        if pct >= 100 {
+            (context.progress)(RETENTION_PHASE_CHECKING_DISK_SPACE, 0);
+        }
+    };
     let delete_progress = |pct: u8| (context.progress)(RETENTION_PHASE_REMOVING_OLD_ROWS, pct);
+    let archive_directory = context.archive_before_delete.then(|| {
+        storage
+            .database_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("retention-archives")
+    });
     let controls = retention_engine::RetentionDeleteControls {
         chunk_rows: context.chunk_rows,
         free_space_recheck_chunks: context.free_space_recheck_chunks,
@@ -4089,6 +4122,10 @@ fn execute_retention_maintenance(
         after_chunk: context.after_chunk,
         scan_progress: Some(scan_progress),
         delete_progress: Some(&delete_progress),
+        archive_directory: archive_directory.as_deref(),
+        archive_progress: context
+            .archive_before_delete
+            .then_some(&archive_progress as retention_engine::ArchiveProgressSink<'_>),
     };
 
     let request = retention_engine::RetentionDeleteRequest {
@@ -4166,6 +4203,16 @@ fn execute_retention_maintenance(
 
     invalidate_analytics_after_retention(storage, context.emit_invalidation);
 
+    let archive_path = report
+        .archive
+        .as_ref()
+        .map(|archive| archive.path.to_string_lossy().into_owned());
+    let archived = report
+        .archive
+        .as_ref()
+        .map(|archive| archive.rows)
+        .unwrap_or_default();
+
     Ok(RetentionMaintenanceResult {
         status: report.status.as_str(),
         reason: report.reason,
@@ -4181,6 +4228,10 @@ fn execute_retention_maintenance(
         compaction_reason,
         bytes_before,
         bytes_after,
+        archive_path,
+        tool_actions_archived: archived.tool_actions,
+        session_events_archived: archived.session_events,
+        model_usage_observations_archived: archived.model_usage_observations,
     })
 }
 
@@ -4197,6 +4248,7 @@ async fn run_retention_maintenance(
     app: tauri::AppHandle,
     confirmed_cutoff: String,
     confirmed_window_days: i64,
+    archive_before_prune: bool,
 ) -> Result<RetentionMaintenanceResult, String> {
     let storage = get_storage()?;
     let progress_app = app.clone();
@@ -4208,12 +4260,10 @@ async fn run_retention_maintenance(
         let emit_invalidation = move |event: &'static str| {
             emit_retention_analytics_invalidation(&invalidation_app, event)
         };
-        execute_retention_maintenance(
-            storage,
-            &confirmed_cutoff,
-            confirmed_window_days,
-            &RetentionMaintenanceContext::new(Utc::now(), progress, &emit_invalidation),
-        )
+        let mut context =
+            RetentionMaintenanceContext::new(Utc::now(), progress, &emit_invalidation);
+        context.archive_before_delete = archive_before_prune;
+        execute_retention_maintenance(storage, &confirmed_cutoff, confirmed_window_days, &context)
     })?;
 
     emit_retention_maintenance_finished(&app, &result);
@@ -5782,11 +5832,14 @@ mod tests {
         }
 
         // The counting phase visibly advances: it opens at zero and closes at
-        // 100 through each table's half of the bar, never going backwards.
+        // 100 through each table's third of the bar, never going backwards.
         let recorded = progress.lock().clone();
         assert_eq!(Some(&0), recorded.first(), "{recorded:?}");
         assert_eq!(Some(&100), recorded.last(), "{recorded:?}");
-        assert!(recorded.contains(&50), "{recorded:?}");
+        assert!(
+            recorded.contains(&33) && recorded.contains(&66),
+            "{recorded:?}"
+        );
         assert!(
             recorded.windows(2).all(|pair| pair[0] <= pair[1]),
             "the counting phase must never go backwards: {recorded:?}"

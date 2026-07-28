@@ -51,7 +51,7 @@ type RetentionStage =
   | { kind: "confirm"; preview: RetentionPreview }
   /** A `skipped` preview: nothing to consent to, and why. */
   | { kind: "declined"; preview: RetentionPreview }
-  | { kind: "running" }
+  | { kind: "running"; archiving: boolean }
   | { kind: "done"; result: RetentionMaintenanceResult };
 
 const IDLE: RetentionStage = { kind: "idle" };
@@ -283,8 +283,8 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
     }
   }, [toast]);
 
-  const confirmRetention = useCallback(async () => {
-    setRetentionStage({ kind: "running" });
+  const confirmRetention = useCallback(async (archiveBeforePrune: boolean) => {
+    setRetentionStage({ kind: "running", archiving: archiveBeforePrune });
     setRetentionProgress({ phase: "Counting rows", pct: 0 });
     try {
       // Re-preview to mint a fresh cutoff token. The backend refuses a
@@ -302,6 +302,7 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
         await invoke<RetentionMaintenanceResult>("run_retention_maintenance", {
           confirmedCutoff: fresh.cutoff,
           confirmedWindowDays: fresh.window_days,
+          archiveBeforePrune,
         }),
       );
     } catch (err) {
@@ -433,7 +434,7 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
       <RetentionPanel
         stage={retentionStage}
         busy={maintenanceBusy}
-        onConfirm={() => void confirmRetention()}
+        onConfirm={(archiveBeforePrune) => void confirmRetention(archiveBeforePrune)}
         onPreview={() => void previewRetention()}
         onDismiss={() => setRetentionStage(IDLE)}
       />
@@ -459,7 +460,7 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
 interface RetentionPanelProps {
   stage: RetentionStage;
   busy: boolean;
-  onConfirm: () => void;
+  onConfirm: (archiveBeforePrune: boolean) => void;
   onPreview: () => void;
   onDismiss: () => void;
 }
@@ -492,7 +493,9 @@ function RetentionPanel({
         <p className="retention-panel-line">
           {stage.kind === "previewing"
             ? "Counting the rows a prune would remove. Ingest is paused while this runs."
-            : "Removing rows and compacting. Ingest is paused: hook and widget reports get a retriable 503 and land once it finishes."}
+            : stage.archiving
+              ? "Archiving the previewed rows, then removing and compacting them. Ingest stays paused so the sidecar and delete set cannot drift."
+              : "Removing rows and compacting. Ingest is paused: hook and widget reports get a retriable 503 and land once it finishes."}
         </p>
       </div>
     );
@@ -550,7 +553,8 @@ function RetentionPanel({
             preview.session_events_rows,
             preview.model_usage_observations_rows,
           )} will
-          be deleted permanently. There is no undo and no export.
+          be deleted permanently. Archive & prune writes a local JSONL copy before
+          deletion begins.
         </p>
         {preview.everything_older && (
           <p className="retention-panel-line">
@@ -564,7 +568,8 @@ function RetentionPanel({
               preview.tool_actions_nonconforming,
               preview.session_events_nonconforming,
             )}{" "}
-            carry timestamps Quill cannot compare, and are kept.
+            carry timestamps Quill cannot compare, and are kept. Archive &amp; prune
+            includes them in the sidecar too.
           </p>
         )}
         {preview.affected_surfaces.length > 0 && (
@@ -587,9 +592,17 @@ function RetentionPanel({
             type="button"
             className="settings-button settings-button--confirm"
             disabled={busy}
-            onClick={onConfirm}
+            onClick={() => onConfirm(true)}
           >
-            Prune permanently
+            Archive &amp; prune
+          </button>
+          <button
+            type="button"
+            className="settings-button"
+            disabled={busy}
+            onClick={() => onConfirm(false)}
+          >
+            Prune without archive
           </button>
           <button
             type="button"
@@ -625,6 +638,18 @@ function RetentionPanel({
               ? "Another maintenance operation holds the database. Nothing was deleted; try again once it finishes."
               : asSentence(result.reason ?? "Retention found nothing it could remove")}
         </p>
+        {result.archive_path !== null && (
+          <p className="retention-panel-note">
+            Archived{" "}
+            {formatRowPair(
+              result.tool_actions_archived,
+              result.session_events_archived,
+              result.model_usage_observations_archived,
+            )}{" "}
+            before the prune to{" "}
+            <code className="retention-panel-path">{result.archive_path}</code>.
+          </p>
+        )}
         <div className="retention-panel-actions">
           {(stale || contended) && (
             <button
@@ -665,6 +690,18 @@ function RetentionPanel({
           ? `Removed ${removed}, then stopped. What was removed is gone permanently; run it again to continue.`
           : `Removed ${removed}.`}
       </p>
+      {result.archive_path !== null && (
+        <p className="retention-panel-note">
+          Archived{" "}
+          {formatRowPair(
+            result.tool_actions_archived,
+            result.session_events_archived,
+            result.model_usage_observations_archived,
+          )}{" "}
+          before deletion to{" "}
+          <code className="retention-panel-path">{result.archive_path}</code>.
+        </p>
+      )}
       {partial && (
         <p className="retention-panel-note">
           Stopped because {asSentence(result.error_reason ?? "the run could not continue")}

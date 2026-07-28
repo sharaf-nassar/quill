@@ -1306,4 +1306,9 @@ export interface RetentionMaintenanceResult {
 	compaction_reason: string | null;
 	bytes_before: number;
 	bytes_after: number;
+	// Absolute local JSONL path when Archive & prune completed its archive step.
+	archive_path: string | null;
+	tool_actions_archived: number;
+	session_events_archived: number;
+	model_usage_observations_archived: number;
 }

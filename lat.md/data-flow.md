@@ -57,34 +57,35 @@ pages into freed bytes without letting an ingest write land between the halves.
    invokes `preview_retention`. Both retention commands acquire through
    [[src-tauri/src/lib.rs#try_begin_ingest_quiesce]], so a lease already held by
    compaction is a structured skip rather than an unbounded wait.
-2. Preview derives the cutoff, scans both target tables under a `Counting rows`
+2. Preview derives the cutoff, scans all three target tables under a `Counting rows`
    heartbeat on [[src-tauri/src/lib.rs#RETENTION_MAINTENANCE_PROGRESS_EVENT]],
    and returns exact per-table row counts, the counts it will keep because their
    timestamps are not byte-comparable, the affected surfaces, and the cutoff the
    run must echo back.
-3. The user confirms. The control re-previews to mint a fresh cutoff and calls
-   `run_retention_maintenance` with it; a confirmation that no longer matches a
-   freshly counted cutoff is refused as `stale_preview` before the lease is
-   taken, so consent is always consent to the numbers actually shown.
+3. The user chooses `Archive & prune` or `Prune without archive`. The control
+   re-previews to mint a fresh cutoff and calls `run_retention_maintenance`;
+   stale confirmations are refused before the lease is taken.
 4. [[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] opens its own
-   maintenance connection, materializes the doomed rowids, preflights free disk
-   for one chunk's WAL plus the temp tables, advances `retention.watermark` to
-   the cutoff before the first chunk commits, and deletes in chunks — WAL
-   checkpointed after each commit, free space re-checked every *N* chunks,
-   `Removing old rows` progress emitted per chunk.
-5. The maintenance connection is closed, then
+   maintenance connection and materializes the doomed rowids. When requested,
+   [[src-tauri/src/retention_engine.rs#write_retention_archive]] atomically
+   publishes a JSONL sidecar containing every preview-counted row before any
+   delete, including the non-conforming rows the database keeps.
+5. The engine preflights free disk after the optional archive, advances
+   `retention.watermark` before the first chunk commits, and deletes in chunks
+   with WAL checkpoints, periodic free-space checks, and progress per chunk.
+6. The maintenance connection is closed, then
    [[src-tauri/src/storage.rs#Storage#vacuum_database]] runs under the same
    lease and emits `Compacting database`. Its preflight is independent of the
    delete preflight, so a run that removed rows but cannot afford a rebuild is a
    completed prune with a skipped compaction, reported rather than hidden.
-6. The audit record is rewritten to `retention.last_run` on the completed,
+7. The audit record is rewritten to `retention.last_run` on the completed,
    partial *and* skipped paths, then
    [[src-tauri/src/lib.rs#invalidate_analytics_after_retention]] drains the five
    analytics caches and emits `transcript-analytics-updated` — a DELETE never
    advances a cache high-water mark, so nothing else would retire a pre-prune
    payload. The lease is released and `retention-maintenance-finished` carries
    the structured result.
-7. Consumers pick it up from there: the settings panel renders the terminal
+8. Consumers pick it up from there: the settings panel renders the terminal
    state and the durable audit record,
    [[src/hooks/useRetentionCutoff.ts#useRetentionCutoff]] re-reads the policy on
    the finished event so degradation banners state the new cutoff, and the

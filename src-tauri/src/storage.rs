@@ -97,7 +97,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 34;
+const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 35;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";

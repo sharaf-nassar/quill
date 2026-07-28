@@ -2470,7 +2470,10 @@ function retentionPreview(scenario: RetentionScenario): RetentionPreview {
   };
 }
 
-function retentionResult(scenario: RetentionScenario): RetentionMaintenanceResult {
+function retentionResult(
+  scenario: RetentionScenario,
+  archiveBeforePrune: boolean,
+): RetentionMaintenanceResult {
   const windowDays = retentionWindowDays;
   const bytesBefore = 8_106_127_360;
   const skipped = (reason: string): RetentionMaintenanceResult => ({
@@ -2488,6 +2491,10 @@ function retentionResult(scenario: RetentionScenario): RetentionMaintenanceResul
     compaction_reason: null,
     bytes_before: bytesBefore,
     bytes_after: bytesBefore,
+    archive_path: null,
+    tool_actions_archived: 0,
+    session_events_archived: 0,
+    model_usage_observations_archived: 0,
   });
 
   if (windowDays === null) {
@@ -2516,6 +2523,12 @@ function retentionResult(scenario: RetentionScenario): RetentionMaintenanceResul
     compaction_reason: null,
     bytes_before: bytesBefore,
     bytes_after: 6_442_450_944,
+    archive_path: archiveBeforePrune
+      ? "/home/demo/.local/share/com.quilltoolkit.app/retention-archives/quill-retention-archive.jsonl"
+      : null,
+    tool_actions_archived: archiveBeforePrune ? 165_915 : 0,
+    session_events_archived: archiveBeforePrune ? 523_852 : 0,
+    model_usage_observations_archived: archiveBeforePrune ? 302_901 : 0,
   };
   if (scenario === "skipped_compaction") {
     // Rows removed, bytes not yet reclaimed — a legitimate outcome, and the one
@@ -2558,11 +2571,18 @@ async function previewRetentionFixture(): Promise<RetentionPreview> {
   return retentionPreview(scenario);
 }
 
-async function runRetentionMaintenanceFixture(): Promise<RetentionMaintenanceResult> {
+async function runRetentionMaintenanceFixture(
+  args: Record<string, unknown> | undefined,
+): Promise<RetentionMaintenanceResult> {
   const scenario = readRetentionScenario();
-  const result = retentionResult(scenario);
+  const archiveBeforePrune =
+    args?.archiveBeforePrune === true || args?.archive_before_prune === true;
+  const result = retentionResult(scenario, archiveBeforePrune);
   if (result.status !== "skipped") {
     await emitRetentionProgress("Counting rows", 10);
+    if (archiveBeforePrune) {
+      await emitRetentionProgress("Archiving rows", 25);
+    }
     await emitRetentionProgress("Checking disk space", 25);
     await emitRetentionProgress("Removing old rows", 45);
     await emitRetentionProgress("Removing old rows", 80);
@@ -2630,7 +2650,7 @@ const fixtures: Record<string, FixtureHandler> = {
   get_retention_policy: () => retentionPolicy(),
   set_retention_policy: (args) => setRetentionPolicyFixture(args),
   preview_retention: () => previewRetentionFixture(),
-  run_retention_maintenance: () => runRetentionMaintenanceFixture(),
+  run_retention_maintenance: (args) => runRetentionMaintenanceFixture(args),
   // live usage
   fetch_usage_data: () => usageData,
   get_usage_history: () => usageHistory(),

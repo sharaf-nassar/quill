@@ -666,7 +666,9 @@ readers depend on it existing.
 
 [[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] runs retention's bounded, audit-backed destructive phase.
 
-It uses a dedicated maintenance connection, a one-pass doomed-rowid scan, a disk preflight, and a chunked delete that advances the watermark at its first chunk. It includes source-owned model observations, comparing normalized integer timestamps to the same confirmed cutoff.
+It uses a dedicated connection, one-pass scan, optional pre-delete JSONL
+archive, disk preflight, and chunked delete with a monotonic watermark. Model
+observations use normalized integer timestamps against the confirmed cutoff.
 
 It owns no policy — the grammars, the cutoff and the monotonic rule live in the
 [[backend#Backend#Database#Retention policy primitive]] — and no UI. Every
@@ -693,7 +695,7 @@ tolerate another one holding schema-visible temp state.
 
 #### The doomed-rowid scan
 
-[[src-tauri/src/retention_engine.rs#scan_doomed_rows]] materializes both target tables' doomed rowids in one pass each, counts the rows the conformance guard kept, and drives a wall-clock heartbeat while it runs.
+[[src-tauri/src/retention_engine.rs#scan_doomed_rows]] materializes all three target tables' doomed rowids in one pass each, counts the rows the conformance guard kept, and drives a wall-clock heartbeat while it runs.
 
 `tool_actions` has no index leading with `timestamp`, so a per-chunk
 `WHERE timestamp < ?` would rescan the table on every chunk. The single pass
@@ -720,6 +722,26 @@ runs for most of a second on a production corpus, so
 than none. The handler is uninstalled before the delete phase, which has real
 per-chunk progress. This is the reason the crate enables rusqlite's `hooks`
 feature.
+
+#### Archive before deletion
+
+[[src-tauri/src/retention_engine.rs#write_retention_archive]] streams a complete JSONL sidecar under the same quiesce lease and maintenance connection, then atomically publishes it before any delete transaction opens.
+
+The manifest records schema version, cutoff, window, deletion-candidate counts
+and non-conforming counts for all three target tables. Each following line
+names its source table, classification and full SQLite row, including `rowid`,
+so the sidecar preserves every field instead of projecting an analytics view.
+Transcript rows use the preview's source-owned byte-order partition, including
+non-conforming rows it reports but keeps. Model observations use the preview's
+normalized `observed_at_ms` predicate and are deletion candidates.
+
+The writer checks its per-table totals against the scan before publishing,
+flushes and syncs a private temporary file, and uses a no-clobber atomic persist
+under `retention-archives/` beside `usage.db`. Any write, serialization, count,
+sync or publish failure becomes a structured skip with no watermark advance and
+no deleted row. The delete preflight runs after a successful archive so the
+sidecar's disk consumption is included in the free-space decision; a refusal
+keeps the completed archive and reports its path.
 
 #### The chunk boundary is a value
 
@@ -1260,7 +1282,7 @@ Claude records may emit multiple ordered runtime events when one content array c
 Key-value configuration and schema migration version tracking.
 
 - **settings** — Key-value config storage.
-- **schema_version** — Migration version tracking (currently v34). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts. Migration 27 adds the [[backend#Database#Schema#Hook Invocations]] `hook_invocations` table with one UNIQUE expression index (identity + agent_id COALESCE) plus four secondary indices (provider+timestamp, provider+session, identity+timestamp, identity+cwd), and sets a `hook_invocation_reingest_pending` flag so the same sweep replays the new attachment extractor across every Claude transcript. Migration 28 adds normalized model observations, retained-source ownership, and the singleton state that separates backfill lifecycle, root completeness, source-total publication, and bounded progress counters. Migration 29 adds the nullable indexed `derived_model_id` attribution column to `model_usage_observations`, nulls the `mtime_ns`/`content_sha256` fingerprints on active `ok` sources so their transcripts are treated as changed, and re-arms `model_backfill_state` to pending under a bumped generation with a `migration` trigger so the next startup pass genuinely re-parses and re-attributes existing evidence. Migration 30 adds [[backend#Database#Schema#Source-Owned Transcript Analytics]] and its durable rebuild marker. Migration 31 adds authoritative project rename aliases and the native-chain runtime index. Migration 32 adds the covering runtime-window index described in [[backend#Database#Schema#Code and Runtime Metrics]]. Migration 33 adds the nullable `lines_added`/`lines_removed` columns to `tool_actions` and re-arms the shared `transcript_analytics_reingest_pending` marker (the same durable flag migration 30 uses) so the next source reconciliation re-parses every transcript and backfills real counts computed before the 10KB `full_input` truncation. Migration 34 permanently drops the unused `tool_actions_legacy_v30` archive. It stamps the database at v34, so older builds refuse it and there is no downgrade path; `DROP` alone reclaims no filesystem bytes, which the separate user-triggered compact operation recovers with `VACUUM`. Existing extractor flags remain until source reconciliation replaces their shared sweep lifecycle.
+- **schema_version** — Migration version tracking (currently v35). Migration 20 truncates `response_times` and `tool_actions` (regenerable from transcripts) and sets a `subagent_reingest_pending` flag in `settings`; migration 21 adds `skill_usages` and sets `skill_usage_reingest_pending` so the next [[backend#Session Indexing]] sweep clears `index_state.json` mtimes and re-reads JSONL transcripts to backfill recognized skill-use rows. Migration 22 adds `cwd` and `hostname` columns to `skill_usages` plus the `idx_skill_usages_skill_cwd` index, and re-arms `skill_usage_reingest_pending` so historical rows refill from JSONL transcripts on the next [[backend#Session Indexing]] sweep. Migration 26 adds the `session_events` table with its unique-on-identity index and sets a `runtime_event_reingest_pending` flag so the next [[backend#Session Indexing]] sweep also clears mtimes and refills `session_events` from JSONL transcripts. Migration 27 adds the [[backend#Database#Schema#Hook Invocations]] `hook_invocations` table with one UNIQUE expression index (identity + agent_id COALESCE) plus four secondary indices (provider+timestamp, provider+session, identity+timestamp, identity+cwd), and sets a `hook_invocation_reingest_pending` flag so the same sweep replays the new attachment extractor across every Claude transcript. Migration 28 adds normalized model observations, retained-source ownership, and the singleton state that separates backfill lifecycle, root completeness, source-total publication, and bounded progress counters. Migration 29 adds the nullable indexed `derived_model_id` attribution column to `model_usage_observations`, nulls the `mtime_ns`/`content_sha256` fingerprints on active `ok` sources so their transcripts are treated as changed, and re-arms `model_backfill_state` to pending under a bumped generation with a `migration` trigger so the next startup pass genuinely re-parses and re-attributes existing evidence. Migration 30 adds [[backend#Database#Schema#Source-Owned Transcript Analytics]] and its durable rebuild marker. Migration 31 adds authoritative project rename aliases and the native-chain runtime index. Migration 32 adds the covering runtime-window index described in [[backend#Database#Schema#Code and Runtime Metrics]]. Migration 33 adds the nullable `lines_added`/`lines_removed` columns to `tool_actions` and re-arms the shared `transcript_analytics_reingest_pending` marker (the same durable flag migration 30 uses) so the next source reconciliation re-parses every transcript and backfills real counts computed before the 10KB `full_input` truncation. Migration 34 permanently drops the unused `tool_actions_legacy_v30` archive. It stamps the database at v34, so older builds refuse it and there is no downgrade path; `DROP` alone reclaims no filesystem bytes, which the separate user-triggered compact operation recovers with `VACUUM`. Migration 35 adds [[backend#Database#Schema#Retention aggregates]]. Existing extractor flags remain until source reconciliation replaces their shared sweep lifecycle.
 
 [[src-tauri/src/storage.rs#MAX_SUPPORTED_SCHEMA_VERSION]] is the highest migration this build knows how to apply, and `Storage::init` compares it against the recorded version before running any migration gate. A database written by a newer build fails initialization with a `SCHEMA_TOO_NEW:`-prefixed error rather than silently skipping every unknown migration and then failing every insert against columns it cannot satisfy. Nothing is written on the way past the guard.
 
@@ -1554,9 +1576,10 @@ lease to the end means the VACUUM that turns freed pages into freed bytes runs
 inside the same quiesce window the deletes did, so no ingest write lands between
 the two halves of one maintenance operation.
 
-Between those two points the sequence is fixed: scan → delete preflight →
-chunked deletes → **close the maintenance connection** → VACUUM preflight →
-VACUUM → audit rewrite → cache clear. The connection close is not incidental —
+Between those two points the sequence is fixed: scan → optional atomic JSONL
+archive → delete preflight → chunked deletes → **close the maintenance
+connection** → VACUUM preflight → VACUUM → audit rewrite → cache clear. The
+connection close is not incidental —
 [[backend#Backend#Database#Retention delete engine]] owns two `TEMP TABLE`s and
 `vacuum_database` will not rebuild the file underneath another connection
 holding schema-visible temp state.

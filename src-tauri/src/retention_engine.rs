@@ -53,14 +53,18 @@
 // tests — is the point of landing it first.
 #![allow(dead_code)]
 
+use std::fs;
+use std::io::{BufWriter, Write};
 use std::os::raw::c_int;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
+use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use serde_json::{Map, Value, json};
 
 use crate::retention::{
     RetentionAuditRecord, RetentionRunStatus, RetentionTableCounts, is_conforming_timestamp,
@@ -367,10 +371,20 @@ pub struct RetentionScanReport {
     pub nonconforming: RetentionTableCounts,
 }
 
+/// Durable JSONL copy written before a retention delete starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionArchiveReport {
+    /// Absolute path of the completed sidecar.
+    pub path: PathBuf,
+    /// Every row represented by the preview: deletion candidates plus
+    /// pre-cutoff rows retained because their timestamps do not conform.
+    pub rows: RetentionTableCounts,
+}
+
 impl RetentionScanReport {
-    /// Total rows both temp tables hold.
+    /// Total rows all three temp tables hold.
     pub const fn total_doomed(&self) -> i64 {
-        self.doomed.tool_actions + self.doomed.session_events
+        self.doomed.tool_actions + self.doomed.session_events + self.doomed.model_usage_observations
     }
 
     /// Structured reason a run with this scan result must skip, or `None` when
@@ -417,6 +431,9 @@ pub type ChunkHook<'a> = &'a dyn Fn(&RetentionChunkReport) -> RetentionChunkCont
 /// Percentage sink for the delete phase.
 pub type DeleteProgressSink<'a> = &'a dyn Fn(u8);
 
+/// Percentage sink for the optional archive phase.
+pub type ArchiveProgressSink<'a> = &'a dyn Fn(u8);
+
 /// Percentage sink shared with the `'static` Counting-phase progress handler.
 pub type ScanProgressSink = Arc<dyn Fn(u8) + Send + Sync>;
 
@@ -439,6 +456,10 @@ pub struct RetentionDeleteControls<'a> {
     pub scan_progress: Option<ScanProgressSink>,
     /// Delete-phase percentage, 0–100, emitted once per committed chunk.
     pub delete_progress: Option<DeleteProgressSink<'a>>,
+    /// When present, write the preview-counted rows here before any delete.
+    pub archive_directory: Option<&'a Path>,
+    /// Archive-phase percentage, 0–100.
+    pub archive_progress: Option<ArchiveProgressSink<'a>>,
 }
 
 impl Default for RetentionDeleteControls<'_> {
@@ -450,6 +471,8 @@ impl Default for RetentionDeleteControls<'_> {
             after_chunk: None,
             scan_progress: None,
             delete_progress: None,
+            archive_directory: None,
+            archive_progress: None,
         }
     }
 }
@@ -506,6 +529,8 @@ pub struct RetentionDeletePhaseReport {
     pub audit: RetentionAuditRecord,
     /// Whether the watermark reached the cutoff during this call.
     pub watermark_advanced: bool,
+    /// Completed sidecar, when the caller requested one.
+    pub archive: Option<RetentionArchiveReport>,
 }
 
 /// Free bytes on the filesystem holding `path`.
@@ -721,6 +746,260 @@ pub fn scan_doomed_rows(
         doomed,
         nonconforming,
     })
+}
+
+/// Stream every preview-counted row to an atomic JSONL sidecar.
+///
+/// The archive predicate is the union already reported by the preview:
+/// conforming deletion candidates plus non-conforming source-owned rows whose
+/// byte value sorts before the cutoff. The latter remain in SQLite, but are
+/// included because the preview counted them and an archive claiming to cover
+/// that preview must not silently omit a class.
+fn write_retention_archive(
+    conn: &Connection,
+    directory: &Path,
+    request: &RetentionDeleteRequest,
+    scan: &RetentionScanReport,
+    progress: Option<ArchiveProgressSink<'_>>,
+) -> Result<RetentionArchiveReport, String> {
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("Create retention archive directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Protect retention archive directory: {error}"))?;
+    }
+
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|error| format!("Create retention archive file: {error}"))?;
+    let nonce = temporary
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sidecar")
+        .trim_start_matches('.');
+    let stamp = request
+        .ran_at
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+        .replace([':', '-', '.'], "");
+    let final_path = directory.join(format!("quill-retention-archive-{stamp}-{nonce}.jsonl"));
+
+    let expected = RetentionTableCounts {
+        tool_actions: scan.doomed.tool_actions + scan.nonconforming.tool_actions,
+        session_events: scan.doomed.session_events + scan.nonconforming.session_events,
+        model_usage_observations: scan.doomed.model_usage_observations
+            + scan.nonconforming.model_usage_observations,
+    };
+    let expected_total =
+        expected.tool_actions + expected.session_events + expected.model_usage_observations;
+    let created_at = request.ran_at.to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    if let Some(sink) = progress {
+        sink(0);
+    }
+
+    {
+        let mut writer = BufWriter::new(temporary.as_file_mut());
+        serde_json::to_writer(
+            &mut writer,
+            &json!({
+                "record_type": "manifest",
+                "schema": 1,
+                "created_at": created_at,
+                "cutoff": request.cutoff,
+                "window_days": request.window_days,
+                "rows": {
+                    "tool_actions": expected.tool_actions,
+                    "session_events": expected.session_events,
+                    "model_usage_observations": expected.model_usage_observations,
+                },
+                "delete_candidates": {
+                    "tool_actions": scan.doomed.tool_actions,
+                    "session_events": scan.doomed.session_events,
+                    "model_usage_observations": scan.doomed.model_usage_observations,
+                },
+                "nonconforming_retained": {
+                    "tool_actions": scan.nonconforming.tool_actions,
+                    "session_events": scan.nonconforming.session_events,
+                    "model_usage_observations": scan.nonconforming.model_usage_observations,
+                },
+            }),
+        )
+        .map_err(|error| format!("Serialize retention archive manifest: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("Write retention archive manifest: {error}"))?;
+
+        let mut written = RetentionTableCounts::default();
+        let mut written_total = 0_i64;
+        let cutoff_ms = DateTime::parse_from_rfc3339(&request.cutoff)
+            .map_err(|error| format!("Parse retention archive cutoff: {error}"))?
+            .timestamp_millis();
+        for target in RetentionTarget::ALL {
+            let sql = match target {
+                RetentionTarget::ModelUsageObservations => format!(
+                    "SELECT rowid AS archive_rowid, *
+                       FROM {}
+                      WHERE observed_at_ms < ?1
+                      ORDER BY rowid",
+                    target.table()
+                ),
+                _ => format!(
+                    "SELECT rowid AS archive_rowid, *
+                       FROM {}
+                      WHERE source_key IS NOT NULL
+                        AND timestamp < ?1
+                      ORDER BY rowid",
+                    target.table()
+                ),
+            };
+            let mut statement = conn
+                .prepare(&sql)
+                .map_err(|error| format!("Prepare {} archive query: {error}", target.table()))?;
+            let column_names = statement
+                .column_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let timestamp_index = if target == RetentionTarget::ModelUsageObservations {
+                None
+            } else {
+                Some(
+                    column_names
+                        .iter()
+                        .position(|name| name == "timestamp")
+                        .ok_or_else(|| {
+                            format!("{} archive query omitted timestamp", target.table())
+                        })?,
+                )
+            };
+            let mut rows = match target {
+                RetentionTarget::ModelUsageObservations => statement.query(params![cutoff_ms]),
+                _ => statement.query(params![request.cutoff]),
+            }
+            .map_err(|error| format!("Read {} archive rows: {error}", target.table()))?;
+
+            let mut target_written = 0_i64;
+            while let Some(row) = rows
+                .next()
+                .map_err(|error| format!("Read {} archive row: {error}", target.table()))?
+            {
+                let classification = match timestamp_index {
+                    None => "delete_candidate",
+                    Some(timestamp_index) => {
+                        let timestamp = match row.get_ref(timestamp_index).map_err(|error| {
+                            format!("Read {} archive timestamp: {error}", target.table())
+                        })? {
+                            ValueRef::Text(value) => {
+                                std::str::from_utf8(value).map_err(|error| {
+                                    format!("Decode {} archive timestamp: {error}", target.table())
+                                })?
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "{} archive timestamp was not stored as text",
+                                    target.table()
+                                ));
+                            }
+                        };
+                        if is_conforming_timestamp(timestamp) {
+                            "delete_candidate"
+                        } else {
+                            "nonconforming_retained"
+                        }
+                    }
+                };
+
+                let mut archived_row = Map::with_capacity(column_names.len());
+                for (index, name) in column_names.iter().enumerate() {
+                    let value = sqlite_value_to_json(row.get_ref(index).map_err(|error| {
+                        format!("Read {} archive column {name}: {error}", target.table())
+                    })?)?;
+                    archived_row.insert(name.clone(), value);
+                }
+                serde_json::to_writer(
+                    &mut writer,
+                    &json!({
+                        "record_type": "row",
+                        "table": target.table(),
+                        "classification": classification,
+                        "row": Value::Object(archived_row),
+                    }),
+                )
+                .map_err(|error| {
+                    format!(
+                        "Serialize {} retention archive row: {error}",
+                        target.table()
+                    )
+                })?;
+                writer.write_all(b"\n").map_err(|error| {
+                    format!("Write {} retention archive row: {error}", target.table())
+                })?;
+
+                target_written += 1;
+                written_total += 1;
+                if let Some(sink) = progress
+                    && (written_total % 1_000 == 0 || written_total == expected_total)
+                {
+                    let pct = if expected_total <= 0 {
+                        100
+                    } else {
+                        ((written_total * 100) / expected_total).clamp(0, 100) as u8
+                    };
+                    sink(pct);
+                }
+            }
+            written = target.with_count(&written, target_written);
+        }
+
+        if written != expected {
+            return Err(format!(
+                "Retention archive row count changed during the quiesced run: expected {} tool actions, {} session events, and {} model observations; wrote {}, {}, and {}",
+                expected.tool_actions,
+                expected.session_events,
+                expected.model_usage_observations,
+                written.tool_actions,
+                written.session_events,
+                written.model_usage_observations,
+            ));
+        }
+        writer
+            .flush()
+            .map_err(|error| format!("Flush retention archive: {error}"))?;
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("Sync retention archive: {error}"))?;
+    temporary
+        .persist_noclobber(&final_path)
+        .map_err(|error| format!("Publish retention archive: {}", error.error))?;
+
+    if let Some(sink) = progress {
+        sink(100);
+    }
+    Ok(RetentionArchiveReport {
+        path: final_path,
+        rows: expected,
+    })
+}
+
+fn sqlite_value_to_json(value: ValueRef<'_>) -> Result<Value, String> {
+    match value {
+        ValueRef::Null => Ok(Value::Null),
+        ValueRef::Integer(value) => Ok(Value::from(value)),
+        ValueRef::Real(value) => serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| "Retention archive encountered a non-finite number".to_string()),
+        ValueRef::Text(value) => std::str::from_utf8(value)
+            .map(|value| Value::String(value.to_string()))
+            .map_err(|error| format!("Decode retention archive text: {error}")),
+        ValueRef::Blob(value) => Ok(json!({
+            "encoding": "hex",
+            "data": hex::encode(value),
+        })),
+    }
 }
 
 fn report_scan_progress(controls: &RetentionDeleteControls<'_>, pct: u8) {
@@ -1054,8 +1333,33 @@ pub fn run_retention_delete_phase(
             RetentionTableCounts::default(),
             None,
             false,
+            None,
         );
     }
+
+    let archive = if let Some(directory) = controls.archive_directory {
+        match write_retention_archive(&conn, directory, request, &scan, controls.archive_progress) {
+            Ok(report) => Some(report),
+            Err(reason) => {
+                return finish(
+                    storage,
+                    request,
+                    RetentionRunStatus::Skipped,
+                    Some(format!(
+                        "Could not archive the previewed rows; nothing was deleted: {reason}"
+                    )),
+                    None,
+                    &scan,
+                    RetentionTableCounts::default(),
+                    None,
+                    false,
+                    None,
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     let budget = match preflight_delete_phase(&db_path, scan.total_doomed().max(0) as u64, controls)
     {
@@ -1073,6 +1377,7 @@ pub fn run_retention_delete_phase(
                 RetentionTableCounts::default(),
                 None,
                 false,
+                archive,
             );
         }
     };
@@ -1143,6 +1448,7 @@ pub fn run_retention_delete_phase(
         state.deleted,
         Some(budget),
         watermark_advanced,
+        archive,
     )
 }
 
@@ -1158,6 +1464,7 @@ fn finish(
     deleted: RetentionTableCounts,
     budget: Option<RetentionDeleteBudget>,
     watermark_advanced: bool,
+    archive: Option<RetentionArchiveReport>,
 ) -> Result<RetentionDeletePhaseReport, RetentionDeleteError> {
     let mut audit = RetentionAuditRecord::new(status, request.ran_at)
         .with_window(request.window_days, request.cutoff.clone())
@@ -1187,6 +1494,7 @@ fn finish(
         budget,
         audit,
         watermark_advanced,
+        archive,
     })
 }
 
@@ -1381,10 +1689,13 @@ mod tests {
         }
         drop(recorded);
 
-        // The heartbeat installs, fires its per-table completion nudges, and
-        // uninstalls without disturbing the scan.
+        // The heartbeat installs, fires all three per-table completion nudges,
+        // and uninstalls without disturbing the scan.
         let pcts = scan_pcts.lock().expect("lock scan pcts");
-        assert!(pcts.contains(&50) && pcts.contains(&100), "{pcts:?}");
+        assert!(
+            pcts.contains(&33) && pcts.contains(&66) && pcts.contains(&100),
+            "{pcts:?}"
+        );
         drop(pcts);
 
         // Strict `<`: a row whose timestamp equals the cutoff is retained.
