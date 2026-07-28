@@ -149,3 +149,8 @@ One process-local guard serializes workflows that can rewrite shared provider in
 For every already-enabled and detected Claude/Codex provider, [[src-tauri/src/integrations/manager.rs#repair_provider]] takes a stamp-gated fast path on every app launch, reinstalling only when the deployment is stale.
 
 "Reinstall" means redeploying managed scripts/mcp/templates, re-registering the MCP server and hooks, and refreshing CLAUDE.md. `verify()` only checks that managed files exist and hooks are registered — never file *contents* — so a bugfix to a managed file that didn't change presence or registration would silently never reach already-installed users. A per-provider deployment stamp (a content hash of the bundled source trees plus the feature flags and app version, written to the batch parent as `.quill-deploy-stamp` only after a clean commit) closes that gap: when the stamp matches the current inputs AND `verify()` still passes, repair skips the install entirely, restoring the cheap startup the unconditional-reinstall approach had regressed (a full install swaps the MCP tree and forces a `uv` resync). On any stamp mismatch or failed verify, the full transactional `install()` runs its idempotent merge/overwrite pass, verifies before commit, and rewrites the stamp. Feature toggles and explicit enable call `install()` directly since their input change already alters the stamp.
+
+`QUILL_DEMO_MODE=1` keeps startup refresh and manual rescan read-only: provider
+detection and isolated status persistence still run, but interrupted-deployment
+recovery and enabled-provider repair are skipped so a demo launch cannot mutate
+real provider configuration.

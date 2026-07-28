@@ -10,7 +10,11 @@ The frontend uses Vite with the React plugin; the backend uses Cargo with Tauri.
 
 Vite serves on port 8181 in dev mode and ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
 
-Production builds target ES2020 with esbuild minification and sourcemaps. TypeScript is strict mode with ESNext modules and bundler resolution. See `vite.config.ts` and `tsconfig.json`.
+Production builds target ES2020 with esbuild minification and sourcemaps. The
+uncompressed chunk warning limit is 550 kB, preserving a zero-warning gate
+with narrow headroom over the measured application chunk. TypeScript is strict
+mode with ESNext modules and bundler resolution. See `vite.config.ts` and
+`tsconfig.json`.
 
 ### Backend Build
 

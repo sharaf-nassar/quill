@@ -11,6 +11,10 @@ const ACTIVITY_TRACKING_ENABLED_KEY: &str = "feature.activity_tracking.enabled";
 const CONTEXT_TELEMETRY_ENABLED_KEY: &str = "feature.context_telemetry.enabled";
 const BREVITY_ENABLED_KEY: &str = "feature.brevity.enabled";
 
+fn demo_mode_active() -> bool {
+    std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1")
+}
+
 // Legacy per-provider brevity keys that pre-date the consolidated global flag.
 // On first read after upgrade, any value of `true` here promotes the global
 // brevity feature to ON so existing users do not silently lose their setting.
@@ -249,14 +253,23 @@ pub fn confirm_disable(
 }
 
 pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    if demo_mode_active() {
+        return startup_refresh_unlocked(app, false);
+    }
+
     let _mutation_guard = integration_mutation_guard()?;
-    startup_refresh_unlocked(app)
+    startup_refresh_unlocked(app, true)
 }
 
-fn startup_refresh_unlocked(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
+fn startup_refresh_unlocked(
+    app: &AppHandle,
+    should_repair_enabled_providers: bool,
+) -> Result<Vec<ProviderStatus>, String> {
     let storage = Storage::init()?;
     let mut statuses = detect_all_with_storage(&storage)?;
-    repair_enabled_providers(app, &storage, &mut statuses);
+    if should_repair_enabled_providers {
+        repair_enabled_providers(app, &storage, &mut statuses);
+    }
     save_statuses(&storage, &statuses)?;
     log_statuses(&statuses);
     emit_statuses(app, &statuses);
@@ -269,9 +282,14 @@ fn startup_refresh_unlocked(app: &AppHandle) -> Result<Vec<ProviderStatus>, Stri
 /// their shell config or installed a CLI and wants Quill to pick it up
 /// without restarting.
 pub fn force_rescan(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
+    if demo_mode_active() {
+        crate::config::refresh_shell_path();
+        return startup_refresh_unlocked(app, false);
+    }
+
     let _mutation_guard = integration_mutation_guard()?;
     crate::config::refresh_shell_path();
-    startup_refresh_unlocked(app)
+    startup_refresh_unlocked(app, true)
 }
 
 pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
