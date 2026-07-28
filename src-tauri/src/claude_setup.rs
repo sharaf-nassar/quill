@@ -12,7 +12,7 @@ use tauri::Manager;
 
 // ── Path helpers ──
 
-/// Returns ~/.config/quill/ — plugin config dir
+/// Returns ~/.config/quill/.
 fn config_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))

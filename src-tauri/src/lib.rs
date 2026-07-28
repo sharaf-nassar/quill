@@ -18,7 +18,6 @@ mod learning;
 mod memory_optimizer;
 mod model_usage;
 mod models;
-mod plugins;
 mod prompt_utils;
 mod redaction;
 mod releases;
@@ -194,8 +193,6 @@ const TRAY_ID: &str = "main";
 // RuntimeSettings storage keys
 const LIVE_USAGE_ENABLED_KEY: &str = "live_usage.enabled";
 const LIVE_USAGE_INTERVAL_KEY: &str = "live_usage.interval_seconds";
-const PLUGIN_UPDATES_ENABLED_KEY: &str = "plugin_updates.enabled";
-const PLUGIN_UPDATES_INTERVAL_KEY: &str = "plugin_updates.interval_hours";
 const RULE_WATCHER_ENABLED_KEY: &str = "rule_watcher.enabled";
 const ALWAYS_ON_TOP_KEY: &str = "always_on_top";
 const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
@@ -212,8 +209,6 @@ const TRANSCRIPT_RESCAN_ENABLED_DEFAULT: bool = true;
 const TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS: i64 = 120;
 const TRANSCRIPT_RESCAN_INTERVAL_MIN_SECS: i64 = 60;
 const TRANSCRIPT_RESCAN_INTERVAL_MAX_SECS: i64 = 600;
-const PLUGIN_UPDATES_INTERVAL_MIN_HOURS: i64 = 1;
-const PLUGIN_UPDATES_INTERVAL_MAX_HOURS: i64 = 24;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ModelUsageLiveSourceKey {
@@ -3299,15 +3294,6 @@ fn load_runtime_settings(storage: &Storage) -> RuntimeSettings {
         defaults.live_usage_interval_seconds,
     )
     .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
-    let plugin_interval = read_i64_setting(
-        storage,
-        PLUGIN_UPDATES_INTERVAL_KEY,
-        defaults.plugin_updates_interval_hours,
-    )
-    .clamp(
-        PLUGIN_UPDATES_INTERVAL_MIN_HOURS,
-        PLUGIN_UPDATES_INTERVAL_MAX_HOURS,
-    );
     RuntimeSettings {
         live_usage_enabled: read_bool_setting(
             storage,
@@ -3315,12 +3301,6 @@ fn load_runtime_settings(storage: &Storage) -> RuntimeSettings {
             defaults.live_usage_enabled,
         ),
         live_usage_interval_seconds: live_interval,
-        plugin_updates_enabled: read_bool_setting(
-            storage,
-            PLUGIN_UPDATES_ENABLED_KEY,
-            defaults.plugin_updates_enabled,
-        ),
-        plugin_updates_interval_hours: plugin_interval,
         rule_watcher_enabled: read_bool_setting(
             storage,
             RULE_WATCHER_ENABLED_KEY,
@@ -3351,11 +3331,6 @@ async fn set_runtime_settings(
     let live_interval = settings
         .live_usage_interval_seconds
         .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
-    let plugin_interval = settings.plugin_updates_interval_hours.clamp(
-        PLUGIN_UPDATES_INTERVAL_MIN_HOURS,
-        PLUGIN_UPDATES_INTERVAL_MAX_HOURS,
-    );
-
     storage.set_setting(
         LIVE_USAGE_ENABLED_KEY,
         if settings.live_usage_enabled {
@@ -3365,15 +3340,6 @@ async fn set_runtime_settings(
         },
     )?;
     storage.set_setting(LIVE_USAGE_INTERVAL_KEY, &live_interval.to_string())?;
-    storage.set_setting(
-        PLUGIN_UPDATES_ENABLED_KEY,
-        if settings.plugin_updates_enabled {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
-    storage.set_setting(PLUGIN_UPDATES_INTERVAL_KEY, &plugin_interval.to_string())?;
     storage.set_setting(
         RULE_WATCHER_ENABLED_KEY,
         if settings.rule_watcher_enabled {
@@ -4864,234 +4830,6 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
     })
 }
 
-// --- Plugin IPC commands ---
-
-#[tauri::command]
-async fn get_installed_plugins(
-    provider: integrations::IntegrationProvider,
-) -> Result<Vec<plugins::InstalledPlugin>, String> {
-    tokio::task::block_in_place(|| plugins::get_installed_plugins(provider))
-}
-
-#[tauri::command]
-async fn get_marketplaces(
-    provider: integrations::IntegrationProvider,
-) -> Result<Vec<plugins::Marketplace>, String> {
-    tokio::task::block_in_place(|| plugins::get_marketplaces(provider))
-}
-
-#[tauri::command]
-async fn get_available_updates(
-    provider: integrations::IntegrationProvider,
-    app: tauri::AppHandle,
-) -> Result<plugins::UpdateCheckResult, String> {
-    if provider != integrations::IntegrationProvider::Claude {
-        return Ok(plugins::UpdateCheckResult {
-            plugin_updates: tokio::task::block_in_place(|| {
-                plugins::get_available_updates(provider)
-            })?,
-            last_checked: None,
-            next_check: None,
-        });
-    }
-
-    let state = app
-        .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
-        .map(|s| s.inner().clone());
-
-    if let Some(state) = state {
-        Ok(state.last_result.lock().clone())
-    } else {
-        // Fallback: compute directly
-        let updates = tokio::task::block_in_place(|| plugins::get_available_updates(provider))?;
-        Ok(plugins::UpdateCheckResult {
-            plugin_updates: updates,
-            last_checked: None,
-            next_check: None,
-        })
-    }
-}
-
-#[tauri::command]
-async fn check_updates_now(
-    provider: integrations::IntegrationProvider,
-    app: tauri::AppHandle,
-) -> Result<plugins::UpdateCheckResult, String> {
-    let _ = tokio::task::block_in_place(|| plugins::refresh_all_marketplaces(provider));
-    let updates = tokio::task::block_in_place(|| plugins::get_available_updates(provider))?;
-    let now = chrono::Utc::now().to_rfc3339();
-
-    let result = plugins::UpdateCheckResult {
-        plugin_updates: updates,
-        last_checked: Some(now),
-        next_check: None,
-    };
-
-    if provider == integrations::IntegrationProvider::Claude
-        && let Some(state) = app
-            .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
-            .map(|s| s.inner().clone())
-    {
-        *state.last_result.lock() = result.clone();
-        let _ = app.emit("plugin-updates-available", result.plugin_updates.len());
-    }
-
-    Ok(result)
-}
-
-#[tauri::command]
-async fn install_plugin(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    marketplace: String,
-    marketplace_path: Option<String>,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| {
-        plugins::install_plugin(provider, &name, &marketplace, marketplace_path.as_deref())
-    })?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn remove_plugin(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    marketplace: String,
-    plugin_id: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| {
-        plugins::remove_plugin(provider, &name, &marketplace, &plugin_id)
-    })?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn enable_plugin(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::enable_plugin(provider, &name))?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn disable_plugin(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::disable_plugin(provider, &name))?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn update_plugin(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    marketplace: String,
-    scope: String,
-    project_path: Option<String>,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| {
-        plugins::update_plugin(
-            provider,
-            &name,
-            &marketplace,
-            &scope,
-            project_path.as_deref(),
-        )
-    })?;
-    refresh_update_cache(&app, provider);
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn update_all_plugins(
-    provider: integrations::IntegrationProvider,
-    app: tauri::AppHandle,
-) -> Result<plugins::BulkUpdateProgress, String> {
-    let updates = tokio::task::block_in_place(|| plugins::get_available_updates(provider))?;
-    let progress = tokio::task::block_in_place(|| plugins::bulk_update_plugins(&updates, &app));
-    refresh_update_cache(&app, provider);
-    let _ = app.emit("plugin-changed", ());
-    Ok(progress)
-}
-
-/// Re-compute the cached update list from disk after a plugin mutation.
-fn refresh_update_cache(app: &tauri::AppHandle, provider: integrations::IntegrationProvider) {
-    if provider != integrations::IntegrationProvider::Claude {
-        return;
-    }
-
-    if let Some(state) = app
-        .try_state::<std::sync::Arc<plugins::UpdateCheckerState>>()
-        .map(|s| s.inner().clone())
-        && let Ok(updates) = plugins::get_available_updates(provider)
-    {
-        let count = updates.len();
-        let now = chrono::Utc::now().to_rfc3339();
-        let next = (chrono::Utc::now() + chrono::Duration::hours(4)).to_rfc3339();
-        let mut cached = state.last_result.lock();
-        cached.plugin_updates = updates;
-        cached.last_checked = Some(now);
-        cached.next_check = Some(next);
-        drop(cached);
-        let _ = app.emit("plugin-updates-available", count);
-    }
-}
-
-#[tauri::command]
-async fn add_marketplace(
-    provider: integrations::IntegrationProvider,
-    repo: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::add_marketplace(provider, &repo))?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn remove_marketplace(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::remove_marketplace(provider, &name))?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn refresh_marketplace(
-    provider: integrations::IntegrationProvider,
-    name: String,
-    app: tauri::AppHandle,
-) -> Result<String, String> {
-    let result = tokio::task::block_in_place(|| plugins::refresh_marketplace(provider, &name))?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
-#[tauri::command]
-async fn refresh_all_marketplaces(
-    provider: integrations::IntegrationProvider,
-    app: tauri::AppHandle,
-) -> Result<plugins::MarketplaceRefreshResults, String> {
-    let result = tokio::task::block_in_place(|| plugins::refresh_all_marketplaces(provider))?;
-    let _ = app.emit("plugin-changed", ());
-    Ok(result)
-}
-
 #[tauri::command]
 async fn hide_window(window: tauri::WebviewWindow) {
     if let Ok(pos) = window.outer_position() {
@@ -5345,18 +5083,6 @@ pub fn run() {
             // Rule filesystem watcher for real-time reconciliation
             if let Some(storage) = STORAGE.get() {
                 rule_watcher::start(app.handle().clone(), storage);
-            }
-
-            // Plugin update checker. Interval and enable flag are read from
-            // the settings table on every tick so the Settings window can
-            // adjust both without a restart.
-            {
-                let update_state = std::sync::Arc::new(plugins::UpdateCheckerState::new());
-                app.manage(update_state.clone());
-                let update_handle = app.handle().clone();
-                if let Some(storage) = STORAGE.get() {
-                    plugins::spawn_update_checker(update_state, update_handle, storage);
-                }
             }
 
             // Initialize restart state and run startup cleanup
@@ -5677,20 +5403,6 @@ pub fn run() {
             get_code_stats_history,
             get_batch_session_code_stats,
             get_llm_runtime_stats,
-            get_installed_plugins,
-            get_marketplaces,
-            get_available_updates,
-            check_updates_now,
-            install_plugin,
-            remove_plugin,
-            enable_plugin,
-            disable_plugin,
-            update_plugin,
-            update_all_plugins,
-            add_marketplace,
-            remove_marketplace,
-            refresh_marketplace,
-            refresh_all_marketplaces,
             sessions::search_sessions,
             sessions::get_session_context,
             sessions::get_search_facets,

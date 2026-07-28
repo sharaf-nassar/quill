@@ -784,8 +784,6 @@ impl Default for IntegrationFeatures {
 pub struct RuntimeSettings {
     pub live_usage_enabled: bool,
     pub live_usage_interval_seconds: i64,
-    pub plugin_updates_enabled: bool,
-    pub plugin_updates_interval_hours: i64,
     pub rule_watcher_enabled: bool,
     pub always_on_top: bool,
     pub crash_reporting_enabled: bool,
@@ -796,8 +794,6 @@ impl Default for RuntimeSettings {
         Self {
             live_usage_enabled: true,
             live_usage_interval_seconds: 180,
-            plugin_updates_enabled: true,
-            plugin_updates_interval_hours: 4,
             rule_watcher_enabled: true,
             always_on_top: false,
             crash_reporting_enabled: true,

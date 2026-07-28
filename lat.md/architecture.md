@@ -15,9 +15,9 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main split-pane window, the consolidated Manage workspace, and a release-notes viewer.
 
-The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. The [[features#Session Search]], [[features#Learning System]], [[features#Plugin Manager]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
+The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
-The Sessions, Learning, Plugins, Restart, and Settings management surfaces are being consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the PFD titlebar's un-gated Manage button (the cog opens it at the Settings section). It embeds each tool's existing window-view component as a rail section — per-window chrome suppressed via `manage.css` — with inline no-provider states, and folds learning run history into the Learning section. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
+The Sessions, Learning, Restart, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the PFD titlebar's un-gated Manage button (the cog opens it at the Settings section). It embeds each tool's existing window-view component as a rail section — per-window chrome suppressed via `manage.css` — with inline no-provider states, and folds learning run history into the Learning section. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
 
 ### Window Configuration
 
@@ -41,7 +41,6 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Sessions | [[src-tauri/src/sessions.rs]] | Tantivy full-text indexing of session transcripts |
 | Learning | [[src-tauri/src/learning.rs]] | Two-stream LLM analysis for behavioral pattern discovery |
 | Memory optimizer | [[src-tauri/src/memory_optimizer.rs]] | LLM-driven memory file optimization |
-| Plugins | [[src-tauri/src/plugins.rs]] | Plugin and marketplace management |
 | Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
 | Integrations | [[src-tauri/src/integrations/mod.rs]] | Provider detection plus persisted enable and disable lifecycle for Claude and Codex |
 | Indicator | [[src-tauri/src/indicator.rs]] | Primary-provider resolution, compact title text, and warnings for the tray summary |

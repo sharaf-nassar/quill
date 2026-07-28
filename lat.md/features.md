@@ -237,34 +237,6 @@ The writer canonicalizes the target path before each write so a single underlyin
 
 When `AGENTS.md` is a symlink to `CLAUDE.md`, [[src-tauri/src/brevity.rs#apply_block]] takes the list of providers that should keep the block and uses canonical-path comparison so stripping one provider's block does not clobber a shared canonical file another still-enabled provider wants. MiniMax does not have a managed agent file; `apply_block` rejects it with an error before any disk write.
 
-## Plugin Manager
-
-Plugin installation, marketplace management, and update tracking via [[src-tauri/src/plugins.rs]].
-
-### Plugin Lifecycle
-
-Plugins are enumerated per enabled provider and normalized into one shared UI model with provider badges.
-
-Claude plugins come from `~/.claude/plugins/installed_plugins.json` with blocklist-based enable/disable and CLI-backed install/remove/update actions. Codex plugins come from `codex app-server` plugin APIs and expose install/remove plus provider-native enabled state, but not separate enable/disable or versioned update actions.
-
-### Marketplace System
-
-Claude marketplaces are git repositories registered in `~/.claude/plugins/known_marketplaces.json`. Each marketplace exposes a manifest of available plugins, refresh pulls latest via git, and users can add or remove custom marketplace repos.
-
-Codex marketplaces are discovered from `codex app-server` catalog responses. Quill can refresh the Codex catalog, but add/remove marketplace actions stay Claude-only because Codex does not expose that mutation surface.
-
-### Update Checking
-
-Claude plugin updates are polled every 4 hours.
-
-Lenient semver comparison detects available updates, and bulk update with per-plugin progress events (`plugin-bulk-progress`) remains Claude-only because Codex does not expose versioned update metadata.
-
-### Plugin UI
-
-The plugin window stays shared but behaves per provider.
-
-It switches between enabled providers and keeps one tab set: **Installed**, **Browse**, **Marketplaces**, and **Updates**. The Installed tab hides enable/disable controls for Codex, the Marketplaces tab disables add/remove for Codex, and the Updates tab shows Codex-specific guidance when only refresh is available. Operation result banners auto-dismiss after 5 seconds.
-
 ## Memory Optimizer
 
 LLM-driven optimization of provider-aware memory and instruction files via [[src-tauri/src/memory_optimizer.rs]].

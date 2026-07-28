@@ -1,6 +1,6 @@
 # Backend
 
-The Rust backend handles storage, ingestion, search, LLM analysis, plugin management, provider lifecycle management, and the cross-platform status indicator.
+The Rust backend handles storage, ingestion, search, LLM analysis, provider lifecycle management, and the cross-platform status indicator.
 
 It communicates with the frontend through a broad Tauri IPC surface and documented push events.
 
@@ -1318,7 +1318,7 @@ At startup, [[src-tauri/src/integrations/manager.rs]] verifies enabled, detected
 
 Single IPC pair backing the [[features#Settings Window]]'s Performance, General (always-on-top), and Learning (rule watcher) tabs.
 
-`get_runtime_settings` returns the resolved `RuntimeSettings` struct with `live_usage.enabled`, `live_usage.interval_seconds`, `plugin_updates.enabled`, `plugin_updates.interval_hours`, `rule_watcher.enabled`, and `always_on_top` clamped to safe ranges (live: 60–600s, plugin updates: 1–24h). `set_runtime_settings` persists each key, calls `WebviewWindow::set_always_on_top` on the main window when that flag changes, and emits `runtime-settings-updated` so any open Settings window observes the resolved values without a re-fetch.
+`get_runtime_settings` returns the resolved `RuntimeSettings` struct with `live_usage.enabled`, `live_usage.interval_seconds`, `rule_watcher.enabled`, and `always_on_top` clamped to safe ranges (live: 60–600s). `set_runtime_settings` persists each key, calls `WebviewWindow::set_always_on_top` on the main window when that flag changes, and emits `runtime-settings-updated` so any open Settings window observes the resolved values without a re-fetch.
 
 ### Retention policy commands
 
@@ -1661,15 +1661,6 @@ Most read and trigger commands accept an optional provider filter for Claude, Co
 
 `get_memory_files`, `trigger_memory_optimization`, `get_optimization_suggestions`, `approve_suggestion`, `deny_suggestion`, `undeny_suggestion`, `undo_suggestion`, `approve_suggestion_group`, `deny_suggestion_group`, `get_suggestions_for_run`, `get_optimization_runs`, `get_known_projects`, `add_custom_project`, `remove_custom_project`, `delete_memory_file`, `delete_project_memories`.
 
-### Plugin Commands (14)
-
-Commands for installing, updating, enabling, and managing plugins and marketplaces.
-All plugin commands take a provider argument so the frontend can target Claude or Codex explicitly while keeping one shared window.
-
-`get_installed_plugins`, `get_marketplaces`, `get_available_updates`, `check_updates_now`, `install_plugin`, `remove_plugin`, `enable_plugin`, `disable_plugin`, `update_plugin`, `update_all_plugins`, `add_marketplace`, `remove_marketplace`, `refresh_marketplace`, `refresh_all_marketplaces`.
-
-Claude plugin mutations delegate to the `claude plugin` CLI and marketplace git repos. Codex plugin reads and install/remove operations use resolved `codex app-server` JSON-RPC over stdio with the launcher-aware execution `PATH`, while unsupported Codex mutations return provider-specific errors instead of guessing behavior.
-
 ### Session Indexing Commands (4)
 
 `search_sessions`, `get_session_context`, `get_search_facets`, and `sync_search_index` all operate on a unified Claude-plus-Codex index. Search and context requests include provider identity so session collisions do not bleed across providers.
@@ -1712,15 +1703,12 @@ The backend pushes real-time updates to the frontend via Tauri's emit system.
 | `context-savings-updated` | server.rs | `()` | Context savings events stored |
 | `learning-log` | learning.rs | `{run_id, message}` | Real-time analysis progress |
 | `learning-updated` | lib.rs | `()` | Rules changed |
-| `plugin-changed` | lib.rs | `()` | Plugin or marketplace mutation completed |
-| `plugin-bulk-progress` | plugins.rs | `BulkUpdateProgress` | Per-plugin update progress |
-| `plugin-updates-available` | plugins.rs | `count` | New updates found |
 | `provider-status-updated` | integrations | `Vec<ProviderStatus>` | Startup provider detection refresh |
 | `restart-status-changed` | restart.rs | `RestartStatus` | Restart phase change |
 | `integrations-updated` | integrations/manager.rs | `ProviderStatus[]` | Startup refresh or provider enable/disable completed |
 | `context-preservation-updated` | integrations/manager.rs | `ContextPreservationStatus` | Global context-preservation toggle changed |
 | `integration-features-updated` | integrations/manager.rs | `IntegrationFeatures` | Activity tracking or context telemetry toggle changed |
-| `runtime-settings-updated` | lib.rs | `RuntimeSettings` | Live-usage / plugin-update / rule-watcher / always-on-top toggle changed |
+| `runtime-settings-updated` | lib.rs | `RuntimeSettings` | Live-usage / rule-watcher / always-on-top toggle changed |
 | `ui-prefs-updated` | useUiPrefs (frontend) | `UiPrefs` | Layout, time mode, or panel-visibility preference changed in the Settings window |
 | `indicator-updated` | lib.rs | `StatusIndicatorState` | Shared usage refresh or primary-provider change recomputed indicator state |
 | `transcript-analytics-updated` | lib.rs | `()` | Transcript analytics committed, renamed, or deleted |

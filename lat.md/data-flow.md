@@ -265,20 +265,6 @@ Five action types that the LLM can propose for memory files.
 - **Create**: Add missing memory documentation
 - **Flag**: Mark for human review (no automated action)
 
-## Plugin Management Pipeline
-
-Plugin lifecycle operations through marketplace git repositories and the Claude CLI.
-
-1. Marketplaces registered in `~/.claude/plugins/known_marketplaces.json` (git repos)
-2. Each marketplace exposes a plugin manifest
-3. [[src-tauri/src/plugins.rs]] enumerates installed from `~/.claude/plugins/installed_plugins.json`
-4. Background task checks for updates every 4 hours (lenient semver comparison)
-5. `plugin-updates-available` event updates TitleBar badge count
-6. Install/update/remove delegate to `claude plugin` CLI subprocess
-7. Enable/disable toggle a blocklist and emit `plugin-changed`
-8. Bulk updates emit per-plugin `plugin-bulk-progress` events
-9. Marketplace refresh: git pull to sync latest manifests
-
 ## Usage Bucket Fetching
 
 The main window polls enabled providers for live rate limit status and stores the results in shared provider-aware usage tables.
