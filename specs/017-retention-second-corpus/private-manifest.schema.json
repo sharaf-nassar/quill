@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quill.local/schemas/retention-private-manifest-1.json",
+  "title": "Private retention corpus study manifest",
+  "description": "Exact local evidence. Never commit, publish, or transfer without privacy review.",
+  "type": "object",
+  "required": [
+    "schema_version", "lifecycle", "created_at", "approval", "source",
+    "source_after_reads", "profile_backup", "cleanup_disposition", "matrix"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "lifecycle": { "enum": ["profiled", "replay_complete", "cancelled", "failed"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "approval": { "$ref": "#/$defs/approval" },
+    "source": { "$ref": "#/$defs/inventory" },
+    "source_after_reads": { "$ref": "#/$defs/inventory" },
+    "profile_backup": { "$ref": "#/$defs/backup" },
+    "cleanup_disposition": { "type": "string", "minLength": 1 },
+    "matrix": { "type": "array", "items": { "$ref": "#/$defs/observation" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "approval": {
+      "type": "object",
+      "required": [
+        "corpus_label", "owner_or_custodian", "authorized_operator", "reviewers",
+        "approved_by", "approved_at", "expires_at", "revoked",
+        "allow_scratch_replay", "allow_aggregate_publication", "cleanup_deadline",
+        "independence_rationale", "fixed_utc_anchor", "retention_window_days",
+        "quill_stopped_acknowledged", "concurrent_load_policy", "prior_prune_state",
+        "prior_rollup_state", "prior_archive_state"
+      ],
+      "properties": {
+        "corpus_label": { "type": "string", "minLength": 1 },
+        "owner_or_custodian": { "type": "string", "minLength": 1 },
+        "authorized_operator": { "type": "string", "minLength": 1 },
+        "reviewers": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "approved_by": { "type": "string", "minLength": 1 },
+        "approved_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "revoked": { "type": "boolean" },
+        "allow_scratch_replay": { "type": "boolean" },
+        "allow_aggregate_publication": { "type": "boolean" },
+        "cleanup_deadline": { "type": "string", "format": "date-time" },
+        "independence_rationale": { "type": "string", "minLength": 1 },
+        "fixed_utc_anchor": { "type": "string", "format": "date-time" },
+        "retention_window_days": { "type": "integer", "minimum": 1 },
+        "quill_stopped_acknowledged": { "const": true },
+        "concurrent_load_policy": { "type": "string", "minLength": 1 },
+        "prior_prune_state": { "type": "string", "minLength": 1 },
+        "prior_rollup_state": { "type": "string", "minLength": 1 },
+        "prior_archive_state": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "inventory": {
+      "type": "object",
+      "required": ["source_path", "schema_version", "page_size", "page_count", "files"],
+      "properties": {
+        "source_path": { "type": "string", "minLength": 1 },
+        "schema_version": { "type": "integer", "minimum": 0 },
+        "page_size": { "type": "integer", "minimum": 1 },
+        "page_count": { "type": "integer", "minimum": 0 },
+        "files": { "type": "array", "minItems": 3, "items": { "$ref": "#/$defs/file" } }
+      },
+      "additionalProperties": false
+    },
+    "file": {
+      "type": "object",
+      "required": ["label", "present", "bytes", "sha256", "identity"],
+      "properties": {
+        "label": { "type": "string" },
+        "present": { "type": "boolean" },
+        "bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+        "identity": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "backup": {
+      "type": "object",
+      "required": ["scratch_path", "pages", "page_size", "elapsed_ms", "integrity_check"],
+      "properties": {
+        "scratch_path": { "type": "string" },
+        "pages": { "type": "integer", "minimum": 0 },
+        "page_size": { "type": "integer", "minimum": 1 },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "integrity_check": { "const": "ok" }
+      },
+      "additionalProperties": false
+    },
+    "observation": {
+      "type": "object",
+      "required": ["archive_mode", "cache_state", "status", "duration_ms", "reason_code"],
+      "properties": {
+        "archive_mode": { "enum": ["archive_off", "archive_on"] },
+        "cache_state": { "type": "string" },
+        "status": { "enum": ["completed", "failed", "cancelled"] },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "reason_code": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    }
+  }
+}

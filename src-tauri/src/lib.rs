@@ -37,6 +37,9 @@ mod retention_engine;
 /// timing spike. Deliberately non-test code: `src/bin/retention_spike.rs` is a
 /// separate crate and cannot link `#[cfg(test)]` items.
 pub mod retention_fixture;
+/// Maintainer-only retention corpus protocol. This is intentionally a Cargo
+/// binary support module, not a Tauri, IPC, or supported-CLI surface.
+pub mod retention_study;
 mod rule_watcher;
 mod server;
 pub(crate) mod sessions;

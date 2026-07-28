@@ -24,7 +24,7 @@ dirs = "6"
 # `hooks` supplies `Connection::progress_handler`, which the retention delete
 # engine installs as the Counting-phase heartbeat: that phase is one opaque
 # `CREATE TEMP TABLE … AS SELECT` with no progress signal of its own.
-rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled", "hooks"] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = "0.8"
 tokio = { version = "1", features = ["net", "sync", "process", "time", "io-util"] }

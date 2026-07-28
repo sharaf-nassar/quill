@@ -97,7 +97,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 35;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 35;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -3818,7 +3818,17 @@ impl Storage {
         ))
     }
     pub fn init() -> Result<Self, String> {
-        let path = db_path()?;
+        Self::init_at(db_path()?, true)
+    }
+
+    /// Open one explicit, disposable study scratch database through the same
+    /// schema and migration path as production. It never resolves data paths
+    /// and deliberately omits production-only startup cleanup and archival.
+    pub(crate) fn init_study_scratch(path: &Path) -> Result<Self, String> {
+        Self::init_at(path.to_path_buf(), false)
+    }
+
+    fn init_at(path: PathBuf, production_startup: bool) -> Result<Self, String> {
         let mut conn =
             Connection::open(&path).map_err(|e| format!("Failed to open database: {e}"))?;
 
@@ -6028,37 +6038,39 @@ impl Storage {
             context_savings_analytics_cache: Mutex::new(HashMap::new()),
         };
 
-        if let Err(e) = storage.aggregate_and_cleanup() {
-            log::warn!("Cleanup on startup failed: {e}");
-        }
+        if production_startup {
+            if let Err(e) = storage.aggregate_and_cleanup() {
+                log::warn!("Cleanup on startup failed: {e}");
+            }
 
-        if let Err(e) = storage.aggregate_and_cleanup_tokens() {
-            log::warn!("Token cleanup on startup failed: {e}");
-        }
+            if let Err(e) = storage.aggregate_and_cleanup_tokens() {
+                log::warn!("Token cleanup on startup failed: {e}");
+            }
 
-        if let Err(e) = storage.cleanup_old_observations() {
-            log::warn!("Observation cleanup on startup failed: {e}");
-        }
+            if let Err(e) = storage.cleanup_old_observations() {
+                log::warn!("Observation cleanup on startup failed: {e}");
+            }
 
-        // One-time redaction backfill (feature 005 US1 T021, contract
-        // redaction.md "One-time backfill"). Idempotent and sentinel-guarded
-        // so it scrubs any plaintext secret/PII captured before US1 wired
-        // the redaction boundary, then never runs again.
-        if let Err(e) = storage.backfill_redaction() {
-            log::warn!("Redaction backfill on startup failed: {e}");
-        }
+            // One-time redaction backfill (feature 005 US1 T021, contract
+            // redaction.md "One-time backfill"). Idempotent and sentinel-guarded
+            // so it scrubs any plaintext secret/PII captured before US1 wired
+            // the redaction boundary, then never runs again.
+            if let Err(e) = storage.backfill_redaction() {
+                log::warn!("Redaction backfill on startup failed: {e}");
+            }
 
-        // One-time legacy learned-rule archive-then-wipe (feature 005 US2
-        // T032, FR-012 / Q3=C, contracts/rule-governance.md "Legacy
-        // archive-then-wipe"). Runs HERE — inside `Storage::init`, i.e.
-        // before `rule_watcher::start` is ever called from the Tauri setup
-        // hook — so the wipe cannot race the watcher's reconcile. Idempotent
-        // + sentinel-guarded: every pre-existing on-disk learned `.md` is
-        // copied to a read-only manifested archive outside the watched dirs,
-        // the live file is deleted, and its DB row is durably tombstoned.
-        // They can only return via the new gated approval pipeline.
-        if let Err(e) = storage.archive_legacy_rules() {
-            log::warn!("Legacy rule archive on startup failed: {e}");
+            // One-time legacy learned-rule archive-then-wipe (feature 005 US2
+            // T032, FR-012 / Q3=C, contracts/rule-governance.md "Legacy
+            // archive-then-wipe"). Runs HERE — inside `Storage::init`, i.e.
+            // before `rule_watcher::start` is ever called from the Tauri setup
+            // hook — so the wipe cannot race the watcher's reconcile. Idempotent
+            // + sentinel-guarded: every pre-existing on-disk learned `.md` is
+            // copied to a read-only manifested archive outside the watched dirs,
+            // the live file is deleted, and its DB row is durably tombstoned.
+            // They can only return via the new gated approval pipeline.
+            if let Err(e) = storage.archive_legacy_rules() {
+                log::warn!("Legacy rule archive on startup failed: {e}");
+            }
         }
 
         Ok(storage)

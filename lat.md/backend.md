@@ -299,6 +299,28 @@ today's code, not a design guarantee: **a future learning pipeline that sources
 observations from `tool_actions` becomes a retention stakeholder, and this entire
 analysis must be redone at that point.**
 
+### Retention corpus study utility
+
+[[src-tauri/src/bin/retention_corpus.rs]] and [[src-tauri/src/retention_study.rs]] provide an unsupported, maintainer-only protocol for approved local corpus study without changing Tauri, IPC, product CLI, policy, presets, or production schema.
+
+The protocol requires explicit approval, source, workspace, and cancellation
+paths. It inventories source SQLite read-only, rejects non-Quill or too-new
+schemas before mutation, records database/WAL/SHM identity, size, presence, and
+SHA-256 before and after reads, then creates fresh SQLite page backups by
+bounded cancellable `rusqlite::backup` steps. Only verified private scratch
+copies enter [[src-tauri/src/storage.rs#Storage#init_study_scratch]] and current
+retention replay; ordinary copies and `VACUUM INTO` are prohibited.
+
+Private manifests conform to
+`specs/017-retention-second-corpus/private-manifest.schema.json`; private
+scratch, sidecars, archives, manifests, and cancellation markers clean up by
+default. The separate renderer writes a new privacy-signed scrubbed report,
+suppresses category/month cells below 10, and keeps the real inventory, index
+drop copy, and synthetic timing fixture as distinct baselines. The
+`synthetic-smoke` command exercises fixture mechanics without generating
+second-corpus evidence; `dbstat` remains an offline scratch-only capability
+pending real-corpus disposition.
+
 ### Retention fixture
 
 [[src-tauri/src/retention_fixture.rs#build_retention_fixture]] builds the one frozen synthetic corpus that every retention test and the retention timing spike run against, so acceptance numbers and budget numbers can never drift onto separate corpora.
