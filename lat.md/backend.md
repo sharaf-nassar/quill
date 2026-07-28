@@ -738,6 +738,13 @@ is index-dominated — `PRAGMA wal_checkpoint(TRUNCATE)` after each commit bound
 WAL by one chunk rather than by the run, measured at zero post-checkpoint bytes
 at every swept chunk size.
 
+Before each chunk deletes detail rows, [[src-tauri/src/retention_engine.rs#drain_target]]
+upserts their daily counters into [[backend#Database#Schema#Retention aggregates]]
+inside the same SQLite transaction. A committed prune therefore leaves a compact
+session/code-stat view; a failed chunk leaves both raw detail and its aggregate
+unchanged. Live rows remain outside this path because the doomed scan excludes
+`source_key IS NULL`.
+
 #### Preflight, and what it is not
 
 [[src-tauri/src/retention_engine.rs#preflight_delete_phase]] requires free disk for one chunk's WAL plus both doomed-rowid temp tables, doubled. Failing it is a skip with a reason, not an error, and it removes no rows and leaves the watermark alone.
@@ -852,7 +859,7 @@ half of the live-rows invariant.
 
 ### Schema
 
-The database schema is versioned through migration 34 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, and metadata tables.
+The database schema is versioned through migration 35 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, retention aggregates, and metadata tables.
 
 #### Usage Tracking
 
@@ -985,6 +992,23 @@ which is precisely the degradation
 
 - **tool_actions** — Tool invocation details behind `get_code_stats`, `get_batch_session_code_stats` and sub-agent discovery (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input; the code-stats queries prefer those columns and re-parse `full_input` only for legacy rows. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
+
+#### Retention aggregates
+
+Migration 35 preserves queryable shape after source-owned transcript detail is pruned.
+
+- **retention_daily_aggregates** — Per-provider/source/session/day counters for
+  tool calls, session events, code changes, added/removed lines, agent identity,
+  and changed-file path. Its primary key merges one pruning chunk with another
+  without retaining payloads, event keys, or message bodies.
+
+The delete engine writes this table before deleting each chunk, in the same
+transaction. Code-stat range/history and per-session reads merge its counters
+with surviving raw rows, while session breakdown/tree reads use its agent and
+tool-call counts. Source suppression and root pruning delete matching aggregate
+rows with their source-owned detail; snapshot replacement leaves already-pruned
+history intact because the retention watermark prevents an old replay from
+resurrecting raw rows.
 
 #### Skill Usages
 

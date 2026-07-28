@@ -818,6 +818,54 @@ fn drain_target(
         target.table(),
         target.doomed_table()
     );
+    // Roll each committed chunk into the durable daily view before deleting
+    // its detail.  Keeping this statement in the same transaction gives the
+    // retention boundary one atomic meaning: either both the aggregate and
+    // its contributing raw rows survive, or neither change is visible.
+    let target_aggregate_sql = match target {
+        RetentionTarget::ToolActions => format!(
+            "INSERT INTO retention_daily_aggregates (
+                 provider, source_key, session_id, day, agent_id, file_path,
+                 tool_action_count, session_event_count, code_change_count,
+                 lines_added, lines_removed
+             )
+             SELECT provider, source_key, session_id, substr(timestamp, 1, 10),
+                    COALESCE(agent_id, ''), COALESCE(file_path, ''),
+                    COUNT(*), 0, SUM(CASE WHEN category = 'code_change' THEN 1 ELSE 0 END),
+                    COALESCE(SUM(CASE WHEN category = 'code_change'
+                                      THEN COALESCE(lines_added, 0) ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN category = 'code_change'
+                                      THEN COALESCE(lines_removed, 0) ELSE 0 END), 0)
+             FROM tool_actions
+             WHERE rowid <= ?1 AND rowid IN (SELECT rid FROM {})
+             GROUP BY provider, source_key, session_id, substr(timestamp, 1, 10),
+                      COALESCE(agent_id, ''), COALESCE(file_path, '')
+             ON CONFLICT(provider, source_key, session_id, day, agent_id, file_path)
+             DO UPDATE SET
+                 tool_action_count = tool_action_count + excluded.tool_action_count,
+                 code_change_count = code_change_count + excluded.code_change_count,
+                 lines_added = lines_added + excluded.lines_added,
+                 lines_removed = lines_removed + excluded.lines_removed",
+            target.doomed_table()
+        ),
+        RetentionTarget::SessionEvents => format!(
+            "INSERT INTO retention_daily_aggregates (
+                 provider, source_key, session_id, day, agent_id, file_path,
+                 tool_action_count, session_event_count, code_change_count,
+                 lines_added, lines_removed
+             )
+             SELECT provider, source_key, session_id, substr(timestamp, 1, 10),
+                    COALESCE(agent_id, ''), '', 0, COUNT(*), 0, 0, 0
+             FROM session_events
+             WHERE rowid <= ?1 AND rowid IN (SELECT rid FROM {})
+             GROUP BY provider, source_key, session_id, substr(timestamp, 1, 10),
+                      COALESCE(agent_id, '')
+             ON CONFLICT(provider, source_key, session_id, day, agent_id, file_path)
+             DO UPDATE SET session_event_count =
+                 session_event_count + excluded.session_event_count",
+            target.doomed_table()
+        ),
+    };
     let bookkeeping_delete_sql = format!("DELETE FROM {} WHERE rid <= ?1", target.doomed_table());
     let remaining_sql = format!("SELECT COUNT(*) FROM {}", target.doomed_table());
 
@@ -867,6 +915,7 @@ fn drain_target(
             tx.rollback()?;
             return Ok((state, DrainOutcome::Completed));
         };
+        tx.execute(&target_aggregate_sql, params![boundary])?;
         let deleted = tx.execute(&target_delete_sql, params![boundary])?;
         let cleared = tx.execute(&bookkeeping_delete_sql, params![boundary])?;
         tx.commit()?;

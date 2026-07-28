@@ -2301,6 +2301,18 @@ fn suppress_transcript_analytics_sources_in_transaction(
             );
         }
     }
+    let mut aggregate_delete = tx
+        .prepare_cached(
+            "DELETE FROM retention_daily_aggregates WHERE provider = ?1 AND source_key = ?2",
+        )
+        .map_err(|e| format!("Prepare retention aggregate source delete: {e}"))?;
+    for (provider, source_key) in sources {
+        deleted = deleted.saturating_add(
+            aggregate_delete
+                .execute(params![provider, source_key])
+                .map_err(|e| format!("Delete retention aggregate source rows: {e}"))?,
+        );
+    }
 
     let mut suppress = tx
         .prepare_cached(
@@ -3409,6 +3421,11 @@ impl Storage {
                 )
                 .map_err(|e| format!("Delete transcript rows: {e}"))?;
             }
+            tx.execute(
+                "DELETE FROM retention_daily_aggregates WHERE provider=?1 AND source_key=?2",
+                params![proof.provider.as_str(), key],
+            )
+            .map_err(|e| format!("Delete retention aggregate rows: {e}"))?;
             tx.execute(
                 "DELETE FROM transcript_analytics_sources WHERE provider=?1 AND source_key=?2",
                 params![proof.provider.as_str(), key],
@@ -5961,6 +5978,42 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 34: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 34 commit: {e}"))?;
+        }
+
+        // Migration 35: retain compact daily evidence before retention removes
+        // source-owned detail rows.  The table deliberately carries only the
+        // dimensions read by the sessions and code-stat rollups; payloads and
+        // event identities remain eligible for pruning.
+        // @lat: [[backend#Database#Schema#Retention aggregates]]
+        if current_version < 35 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 35 transaction: {e}"))?;
+            tx.execute_batch(
+                "CREATE TABLE retention_daily_aggregates (
+                     provider           TEXT NOT NULL,
+                     source_key         TEXT NOT NULL,
+                     session_id         TEXT NOT NULL,
+                     day                TEXT NOT NULL,
+                     agent_id           TEXT NOT NULL DEFAULT '',
+                     file_path          TEXT NOT NULL DEFAULT '',
+                     tool_action_count  INTEGER NOT NULL DEFAULT 0,
+                     session_event_count INTEGER NOT NULL DEFAULT 0,
+                     code_change_count  INTEGER NOT NULL DEFAULT 0,
+                     lines_added        INTEGER NOT NULL DEFAULT 0,
+                     lines_removed      INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY(provider, source_key, session_id, day, agent_id, file_path)
+                 );
+                 CREATE INDEX idx_retention_daily_session
+                     ON retention_daily_aggregates(provider, session_id);
+                 CREATE INDEX idx_retention_daily_day
+                     ON retention_daily_aggregates(day);",
+            )
+            .map_err(|e| format!("Migration 35 (retention aggregates): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (35)", [])
+                .map_err(|e| format!("Failed to record migration 35: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 35 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -10839,6 +10892,10 @@ impl Storage {
                      SELECT agent_id FROM tool_actions
                        WHERE provider = tok.provider AND session_id = tok.session_id
                          AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM retention_daily_aggregates
+                       WHERE provider = tok.provider AND session_id = tok.session_id
+                         AND agent_id != ''
                  )) AS subagent_count
              FROM tok
              WHERE 1=1",
@@ -10924,6 +10981,9 @@ impl Storage {
                      UNION
                      SELECT agent_id FROM tool_actions
                        WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM retention_daily_aggregates
+                       WHERE provider = ?1 AND session_id = ?2 AND agent_id != ''
                  )",
             )
             .map_err(|e| format!("Prepare agent universe: {e}"))?;
@@ -10972,7 +11032,11 @@ impl Storage {
                      COALESCE((SELECT SUM(cache_read_input_tokens) FROM token_snapshots
                         WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS cache_read_tokens,
                      (SELECT COUNT(*) FROM tool_actions
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3) AS tool_call_count,
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3)
+                     + COALESCE((SELECT SUM(tool_action_count)
+                        FROM retention_daily_aggregates
+                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0)
+                     AS tool_call_count,
                      -- Earliest parent_uuid for this agent (the chain root).
                      (SELECT parent_uuid FROM response_times
                         WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
@@ -16182,6 +16246,35 @@ impl Storage {
             }
         }
 
+        // Raw rows carry payload for legacy parsing; pruned rows retain their
+        // already-computed counters in daily aggregates.  Merge both views so
+        // a range spanning the retention boundary remains additive.
+        let mut aggregate_stmt = conn
+            .prepare(
+                "SELECT session_id, file_path, lines_added, lines_removed
+                 FROM retention_daily_aggregates
+                 WHERE day >= substr(?1, 1, 10) AND code_change_count > 0",
+            )
+            .map_err(|e| format!("Prepare retention code stats: {e}"))?;
+        let aggregate_rows = aggregate_stmt
+            .query_map([&from], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| format!("Query retention code stats: {e}"))?;
+        for row in aggregate_rows {
+            let (session_id, file_path, added, removed) =
+                row.map_err(|e| format!("Retention code stats row: {e}"))?;
+            total_added += added;
+            total_removed += removed;
+            sessions.insert(session_id);
+            *lang_lines.entry(ext_to_language(&file_path)).or_insert(0) += added + removed;
+        }
+
         let session_count = sessions.len() as i64;
         let total_changed = total_added + total_removed;
         let avg_per_session = if session_count > 0 {
@@ -16275,6 +16368,31 @@ impl Storage {
             if let Some((added, removed)) = counts
                 && let Ok(ts) = timestamp.parse::<DateTime<Utc>>()
             {
+                changes.push(RawChange { added, removed, ts });
+            }
+        }
+
+        let mut aggregate_stmt = conn
+            .prepare(
+                "SELECT day, lines_added, lines_removed
+                 FROM retention_daily_aggregates
+                 WHERE day >= substr(?1, 1, 10) AND code_change_count > 0
+                 ORDER BY day ASC",
+            )
+            .map_err(|e| format!("Prepare retention code history: {e}"))?;
+        let aggregate_rows = aggregate_stmt
+            .query_map([&from_str], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| format!("Query retention code history: {e}"))?;
+        for row in aggregate_rows {
+            let (day, added, removed) =
+                row.map_err(|e| format!("Retention code history row: {e}"))?;
+            if let Ok(ts) = format!("{day}T00:00:00Z").parse::<DateTime<Utc>>() {
                 changes.push(RawChange { added, removed, ts });
             }
         }
@@ -16401,6 +16519,34 @@ impl Storage {
                             lines_removed: 0,
                             net_change: 0,
                         });
+                entry.lines_added += added;
+                entry.lines_removed += removed;
+                entry.net_change = entry.lines_added - entry.lines_removed;
+            }
+        }
+
+        let mut aggregate_stmt = conn
+            .prepare_cached(
+                "SELECT COALESCE(SUM(lines_added), 0), COALESCE(SUM(lines_removed), 0)
+                 FROM retention_daily_aggregates
+                 WHERE provider = ?1 AND session_id = ?2 AND code_change_count > 0",
+            )
+            .map_err(|e| format!("Prepare retention session code stats: {e}"))?;
+        for session_ref in unique_refs {
+            let (added, removed): (i64, i64) = aggregate_stmt
+                .query_row(
+                    params![session_ref.provider.to_string(), session_ref.session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|e| format!("Query retention session code stats: {e}"))?;
+            if added != 0 || removed != 0 {
+                let entry = result
+                    .entry(session_key(session_ref.provider, &session_ref.session_id))
+                    .or_insert(SessionCodeStats {
+                        lines_added: 0,
+                        lines_removed: 0,
+                        net_change: 0,
+                    });
                 entry.lines_added += added;
                 entry.lines_removed += removed;
                 entry.net_change = entry.lines_added - entry.lines_removed;
