@@ -158,6 +158,10 @@ pub struct RetentionTableCounts {
     pub tool_actions: i64,
     #[serde(default)]
     pub session_events: i64,
+    /// Model evidence uses integer epoch milliseconds, so it never takes the
+    /// transcript timestamp conformance path.
+    #[serde(default)]
+    pub model_usage_observations: i64,
 }
 
 impl RetentionTableCounts {
@@ -166,6 +170,7 @@ impl RetentionTableCounts {
         Self {
             tool_actions,
             session_events,
+            model_usage_observations: 0,
         }
     }
 }

@@ -664,7 +664,9 @@ readers depend on it existing.
 
 ### Retention delete engine
 
-[[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] is retention's destructive core: a dedicated maintenance connection, a one-pass doomed-rowid scan, a disk preflight, and a bounded chunked delete that advances the watermark at its first chunk and persists an audit record on every path.
+[[src-tauri/src/retention_engine.rs#run_retention_delete_phase]] runs retention's bounded, audit-backed destructive phase.
+
+It uses a dedicated maintenance connection, a one-pass doomed-rowid scan, a disk preflight, and a chunked delete that advances the watermark at its first chunk. It includes source-owned model observations, comparing normalized integer timestamps to the same confirmed cutoff.
 
 It owns no policy — the grammars, the cutoff and the monotonic rule live in the
 [[backend#Backend#Database#Retention policy primitive]] — and no UI. Every
@@ -895,6 +897,8 @@ The source lifecycle and graph-resolution path is documented in [[data-flow#Mode
 Backfill lifecycle writes are transactional and state-guarded. Interrupted and explicit retry initialization advance the inventory generation, clear only run-local counters, and preserve evidence; pending work alone can become running. Root outcomes precede an explicit source-total publication marker, which distinguishes an authoritative empty inventory from work not yet inventoried. Batch counters cannot exceed remaining work, and only a failure-free resolved inventory with at least one configured root and a published source total can finish complete. Partial and failed states persist inventory completeness independently, so unreadable sources and unreadable roots remain distinguishable. Persisted diagnostics use the bounded `ModelBackfillDiagnostic` value rather than raw filesystem errors.
 
 [[src-tauri/src/model_usage.rs#run_retained_model_history_backfill]] owns one retained-history pass under the shared process permit. It inventories each provider root off the async executor and commits its cumulative outcome before starting the next, then prepares stable generation-owned work before publishing the plan's validated source total. Bounded source batches commit and record progress between yields, source failures retain last-good rows, and only completed root proofs prune child rows before parents. Terminal `partial` versus `failed` reflects useful committed work, while inventory completeness depends only on resolved roots and attempted discovered sources.
+
+Retention deletes model observations older than its confirmed cutoff with the transcript-owned targets, but retains each source inventory row so source reconciliation, revision detection, and cursor progress remain valid. [[src-tauri/src/storage.rs#Storage#replace_model_source]] re-reads the durable watermark in its replacement transaction and filters pre-cutoff `observed_at_ms` rows before inserting, preventing a revised or backfilled source from resurrecting pruned evidence. `usage_snapshots` and `token_snapshots` remain outside this policy: they are live-hook/API state without source replay semantics, and their bounded cleanup lifecycles remain independent.
 
 [[src-tauri/src/lib.rs#run]] resets an interrupted running pass to a fresh `startup_resume` generation after storage initialization and reserves one nonblocking worker for migration-pending or resumed work. The reservation waits for live reconciliation to release the shared process permit instead of discarding historical work.
 

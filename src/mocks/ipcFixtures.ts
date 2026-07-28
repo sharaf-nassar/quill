@@ -2364,8 +2364,8 @@ function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord
     window_days: 90,
     cutoff,
     ran_at: iso(112 * D),
-    deleted: { tool_actions: 165_912, session_events: 523_847 },
-    skipped_nonconforming: { tool_actions: 3, session_events: 5 },
+    deleted: { tool_actions: 165_912, session_events: 523_847, model_usage_observations: 302_901 },
+    skipped_nonconforming: { tool_actions: 3, session_events: 5, model_usage_observations: 0 },
     bytes_before: 8_106_127_360,
     bytes_after: 6_442_450_944,
   };
@@ -2375,7 +2375,7 @@ function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord
       status: "partial",
       error_reason:
         "free space fell below the delete-phase budget after 41 chunks",
-      deleted: { tool_actions: 61_440, session_events: 190_512 },
+      deleted: { tool_actions: 61_440, session_events: 190_512, model_usage_observations: 112_640 },
       bytes_after: base.bytes_before,
     };
   }
@@ -2389,8 +2389,8 @@ function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord
       reason: "another maintenance operation was running",
       cutoff: null,
       ran_at: iso(2 * D),
-      deleted: { tool_actions: 0, session_events: 0 },
-      skipped_nonconforming: { tool_actions: 0, session_events: 0 },
+      deleted: { tool_actions: 0, session_events: 0, model_usage_observations: 0 },
+      skipped_nonconforming: { tool_actions: 0, session_events: 0, model_usage_observations: 0 },
       bytes_after: base.bytes_before,
     };
   }
@@ -2417,6 +2417,7 @@ function retentionPreview(scenario: RetentionScenario): RetentionPreview {
   const empty = {
     tool_actions_rows: 0,
     session_events_rows: 0,
+    model_usage_observations_rows: 0,
     tool_actions_nonconforming: 0,
     session_events_nonconforming: 0,
     everything_older: false,
@@ -2457,6 +2458,7 @@ function retentionPreview(scenario: RetentionScenario): RetentionPreview {
     window_days: windowDays,
     tool_actions_rows: 165_912,
     session_events_rows: 523_847,
+    model_usage_observations_rows: 302_901,
     tool_actions_nonconforming: 3,
     session_events_nonconforming: 5,
     // The cutoff covering every owned row is the case that needs the blunter
@@ -2479,6 +2481,7 @@ function retentionResult(scenario: RetentionScenario): RetentionMaintenanceResul
     window_days: windowDays,
     tool_actions_deleted: 0,
     session_events_deleted: 0,
+    model_usage_observations_deleted: 0,
     tool_actions_nonconforming: 0,
     session_events_nonconforming: 0,
     compaction_status: "skipped",
@@ -2506,6 +2509,7 @@ function retentionResult(scenario: RetentionScenario): RetentionMaintenanceResul
     window_days: windowDays,
     tool_actions_deleted: 165_912,
     session_events_deleted: 523_847,
+    model_usage_observations_deleted: 302_901,
     tool_actions_nonconforming: 3,
     session_events_nonconforming: 5,
     compaction_status: "completed",

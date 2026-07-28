@@ -9023,6 +9023,37 @@ impl Storage {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("Begin model source replacement: {error}"))?;
+        // The same durable watermark that protects transcript re-ingestion
+        // also protects model-source replacement. A source revision may replay
+        // its whole history, so filtering only the delete phase would allow an
+        // older observation to resurrect on the next successful parse.
+        let retention_watermark_ms = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RETENTION_WATERMARK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read model observation retention watermark: {error}"))?
+            .as_deref()
+            .and_then(parse_watermark_setting)
+            .and_then(|watermark| {
+                chrono::DateTime::parse_from_rfc3339(&watermark)
+                    .ok()
+                    .map(|instant| instant.timestamp_millis())
+            });
+        let retained_observations: Vec<_> = prepared_observations
+            .into_iter()
+            .filter(|observation| {
+                retention_watermark_ms.is_none_or(|watermark| {
+                    observation.observation.metadata().observed_at_ms >= watermark
+                })
+            })
+            .collect();
+        let retained_observation_count =
+            i64::try_from(retained_observations.len()).map_err(|_| {
+                "Retained model observation count exceeds SQLite INTEGER range".to_string()
+            })?;
         let current_suppression = tx
             .query_row(
                 "SELECT source.processing_status,
@@ -9152,7 +9183,7 @@ impl Storage {
                      )",
                 )
                 .map_err(|error| format!("Prepare model source observation insert: {error}"))?;
-            for prepared in &prepared_observations {
+            for prepared in &retained_observations {
                 let observation = prepared.observation;
                 let metadata = observation.metadata();
                 stmt.execute(params![
@@ -9241,7 +9272,7 @@ impl Storage {
                 fast.size_bytes(),
                 fingerprint.content_sha256(),
                 source.seen_generation,
-                source.observation_count,
+                retained_observation_count,
                 last_attempt_at_ms,
                 last_success_at_ms,
             ],

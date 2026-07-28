@@ -135,11 +135,21 @@ const SCAN_HEARTBEAT_CEILING: u8 = 45;
 pub enum RetentionTarget {
     ToolActions,
     SessionEvents,
+    ModelUsageObservations,
 }
 
 impl RetentionTarget {
     /// Both targets, in the order the run drains them.
-    pub const ALL: [RetentionTarget; 2] =
+    pub const ALL: [RetentionTarget; 3] = [
+        RetentionTarget::ToolActions,
+        RetentionTarget::SessionEvents,
+        RetentionTarget::ModelUsageObservations,
+    ];
+
+    /// Targets covered by the transcript fixture. Model observations have
+    /// their own source lifecycle and are exercised through storage tests.
+    #[cfg(test)]
+    pub const TRANSCRIPT_TARGETS: [RetentionTarget; 2] =
         [RetentionTarget::ToolActions, RetentionTarget::SessionEvents];
 
     /// SQL name of the table rows are deleted from.
@@ -147,6 +157,7 @@ impl RetentionTarget {
         match self {
             RetentionTarget::ToolActions => "tool_actions",
             RetentionTarget::SessionEvents => "session_events",
+            RetentionTarget::ModelUsageObservations => "model_usage_observations",
         }
     }
 
@@ -155,6 +166,7 @@ impl RetentionTarget {
         match self {
             RetentionTarget::ToolActions => "retention_doomed_tool_actions",
             RetentionTarget::SessionEvents => "retention_doomed_session_events",
+            RetentionTarget::ModelUsageObservations => "retention_doomed_model_usage_observations",
         }
     }
 
@@ -163,6 +175,7 @@ impl RetentionTarget {
         match self {
             RetentionTarget::ToolActions => counts.tool_actions,
             RetentionTarget::SessionEvents => counts.session_events,
+            RetentionTarget::ModelUsageObservations => counts.model_usage_observations,
         }
     }
 
@@ -176,10 +189,17 @@ impl RetentionTarget {
             RetentionTarget::ToolActions => RetentionTableCounts {
                 tool_actions: value,
                 session_events: counts.session_events,
+                model_usage_observations: counts.model_usage_observations,
             },
             RetentionTarget::SessionEvents => RetentionTableCounts {
                 tool_actions: counts.tool_actions,
                 session_events: value,
+                model_usage_observations: counts.model_usage_observations,
+            },
+            RetentionTarget::ModelUsageObservations => RetentionTableCounts {
+                tool_actions: counts.tool_actions,
+                session_events: counts.session_events,
+                model_usage_observations: value,
             },
         }
     }
@@ -531,15 +551,23 @@ fn available_disk_space(_path: &Path) -> Result<u64, String> {
 fn doomed_scan_sql(target: RetentionTarget) -> String {
     // Both interpolated fragments are compile-time constants owned by
     // `RetentionTarget`; nothing caller-supplied reaches the SQL text.
-    format!(
-        "CREATE TEMP TABLE {} AS
-         SELECT rowid AS rid FROM {}
-          WHERE source_key IS NOT NULL
-            AND length(timestamp) = 24 AND timestamp LIKE '%Z'
-            AND timestamp < ?1",
-        target.doomed_table(),
-        target.table()
-    )
+    match target {
+        RetentionTarget::ModelUsageObservations => format!(
+            "CREATE TEMP TABLE {} AS
+             SELECT rowid AS rid FROM {} WHERE observed_at_ms < ?1",
+            target.doomed_table(),
+            target.table()
+        ),
+        _ => format!(
+            "CREATE TEMP TABLE {} AS
+             SELECT rowid AS rid FROM {}
+              WHERE source_key IS NOT NULL
+                AND length(timestamp) = 24 AND timestamp LIKE '%Z'
+                AND timestamp < ?1",
+            target.doomed_table(),
+            target.table()
+        ),
+    }
 }
 
 /// Owned pre-cutoff rows that failed the conformance guard.
@@ -549,6 +577,9 @@ fn doomed_scan_sql(target: RetentionTarget) -> String {
 /// number is a *report* and never a delete predicate: it answers "how many
 /// old-looking rows did the guard keep", and no row is removed on its basis.
 fn nonconforming_count_sql(target: RetentionTarget) -> String {
+    if target == RetentionTarget::ModelUsageObservations {
+        return "SELECT 0".to_string();
+    }
     format!(
         "SELECT COUNT(*) FROM {}
           WHERE source_key IS NOT NULL
@@ -560,6 +591,9 @@ fn nonconforming_count_sql(target: RetentionTarget) -> String {
 
 /// Every source-owned row in a target table, regardless of age.
 fn owned_count_sql(target: RetentionTarget) -> String {
+    if target == RetentionTarget::ModelUsageObservations {
+        return "SELECT COUNT(*) FROM model_usage_observations".to_string();
+    }
     format!(
         "SELECT COUNT(*) FROM {} WHERE source_key IS NOT NULL",
         target.table()
@@ -633,36 +667,54 @@ pub fn scan_doomed_rows(
         });
     }
 
+    let cutoff_ms = DateTime::parse_from_rfc3339(cutoff)
+        .map_err(|_| RetentionDeleteError::MalformedCutoff {
+            cutoff: cutoff.to_string(),
+        })?
+        .timestamp_millis();
     let mut doomed = RetentionTableCounts::default();
     let mut nonconforming = RetentionTableCounts::default();
 
     for (index, target) in RetentionTarget::ALL.into_iter().enumerate() {
-        // Each table owns half the bar, so the phase advances across the whole
+        // Each table owns a third of the bar, so the phase advances across the whole
         // scan rather than restarting at zero for the second table.
-        let base = (index as u8) * 50;
+        let target_count = RetentionTarget::ALL.len();
+        let base = (index * 100 / target_count) as u8;
+        let next = (((index + 1) * 100 / target_count).min(100)) as u8;
         install_scan_heartbeat(conn, controls, base);
 
         conn.execute_batch(&format!(
             "DROP TABLE IF EXISTS temp.{}",
             target.doomed_table()
         ))?;
-        conn.execute(&doomed_scan_sql(target), params![cutoff])?;
+        match target {
+            RetentionTarget::ModelUsageObservations => {
+                conn.execute(&doomed_scan_sql(target), params![cutoff_ms])?;
+            }
+            _ => {
+                conn.execute(&doomed_scan_sql(target), params![cutoff])?;
+            }
+        }
 
         let rows: i64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM temp.{}", target.doomed_table()),
             [],
             |row| row.get(0),
         )?;
-        let skipped: i64 =
-            conn.query_row(&nonconforming_count_sql(target), params![cutoff], |row| {
+        let skipped: i64 = match target {
+            RetentionTarget::ModelUsageObservations => {
+                conn.query_row(&nonconforming_count_sql(target), [], |row| row.get(0))?
+            }
+            _ => conn.query_row(&nonconforming_count_sql(target), params![cutoff], |row| {
                 row.get(0)
-            })?;
+            })?,
+        };
 
         doomed = target.with_count(&doomed, rows.max(0));
         nonconforming = target.with_count(&nonconforming, skipped.max(0));
 
         clear_scan_heartbeat(conn);
-        report_scan_progress(controls, base + 50);
+        report_scan_progress(controls, next);
     }
 
     Ok(RetentionScanReport {
@@ -823,7 +875,7 @@ fn drain_target(
     // retention boundary one atomic meaning: either both the aggregate and
     // its contributing raw rows survive, or neither change is visible.
     let target_aggregate_sql = match target {
-        RetentionTarget::ToolActions => format!(
+        RetentionTarget::ToolActions => Some(format!(
             "INSERT INTO retention_daily_aggregates (
                  provider, source_key, session_id, day, agent_id, file_path,
                  tool_action_count, session_event_count, code_change_count,
@@ -847,8 +899,8 @@ fn drain_target(
                  lines_added = lines_added + excluded.lines_added,
                  lines_removed = lines_removed + excluded.lines_removed",
             target.doomed_table()
-        ),
-        RetentionTarget::SessionEvents => format!(
+        )),
+        RetentionTarget::SessionEvents => Some(format!(
             "INSERT INTO retention_daily_aggregates (
                  provider, source_key, session_id, day, agent_id, file_path,
                  tool_action_count, session_event_count, code_change_count,
@@ -864,7 +916,11 @@ fn drain_target(
              DO UPDATE SET session_event_count =
                  session_event_count + excluded.session_event_count",
             target.doomed_table()
-        ),
+        )),
+        // Model evidence has no transcript aggregate representation. It is
+        // retained only as normalized detail, so its chunk deletes must not
+        // fabricate a row in retention_daily_aggregates.
+        RetentionTarget::ModelUsageObservations => None,
     };
     let bookkeeping_delete_sql = format!("DELETE FROM {} WHERE rid <= ?1", target.doomed_table());
     let remaining_sql = format!("SELECT COUNT(*) FROM {}", target.doomed_table());
@@ -915,7 +971,9 @@ fn drain_target(
             tx.rollback()?;
             return Ok((state, DrainOutcome::Completed));
         };
-        tx.execute(&target_aggregate_sql, params![boundary])?;
+        if let Some(target_aggregate_sql) = &target_aggregate_sql {
+            tx.execute(target_aggregate_sql, params![boundary])?;
+        }
         let deleted = tx.execute(&target_delete_sql, params![boundary])?;
         let cleared = tx.execute(&bookkeeping_delete_sql, params![boundary])?;
         tx.commit()?;
@@ -1168,6 +1226,9 @@ mod tests {
         match target {
             RetentionTarget::ToolActions => RetentionTable::ToolActions,
             RetentionTarget::SessionEvents => RetentionTable::SessionEvents,
+            RetentionTarget::ModelUsageObservations => {
+                unreachable!("the transcript fixture has no model-observation lane")
+            }
         }
     }
 
@@ -1303,7 +1364,7 @@ mod tests {
         // still queued equal the doomed set minus everything committed so far.
         let recorded = chunks.borrow();
         assert!(recorded.len() >= 2, "the run must have committed chunks");
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             let mut cumulative = 0_u64;
             let expected = target.counts_field(&report.doomed) as u64;
             for chunk in recorded.iter().filter(|chunk| chunk.target == target) {
@@ -1329,7 +1390,7 @@ mod tests {
         // Strict `<`: a row whose timestamp equals the cutoff is retained.
         assert_eq!((1, 1), boundary_rows_present(&fixture));
 
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             assert_eq!(
                 0,
                 count_before(
@@ -1425,7 +1486,7 @@ mod tests {
             total_doomed - committed,
             resumed.deleted.tool_actions + resumed.deleted.session_events
         );
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             assert_eq!(
                 0,
                 count_before(
@@ -1532,7 +1593,7 @@ mod tests {
             Some(before),
             storage.read_retention_watermark().expect("read watermark")
         );
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             assert_eq!(
                 target.counts_field(&report.doomed) as u64,
                 count_before(
@@ -1629,7 +1690,7 @@ mod tests {
         let storage = Storage::init().expect("open storage on fixture");
         let request = request(&fixture);
 
-        let before: Vec<u64> = RetentionTarget::ALL
+        let before: Vec<u64> = RetentionTarget::TRANSCRIPT_TARGETS
             .iter()
             .map(|target| {
                 count(
@@ -1645,7 +1706,7 @@ mod tests {
             .expect("run delete phase");
         assert_eq!(RetentionRunStatus::Completed, report.status);
 
-        for (index, target) in RetentionTarget::ALL.into_iter().enumerate() {
+        for (index, target) in RetentionTarget::TRANSCRIPT_TARGETS.into_iter().enumerate() {
             let table = target_table(target);
             // Pre-cutoff `+00:00` rows survive …
             assert_eq!(
@@ -1722,7 +1783,7 @@ mod tests {
         let storage = Storage::init().expect("open storage on fixture");
         let request = request(&fixture);
 
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             let table = target_table(target);
             let older = count_before(&fixture, table, RetentionRowKind::Live, &request.cutoff);
             assert!(older > 0, "live rows must straddle the cutoff");
@@ -1733,7 +1794,7 @@ mod tests {
             .expect("open maintenance connection");
         let scan = scan_doomed_rows(&conn, &request.cutoff, &RetentionDeleteControls::default())
             .expect("scan doomed rows");
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             assert_eq!(
                 doomed_rows(&fixture, target),
                 target.counts_field(&scan.doomed),
@@ -1746,7 +1807,7 @@ mod tests {
             .expect("run delete phase");
         assert_eq!(RetentionRunStatus::Completed, report.status);
 
-        for target in RetentionTarget::ALL {
+        for target in RetentionTarget::TRANSCRIPT_TARGETS {
             let table = target_table(target);
             assert_eq!(
                 fixture.plan().total_rows(table, RetentionRowKind::Live),

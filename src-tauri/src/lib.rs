@@ -3638,6 +3638,7 @@ pub(crate) struct RetentionPreview {
     window_days: Option<i64>,
     tool_actions_rows: i64,
     session_events_rows: i64,
+    model_usage_observations_rows: i64,
     tool_actions_nonconforming: i64,
     session_events_nonconforming: i64,
     /// The cutoff covers every source-owned row, which is the case that needs
@@ -3668,6 +3669,7 @@ impl RetentionPreview {
             window_days,
             tool_actions_rows: 0,
             session_events_rows: 0,
+            model_usage_observations_rows: 0,
             tool_actions_nonconforming: nonconforming.tool_actions,
             session_events_nonconforming: nonconforming.session_events,
             everything_older: false,
@@ -3754,8 +3756,10 @@ fn build_retention_preview(
     // rather than holding them until the caller drops the payload.
     drop(conn);
 
-    let owned_total = owned.tool_actions + owned.session_events;
-    let nonconforming_total = scan.nonconforming.tool_actions + scan.nonconforming.session_events;
+    let owned_total = owned.tool_actions + owned.session_events + owned.model_usage_observations;
+    let nonconforming_total = scan.nonconforming.tool_actions
+        + scan.nonconforming.session_events
+        + scan.nonconforming.model_usage_observations;
     let doomed_total = scan.total_doomed();
 
     if doomed_total == 0 {
@@ -3785,6 +3789,7 @@ fn build_retention_preview(
         window_days: Some(window_days),
         tool_actions_rows: scan.doomed.tool_actions,
         session_events_rows: scan.doomed.session_events,
+        model_usage_observations_rows: scan.doomed.model_usage_observations,
         tool_actions_nonconforming: scan.nonconforming.tool_actions,
         session_events_nonconforming: scan.nonconforming.session_events,
         everything_older: retained <= 0,
@@ -3895,6 +3900,7 @@ pub(crate) struct RetentionMaintenanceResult {
     window_days: Option<i64>,
     tool_actions_deleted: i64,
     session_events_deleted: i64,
+    model_usage_observations_deleted: i64,
     tool_actions_nonconforming: i64,
     session_events_nonconforming: i64,
     /// `"completed" | "skipped"`.
@@ -3920,6 +3926,7 @@ fn skipped_retention_maintenance(
         window_days,
         tool_actions_deleted: 0,
         session_events_deleted: 0,
+        model_usage_observations_deleted: 0,
         tool_actions_nonconforming: 0,
         session_events_nonconforming: 0,
         compaction_status: retention::RetentionRunStatus::Skipped.as_str(),
@@ -4167,6 +4174,7 @@ fn execute_retention_maintenance(
         window_days: Some(window_days),
         tool_actions_deleted: report.deleted.tool_actions,
         session_events_deleted: report.deleted.session_events,
+        model_usage_observations_deleted: report.deleted.model_usage_observations,
         tool_actions_nonconforming: report.nonconforming.tool_actions,
         session_events_nonconforming: report.nonconforming.session_events,
         compaction_status,

@@ -1209,6 +1209,7 @@ export interface RestartStatus {
 export interface RetentionTableCounts {
 	tool_actions: number;
 	session_events: number;
+	model_usage_observations: number;
 }
 
 // "partial" means chunks committed and then the run stopped — mid-run disk
@@ -1263,6 +1264,7 @@ export interface RetentionPreview {
 	window_days: number | null;
 	tool_actions_rows: number;
 	session_events_rows: number;
+	model_usage_observations_rows: number;
 	tool_actions_nonconforming: number;
 	session_events_nonconforming: number;
 	// True when the cutoff covers every owned row — drives the explicit-loss
@@ -1297,6 +1299,7 @@ export interface RetentionMaintenanceResult {
 	window_days: number | null;
 	tool_actions_deleted: number;
 	session_events_deleted: number;
+	model_usage_observations_deleted: number;
 	tool_actions_nonconforming: number;
 	session_events_nonconforming: number;
 	compaction_status: "completed" | "skipped";

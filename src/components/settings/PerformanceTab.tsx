@@ -102,11 +102,17 @@ function asSentence(reason: string): string {
   return /[.!?]$/.test(reason.trim()) ? reason.trim() : `${reason.trim()}.`;
 }
 
-/** "165,912 tool actions and 523,847 session events", singularised. */
-function formatRowPair(toolActions: number, sessionEvents: number): string {
+/** Per-target row counts, singularised. */
+function formatRowPair(
+  toolActions: number,
+  sessionEvents: number,
+  modelUsageObservations = 0,
+): string {
   const tools = `${formatCount(toolActions)} tool action${toolActions === 1 ? "" : "s"}`;
   const events = `${formatCount(sessionEvents)} session event${sessionEvents === 1 ? "" : "s"}`;
-  return `${tools} and ${events}`;
+  if (modelUsageObservations === 0) return `${tools} and ${events}`;
+  const observations = `${formatCount(modelUsageObservations)} model observation${modelUsageObservations === 1 ? "" : "s"}`;
+  return `${tools}, ${events}, and ${observations}`;
 }
 
 const MS_PER_DAY = 86_400_000;
@@ -539,7 +545,11 @@ function RetentionPanel({
           )}
         </div>
         <p className="retention-panel-line">
-          {formatRowPair(preview.tool_actions_rows, preview.session_events_rows)} will
+          {formatRowPair(
+            preview.tool_actions_rows,
+            preview.session_events_rows,
+            preview.model_usage_observations_rows,
+          )} will
           be deleted permanently. There is no undo and no export.
         </p>
         {preview.everything_older && (
@@ -638,6 +648,7 @@ function RetentionPanel({
   const removed = formatRowPair(
     result.tool_actions_deleted,
     result.session_events_deleted,
+    result.model_usage_observations_deleted,
   );
   return (
     <div className="retention-panel" role="note">
@@ -759,6 +770,10 @@ function RetentionAudit({ record, windowDays, now }: RetentionAuditProps) {
           <dd>{formatCount(record.deleted.session_events)}</dd>
         </div>
         <div className="retention-audit-figure">
+          <dt>Model observations removed</dt>
+          <dd>{formatCount(record.deleted.model_usage_observations)}</dd>
+        </div>
+        <div className="retention-audit-figure">
           <dt>On disk</dt>
           <dd>
             {formatBytes(record.bytes_before)} → {formatBytes(record.bytes_after)}
@@ -787,7 +802,11 @@ function RetentionAudit({ record, windowDays, now }: RetentionAuditProps) {
           carrying timestamps Quill cannot compare.
         </p>
       )}
-      {reclaimed <= 0 && record.deleted.tool_actions + record.deleted.session_events > 0 && (
+      {reclaimed <= 0 &&
+        record.deleted.tool_actions +
+          record.deleted.session_events +
+          record.deleted.model_usage_observations >
+          0 && (
         <p className="retention-audit-note">{RECLAIM_SENTENCE}</p>
       )}
     </div>
