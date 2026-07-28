@@ -6,8 +6,6 @@ import type { RuntimeSettings } from "../types";
 export const RUNTIME_SETTINGS_DEFAULTS: RuntimeSettings = {
   liveUsageEnabled: true,
   liveUsageIntervalSeconds: 180,
-  pluginUpdatesEnabled: true,
-  pluginUpdatesIntervalHours: 4,
   ruleWatcherEnabled: true,
   alwaysOnTop: false,
   crashReportingEnabled: true,

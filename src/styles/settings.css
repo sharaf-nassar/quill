@@ -91,7 +91,7 @@
   padding: 16px 20px 24px;
 }
 
-/* Custom-styled scrollbar mirrors the Sessions / Plugins windows.
+/* Custom-styled scrollbar mirrors the Sessions window.
  * On Linux WebKitGTK, the default native scrollbar's mouse capture
  * does not release cleanly on transparent borderless Tauri windows
  * — the thumb sticks to the cursor after mouseup. Styling

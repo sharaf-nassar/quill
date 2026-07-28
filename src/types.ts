@@ -400,8 +400,6 @@ export interface LearningSettings {
 export interface RuntimeSettings {
   liveUsageEnabled: boolean;
   liveUsageIntervalSeconds: number;
-  pluginUpdatesEnabled: boolean;
-  pluginUpdatesIntervalHours: number;
   ruleWatcherEnabled: boolean;
   alwaysOnTop: boolean;
   crashReportingEnabled: boolean;
@@ -1144,82 +1142,6 @@ export interface MergedDataPoint {
 export interface ChartSeriesVisibility {
 	utilization: boolean;
 	tokens: boolean;
-}
-
-// Plugin manager types
-
-export type PluginsTab = "installed" | "browse" | "marketplaces" | "updates";
-
-export interface InstalledPlugin {
-	provider: IntegrationProvider;
-	plugin_id: string;
-	marketplace_path: string | null;
-	name: string;
-	marketplace: string;
-	version: string;
-	scope: string;
-	project_path: string | null;
-	enabled: boolean;
-	description: string | null;
-	author: string | null;
-	installed_at: string;
-	last_updated: string;
-	git_commit_sha: string | null;
-}
-
-export interface MarketplacePlugin {
-	provider: IntegrationProvider;
-	plugin_id: string;
-	marketplace_path: string | null;
-	name: string;
-	description: string | null;
-	version: string;
-	author: string | null;
-	category: string | null;
-	source_path: string;
-	installed: boolean;
-	enabled: boolean;
-	install_url: string | null;
-}
-
-export interface Marketplace {
-	provider: IntegrationProvider;
-	name: string;
-	source_type: string;
-	repo: string;
-	install_location: string;
-	last_updated: string | null;
-	plugins: MarketplacePlugin[];
-}
-
-export interface PluginUpdate {
-	provider: IntegrationProvider;
-	name: string;
-	marketplace: string;
-	scope: string;
-	project_path: string | null;
-	current_version: string;
-	available_version: string;
-}
-
-export interface UpdateCheckResult {
-	plugin_updates: PluginUpdate[];
-	last_checked: string | null;
-	next_check: string | null;
-}
-
-export interface BulkUpdateProgress {
-	total: number;
-	completed: number;
-	current_plugin: string | null;
-	results: BulkUpdateItem[];
-}
-
-export interface BulkUpdateItem {
-	plugin_key: string;
-	name: string;
-	status: string;
-	error: string | null;
 }
 
 // LLM runtime types

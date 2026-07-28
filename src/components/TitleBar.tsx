@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { listen, emit } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type { UseIntegrationsResult } from "../hooks/useIntegrations";
 import type { PendingUpdate } from "../types";
@@ -68,21 +68,11 @@ function TitleBar({
   integrations,
 }: TitleBarProps) {
   const [version, setVersion] = useState("");
-  const [pluginUpdateCount, setPluginUpdateCount] = useState(0);
 
   const { hasEnabledProvider, loading: providersLoading } = integrations;
 
   useEffect(() => {
     getVersion().then(setVersion).catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    const unlisten = listen<number>("plugin-updates-available", (event) => {
-      setPluginUpdateCount(event.payload);
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
   }, []);
 
   const liveDisabled = !showLive && (providersLoading || !hasEnabledProvider);
@@ -155,15 +145,12 @@ function TitleBar({
           </button>
           <span aria-hidden="true" className="view-tab-divider" />
           <button
-            className="view-tab view-tab--icon view-tab--plugins"
+            className="view-tab view-tab--icon"
             onClick={() => void handleOpenManage()}
             aria-label="Open Tools workspace"
             title="Tools"
           >
             <ManageIcon />
-            {pluginUpdateCount > 0 && (
-              <span className="plugins-update-badge">{pluginUpdateCount}</span>
-            )}
           </button>
         </div>
       </div>

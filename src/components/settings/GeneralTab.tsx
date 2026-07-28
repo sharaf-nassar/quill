@@ -39,10 +39,7 @@ export function GeneralTab({
     const live = runtime.settings.liveUsageEnabled
       ? `every ${runtime.settings.liveUsageIntervalSeconds}s`
       : "off";
-    const plugins = runtime.settings.pluginUpdatesEnabled
-      ? `every ${runtime.settings.pluginUpdatesIntervalHours}h`
-      : "off";
-    return `Live polling: ${live} • Plugin updates: ${plugins} • Layout: ${prefs.layoutMode}`;
+    return `Live polling: ${live} • Layout: ${prefs.layoutMode}`;
   };
 
   const handleResetAll = async () => {

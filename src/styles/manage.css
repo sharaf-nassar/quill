@@ -208,7 +208,6 @@
  * pane, and let it fill the available height (overriding its 100vh wrapper). */
 .manage-content > .sessions-window,
 .manage-content > .learning-window,
-.manage-content > .plugins-window,
 .manage-content > .restart-window,
 .manage-content > .settings-window {
   flex: 1;
@@ -219,7 +218,6 @@
 }
 .manage-content .sessions-window-titlebar,
 .manage-content .learning-window-titlebar,
-.manage-content .plugins-window-titlebar,
 .manage-content .restart-window-titlebar,
 .manage-content .settings-window-titlebar {
   display: none;

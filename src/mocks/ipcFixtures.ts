@@ -116,8 +116,6 @@ const integrationFeatures: IntegrationFeatures = {
 const runtimeSettings: RuntimeSettings = {
   liveUsageEnabled: true,
   liveUsageIntervalSeconds: 180,
-  pluginUpdatesEnabled: true,
-  pluginUpdatesIntervalHours: 6,
   ruleWatcherEnabled: true,
   alwaysOnTop: true,
   crashReportingEnabled: false,
@@ -2682,11 +2680,6 @@ const fixtures: Record<string, FixtureHandler> = {
   add_custom_project: () => null,
   remove_custom_project: () => null,
   trigger_memory_optimization: () => null,
-  // plugins
-  get_installed_plugins: () => [],
-  get_marketplaces: () => [],
-  get_available_updates: () => ({ plugin_updates: [], last_checked: null, next_check: null }),
-  check_updates_now: () => ({ plugin_updates: [], last_checked: iso(0), next_check: isoIn(6 * H) }),
   // sessions
   search_sessions: () => searchResults,
   get_search_facets: () => searchFacets,

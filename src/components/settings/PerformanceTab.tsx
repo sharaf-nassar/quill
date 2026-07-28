@@ -379,45 +379,6 @@ export function PerformanceTab({ runtime }: PerformanceTabProps) {
         }
       />
 
-      <div className="settings-section-header">Plugin update checker</div>
-      <SettingRow
-        label="Check for plugin updates"
-        description="When ON, Quill polls Claude marketplaces in the background and surfaces an update badge on the plugins button."
-        control={
-          <Toggle
-            tone={settings.pluginUpdatesEnabled ? "on" : "off"}
-            pressed={settings.pluginUpdatesEnabled}
-            disabled={saving}
-            onClick={() =>
-              update({ pluginUpdatesEnabled: !settings.pluginUpdatesEnabled })
-            }
-          />
-        }
-      />
-      <SettingRow
-        label="Check interval (hours)"
-        description="Range 1–24."
-        control={
-          <input
-            type="number"
-            className="settings-input settings-input--narrow"
-            min={1}
-            max={24}
-            value={settings.pluginUpdatesIntervalHours}
-            onChange={(e) =>
-              update({
-                pluginUpdatesIntervalHours: clampInt(
-                  parseInt(e.target.value, 10),
-                  1,
-                  24,
-                ),
-              })
-            }
-            disabled={!settings.pluginUpdatesEnabled || saving}
-          />
-        }
-      />
-
       <div className="settings-section-header">Database maintenance</div>
       <SettingRow
         label="Compact database"

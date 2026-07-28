@@ -1112,10 +1112,6 @@ body {
   shape-rendering: geometricPrecision;
 }
 
-.view-tab--plugins {
-  position: relative;
-}
-
 /* Hairline divider between text tabs and the icon cluster */
 .view-tab-divider {
   width: 1px;

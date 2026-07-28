@@ -22,7 +22,6 @@ import "../styles/manage.css";
 // the active section's chunk is fetched.
 const SessionsSection = lazy(() => import("./SessionsWindowView"));
 const LearningSection = lazy(() => import("./LearningWindow"));
-const PluginsSection = lazy(() => import("./PluginsWindowView"));
 const InstancesSection = lazy(() => import("./RestartWindowView"));
 const SettingsSection = lazy(() => import("./SettingsWindowView"));
 
@@ -50,14 +49,6 @@ const SessionsIcon = () => (
 const LearningIcon = () => (
   <svg {...SVG}>
     <path d="M7 1.5L8.4 5.6 12.5 7 8.4 8.4 7 12.5 5.6 8.4 1.5 7 5.6 5.6Z" />
-  </svg>
-);
-const PluginsIcon = () => (
-  <svg {...SVG}>
-    <rect x="2.5" y="2.5" width="3.6" height="3.6" rx="0.5" />
-    <rect x="7.9" y="2.5" width="3.6" height="3.6" rx="0.5" />
-    <rect x="2.5" y="7.9" width="3.6" height="3.6" rx="0.5" />
-    <rect x="7.9" y="7.9" width="3.6" height="3.6" rx="0.5" />
   </svg>
 );
 const InstancesIcon = () => (
@@ -97,7 +88,6 @@ const CloseIcon = () => (
 export type ManageSection =
   | "sessions"
   | "learning"
-  | "plugins"
   | "instances"
   | "settings";
 
@@ -109,7 +99,7 @@ interface SectionDef {
 }
 
 // Memory + Runs stay under Learning (per the confirmed brief), so the rail is
-// five flat items.
+// four flat items.
 const SECTIONS: SectionDef[] = [
   {
     id: "sessions",
@@ -122,12 +112,6 @@ const SECTIONS: SectionDef[] = [
     label: "Learning",
     desc: "Learned rules, memory optimization, and analysis run history.",
     Icon: LearningIcon,
-  },
-  {
-    id: "plugins",
-    label: "Plugins",
-    desc: "Install, enable, and update agent plugins and marketplaces.",
-    Icon: PluginsIcon,
   },
   {
     id: "instances",
@@ -390,8 +374,6 @@ function ManageWindowView() {
               <SessionsSection />
             ) : active === "learning" ? (
               <LearningSection />
-            ) : active === "plugins" ? (
-              <PluginsSection />
             ) : active === "instances" ? (
               <InstancesSection />
             ) : (
