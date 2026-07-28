@@ -1,5 +1,6 @@
 [package]
 name = "quill"
+default-run = "quill"
 version = "0.0.0-injected-by-ci"
 edition = "2024"
 

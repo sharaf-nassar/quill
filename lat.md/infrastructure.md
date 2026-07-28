@@ -20,6 +20,9 @@ mode with ESNext modules and bundler resolution. See `vite.config.ts` and
 
 Rust edition 2024 uses the pinned `rust-toolchain.toml` compiler version. Crate types: `lib`, `cdylib`, `staticlib`. `build.rs` calls `tauri_build::build()`.
 
+The `quill` app binary is Cargo's default run target; maintenance spikes under
+`src-tauri/src/bin/` remain explicit `cargo run --bin <name>` targets.
+
 The bundled SQLite driver (`rusqlite` with `bundled` feature) avoids system dependency issues. Tauri bundles Claude and Codex integration assets as app resources.
 
 ### Tauri Configuration
