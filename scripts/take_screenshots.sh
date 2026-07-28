@@ -3,10 +3,10 @@
 # Requires: xdotool, import (imagemagick)
 #
 # Quill titlebar buttons (left to right):
-#   Live | Analytics | 🧠 (Learning) | ⌕ (Sessions) | ⚙ (Plugins) | ↻ (Restart) | [close]
+#   Live | Analytics | 🧠 (Learning) | ⌕ (Sessions) | ↻ (Restart) | [close]
 #
 # Secondary windows open as separate Tauri windows with titles:
-#   "Learning", "Session Search", "Plugin Manager"
+#   "Learning", "Session Search"
 set -euo pipefail
 
 OUTDIR="${OUTDIR:-$(cd "$(dirname "$0")/.." && pwd)/marketing-site/assets/screenshots}"
@@ -106,7 +106,6 @@ BTN_LIVE=25
 BTN_ANALYTICS=65
 BTN_LEARNING=100
 BTN_SESSIONS=125
-BTN_PLUGINS=150
 # BTN_RESTART=175  # not captured as a screenshot currently
 
 # ── 1. Hero / Live view (default) ─────────────────────────────────────────────
@@ -117,7 +116,7 @@ BTN_PLUGINS=150
 # site's per-section mapping clean while avoiding a second capture round.
 
 echo ""
-echo "[1/7] hero.png + live.png"
+echo "[1/6] hero.png + live.png"
 xdotool windowactivate --sync "$QUILL_WID"
 sleep 0.3
 # Click Live to ensure it is the active pane.
@@ -130,7 +129,7 @@ log "Saved: $OUTDIR/live.png (copy of hero.png)"
 # ── 2. Analytics – Now tab ────────────────────────────────────────────────────
 
 echo ""
-echo "[2/7] analytics-now.png (Now tab)"
+echo "[2/6] analytics-now.png (Now tab)"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_ANALYTICS" "$TITLEBAR_Y"
 sleep "$DELAY_SHORT"
@@ -142,7 +141,7 @@ capture "$OUTDIR/analytics-now.png" "$QUILL_WID"
 # ── 3. Analytics – Charts tab ─────────────────────────────────────────────────
 
 echo ""
-echo "[3/7] analytics-charts.png (Charts tab)"
+echo "[3/6] analytics-charts.png (Charts tab)"
 # The tab bar sits below the titlebar (~50px from top).
 # Tab order: Now | Charts | Trends | Context (last; appears only when context preservation is on)
 # "Charts" tab is approximately the second pill (~25% from left of window).
@@ -155,7 +154,7 @@ capture "$OUTDIR/analytics-charts.png" "$QUILL_WID"
 # ── 4. Analytics – Context tab ────────────────────────────────────────────────
 
 echo ""
-echo "[4/7] analytics-context.png (Context tab)"
+echo "[4/6] analytics-context.png (Context tab)"
 # Context tab is rightmost in the Analytics tab bar. It is only present when
 # Working Context Preservation is enabled in Settings or historical events exist.
 # In the demo dataset both conditions hold, so the tab is reliably reachable.
@@ -173,7 +172,7 @@ sleep 0.3
 # ── 5. Learning panel ─────────────────────────────────────────────────────────
 
 echo ""
-echo "[5/7] learning.png"
+echo "[5/6] learning.png"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_LEARNING" "$TITLEBAR_Y"
 LEARN_WID=$(wait_for_window "Learning" 8)
@@ -185,7 +184,7 @@ close_window_by_id "$LEARN_WID"
 # ── 5. Session Search ─────────────────────────────────────────────────────────
 
 echo ""
-echo "[6/7] sessions.png"
+echo "[6/6] sessions.png"
 xdotool windowactivate --sync "$QUILL_WID"
 click_offset "$QUILL_WID" "$BTN_SESSIONS" "$TITLEBAR_Y"
 SESSIONS_WID=$(wait_for_window "Session Search" 8)
@@ -194,18 +193,7 @@ sleep "$DELAY_WINDOW"
 capture "$OUTDIR/sessions.png" "$SESSIONS_WID"
 close_window_by_id "$SESSIONS_WID"
 
-# ── 6. Plugin Manager ─────────────────────────────────────────────────────────
-
 echo ""
-echo "[7/7] plugins.png"
-xdotool windowactivate --sync "$QUILL_WID"
-click_offset "$QUILL_WID" "$BTN_PLUGINS" "$TITLEBAR_Y"
-PLUGINS_WID=$(wait_for_window "Plugin Manager" 8)
-xdotool windowactivate --sync "$PLUGINS_WID"
-sleep "$DELAY_WINDOW"
-capture "$OUTDIR/plugins.png" "$PLUGINS_WID"
-close_window_by_id "$PLUGINS_WID"
-
 # ── Done ──────────────────────────────────────────────────────────────────────
 
 echo ""

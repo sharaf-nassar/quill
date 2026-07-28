@@ -3,6 +3,6 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[architecture]] — Tech stack, multi-window design, module map, communication layers
 - [[frontend]] — React components, custom hooks, state management, types, styling
 - [[backend]] — Rust modules, database schema, HTTP API, IPC commands, events
-- [[features]] — Live usage, analytics, learning, session search, plugins, restart, memory optimizer
-- [[data-flow]] — Token reporting, learning analysis, session indexing, memory optimization, plugin management
+- [[features]] — Live usage, analytics, learning, session search, restart, memory optimizer
+- [[data-flow]] — Token reporting, learning analysis, session indexing, and memory optimization
 - [[infrastructure]] — CI/CD pipeline, release process, build config, code quality, scripts

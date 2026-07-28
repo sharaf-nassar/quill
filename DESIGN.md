@@ -141,7 +141,7 @@ gauges-as-decoration, no aviation cosplay.
 The system runs in **two densities of the same instrument.** The **Primary Flight
 Display (PFD)** — the always-on-top live analytics — is maximally dense: 11px type,
 hairline dividers, tabular numerics, semantic meters you read at a glance while you
-fly. The **Systems Pages** — session search, learning, plugins, agents, memory,
+fly. The **Systems Pages** — session search, learning, agents, memory,
 settings — are the same instrument zoomed out: roomier spacing, larger hit targets,
 visible labels, one task per view. Same tokens, same control vocabulary, inverted
 spacing. The PFD is for monitoring; the Systems Pages are for managing. Nothing

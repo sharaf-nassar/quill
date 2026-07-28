@@ -1,6 +1,6 @@
 # Architecture
 
-Quill is a cross-platform Claude Code and Codex companion built with Tauri (Rust) and React. It tracks usage, analytics, behavioral patterns, plugins, session history, and provider integrations.
+Quill is a cross-platform Claude Code and Codex companion built with Tauri (Rust) and React. It tracks usage, analytics, behavioral patterns, session history, and provider integrations.
 
 ## Tech Stack
 
@@ -21,7 +21,7 @@ The Sessions, Learning, Restart, and Settings management surfaces are consolidat
 
 ### Window Configuration
 
-The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `manage`, `runs`, `sessions`, `learning`, `plugins`, `restart`, `settings`, and `release-notes`.
+The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `manage`, `runs`, `sessions`, `learning`, `restart`, `settings`, and `release-notes`.
 
 The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls, a centered static `QUILL` brand label, and a right-aligned cluster with a settings button that opens the Settings window, followed by the version and close controls.
 
@@ -86,7 +86,7 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 Backend pushes real-time updates to the frontend via `emit()`.
 
-Current events include `tokens-updated`, `learning-updated`, `learning-log`, `plugin-changed`, `restart-status-changed`, `integrations-updated`, `indicator-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
+Current events include `tokens-updated`, `learning-updated`, `learning-log`, `restart-status-changed`, `integrations-updated`, `indicator-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
 
 ## Background Tasks
 
@@ -96,7 +96,6 @@ All tasks that touch the database or network MUST be spawned async — never blo
 
 - **Hourly cleanup**: Aggregates snapshots into hourly tables, prunes old data, compresses observations
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
-- **Plugin update checker**: Polls marketplaces for available updates. Both the master enable flag (`plugin_updates.enabled`) and the interval (`plugin_updates.interval_hours`, 1–24, default 4) are read from the settings table on every tick so the [[features#Settings Window]] can adjust both at runtime without a restart.
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
 - **Live usage refresh**: Background loop that updates the main widget and tray summary rows. The enable flag (`live_usage.enabled`) and refresh interval (`live_usage.interval_seconds`, 60–600, default 180) are read from the settings table on every iteration so the [[features#Settings Window]] can adjust both at runtime.
 - **Transcript rescan loop**: Always-on incremental rescan of both transcript roots (`~/.claude/projects/` and `~/.codex/sessions/**`) via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Each tick enumerates candidates and enqueues only sources whose mtime advanced past the previous tick's in-memory watermark (seeded to startup time so the full startup walk is not redone), feeding them into the same live-reconcile queue the notify hook uses. The enable flag (`transcript_rescan.enabled`, default true) and interval (`transcript_rescan.interval_seconds`, 60–600, default 120) are read from the settings table on every tick; these are backend-only keys, not part of [[features#Settings Window]]. Unchanged sources are a cheap stat-only no-op in the queue's freshness classifier, so over-enqueueing never re-parses a file.

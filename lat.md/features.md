@@ -1,6 +1,6 @@
 # Features
 
-Quill provides live usage monitoring, analytics, behavioral learning, session search, working-context preservation, plugin management, memory optimization, and restart orchestration.
+Quill provides live usage monitoring, analytics, behavioral learning, session search, working-context preservation, memory optimization, and restart orchestration.
 
 ## Live Usage View
 
@@ -321,7 +321,7 @@ Top-tabs navigation hosts five panels: General, Integrations, Context, Learning,
 | Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form |
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
 | Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
-| Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), plugin update checker enable + interval (1–24h), manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
+| Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
 
 ### Database Compaction
 
@@ -349,7 +349,7 @@ The [[src/hooks/useUiPrefs.ts#useUiPrefs]] hook writes localStorage and emits a 
 
 Always-on background tasks expose enable/interval toggles through a single `RuntimeSettings` IPC pair.
 
-[[src-tauri/src/lib.rs#get_runtime_settings]] and [[src-tauri/src/lib.rs#set_runtime_settings]] persist `live_usage.enabled`, `live_usage.interval_seconds`, `plugin_updates.enabled`, `plugin_updates.interval_hours`, `rule_watcher.enabled`, `always_on_top`, and `crash_reporting.enabled` in the SQLite settings table. Live values are read on every iteration of the live-usage loop and the plugin-update checker so changes take effect on the next tick. The rule watcher reads its flag once at startup since `notify` holds an OS handle. Changing `always_on_top` calls `WebviewWindow::set_always_on_top` on the main window; toggling `crash_reporting.enabled` calls [[src-tauri/src/crash_reporting.rs#set_enabled]] which (re)initializes or drops the Sentry `ClientInitGuard` immediately; other runtime saves do not touch the main window's topmost/focus state. After every save the backend emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] keeps any open Settings windows in sync.
+[[src-tauri/src/lib.rs#get_runtime_settings]] and [[src-tauri/src/lib.rs#set_runtime_settings]] persist `live_usage.enabled`, `live_usage.interval_seconds`, `rule_watcher.enabled`, `always_on_top`, and `crash_reporting.enabled` in the SQLite settings table. Live values are read on every iteration of the live-usage loop. The rule watcher reads its flag once at startup since `notify` holds an OS handle. Changing `always_on_top` calls `WebviewWindow::set_always_on_top` on the main window; toggling `crash_reporting.enabled` calls [[src-tauri/src/crash_reporting.rs#set_enabled]] which (re)initializes or drops the Sentry `ClientInitGuard` immediately; other runtime saves do not touch the main window's topmost/focus state. After every save the backend emits `runtime-settings-updated` so [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]] keeps any open Settings windows in sync.
 
 ### MiniMax API Key Update
 

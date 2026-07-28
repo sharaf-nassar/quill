@@ -78,11 +78,6 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 - Context tools (only when context preservation is enabled): see the Working context preservation section above
 - Automatically configured when the app starts — no manual setup needed
 
-### Plugin manager
-- Browse, install, update, and remove Claude Code plugins from a marketplace
-- View installed plugins, available updates, and manage marketplaces
-- Opens in a dedicated window from the titlebar
-
 ### Restart orchestrator
 - Monitor and restart Claude Code instances from within Quill
 - Detects terminal type (Tmux, Plain) and tracks instance status
@@ -117,13 +112,13 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
     <td><img src="screenshots/session-search.png" width="300" alt="Session search with filters and highlighted results" /></td>
   </tr>
   <tr>
-    <td align="center"><strong>Plugin manager</strong></td>
     <td align="center"><strong>Restart orchestrator</strong></td>
+    <td></td>
     <td></td>
   </tr>
   <tr>
-    <td><img src="screenshots/plugins.png" width="300" alt="Plugin manager with installed plugins, marketplace, and update tabs" /></td>
     <td><img src="screenshots/restart.png" width="280" alt="Restart panel showing Claude Code instances with idle/processing status" /></td>
+    <td></td>
     <td></td>
   </tr>
 </table>
@@ -349,7 +344,6 @@ cargo tauri dev
 - **Analytics tab** to toggle the analytics view
 - **Brain icon (🧠)** to open the learning window
 - **Search icon (⌕)** to open the session search window
-- **Plugin icon (⚙)** to open the plugin manager — shows a badge when updates are available
 - **Restart icon (↻)** to open the restart panel
 - **System tray icon** — left-click to show the widget; menu has Always on Top, Check for Update, and Quit
 - **Ctrl+/- (or Cmd+/-)** to zoom in/out across all windows
@@ -362,7 +356,7 @@ src/                          # React frontend
   App.tsx                     # Main app component with tiling layout
   types.ts                    # Shared TypeScript interfaces
   components/
-    TitleBar.tsx              # Custom titlebar (drag, view toggles, plugins, restart, update)
+    TitleBar.tsx              # Custom titlebar (drag, view toggles, restart, update)
     SectionHeader.tsx         # Reusable collapsible section header
     UsageRow.tsx              # Usage row with progress bar + token sparkline
     UsageDisplay.tsx          # Container for all usage rows
@@ -401,19 +395,12 @@ src/                          # React frontend
       FilterBar.tsx           # Collapsible filters (project, host, role, date)
       ResultCard.tsx          # Search result with expandable context
       DetailPanel.tsx         # Session detail view
-    plugins/
-      PluginsTabs.tsx         # Plugin manager tab navigation
-      BrowseTab.tsx           # Marketplace browser
-      InstalledTab.tsx        # Installed plugins list
-      UpdatesTab.tsx          # Available updates list
-      MarketplacesTab.tsx     # Marketplace sources management
     restart/
       RestartPanel.tsx        # Claude Code instance restart panel
   windows/
     LearningWindow.tsx        # Learning panel window
     RunsWindowView.tsx        # Standalone run history window
     SessionsWindowView.tsx    # Session search window
-    PluginsWindowView.tsx     # Plugin manager window
     RestartWindowView.tsx     # Restart orchestrator window
   hooks/
     useAnalyticsData.ts       # Fetches utilization history and stats
@@ -431,7 +418,6 @@ src/                          # React frontend
     useCacheEfficiency.ts     # Cache efficiency calculations
     useResponseTimeStats.ts   # Response time and idle time stats
     useContextSavingsStats.ts # Context preservation telemetry aggregates
-    usePluginData.ts          # Plugin list, updates, marketplace data
     useToast.tsx              # Toast notification system
   utils/
     time.ts                   # Relative time formatting
@@ -442,7 +428,6 @@ src/                          # React frontend
     index.css                 # Global styles + dark theme
     learning.css              # Learning panel styles
     sessions.css              # Session search styles
-    plugins.css               # Plugin manager styles
     restart.css               # Restart panel styles
 src-tauri/                    # Rust backend
   src/
@@ -457,7 +442,6 @@ src-tauri/                    # Rust backend
     learning.rs               # Learning analysis spawner
     memory_optimizer.rs       # Memory file scanning, LLM analysis, and suggestion execution
     models.rs                 # Data models (usage buckets + token + learning types)
-    plugins.rs                # Plugin management and marketplace integration
     prompt_utils.rs           # Prompt sanitization utilities
     restart.rs                # Claude Code instance restart management
     sessions.rs               # Tantivy full-text session search and indexing

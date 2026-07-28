@@ -15,16 +15,16 @@ Three Tauri windows are routed by the `?view=` URL parameter, each with its own 
 | Route | Component | Purpose |
 |-------|-----------|---------|
 | `?view=main` (default) | [[src/App.tsx]] | Split-pane live + analytics |
-| `?view=manage` | [[src/windows/ManageWindowView.tsx]] | Rail-navigated Manage workspace; the five tool UIs (Sessions, Learning, Plugins, Instances, Settings) embedded as sections |
+| `?view=manage` | [[src/windows/ManageWindowView.tsx]] | Rail-navigated Manage workspace; four tool UIs (Sessions, Learning, Instances, Settings) embedded as sections |
 | `?view=release-notes` | `ReleaseNotesWindow` | Browse published GitHub release notes |
 
-The former per-tool windows (`sessions`, `learning`, `plugins`, `restart`, `runs`, `settings`) were retired into Manage sections, and run history folded into the Learning section. All three remaining routes are reachable without an enabled provider — the Manage workspace gates each tool section inline (Settings always renders), so the former `BlockedWindow` per-window provider-blocking was removed.
+The former per-tool windows (`sessions`, `learning`, `restart`, `runs`, `settings`) were retired into Manage sections, and run history folded into the Learning section. All three remaining routes are reachable without an enabled provider — the Manage workspace gates each tool section inline (Settings always renders), so the former `BlockedWindow` per-window provider-blocking was removed.
 
 ## Manage Workspace
 
 `?view=manage` ([[src/windows/ManageWindowView.tsx]]) is a single rail-navigated window that consolidates the former tool windows into the "Systems Pages" half of the monitor-vs-manage split. It is opened from the PFD titlebar's un-gated Tools button.
 
-The left rail has five flat sections — Sessions, Learning (Rules / Memory / Runs), Plugins, Instances (instance restart), and Settings — with a signal-blue active indicator and a footer "Live" affordance back to the PFD. The active section persists to `localStorage` (`quill-manage-section`) and accepts a `?section=` deep-link (the titlebar cog opens `manage` at Settings). It uses the roomier Systems-Pages density and the Glass Cockpit tokens from DESIGN.md. Each section's content reuses the tool's existing window-view component, lazy-loaded and rendered with its own window chrome (titlebar/close) suppressed via `manage.css`; provider-dependent sections (Sessions, Learning, Plugins, Instances) show an inline no-provider state while Settings stays reachable. The Learning section's Runs toggle opens run history as an inline right-docked panel (folded in from the former floating `runs` window). The standalone tool windows, their `?view=` routes, and capabilities entries have been retired. A rail Search affordance and `⌘K` / `Ctrl K` open the [[src/components/CommandPalette.tsx]] — a substring-filtered list of the five sections plus Back-to-Live and Close-Tools actions, navigated with arrow keys and Enter. The titlebar, its launcher button, and the palette's Close action display the label "Tools"; the window label, `?view=manage` route, `manage.css`, and component names are unchanged.
+The left rail has four flat sections — Sessions, Learning (Rules / Memory / Runs), Instances (instance restart), and Settings — with a signal-blue active indicator and a footer "Live" affordance back to the PFD. The active section persists to `localStorage` (`quill-manage-section`) and accepts a `?section=` deep-link (the titlebar cog opens `manage` at Settings). It uses the roomier Systems-Pages density and the Glass Cockpit tokens from DESIGN.md. Each section's content reuses the tool's existing window-view component, lazy-loaded and rendered with its own window chrome (titlebar/close) suppressed via `manage.css`; provider-dependent sections (Sessions, Learning, Instances) show an inline no-provider state while Settings stays reachable. The Learning section's Runs toggle opens run history as an inline right-docked panel (folded in from the former floating `runs` window). The standalone tool windows, their `?view=` routes, and capabilities entries have been retired. A rail Search affordance and `⌘K` / `Ctrl K` open the [[src/components/CommandPalette.tsx]] — a substring-filtered list of the four sections plus Back-to-Live and Close-Tools actions, navigated with arrow keys and Enter. The titlebar, its launcher button, and the palette's Close action display the label "Tools"; the window label, `?view=manage` route, `manage.css`, and component names are unchanged.
 
 ## Browser Mock Mode
 
@@ -267,15 +267,6 @@ an invariant instead of an edit:
 The 30-day cap is what makes the three range-based readers provably unaffected,
 so an unbounded range is precisely the change that breaks the proof.
 
-### Plugin Components
-
-Plugin management UI in `src/components/plugins/` with four tabs.
-
-- **InstalledTab** — Plugin list with enable/disable controls.
-- **BrowseTab** — Available plugins from connected marketplaces.
-- **MarketplacesTab** — Add, remove, refresh marketplace repos.
-- **UpdatesTab** — Available updates with bulk update support.
-
 ### Restart Component
 
 Controls for restarting Claude Code instances from the dedicated Restart window.
@@ -299,7 +290,7 @@ Five hooks back the [[features#Settings Window]]: each owns one slice of state, 
 | Hook | File | Source of truth | Listens for |
 |------|------|-----------------|-------------|
 | `useIntegrationFeatures` | [[src/hooks/useIntegrationFeatures.ts]] | `IntegrationFeatures` global flags (context preservation, activity tracking, context telemetry) | `integration-features-updated` |
-| `useRuntimeSettings` | [[src/hooks/useRuntimeSettings.ts]] | `RuntimeSettings` background-task tunings (live-usage interval, plugin-update interval, rule watcher, always-on-top) | `runtime-settings-updated` |
+| `useRuntimeSettings` | [[src/hooks/useRuntimeSettings.ts]] | `RuntimeSettings` background-task tunings (live-usage interval, rule watcher, always-on-top) | `runtime-settings-updated` |
 | `useLearningSettings` | [[src/hooks/useLearningSettings.ts]] | `LearningSettings` (trigger mode, periodic interval, thresholds) | None — read on mount and after save |
 | `useUiPrefs` | [[src/hooks/useUiPrefs.ts]] | `UiPrefs` localStorage values (layout mode, time mode, panel visibility) | `ui-prefs-updated` (frontend-emitted across windows) |
 | `useRetentionPolicy` | [[src/hooks/useRetentionPolicy.ts]] | `RetentionPolicy` (window, watermark, last run) via `get_retention_policy` / `set_retention_policy` | `retention-maintenance-finished` |
@@ -345,7 +336,6 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useLearningData` | Rules, runs, settings, observations, logs | Multiple learning commands + events |
 | `useMemoryData` | Memory files, suggestions, projects | Multiple memory optimizer commands |
 | `useSessionCodeStats` | Batch LOC stats per session (ref-cached) | `get_batch_session_code_stats` |
-| `usePluginData` | Installed plugins, marketplaces, updates | Multiple plugin commands |
 | `useCacheEfficiency` | Cache hit rate (derived from token history) | None (derived) |
 | `useContextSavingsStats` | Context savings summary, time series, breakdowns, and recent events; subscribes to `context-savings-updated`. Powers both the [[features#Analytics Dashboard#Context Tab]] strip and the right column of [[features#Analytics Dashboard#Now Tab]]. | `get_context_savings_analytics` |
 | `useSessionSubagents` | Per-`(provider, session_id)` lazy sub-agent tree state for the Sessions breakdown's expandable rows; caches results so collapse/re-expand never refetches | `get_session_subagent_tree` |
@@ -408,9 +398,9 @@ React Context providers used across the frontend for shared state.
 
 [[src/types.ts]] contains shared TypeScript types mirroring the Rust models in [[src-tauri/src/models.rs]].
 
-Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), context savings (`ContextSavingsAnalytics`, `ContextSavingsEvent`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), plugins (`InstalledPlugin`, `Marketplace`, `PluginUpdate`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
+Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), context savings (`ContextSavingsAnalytics`, `ContextSavingsEvent`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
 
-Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`, `PluginsTab`. `RangeType` carries the all-range retention invariant in its doc comment, and `SessionBreakdown.subagent_count` / `SessionCodeStats` carry their retention degradation notes — both described in [[frontend#Frontend#Components#Retention Degradation]].
+Display enums: `TimeMode`, `RangeType`, `TrendType`, `BreakdownMode`, `SortMode`, `AnalyticsTab`. `RangeType` carries the all-range retention invariant in its doc comment, and `SessionBreakdown.subagent_count` / `SessionCodeStats` carry their retention degradation notes — both described in [[frontend#Frontend#Components#Retention Degradation]].
 
 Retention types (`RetentionPolicy`, `RetentionPreview`, `RetentionAuditRecord`, `RetentionMaintenanceProgress`, `RetentionMaintenanceResult`) mirror [[src-tauri/src/retention.rs]] and keep snake_case because they arrive straight off `invoke()` with no mapping layer.
 
@@ -428,7 +418,7 @@ Both are vendored from the `geist` npm package into `src/assets/fonts/` (`Geist-
 
 The canonical palette lives as `:root` CSS custom properties in `src/styles/index.css`, following DESIGN.md. Because [[src/main.tsx]] loads `index.css` for every window, these tokens are global to all stylesheets.
 
-Tokens cover backgrounds (`--console-black`, `--panel-deep`, `--panel-raised`, `--card-graphite`, `--slate-input`, `--graphite-line`), text (`--readout`, `--readout-bright`, `--label`, `--label-faint`), the status meter (`--meter-green` / `--meter-amber` / `--meter-red`), accents (`--signal-blue` / `--signal-cyan` / `--signal-violet` / `--signal-orchid`), provider identity (`--provider-claude` / `--provider-codex` / `--provider-minimax` / `--provider-agent`), and `--radius-*` / `--space-*` scales. Every window stylesheet reads its palette from these vars. The former Tokyo-night palette (plugin and restart windows), the divergent green and lifecycle colors (learning window), and the GitHub-dark insight-card/tooltip sub-palette plus assorted near-whites (`index.css`, `settings.css`) have all been unified onto the canonical tokens. The only remaining color literals are neutral white/black alpha — the dimming ladder — and one intentional lighter-green toggle-hover tint.
+Tokens cover backgrounds (`--console-black`, `--panel-deep`, `--panel-raised`, `--card-graphite`, `--slate-input`, `--graphite-line`), text (`--readout`, `--readout-bright`, `--label`, `--label-faint`), the status meter (`--meter-green` / `--meter-amber` / `--meter-red`), accents (`--signal-blue` / `--signal-cyan` / `--signal-violet` / `--signal-orchid`), provider identity (`--provider-claude` / `--provider-codex` / `--provider-minimax` / `--provider-agent`), and `--radius-*` / `--space-*` scales. Every window stylesheet reads its palette from these vars. The former Tokyo-night palette and divergent green and lifecycle colors, plus the GitHub-dark insight-card/tooltip sub-palette and assorted near-whites (`index.css`, `settings.css`) have all been unified onto the canonical tokens. The only remaining color literals are neutral white/black alpha — the dimming ladder — and one intentional lighter-green toggle-hover tint.
 
 ### Stylesheets
 
@@ -439,7 +429,6 @@ Per-window CSS files under `src/styles/`, each scoped to a specific feature doma
 | `src/styles/index.css` | 3,798 | Global styles, main window, analytics, layout toggle |
 | `src/styles/learning.css` | 940 | Learning window and components |
 | `src/styles/sessions.css` | 498 | Session search window |
-| `src/styles/plugins.css` | 847 | Plugin manager |
 | `src/styles/restart.css` | 356 | Restart window |
 
 ### Color System
