@@ -82,5 +82,36 @@ transfer approval.
 
 `synthetic-smoke --workspace <private-dir>` exercises the existing fixture and
 emits a non-sensitive checklist; timing is never corpus evidence. `dbstat`
-accepts only identity-verified scratch and produces private capability data;
-real execution and retain/reject disposition remain deferred.
+accepts only an identity-verified scratch and produces private object totals.
+
+After timing-sensitive replay completes, create two fresh, separate page-backup
+snapshots for the before/after footprint comparison. Never reuse a replay copy:
+the full `dbstat` page walk would otherwise perturb replay timing. Run the
+paired study exactly once; it performs exactly three controlled warm
+repetitions, priming both snapshots with the fixed query set before each timed
+walk. Its cancellation probe is separately labeled and is not a fourth
+controlled repetition.
+
+```text
+cargo run --release --bin retention_corpus -- \
+  dbstat-study --manifest <private-manifest.json> \
+  --before-scratch <private-before.db> --after-scratch <private-after.db> \
+  --cancel-marker <private-path> \
+  --actionable-object <object-with-a-recorded-storage-lever>
+```
+
+The private result records each page-walk wall time and incremental RSS;
+object b-tree, freelist, unattributed/non-btree, WAL, and SHM bytes; per-object
+before/after deltas; and cancellation latency. It requires exact zero-tolerance
+reconciliation: `main + WAL + SHM = object b-tree + freelist + unattributed +
+WAL + SHM`.
+
+The capability is `retain` only when all six paired walks (three repetitions)
+are at most 2,616 ms, RSS is at most 64 MiB, cancellation is observed within
+1,000 ms, every reconciliation is exact, and placement remains the offline
+maintainer path outside setup, UI, and quiesce. Any unavailable measurement or
+failed predicate is `reject`. The command only reports whether a future product
+follow-up is eligible: it never creates a Beads task or exposes a product
+surface. Eligibility also requires a retained capability, at least 90% of the
+measured database-byte delta explained by object deltas, and an operator-recorded
+actionable object occupying at least 5% of the before file.

@@ -4,9 +4,9 @@
 //! repository-local protocol surface, not a product CLI.
 
 use quill_lib::retention_study::{
-    ApprovalRecord, DbstatRequest, ProfileRequest, ReplayRequest, ReportRequest, StudyCancellation,
-    SyntheticSmokeRequest, measure_dbstat, profile_source, render_scrubbed_report,
-    run_replay_matrix, run_synthetic_smoke,
+    ApprovalRecord, DbstatRequest, DbstatStudyRequest, ProfileRequest, ReplayRequest,
+    ReportRequest, StudyCancellation, SyntheticSmokeRequest, measure_dbstat, measure_dbstat_study,
+    profile_source, render_scrubbed_report, run_replay_matrix, run_synthetic_smoke,
 };
 use std::{env, fs::File, path::PathBuf, process};
 
@@ -30,7 +30,7 @@ fn read_approval(path: PathBuf) -> Result<ApprovalRecord, String> {
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(|| {
-        "missing subcommand: profile | replay | render-report | synthetic-smoke | dbstat"
+        "missing subcommand: profile | replay | render-report | synthetic-smoke | dbstat | dbstat-study"
             .to_string()
     })?;
     match command.as_str() {
@@ -114,9 +114,38 @@ fn run() -> Result<(), String> {
                 println!("{name}: {bytes}");
             }
         }
+        "dbstat-study" => {
+            let manifest = required_path(&mut args, "--manifest")?;
+            let before_scratch = required_path(&mut args, "--before-scratch")?;
+            let after_scratch = required_path(&mut args, "--after-scratch")?;
+            let marker = required_path(&mut args, "--cancel-marker")?;
+            let mut actionable_objects = Vec::new();
+            while let Some(flag) = args.next() {
+                if flag != "--actionable-object" {
+                    return Err("unexpected dbstat-study argument".into());
+                }
+                actionable_objects.push(
+                    args.next()
+                        .ok_or_else(|| "--actionable-object needs an object name".to_string())?,
+                );
+            }
+            let result = measure_dbstat_study(DbstatStudyRequest {
+                manifest: &manifest,
+                before_scratch: &before_scratch,
+                after_scratch: &after_scratch,
+                cancellation: StudyCancellation::from_marker(&marker),
+                actionable_objects: &actionable_objects,
+            })
+            .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result)
+                    .map_err(|error| format!("serialize dbstat study: {error}"))?
+            );
+        }
         _ => {
             return Err(
-                "unknown subcommand: profile | replay | render-report | synthetic-smoke | dbstat"
+                "unknown subcommand: profile | replay | render-report | synthetic-smoke | dbstat | dbstat-study"
                     .into(),
             );
         }
