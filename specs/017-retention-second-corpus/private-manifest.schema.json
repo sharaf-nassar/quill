@@ -17,7 +17,6 @@
     "source_after_reads": { "$ref": "#/$defs/inventory" },
     "profile_backup": { "$ref": "#/$defs/backup" },
     "cleanup_disposition": { "type": "string", "minLength": 1 },
-    "dbstat": { "$ref": "#/$defs/dbstat_study" },
     "matrix": {
       "type": "array",
       "items": { "$ref": "#/$defs/observation" }
@@ -239,78 +238,6 @@
           "additionalProperties": false
         }
       ]
-    },
-    "dbstat_object": {
-      "type": "object",
-      "required": ["name", "bytes"],
-      "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "bytes": { "type": "integer", "minimum": 0 }
-      },
-      "additionalProperties": false
-    },
-    "dbstat_totals": {
-      "type": "object",
-      "required": ["main_database_bytes", "wal_bytes", "shm_bytes", "dbstat_page_bytes", "object_btree_bytes", "freelist_bytes", "unattributed_non_btree_bytes", "reconciliation_exact", "objects"],
-      "properties": {
-        "main_database_bytes": { "type": "integer", "minimum": 0 },
-        "wal_bytes": { "type": "integer", "minimum": 0 },
-        "shm_bytes": { "type": "integer", "minimum": 0 },
-        "dbstat_page_bytes": { "type": "integer", "minimum": 0 },
-        "object_btree_bytes": { "type": "integer", "minimum": 0 },
-        "freelist_bytes": { "type": "integer", "minimum": 0 },
-        "unattributed_non_btree_bytes": { "type": "integer", "minimum": 0 },
-        "reconciliation_exact": { "type": "boolean" },
-        "objects": { "type": "array", "items": { "$ref": "#/$defs/dbstat_object" } }
-      },
-      "additionalProperties": false
-    },
-    "dbstat_walk": {
-      "type": "object",
-      "required": ["snapshot", "wall_time_ms", "incremental_rss_bytes", "totals"],
-      "properties": {
-        "snapshot": { "enum": ["before_replay", "after_replay"] },
-        "wall_time_ms": { "type": "integer", "minimum": 0 },
-        "incremental_rss_bytes": { "type": ["integer", "null"] },
-        "totals": { "$ref": "#/$defs/dbstat_totals" }
-      },
-      "additionalProperties": false
-    },
-    "dbstat_repetition": {
-      "type": "object",
-      "required": ["run_ordinal", "before", "after"],
-      "properties": {
-        "run_ordinal": { "type": "integer", "minimum": 1, "maximum": 3 },
-        "before": { "$ref": "#/$defs/dbstat_walk" },
-        "after": { "$ref": "#/$defs/dbstat_walk" }
-      },
-      "additionalProperties": false
-    },
-    "dbstat_study": {
-      "type": "object",
-      "required": ["execution_placement", "repetitions", "cancellation", "object_deltas", "measured_before_after_delta_bytes", "object_delta_explained_bytes", "accounting_explained_percent", "capability_disposition", "capability_reasons", "product_follow_up_allowed", "product_follow_up_reasons"],
-      "properties": {
-        "execution_placement": { "const": "offline_maintainer_outside_setup_ui_quiesce" },
-        "repetitions": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/dbstat_repetition" } },
-        "cancellation": {
-          "type": "object",
-          "required": ["status", "latency_ms"],
-          "properties": {
-            "status": { "type": "string", "minLength": 1 },
-            "latency_ms": { "type": ["integer", "null"], "minimum": 0 }
-          },
-          "additionalProperties": false
-        },
-        "object_deltas": { "type": "array", "items": { "type": "object", "required": ["name", "before_bytes", "after_bytes", "delta_bytes"], "properties": { "name": { "type": "string" }, "before_bytes": { "type": "integer", "minimum": 0 }, "after_bytes": { "type": "integer", "minimum": 0 }, "delta_bytes": { "type": "integer" } }, "additionalProperties": false } },
-        "measured_before_after_delta_bytes": { "type": "integer" },
-        "object_delta_explained_bytes": { "type": "integer", "minimum": 0 },
-        "accounting_explained_percent": { "type": ["number", "null"], "minimum": 0 },
-        "capability_disposition": { "enum": ["retain", "reject"] },
-        "capability_reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-        "product_follow_up_allowed": { "type": "boolean" },
-        "product_follow_up_reasons": { "type": "array", "items": { "type": "string", "minLength": 1 } }
-      },
-      "additionalProperties": false
     }
   }
 }

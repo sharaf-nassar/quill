@@ -326,16 +326,8 @@ default. The separate renderer writes a new privacy-signed scrubbed report,
 suppresses category/month cells below 10, and keeps the real inventory, index
 drop copy, and synthetic timing fixture as distinct baselines. The
 `synthetic-smoke` command exercises fixture mechanics without generating
-second-corpus evidence. After timing-sensitive replay,
-`dbstat-study` takes two separate fresh scratch snapshots and runs exactly
-three fixed-primed paired warm repetitions, plus a separately labeled
-cancellation probe. It records full-page wall/RSS, object b-tree, freelist,
-unattributed/non-btree, WAL, SHM, and object deltas in the private manifest;
-zero-tolerance reconciliation and 2,616 ms, 1,000 ms cancellation, 64 MiB RSS,
-and offline-placement gates deterministically retain or reject the unsupported
-capability. A product follow-up remains only an eligibility result, requiring
-all retain gates, 90% object-delta explanation, and an operator-recorded
-actionable object at least 5% of the before file; no UI, IPC, or task is made.
+second-corpus evidence; `dbstat` remains an offline scratch-only capability
+pending real-corpus disposition.
 
 ### Retention fixture
 

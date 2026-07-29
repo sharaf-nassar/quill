@@ -16,12 +16,11 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -210,9 +209,6 @@ pub struct PrivateManifest {
     pub profile_backup: BackupRecord,
     pub cleanup_disposition: String,
     pub matrix: Vec<ReplayObservation>,
-    /// Private evidence for the separate post-replay `dbstat` study.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dbstat: Option<DbstatStudyResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,83 +361,6 @@ pub struct DbstatRequest<'a> {
     pub manifest: &'a Path,
     pub scratch: &'a Path,
     pub cancellation: StudyCancellation,
-}
-
-/// The two independent scratch snapshots used to price object accounting.
-/// They are supplied after the timing-sensitive replay and are never reused
-/// from that replay, so this full page walk cannot perturb replay timing.
-pub struct DbstatStudyRequest<'a> {
-    pub manifest: &'a Path,
-    pub before_scratch: &'a Path,
-    pub after_scratch: &'a Path,
-    pub cancellation: StudyCancellation,
-    /// Objects for which an operator has separately recorded an actionable
-    /// storage lever. This only permits a candidate; it never creates work.
-    pub actionable_objects: &'a [String],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DbstatObjectTotal {
-    pub name: String,
-    pub bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbstatTotals {
-    pub main_database_bytes: u64,
-    pub wal_bytes: u64,
-    pub shm_bytes: u64,
-    pub dbstat_page_bytes: u64,
-    pub object_btree_bytes: u64,
-    pub freelist_bytes: u64,
-    pub unattributed_non_btree_bytes: u64,
-    pub reconciliation_exact: bool,
-    pub objects: Vec<DbstatObjectTotal>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbstatWalk {
-    pub snapshot: String,
-    pub wall_time_ms: u64,
-    pub incremental_rss_bytes: Option<i64>,
-    pub totals: DbstatTotals,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbstatRepetition {
-    pub run_ordinal: u8,
-    pub before: DbstatWalk,
-    pub after: DbstatWalk,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbstatCancellationProbe {
-    pub status: String,
-    pub latency_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbstatObjectDelta {
-    pub name: String,
-    pub before_bytes: u64,
-    pub after_bytes: u64,
-    pub delta_bytes: i64,
-}
-
-/// Exact private evidence and deterministic disposition for the offline study.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbstatStudyResult {
-    pub execution_placement: String,
-    pub repetitions: Vec<DbstatRepetition>,
-    pub cancellation: DbstatCancellationProbe,
-    pub object_deltas: Vec<DbstatObjectDelta>,
-    pub measured_before_after_delta_bytes: i64,
-    pub object_delta_explained_bytes: u64,
-    pub accounting_explained_percent: Option<f64>,
-    pub capability_disposition: String,
-    pub capability_reasons: Vec<String>,
-    pub product_follow_up_allowed: bool,
-    pub product_follow_up_reasons: Vec<String>,
 }
 
 fn io_error(code: StudyErrorCode, action: &str, error: std::io::Error) -> StudyError {
@@ -915,7 +834,6 @@ pub fn profile_source(request: ProfileRequest<'_>) -> Result<PathBuf, StudyError
         profile_backup: backup,
         cleanup_disposition: "profile scratch removed by default".into(),
         matrix: Vec::new(),
-        dbstat: None,
     };
     write_manifest(&manifest_path, &manifest)?;
     remove_scratch(&scratch);
@@ -1361,12 +1279,20 @@ pub fn run_synthetic_smoke(
     ])
 }
 
-fn dbstat_connection(
-    scratch: &Path,
-    cancellation: &StudyCancellation,
-) -> Result<Connection, StudyError> {
+/// Walk `dbstat` only on an identity-verified scratch copy. This capability
+/// reports private facts; timing disposition is intentionally deferred.
+pub fn measure_dbstat(request: DbstatRequest<'_>) -> Result<Vec<(String, i64)>, StudyError> {
+    let manifest = read_manifest(request.manifest)?;
+    let scratch = canonical_existing(request.scratch, StudyErrorCode::SourceInvalid)?;
+    if identity(&scratch)? == identity(Path::new(&manifest.source.source_path))? {
+        return Err(StudyError::new(
+            StudyErrorCode::SourceAlias,
+            "dbstat scratch aliases the source",
+        ));
+    }
+    request.cancellation.check()?;
     let conn = Connection::open_with_flags(
-        scratch,
+        &scratch,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| {
@@ -1375,65 +1301,17 @@ fn dbstat_connection(
             format!("open dbstat scratch: {error}"),
         )
     })?;
-    let cancelled = Arc::clone(&cancellation.0);
-    conn.progress_handler(1_000, Some(move || cancelled.load(Ordering::Relaxed)));
-    Ok(conn)
-}
-
-#[cfg(target_os = "linux")]
-fn resident_bytes() -> Option<u64> {
-    let statm = fs::read_to_string("/proc/self/statm").ok()?;
-    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    // SAFETY: `_SC_PAGESIZE` has no preconditions; a non-positive result is
-    // rejected before conversion.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    (page_size > 0).then_some(resident_pages * page_size as u64)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn resident_bytes() -> Option<u64> {
-    None
-}
-
-fn sidecar_bytes(scratch: &Path, suffix: &str) -> Result<u64, StudyError> {
-    let sidecar = PathBuf::from(format!("{}-{suffix}", scratch.display()));
-    if sidecar.exists() {
-        fs::metadata(&sidecar)
-            .map(|metadata| metadata.len())
-            .map_err(|error| io_error(StudyErrorCode::SourceInvalid, "stat dbstat sidecar", error))
-    } else {
-        Ok(0)
-    }
-}
-
-fn dbstat_totals(
-    conn: &Connection,
-    scratch: &Path,
-    cancellation: &StudyCancellation,
-) -> Result<DbstatTotals, StudyError> {
-    let main_database_bytes = fs::metadata(scratch)
-        .map_err(|error| io_error(StudyErrorCode::SourceInvalid, "stat dbstat scratch", error))?
-        .len();
-    let wal_bytes = sidecar_bytes(scratch, "wal")?;
-    let shm_bytes = sidecar_bytes(scratch, "shm")?;
-    let mut statement = conn
-        .prepare(
-            "SELECT name, pagetype, SUM(pgsize)\
-             FROM dbstat GROUP BY name, pagetype ORDER BY name, pagetype",
-        )
+    let mut stmt = conn
+        .prepare("SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY name")
         .map_err(|error| {
             StudyError::new(
                 StudyErrorCode::MeasurementUnavailable,
                 format!("open dbstat virtual table: {error}"),
             )
         })?;
-    let rows = statement
+    let rows = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })
         .map_err(|error| {
             StudyError::new(
@@ -1441,372 +1319,14 @@ fn dbstat_totals(
                 format!("query dbstat: {error}"),
             )
         })?;
-    let mut objects = BTreeMap::<String, u64>::new();
-    let mut dbstat_page_bytes = 0_u64;
-    let mut freelist_bytes = 0_u64;
+    let mut values = Vec::new();
     for row in rows {
-        cancellation.check()?;
-        let (name, page_type, bytes) = row.map_err(|error| {
-            StudyError::new(StudyErrorCode::MeasurementUnavailable, error.to_string())
-        })?;
-        let bytes = u64::try_from(bytes).map_err(|_| {
-            StudyError::new(
-                StudyErrorCode::MeasurementUnavailable,
-                "negative dbstat page bytes",
-            )
-        })?;
-        dbstat_page_bytes = dbstat_page_bytes.checked_add(bytes).ok_or_else(|| {
-            StudyError::new(
-                StudyErrorCode::MeasurementUnavailable,
-                "dbstat page total overflow",
-            )
-        })?;
-        match name.as_deref() {
-            Some("freelist") => {
-                freelist_bytes = freelist_bytes.checked_add(bytes).ok_or_else(|| {
-                    StudyError::new(
-                        StudyErrorCode::MeasurementUnavailable,
-                        "freelist total overflow",
-                    )
-                })?;
-            }
-            Some(name) if matches!(page_type.as_str(), "internal" | "leaf" | "overflow") => {
-                let entry = objects.entry(name.to_owned()).or_default();
-                *entry = entry.checked_add(bytes).ok_or_else(|| {
-                    StudyError::new(
-                        StudyErrorCode::MeasurementUnavailable,
-                        "object total overflow",
-                    )
-                })?;
-            }
-            _ => {}
-        }
-    }
-    let object_btree_bytes = objects.values().try_fold(0_u64, |total, bytes| {
-        total.checked_add(*bytes).ok_or_else(|| {
-            StudyError::new(
-                StudyErrorCode::MeasurementUnavailable,
-                "object total overflow",
-            )
-        })
-    })?;
-    let classified_bytes = object_btree_bytes.checked_add(freelist_bytes);
-    let unattributed_non_btree_bytes = classified_bytes
-        .and_then(|bytes| main_database_bytes.checked_sub(bytes))
-        .unwrap_or(0);
-    let lhs = main_database_bytes
-        .checked_add(wal_bytes)
-        .and_then(|bytes| bytes.checked_add(shm_bytes));
-    let rhs = object_btree_bytes
-        .checked_add(freelist_bytes)
-        .and_then(|bytes| bytes.checked_add(unattributed_non_btree_bytes))
-        .and_then(|bytes| bytes.checked_add(wal_bytes))
-        .and_then(|bytes| bytes.checked_add(shm_bytes));
-    Ok(DbstatTotals {
-        main_database_bytes,
-        wal_bytes,
-        shm_bytes,
-        dbstat_page_bytes,
-        object_btree_bytes,
-        freelist_bytes,
-        unattributed_non_btree_bytes,
-        reconciliation_exact: classified_bytes.is_some_and(|bytes| bytes <= main_database_bytes)
-            && dbstat_page_bytes <= main_database_bytes
-            && lhs == rhs,
-        objects: objects
-            .into_iter()
-            .map(|(name, bytes)| DbstatObjectTotal { name, bytes })
-            .collect(),
-    })
-}
-
-fn timed_dbstat_walk(
-    snapshot: &str,
-    scratch: &Path,
-    cancellation: &StudyCancellation,
-) -> Result<DbstatWalk, StudyError> {
-    cancellation.check()?;
-    let resident_before = resident_bytes();
-    let started = Instant::now();
-    let conn = dbstat_connection(scratch, cancellation)?;
-    let totals = dbstat_totals(&conn, scratch, cancellation)?;
-    cancellation.check()?;
-    let incremental_rss_bytes = match (resident_before, resident_bytes()) {
-        (Some(before), Some(after)) => Some(after as i64 - before as i64),
-        _ => None,
-    };
-    Ok(DbstatWalk {
-        snapshot: snapshot.into(),
-        wall_time_ms: started.elapsed().as_millis() as u64,
-        incremental_rss_bytes,
-        totals,
-    })
-}
-
-fn measure_dbstat_walk(
-    snapshot: &str,
-    scratch: &Path,
-    cancellation: &StudyCancellation,
-) -> Result<DbstatWalk, StudyError> {
-    // Each timed walk gets the same fixed, read-only priming query set. The
-    // priming duration is intentionally excluded from the full page-walk wall.
-    prime_warm_scratch(scratch, cancellation)?;
-    timed_dbstat_walk(snapshot, scratch, cancellation)
-}
-
-fn canonical_dbstat_scratch(
-    manifest: &PrivateManifest,
-    scratch: &Path,
-) -> Result<PathBuf, StudyError> {
-    let scratch = canonical_existing(scratch, StudyErrorCode::SourceInvalid)?;
-    if identity(&scratch)? == identity(Path::new(&manifest.source.source_path))? {
-        return Err(StudyError::new(
-            StudyErrorCode::SourceAlias,
-            "dbstat scratch aliases the source",
-        ));
-    }
-    Ok(scratch)
-}
-
-/// The compatibility capability walks one verified scratch once and returns
-/// object totals. The study command below owns timing and disposition.
-pub fn measure_dbstat(request: DbstatRequest<'_>) -> Result<Vec<(String, i64)>, StudyError> {
-    let manifest = read_manifest(request.manifest)?;
-    let scratch = canonical_dbstat_scratch(&manifest, request.scratch)?;
-    let walk = measure_dbstat_walk("single", &scratch, &request.cancellation)?;
-    walk.totals
-        .objects
-        .into_iter()
-        .map(|object| {
-            i64::try_from(object.bytes)
-                .map(|bytes| (object.name, bytes))
-                .map_err(|_| {
-                    StudyError::new(
-                        StudyErrorCode::MeasurementUnavailable,
-                        "object bytes exceed i64",
-                    )
-                })
-        })
-        .collect()
-}
-
-fn cancellation_probe(scratch: &Path) -> DbstatCancellationProbe {
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancellation = StudyCancellation(Arc::clone(&cancelled));
-    // Prime before starting the timer: this probe measures only interruption
-    // of the full `dbstat` page walk, not the fixed warm-up queries.
-    if prime_warm_scratch(scratch, &cancellation).is_err() {
-        return DbstatCancellationProbe {
-            status: "prime_failed".into(),
-            latency_ms: None,
-        };
-    }
-    let requested_at = Arc::new(Mutex::new(None));
-    let requested_at_thread = Arc::clone(&requested_at);
-    let timer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(10));
-        *requested_at_thread
-            .lock()
-            .expect("cancellation timestamp lock") = Some(Instant::now());
-        cancelled.store(true, Ordering::Relaxed);
-    });
-    let result = timed_dbstat_walk("cancellation_probe", scratch, &cancellation);
-    let completed_at = Instant::now();
-    let _ = timer.join();
-    let requested_at = *requested_at.lock().expect("cancellation timestamp lock");
-    match (result, requested_at) {
-        (Err(_), Some(requested_at))
-            if cancellation.requested() && requested_at <= completed_at =>
-        {
-            DbstatCancellationProbe {
-                status: "observed".into(),
-                latency_ms: Some(completed_at.duration_since(requested_at).as_millis() as u64),
-            }
-        }
-        (Ok(_), Some(requested_at)) if completed_at < requested_at => DbstatCancellationProbe {
-            status: "completed_before_request".into(),
-            latency_ms: None,
-        },
-        (Ok(_), _) => DbstatCancellationProbe {
-            status: "completed_before_interrupt".into(),
-            latency_ms: None,
-        },
-        _ => DbstatCancellationProbe {
-            status: "probe_failed".into(),
-            latency_ms: None,
-        },
-    }
-}
-
-fn object_deltas(before: &DbstatTotals, after: &DbstatTotals) -> Vec<DbstatObjectDelta> {
-    let before = before
-        .objects
-        .iter()
-        .map(|object| (object.name.as_str(), object.bytes))
-        .collect::<BTreeMap<_, _>>();
-    let after = after
-        .objects
-        .iter()
-        .map(|object| (object.name.as_str(), object.bytes))
-        .collect::<BTreeMap<_, _>>();
-    before
-        .keys()
-        .chain(after.keys())
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .map(|name| {
-            let before_bytes = before.get(name).copied().unwrap_or(0);
-            let after_bytes = after.get(name).copied().unwrap_or(0);
-            DbstatObjectDelta {
-                name: name.into(),
-                before_bytes,
-                after_bytes,
-                delta_bytes: after_bytes as i64 - before_bytes as i64,
-            }
-        })
-        .collect()
-}
-
-/// Run exactly three controlled warm paired walks on independent pre/post
-/// replay snapshots, record the cancellation probe separately, and persist a
-/// deterministic retain/reject disposition in the private manifest.
-pub fn measure_dbstat_study(
-    request: DbstatStudyRequest<'_>,
-) -> Result<DbstatStudyResult, StudyError> {
-    let mut manifest = read_manifest(request.manifest)?;
-    if manifest.lifecycle != "replay_complete" {
-        return Err(StudyError::new(
-            StudyErrorCode::MeasurementUnavailable,
-            "dbstat requires a completed timing-sensitive replay",
-        ));
-    }
-    let before_scratch = canonical_dbstat_scratch(&manifest, request.before_scratch)?;
-    let after_scratch = canonical_dbstat_scratch(&manifest, request.after_scratch)?;
-    if identity(&before_scratch)? == identity(&after_scratch)? {
-        return Err(StudyError::new(
-            StudyErrorCode::SourceAlias,
-            "dbstat before and after snapshots must be separate files",
-        ));
-    }
-    let mut repetitions = Vec::with_capacity(CONTROLLED_WARM_RUNS as usize);
-    for run_ordinal in 1..=CONTROLLED_WARM_RUNS {
         request.cancellation.check()?;
-        repetitions.push(DbstatRepetition {
-            run_ordinal,
-            before: measure_dbstat_walk("before_replay", &before_scratch, &request.cancellation)?,
-            after: measure_dbstat_walk("after_replay", &after_scratch, &request.cancellation)?,
-        });
+        values.push(row.map_err(|error| {
+            StudyError::new(StudyErrorCode::MeasurementUnavailable, error.to_string())
+        })?);
     }
-    let cancellation = cancellation_probe(&after_scratch);
-    let baseline = repetitions
-        .first()
-        .expect("three controlled repetitions exist");
-    let object_deltas = object_deltas(&baseline.before.totals, &baseline.after.totals);
-    let measured_before_after_delta_bytes = baseline.before.totals.main_database_bytes as i64
-        - baseline.after.totals.main_database_bytes as i64;
-    let object_delta_explained_bytes = object_deltas
-        .iter()
-        .filter_map(|delta| u64::try_from(-delta.delta_bytes).ok())
-        .sum::<u64>();
-    let accounting_explained_percent = (measured_before_after_delta_bytes > 0).then(|| {
-        object_delta_explained_bytes as f64 * 100.0 / measured_before_after_delta_bytes as f64
-    });
-    let mut capability_reasons = Vec::new();
-    for repetition in &repetitions {
-        for walk in [&repetition.before, &repetition.after] {
-            if walk.wall_time_ms > 2_616 {
-                capability_reasons.push(format!(
-                    "walk_{}_{}_over_2616ms",
-                    repetition.run_ordinal, walk.snapshot
-                ));
-            }
-            match walk.incremental_rss_bytes {
-                Some(bytes) if bytes <= 64 * 1024 * 1024 => {}
-                Some(_) => capability_reasons.push(format!(
-                    "rss_{}_{}_over_64mib",
-                    repetition.run_ordinal, walk.snapshot
-                )),
-                None => capability_reasons.push(format!(
-                    "rss_{}_{}_unavailable",
-                    repetition.run_ordinal, walk.snapshot
-                )),
-            }
-            if !walk.totals.reconciliation_exact {
-                capability_reasons.push(format!(
-                    "accounting_{}_{}_not_exact",
-                    repetition.run_ordinal, walk.snapshot
-                ));
-            }
-        }
-    }
-    if cancellation.status != "observed"
-        || cancellation
-            .latency_ms
-            .is_none_or(|latency| latency > 1_000)
-    {
-        capability_reasons.push("cancellation_not_observed_within_1000ms".into());
-    }
-    let first_before = &baseline.before.totals;
-    let first_after = &baseline.after.totals;
-    if repetitions.iter().skip(1).any(|repetition| {
-        repetition.before.totals.objects != first_before.objects
-            || repetition.after.totals.objects != first_after.objects
-    }) {
-        capability_reasons.push("object_totals_not_reproducible".into());
-    }
-    let capability_disposition = if capability_reasons.is_empty() {
-        "retain"
-    } else {
-        "reject"
-    }
-    .to_string();
-    let actionable = request
-        .actionable_objects
-        .iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let five_percent_of_before = first_before.main_database_bytes / 20
-        + u64::from(first_before.main_database_bytes % 20 != 0);
-    let has_actionable_large_object = object_deltas.iter().any(|delta| {
-        delta.delta_bytes < 0
-            && delta.before_bytes >= five_percent_of_before
-            && actionable.contains(&delta.name)
-    });
-    let mut product_follow_up_reasons = Vec::new();
-    if capability_disposition != "retain" {
-        product_follow_up_reasons.push("offline_capability_not_retained".into());
-    }
-    if accounting_explained_percent.is_none_or(|percent| percent < 90.0) {
-        product_follow_up_reasons.push("object_accounting_below_90_percent".into());
-    }
-    if !has_actionable_large_object {
-        product_follow_up_reasons.push("no_actionable_object_at_least_5_percent_of_file".into());
-    }
-    let result = DbstatStudyResult {
-        execution_placement: "offline_maintainer_outside_setup_ui_quiesce".into(),
-        repetitions,
-        cancellation,
-        object_deltas,
-        measured_before_after_delta_bytes,
-        object_delta_explained_bytes,
-        accounting_explained_percent,
-        capability_disposition,
-        capability_reasons,
-        product_follow_up_allowed: product_follow_up_reasons.is_empty(),
-        product_follow_up_reasons,
-    };
-    manifest.dbstat = Some(result.clone());
-    let serialized = serde_json::to_vec_pretty(&manifest)
-        .map_err(|error| StudyError::new(StudyErrorCode::ManifestInvalid, error.to_string()))?;
-    fs::write(request.manifest, serialized).map_err(|error| {
-        io_error(
-            StudyErrorCode::ManifestInvalid,
-            "update dbstat manifest",
-            error,
-        )
-    })?;
-    set_private_permissions(request.manifest, false)?;
-    Ok(result)
+    Ok(values)
 }
 
 fn synthetic_approval() -> ApprovalRecord {

@@ -25,28 +25,6 @@ replace a warm observation with cold or extra data.
 | Archive off | | | | | | insufficient evidence |
 | Archive on | | | | | | insufficient evidence |
 
-## Offline dbstat footprint gate
-
-This section is eligible only after timing-sensitive replay and uses separate
-post-replay scratch snapshots, never a replay copy. Publish exactly three
-controlled warm paired repetitions; the cancellation probe is separate and is
-not a fourth repetition. Whole-object totals and before/after deltas may remain
-exact because they contain no category or calendar-month cells.
-
-| Repetition | Before walk | After walk | Max RSS delta | Reconciliation |
-| --- | ---: | ---: | ---: | --- |
-| 1 | | | | |
-| 2 | | | | |
-| 3 | | | | |
-
-Record main-database, object-btree, freelist, unattributed/non-btree, WAL, and
-SHM bytes separately. The zero-tolerance equation is `main + WAL + SHM =
-object b-tree + freelist + unattributed + WAL + SHM`. State cancellation
-latency, the fixed offline placement, retain or reject disposition, and reasons.
-Do not create or imply product work unless retained accounting explains at least
-90% of measured database-byte delta and an operator-recorded actionable object
-occupies at least 5% of the before file.
-
 ## Privacy and rounding
 
 Suppress category and UTC-calendar-month cells below 10 as `suppressed (<10)`.
