@@ -17,10 +17,60 @@
     "source_after_reads": { "$ref": "#/$defs/inventory" },
     "profile_backup": { "$ref": "#/$defs/backup" },
     "cleanup_disposition": { "type": "string", "minLength": 1 },
-    "matrix": { "type": "array", "items": { "$ref": "#/$defs/observation" } }
+    "matrix": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/observation" }
+    }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "lifecycle": { "const": "profiled" } }, "required": ["lifecycle"] },
+      "then": { "properties": { "matrix": { "maxItems": 0 } } },
+      "else": { "properties": { "matrix": { "$ref": "#/$defs/replay_matrix" } } }
+    }
+  ],
   "$defs": {
+    "replay_matrix": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/observation" },
+      "allOf": [
+        {
+          "contains": {
+            "properties": { "archive_mode": { "const": "archive_off" }, "cache_state": { "const": "controlled_warm" } },
+            "required": ["archive_mode", "cache_state"]
+          },
+          "minContains": 3,
+          "maxContains": 3
+        },
+        {
+          "contains": {
+            "properties": { "archive_mode": { "const": "archive_off" }, "cache_state": { "const": "best_effort_cold" } },
+            "required": ["archive_mode", "cache_state"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": { "archive_mode": { "const": "archive_on" }, "cache_state": { "const": "controlled_warm" } },
+            "required": ["archive_mode", "cache_state"]
+          },
+          "minContains": 3,
+          "maxContains": 3
+        },
+        {
+          "contains": {
+            "properties": { "archive_mode": { "const": "archive_on" }, "cache_state": { "const": "best_effort_cold" } },
+            "required": ["archive_mode", "cache_state"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    },
     "approval": {
       "type": "object",
       "required": [
@@ -92,15 +142,102 @@
     },
     "observation": {
       "type": "object",
-      "required": ["archive_mode", "cache_state", "status", "duration_ms", "reason_code"],
+      "required": ["archive_mode", "cache_state", "run_ordinal", "status", "backup", "timing", "cancellation", "cleanup", "failure"],
       "properties": {
         "archive_mode": { "enum": ["archive_off", "archive_on"] },
-        "cache_state": { "type": "string" },
-        "status": { "enum": ["completed", "failed", "cancelled"] },
-        "duration_ms": { "type": "integer", "minimum": 0 },
+        "cache_state": { "enum": ["controlled_warm", "best_effort_cold"] },
+        "run_ordinal": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "status": { "enum": ["completed", "failed", "cancelled", "missing"] },
+        "backup": { "$ref": "#/$defs/backup_evidence" },
+        "timing": { "$ref": "#/$defs/timing_evidence" },
+        "cancellation": { "$ref": "#/$defs/cancellation" },
+        "cleanup": { "$ref": "#/$defs/cleanup" },
+        "failure": { "$ref": "#/$defs/failure_evidence" }
+      },
+      "additionalProperties": false
+    },
+    "backup_evidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "value", "reason_code"],
+          "properties": { "status": { "const": "observed" }, "value": { "$ref": "#/$defs/backup" }, "reason_code": { "type": "null" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["status", "value", "reason_code"],
+          "properties": { "status": { "enum": ["missing", "not_applicable", "suppressed"] }, "value": { "type": "null" }, "reason_code": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "timing": {
+      "type": "object",
+      "required": ["replay_elapsed_ms", "priming_elapsed_ms"],
+      "properties": {
+        "replay_elapsed_ms": { "type": "integer", "minimum": 0 },
+        "priming_elapsed_ms": { "type": ["integer", "null"], "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "timing_evidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "value", "reason_code"],
+          "properties": { "status": { "const": "observed" }, "value": { "$ref": "#/$defs/timing" }, "reason_code": { "type": "null" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["status", "value", "reason_code"],
+          "properties": { "status": { "enum": ["missing", "not_applicable", "suppressed"] }, "value": { "type": "null" }, "reason_code": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "cancellation": {
+      "type": "object",
+      "required": ["requested", "phase"],
+      "properties": {
+        "requested": { "type": "boolean" },
+        "phase": { "enum": ["not_requested", "before_start", "preflight", "backup", "migration", "priming", "timed_replay"] }
+      },
+      "additionalProperties": false
+    },
+    "cleanup": {
+      "type": "object",
+      "required": ["status", "scratch_removed", "archive_removed", "reason_code"],
+      "properties": {
+        "status": { "enum": ["completed", "failed", "not_applicable"] },
+        "scratch_removed": { "type": "boolean" },
+        "archive_removed": { "type": "boolean" },
         "reason_code": { "type": ["string", "null"] }
       },
       "additionalProperties": false
+    },
+    "failure": {
+      "type": "object",
+      "required": ["code"],
+      "properties": { "code": { "type": "string", "minLength": 1 } },
+      "additionalProperties": false
+    },
+    "failure_evidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status", "value", "reason_code"],
+          "properties": { "status": { "const": "observed" }, "value": { "$ref": "#/$defs/failure" }, "reason_code": { "type": "null" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["status", "value", "reason_code"],
+          "properties": { "status": { "enum": ["missing", "not_applicable", "suppressed"] }, "value": { "type": "null" }, "reason_code": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        }
+      ]
     }
   }
 }

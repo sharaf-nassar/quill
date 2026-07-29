@@ -24,10 +24,11 @@ after every source read. Any delta is `source_changed`.
 
 ## Scratch replay
 
-The only duplication is SQLite online backup stepped in bounded page batches.
-`VACUUM INTO` and filesystem copying are forbidden. Migrations, retention
-archive, delete, aggregates, and compaction run only on new identity-checked
-scratch copies. Archive-off and archive-on have separate copies.
+The only duplication is SQLite online backup stepped in bounded, cancellable
+page batches. `VACUUM INTO` and filesystem copying are forbidden. Migrations,
+retention archive, delete, aggregates, and compaction run only on new
+identity-checked scratch copies. Every observation gets a new backup of the
+verified source snapshot; no archive mode, cache state, or run reuses a copy.
 
 ```text
 cargo run --release --bin retention_corpus -- \
@@ -35,18 +36,35 @@ cargo run --release --bin retention_corpus -- \
   --cancel-marker <private-path>
 ```
 
-The utility records mechanics, not a classification. Approved measurement later
-requires three controlled warm runs per mode plus separately labelled cold
-observations. Cutoffs use strict `timestamp < cutoff`; UTC month buckets apply;
-non-conforming timestamps remain counted and never retention-eligible.
+The utility records exactly eight observations: archive-off and archive-on each
+have three `controlled_warm` observations with ordinals 1 through 3, followed
+by one `best_effort_cold` observation with ordinal 1. Warm observations run this
+fixed read-only query set after scratch migration and before timing starts:
+
+```sql
+SELECT COUNT(*) FROM tool_actions;
+SELECT COUNT(*) FROM session_events;
+SELECT COUNT(*) FROM model_usage_observations;
+```
+
+Cold observations start from their own fresh backup and do not run any priming
+query. Cold results are descriptive only and never replace or supplement a
+controlled warm result. Cancellation, setup failure, replay failure, and
+cleanup failure leave an explicit typed observation; missing runs are not
+silently omitted or substituted. Cutoffs use strict `timestamp < cutoff`; UTC
+month buckets apply; non-conforming timestamps remain counted and never
+retention-eligible.
 
 ## Evidence and cleanup
 
-`private-manifest.schema.json` defines exact local evidence. It is private and
-must not be committed. Owner-only workspace permissions are verified or fail
-closed. Scratch databases, sidecars, archives, and markers are removed by
-default. The renderer creates a new scrubbed report only after human privacy
-signoff and approval for aggregate publication:
+`private-manifest.schema.json` defines exact local evidence. Each matrix record
+names mode, cache state, ordinal, backup, timing, cancellation, cleanup, and
+typed failure evidence. Evidence values are `observed`, `missing`,
+`not_applicable`, or `suppressed`; no cache state or missing result is inferred.
+The manifest is private and must not be committed. Owner-only workspace
+permissions are verified or fail closed. Scratch databases, sidecars, archives,
+and markers are removed by default. The renderer creates a new scrubbed report
+only after human privacy signoff and approval for aggregate publication:
 
 ```text
 cargo run --release --bin retention_corpus -- \

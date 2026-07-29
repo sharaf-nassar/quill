@@ -311,6 +311,14 @@ bounded cancellable `rusqlite::backup` steps. Only verified private scratch
 copies enter [[src-tauri/src/storage.rs#Storage#init_study_scratch]] and current
 retention replay; ordinary copies and `VACUUM INTO` are prohibited.
 
+Each replay has eight explicit observations: archive-off and archive-on each
+run three ordinal `controlled_warm` copies and one separately labelled ordinal
+`best_effort_cold` copy. Every observation uses a new backup; warm copies run
+the fixed read-only counts for the three retention target tables before timing,
+while cold copies remain unprimed. Mode, cache state, ordinal, backup, timing,
+cancellation, cleanup, and typed missing or failed state remain private
+manifest evidence, so no cold result can substitute for a controlled run.
+
 Private manifests conform to
 `specs/017-retention-second-corpus/private-manifest.schema.json`; private
 scratch, sidecars, archives, manifests, and cancellation markers clean up by

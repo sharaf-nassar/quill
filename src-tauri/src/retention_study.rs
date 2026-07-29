@@ -5,6 +5,7 @@
 //! the source read-only, proves it did not change, and mutates fresh page
 //! backups inside a private workspace.
 
+use crate::retention::RetentionRunStatus;
 use crate::retention_engine::{self, RetentionDeleteControls, RetentionDeleteRequest};
 use crate::storage::{MAX_SUPPORTED_SCHEMA_VERSION, Storage};
 use chrono::{DateTime, Utc};
@@ -29,6 +30,12 @@ use std::{
 const MANIFEST_VERSION: u32 = 1;
 const PAGE_BATCH: i32 = 128;
 const PRIVATE_MANIFEST: &str = "private-manifest.json";
+const CONTROLLED_WARM_RUNS: u8 = 3;
+const WARM_PRIMING_QUERIES: [&str; 3] = [
+    "SELECT COUNT(*) FROM tool_actions",
+    "SELECT COUNT(*) FROM session_events",
+    "SELECT COUNT(*) FROM model_usage_observations",
+];
 
 /// A stable, display-safe failure code for the internal study protocol.
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -208,9 +215,73 @@ pub struct PrivateManifest {
 pub struct ReplayObservation {
     pub archive_mode: String,
     pub cache_state: String,
+    pub run_ordinal: u8,
     pub status: String,
-    pub duration_ms: u64,
+    pub backup: Evidence<BackupRecord>,
+    pub timing: Evidence<ReplayTiming>,
+    pub cancellation: ReplayCancellation,
+    pub cleanup: ReplayCleanup,
+    pub failure: Evidence<ReplayFailure>,
+}
+
+/// A private manifest field whose absence is explicit rather than inferred.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Evidence<T> {
+    pub status: String,
+    pub value: Option<T>,
     pub reason_code: Option<String>,
+}
+
+impl<T> Evidence<T> {
+    fn observed(value: T) -> Self {
+        Self {
+            status: "observed".into(),
+            value: Some(value),
+            reason_code: None,
+        }
+    }
+
+    fn missing(reason_code: impl Into<String>) -> Self {
+        Self {
+            status: "missing".into(),
+            value: None,
+            reason_code: Some(reason_code.into()),
+        }
+    }
+
+    fn not_applicable(reason_code: impl Into<String>) -> Self {
+        Self {
+            status: "not_applicable".into(),
+            value: None,
+            reason_code: Some(reason_code.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayTiming {
+    /// Starts only after warm priming has completed.
+    pub replay_elapsed_ms: u64,
+    pub priming_elapsed_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayCancellation {
+    pub requested: bool,
+    pub phase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayCleanup {
+    pub status: String,
+    pub scratch_removed: bool,
+    pub archive_removed: bool,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayFailure {
+    pub code: String,
 }
 
 /// A cooperative cancellation marker, polled between bounded SQLite work.
@@ -244,6 +315,10 @@ impl StudyCancellation {
             Ok(())
         }
     }
+
+    fn requested(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 pub struct ProfileRequest<'a> {
@@ -257,6 +332,19 @@ pub struct ReplayRequest<'a> {
     pub manifest: &'a Path,
     pub workspace: &'a Path,
     pub cancellation: StudyCancellation,
+}
+
+struct ReplayObservationRequest<'a> {
+    source: &'a Path,
+    source_snapshot: &'a SourceInventory,
+    workspace: &'a Path,
+    mode: &'a str,
+    archive_on: bool,
+    cache_state: &'a str,
+    run_ordinal: u8,
+    cutoff: &'a DateTime<Utc>,
+    window_days: i64,
+    cancellation: &'a StudyCancellation,
 }
 
 pub struct ReportRequest<'a> {
@@ -758,8 +846,252 @@ fn remove_scratch(scratch: &Path) {
     }
 }
 
-/// Run one archive-off and one archive-on scratch replay. It is deliberately
-/// not a measurement classifier: callers need three approved warm runs later.
+fn replay_error_code(error: &StudyError) -> String {
+    format!("{:?}", error.code).to_ascii_lowercase()
+}
+
+fn remove_replay_outputs(scratch: &Path, archive: &Path) -> ReplayCleanup {
+    let scratch_result = sidecar_paths(scratch)
+        .into_iter()
+        .filter(|path| path.exists())
+        .try_for_each(fs::remove_file);
+    let archive_result = if archive.exists() {
+        fs::remove_dir_all(archive)
+    } else {
+        Ok(())
+    };
+    match (scratch_result, archive_result) {
+        (Ok(()), Ok(())) => ReplayCleanup {
+            status: "completed".into(),
+            scratch_removed: true,
+            archive_removed: true,
+            reason_code: None,
+        },
+        _ => ReplayCleanup {
+            status: "failed".into(),
+            scratch_removed: !scratch.exists(),
+            archive_removed: !archive.exists(),
+            reason_code: Some("cleanup_failed".into()),
+        },
+    }
+}
+
+fn prime_warm_scratch(scratch: &Path, cancellation: &StudyCancellation) -> Result<u64, StudyError> {
+    let conn = Connection::open_with_flags(
+        scratch,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        StudyError::new(
+            StudyErrorCode::MeasurementUnavailable,
+            format!("open scratch for warm priming: {error}"),
+        )
+    })?;
+    let started = Instant::now();
+    for query in WARM_PRIMING_QUERIES {
+        cancellation.check()?;
+        conn.query_row(query, [], |row| row.get::<_, i64>(0))
+            .map_err(|error| {
+                StudyError::new(
+                    StudyErrorCode::MeasurementUnavailable,
+                    format!("execute fixed warm priming query: {error}"),
+                )
+            })?;
+    }
+    cancellation.check()?;
+    Ok(started.elapsed().as_millis() as u64)
+}
+
+fn missing_observation(
+    mode: &str,
+    cache_state: &str,
+    run_ordinal: u8,
+    reason: &str,
+) -> ReplayObservation {
+    ReplayObservation {
+        archive_mode: mode.into(),
+        cache_state: cache_state.into(),
+        run_ordinal,
+        status: "missing".into(),
+        backup: Evidence::missing(reason),
+        timing: Evidence::missing(reason),
+        cancellation: ReplayCancellation {
+            requested: true,
+            phase: "before_start".into(),
+        },
+        cleanup: ReplayCleanup {
+            status: "not_applicable".into(),
+            scratch_removed: false,
+            archive_removed: false,
+            reason_code: Some(reason.into()),
+        },
+        failure: Evidence::observed(ReplayFailure {
+            code: reason.into(),
+        }),
+    }
+}
+
+fn run_replay_observation(request: ReplayObservationRequest<'_>) -> ReplayObservation {
+    let ReplayObservationRequest {
+        source,
+        source_snapshot,
+        workspace,
+        mode,
+        archive_on,
+        cache_state,
+        run_ordinal,
+        cutoff,
+        window_days,
+        cancellation,
+    } = request;
+    let suffix = format!("{mode}-{cache_state}-{run_ordinal}");
+    let scratch = workspace.join(format!("replay-{suffix}.db"));
+    let archive = workspace.join(format!("archive-{suffix}"));
+    let mut phase = "preflight";
+    let mut backup = Evidence::missing("backup_not_started");
+    let result = (|| -> Result<ReplayTiming, StudyError> {
+        cancellation.check()?;
+        let current = source_inventory(source)?;
+        if current.files != source_snapshot.files {
+            return Err(StudyError::new(
+                StudyErrorCode::SourceChanged,
+                "source no longer matches verified profile snapshot",
+            ));
+        }
+        if scratch.exists() || archive.exists() {
+            return Err(StudyError::new(
+                StudyErrorCode::OutputCollision,
+                "replay observation output already exists",
+            ));
+        }
+        reject_aliases(source, &[&scratch, &archive])?;
+        phase = "backup";
+        backup = Evidence::observed(page_backup(source, &scratch, cancellation)?);
+        phase = "migration";
+        let storage = Storage::init_study_scratch(&scratch).map_err(|error| {
+            StudyError::new(
+                StudyErrorCode::SourceInvalid,
+                format!("migrate replay scratch: {error}"),
+            )
+        })?;
+        drop(storage);
+        let priming_elapsed_ms = if cache_state == "controlled_warm" {
+            phase = "priming";
+            Some(prime_warm_scratch(&scratch, cancellation)?)
+        } else {
+            None
+        };
+        cancellation.check()?;
+        phase = "timed_replay";
+        let started = Instant::now();
+        let storage = Storage::init_study_scratch(&scratch).map_err(|error| {
+            StudyError::new(
+                StudyErrorCode::SourceInvalid,
+                format!("open timed replay scratch: {error}"),
+            )
+        })?;
+        let delete_request = RetentionDeleteRequest {
+            cutoff: cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            window_days,
+            bytes_before: fs::metadata(&scratch)
+                .map_err(|error| io_error(StudyErrorCode::SourceInvalid, "stat scratch", error))?
+                .len(),
+            ran_at: Utc::now(),
+        };
+        let controls = RetentionDeleteControls {
+            archive_directory: archive_on.then_some(archive.as_path()),
+            ..RetentionDeleteControls::default()
+        };
+        let report =
+            retention_engine::run_retention_delete_phase(&storage, &delete_request, &controls)
+                .map_err(|error| {
+                    StudyError::new(
+                        StudyErrorCode::MeasurementUnavailable,
+                        format!("run scratch retention replay: {error}"),
+                    )
+                })?;
+        if report.status != RetentionRunStatus::Completed {
+            return Err(StudyError::new(
+                StudyErrorCode::MeasurementUnavailable,
+                "scratch retention replay did not complete",
+            ));
+        }
+        cancellation.check()?;
+        let bytes = storage.preflight_database_compaction().map_err(|result| {
+            StudyError::new(
+                StudyErrorCode::DiskPreflight,
+                format!("scratch compaction preflight: {:?}", result.reason),
+            )
+        })?;
+        let compacted = storage.vacuum_database(bytes);
+        if compacted.status != "completed" {
+            return Err(StudyError::new(
+                StudyErrorCode::MeasurementUnavailable,
+                "scratch compaction skipped",
+            ));
+        }
+        cancellation.check()?;
+        Ok(ReplayTiming {
+            replay_elapsed_ms: started.elapsed().as_millis() as u64,
+            priming_elapsed_ms,
+        })
+    })();
+    let cleanup = remove_replay_outputs(&scratch, &archive);
+    match result {
+        Ok(timing) if cleanup.status == "completed" => ReplayObservation {
+            archive_mode: mode.into(),
+            cache_state: cache_state.into(),
+            run_ordinal,
+            status: "completed".into(),
+            backup,
+            timing: Evidence::observed(timing),
+            cancellation: ReplayCancellation {
+                requested: false,
+                phase: "not_requested".into(),
+            },
+            cleanup,
+            failure: Evidence::not_applicable("completed"),
+        },
+        Ok(_) => ReplayObservation {
+            archive_mode: mode.into(),
+            cache_state: cache_state.into(),
+            run_ordinal,
+            status: "failed".into(),
+            backup,
+            timing: Evidence::missing("cleanup_failed"),
+            cancellation: ReplayCancellation {
+                requested: false,
+                phase: "not_requested".into(),
+            },
+            cleanup,
+            failure: Evidence::observed(ReplayFailure {
+                code: "cleanup_failed".into(),
+            }),
+        },
+        Err(error) => {
+            let cancelled = matches!(error.code, StudyErrorCode::Cancelled);
+            let code = replay_error_code(&error);
+            ReplayObservation {
+                archive_mode: mode.into(),
+                cache_state: cache_state.into(),
+                run_ordinal,
+                status: if cancelled { "cancelled" } else { "failed" }.into(),
+                backup,
+                timing: Evidence::missing(code.clone()),
+                cancellation: ReplayCancellation {
+                    requested: cancelled || cancellation.requested(),
+                    phase: if cancelled { phase } else { "not_requested" }.into(),
+                },
+                cleanup,
+                failure: Evidence::observed(ReplayFailure { code }),
+            }
+        }
+    }
+}
+
+/// Run the fixed archive-mode cache matrix. The matrix is descriptive only:
+/// three controlled warm observations and one best-effort cold observation per
+/// mode are recorded without classifying a corpus or changing product policy.
 pub fn run_replay_matrix(request: ReplayRequest<'_>) -> Result<PrivateManifest, StudyError> {
     let workspace = prepare_workspace(request.workspace)?;
     let mut manifest = read_manifest(request.manifest)?;
@@ -785,90 +1117,52 @@ pub fn run_replay_matrix(request: ReplayRequest<'_>) -> Result<PrivateManifest, 
         .with_timezone(&Utc)
         - chrono::TimeDelta::days(manifest.approval.retention_window_days);
     for archive_on in [false, true] {
-        request.cancellation.check()?;
         let mode = if archive_on {
             "archive_on"
         } else {
             "archive_off"
         };
-        let scratch = workspace.join(format!("replay-{mode}.db"));
-        let archive = workspace.join(format!("archive-{mode}"));
-        if scratch.exists() || archive.exists() {
-            return Err(StudyError::new(
-                StudyErrorCode::OutputCollision,
-                format!("{mode} output already exists"),
-            ));
+        for (cache_state, run_ordinal) in (1..=CONTROLLED_WARM_RUNS)
+            .map(|ordinal| ("controlled_warm", ordinal))
+            .chain(std::iter::once(("best_effort_cold", 1)))
+        {
+            let observation = if request.cancellation.requested() {
+                missing_observation(mode, cache_state, run_ordinal, "cancelled_before_start")
+            } else {
+                run_replay_observation(ReplayObservationRequest {
+                    source: &source,
+                    source_snapshot: &manifest.source,
+                    workspace: &workspace,
+                    mode,
+                    archive_on,
+                    cache_state,
+                    run_ordinal,
+                    cutoff: &cutoff,
+                    window_days: manifest.approval.retention_window_days,
+                    cancellation: &request.cancellation,
+                })
+            };
+            manifest.matrix.push(observation);
         }
-        reject_aliases(&source, &[&scratch, &archive])?;
-        let started = Instant::now();
-        let result = (|| -> Result<(), StudyError> {
-            page_backup(&source, &scratch, &request.cancellation)?;
-            let storage = Storage::init_study_scratch(&scratch).map_err(|error| {
-                StudyError::new(
-                    StudyErrorCode::SourceInvalid,
-                    format!("migrate replay scratch: {error}"),
-                )
-            })?;
-            let delete_request = RetentionDeleteRequest {
-                cutoff: cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                window_days: manifest.approval.retention_window_days,
-                bytes_before: fs::metadata(&scratch)
-                    .map_err(|error| {
-                        io_error(StudyErrorCode::SourceInvalid, "stat scratch", error)
-                    })?
-                    .len(),
-                ran_at: Utc::now(),
-            };
-            let controls = RetentionDeleteControls {
-                archive_directory: archive_on.then_some(archive.as_path()),
-                ..RetentionDeleteControls::default()
-            };
-            retention_engine::run_retention_delete_phase(&storage, &delete_request, &controls)
-                .map_err(|error| {
-                    StudyError::new(
-                        StudyErrorCode::MeasurementUnavailable,
-                        format!("run scratch retention replay: {error}"),
-                    )
-                })?;
-            request.cancellation.check()?;
-            let bytes = storage.preflight_database_compaction().map_err(|result| {
-                StudyError::new(
-                    StudyErrorCode::DiskPreflight,
-                    format!("scratch compaction preflight: {:?}", result.reason),
-                )
-            })?;
-            let compacted = storage.vacuum_database(bytes);
-            if compacted.status != "completed" {
-                return Err(StudyError::new(
-                    StudyErrorCode::MeasurementUnavailable,
-                    "scratch compaction skipped",
-                ));
-            }
-            Ok(())
-        })();
-        let observation = match result {
-            Ok(()) => ReplayObservation {
-                archive_mode: mode.into(),
-                cache_state: "unclassified".into(),
-                status: "completed".into(),
-                duration_ms: started.elapsed().as_millis() as u64,
-                reason_code: None,
-            },
-            Err(error) => ReplayObservation {
-                archive_mode: mode.into(),
-                cache_state: "unclassified".into(),
-                status: "failed".into(),
-                duration_ms: started.elapsed().as_millis() as u64,
-                reason_code: Some(format!("{:?}", error.code).to_ascii_lowercase()),
-            },
-        };
-        manifest.matrix.push(observation);
-        remove_scratch(&scratch);
-        let _ = fs::remove_dir_all(&archive);
     }
     let after = ensure_source_unchanged(&before)?;
     manifest.source_after_reads = after;
-    manifest.lifecycle = "replay_complete".into();
+    manifest.lifecycle = if manifest
+        .matrix
+        .iter()
+        .any(|observation| observation.status == "cancelled")
+    {
+        "cancelled"
+    } else if manifest
+        .matrix
+        .iter()
+        .any(|observation| observation.status == "failed")
+    {
+        "failed"
+    } else {
+        "replay_complete"
+    }
+    .into();
     // Existing private manifest is updated in place only inside its owner-only
     // workspace; reports are still exclusively-created separate files.
     let serialized = serde_json::to_vec_pretty(&manifest)
@@ -921,14 +1215,23 @@ pub fn render_scrubbed_report(request: ReportRequest<'_>) -> Result<(), StudyErr
     for observation in &manifest.matrix {
         writeln!(
             report,
-            "- {}: {} ({} ms{})",
+            "- {} / {} #{}: {}{}{}",
             observation.archive_mode,
+            observation.cache_state,
+            observation.run_ordinal,
             observation.status,
-            observation.duration_ms,
             observation
-                .reason_code
+                .timing
+                .value
+                .as_ref()
+                .map(|timing| format!(" ({} ms)", timing.replay_elapsed_ms))
+                .unwrap_or_default(),
+            observation
+                .failure
+                .value
+                .as_ref()
+                .map(|failure| format!(", code {}", failure.code))
                 .as_deref()
-                .map(|code| format!(", code {code}"))
                 .unwrap_or_default()
         )
         .map_err(|error| io_error(StudyErrorCode::ManifestInvalid, "write report", error))?;
