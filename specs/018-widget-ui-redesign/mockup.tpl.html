@@ -1,0 +1,493 @@
+<title>Quill — Proposal 17 · Flat Polish</title>
+<style>
+  @font-face{
+    font-family:"Geist";
+    src:url(data:font/woff2;base64,@@GEIST@@) format("woff2-variations");
+    font-weight:100 900;font-style:normal;font-display:block;
+  }
+  @font-face{
+    font-family:"Geist Mono";
+    src:url(data:font/woff2;base64,@@GEISTMONO@@) format("woff2-variations");
+    font-weight:100 900;font-style:normal;font-display:block;
+  }
+  :root{
+    --sans:"Geist",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    --mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+
+    /* Quill graphite stack — src/styles/index.css family */
+    --surface:#14181f;
+    --inset:#0f1319;
+    --line:rgba(255,255,255,.065);
+    --line-soft:rgba(255,255,255,.045);
+    --hover:rgba(255,255,255,.04);
+    --text-hi:#e6edf3;
+    --text:#c9d1d9;
+    --label:#8b949e;
+    --faint:#6e7681;
+
+    --cyan:#22d3ee;
+    --green:#3fce8a;
+    --amber:#fbbf24;
+    --red:#f87171;
+    --claude:#fb923c;
+    --codex:#60a5fa;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{background:#0a0d11}
+  body{
+    font-family:var(--sans);color:var(--text);background:#0a0d11;
+    font-size:12px;line-height:1.45;-webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+    padding:44px 20px 72px;min-height:100vh;
+  }
+  .num{font-variant-numeric:tabular-nums}
+
+  .caption{max-width:880px;margin:0 auto 26px;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .caption .tag{
+    font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;
+    color:#0a0d11;background:var(--cyan);padding:3px 8px;border-radius:4px;
+  }
+  .caption span{font-size:12px;color:#646b76}
+  .stage{max-width:880px;margin:0 auto;display:flex;gap:44px;justify-content:center;align-items:flex-start;flex-wrap:wrap}
+  .variant{display:flex;flex-direction:column;gap:10px}
+  .vlabel{font-size:10px;font-weight:600;letter-spacing:.13em;text-transform:uppercase;color:#646b76;text-align:center}
+
+  /* ================= widget — one flat surface ================= */
+  .w{
+    width:360px;overflow:hidden;
+    background:var(--surface);
+    border:1px solid rgba(255,255,255,.08);
+    border-radius:12px;
+    box-shadow:0 16px 48px rgba(0,0,0,.55);
+    color:var(--text);
+  }
+  .hr{height:1px;background:var(--line-soft)}
+
+  /* titlebar */
+  .tb{display:flex;align-items:center;gap:9px;height:40px;padding:0 14px}
+  .glyph{
+    width:18px;height:18px;border-radius:5px;flex:0 0 18px;
+    background:rgba(34,211,238,.12);
+    display:grid;place-items:center;color:var(--cyan);
+    font-size:10px;font-weight:700;
+  }
+  .name{font-size:11px;font-weight:600;letter-spacing:.14em;color:var(--text-hi)}
+  .tbr{margin-left:auto;display:flex;align-items:center;gap:4px}
+  .sync{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:500;color:var(--faint);margin-right:8px}
+  .p{width:5px;height:5px;border-radius:50%;background:var(--green)}
+  @media (prefers-reduced-motion:no-preference){
+    .p{animation:pp 2.6s ease-in-out infinite}
+    @keyframes pp{0%,100%{opacity:1}50%{opacity:.35}}
+  }
+  .key{
+    width:24px;height:24px;border-radius:6px;display:grid;place-items:center;
+    color:var(--faint);
+  }
+  .key:hover{color:var(--text);background:var(--hover)}
+  .key svg{display:block}
+
+  /* annunciator — one calm line */
+  .ann{
+    display:flex;align-items:center;gap:8px;
+    padding:8px 14px;
+    background:rgba(251,191,36,.06);
+    font-size:11px;color:var(--text);
+  }
+  .ann .lamp{width:6px;height:6px;border-radius:50%;background:var(--amber);flex:0 0 6px}
+  .ann b{font-weight:600;color:var(--amber)}
+  .ann .r{margin-left:auto;color:var(--label);font-weight:500}
+
+  /* limits — one provider per line */
+  .limits{display:flex;flex-direction:column;gap:9px;padding:10px 14px 12px}
+  .limits .t{font-size:10px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--label)}
+  .lrow{display:flex;align-items:center;gap:10px}
+  .psw{width:6px;height:6px;border-radius:2px;flex:0 0 6px}
+  .psw.claude{background:var(--claude)}
+  .psw.codex{background:var(--codex)}
+  .pname{font-size:9.5px;font-weight:600;letter-spacing:.08em;color:var(--label);width:44px;flex:0 0 44px}
+  .bkt{display:flex;flex-direction:column;gap:4px;width:60px}
+  .bkt .top{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
+  .bkt .pc{font-size:11px;font-weight:600;color:var(--text);line-height:1}
+  .bkt .pc.a{color:var(--amber)}
+  .bkt .bl{font-size:8px;font-weight:500;letter-spacing:.04em;color:var(--faint)}
+  .bar{height:4px;border-radius:99px;background:rgba(255,255,255,.08);position:relative;overflow:hidden}
+  .bar i{position:absolute;top:0;bottom:0;left:0;border-radius:99px;background:#8b949e}
+  .bar i.a{background:var(--amber)}
+  .lreset{margin-left:auto;font-size:10px;font-weight:500;color:var(--faint);white-space:nowrap}
+  .lreset.a{color:var(--amber);font-weight:600}
+
+  /* usage */
+  .band{padding:12px 14px 14px}
+  .band-h{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;margin-bottom:10px}
+
+  /* view switcher dropdown */
+  .view-dd{position:relative;justify-self:start}
+  .view-btn{
+    all:unset;display:flex;align-items:center;gap:5px;cursor:pointer;
+    font-family:var(--sans);font-size:10px;font-weight:600;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--label);
+    padding:3px 7px;margin-left:-7px;border-radius:6px;
+  }
+  .view-btn:hover{color:var(--text-hi);background:var(--hover)}
+  .view-btn:focus-visible{outline:2px solid rgba(96,165,250,.7);outline-offset:2px}
+  .view-btn .chev{transition:transform .15s ease}
+  .view-dd.open .view-btn .chev{transform:rotate(180deg)}
+  .view-menu{
+    position:absolute;top:calc(100% + 6px);left:-7px;z-index:5;
+    min-width:132px;padding:4px;display:none;
+    background:#1b212b;border:1px solid var(--line);border-radius:8px;
+    box-shadow:0 8px 24px rgba(0,0,0,.6);
+  }
+  .view-dd.open .view-menu{display:block}
+  .view-menu .vi{
+    display:flex;align-items:center;gap:8px;
+    font-size:11px;font-weight:500;color:var(--text);
+    padding:6px 9px;border-radius:5px;cursor:pointer;
+  }
+  .view-menu .vi:hover{background:rgba(255,255,255,.06)}
+  .view-menu .vi.on{color:var(--text-hi);font-weight:600}
+  .view-menu .vi .chk{margin-left:auto;font-size:10px;color:var(--cyan);visibility:hidden}
+  .view-menu .vi.on .chk{visibility:visible}
+  .rng{display:flex;gap:2px;justify-self:center}
+  .rng span{font-size:10px;font-weight:500;color:var(--faint);padding:3px 9px;border-radius:6px}
+  .rng span:hover{color:var(--text)}
+  .rng span.on{background:rgba(255,255,255,.08);color:var(--text-hi);font-weight:600}
+  .chartwrap{position:relative}
+  .overlay{
+    position:absolute;inset:0;z-index:1;pointer-events:none;
+    display:flex;align-items:flex-start;justify-content:flex-start;
+    padding:6px 0 0 1px;
+  }
+  .stack{
+    display:flex;flex-direction:column;gap:3px;
+    padding:8px 34px 8px 0;
+    background:linear-gradient(90deg,var(--surface) 55%,rgba(20,24,31,0));
+  }
+  .stack .delta{font-size:10.5px;font-weight:600;color:var(--green);line-height:1}
+  .headline{display:flex;align-items:baseline;gap:7px}
+  .headline .big{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1;color:var(--text-hi)}
+  .headline .unit{font-size:11px;font-weight:450;color:var(--label)}
+  /* legend appears only on chart hover — providers are already named in Limits */
+  .chart-legend{
+    position:absolute;top:6px;right:2px;z-index:2;pointer-events:none;
+    display:flex;flex-direction:column;gap:4px;align-items:flex-start;
+    padding:6px 9px;border-radius:6px;
+    background:rgba(20,24,31,.88);border:1px solid var(--line);
+    font-size:9px;font-weight:500;letter-spacing:.07em;color:var(--label);
+    opacity:0;transition:opacity .15s ease;
+  }
+  .chartwrap:hover .chart-legend,.chart-legend.show{opacity:1}
+  @media (prefers-reduced-motion:reduce){.chart-legend{transition:none}}
+  .chart-legend i{width:8px;height:2.5px;border-radius:2px;display:inline-block;margin-right:5px;vertical-align:2px}
+  .chart-legend .lc i{background:var(--claude)}
+  .chart-legend .lx i{background:var(--codex)}
+  .chart-legend b{color:var(--text);font-weight:600;margin-left:4px}
+  #chart{width:100%;height:118px;display:block}
+
+  .insight{
+    display:flex;align-items:center;gap:8px;
+    margin-top:8px;
+    font-size:11px;color:var(--label);
+  }
+  .insight .g{color:var(--cyan);font-size:8px}
+  .insight b{color:var(--text);font-weight:600}
+
+  /* readouts — hairline grid, open */
+  .grid{display:grid;grid-template-columns:1fr 1fr 1fr}
+  .cell{padding:11px 14px 10px;min-width:0;border-top:1px solid var(--line-soft)}
+  .cell:nth-child(3n+2),.cell:nth-child(3n){border-left:1px solid var(--line-soft)}
+  .cell .v{
+    font-size:15px;font-weight:600;letter-spacing:-.01em;line-height:1.15;color:var(--text-hi);
+    display:flex;align-items:baseline;gap:5px;white-space:nowrap;
+  }
+  .cell .v .d{font-size:9px;font-weight:600}
+  .d.up{color:var(--green)} .d.down{color:var(--red)} .d.flat{color:var(--faint)}
+  .cell .k{
+    font-size:9px;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--label);
+    margin-top:3px;display:flex;align-items:center;gap:5px;
+  }
+  .cell .k .msw{width:5px;height:5px;border-radius:2px;flex:0 0 5px}
+  .cell .cspark{display:block;width:100%;height:13px;margin-top:7px}
+
+  /* sessions */
+  .sess{padding:10px 14px 8px}
+  .sess-h{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .bkt-toggles{display:flex;gap:1px;margin-left:-6px}
+  .bkt-toggles span{font-size:10px;font-weight:500;color:var(--faint);padding:3px 8px;border-radius:6px;white-space:nowrap}
+  .bkt-toggles span:hover{color:var(--text)}
+  .bkt-toggles span.on{background:rgba(255,255,255,.08);color:var(--text-hi);font-weight:600}
+  .sess-h .n{margin-left:auto;font-size:10px;font-weight:600;color:var(--green);white-space:nowrap}
+  .row{display:flex;align-items:center;gap:9px;height:30px;border-radius:6px;padding:0 7px;margin:0 -7px}
+  .row:hover{background:var(--hover)}
+  .st{width:6px;height:6px;border-radius:50%;flex:0 0 6px}
+  .st.live{background:var(--green)}
+  .st.idle{background:var(--faint);opacity:.4}
+  .proj{font-size:11.5px;font-weight:500;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pv{
+    font-size:8px;font-weight:600;letter-spacing:.08em;border-radius:4px;
+    padding:2px 0;width:52px;text-align:center;flex:0 0 52px;
+  }
+  .pv.claude{background:rgba(251,146,60,.1);color:var(--claude)}
+  .pv.codex{background:rgba(96,165,250,.1);color:var(--codex)}
+  .tk{margin-left:auto;font-size:11.5px;font-weight:600;color:var(--text-hi)}
+  .ago{font-size:10px;font-weight:450;color:var(--faint);width:38px;text-align:right}
+  .row.idle .proj,.row.idle .tk{color:var(--label)}
+
+  /* footer */
+  .ft{display:flex;align-items:center;gap:14px;height:40px;padding:0 14px;font-size:10.5px;color:var(--label)}
+  .ft .kv{display:flex;gap:5px;align-items:baseline}
+  .ft .kv b{color:var(--text);font-weight:600}
+  .manage{
+    margin-left:auto;display:flex;align-items:center;gap:6px;
+    font-size:10px;font-weight:600;color:var(--label);
+    height:24px;padding:0 10px;border-radius:6px;
+  }
+  .manage:hover{color:var(--text-hi);background:var(--hover)}
+  .manage .kbd{
+    font-family:var(--mono);font-size:8.5px;color:var(--faint);
+    border:1px solid var(--line);border-radius:4px;padding:0 4px;
+  }
+
+  .notes{
+    max-width:880px;margin:30px auto 0;display:flex;flex-wrap:wrap;gap:6px 28px;
+    font-size:11px;color:#646b76;justify-content:center;
+  }
+  .notes b{color:#9aa3ad;font-weight:600}
+</style>
+
+<div class="caption">
+  <span class="tag">Proposal 17</span>
+  <span>Static legend removed — hover the chart to reveal per-provider totals</span>
+</div>
+
+<div class="stage">
+  <div class="variant">
+    <div class="w" role="img" aria-label="Quill widget, flat polished skin, caution state">
+
+      <div class="tb">
+        <span class="glyph">Q</span><span class="name">QUILL</span>
+        <div class="tbr">
+          <span class="sync num"><span class="p"></span>3s</span>
+          <span class="key" title="Always on top">
+            <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round">
+              <path d="M3.2 1h3.6M5 1v5.4M2.6 6.4h4.8M5 6.4V9"/>
+            </svg>
+          </span>
+          <span class="key" title="Settings">
+            <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round">
+              <path d="M1 2.6h8M1 5h8M1 7.4h8"/>
+              <circle cx="6.4" cy="2.6" r="1.1" fill="#14181f"/>
+              <circle cx="3.4" cy="5" r="1.1" fill="#14181f"/>
+              <circle cx="7" cy="7.4" r="1.1" fill="#14181f"/>
+            </svg>
+          </span>
+        </div>
+      </div>
+
+      <div class="ann num">
+        <span class="lamp"></span>
+        <span><b>Claude 5h at 62%</b> · ahead of pace</span>
+        <span class="r">resets 3h 54m</span>
+      </div>
+
+      <div class="limits num">
+        <span class="t">Limits</span>
+        <div class="lrow">
+          <span class="psw claude"></span><span class="pname">CLAUDE</span>
+          <span class="bkt"><span class="top"><span class="pc a">62%</span><span class="bl">5H</span></span><span class="bar"><i class="a" style="width:62%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="pc">31%</span><span class="bl">7D</span></span><span class="bar"><i style="width:31%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="pc">18%</span><span class="bl">FABLE</span></span><span class="bar"><i style="width:18%"></i></span></span>
+          <span class="lreset a">3h 54m</span>
+        </div>
+        <div class="lrow">
+          <span class="psw codex"></span><span class="pname">CODEX</span>
+          <span class="bkt"><span class="top"><span class="pc">44%</span><span class="bl">7D</span></span><span class="bar"><i style="width:44%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="pc">7%</span><span class="bl">SPARK</span></span><span class="bar"><i style="width:7%"></i></span></span>
+          <span class="lreset">6d 22h</span>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="band">
+        <div class="band-h">
+          <div class="view-dd" id="viewdd">
+            <button class="view-btn" aria-haspopup="listbox" aria-expanded="false">
+              Usage
+              <svg class="chev" width="8" height="8" viewBox="0 0 8 8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M1.5 3l2.5 2.5L6.5 3"/></svg>
+            </button>
+            <div class="view-menu" role="listbox">
+              <div class="vi on" role="option" aria-selected="true">Usage<span class="chk">✓</span></div>
+              <div class="vi" role="option">Trends<span class="chk">✓</span></div>
+              <div class="vi" role="option">Charts<span class="chk">✓</span></div>
+              <div class="vi" role="option">Models<span class="chk">✓</span></div>
+              <div class="vi" role="option">Context<span class="chk">✓</span></div>
+            </div>
+          </div>
+          <div class="rng num"><span>1H</span><span class="on">6H</span><span>24H</span><span>7D</span></div>
+          <span></span>
+        </div>
+        <div class="chartwrap">
+          <div class="overlay num">
+            <div class="stack">
+              <span class="delta">▲ 4.2%</span>
+              <div class="headline">
+                <span class="big">12.4M</span><span class="unit">tokens</span>
+              </div>
+            </div>
+          </div>
+          <div class="chart-legend num" id="chartlegend">
+            <span class="lc"><i></i>CLAUDE<b>3.2M</b></span>
+            <span class="lx"><i></i>CODEX<b>9.2M</b></span>
+          </div>
+          <svg id="chart" aria-label="Token usage over the last six hours, Claude 3.2M and Codex 9.2M"></svg>
+        </div>
+        <div class="insight num">
+          <span class="g">◆</span>
+          <span><b>7.3M tokens saved</b> — 50% of input served from cache</span>
+        </div>
+      </div>
+
+      <div class="grid num">
+        <div class="cell" data-c="#22d3ee"><span class="v">5h 33m</span><span class="k"><i class="msw"></i>Runtime</span><svg class="cspark" data-s="3,4,4,5,6,6,7,8" aria-hidden="true"></svg></div>
+        <div class="cell" data-c="#a78bfa"><span class="v">463 <span class="d down">▼13%</span></span><span class="k"><i class="msw"></i>Tok / LOC</span><svg class="cspark" data-s="8,7,8,6,6,5,5,4" aria-hidden="true"></svg></div>
+        <div class="cell" data-c="#f472b6"><span class="v">1,229</span><span class="k"><i class="msw"></i>LOC / hr</span><svg class="cspark" data-s="5,6,5,7,6,7,7,7" aria-hidden="true"></svg></div>
+        <div class="cell" data-c="#818cf8"><span class="v">13</span><span class="k"><i class="msw"></i>Sessions</span><svg class="cspark" data-s="2,3,3,5,4,6,7,8" aria-hidden="true"></svg></div>
+        <div class="cell" data-c="#2dd4bf"><span class="v">9</span><span class="k"><i class="msw"></i>Projects</span><svg class="cspark" data-s="4,4,5,5,5,6,6,6" aria-hidden="true"></svg></div>
+        <div class="cell" data-c="#a3e635"><span class="v">+1,923</span><span class="k"><i class="msw"></i>Net lines</span><svg class="cspark" data-s="3,5,4,6,5,7,6,8" aria-hidden="true"></svg></div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="sess">
+        <div class="sess-h">
+          <div class="bkt-toggles">
+            <span class="on">Sessions</span><span>Projects</span><span>Hosts</span><span>Skills</span><span>Hooks</span>
+          </div>
+          <span class="n num">3 LIVE</span>
+        </div>
+        <div class="row">
+          <span class="st live"></span><span class="proj">llm-router</span><span class="pv codex">CODEX</span>
+          <span class="tk num">772.9k</span><span class="ago num">now</span>
+        </div>
+        <div class="row">
+          <span class="st live"></span><span class="proj">firecrawl</span><span class="pv codex">CODEX</span>
+          <span class="tk num">6.7M</span><span class="ago num">now</span>
+        </div>
+        <div class="row">
+          <span class="st live"></span><span class="proj">nasha-lab</span><span class="pv claude">CLAUDE</span>
+          <span class="tk num">320.6k</span><span class="ago num">now</span>
+        </div>
+        <div class="row idle">
+          <span class="st idle"></span><span class="proj">aiden</span><span class="pv codex">CODEX</span>
+          <span class="tk num">2.7M</span><span class="ago num">42m</span>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="ft num">
+        <span class="kv">In <b>14.7M</b></span>
+        <span class="kv">Out <b>97.2k</b></span>
+        <span class="kv">Cache <b>50%</b></span>
+        <span class="manage">Manage<span class="kbd">⌘M</span></span>
+      </div>
+
+    </div>
+    <span class="vlabel">Flat polish · caution state</span>
+  </div>
+</div>
+
+<div class="notes num">
+  <span><b>What changed:</b> boxes deleted — one flat surface, hairline dividers only</span>
+  <span><b>Type floor raised</b> to 9px; label tracking relaxed; weights reduced to two</span>
+  <span><b>Color calmed:</b> amber appears once as a tinted band; metric hues stay on sparklines only</span>
+</div>
+
+<script>
+(function(){
+  function path(pts){
+    let d = "M" + pts[0][0] + "," + pts[0][1];
+    for (let i = 0; i < pts.length - 1; i++){
+      const p0 = pts[Math.max(0,i-1)], p1 = pts[i], p2 = pts[i+1], p3 = pts[Math.min(pts.length-1,i+2)];
+      d += "C" + (p1[0]+(p2[0]-p0[0])/6) + "," + (p1[1]+(p2[1]-p0[1])/6) + " "
+             + (p2[0]-(p3[0]-p1[0])/6) + "," + (p2[1]-(p3[1]-p1[1])/6) + " "
+             + p2[0] + "," + p2[1];
+    }
+    return d;
+  }
+  const NS = "http://www.w3.org/2000/svg";
+  function el(t,a){ const e=document.createElementNS(NS,t); for(const k in a) e.setAttribute(k,a[k]); return e; }
+
+  const svg = document.getElementById("chart");
+  const W = 332, H = 118, BASE = H - 16;
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  svg.setAttribute("preserveAspectRatio","none");
+
+  [0.5,0.78].forEach(f=>{
+    svg.appendChild(el("line",{x1:0,y1:BASE*f,x2:W,y2:BASE*f,stroke:"rgba(255,255,255,.045)","stroke-width":1}));
+  });
+  const hours=["13:00","14:00","15:00","16:00","17:00","18:00"];
+  hours.forEach((hh,i)=>{
+    const t = el("text",{x:(i+1)*(W/7),y:H-4,"text-anchor":"middle",fill:"#6e7681","font-size":"7.5","font-family":"Geist, sans-serif","font-weight":"500"});
+    t.textContent = hh; svg.appendChild(t);
+  });
+
+  const codex  = [9,12,15,14,19,23,26,25,31,36,40,45,52];
+  const claude = [4,5,7,9,8,11,13,15,14,17,19,20,21];
+  const max = 62;
+  // keep series in the lower ~60% so the overlaid headline never collides
+  function pts(data){
+    return data.map((v,i)=>[ i*W/(data.length-1), BASE - 4 - (v/max)*(BASE*0.62) ]);
+  }
+  const px = pts(codex), pc = pts(claude);
+
+  const defs = el("defs",{});
+  [["gx","#60a5fa",.16],["gc","#fb923c",.09]].forEach(([id,c,o])=>{
+    const g = el("linearGradient",{id:id,x1:0,y1:0,x2:0,y2:1});
+    g.appendChild(el("stop",{offset:"0%","stop-color":c,"stop-opacity":o}));
+    g.appendChild(el("stop",{offset:"100%","stop-color":c,"stop-opacity":"0"}));
+    defs.appendChild(g);
+  });
+  svg.appendChild(defs);
+
+  svg.appendChild(el("path",{d:path(px)+"L"+px[px.length-1][0]+","+BASE+" L"+px[0][0]+","+BASE+" Z",fill:"url(#gx)"}));
+  svg.appendChild(el("path",{d:path(pc)+"L"+pc[pc.length-1][0]+","+BASE+" L"+pc[0][0]+","+BASE+" Z",fill:"url(#gc)"}));
+  svg.appendChild(el("path",{d:path(px),fill:"none",stroke:"#60a5fa","stroke-width":1.6,"stroke-linecap":"round"}));
+  svg.appendChild(el("path",{d:path(pc),fill:"none",stroke:"#fb923c","stroke-width":1.6,"stroke-linecap":"round"}));
+  [[px,"#60a5fa"],[pc,"#fb923c"]].forEach(([p,c])=>{
+    const [x,y]=p[p.length-1];
+    svg.appendChild(el("circle",{cx:x-1.5,cy:y,r:2.4,fill:c,stroke:"#14181f","stroke-width":1.5}));
+  });
+
+  // cell sparklines — metric hue, values stay white
+  document.querySelectorAll(".cell[data-c]").forEach(cell=>{
+    const c = cell.getAttribute("data-c");
+    const sw = cell.querySelector(".msw");
+    if (sw) sw.style.background = c;
+    const s = cell.querySelector(".cspark");
+    const data = s.getAttribute("data-s").split(",").map(Number);
+    const w=100,h=13;
+    s.setAttribute("viewBox","0 0 "+w+" "+h);
+    s.setAttribute("preserveAspectRatio","none");
+    const mx=Math.max.apply(null,data), mn=Math.min.apply(null,data);
+    const sp=data.map((v,i)=>[2+i*(w-6)/(data.length-1), h-2.5-((v-mn)/(mx-mn||1))*(h-5)]);
+    s.appendChild(el("path",{d:path(sp),fill:"none",stroke:c,"stroke-opacity":".6","stroke-width":1.3,"stroke-linecap":"round"}));
+    const [ex,ey]=sp[sp.length-1];
+    s.appendChild(el("circle",{cx:ex,cy:ey,r:1.7,fill:c}));
+  });
+
+  // view switcher dropdown
+  const dd = document.getElementById("viewdd");
+  const btn = dd.querySelector(".view-btn");
+  function setOpen(open){
+    dd.classList.toggle("open", open);
+    btn.setAttribute("aria-expanded", String(open));
+  }
+  btn.addEventListener("click", e => { e.stopPropagation(); setOpen(!dd.classList.contains("open")); });
+  document.addEventListener("click", () => setOpen(false));
+  document.addEventListener("keydown", e => { if (e.key === "Escape") setOpen(false); });
+  if (location.hash === "#dd-open") setOpen(true);
+  if (location.hash === "#hover") document.getElementById("chartlegend").classList.add("show");
+})();
+</script>
