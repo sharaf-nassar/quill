@@ -72,7 +72,7 @@ use storage::Storage;
 use subtle::ConstantTimeEq;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Emitter, Listener, Manager, PhysicalPosition};
+use tauri::{Emitter, Listener, LogicalSize, Manager, PhysicalPosition};
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_updater::UpdaterExt;
 use tauri_plugin_window_state::{StateFlags, WindowExt};
@@ -209,9 +209,9 @@ const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
 const WIDGET_UI_MARKER_KEY: &str = "widget_ui_v1";
 
 // One-time marker for the widget's stored window size. The pre-widget main
-// window was a split-pane surface users had grown to several hundred pixels
-// wider and taller than the 360x560 widget, and that geometry is still sitting
-// in `.window-state.json` after an upgrade, so restoring SIZE on the first
+// window was a split-pane surface users had grown several hundred pixels wider
+// than the 360px widget, and that geometry is still sitting in
+// `.window-state.json` after an upgrade, so restoring SIZE on the first
 // widget launch would open the widget at the old window's size instead of its
 // design size. The first launch therefore restores position only and lets the
 // config win; the plugin saves the widget's real geometry on exit, so every
@@ -220,6 +220,13 @@ const WIDGET_UI_MARKER_KEY: &str = "widget_ui_v1";
 // been written by a build that predates this reset, and reusing it would skip
 // the reset for exactly the users who need it.
 const WIDGET_SIZE_RESET_MARKER_KEY: &str = "widget_size_reset_v1";
+
+// Bounds for the seeded-launch height clamp. The margin keeps the widget off
+// the very edge of the work area, which also covers compositors that report the
+// full screen because they cannot see an auto-hide panel. The floor mirrors
+// `minHeight` in `tauri.conf.json`: asking for less would only be overridden.
+const WIDGET_WORK_AREA_MARGIN: f64 = 24.0;
+const WIDGET_MIN_HEIGHT: f64 = 200.0;
 
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
@@ -3366,8 +3373,8 @@ fn seed_widget_always_on_top(storage: &Storage) -> bool {
 /// Position is always restored — where the user parked the widget survives any
 /// upgrade. Size is held back on the single launch that consumes the
 /// `widget_size_reset_v1` marker, because a profile upgrading from the
-/// split-pane main window still has that window's much larger size saved under
-/// `main` and restoring it would override the widget's 360x560 config default.
+/// split-pane main window still has that window's much wider size saved under
+/// `main` and restoring it would override the widget's 360x800 config default.
 /// Dropping SIZE lets the config win; the plugin still saves on exit, so the
 /// stale entry is replaced by the widget's own geometry and every later launch
 /// restores the size the user chose.
@@ -3391,6 +3398,79 @@ fn widget_restore_flags(storage: &Storage) -> StateFlags {
         log::warn!("Failed to record widget size reset marker: {error}");
     }
     StateFlags::POSITION
+}
+
+/// Fit a seeded widget height inside a monitor work area.
+///
+/// `height` is logical and `work_area_height` is physical, so the work area is
+/// divided by the monitor's scale factor before the two are compared. `None`
+/// means leave the configured size alone: either it already fits, or the
+/// monitor reported numbers that cannot be reasoned about, and guessing a
+/// height would be worse than opening at the size the config asked for.
+fn fit_height_to_work_area(height: f64, work_area_height: u32, scale_factor: f64) -> Option<f64> {
+    if work_area_height == 0 || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+
+    let available = f64::from(work_area_height) / scale_factor - WIDGET_WORK_AREA_MARGIN;
+    let fitted = available.max(WIDGET_MIN_HEIGHT);
+    if fitted < height { Some(fitted) } else { None }
+}
+
+/// Cap the widget to the display on the launch that seeds its size.
+///
+/// The configured height is tall enough to show the whole default view without
+/// scrolling, which a laptop or a short secondary display cannot honour, so a
+/// window opened at it would run off the bottom of the screen with its lower
+/// bands unreachable. Only the launch that seeds the size runs this — a size
+/// the user has dragged is theirs and is never second-guessed — and only the
+/// height moves, so the 360px design width survives the clamp.
+///
+/// The monitor is read after the position restore so a widget parked on a
+/// second display is measured against that display; `primary_monitor` is the
+/// fallback for a compositor that cannot place the window yet.
+fn clamp_seeded_widget_height(window: &tauri::WebviewWindow) {
+    let monitor = match window.current_monitor() {
+        Ok(Some(monitor)) => monitor,
+        Ok(None) => match window.primary_monitor() {
+            Ok(Some(monitor)) => monitor,
+            Ok(None) => {
+                log::warn!("No monitor reported; keeping the configured widget height");
+                return;
+            }
+            Err(error) => {
+                log::warn!("Failed to read the primary monitor: {error}");
+                return;
+            }
+        },
+        Err(error) => {
+            log::warn!("Failed to read the current monitor: {error}");
+            return;
+        }
+    };
+
+    let scale_factor = monitor.scale_factor();
+    let work_area_height = monitor.work_area().size.height;
+    let current = match window.inner_size() {
+        Ok(size) => size.to_logical::<f64>(scale_factor),
+        Err(error) => {
+            log::warn!("Failed to read the widget size: {error}");
+            return;
+        }
+    };
+
+    let Some(height) = fit_height_to_work_area(current.height, work_area_height, scale_factor)
+    else {
+        return;
+    };
+
+    log::info!(
+        "Clamping the seeded widget height from {} to {height} to fit the display work area",
+        current.height
+    );
+    if let Err(error) = window.set_size(LogicalSize::new(current.width, height)) {
+        log::warn!("Failed to clamp the widget height to the display: {error}");
+    }
 }
 
 fn read_i64_setting(storage: &Storage, key: &str, default: i64) -> i64 {
@@ -5338,6 +5418,15 @@ pub fn run() {
                     .unwrap_or(StateFlags::POSITION);
                 if let Err(error) = w.restore_state(restore_flags) {
                     log::warn!("Failed to restore widget window geometry: {error}");
+                }
+                // Seeding the size means the config height is what opens, and
+                // that height assumes a display tall enough for the whole
+                // default view. Cap it to the work area here so a short screen
+                // gets a shorter widget instead of one running off the bottom.
+                // Gated on the same flag rather than on the marker so a
+                // restored size — the user's own — is never touched.
+                if !restore_flags.contains(StateFlags::SIZE) {
+                    clamp_seeded_widget_height(&w);
                 }
                 // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
                 let taskbar_icon_bytes = include_bytes!("../icons/taskbar-icon.png");

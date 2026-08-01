@@ -44,7 +44,7 @@
       {
         "title": "Quill",
         "width": 360,
-        "height": 560,
+        "height": 800,
         "minWidth": 320,
         "minHeight": 200,
         "alwaysOnTop": false,
