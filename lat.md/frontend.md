@@ -10,7 +10,7 @@ Each window gets its own Suspense boundary with a fallback. Per-window zoom pers
 
 ### Window Routes
 
-Three Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary: the resizable main widget, the consolidated Manage workspace, and the release-notes viewer.
+Three Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary: the main widget, the consolidated Manage workspace, and the release-notes viewer.
 
 | Route | Component | Purpose |
 |-------|-----------|---------|
@@ -19,6 +19,8 @@ Three Tauri windows are routed by the `?view=` URL parameter, each with its own 
 | `?view=release-notes` | `ReleaseNotesWindow` | Browse published GitHub release notes |
 
 The former per-tool windows (`sessions`, `learning`, `restart`, `runs`, `settings`) were retired into Manage sections, and run history folded into the Learning section. All three remaining routes are reachable without an enabled provider — the Manage workspace gates each tool section inline (Settings always renders), so the former `BlockedWindow` per-window provider-blocking was removed.
+
+Every route also mounts [[src/components/WindowResizeHandles.tsx]] as a sibling of its view, because all three windows are decorationless and none of them gets a resize border from the window manager. The main route takes the default `widget` geometry; `manage` and `release-notes` take the `roomy` variant.
 
 ## Manage Workspace
 
@@ -54,7 +56,7 @@ Geometry is the user's, not the shell's. The window drags freely on both axes an
 
 Deleting the sizer left the config height as the only thing deciding how tall the widget opens, so that height is now measured against this shell rather than left at the sizer's old starting value: 43px of non-scrolling chrome plus the 745px the saturated Usage view renders at 360px wide, rounded to a 800px default and capped to the display on the launch that seeds it — see [[architecture#Multi-Window Design#Window Configuration#Seeded Height Clamp]]. The measurement is a one-off design input, not a runtime behaviour; nothing in the shell reads its own height any more.
 
-The drag itself comes from [[src/components/WindowResizeHandles.tsx]], because a `decorations: false` window has no native border to grab — see [[architecture#Multi-Window Design#Window Configuration]]. [[src/main.tsx]] mounts it beside `App` on the main route only, so its widget-tuned geometry never lands on another window.
+The drag itself comes from [[src/components/WindowResizeHandles.tsx]], because a `decorations: false` window has no native border to grab — see [[architecture#Multi-Window Design#Window Configuration]]. [[src/main.tsx]] mounts it beside `App` in its default `widget` geometry; the other two routes mount the same component in the `roomy` variant.
 
 ### Component Tree
 
@@ -75,7 +77,7 @@ The widget's own chrome lives under `src/components/widget/` and is described in
 - **ReleaseNotesWindow** (`src/windows/ReleaseNotesWindow.tsx`) — Standalone window that fetches published GitHub releases through the [[src-tauri/src/lib.rs#get_release_notes]] command, shows the latest first, and places Previous/Next navigation plus the selectable release URL in a top toolbar below the titlebar. Centers the release tag between the release counter and publish date, renders release bodies as sanitized GitHub-flavored Markdown that fills the scroll area, surfaces loading, empty, and error states with a Retry control, and supports Escape plus Left/Right arrow keyboard navigation. Its only entry point is the About row in the General settings tab — the widget titlebar carries no version affordance.
 - **ConfirmDialog** ([[src/components/ConfirmDialog.tsx]]) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation, driven from the Integrations settings tab.
 - **CommandPalette** ([[src/components/CommandPalette.tsx]]) — The Manage workspace's `⌘K` / `Ctrl K` substring-filtered navigator over its four sections plus Back-to-Live and Close-Tools actions.
-- **WindowResizeHandles** ([[src/components/WindowResizeHandles.tsx]]) — The widget's resize border: eight absolutely-positioned zones (four 5px edges, four 12px corners) inside a click-through fixed overlay, each handing its gesture to the compositor through `startResizeDragging` so the drag stays native and never round-trips through React. They are `aria-hidden` and pointer-only, and their 12px corner inset matches `.wg-shell`'s radius while clearing the titlebar keycaps and the view dropdown by at least 2px. Mounted on the main route only — see [[frontend#Frontend#Main Window Layout]].
+- **WindowResizeHandles** ([[src/components/WindowResizeHandles.tsx]]) — The resize border shared by all three decorationless windows: eight absolutely-positioned zones (four edges, four corners, the corners painted last so they win the diagonal cursor) inside a click-through fixed overlay, each handing its gesture to the compositor through `startResizeDragging` so the drag stays native and never round-trips through React. They are `aria-hidden`, pointer-only, hold no focusable content, and act on the left button alone so the widget's right-click Refresh/Quit menu still opens. The `variant` prop picks the geometry, which is expressed as the `--wrh-edge` and `--wrh-corner` custom properties on the overlay: `widget` (default) is 5px edges and 12px corners, `roomy` keeps the 5px edges and drops to 8px corners for Manage and release-notes. Both mounts are in [[src/main.tsx]] — see [[architecture#Multi-Window Design#Window Configuration#Resize Border Geometry]] for why the two windows cannot share one number.
 - **RetentionBanner** ([[src/components/RetentionBanner.tsx#RetentionBanner]]) — The multi-line retention disclosure, described in [[lat.md/frontend#Frontend#Components#Retention Degradation]]. The widget states the same fact as a condensed one-line variant inside the affected view rather than mounting this banner.
 
 The pre-widget main-window chrome — `TitleBar`, `UsageDisplay`, `UsageRow`, the `live/` modules, and the `ProviderMenu` popover with its legacy `IntegrationsWindow` host — was deleted with the widget redesign. Their responsibilities moved to [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]], [[src/components/widget/LimitsSection.tsx#LimitsSection]], and the Settings surfaces respectively.

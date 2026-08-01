@@ -109,10 +109,12 @@ if (view === null) {
   });
 }
 
-// The resize border is mounted per route rather than around `RoutedView`,
-// because its geometry is tuned to the widget's 12px corner radius and its
-// titlebar keycaps. Manage and release-notes are decorationless too and need
-// their own pass; the widget is what this restores.
+// All three windows are decorationless, so all three need the resize border.
+// It is mounted per route rather than once around `RoutedView` because the
+// zone geometry has to clear each window's own chrome: the widget's 12px
+// corner squares match `.wg-shell`'s radius, while Manage and release-notes
+// put a close key close enough to the top-right corner to need the smaller
+// `roomy` squares.
 function MainAppView() {
   const integrations = useIntegrations();
   return (
@@ -129,10 +131,20 @@ function MainAppView() {
 // blocking is gone.
 function RoutedView() {
   if (view === "manage") {
-    return <ManageWindowView />;
+    return (
+      <>
+        <ManageWindowView />
+        <WindowResizeHandles variant="roomy" />
+      </>
+    );
   }
   if (view === "release-notes") {
-    return <ReleaseNotesWindowView />;
+    return (
+      <>
+        <ReleaseNotesWindowView />
+        <WindowResizeHandles variant="roomy" />
+      </>
+    );
   }
   return <MainAppView />;
 }

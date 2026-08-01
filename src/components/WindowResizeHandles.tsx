@@ -1,20 +1,33 @@
 // WindowResizeHandles — the resize border of a decorationless window.
 //
-// The widget paints its own rounded surface on a `decorations: false` window,
-// so the window manager has no native frame to hit-test. `resizable: true` in
-// `tauri.conf.json` is inert on its own; these eight zones are the widget's
-// entire resize affordance. Each one hands the gesture straight to the
-// compositor through `startResizeDragging`, so the drag is native — React
-// never sees a mousemove and the window keeps resizing while the webview is
-// busy.
+// Every window in the app paints its own surface on a `decorations: false`
+// window, so the window manager has no native frame to hit-test.
+// `resizable: true` is inert on its own; these eight zones are the entire
+// resize affordance. Each one hands the gesture straight to the compositor
+// through `startResizeDragging`, so the drag is native — React never sees a
+// mousemove and the window keeps resizing while the webview is busy.
 //
 // The zones are pointer-only (`aria-hidden`, no focus, no content) and the
-// geometry in `.window-resize-handle*` keeps them clear of the widget's own
-// chrome: the titlebar drag region, the update button, the sync pill, the
-// always-on-top toggle, and the settings and close keys all stay clickable.
+// geometry in `.window-resize-handle*` keeps them clear of the host window's
+// own chrome. That clearance is per-window, which is what `variant` selects:
+// the widget's corner squares are sized to `.wg-shell`'s 12px radius, while
+// Manage and release-notes put a close key much closer to the top-right than
+// the widget's keycaps do and need smaller corners. Edge width is shared —
+// the tightest control in the app (Manage's close key, 5px below the top)
+// leaves room for exactly 5px on every window.
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { MouseEventHandler } from "react";
+
+/**
+ * Which window's chrome the border geometry is tuned to. `widget` is the
+ * 360px main window; `roomy` is Manage and release-notes.
+ */
+export type WindowResizeVariant = "widget" | "roomy";
+
+interface WindowResizeHandlesProps {
+  variant?: WindowResizeVariant;
+}
 
 /** The eight directions Tauri accepts for a border drag. */
 type ResizeDirection =
@@ -59,9 +72,17 @@ function startResize(
   };
 }
 
-function WindowResizeHandles() {
+function WindowResizeHandles({ variant = "widget" }: WindowResizeHandlesProps) {
+  // The base class carries the widget geometry, so the main window renders
+  // byte-identical markup to the single-window version; only `roomy` adds a
+  // modifier that retunes the custom properties the zones read.
+  const overlayClass =
+    variant === "roomy"
+      ? "window-resize-handles window-resize-handles--roomy"
+      : "window-resize-handles";
+
   return (
-    <div className="window-resize-handles" aria-hidden="true">
+    <div className={overlayClass} aria-hidden="true">
       {HANDLES.map(({ modifier, direction }) => (
         <div
           key={direction}

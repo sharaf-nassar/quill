@@ -1433,22 +1433,47 @@ body {
 
 /* ─── Resize border ───
    `decorations: false` leaves the window manager no frame to hit-test, so the
-   eight zones rendered by src/components/WindowResizeHandles.tsx are the
-   widget's whole resize affordance. The overlay is click-through; only the
-   zones take the pointer.
+   eight zones rendered by src/components/WindowResizeHandles.tsx are the whole
+   resize affordance of every window in the app. The overlay is click-through;
+   only the zones take the pointer.
 
-   Edges are 5px and stop 12px short of each corner, where 12px squares — the
-   shell's own corner radius — own the diagonals. Nothing interactive reaches
-   that far out: the titlebar keycaps are 24px inset by the bar's 14px
-   padding, and the view dropdown opens at 7px from the left gutter, so every
-   control clears the zones by at least 2px. The 40px drag region gives up its
-   top 5px to the north edge, which is the normal trade for a borderless
-   window. */
+   The geometry is two numbers — `--wrh-edge` and `--wrh-corner` — because the
+   clearance it has to respect belongs to the host window's chrome, not to the
+   handles. Edges are `--wrh-edge` tall/wide and stop `--wrh-corner` short of
+   each end, where squares of that size own the diagonals and so win the
+   diagonal cursor on the overlap. The drag region under the north edge gives
+   up its top `--wrh-edge`, which is the normal trade for a borderless window.
+
+   Widget (default, 5px / 12px): 12px is `.wg-shell`'s own corner radius. The
+   titlebar keycaps are 24px inset by the bar's 14px padding and the view
+   dropdown opens 7px from the left gutter, so every control clears the zones
+   by at least 2px.
+
+   Roomy (`--roomy`, 5px / 8px) covers Manage and release-notes. Both put a
+   close key far closer to the top-right corner than the widget's keycaps sit,
+   and that key is what sets the number. Manage's is 26px square, 8px in from
+   the right edge and 5px down; release-notes' is 28px square, 11px in and 7px
+   down. 8px corners stop exactly where the Manage key starts and clear the
+   release-notes key by 3px, and 8px is also release-notes' own shell radius,
+   so the square covers precisely the transparent notch there — 12px would cut
+   into both keys. The 5px edge is the most the Manage key's 5px top gap
+   allows. Everything else has room to spare: the west edge clears the Manage
+   rail's search trigger and section buttons by 5px, the east edge clears the
+   Manage close key by 3px and the release-notes one by 6px, and the ⌘K
+   palette is centred and never comes within 80px of an edge, even at Manage's
+   720px minimum width. */
 .window-resize-handles {
+  --wrh-edge: 5px;
+  --wrh-corner: 12px;
+
   position: fixed;
   inset: 0;
   z-index: 2147483647;
   pointer-events: none;
+}
+
+.window-resize-handles--roomy {
+  --wrh-corner: 8px;
 }
 
 .window-resize-handle {
@@ -1459,65 +1484,65 @@ body {
 
 .window-resize-handle--north {
   top: 0;
-  right: 12px;
-  left: 12px;
-  height: 5px;
+  right: var(--wrh-corner);
+  left: var(--wrh-corner);
+  height: var(--wrh-edge);
   cursor: n-resize;
 }
 
 .window-resize-handle--east {
-  top: 12px;
+  top: var(--wrh-corner);
   right: 0;
-  bottom: 12px;
-  width: 5px;
+  bottom: var(--wrh-corner);
+  width: var(--wrh-edge);
   cursor: e-resize;
 }
 
 .window-resize-handle--south {
-  right: 12px;
+  right: var(--wrh-corner);
   bottom: 0;
-  left: 12px;
-  height: 5px;
+  left: var(--wrh-corner);
+  height: var(--wrh-edge);
   cursor: s-resize;
 }
 
 .window-resize-handle--west {
-  top: 12px;
-  bottom: 12px;
+  top: var(--wrh-corner);
+  bottom: var(--wrh-corner);
   left: 0;
-  width: 5px;
+  width: var(--wrh-edge);
   cursor: w-resize;
 }
 
 .window-resize-handle--north-east {
   top: 0;
   right: 0;
-  width: 12px;
-  height: 12px;
+  width: var(--wrh-corner);
+  height: var(--wrh-corner);
   cursor: nesw-resize;
 }
 
 .window-resize-handle--south-east {
   right: 0;
   bottom: 0;
-  width: 12px;
-  height: 12px;
+  width: var(--wrh-corner);
+  height: var(--wrh-corner);
   cursor: nwse-resize;
 }
 
 .window-resize-handle--south-west {
   bottom: 0;
   left: 0;
-  width: 12px;
-  height: 12px;
+  width: var(--wrh-corner);
+  height: var(--wrh-corner);
   cursor: nesw-resize;
 }
 
 .window-resize-handle--north-west {
   top: 0;
   left: 0;
-  width: 12px;
-  height: 12px;
+  width: var(--wrh-corner);
+  height: var(--wrh-corner);
   cursor: nwse-resize;
 }
 

@@ -13,7 +13,7 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 ## Multi-Window Design
 
-The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the resizable main widget, the consolidated Manage workspace, and a release-notes viewer.
+The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main widget, the consolidated Manage workspace, and a release-notes viewer. All three are decorationless, transparent, and freely resizable.
 
 The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
@@ -27,7 +27,7 @@ The main window is `resizable: true` and drags freely on both axes. It opens at 
 
 The 800px height is measured, not chosen. The default Usage view renders 788px tall at the 360px design width with its breakdown saturated at `BREAKDOWN_LIMIT` rows — 43px of non-scrolling chrome (40px titlebar, 1px rule, 2px shell borders) above a 745px content column — and 800 rounds that up so sub-pixel rounding at fractional display scaling cannot reintroduce a scrollbar. Usage is also the tallest view, so Trends, Charts, Models, and Context all fit inside it. The earlier 560 was a placeholder for the deleted content-driven sizer described in [[frontend#Main Window Layout]], and once that sizer was gone it opened the widget with its lower bands cut off.
 
-`resizable: true` is inert by itself on a `decorations: false` window: there is no native frame for the window manager to hit-test, so the flag only means the compositor will honour a resize the app asks for. The affordance that asks is [[src/components/WindowResizeHandles.tsx]], mounted by [[src/main.tsx]] on the main route alone. `manage` and `release-notes` are decorationless too and currently have no equivalent, so they resize only through their window manager's own keyboard or modifier gestures.
+`resizable: true` is inert by itself on a `decorations: false` window: there is no native frame for the window manager to hit-test, so the flag only means the compositor will honour a resize the app asks for. The affordance that asks is [[src/components/WindowResizeHandles.tsx]], and all three windows are decorationless, so [[src/main.tsx]] mounts it on all three routes — see [[architecture#Multi-Window Design#Window Configuration#Resize Border Geometry]].
 
 Geometry belongs to the user, so `tauri-plugin-window-state` persists the widget's size and position like every other window. The plugin is still built with `skip_initial_state("main")` because its automatic restore replays every flag, and a saved `decorated` or `visible` value would undo the decorationless surface and the close-to-tray contract. Skipping that restore drops all flags for the window, so the two the widget actually wants are restored explicitly in setup with `StateFlags::POSITION | StateFlags::SIZE`; `skip_initial_state` gates only the restore, so saving is unaffected. Other windows keep the plugin's full default behaviour.
 
@@ -40,6 +40,16 @@ A default sized for the whole Usage view is taller than a short display can show
 The clamp is gated on `StateFlags::SIZE` being absent from the restore flags rather than on the marker directly, so it runs on exactly the launches where the config height is what opens. A size the user dragged is restored instead and is never touched — reclaiming it is the mistake the deleted `ResizeObserver` sizer made. It runs after `restore_state` so `current_monitor` reports the display the widget was actually parked on, falling back to `primary_monitor` when the compositor cannot place the window yet.
 
 [[src-tauri/src/lib.rs#fit_height_to_work_area]] does the arithmetic: monitor geometry is physical and the config height is logical, so the work area is divided by the monitor's scale factor before the comparison, then [[src-tauri/src/lib.rs#WIDGET_WORK_AREA_MARGIN]] is subtracted to keep the widget off the screen edge — which also absorbs a panel or dock a compositor failed to exclude from the work area — and the result is floored at [[src-tauri/src/lib.rs#WIDGET_MIN_HEIGHT]] to match `minHeight`. It returns `None` when the height already fits or when the monitor reports a zero or non-finite scale factor, and `None` means leave the configured size alone: opening at the size the config asked for beats guessing from numbers that cannot be trusted. Only the height moves, so the 360px design width survives the clamp.
+
+#### Resize Border Geometry
+
+The eight zones have to clear each host window's own chrome, so the geometry is two custom properties on the overlay — `--wrh-edge` and `--wrh-corner` — and the `variant` prop of [[src/components/WindowResizeHandles.tsx]] selects which pair applies.
+
+The widget takes the default 5px edges and 12px corners: 12px is `.wg-shell`'s own radius, so the corner square covers exactly the transparent notch, and the titlebar keycaps and view dropdown still clear it by at least 2px. Manage and release-notes take the `roomy` variant — the same 5px edges, but 8px corners.
+
+The corner is what has to shrink, and the close key in each window is what shrinks it. Manage's is a 26px square 8px in from the right edge and 5px down; release-notes' is 28px, 11px in and 7px down. A 12px corner would cut into both; an 8px one stops exactly where the Manage key starts, clears the release-notes key by 3px, and happens to equal release-notes' own 8px shell radius. The 5px edge is the most the Manage key's 5px top gap allows, and the north edge claiming the top 5px of the titlebar drag region is the usual borderless-window trade. Nothing else is close: the Manage rail's search trigger and section buttons start 10px in, and the ⌘K palette is centred and never within 80px of an edge even at the 720px minimum width.
+
+Neither Manage nor release-notes had any affordance at all before this, because the component was originally mounted on the main route alone on the grounds that its geometry was widget-specific; parameterising the two numbers is what let the other two windows share it without inheriting the widget's clearances.
 
 ## Module Map
 
