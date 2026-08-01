@@ -25,6 +25,8 @@ The main widget lives in `src-tauri/tauri.conf.json`, while the dynamically crea
 
 The main window is `resizable: true` and drags freely on both axes. It opens at the 360x560 design size with a 320px minimum width and a 200px minimum height, declares no maximum on either axis, and stays borderless and transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to the Settings window, which is now the only place it appears.
 
+`resizable: true` is inert by itself on a `decorations: false` window: there is no native frame for the window manager to hit-test, so the flag only means the compositor will honour a resize the app asks for. The affordance that asks is [[src/components/WindowResizeHandles.tsx]], mounted by [[src/main.tsx]] on the main route alone. `manage` and `release-notes` are decorationless too and currently have no equivalent, so they resize only through their window manager's own keyboard or modifier gestures.
+
 Geometry belongs to the user, so `tauri-plugin-window-state` persists the widget's size and position like every other window. The plugin is still built with `skip_initial_state("main")` because its automatic restore replays every flag, and a saved `decorated` or `visible` value would undo the decorationless surface and the close-to-tray contract. Skipping that restore drops all flags for the window, so the two the widget actually wants are restored explicitly in setup with `StateFlags::POSITION | StateFlags::SIZE`; `skip_initial_state` gates only the restore, so saving is unaffected. Other windows keep the plugin's full default behaviour.
 
 ## Module Map

@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
+import WindowResizeHandles from "./components/WindowResizeHandles";
 import { openManageWindow } from "./lib/manageWindow";
 import type { RuntimeSettings } from "./types";
 import "./styles/index.css";
@@ -108,9 +109,18 @@ if (view === null) {
   });
 }
 
+// The resize border is mounted per route rather than around `RoutedView`,
+// because its geometry is tuned to the widget's 12px corner radius and its
+// titlebar keycaps. Manage and release-notes are decorationless too and need
+// their own pass; the widget is what this restores.
 function MainAppView() {
   const integrations = useIntegrations();
-  return <App integrations={integrations} />;
+  return (
+    <>
+      <App integrations={integrations} />
+      <WindowResizeHandles />
+    </>
+  );
 }
 
 // Only main / manage / release-notes routes remain after the workspace

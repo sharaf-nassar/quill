@@ -1431,6 +1431,96 @@ body {
   background: transparent;
 }
 
+/* ─── Resize border ───
+   `decorations: false` leaves the window manager no frame to hit-test, so the
+   eight zones rendered by src/components/WindowResizeHandles.tsx are the
+   widget's whole resize affordance. The overlay is click-through; only the
+   zones take the pointer.
+
+   Edges are 5px and stop 12px short of each corner, where 12px squares — the
+   shell's own corner radius — own the diagonals. Nothing interactive reaches
+   that far out: the titlebar keycaps are 24px inset by the bar's 14px
+   padding, and the view dropdown opens at 7px from the left gutter, so every
+   control clears the zones by at least 2px. The 40px drag region gives up its
+   top 5px to the north edge, which is the normal trade for a borderless
+   window. */
+.window-resize-handles {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+.window-resize-handle {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.window-resize-handle--north {
+  top: 0;
+  right: 12px;
+  left: 12px;
+  height: 5px;
+  cursor: n-resize;
+}
+
+.window-resize-handle--east {
+  top: 12px;
+  right: 0;
+  bottom: 12px;
+  width: 5px;
+  cursor: e-resize;
+}
+
+.window-resize-handle--south {
+  right: 12px;
+  bottom: 0;
+  left: 12px;
+  height: 5px;
+  cursor: s-resize;
+}
+
+.window-resize-handle--west {
+  top: 12px;
+  bottom: 12px;
+  left: 0;
+  width: 5px;
+  cursor: w-resize;
+}
+
+.window-resize-handle--north-east {
+  top: 0;
+  right: 0;
+  width: 12px;
+  height: 12px;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle--south-east {
+  right: 0;
+  bottom: 0;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+}
+
+.window-resize-handle--south-west {
+  bottom: 0;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  cursor: nesw-resize;
+}
+
+.window-resize-handle--north-west {
+  top: 0;
+  left: 0;
+  width: 12px;
+  height: 12px;
+  cursor: nwse-resize;
+}
+
 .wg-shell {
   display: flex;
   flex-direction: column;
