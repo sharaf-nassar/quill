@@ -317,11 +317,17 @@ Top-tabs navigation hosts five panels: General, Integrations, Context, Learning,
 
 | Tab | Panel | Settings |
 |-----|-------|----------|
-| General | [[src/components/settings/GeneralTab.tsx]] | Layout (stacked / side-by-side), time visualization mode, Live and Analytics panel visibility, always-on-top toggle, an Advanced section with the current-config summary and "Reset to defaults" button covering runtime, learning, and UI prefs, plus a bottom "Help improve Quill" toggle that drives the [[features#Crash Reporting]] opt-out |
+| General | [[src/components/settings/GeneralTab.tsx]] | Always-on-top toggle, an Advanced section with the current-config summary and "Reset to defaults" button covering runtime and learning settings, a "Help improve Quill" toggle that drives the [[features#Crash Reporting]] opt-out, and an About section described in [[features#Settings Window#Version and Release Notes]] |
 | Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form |
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
 | Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
 | Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
+
+### Version and Release Notes
+
+The General tab's About section is the settings surface that reports the running app version and opens the release-notes window.
+
+[[src/components/settings/GeneralTab.tsx]] reads the version once on mount through the Tauri `getVersion()` API and renders it in the About row; a failed read is logged and the row falls back to "Version unavailable" rather than disappearing, so the adjacent "What's new" button always works. That button focuses an existing `release-notes` webview when one is open and otherwise creates it at `/?view=release-notes` ([[src/windows/ReleaseNotesWindow.tsx]]), which keeps the release-notes viewer reachable from settings independently of the main-window chrome.
 
 ### Database Compaction
 
@@ -343,7 +349,7 @@ Four global feature flags decide which optional Quill assets get deployed into C
 
 UI preferences stored in `localStorage` (layout mode, time mode, Live/Analytics panel visibility) are shared across Tauri webviews but require an explicit notify so other windows update without reloading.
 
-The [[src/hooks/useUiPrefs.ts#useUiPrefs]] hook writes localStorage and emits a `ui-prefs-updated` Tauri event. The main window's [[src/App.tsx]] subscribes to this event and re-applies layout, time mode, and panel visibility without a reload. The same event drives the "Reset to defaults" button in the Advanced section at the bottom of the General tab.
+The [[src/hooks/useUiPrefs.ts#useUiPrefs]] hook writes localStorage and emits a `ui-prefs-updated` Tauri event. The main window's [[src/App.tsx]] subscribes to this event and re-applies layout, time mode, and panel visibility without a reload. The Settings window no longer participates: the General tab's controls for these preferences and the UI-prefs branch of "Reset to defaults" were removed, so the event now has only main-window producers and consumers.
 
 ### Runtime Settings IPC
 

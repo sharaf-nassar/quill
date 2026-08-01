@@ -1,5 +1,6 @@
-import type { LayoutMode, TimeMode } from "../../types";
-import type { UiPrefs } from "../../hooks/useUiPrefs";
+import { useCallback, useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   RUNTIME_SETTINGS_DEFAULTS,
   type UseRuntimeSettingsResult,
@@ -14,22 +15,29 @@ import SettingRow from "./SettingRow";
 import Toggle from "./Toggle";
 
 interface GeneralTabProps {
-  prefs: UiPrefs;
-  onUpdatePrefs: (patch: Partial<UiPrefs>) => void;
   runtime: UseRuntimeSettingsResult;
   learning: UseLearningSettingsResult;
-  onResetUiPrefs: () => Promise<void>;
 }
 
-export function GeneralTab({
-  prefs,
-  onUpdatePrefs,
-  runtime,
-  learning,
-  onResetUiPrefs,
-}: GeneralTabProps) {
+export function GeneralTab({ runtime, learning }: GeneralTabProps) {
   const { toast } = useToast();
   const appImage = useAppImageIntegration();
+  const [version, setVersion] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    getVersion()
+      .then((value) => {
+        if (active) setVersion(value);
+      })
+      .catch((error: unknown) => {
+        // Chrome, not data: the row stays usable, but keep the failure context.
+        console.warn("Failed to read app version", error);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleAlwaysOnTop = (next: boolean) => {
     void runtime.save({ ...runtime.settings, alwaysOnTop: next });
@@ -39,84 +47,41 @@ export function GeneralTab({
     const live = runtime.settings.liveUsageEnabled
       ? `every ${runtime.settings.liveUsageIntervalSeconds}s`
       : "off";
-    return `Live polling: ${live} • Layout: ${prefs.layoutMode}`;
+    return `Live polling: ${live}`;
   };
 
   const handleResetAll = async () => {
     try {
       await runtime.save(RUNTIME_SETTINGS_DEFAULTS);
       await learning.save(LEARNING_SETTINGS_DEFAULTS);
-      await onResetUiPrefs();
       toast("info", "Settings reset to defaults");
     } catch (err) {
       toast("error", `Reset failed: ${String(err)}`);
     }
   };
 
+  const handleOpenReleaseNotes = useCallback(async () => {
+    const existing = await WebviewWindow.getByLabel("release-notes");
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    new WebviewWindow("release-notes", {
+      url: "/?view=release-notes",
+      title: "Release Notes",
+      width: 560,
+      height: 600,
+      minWidth: 380,
+      minHeight: 360,
+      decorations: false,
+      transparent: true,
+      resizable: true,
+    });
+  }, []);
+
   return (
     <div className="settings-panel">
-      <SettingRow
-        label="Layout"
-        description="Stacked places Live above Analytics; side-by-side puts them left/right."
-        control={
-          <div className="settings-segmented">
-            {(["stacked", "side-by-side"] as LayoutMode[]).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                className={`settings-segment${prefs.layoutMode === mode ? " settings-segment--active" : ""}`}
-                onClick={() => onUpdatePrefs({ layoutMode: mode })}
-              >
-                {mode === "stacked" ? "Stacked" : "Side-by-side"}
-              </button>
-            ))}
-          </div>
-        }
-      />
-
-      <SettingRow
-        label="Time visualization"
-        description="How Live Usage renders the bucket reset clock."
-        control={
-          <div className="settings-segmented">
-            {(["marker", "dual", "background"] as TimeMode[]).map((mode) => (
-              <button
-                key={mode}
-                type="button"
-                className={`settings-segment${prefs.timeMode === mode ? " settings-segment--active" : ""}`}
-                onClick={() => onUpdatePrefs({ timeMode: mode })}
-              >
-                {mode}
-              </button>
-            ))}
-          </div>
-        }
-      />
-
-      <SettingRow
-        label="Live panel"
-        description="Show the live-usage pane in the main window."
-        control={
-          <Toggle
-            tone={prefs.showLive ? "on" : "off"}
-            pressed={prefs.showLive}
-            onClick={() => onUpdatePrefs({ showLive: !prefs.showLive })}
-          />
-        }
-      />
-
-      <SettingRow
-        label="Analytics panel"
-        description="Show the analytics dashboard pane in the main window."
-        control={
-          <Toggle
-            tone={prefs.showAnalytics ? "on" : "off"}
-            pressed={prefs.showAnalytics}
-            onClick={() => onUpdatePrefs({ showAnalytics: !prefs.showAnalytics })}
-          />
-        }
-      />
-
       <SettingRow
         label="Always on top"
         description="Pin the main window above other windows."
@@ -161,7 +126,7 @@ export function GeneralTab({
       />
       <SettingRow
         label="Reset to defaults"
-        description="Restore Quill's runtime, learning, and UI preferences to their initial values. Provider integrations, brevity blocks, learned rules, and analytics history are NOT touched."
+        description="Restore Quill's runtime and learning preferences to their initial values. Provider integrations, brevity blocks, learned rules, and analytics history are NOT touched."
         control={
           <button
             type="button"
@@ -196,6 +161,26 @@ export function GeneralTab({
               })
             }
           />
+        }
+      />
+
+      <div className="settings-section-header">About</div>
+      <SettingRow
+        label="Version"
+        description={
+          version
+            ? `Quill v${version} — read the release notes for this and earlier builds.`
+            : "Version unavailable — read the release notes for recent builds."
+        }
+        control={
+          <button
+            type="button"
+            className="settings-button"
+            onClick={() => void handleOpenReleaseNotes()}
+            title="Open release notes"
+          >
+            {"What's new"}
+          </button>
         }
       />
     </div>
