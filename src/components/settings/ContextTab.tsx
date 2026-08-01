@@ -9,7 +9,7 @@ interface ContextTabProps {
   features: UseIntegrationFeaturesResult;
 }
 
-export function ContextTab({ integrations, features }: ContextTabProps) {
+function ContextTab({ integrations, features }: ContextTabProps) {
   const { toast } = useToast();
   const {
     contextPreservation,

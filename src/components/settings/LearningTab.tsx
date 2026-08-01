@@ -16,7 +16,7 @@ const TRIGGER_MODES: ReadonlyArray<{ id: LearningTriggerMode; label: string }> =
   { id: "periodic", label: "Periodic" },
 ];
 
-export function LearningTab({ learning, runtime }: LearningTabProps) {
+function LearningTab({ learning, runtime }: LearningTabProps) {
   const { toast } = useToast();
   const { settings, saving } = learning;
 

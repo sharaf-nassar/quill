@@ -154,6 +154,16 @@ Flat config format (v9+) in `eslint.config.js`. Base: `@eslint/js` recommended +
 
 The `clippy` hook delegates to `scripts/precommit-rust.sh` (see [[infrastructure#Infrastructure#Scripts#Platform-Aware Rust Lint Hook]]) so platform-gated `#[cfg(target_os = "…")]` code is linted on a matching host instead of slipping through to the macOS Release build.
 
+### Dead-Code Gate
+
+`npm run knip` must report nothing — zero unused files, exports, types, and dependencies across `src/**/*.{ts,tsx}`.
+
+Config lives in `knip.json`: project scope `src/**/*.{ts,tsx}`, `ignoreExportsUsedInFile` on (a symbol consumed only inside its own module is not "unused"), checks limited to files, dependencies, exports, and types. Enum members and duplicate exports are excluded because neither is a reliable deletion signal here.
+
+The gate is absolute, not differential. The widget redesign temporarily carried a `knip-baseline.txt` recording pre-existing debt so the legacy teardown could prove it added no new unused surface; that debt is now gone and the baseline file with it. There is no allowlist to append to — a new report line means the code is dead and must be deleted or wired up.
+
+Two categories of finding recur. A component that exports both `export function X` and `export default X` while every consumer imports the default: drop the named export, keeping the repo's `function X(...)` + `export default X` shape. An npm package whose Rust counterpart is what the app actually uses (`@tauri-apps/plugin-process` and `@tauri-apps/plugin-window-state` were both removed for this reason): drop the JS binding, keep the `src-tauri/Cargo.toml` crate.
+
 ## Scripts
 
 Utility scripts for development, testing, and documentation tasks.

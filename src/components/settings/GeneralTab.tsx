@@ -19,7 +19,7 @@ interface GeneralTabProps {
   learning: UseLearningSettingsResult;
 }
 
-export function GeneralTab({ runtime, learning }: GeneralTabProps) {
+function GeneralTab({ runtime, learning }: GeneralTabProps) {
   const { toast } = useToast();
   const appImage = useAppImageIntegration();
   const [version, setVersion] = useState("");

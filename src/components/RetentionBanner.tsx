@@ -78,5 +78,3 @@ export function RetentionBanner({ cutoff, surface }: RetentionBannerProps) {
 		</div>
 	);
 }
-
-export default RetentionBanner;

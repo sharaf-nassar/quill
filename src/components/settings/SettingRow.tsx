@@ -7,7 +7,7 @@ interface SettingRowProps {
   badge?: ReactNode;
 }
 
-export function SettingRow({ label, description, control, badge }: SettingRowProps) {
+function SettingRow({ label, description, control, badge }: SettingRowProps) {
   return (
     <div className="settings-row">
       <div className="settings-row-meta">

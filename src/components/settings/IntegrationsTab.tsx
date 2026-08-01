@@ -69,7 +69,7 @@ function providerActionCopy(action: PendingProviderAction) {
   };
 }
 
-export function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
+function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
   const { toast } = useToast();
   const {
     statuses,

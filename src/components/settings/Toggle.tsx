@@ -20,7 +20,7 @@ const DEFAULT_LABELS: Record<ToggleTone, string> = {
   busy: "...",
 };
 
-export function Toggle({
+function Toggle({
   tone,
   label,
   disabled,

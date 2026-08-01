@@ -168,7 +168,7 @@ function retentionStatusLabel(status: RetentionAuditRecord["status"]): string {
   return status === "partial" ? "Stopped part-way" : "Nothing removed";
 }
 
-export function PerformanceTab({ runtime }: PerformanceTabProps) {
+function PerformanceTab({ runtime }: PerformanceTabProps) {
   const { toast } = useToast();
   const { settings, saving } = runtime;
   const retention = useRetentionPolicy();

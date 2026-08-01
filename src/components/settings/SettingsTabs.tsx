@@ -18,7 +18,7 @@ const TABS: ReadonlyArray<{ id: SettingsTabId; label: string }> = [
   { id: "performance", label: "Performance" },
 ];
 
-export function SettingsTabs({ active, onChange }: SettingsTabsProps) {
+function SettingsTabs({ active, onChange }: SettingsTabsProps) {
   return (
     <nav className="settings-tabs" role="tablist" aria-label="Settings sections">
       {TABS.map((tab) => (
