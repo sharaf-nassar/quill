@@ -175,7 +175,7 @@
 }
 .manage-rail-back:hover {
   color: var(--readout);
-  border-color: var(--hairline-strong, rgba(255, 255, 255, 0.18));
+  border-color: var(--hairline-strong);
   background: var(--fill-ghost);
 }
 .manage-rail-back:focus-visible {
@@ -305,7 +305,7 @@
 }
 .manage-rail-search:hover {
   color: var(--readout);
-  border-color: var(--hairline-strong, rgba(255, 255, 255, 0.18));
+  border-color: var(--hairline-strong);
 }
 .manage-rail-search:focus-visible {
   outline: 2px solid rgba(96, 165, 250, 0.7);

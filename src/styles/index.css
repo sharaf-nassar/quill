@@ -30,6 +30,15 @@
   --slate-input: #1a1a1f;
   --graphite-line: #21262d;
 
+  /* Graphite Stack hairlines — the line ladder for the windows DESIGN.md §6
+     defers (Manage, learning, release-notes). These are aliases of the
+     Graphite Stack line, NOT the Flat Polish --line/--line-soft: §6 forbids
+     back-porting Flat Polish tokens piecemeal, so a legacy window rules its
+     bands with --graphite-line until it converts in one pass.
+     --hairline-strong is the hover step, a neutral white-alpha lift. */
+  --hairline: var(--graphite-line);
+  --hairline-strong: rgba(255, 255, 255, 0.18);
+
   /* Text */
   --readout: #d4d4d4;
   --readout-bright: #e6edf3;
