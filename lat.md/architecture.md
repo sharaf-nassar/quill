@@ -13,9 +13,9 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 ## Multi-Window Design
 
-The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main split-pane window, the consolidated Manage workspace, and a release-notes viewer.
+The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the 360px main widget, the consolidated Manage workspace, and a release-notes viewer.
 
-The main window hosts a split-pane layout with the [[features#Live Usage View]] and [[features#Analytics Dashboard]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
+The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
 The Sessions, Learning, Restart, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the PFD titlebar's un-gated Manage button (the cog opens it at the Settings section). It embeds each tool's existing window-view component as a rail section — per-window chrome suppressed via `manage.css` — with inline no-provider states, and folds learning run history into the Learning section. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
 
@@ -23,7 +23,9 @@ The Sessions, Learning, Restart, and Settings management surfaces are consolidat
 
 The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `manage`, `runs`, `sessions`, `learning`, `restart`, `settings`, and `release-notes`.
 
-The main window defaults to 280x340px, stays borderless and transparent, and uses the custom titlebar in [[src/components/TitleBar.tsx]] for left-aligned feature controls, a centered static `QUILL` brand label, and a right-aligned cluster with a settings button that opens the Settings window, followed by the version and close controls.
+The main window is fixed at 360px wide (`minWidth` = `maxWidth` = 360, `resizable: false`) with a 200-900px height range the shell drives from its content, and stays borderless and transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to the Settings window, which is now the only place it appears.
+
+Because that geometry belongs to the app, `tauri-plugin-window-state` is built with `skip_initial_state("main")` so a saved size — including a pre-widget 520x700 pane layout — can never be restored over it. Skipping the initial restore drops every flag for that window, so the widget's position (the one piece of geometry a corner widget must keep) is restored explicitly in setup with `StateFlags::POSITION`. Other windows keep the plugin's full default behaviour.
 
 ## Module Map
 

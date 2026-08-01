@@ -6,7 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { ToastProvider } from "./hooks/useToast";
 import { useIntegrations } from "./hooks/useIntegrations";
-import WindowResizeHandles from "./components/WindowResizeHandles";
+import { openManageWindow } from "./lib/manageWindow";
 import type { RuntimeSettings } from "./types";
 import "./styles/index.css";
 
@@ -91,6 +91,23 @@ const ManageWindowView = React.lazy(
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view");
 
+// The widget paints its own rounded surface on a transparent, decorationless
+// window, so the document must not paint one behind it. Other routes keep the
+// opaque page background.
+document.documentElement.dataset.view = view ?? "main";
+
+// ⌘M / Ctrl+M opens the Manage workspace, focusing it when it already exists.
+// App-scoped on purpose: a global shortcut would collide with macOS minimize,
+// and the widget is the only surface that needs the entry point.
+if (view === null) {
+  document.addEventListener("keydown", (e) => {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
+    if (e.key !== "m" && e.key !== "M") return;
+    e.preventDefault();
+    void openManageWindow();
+  });
+}
+
 function MainAppView() {
   const integrations = useIntegrations();
   return <App integrations={integrations} />;
@@ -117,7 +134,6 @@ ReactDOM.createRoot(document.getElementById("root")!, {
 }).render(
   <React.StrictMode>
     <ToastProvider>
-      <WindowResizeHandles />
       <Suspense fallback={<div className="loading">Loading...</div>}>
         <RoutedView />
       </Suspense>

@@ -1409,7 +1409,7 @@ At startup, [[src-tauri/src/integrations/manager.rs]] verifies enabled, detected
 
 Single IPC pair backing the [[features#Settings Window]]'s Performance, General (always-on-top), and Learning (rule watcher) tabs.
 
-`get_runtime_settings` returns the resolved `RuntimeSettings` struct with `live_usage.enabled`, `live_usage.interval_seconds`, `rule_watcher.enabled`, and `always_on_top` clamped to safe ranges (live: 60–600s). `set_runtime_settings` persists each key, calls `WebviewWindow::set_always_on_top` on the main window when that flag changes, and emits `runtime-settings-updated` so any open Settings window observes the resolved values without a re-fetch.
+`get_runtime_settings` returns the resolved `RuntimeSettings` struct with `live_usage.enabled`, `live_usage.interval_seconds`, `rule_watcher.enabled`, and `always_on_top` clamped to safe ranges (live: 60–600s). `set_runtime_settings` persists each key, calls `WebviewWindow::set_always_on_top` on the main window when that flag changes, and emits `runtime-settings-updated` so any open Settings window observes the resolved values without a re-fetch. A refused `set_always_on_top` (Wayland has no such protocol) is logged rather than dropped, so the widget never claims a state the window does not have. The tray's Always-on-Top checkitem writes the same key and now emits `runtime-settings-updated` too, keeping the widget titlebar toggle in sync with the tray. [[src-tauri/src/lib.rs#seed_widget_always_on_top]] runs once at startup: while the `widget_ui_v1` marker is absent it seeds `always_on_top` to `true` for the widget, but only when no value is stored, so a user who deliberately turned it off keeps that choice.
 
 ### Retention policy commands
 

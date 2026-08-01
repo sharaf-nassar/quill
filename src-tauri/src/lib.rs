@@ -75,6 +75,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Listener, Manager, PhysicalPosition};
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_updater::UpdaterExt;
+use tauri_plugin_window_state::{StateFlags, WindowExt};
 
 static STORAGE: OnceLock<Storage> = OnceLock::new();
 static STARTUP_CLEANUP_DONE: OnceLock<()> = OnceLock::new();
@@ -200,6 +201,12 @@ const LIVE_USAGE_INTERVAL_KEY: &str = "live_usage.interval_seconds";
 const RULE_WATCHER_ENABLED_KEY: &str = "rule_watcher.enabled";
 const ALWAYS_ON_TOP_KEY: &str = "always_on_top";
 const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
+
+// One-time marker for the widget main window (feature 018). Its only job is to
+// seed the new always-on-top default exactly once: a widget that hides behind
+// the editor is useless, but an existing user who deliberately stored `false`
+// must keep that choice, so the seed only writes when no value exists.
+const WIDGET_UI_MARKER_KEY: &str = "widget_ui_v1";
 
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
@@ -3308,6 +3315,39 @@ fn read_bool_setting(storage: &Storage, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Seed the widget's fresh-install always-on-top default, once.
+///
+/// The widget main window ships with always-on-top on, but the preference has
+/// existed (defaulting to off) since before the widget did. Writing the new
+/// default unconditionally would silently re-enable it for a user who turned
+/// it off, so the seed runs only while the `widget_ui_v1` marker is absent and
+/// only when no `always_on_top` value is stored at all. Returns the value the
+/// window should start with.
+fn seed_widget_always_on_top(storage: &Storage) -> bool {
+    let stored = storage.get_setting(ALWAYS_ON_TOP_KEY).ok().flatten();
+    let seeded = storage
+        .get_setting(WIDGET_UI_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some();
+
+    if !seeded {
+        if stored.is_none()
+            && let Err(error) = storage.set_setting(ALWAYS_ON_TOP_KEY, "true")
+        {
+            log::warn!("Failed to seed widget always-on-top default: {error}");
+        }
+        if let Err(error) = storage.set_setting(WIDGET_UI_MARKER_KEY, "1") {
+            log::warn!("Failed to record widget UI marker: {error}");
+        }
+    }
+
+    match stored {
+        Some(value) => value == "true",
+        None => !seeded,
+    }
+}
+
 fn read_i64_setting(storage: &Storage, key: &str, default: i64) -> i64 {
     storage
         .get_setting(key)
@@ -3398,8 +3438,12 @@ async fn set_runtime_settings(
 
     if previous.always_on_top != settings.always_on_top
         && let Some(window) = app.get_webview_window("main")
+        && let Err(error) = window.set_always_on_top(settings.always_on_top)
     {
-        let _ = window.set_always_on_top(settings.always_on_top);
+        // The preference is still recorded; the compositor simply refused to
+        // honour it (Wayland has no always-on-top protocol). Log it rather
+        // than let the widget claim a state the window does not have.
+        log::warn!("Failed to apply always-on-top: {error}");
     }
     if let Some(item) = TRAY_ON_TOP_ITEM.get() {
         let _ = item.set_checked(settings.always_on_top);
@@ -5003,7 +5047,17 @@ pub fn run() {
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        // The widget's width and height are owned by the app (fixed 360px,
+        // content-derived height), so the plugin must not restore a saved size
+        // over them — a pre-widget state file would otherwise reopen the old
+        // 520x700 pane layout. Skipping the initial restore for `main` drops
+        // every flag for that window, so its position is restored explicitly
+        // in `setup`; other windows keep the full default behaviour.
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .skip_initial_state("main")
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // A failed migration or an unreadable database is terminal, but the
@@ -5209,15 +5263,24 @@ pub fn run() {
                 });
             }
 
-            // Restore always-on-top preference (default: off)
+            // Restore the always-on-top preference, seeding the widget's
+            // fresh-install default on the first run of the new UI.
             let on_top_enabled = STORAGE
                 .get()
-                .and_then(|s| s.get_setting("always_on_top").ok().flatten())
-                .map(|v| v == "true")
+                .map(seed_widget_always_on_top)
                 .unwrap_or(false);
 
             if let Some(w) = app.get_webview_window("main") {
-                let _ = w.set_always_on_top(on_top_enabled);
+                if let Err(error) = w.set_always_on_top(on_top_enabled) {
+                    log::warn!("Failed to apply always-on-top at startup: {error}");
+                }
+                // The window-state plugin skips the widget entirely (its saved
+                // size would fight the fixed 360px geometry), so its position
+                // — the one piece of geometry a corner widget must keep — is
+                // restored here on its own.
+                if let Err(error) = w.restore_state(StateFlags::POSITION) {
+                    log::warn!("Failed to restore widget window position: {error}");
+                }
                 // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
                 let taskbar_icon_bytes = include_bytes!("../icons/taskbar-icon.png");
                 match tauri::image::Image::from_bytes(taskbar_icon_bytes as &[u8]) {
@@ -5295,11 +5358,23 @@ pub fn run() {
                             && let Ok(current) = w.is_always_on_top()
                         {
                             let new_state = !current;
-                            let _ = w.set_always_on_top(new_state);
+                            if let Err(error) = w.set_always_on_top(new_state) {
+                                log::warn!("Failed to apply always-on-top: {error}");
+                            }
                             if let Some(storage) = STORAGE.get() {
-                                let _ = storage.set_setting(
-                                    "always_on_top",
+                                if let Err(error) = storage.set_setting(
+                                    ALWAYS_ON_TOP_KEY,
                                     if new_state { "true" } else { "false" },
+                                ) {
+                                    log::warn!("Failed to persist always-on-top: {error}");
+                                }
+                                // The widget titlebar and the Settings toggle
+                                // both mirror this one setting, so the tray
+                                // must broadcast the change like any other
+                                // writer of the runtime settings.
+                                let _ = app.emit(
+                                    "runtime-settings-updated",
+                                    load_runtime_settings(storage),
                                 );
                             }
                         }

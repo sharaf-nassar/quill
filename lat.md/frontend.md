@@ -44,19 +44,17 @@ A dev-only Vite plugin in [[vite.config.ts]] (`apply: "serve"`) relaxes the stri
 
 ## Main Window Layout
 
-[[src/App.tsx]] implements a split-pane layout with a draggable divider separating the [[features#Live Usage View]] and [[features#Analytics Dashboard]].
+[[src/App.tsx]] is the widget shell: a fixed 360px window holding [[src/components/widget/WidgetTitleBar.tsx]], a hairline, and one scrolling content column. The split-pane layout and its draggable divider were replaced by the widget redesign.
 
-The layout supports two orientations controlled by a `LayoutMode` toggle (`"stacked"` or `"side-by-side"`) persisted in localStorage as `quill-layout-mode`. Stacked mode (default) places Live above Analytics with a horizontal divider; side-by-side mode places Live on the left and Analytics on the right with a vertical divider. Each orientation has an independent split ratio (0.15-0.85) persisted separately (`quill-split-ratio` for stacked, `quill-split-ratio-h` for side-by-side). The layout supports keyboard-driven resizing (ArrowUp/Down for stacked, ArrowLeft/Right for side-by-side), pointer-anchored divider dragging, and window resize events. Usage data refreshes every 3 minutes via `fetch_usage_data()` only while Live is visible and a provider is active. Provider loading and setup states replace only Live content, so the transcript-backed Analytics pane stays mounted without enabled live providers. Manual Refresh updates integration status; the Live effect owns the resulting usage fetch after that status settles, preventing duplicate requests. Right-click also exposes Quit.
+The shell owns only the app-lifecycle work that has no other home: usage polling every 3 minutes via `fetch_usage_data()` while a provider is enabled, the four-hour updater check, the right-click Refresh/Quit menu, close-to-tray on both the titlebar control and the window manager's close request, and the window's height. Manual Refresh updates integration status; the polling effect owns the resulting usage fetch after that status settles, preventing duplicate requests. When no provider is enabled the column shows one shell-level empty state with a rescan action in place of every band.
 
-The split panes keep their root content views shrinkable with `min-width: 0` on `UsageDisplay` and `AnalyticsView`, preventing intrinsic child widths from forcing the macOS window wider when switching orientations.
-
-The shared `.content` class centers its children for full-pane loading and empty states, so each pane wrapper (`.live-content`, `.analytics-content`) overrides `align-items` to `stretch` and `justify-content` to `flex-start`. Without this override the pane re-centers vertically whenever its child changes height (for example when switching the Context tab range), which the user perceives as the page jumping to the middle even though `scrollTop` is unchanged.
+Height is content-derived: a `ResizeObserver` on the content column asks the window for the measured height plus the 43px chrome (titlebar, hairline, and the shell's border), clamped to the 200-900px bounds declared in `src-tauri/tauri.conf.json`. Width is never touched. The measured element sits inside the scroll container and is never constrained by the viewport, so the measurement cannot oscillate, and only the column below the titlebar scrolls — which is what keeps the widget reachable under webview zoom or on a platform that refuses a programmatic resize.
 
 ### Component Tree
 
-The main window nests `TitleBar` at the top, `UsageDisplay` and `AnalyticsView` in the panels area.
+The widget nests [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]] above a scrolling content column holding [[src/components/widget/LimitsSection.tsx]] and, below it, the switchable view region.
 
-`TitleBar` has feature buttons on the left, a centered static `QUILL` brand label, and a right-side cluster with the version button followed by a settings button (sliders icon, immediately right of the version) that opens the standalone [[features#Settings Window]], then the close control. An active Live pane remains dismissible during provider discovery or when no live provider is enabled; only reopening hidden Live is gated. Analytics remains independently available for transcript-backed data. `UsageDisplay` shows live rate limit buckets. [[src/components/analytics/AnalyticsView.tsx#AnalyticsView]] renders tabbed analytics with a matching labeled `tabpanel` shell for every visible tab. In stacked mode, Live is above Analytics; in side-by-side mode, Live is on the left and Analytics on the right.
+`WidgetTitleBar` carries the widget's whole chrome contract in three grid tracks: the brand glyph and `QUILL` wordmark on the left, the update button centred on the window (rendered only once the updater check has found a release, wired to `install_app_update`), and a right cluster of the sync freshness pill, the always-on-top toggle, the settings key, and the close key. The bar and its non-interactive children carry `data-tauri-drag-region`, so a decorationless window stays draggable. The sync pill is a `role="status"` `aria-live="polite"` region showing real elapsed time since the last successful read; it absorbs the old usage pill vocabulary as slate variants (`offline` beats `cached` beats `paused`, mirroring the precedence those pills used) and never turns red. The always-on-top toggle reads and writes the persisted `always_on_top` setting through [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]], so the tray checkitem, the Settings toggle, and the titlebar are one state; a failed write surfaces as a toast rather than a button that lies. Both the settings key and the ⌘M/Ctrl+M accelerator registered in [[src/main.tsx]] go through [[src/lib/manageWindow.ts#openManageWindow]], which focuses an existing Manage window instead of stacking a second one.
 
 ## Components
 
@@ -472,11 +470,9 @@ Semantic palette, drawn from the `:root` tokens. Status color is reserved; ident
 
 ### Responsive Scaling
 
-The CSS variable `--s` scales all dimensions based on container size. Per-layout window sizes persist in localStorage (`quill-size-{live|analytics|both}`).
+The widget main window does not scale: it is fixed at 360px wide with a content-derived height, so the `--s` fit-to-height system and the per-layout `quill-size-*` sizes it depended on no longer have a consumer.
 
-[[src/App.tsx]] now measures the rendered live content height at `--s: 1` before choosing the next scale, then applies a second fit-to-height correction pass against the actual post-scale `scrollHeight`. A `MutationObserver` on the live subtree retriggers that sizing pass when async live widgets change after the initial provider fetch, and split-ratio changes rerun the same fit logic with a small height gutter so the last usage row stays visible.
-
-The live pane keeps the same `--s`-driven scaling strategy, but its summary rail is now provider-agnostic: the top card grid auto-fits whichever Claude and Codex buckets are present, while the grouped row sections below continue to shrink with the split divider instead of relying on a fixed Claude-only baseline. In split mode the main window stylesheet allows vertical scrolling in the live pane as a fallback, and the fit calculation reserves a bottom gutter above the divider so the last usage row does not sit flush against the resize bar.
+Accessibility zoom is unaffected — [[src/main.tsx]] still applies Ctrl+`+`/`-`/`0` webview zoom per window, and the widget's content column scrolls so a zoomed-in layout stays reachable. The remaining `--s` declarations in `src/styles/index.css` belong to components the widget redesign has not yet torn down.
 
 ## Utilities
 
