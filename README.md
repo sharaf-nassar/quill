@@ -10,42 +10,48 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 ## Features
 
-### Live usage
-- Per-5-hour and per-7-day usage with progress bars
-- Per-model breakdown (Sonnet, Opus, Code, OAuth)
-- Color-coded percentages that transition green → yellow → red as usage increases
-- Countdown timers showing time until usage resets
-- Three time display modes (pace marker, dual bars, background fill)
-- Token sparkline showing per-turn token counts over time
+### Live usage — the LIMITS band
+- One always-visible row per enabled provider (Claude, Codex, MiniMax), pinned above everything else in the widget
+- One cell per rate-limit window: rounded percentage, compressed window label, and a 4px severity bar
+- Severity is reserved for real thresholds — green below 50%, amber from 50%, red from 80%
+- A window whose reset has already elapsed renders neutral instead of carrying a bygone utilization as a live alarm
+- Right-aligned countdown to each row's nearest upcoming reset
+- A provider with no live buckets still states why: `SETUP` when the failure is actionable, `UNAVAILABLE` otherwise
+- Degraded reads (offline / paused / showing cached data) surface on the titlebar's sync pill, never as a false severity
+- The whole band is absent when no provider is enabled
 
-### Analytics
-- Historical usage charts with dual-axis visualization (utilization + tokens)
-- Per-bucket statistics with min/max/average, trend indicators, and sparklines
-- **Breakdown panels** — token usage grouped by host, project, or session with per-item data deletion
-- Time range selection (1h, 24h, 7d, 30d)
-- **Tabbed dashboard** — Now (current period stats), Trends (historical patterns), Charts (synchronized mini-charts), and a conditional Context tab when context preservation is active
-- **Context tab** — four-column stats strip (saved / indexed / returned / routing tokens), stacked-bar trend chart, magnitude-fill breakdown by event type, and a single-line event log with a directional byte indicator (→ indexed, ← returned)
-- Activity heatmap showing usage patterns over time
-- Project focus, session health, and learning progress insight cards
-- Efficiency metrics (cache hit ratio, avg tokens per turn)
-- Average response time, peak response time, and average idle time per session
+### Widget views
+Everything below LIMITS is one swappable view region. The view name and a shared 1H/6H/24H/7D range strip sit in the region's header, so switching views keeps the selected window. Every chart is drawn by an internal SVG kit — Quill ships no charting dependency.
+
+- **Usage** (default) — a per-provider stacked area chart with the range's total tokens and an in-range momentum delta overlaid, a hover-only legend chip, one computed insight line, a 3×2 readout grid (LLM runtime, tokens per LOC, LOC per hour, sessions, projects, net lines) where each metric carries its own sparkline, a switchable breakdown (Sessions, Projects, Hosts, Skills, Hooks), and an In / Out / Cache footer
+- **Trends** — three week-over-week rows (tokens, velocity, cache efficiency) with a delta and paired mini-bars each; fixed to the last seven days against the seven before them, so the view declares itself unranged rather than offering a control that would do nothing
+- **Charts** — token flow, code changes, and cache efficiency stacked on one time axis under one shared crosshair, so the three can be read against each other
+- **Models** — a running-now strip per provider plus the session-ranked model list; raw model ids exactly as observed, qualified by a provider swatch, with attributed tokens beside each
+- **Context** — preserved and retrieved token totals with a split bar, the shared cache-savings line, and the routing cost
+- Honesty disclosures keep the home that matches their data: the Hooks breakdown carries the Claude/Codex tracking-asymmetry note, and a condensed retention line appears wherever pruning affects what is drawn
+
+### Manage workspace
+- One rail-navigated window for everything that is not live monitoring, opened from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator
+- Four sections — **Sessions** (search), **Learning** (rules, memory, runs), **Instances** (restart), and **Settings**
+- ⌘K / Ctrl+K opens a command palette over the sections plus Back-to-Live and Close-Tools actions
+- **Settings** tabs: General, Integrations, Context, Learning, and Performance
 
 ### Session search
-- Full-text search across all Claude Code sessions (powered by Tantivy)
-- Filter by project, host, role, date range, and git branch
-- Snippet highlighting with expandable message context
-- Opens in a dedicated search window from the titlebar
+- Full-text search across all Claude Code and Codex sessions (powered by Tantivy)
+- Filter by provider, project, host, role, and date range; sort by relevance or recency
+- Snippet highlighting with expandable message context and a session detail panel
+- Lives in the **Sessions** section of the Manage workspace
 
 ### Token tracking
-- Per-turn input/output/cache token counts via Claude Code hook
-- Token sparkline in the live view and dual-axis chart overlay in analytics
+- Per-turn input/output/cache token counts via the bundled Claude Code and Codex hooks
+- Feeds the Usage view's provider chart, the readout sparklines, and the In / Out / Cache footer
 
 ### Learning
-- Integrated side panel that shows learned usage rules, observation stats, and analysis history
-- Configurable triggers: on-demand, session-end, periodic, or combined
-- Rule state tracking (emerging → confirmed → stale → invalidated)
+- The Manage workspace's **Learning** section shows learned usage rules, observation stats, and analysis history
+- Trigger modes: on-demand, or periodic once enough new observations have accumulated
+- Rule lifecycle tracking (candidate → awaiting review → active, plus rejected, suppressed, superseded, and conflict-flagged states)
 - Domain-grouped rules with confidence scores
-- Run history with real-time analysis logs
+- Run history with real-time analysis logs, opened as a docked panel beside the rules
 - Git history integration for cross-source pattern synthesis
 
 ### Memory optimizer
@@ -56,18 +62,18 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 - Optional **Compress prose** pre-pass — rewrites every eligible memory file in caveman style via Anthropic Haiku before the optimizer runs. Skips instruction files, files over 500 KB, files on the secrets denylist, and files that already have an `.original.md` backup. Validates that headings, code blocks, URLs, file paths, and bullets are preserved; on failure restores the original. Successful rewrites leave a `<file>.original.md` backup next to the compressed file so the change is reversible.
 
 ### Brevity profile
-- Per-provider toggle (Claude Code and Codex) in the **QUILL** menu and the dedicated Integrations window
+- Toggled from **Settings → Context** in the Manage workspace, and applied to whichever providers (Claude Code, Codex) are enabled
 - Injects a managed "Quill Brevity Profile" instruction block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex), asking the assistant to write in a compressed caveman style for its own prose responses while preserving code blocks, file paths, URLs, library names, command names, numbers, env vars, and markdown structure exactly
 - Symlink-aware — when `AGENTS.md` is a symlink to `CLAUDE.md`, only one block is written so the same instructions are not duplicated
 - Toggling off strips just the managed block; the rest of the agent file is left untouched
 - MiniMax does not have a managed agent file, so brevity is unavailable for it
 
 ### Working context preservation
-- Optional, default-off feature toggled from the QUILL menu in the titlebar — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
+- Optional, default-off feature toggled from **Settings → Context** — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
 - **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
 - **Routing hooks** — block raw `WebFetch` and noisy `curl`/`wget` dumps, nudge broad `Bash`/`Read`/`Grep`/build/test output toward `quill_*` tools, and use per-session marker files to avoid repeating guidance
 - **Continuity capture** — small task and decision hints recorded across sessions so a new session can resume context without writing to provider memory paths
-- **Telemetry** — every preservation event reports compact byte and token estimates to the Context tab; large content stays in the local context store and never enters the analytics database
+- **Telemetry** — every preservation event reports compact byte and token estimates to the widget's Context view; large content stays in the local context store and never enters the analytics database
 - Toggling the feature deploys or removes context scripts, the context MCP tool, instruction templates, and hooks for currently enabled providers; historical context stores and analytics rows are preserved on disable
 - Available for both Claude Code and Codex via their respective integrations
 
@@ -81,22 +87,23 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 ### Restart orchestrator
 - Monitor and restart Claude Code instances from within Quill
 - Detects terminal type (Tmux, Plain) and tracks instance status
-- Opens in a dedicated window from the titlebar
+- Lives in the **Instances** section of the Manage workspace
 
 ### Code stats
 - Lines of code added/removed tracked per session, grouped by language
-- Code changes sparkline in the Now tab showing change frequency over time
-- Velocity metrics (tokens/hour, sessions/day)
+- Net lines, tokens per LOC, and LOC per hour sit in the Usage view's readout grid, each with its own sparkline
+- The code-changes timeline shares the Charts view's axis and crosshair, and velocity is one of the Trends view's week-over-week rows
 
 ### Desktop integration
-- **System tray** with Show / Always on Top / Check for Update / Quit
-- **In-app updater** — checks on startup and every 4 hours; yellow "Update" button appears in the titlebar
-- Always-on-top mode (toggleable from tray menu)
-- Semi-transparent dark theme with custom drag-to-move titlebar
-- Remembers window position and size across restarts
-- Auto-refreshes usage every 60 seconds
+- **System tray** with Show Widget / Always on Top / Check for Update / Quit
+- **In-app updater** — checks on startup and every 4 hours; a cyan "Update" button then appears centered in the widget titlebar
+- Always-on-top toggle in the widget titlebar, sharing one persisted setting with the tray checkitem and Settings
+- Frameless, transparent, near-black flat surface with a drag-to-move titlebar
+- Fixed 360px width with a content-derived height (clamped to 200–900px); window position is remembered across restarts, size is deliberately not stored
+- Closing from the titlebar hides the widget to the tray rather than quitting
+- Refreshes usage every 3 minutes while the widget is open; an optional background refresh (60–600s, Settings → Performance) keeps the tray indicator current while it is hidden
 - Read-only OAuth — reads Claude Code's token, never refreshes it
-- **Zoom controls** — Ctrl+/- to zoom all windows in or out
+- **Zoom controls** — Ctrl+/- to zoom, Ctrl+0 to reset, persisted per window
 
 ## Screenshots
 
@@ -273,13 +280,13 @@ No additional configuration is needed — the widget starts tracking utilization
 
 ### Enabling context preservation (optional)
 
-Open the **QUILL** menu in the titlebar and toggle the **Context Preservation** switch. Enabling installs the context MCP tool, routing hooks, and capture scripts for currently active providers (Claude Code, Codex). Disabling redeploys the base integration and removes context assets while preserving historical context stores and analytics rows. When at least one event is recorded, the **Context** tab appears in Analytics.
+Open the Manage workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and toggle **Working Context Preservation** in **Settings → Context**. Enabling installs the context MCP tool, routing hooks, and capture scripts for currently active providers (Claude Code, Codex). Disabling redeploys the base integration and removes context assets while preserving historical context stores and analytics rows. The widget's **Context** view then reports what the store kept out of the transcript, what came back, and what routing cost.
 
 ## Token Tracking, Learning & Session Search
 
 The app includes an HTTP server (port `19876`, configurable via `QUILL_PORT`) that receives data from Claude Code via hooks. This powers three features:
 
-- **Token tracking** — per-turn input/output/cache token counts, powering the sparkline in the live view and the token overlay on the analytics chart
+- **Token tracking** — per-turn input/output/cache token counts, powering the Usage view's provider chart, its readout sparklines, and the In / Out / Cache footer
 - **Learning** — observes tool usage patterns across sessions and can analyze them to extract reusable rules (stored in `~/.claude/rules/learned/`)
 - **Session search** — indexes Claude Code session transcripts for full-text search with filters
 
@@ -298,19 +305,17 @@ When the Quill app runs on the same machine as Claude Code, **everything is conf
 
 Just install the app, launch it, and restart Claude Code. Token tracking, learning, session search, and MCP tools will all be active.
 
-### Using the learning panel
+### Using the Learning section
 
 Once observations are being collected:
 
-1. Click the **✦ button** in the titlebar to open the learning panel
-2. Toggle learning **ON** with the switch in the panel header
+1. Open the Manage workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and select **Learning**
+2. Toggle learning **ON** with the switch in the section header
 3. Choose a trigger mode:
-   - **On-demand** — click "Analyze" in the panel to run analysis manually
-   - **Session-end** — automatically analyzes after each Claude Code session ends
-   - **Periodic** — runs analysis on a configurable interval
-   - **Combined** — both session-end and periodic enabled together
+   - **On-demand** — click "Analyze" in the status strip to run analysis manually
+   - **Periodic** — runs on a configurable interval once enough new observations have accumulated
 4. Analysis extracts patterns from observations and creates rule files in `~/.claude/rules/learned/`
-5. Learned rules appear as cards in the panel with confidence scores and domain tags
+5. Learned rules appear as cards under **Rules** with confidence scores and domain tags; **Runs** docks the analysis history beside them
 
 ### Verify
 
@@ -333,132 +338,123 @@ cargo tauri dev
 
 ## Controls
 
-- **Drag the title bar** to move the window
-- **Drag any edge or corner** to resize
-- **QUILL** title in the titlebar opens the provider menu (layout, indicator provider, context preservation toggle, per-provider brevity profile toggle, and Claude Code / Codex / MiniMax integration controls)
-- **Live tab** to toggle the live usage view
-- **Analytics tab** to toggle the analytics view
-- **Brain icon (🧠)** to open the learning window
-- **Search icon (⌕)** to open the session search window
-- **Restart icon (↻)** to open the restart panel
-- **System tray icon** — left-click to show the widget; menu has Always on Top, Check for Update, and Quit
-- **Ctrl+/- (or Cmd+/-)** to zoom in/out across all windows
+- **Drag the titlebar** to move the widget — the width is fixed at 360px and the height follows the content, so there is nothing to resize
+- **Pin key** in the titlebar toggles always-on-top
+- **Settings key** in the titlebar opens the Manage workspace at its Settings section
+- **Close key** in the titlebar hides the widget to the tray; Quill keeps running
+- **View name** below LIMITS opens the view list — Usage, Trends, Charts, Models, Context
+- **1H / 6H / 24H / 7D** re-scopes every band of the active view at once
+- **⌘M / Ctrl+M**, or the Manage button in the Usage footer, opens the Manage workspace
+- **⌘K / Ctrl+K** inside Manage opens the command palette
+- **Right-click the widget** for Refresh and Quit
+- **System tray menu** — Show Widget, Always on Top, Check for Update, and Quit
+- **Ctrl+/- (or Cmd+/-)** to zoom and **Ctrl+0** to reset, remembered per window
 
 ## Project structure
 
 ```
 src/                          # React frontend
-  main.tsx                    # Entry point
-  App.tsx                     # Main app component with tiling layout
+  main.tsx                    # Window routing, per-window zoom, ⌘M accelerator
+  App.tsx                     # The 360px widget shell (polling, updater, close-to-tray, height)
   types.ts                    # Shared TypeScript interfaces
   components/
-    TitleBar.tsx              # Custom titlebar (drag, view toggles, restart, update)
-    SectionHeader.tsx         # Reusable collapsible section header
-    UsageRow.tsx              # Usage row with progress bar + token sparkline
-    UsageDisplay.tsx          # Container for all usage rows
-    analytics/
-      AnalyticsView.tsx       # Tabbed analytics (Now, Trends, Charts, conditional Context)
-      NowTab.tsx              # Current period stats with code sparkline
-      TrendsTab.tsx           # Historical trend analysis
-      ChartsTab.tsx           # Four synchronized mini-charts
-      ContextSavingsTab.tsx   # Context preservation analytics (savings strip, magnitude breakdown, event log)
-      BreakdownPanel.tsx      # Host/project/session breakdown with deletion
-      UsageChart.tsx          # Dual-axis chart (utilization + tokens)
-      MiniChart.tsx           # Compact chart for the Charts tab
-      StatsPanel.tsx          # Per-bucket statistics panel
-      ActivityHeatmap.tsx     # Usage activity heatmap
-      InsightCard.tsx         # Reusable insight card component
-      ProjectFocusCard.tsx    # Project focus insight card
-      SessionHealthCard.tsx   # Session health insight card
-      LearningProgressCard.tsx # Learning progress insight card
-      CompactStatsRow.tsx     # Compact stats display row
-      CodeSparkline.tsx       # Code changes sparkline
-      TokenSparkline.tsx      # Token usage sparkline
-      TabBar.tsx              # Analytics tab navigation
-      TogglePills.tsx         # Toggle pill selectors
-      ChartCrosshairContext.tsx # Shared crosshair context for synced charts
-      shared.tsx              # Shared analytics utilities
-    learning/
-      StatusStrip.tsx         # Observation stats and sparkline
-      RuleCard.tsx            # Individual learned rule display
-      SuggestionCard.tsx      # Memory optimization suggestion with diff view
-      MemoriesPanel.tsx       # Memory optimizer panel with approve/undo
-      DomainBreakdown.tsx     # Rules grouped by domain
-      RunHistory.tsx          # Past analysis run log
-      FloatingRunsWindow.tsx  # Floating window for run history with live logs
-    sessions/
-      SearchBar.tsx           # Full-text search input with debounce
-      FilterBar.tsx           # Collapsible filters (project, host, role, date)
-      ResultCard.tsx          # Search result with expandable context
-      DetailPanel.tsx         # Session detail view
-    restart/
-      RestartPanel.tsx        # Claude Code instance restart panel
+    widget/
+      WidgetTitleBar.tsx      # Brand, update button, sync pill, pin/settings/close keys
+      LimitsSection.tsx       # LIMITS band: one row per enabled provider
+      ViewRegion.tsx          # View + range header; hosts the active view
+      ViewSwitcher.tsx        # Listbox that swaps the view region
+      views/
+        UsageView.tsx         # Chart, insight line, readout grid, breakdown, totals footer
+        TrendsView.tsx        # Week-over-week tokens, velocity, cache efficiency
+        ChartsView.tsx        # Three series on one axis under one crosshair
+        ModelsView.tsx        # Running-now strip + session-ranked model list
+        ContextView.tsx       # Preserved/retrieved totals and routing cost
+        insightLine.ts        # Priority rule behind the Usage insight line
+      viz/                    # Internal SVG kit (AreaChart, Sparkline, Bars, geometry)
+    settings/                 # General, Integrations, Context, Learning, Performance tabs
+    learning/                 # Status strip, rule cards, memory optimizer, run history
+    sessions/                 # Search bar, filters, result cards, detail panel
+    restart/RestartPanel.tsx  # Claude Code instance restart panel
+    CommandPalette.tsx        # Manage's ⌘K section navigator
+    ConfirmDialog.tsx         # Shared confirmation modal
+    RetentionBanner.tsx       # Retention degradation disclosure
   windows/
-    LearningWindow.tsx        # Learning panel window
-    RunsWindowView.tsx        # Standalone run history window
-    SessionsWindowView.tsx    # Session search window
-    RestartWindowView.tsx     # Restart orchestrator window
-  hooks/
-    useAnalyticsData.ts       # Fetches utilization history and stats
-    useBreakdownData.ts       # Fetches host/project/session breakdowns
-    useTokenData.ts           # Fetches token history, stats, hostnames
-    useLearningData.ts        # Fetches learning rules, runs, observations
-    useLearningStats.ts       # Aggregated learning statistics
-    useMemoryData.ts          # Fetches memory files, optimization runs, suggestions
-    useCodeStats.ts           # Code change statistics (LOC by language)
-    useSessionCodeStats.ts    # Per-session code stats
-    useVelocityStats.ts       # Tokens/hour, sessions/day velocity metrics
-    useEfficiencyStats.ts     # Cache hit ratio, avg tokens per turn
-    useSessionHealth.ts       # Session duration and health scoring
-    useActivityPattern.ts     # Activity heatmap data
-    useCacheEfficiency.ts     # Cache efficiency calculations
-    useResponseTimeStats.ts   # Response time and idle time stats
+    ManageWindowView.tsx      # Rail-navigated Manage workspace hosting the four sections
+    SessionsWindowView.tsx    # Sessions section (session search)
+    LearningWindow.tsx        # Learning section (Rules / Memory / Runs)
+    RestartWindowView.tsx     # Instances section
+    SettingsWindowView.tsx    # Settings section
+    ReleaseNotesWindow.tsx    # Release notes viewer window
+  hooks/                      # IPC data hooks
+    useWidgetSeries.ts        # Provider token series and activity series for the widget
+    useBreakdownData.ts       # Session/project/host/skill/hook breakdowns
+    useWeeklyTrends.ts        # Week-over-week figures behind the Trends view
+    useCodeInsights.ts        # Tokens per LOC, LOC per hour, net lines
+    useLlmRuntimeStats.ts     # Active LLM runtime and its sparkline
+    useModelAnalytics.ts      # Model attribution behind the Models view
     useContextSavingsStats.ts # Context preservation telemetry aggregates
-    useToast.tsx              # Toast notification system
-  utils/
-    time.ts                   # Relative time formatting
-    tokens.ts                 # Token count formatting (1.2k, 1.5M)
-    format.ts                 # General formatting utilities
-    chartHelpers.ts           # Chart data transformation helpers
+    useLearningData.ts        # Learning rules, runs, observations
+    useMemoryData.ts          # Memory files, optimization runs, suggestions
+    useIntegrations.ts        # Provider detection, enablement, and feature toggles
+    useRuntimeSettings.ts     # Persisted runtime settings (always-on-top, polling, …)
+  lib/
+    manageWindow.ts           # Single entry point that focuses or creates Manage
+    crashReporting.ts         # Opt-in crash reporting
+  mocks/                      # Browser-mode IPC fixtures (dev only, no Tauri runtime)
+  utils/                      # Time, token, provider, retention, and format helpers
   styles/
-    index.css                 # Global styles + dark theme
-    learning.css              # Learning panel styles
+    index.css                 # Global styles, widget tokens, and every widget band
+    manage.css                # Manage workspace chrome and section embedding
+    settings.css              # Settings tab styles
+    learning.css              # Learning section styles
     sessions.css              # Session search styles
-    restart.css               # Restart panel styles
+    restart.css               # Instance restart styles
 src-tauri/                    # Rust backend
   src/
     main.rs                   # Tauri entry point
     lib.rs                    # IPC commands, tray icon, updater, server startup
-    ai_client.rs              # Rig Anthropic integration for learning analysis
-    auth.rs                   # OAuth token management
+    integrations/             # Provider detection, deployment, and manifests
+      claude.rs, codex.rs, minimax.rs, deploy.rs, manager.rs, manifest.rs
     claude_setup.rs           # Auto-configures Claude Code on app startup (hooks, MCP, config)
-    config.rs                 # Credential loading (read-only)
+    auth.rs                   # OAuth token management
+    config.rs                 # Credential loading (read-only) and the shared HTTP client
     fetcher.rs                # Usage API calls
-    git_analysis.rs           # Git history analysis for learning
-    learning.rs               # Learning analysis spawner
-    memory_optimizer.rs       # Memory file scanning, LLM analysis, and suggestion execution
-    models.rs                 # Data models (usage buckets + token + learning types)
-    prompt_utils.rs           # Prompt sanitization utilities
-    restart.rs                # Claude Code instance restart management
-    sessions.rs               # Tantivy full-text session search and indexing
+    cc_client.rs              # Claude Code subprocess surface for inference calls
+    indicator.rs              # Tray indicator summary state
     storage.rs                # SQLite storage with aggregation
+    models.rs                 # Data models (usage buckets, tokens, learning types)
+    model_usage.rs            # Model attribution behind the Models view
+    sessions.rs               # Tantivy full-text session search and indexing
+    transcript_analytics.rs   # Analytics snapshots parsed from retained transcripts
+    transcript_identity.rs    # Provider-native transcript identity resolution
     server.rs                 # axum HTTP server for token reporting
+    learning.rs               # Learning analysis spawner
+    git_analysis.rs           # Git history analysis for learning
+    memory_optimizer.rs       # Memory file scanning, LLM analysis, suggestion execution
+    compress_prose.rs         # Caveman pre-pass (detect / prompt / validate submodules)
+    brevity.rs                # Managed brevity block in provider agent files
+    context_category.rs       # Context-savings event taxonomy
+    retention*.rs             # Retention policy, pruning engine, and corpus study
+    restart.rs                # Claude Code instance restart management
+    releases.rs               # GitHub release notes
+    appimage_integration.rs   # Linux applications-menu install
+    crash_reporting.rs        # Opt-in crash report plumbing
   claude-integration/         # Resources bundled into the app for local Claude Code setup
     scripts/                  # Hook scripts deployed to ~/.config/quill/scripts/
       observe.cjs             # Captures tool observations (pre/post tool use)
       report-tokens.sh        # Extracts tokens from transcript, POSTs to widget
       session-sync.cjs        # Syncs session metadata and messages to widget
-      session-end-learn.cjs   # Triggers learning analysis on session end
       context-capture.cjs     # Records continuity events, snapshots, and capture telemetry
       context-router.cjs      # Routes broad tool calls toward quill_* MCP tools (when enabled)
       context-telemetry.cjs   # Builds and posts context-savings events to the widget
+    templates/                # Managed CLAUDE.md instruction blocks
     mcp/                      # MCP server deployed to ~/.config/quill/mcp/
       server.py               # FastMCP server for session history (and context) tools
       dependencies.py         # Lifespan and shared state
       tools/
         search.py             # search_history
-        context.py            # quill_index_context, quill_search_context, quill_execute, fetch_and_index, snapshots, etc.
-  codex-integration/          # Parallel resources for Codex CLI (mirrors claude-integration scripts and tools)
+        context.py            # quill_index_context, quill_search_context, quill_execute, fetch_and_index, etc.
+  codex-integration/          # Parallel resources for Codex CLI (scripts, templates, hook observer)
   tauri.conf.json             # Tauri window and build configuration
 ```
 
@@ -477,7 +473,7 @@ Releases are driven by git tags via `release.sh`. The CI workflow (`.github/work
 
 The `tauri-action` patches the version in `tauri.conf.json` at build time using the tag — you do not need to update version numbers manually. The workflow builds for all platforms (Linux AppImage, macOS dmg for Intel + ARM, Windows nsis), then publishes the release.
 
-The in-app updater checks `latest.json` on GitHub Releases on startup and every 4 hours. When an update is found, a yellow "Update" button appears in the titlebar.
+The in-app updater checks `latest.json` on GitHub Releases on startup and every 4 hours. When an update is found, a cyan "Update" button appears centered in the widget titlebar.
 
 ## License
 
