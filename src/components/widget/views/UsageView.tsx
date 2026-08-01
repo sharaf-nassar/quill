@@ -10,6 +10,8 @@
 //   - **One range, one story.** Chart, delta, insight, every readout, every
 //     sparkline and the footer read the same selected range. A band that
 //     silently used a different window would be a quiet lie (constitution #1).
+//     The insight line rotates across windows, but only under the stated rule
+//     in `insightLine.ts` — never by taste and never on a timer.
 //   - **Colour means something.** Metric hues appear only on a cell's swatch,
 //     sparkline stroke and endpoint; values stay `--text-hi`. Green/red on a
 //     delta is assigned by *meaning*, not by arrow direction — a falling
@@ -22,6 +24,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AreaChart, Sparkline, type VizSeries } from "../viz";
+import { selectInsightLine } from "./insightLine";
 import { useActivitySeries, useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
 import { useBreakdownData } from "../../../hooks/useBreakdownData";
 import { useCachedInvoke } from "../../../hooks/useCachedInvoke";
@@ -491,11 +494,46 @@ function UsageView({ range }: UsageViewProps) {
 
   const cachePercent = cacheHitRate(tokens.stats);
   const savingsSummary = savings.data?.summary ?? null;
-  const tokensSaved = savingsSummary?.tokensSavedEst ?? 0;
   const reusePercent =
     savingsSummary && (savingsSummary.sourcesPreserved ?? 0) > 0
       ? Math.round((savingsSummary.retentionRatio ?? 0) * 100)
       : null;
+
+  // Which insight this window gets is decided by the rule in `insightLine.ts`,
+  // not by whichever source happened to answer first.
+  const insight = useMemo(
+    () =>
+      selectInsightLine({
+        savings: {
+          tokensSaved: savingsSummary?.tokensSavedEst ?? null,
+          reusePercent,
+          loading: savings.loading,
+        },
+        cache: {
+          tokensFromCache: tokens.stats?.total_cache_read ?? null,
+          percentOfInput: cachePercent,
+          loading: tokens.loading,
+        },
+        providers: {
+          totals:
+            tokenSeries.data?.series.map((entry) => ({
+              label: providerTag(entry.provider),
+              tokens: entry.total_tokens,
+            })) ?? null,
+          loading: tokenSeries.loading,
+        },
+      }),
+    [
+      savingsSummary,
+      reusePercent,
+      savings.loading,
+      tokens.stats,
+      tokens.loading,
+      cachePercent,
+      tokenSeries.data,
+      tokenSeries.loading,
+    ],
+  );
 
   return (
     <>
@@ -542,16 +580,16 @@ function UsageView({ range }: UsageViewProps) {
           />
         )}
 
-        {/* Insight line v1: what Quill's own context store kept out of the
-            prompt. Absent rather than zeroed when nothing was preserved. */}
-        {tokensSaved > 0 && (
+        {/* One insight for this window, chosen by the rotation rule and absent
+            rather than zeroed when no candidate has anything true to say. */}
+        {insight && (
           <p className="wg-insight wg-num">
             <span className="wg-insight-glyph" aria-hidden="true">
               ◆
             </span>
             <span>
-              <b>{formatTokenCount(tokensSaved)} tokens saved</b>
-              {reusePercent !== null && ` — ${reusePercent}% of preserved sources reused`}
+              <b>{insight.headline}</b>
+              {insight.detail !== null && ` — ${insight.detail}`}
             </span>
           </p>
         )}
