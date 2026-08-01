@@ -8385,3 +8385,118 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
   color: var(--faint);
   text-wrap: pretty;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Charts view — three series, one axis, one crosshair
+   (src/components/widget/views/ChartsView.tsx)
+
+   The stack is the interactive element: pointer or arrow keys pick a bucket,
+   every panel draws its rule at the same x, each head value swaps in place,
+   and the matching axis tick brightens. Nothing is added or removed on scrub,
+   so the reading costs no layout shift and no floating chip.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.wg-charts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: 0 14px 14px;
+}
+
+.wg-charts-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  /* Keeps the focus ring clear of the panels it wraps. */
+  border-radius: var(--radius-sm);
+}
+
+.wg-chart {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.wg-chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-md);
+  min-height: 12px;
+}
+
+.wg-chart-key {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+
+/* Fixed swatch column: every key label starts at the same x whatever the
+   panel's series count, and an unresolved series leaves the gap rather than
+   moving the label. */
+.wg-chart-swatches {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 13px;
+}
+
+.wg-chart-swatch {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: var(--radius-pill);
+}
+
+/* Right-aligned and tabular so a scrubbed value never resizes its own row. */
+.wg-chart-value {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text-hi);
+  white-space: nowrap;
+}
+
+.wg-chart-svg {
+  display: block;
+  width: 100%;
+}
+
+/* The axis doubles as the time readout for the crosshair. */
+.wg-charts-axis {
+  display: flex;
+  min-height: 11px;
+  font-size: 7.5px;
+  font-weight: 500;
+  line-height: 11px;
+  color: var(--faint);
+}
+
+.wg-charts-axis span {
+  flex: 1 1 0;
+  min-width: 0;
+  text-align: center;
+  transition: color 0.12s ease;
+}
+
+.wg-charts-axis span[data-active="true"] {
+  color: var(--text-hi);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wg-charts-axis span {
+    transition: none;
+  }
+}
+
+.wg-chart-note {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--faint);
+  text-wrap: pretty;
+}

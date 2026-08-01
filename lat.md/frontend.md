@@ -132,6 +132,18 @@ Both sides or neither: a delta renders only when both weeks have a figure, since
 
 Only velocity degrades under retention: it reads `tool_actions` and `session_events`, both of which [[lat.md/frontend#Frontend#Components#Retention Degradation]] prunes, while the token figures come from snapshots retention never touches. A compared week that falls entirely below the watermark renders as an em dash with no delta rather than as a collapse in output, and a condensed line beneath the rows states the cutoff whenever either week is affected.
 
+#### Charts View
+
+[[src/components/widget/views/ChartsView.tsx#ChartsView]] stacks tokens, code changes and cache efficiency on one time axis under one crosshair, so the operator can read the three against each other rather than one at a time.
+
+Correlation is the view's only reason to exist, so every panel is bucketed onto the timestamps `get_provider_token_series` returns for the region's range. The code and cache sources arrive on their own server-side granularity and are re-gridded by [[src/components/widget/views/ChartsView.tsx#bucketAssigner]], which reads the bucket width from the grid itself instead of recomputing it — a panel drawn on a different grid would make the shared crosshair assert an alignment that does not exist. Cache rates come from summed numerators and denominators per bucket rather than averaged point rates, so a busy minute is not outvoted by an idle one and the range figure is the same weighted rate the Usage footer reports.
+
+There is no floating tooltip. Scrubbing — pointer, or arrow keys once the stack has focus — swaps each panel's head value in place and brightens the matching axis tick, which makes the axis itself the time readout and costs no layout shift. The stack is a labelled `role="group"` with a screen-reader instruction and a polite live region announcing the bucket's three values together. Escape clears the reading, a range change drops it because the grid is rebuilt, and every head reads `—` until its own source lands so no panel states a zero it has not measured.
+
+Gaps stay gaps: a bucket with no cacheable input has no hit rate, so the cache line breaks over it instead of drawing 0%, while tokens and code are genuinely zero when nothing happened and are drawn as zero. Failure is region-local — a failed code or cache read leaves its own panel stating so while the others keep charting — except for the token series itself, which is the shared grid, so losing it collapses the band to one line rather than showing three panels that cannot be compared.
+
+Colour follows [[lat.md/frontend#Frontend#Styling#Color System]]: tokens carry provider identity, and because added-versus-removed lines are a category rather than a threshold state, the diff pair is drawn from the metric ramp (`--metric-net-lines` up, `--metric-loc-per-hr` down) instead of the conventional green/red the severity rule reserves. Cache takes the widget's throughput cyan. The condensed retention line appears under the panels only when the watermark actually falls inside the drawn window, because `get_code_stats_history` reads the `tool_actions` rows [[lat.md/frontend#Frontend#Components#Retention Degradation]] prunes.
+
 #### Models View
 
 [[src/components/widget/views/ModelsView.tsx#ModelsView]] answers "what am I running, and what did the work" in two bands: a running-now strip, then the session-ranked model list.
