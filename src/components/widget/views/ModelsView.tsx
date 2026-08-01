@@ -19,6 +19,11 @@
 //     when the backend calls the scope final *and* the history inventory is
 //     complete; otherwise the band says the evidence is still being processed
 //     and the retained-history line says why.
+//   - **Zero is never a stand-in for absent.** A model that ran sessions
+//     necessarily burned tokens, so a zero attributed-token figure is the
+//     absence of a measurement, not a measurement of nothing. It renders as an
+//     em dash — the same way every other widget head states a figure it does
+//     not have — with the reason on hover.
 //
 // See specs/018-widget-ui-redesign/plan.md#Affected Components.
 
@@ -76,9 +81,14 @@ const VIOLET_SHADES = [
 /** Rank seven and beyond renders neutral rather than a generated hue. */
 const NEUTRAL_SHADE = "#8b949e";
 
+// 24-hour, matching the Usage readouts and the Charts axis. A 12-hour clock
+// here would put `05:39 PM` beside the axis' `17:40` for the same instant, and
+// the `AM`/`PM` suffix is not a tabular figure — the takeover caption would
+// change width as the day crossed noon.
 const CLOCK_FORMAT = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit",
   minute: "2-digit",
+  hour12: false,
 });
 
 const DATE_CLOCK_FORMAT = new Intl.DateTimeFormat(undefined, {
@@ -86,6 +96,7 @@ const DATE_CLOCK_FORMAT = new Intl.DateTimeFormat(undefined, {
   day: "numeric",
   hour: "2-digit",
   minute: "2-digit",
+  hour12: false,
 });
 
 const BACKFILL_LABELS: Record<ModelBackfillStatus["status"], string> = {
@@ -157,7 +168,7 @@ function formatRecency(timestamp: string, nowMs: number): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-/** `04:49 today` while the takeover is same-day, else `Jul 18, 22:14`. */
+/** `16:49 today` while the takeover is same-day, else `Jul 18, 22:14`. */
 function formatSince(timestamp: string, nowMs: number): string {
   const then = new Date(timestamp);
   if (!Number.isFinite(then.getTime())) return timestamp;
@@ -209,6 +220,35 @@ function emptyClaim(
     return "Sessions ran, but none carry a model identifier";
   }
   return "No models observed in this range";
+}
+
+interface TokenReading {
+  readonly text: string;
+  /** Why the figure is absent, or null when a real figure is being shown. */
+  readonly absence: string | null;
+}
+
+/**
+ * Attributed tokens for a ranked row, or an em dash when there are none to
+ * attribute.
+ *
+ * A model only earns a row by having run sessions, and a session that ran
+ * necessarily burned tokens — so a zero here cannot be a measurement, only the
+ * absence of one. It is what a provider whose observations carry no token
+ * columns looks like (Codex reports cumulative deltas rather than
+ * per-observation counts). Printing `0` beside the range's busiest model would
+ * state a figure nobody recorded; the em dash says the number is missing and
+ * the hover says why (constitution #1 — gaps stay explicit).
+ */
+function tokenReading(row: ModelUsageOverviewRow): TokenReading {
+  if (row.attributedTokens > 0) {
+    return { text: formatTokenCount(row.attributedTokens), absence: null };
+  }
+  return {
+    text: "—",
+    absence:
+      "No token counts are attributed to this model — its provider reports usage without per-observation token figures",
+  };
 }
 
 interface ModelSwatchProps {
@@ -396,6 +436,7 @@ function ModelsView({ range }: ModelsViewProps) {
               const shade = shadeFor(shades, row.identity);
               const percent =
                 sessionsCeiling > 0 ? (row.sessions / sessionsCeiling) * 100 : 0;
+              const tokens = tokenReading(row);
               return (
                 <li
                   className="wg-mv-row"
@@ -411,8 +452,8 @@ function ModelsView({ range }: ModelsViewProps) {
                     <bdi className="wg-mv-id" dir="ltr" translate="no">
                       {row.identity.modelId}
                     </bdi>
-                    <span className="wg-mv-tokens wg-num">
-                      {formatTokenCount(row.attributedTokens)}
+                    <span className="wg-mv-tokens wg-num" title={tokens.absence ?? undefined}>
+                      {tokens.text}
                     </span>
                   </div>
                   <div className="wg-mv-row-bar">

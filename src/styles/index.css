@@ -2552,10 +2552,14 @@ body {
   color: var(--faint);
 }
 
+/* Ticks never wrap: the row's height is part of the no-layout-shift guarantee
+   the crosshair depends on, and a two-line tick would move every panel above
+   it. Captions that carry a day as well as an hour stay on one line. */
 .wg-charts-axis span {
   flex: 1 1 0;
   min-width: 0;
   text-align: center;
+  white-space: nowrap;
   transition: color 0.12s ease;
 }
 

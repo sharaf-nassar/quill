@@ -88,23 +88,43 @@ function providerTag(provider: string): string {
   return provider.replace(/_/g, "").toUpperCase();
 }
 
+const DAY_MS = 86_400_000;
+
 /**
- * Axis captions for the shared axis. Intraday ranges read as clock time; a
- * week reads as weekdays, because eight `HH:MM` labels across seven days say
- * nothing about which day.
+ * Axis captions for the shared axis, keyed off the grid the server actually
+ * returned rather than off the range name.
+ *
+ * The rule is that no two ticks may read alike, because the scrubbed tick
+ * brightening *is* the time readout — two identical captions would make the
+ * axis assert that one bucket is being read when it is another. A window
+ * inside a day is unambiguous as `HH:MM`; a window spanning days needs the day
+ * as well, and a grid whose buckets are narrower than a day needs the hour on
+ * top of it. The widget's 7D range is exactly that case: eight buckets across
+ * seven days are 21h apart, so bare weekdays repeat.
  */
-function axisLabels(timestamps: readonly string[], range: RangeType): string[] {
-  const daily = range === "7d" || range === "30d";
+function axisLabels(timestamps: readonly string[]): string[] {
+  const first = new Date(timestamps[0] ?? "").getTime();
+  const last = new Date(timestamps[timestamps.length - 1] ?? "").getTime();
+  const span = Number.isFinite(first) && Number.isFinite(last) ? last - first : 0;
+  const step = timestamps.length > 1 ? span / (timestamps.length - 1) : 0;
+  const spansDays = span >= DAY_MS;
   return timestamps.map((timestamp) => {
     const date = new Date(timestamp);
     if (Number.isNaN(date.getTime())) return "";
-    return daily
-      ? date.toLocaleDateString(undefined, { weekday: "short" })
-      : date.toLocaleTimeString(undefined, {
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-        });
+    if (!spansDays) {
+      return date.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+    }
+    const day = date.toLocaleDateString(undefined, { weekday: "short" });
+    if (step >= DAY_MS) return day;
+    const hour = date.toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      hour12: false,
+    });
+    return `${day} ${hour}`;
   });
 }
 
@@ -407,7 +427,7 @@ function ChartsView({ range }: ChartsViewProps) {
   const buckets = timestamps.length;
   const geometry = useMemo(() => bucketGeometry(buckets), [buckets]);
 
-  const labels = useMemo(() => axisLabels(timestamps, range), [timestamps, range]);
+  const labels = useMemo(() => axisLabels(timestamps), [timestamps]);
 
   const tokens = useMemo(() => {
     if (!response) return null;
