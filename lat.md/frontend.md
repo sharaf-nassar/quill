@@ -10,11 +10,11 @@ Each window gets its own Suspense boundary with a fallback. Per-window zoom pers
 
 ### Window Routes
 
-Three Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary: the 360px main widget, the consolidated Manage workspace, and the release-notes viewer.
+Three Tauri windows are routed by the `?view=` URL parameter, each with its own Suspense boundary: the resizable main widget, the consolidated Manage workspace, and the release-notes viewer.
 
 | Route | Component | Purpose |
 |-------|-----------|---------|
-| `?view=main` (default) | [[src/App.tsx]] | The 360px monitoring widget: titlebar, LIMITS band, switchable view region |
+| `?view=main` (default) | [[src/App.tsx]] | The monitoring widget: titlebar, LIMITS band, switchable view region |
 | `?view=manage` | [[src/windows/ManageWindowView.tsx]] | Rail-navigated Manage workspace; four tool UIs (Sessions, Learning, Instances, Settings) embedded as sections |
 | `?view=release-notes` | `ReleaseNotesWindow` | Browse published GitHub release notes |
 
@@ -46,11 +46,11 @@ A dev-only Vite plugin in [[vite.config.ts]] (`apply: "serve"`) relaxes the stri
 
 ## Main Window Layout
 
-[[src/App.tsx]] is the widget shell: a fixed 360px window holding [[src/components/widget/WidgetTitleBar.tsx]], a hairline, and one scrolling content column. The split-pane layout and its draggable divider were replaced by the widget redesign.
+[[src/App.tsx]] is the widget shell: a freely resizable window holding [[src/components/widget/WidgetTitleBar.tsx]], a hairline, and one scrolling content column. The split-pane layout and its draggable divider were replaced by the widget redesign.
 
-The shell owns only the app-lifecycle work that has no other home: usage polling every 3 minutes via `fetch_usage_data()` while a provider is enabled, the four-hour updater check, the right-click Refresh/Quit menu, close-to-tray on both the titlebar control and the window manager's close request, and the window's height. Manual Refresh updates integration status; the polling effect owns the resulting usage fetch after that status settles, preventing duplicate requests. When no provider is enabled the column shows one shell-level empty state with a rescan action in place of every band.
+The shell owns only the app-lifecycle work that has no other home: usage polling every 3 minutes via `fetch_usage_data()` while a provider is enabled, the four-hour updater check, the right-click Refresh/Quit menu, and close-to-tray on both the titlebar control and the window manager's close request. Manual Refresh updates integration status; the polling effect owns the resulting usage fetch after that status settles, preventing duplicate requests. When no provider is enabled the column shows one shell-level empty state with a rescan action in place of every band.
 
-Height is content-derived: a `ResizeObserver` on the content column asks the window for the measured height plus the 43px chrome (titlebar, hairline, and the shell's border), clamped to the 200-900px bounds declared in `src-tauri/tauri.conf.json`. Width is never touched. The measured element sits inside the scroll container and is never constrained by the viewport, so the measurement cannot oscillate, and only the column below the titlebar scrolls — which is what keeps the widget reachable under webview zoom or on a platform that refuses a programmatic resize.
+Geometry is the user's, not the shell's. The window drags freely on both axes and `tauri.conf.json` declares only floors (320x200); the earlier content-derived height — a `ResizeObserver` that called `setSize` with the measured height and a fixed 360px width — was deleted rather than gated, because free resize and auto-height cannot both own the geometry and a dormant effect would reclaim the window on the first content change. `.wg-shell` fills the viewport at `height: 100vh`, and only the column below the titlebar scrolls, which is what keeps the widget reachable under webview zoom or when the user drags it shorter than its content.
 
 ### Component Tree
 
@@ -476,7 +476,11 @@ Semantic palette, drawn from the `:root` tokens. Status color is reserved; ident
 
 ### Responsive Scaling
 
-The widget main window does not scale: it is fixed at 360px wide with a content-derived height, so the `--s` fit-to-height system and the per-layout `quill-size-*` sizes it depended on no longer have a consumer.
+The widget main window resizes freely but its density does not scale with it, so the `--s` fit-to-height system and the per-layout `quill-size-*` sizes it depended on no longer have a consumer.
+
+Type sizes, gutters, and the vertical ladder stay fixed at the 360px design width whatever the window measures.
+
+Bands absorb the width instead of scaling into it. The shell is a flex column at `height: 100vh`, the content column has no width of its own, `.wg-grid` splits into three `1fr` tracks, and rows are flex lines whose text cells carry `min-width: 0` so they ellipsize rather than push. The one band with an intrinsic width wider than the 320px floor is `.wg-footer`, which wraps its Manage affordance onto a second line under that pressure; at the design width and above it stays a single 40px row. The `.wg-row` hover bleed (`margin: 0 -7px`) reports as horizontal overflow on `.wg-rows` at every width — it is contained by the band's 14px gutter and clipped by `.wg-scroll`, which is the intent.
 
 Accessibility zoom is unaffected — [[src/main.tsx]] still applies Ctrl+`+`/`-`/`0` webview zoom per window, and the widget's content column scrolls so a zoomed-in layout stays reachable. No `--s` declaration survives in `src/styles/index.css`: the scaling system was deleted with the components that consumed it.
 

@@ -121,7 +121,8 @@ restyling, or building any UI — they describe the target visual system.
   green/amber/red severity meter, a fixed provider color-code (Claude orange · Codex
   blue · MiniMax violet · Agent orchid), six metric hues confined to sparklines and
   swatches, Geist / Geist Mono with tabular figures on an 8–26px ladder, and a single
-  density set by the 360px widget. `.impeccable/design.json` is its machine-readable
+  density set at the widget's 360px design width — the window itself is freely
+  resizable, so bands must stay fluid. `.impeccable/design.json` is its machine-readable
   sidecar.
 
 These describe the target system, not necessarily the current `src/` — when they

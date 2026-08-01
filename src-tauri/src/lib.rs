@@ -5047,12 +5047,14 @@ pub fn run() {
         )
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        // The widget's width and height are owned by the app (fixed 360px,
-        // content-derived height), so the plugin must not restore a saved size
-        // over them — a pre-widget state file would otherwise reopen the old
-        // 520x700 pane layout. Skipping the initial restore for `main` drops
-        // every flag for that window, so its position is restored explicitly
-        // in `setup`; other windows keep the full default behaviour.
+        // The plugin's automatic restore applies every flag, which for the
+        // decorationless widget would also replay a saved `decorated` or
+        // `visible` value over the config. Skipping the initial restore for
+        // `main` drops every flag for that window, so the two the widget
+        // actually wants — position and size — are restored explicitly in
+        // `setup`. Saving is unaffected: `skip_initial_state` gates only the
+        // restore, so the widget's geometry is still persisted on resize and
+        // move like every other window.
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .skip_initial_state("main")
@@ -5274,12 +5276,15 @@ pub fn run() {
                 if let Err(error) = w.set_always_on_top(on_top_enabled) {
                     log::warn!("Failed to apply always-on-top at startup: {error}");
                 }
-                // The window-state plugin skips the widget entirely (its saved
-                // size would fight the fixed 360px geometry), so its position
-                // — the one piece of geometry a corner widget must keep — is
-                // restored here on its own.
-                if let Err(error) = w.restore_state(StateFlags::POSITION) {
-                    log::warn!("Failed to restore widget window position: {error}");
+                // The plugin's automatic restore is skipped for `main`, so the
+                // geometry a widget must keep across restarts — where the user
+                // parked it and how big they dragged it — is restored here.
+                // Only these two flags: the widget is deliberately
+                // decorationless and its visibility is owned by close-to-tray,
+                // so restoring DECORATIONS, VISIBLE, MAXIMIZED, or FULLSCREEN
+                // would let a stale state file undo that.
+                if let Err(error) = w.restore_state(StateFlags::POSITION | StateFlags::SIZE) {
+                    log::warn!("Failed to restore widget window geometry: {error}");
                 }
                 // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
                 let taskbar_icon_bytes = include_bytes!("../icons/taskbar-icon.png");

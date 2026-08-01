@@ -1413,13 +1413,15 @@ body {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Widget shell — the 360px main window (specs/018-widget-ui-redesign)
+   Widget shell — the main window (specs/018-widget-ui-redesign)
 
-   One flat plane at a fixed width: a 40px titlebar, a hairline, and a single
-   scrolling content column. The shell fills the window so a platform that
-   refuses the app's content-derived resize still paints an opaque widget
-   instead of a transparent gap; the column below the hairline is the only
-   thing that ever scrolls (which is what keeps webview zoom usable).
+   One flat plane: a 40px titlebar, a hairline, and a single scrolling content
+   column. The window is freely resizable on both axes and the shell simply
+   fills whatever size it is given — the density stays fixed at the 360px
+   design width, and bands absorb the extra room rather than scaling into it.
+   The column below the hairline is the only thing that ever scrolls, which is
+   what keeps webview zoom usable and what absorbs a window dragged shorter
+   than its content.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 /* The widget owns the full window surface; the document behind it must stay
@@ -1449,8 +1451,8 @@ body {
   overflow-x: hidden;
 }
 
-/* Measured for the window height, so it must stay content-sized: never give
-   this element a viewport-relative height. */
+/* Content-sized on purpose: the scroll parent owns the viewport height, so
+   giving this element one would collapse the bands instead of scrolling them. */
 .wg-content {
   display: flex;
   flex-direction: column;
@@ -2020,13 +2022,18 @@ body {
   color: var(--faint);
 }
 
-/* ─── Footer — range totals and the way out to Manage ─── */
+/* ─── Footer — range totals and the way out to Manage ───
+   The window is freely resizable, so the totals and the Manage affordance are
+   the one band whose intrinsic width can exceed a narrow widget: they wrap to
+   a second line rather than pushing the button past the right gutter. At the
+   design width and above this is a single 40px row, unchanged. */
 .wg-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
-  height: 40px;
-  padding: 0 14px;
+  gap: 8px 14px;
+  min-height: 40px;
+  padding: 8px 14px;
   font-size: 10.5px;
   color: var(--label);
 }

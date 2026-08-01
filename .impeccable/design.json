@@ -41,7 +41,8 @@
       { "name": "reduced-motion", "value": "prefers-reduced-motion: no-preference", "purpose": "Every animation, pulse, and skeleton shimmer is gated behind this query; fills snap to value under reduce." }
     ],
     "breakpoints": [
-      { "name": "widget", "value": "360px", "purpose": "The main window is fixed at 360px wide with a content-derived height. It does not scale; it is the density reference for the whole system." }
+      { "name": "widget-min", "value": "320px", "purpose": "The main window's minimum width. Every band must read here without clipping — the footer wraps its Manage affordance below this pressure." },
+      { "name": "widget", "value": "360px", "purpose": "The main window's default and design width, and the density reference for the whole system. The window is freely resizable on both axes, so the density never scales with it: a wider widget gives its bands more room at the same gutter and type ladder." }
     ]
   },
   "components": [
@@ -120,7 +121,7 @@
   ],
   "narrative": {
     "northStar": "Flat Polish",
-    "overview": "Quill is an instrument, not a dashboard. The whole app is one flat plane — a single near-black surface (#14181f) ruled into bands by hairlines, carrying nothing that is not a number, a label, or the shape of a number. No cards, no raised panels, no gradients, no glow. Depth is spent only on layers that genuinely leave the plane: a dropdown, a tooltip, a dialog. This is the discipline of a glass cockpit taken to its conclusion: keep the severity meter, the tabular figures, and the strict color budget, and remove the last of the chrome — the boxes. The system runs at one density, set by the 360px always-on-top widget: a 14px gutter, an 8/10/12/16px vertical ladder, 10px base type. The legacy Manage, settings, and release-notes windows keep their current roomier density until their own redesign pass; that is a stated migration exception, not a second doctrine.",
+    "overview": "Quill is an instrument, not a dashboard. The whole app is one flat plane — a single near-black surface (#14181f) ruled into bands by hairlines, carrying nothing that is not a number, a label, or the shape of a number. No cards, no raised panels, no gradients, no glow. Depth is spent only on layers that genuinely leave the plane: a dropdown, a tooltip, a dialog. This is the discipline of a glass cockpit taken to its conclusion: keep the severity meter, the tabular figures, and the strict color budget, and remove the last of the chrome — the boxes. The system runs at one density, set at the always-on-top widget's 360px design width: a 14px gutter, an 8/10/12/16px vertical ladder, 10px base type. The window is freely resizable on both axes and the density does not scale with it, so every band must stay fluid from a 320px minimum up to a full-screen drag. The legacy Manage, settings, and release-notes windows keep their current roomier density until their own redesign pass; that is a stated migration exception, not a second doctrine.",
     "keyCharacteristics": [
       "One flat surface for the whole widget; bands are separated by hairlines, never by boxes.",
       "A reserved three-color severity meter (green / amber / red) is the system's spine and carries no other meaning.",

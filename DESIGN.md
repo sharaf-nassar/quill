@@ -185,10 +185,13 @@ cannot see about itself (what it is burning and where it stands against the
 limits) and reports it at a glance, from a 360px widget that lives in a screen
 corner while the operator works.
 
-The system runs at **one density.** The 360px always-on-top widget is the
-primary surface and sets the rhythm: a 14px gutter, 8/10/12/16px vertical
-spacing, a 10px base type size, hairline separators between bands. Everything
-Quill ships is meant to converge on that rhythm. See
+The system runs at **one density.** The always-on-top widget is the primary
+surface and sets the rhythm at its 360px design width: a 14px gutter,
+8/10/12/16px vertical spacing, a 10px base type size, hairline separators
+between bands. The window is freely resizable on both axes, so 360px is the
+width the density is tuned for, not a width the layout may assume — bands stay
+fluid and every one of them must read from a 320px minimum up to a full-screen
+drag. Everything Quill ships is meant to converge on that rhythm. See
 [§6 Density and Migration](#6-density-and-migration) for the one stated
 exception — the legacy Manage/settings/release-notes windows, which keep their
 current roomier density until their own redesign pass.
@@ -439,7 +442,9 @@ The track is a real `role="progressbar"` with `aria-valuenow/min/max` and the
 untruncated window label as its accessible name. A bucket whose reset has
 already elapsed is `stale`: neutral slate, no severity, because a utilization
 measured against a bygone window is not a live threshold. Cells hold their
-column width so rows scan as a table at 360px.
+column width so rows scan as a table at the 360px design width, and keep it as
+the window widens — the row grows by pushing its reset countdown right, never
+by stretching the meters.
 
 ### Charts
 - Drawn by an internal SVG kit, not a charting library. Primitives are
@@ -474,9 +479,11 @@ column width so rows scan as a table at 360px.
 ## 6. Density and Migration
 
 Flat Polish replaces the previous "two densities" doctrine (a dense Primary
-Flight Display beside roomier Systems Pages) with **one density**, set by the
-360px widget: a 14px gutter, an 8/10/12/16px vertical ladder, 10px base type,
-and hairline band separators.
+Flight Display beside roomier Systems Pages) with **one density**, set at the
+widget's 360px design width: a 14px gutter, an 8/10/12/16px vertical ladder,
+10px base type, and hairline band separators. The density does not scale with
+the window — a widget dragged to 1200px keeps the same gutter and type ladder
+and simply gives its bands more room.
 
 **The stated exception.** The Manage workspace (Sessions, Learning, Instances,
 Settings), the settings surfaces, and the release-notes window still render in

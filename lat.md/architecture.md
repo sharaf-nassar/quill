@@ -13,7 +13,7 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 ## Multi-Window Design
 
-The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the 360px main widget, the consolidated Manage workspace, and a release-notes viewer.
+The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the resizable main widget, the consolidated Manage workspace, and a release-notes viewer.
 
 The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
@@ -23,9 +23,9 @@ The Sessions, Learning, Restart, and Settings management surfaces are consolidat
 
 The main widget lives in `src-tauri/tauri.conf.json`, while the dynamically created `manage` and `release-notes` windows are allowed by `src-tauri/capabilities/default.json`.
 
-The main window is fixed at 360px wide (`minWidth` = `maxWidth` = 360, `resizable: false`) with a 200-900px height range the shell drives from its content, and stays borderless and transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to the Settings window, which is now the only place it appears.
+The main window is `resizable: true` and drags freely on both axes. It opens at the 360x560 design size with a 320px minimum width and a 200px minimum height, declares no maximum on either axis, and stays borderless and transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to the Settings window, which is now the only place it appears.
 
-Because that geometry belongs to the app, `tauri-plugin-window-state` is built with `skip_initial_state("main")` so a saved size — including a pre-widget 520x700 pane layout — can never be restored over it. Skipping the initial restore drops every flag for that window, so the widget's position (the one piece of geometry a corner widget must keep) is restored explicitly in setup with `StateFlags::POSITION`. Other windows keep the plugin's full default behaviour.
+Geometry belongs to the user, so `tauri-plugin-window-state` persists the widget's size and position like every other window. The plugin is still built with `skip_initial_state("main")` because its automatic restore replays every flag, and a saved `decorated` or `visible` value would undo the decorationless surface and the close-to-tray contract. Skipping that restore drops all flags for the window, so the two the widget actually wants are restored explicitly in setup with `StateFlags::POSITION | StateFlags::SIZE`; `skip_initial_state` gates only the restore, so saving is unaffected. Other windows keep the plugin's full default behaviour.
 
 ## Module Map
 
@@ -62,7 +62,7 @@ React and TypeScript sources organized by feature domain under `src/`.
 
 | Directory | Purpose |
 |-----------|---------|
-| [[src/App.tsx]] | Main window: the 360px widget shell (titlebar, LIMITS, view region) |
+| [[src/App.tsx]] | Main window: the resizable widget shell (titlebar, LIMITS, view region) |
 | `src/components/` | UI components organized by feature domain |
 | `src/hooks/` | Custom hooks for Tauri IPC data fetching, over the shared `useCachedInvoke` primitive |
 | `src/windows/` | Secondary window entry points |
