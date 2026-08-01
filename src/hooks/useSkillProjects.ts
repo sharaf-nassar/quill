@@ -1,6 +1,10 @@
 import { useCallback, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { IntegrationProvider, SkillProjectBreakdown } from "../types";
+import type {
+  IntegrationProvider,
+  RangeType,
+  SkillProjectBreakdown,
+} from "../types";
 
 /**
  * Per-skill project-breakdown state used by the Skills tab. One entry per
@@ -17,7 +21,7 @@ export type SkillProjectsState =
 const IDLE: SkillProjectsState = { status: "idle" };
 
 interface FetchArgs {
-  days: number;
+  range: RangeType;
   allTime: boolean;
   provider: IntegrationProvider | null;
   limit: number;
@@ -68,7 +72,7 @@ export function useSkillProjects() {
           "get_skill_project_breakdown",
           {
             skillName,
-            days: args.days,
+            range: args.range,
             provider: args.provider,
             allTime: args.allTime,
             limit: args.limit,

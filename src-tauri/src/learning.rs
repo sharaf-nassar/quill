@@ -16,7 +16,7 @@ use tauri::Emitter;
 /// Recency window for session selection: sessions whose last activity is
 /// older than this are not considered (mirrors the prior approach's
 /// recent-subset sampling rather than all history).
-const STREAM_C_LOOKBACK_DAYS: i32 = 14;
+const STREAM_C_LOOKBACK_RANGE: &str = "14d";
 /// Hard cap on the number of (top-level) sessions analyzed per run.
 const STREAM_C_MAX_SESSIONS: i32 = 40;
 /// Total byte budget for the concatenated per-session digests fed to the
@@ -79,7 +79,7 @@ fn select_sessions_for_insights(
     provider: Option<IntegrationProvider>,
 ) -> Result<Vec<crate::models::SessionBreakdown>, String> {
     storage.get_session_breakdown(
-        STREAM_C_LOOKBACK_DAYS,
+        STREAM_C_LOOKBACK_RANGE,
         None,
         provider,
         Some(STREAM_C_MAX_SESSIONS),

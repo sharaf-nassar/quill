@@ -464,6 +464,7 @@ interface MockModelObservation {
 
 const MODEL_RANGE_MS: Record<ModelRange, number> = {
   "1h": H,
+  "6h": 6 * H,
   "24h": D,
   "7d": 7 * D,
   "30d": 30 * D,
@@ -1314,6 +1315,7 @@ function getScopedModelObservations(
 
 const ACTIVITY_BUCKET_SECONDS: Record<ModelRange, number> = {
   "1h": 10 * 60,
+  "6h": 15 * 60,
   "24h": 60 * 60,
   "7d": 24 * 60 * 60,
   "30d": 24 * 60 * 60,

@@ -1156,6 +1156,8 @@ pub struct MemoryFilesUpdatedEvent {
 pub enum ModelRange {
     #[serde(rename = "1h")]
     OneHour,
+    #[serde(rename = "6h")]
+    SixHours,
     #[serde(rename = "24h")]
     TwentyFourHours,
     #[serde(rename = "7d")]
@@ -1168,6 +1170,7 @@ impl ModelRange {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OneHour => "1h",
+            Self::SixHours => "6h",
             Self::TwentyFourHours => "24h",
             Self::SevenDays => "7d",
             Self::ThirtyDays => "30d",
@@ -1181,12 +1184,13 @@ impl TryFrom<&str> for ModelRange {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "1h" => Ok(Self::OneHour),
+            "6h" => Ok(Self::SixHours),
             "24h" => Ok(Self::TwentyFourHours),
             "7d" => Ok(Self::SevenDays),
             "30d" => Ok(Self::ThirtyDays),
             _ => Err(ModelAnalyticsError::new(
                 ModelAnalyticsErrorCode::InvalidRange,
-                "Range must be one of 1h, 24h, 7d, or 30d.",
+                "Range must be one of 1h, 6h, 24h, 7d, or 30d.",
             )),
         }
     }

@@ -13,6 +13,7 @@ export interface SnapshotCountState {
 
 const RANGES: Record<RangeType, { label: string; days: number }> = {
   "1h": { label: "1 Hour", days: 1 },
+  "6h": { label: "6 Hours", days: 1 },
   "24h": { label: "24 Hours", days: 1 },
   "7d": { label: "7 Days", days: 7 },
   "30d": { label: "30 Days", days: 30 },

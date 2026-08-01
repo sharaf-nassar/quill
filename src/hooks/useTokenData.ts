@@ -9,13 +9,6 @@ import type {
   TokenStats,
 } from "../types";
 
-const RANGE_DAYS: Record<RangeType, number> = {
-  "1h": 1,
-  "24h": 1,
-  "7d": 7,
-  "30d": 30,
-};
-
 const REFRESH_DEBOUNCE_MS = 1000;
 
 export function useTokenData(
@@ -39,7 +32,6 @@ export function useTokenData(
     setError(null);
 
     try {
-      const days = RANGE_DAYS[range] ?? 1;
       const providerArg = provider || null;
       const hostnameArg = hostname || null;
       const sessionIdArg = sessionId || null;
@@ -54,7 +46,7 @@ export function useTokenData(
           cwd: cwdArg,
         }),
         invoke<TokenStats>("get_token_stats", {
-          days,
+          range,
           provider: providerArg,
           hostname: hostnameArg,
           sessionId: sessionIdArg,

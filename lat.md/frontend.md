@@ -92,7 +92,7 @@ Recharts is hostile to those treatments and costs 3.7 MB for shapes the widget c
 
 Analytics components in `src/components/analytics/` provide Now, Trends, Charts, Models, and an optional Context tab.
 
-- **NowTab** (214 lines) — Real-time metrics with range selector (1h/24h/7d/30d), six insight cards, a 24-hour activity heatmap, and a switchable breakdown panel (sessions/projects/hosts/skills).
+- **NowTab** (214 lines) — Real-time metrics with range selector (1h/6h/24h/7d/30d), six insight cards, a 24-hour activity heatmap, and a switchable breakdown panel (sessions/projects/hosts/skills).
 - `NowTab` shares one comparison-range code-history fetch between the efficiency and velocity cards via `src/hooks/useCodeInsights.ts`, which avoids firing the same `get_code_stats_history` IPC call twice per refresh. The same hook fetches `get_llm_runtime_stats` so velocity divides LOC by active LLM runtime (matching the LLM Runtime card) instead of the wall-clock span; the prior window's active seconds are recovered by prorating the comparison-range runtime sparkline, and both periods fall back to wall-clock when no runtime is recorded.
 - Selecting a session in `NowTab` now keeps provider identity alongside `session_id`, so token charts, compact token stats, and delete actions stay scoped to the correct Claude or Codex session.
 - **TrendsTab** (105 lines) — Token trends, code velocity, and cache efficiency charts with week-over-week comparison.

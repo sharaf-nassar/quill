@@ -19,6 +19,7 @@ import type {
   HostBreakdown,
   IntegrationProvider,
   ProjectBreakdown,
+  RangeType,
   SessionBreakdown,
   SessionRef,
   SkillBreakdown,
@@ -604,12 +605,12 @@ function SkillProjectRow({ row }: SkillProjectRowProps) {
 }
 
 interface BreakdownPanelProps {
-  days: number;
+  range: RangeType;
   selection: BreakdownSelection | null;
   onSelect: (selection: BreakdownSelection | null) => void;
 }
 
-function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
+function BreakdownPanel({ range, selection, onSelect }: BreakdownPanelProps) {
   const { toast } = useToast();
   const [mode, setMode] = useState<BreakdownMode>("sessions");
   const [skillsAllTime, setSkillsAllTime] = useState(true);
@@ -659,7 +660,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     skillsProvider === "all" ? null : skillsProvider;
   const hookProviderArg: IntegrationProvider | null =
     hooksProvider === "all" ? null : hooksProvider;
-  const { data, loading, error, refresh } = useBreakdownData(mode, days, {
+  const { data, loading, error, refresh } = useBreakdownData(mode, range, {
     skillAllTime: skillsAllTime,
     skillProvider: skillProviderArg,
     hookAllTime: hooksAllTime,
@@ -673,8 +674,8 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
   // but no client-side filtering is needed.
   // Mirrors the cache key shape used by `useBreakdownData` so the
   // per-skill project drilldown invalidates on the exact same filter
-  // axes (days / all-time / provider) that drive the parent rows.
-  const skillRequestKey = `${mode}:${days}:${skillsAllTime}:${skillProviderArg ?? "all"}`;
+  // axes (range / all-time / provider) that drive the parent rows.
+  const skillRequestKey = `${mode}:${range}:${skillsAllTime}:${skillProviderArg ?? "all"}`;
   const sortedSkillRows = useMemo(() => {
     if (mode !== "skills") {
       return [];
@@ -809,7 +810,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
     });
   }, []);
 
-  // When the filter axes change (days / all-time / provider) the cached
+  // When the filter axes change (range / all-time / provider) the cached
   // sub-row data for the previous filter no longer applies, so collapse
   // all expanded skill rows. Re-expanding triggers a fresh fetch under
   // the new request key.
@@ -826,7 +827,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
         // the state update so Strict Mode's double-invoked updater can't
         // trigger duplicate fetches.
         void fetchSkillProjects(skillName, skillRequestKey, {
-          days,
+          range,
           allTime: skillsAllTime,
           provider: skillProviderArg,
           limit: 50,
@@ -844,7 +845,7 @@ function BreakdownPanel({ days, selection, onSelect }: BreakdownPanelProps) {
       expandedSkills,
       fetchSkillProjects,
       skillRequestKey,
-      days,
+      range,
       skillsAllTime,
       skillProviderArg,
     ],

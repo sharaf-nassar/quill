@@ -2,7 +2,7 @@ import type { RangeType } from "../types";
 
 export function formatTime(timestamp: string, range: RangeType): string {
 	const d = new Date(timestamp);
-	if (range === "1h" || range === "24h") {
+	if (range === "1h" || range === "6h" || range === "24h") {
 		return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 	}
 	if (range === "7d") {

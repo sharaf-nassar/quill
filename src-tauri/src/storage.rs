@@ -1279,14 +1279,26 @@ fn parse_rule_frontmatter(content: &str) -> (Option<String>, bool, String) {
 fn range_to_duration(range: &str) -> TimeDelta {
     match range {
         "1h" => TimeDelta::hours(1),
+        "6h" => TimeDelta::hours(6),
         "24h" => TimeDelta::hours(24),
         "7d" => TimeDelta::days(7),
+        // Internal lookback for the insights session selector; not part of
+        // the user-facing range toggle vocabulary, but named here so it
+        // resolves through the same helper instead of a private duration.
+        "14d" => TimeDelta::days(14),
         "30d" => TimeDelta::days(30),
         _ => TimeDelta::hours(24),
     }
 }
 
-fn context_savings_from_timestamp(range: &str) -> String {
+/// Inclusive lower bound of a range-scoped query as an RFC 3339 string.
+///
+/// Single scoping helper shared by every range-parameterized read path —
+/// token stats, the five breakdowns, and context savings — so the range
+/// vocabulary (`1h`, `6h`, `24h`, `7d`, `30d`, `all`) is honored
+/// identically everywhere instead of one command quietly answering a 24h
+/// window for a 1H/6H request.
+fn range_from_timestamp(range: &str) -> String {
     if range == "all" {
         return "1970-01-01T00:00:00Z".to_string();
     }
@@ -1296,7 +1308,7 @@ fn context_savings_from_timestamp(range: &str) -> String {
 
 fn context_savings_bucket_expr(range: &str) -> &'static str {
     match range {
-        "1h" => "substr(timestamp, 1, 16) || ':00Z'",
+        "1h" | "6h" => "substr(timestamp, 1, 16) || ':00Z'",
         "30d" | "all" => "substr(timestamp, 1, 10) || 'T00:00:00Z'",
         _ => "substr(timestamp, 1, 13) || ':00:00Z'",
     }
@@ -2907,6 +2919,7 @@ fn bump_model_data_revision(conn: &Connection) -> Result<i64, String> {
 fn model_range_duration(range: ModelRange) -> TimeDelta {
     match range {
         ModelRange::OneHour => TimeDelta::hours(1),
+        ModelRange::SixHours => TimeDelta::hours(6),
         ModelRange::TwentyFourHours => TimeDelta::hours(24),
         ModelRange::SevenDays => TimeDelta::days(7),
         ModelRange::ThirtyDays => TimeDelta::days(30),
@@ -2916,6 +2929,7 @@ fn model_range_duration(range: ModelRange) -> TimeDelta {
 fn model_history_bucket_seconds(range: ModelRange) -> i64 {
     match range {
         ModelRange::OneHour => 5 * 60,
+        ModelRange::SixHours => 15 * 60,
         ModelRange::TwentyFourHours => 60 * 60,
         ModelRange::SevenDays => 6 * 60 * 60,
         ModelRange::ThirtyDays => 24 * 60 * 60,
@@ -2927,6 +2941,7 @@ fn model_history_bucket_seconds(range: ModelRange) -> i64 {
 fn model_overview_bucket_seconds(range: ModelRange) -> i64 {
     match range {
         ModelRange::OneHour => 5 * 60,
+        ModelRange::SixHours => 15 * 60,
         ModelRange::TwentyFourHours => 60 * 60,
         ModelRange::SevenDays | ModelRange::ThirtyDays => 24 * 60 * 60,
     }
@@ -9515,6 +9530,7 @@ impl Storage {
 
         let (from, use_hourly) = match range {
             "1h" => (now - TimeDelta::hours(1), false),
+            "6h" => (now - TimeDelta::hours(6), false),
             "24h" => (now - TimeDelta::hours(24), false),
             "7d" => (now - TimeDelta::days(7), false),
             "30d" => (now - TimeDelta::days(30), true),
@@ -9599,6 +9615,7 @@ impl Storage {
 
             let max_points = match range {
                 "1h" => 60,
+                "6h" => 360,
                 "7d" => 672,
                 _ => 1440,
             };
@@ -9841,6 +9858,7 @@ impl Storage {
         let needs_granular = session_id.is_some() || cwd.is_some();
         let (from, use_hourly) = match range {
             "1h" => (now - TimeDelta::hours(1), false),
+            "6h" => (now - TimeDelta::hours(6), false),
             "24h" => (now - TimeDelta::hours(24), false),
             "7d" => (now - TimeDelta::days(7), false),
             "30d" => (now - TimeDelta::days(30), !needs_granular),
@@ -9984,6 +10002,7 @@ impl Storage {
 
         let max_points = match range {
             "1h" => 60,
+            "6h" => 360,
             "7d" => 672,
             "30d" | "all" => 720,
             _ => 1440,
@@ -9994,15 +10013,14 @@ impl Storage {
 
     pub fn get_token_stats(
         &self,
-        days: i32,
+        range: &str,
         provider: Option<IntegrationProvider>,
         hostname: Option<&str>,
         session_id: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<TokenStats, String> {
-        let days = days.clamp(1, 365);
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         let mut sql = String::from(
             "SELECT
@@ -10212,7 +10230,7 @@ impl Storage {
         range: &str,
         limit: Option<i64>,
     ) -> Result<ContextSavingsAnalytics, String> {
-        let from = context_savings_from_timestamp(range);
+        let from = range_from_timestamp(range);
         let recent_limit = limit.unwrap_or(50).clamp(1, 500);
         let breakdown_limit = 20i64;
 
@@ -10465,10 +10483,9 @@ impl Storage {
         Ok(hostnames)
     }
 
-    pub fn get_host_breakdown(&self, days: i32) -> Result<Vec<HostBreakdown>, String> {
-        let days = days.clamp(1, 365);
+    pub fn get_host_breakdown(&self, range: &str) -> Result<Vec<HostBreakdown>, String> {
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         let mut stmt = conn
             .prepare_cached(
@@ -10503,10 +10520,9 @@ impl Storage {
         Ok(results)
     }
 
-    pub fn get_project_breakdown(&self, days: i32) -> Result<Vec<ProjectBreakdown>, String> {
-        let days = days.clamp(1, 365);
+    pub fn get_project_breakdown(&self, range: &str) -> Result<Vec<ProjectBreakdown>, String> {
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         let mut stmt = conn
             .prepare_cached(
@@ -10550,7 +10566,7 @@ impl Storage {
 
     pub fn get_skill_breakdown(
         &self,
-        days: i32,
+        range: &str,
         provider: Option<IntegrationProvider>,
         all_time: bool,
         limit: Option<i32>,
@@ -10559,10 +10575,9 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let days = days.clamp(1, 365);
         let limit = limit.unwrap_or(100).clamp(1, 500);
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         let mut sql = String::from(
             "SELECT
@@ -10624,7 +10639,7 @@ impl Storage {
     // @lat: [[backend#Database#Schema#Hook Invocations]]
     pub fn get_hook_breakdown(
         &self,
-        days: i32,
+        range: &str,
         provider: Option<IntegrationProvider>,
         all_time: bool,
         limit: Option<i32>,
@@ -10633,10 +10648,9 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let days = days.clamp(1, 365);
         let limit = limit.unwrap_or(100).clamp(1, 500);
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         // For each `hook_identity` group, surface the most recently
         // seen `hook_event` / `tool_name` via a correlated subquery
@@ -10714,7 +10728,7 @@ impl Storage {
     pub fn get_skill_project_breakdown(
         &self,
         skill_name: &str,
-        days: i32,
+        range: &str,
         provider: Option<IntegrationProvider>,
         all_time: bool,
         limit: Option<i32>,
@@ -10723,10 +10737,9 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        let days = days.clamp(1, 365);
         let limit = limit.unwrap_or(50).clamp(1, 500);
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         let mut sql = String::from(
             "SELECT
@@ -10853,15 +10866,14 @@ impl Storage {
 
     pub fn get_session_breakdown(
         &self,
-        days: i32,
+        range: &str,
         hostname: Option<&str>,
         provider: Option<IntegrationProvider>,
         limit: Option<i32>,
     ) -> Result<Vec<SessionBreakdown>, String> {
-        let days = days.clamp(1, 365);
         let limit = limit.unwrap_or(10).clamp(1, 500);
         let conn = self.conn.lock();
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = range_from_timestamp(range);
 
         // Sub-agent rollup (Wave 2). Each output row is keyed by
         // `(provider, session_id, hostname)` — the same natural key as
@@ -16364,6 +16376,7 @@ impl Storage {
 
         let bucket_secs: i64 = match range {
             "1h" => 60,
+            "6h" => 5 * 60,
             "24h" => 15 * 60,
             "7d" => 3600,
             "30d" => 86400,
@@ -18196,7 +18209,7 @@ mod tests {
         }
 
         let rows = storage
-            .get_session_breakdown(7, None, None, Some(100))
+            .get_session_breakdown("7d", None, None, Some(100))
             .expect("get_session_breakdown");
         let row = rows
             .iter()

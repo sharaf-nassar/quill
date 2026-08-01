@@ -244,7 +244,7 @@ export type TimeMode = "marker" | "dual" | "background";
  * labelled "All time": they read `skill_usages` and `hook_invocations`, which
  * retention never prunes, so relabelling them would itself be a lie.
  */
-export type RangeType = "1h" | "24h" | "7d" | "30d";
+export type RangeType = "1h" | "6h" | "24h" | "7d" | "30d";
 export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
 export type TrendType = "up" | "down" | "flat" | "unknown";
@@ -699,7 +699,7 @@ export interface SessionContext {
 
 // Analytics redesign types
 
-export type ModelRange = "1h" | "24h" | "7d" | "30d";
+export type ModelRange = "1h" | "6h" | "24h" | "7d" | "30d";
 
 export interface ModelIdentity {
   provider: string;

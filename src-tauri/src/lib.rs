@@ -2886,7 +2886,7 @@ async fn get_token_history(
 
 #[tauri::command]
 async fn get_token_stats(
-    days: i32,
+    range: String,
     provider: Option<integrations::IntegrationProvider>,
     hostname: Option<String>,
     session_id: Option<String>,
@@ -2895,7 +2895,7 @@ async fn get_token_stats(
     let storage = get_storage()?;
     run_blocking(move || {
         storage.get_token_stats(
-            days,
+            &range,
             provider,
             hostname.as_deref(),
             session_id.as_deref(),
@@ -2911,20 +2911,22 @@ async fn get_token_hostnames() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn get_host_breakdown(days: i32) -> Result<Vec<HostBreakdown>, String> {
+async fn get_host_breakdown(range: String) -> Result<Vec<HostBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_host_breakdown(days))
+    run_blocking(move || storage.get_host_breakdown(&range))
 }
 
 #[tauri::command]
 async fn get_session_breakdown(
-    days: i32,
+    range: String,
     hostname: Option<String>,
     provider: Option<integrations::IntegrationProvider>,
     limit: Option<i32>,
 ) -> Result<Vec<SessionBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_session_breakdown(days, hostname.as_deref(), provider, limit))
+    run_blocking(move || {
+        storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)
+    })
 }
 
 #[tauri::command]
@@ -2940,20 +2942,20 @@ async fn get_session_stats(days: i32) -> Result<SessionStats, String> {
 }
 
 #[tauri::command]
-async fn get_project_breakdown(days: i32) -> Result<Vec<ProjectBreakdown>, String> {
+async fn get_project_breakdown(range: String) -> Result<Vec<ProjectBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_project_breakdown(days))
+    run_blocking(move || storage.get_project_breakdown(&range))
 }
 
 #[tauri::command]
 async fn get_skill_breakdown(
-    days: i32,
+    range: String,
     provider: Option<integrations::IntegrationProvider>,
     all_time: bool,
     limit: Option<i32>,
 ) -> Result<Vec<SkillBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_skill_breakdown(days, provider, all_time, limit))
+    run_blocking(move || storage.get_skill_breakdown(&range, provider, all_time, limit))
 }
 
 // Feature 009: powers the Now-tab Hooks breakdown. Signature mirrors
@@ -2963,26 +2965,26 @@ async fn get_skill_breakdown(
 // @lat: [[backend#Tauri IPC Commands]]
 #[tauri::command]
 async fn get_hook_breakdown(
-    days: i32,
+    range: String,
     provider: Option<integrations::IntegrationProvider>,
     all_time: bool,
     limit: Option<i32>,
 ) -> Result<Vec<HookBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || storage.get_hook_breakdown(days, provider, all_time, limit))
+    run_blocking(move || storage.get_hook_breakdown(&range, provider, all_time, limit))
 }
 
 #[tauri::command]
 async fn get_skill_project_breakdown(
     skill_name: String,
-    days: i32,
+    range: String,
     provider: Option<integrations::IntegrationProvider>,
     all_time: bool,
     limit: Option<i32>,
 ) -> Result<Vec<SkillProjectBreakdown>, String> {
     let storage = get_storage()?;
     run_blocking(move || {
-        storage.get_skill_project_breakdown(&skill_name, days, provider, all_time, limit)
+        storage.get_skill_project_breakdown(&skill_name, &range, provider, all_time, limit)
     })
 }
 

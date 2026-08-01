@@ -146,7 +146,7 @@ export function useLiveSummaryData(
         enabledProviders.map(async (provider) => {
           const [sessionBreakdown, tokenHistory] = await Promise.all([
             invoke<SessionBreakdown[]>("get_session_breakdown", {
-              days: 1,
+              range: "24h",
               hostname: null,
               provider,
               limit: SESSION_BREAKDOWN_LIMIT,

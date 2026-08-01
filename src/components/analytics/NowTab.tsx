@@ -17,23 +17,13 @@ import type {
 	ContextSavingsSummary,
 } from "../../types";
 
-const RANGES: RangeType[] = ["1h", "24h", "7d", "30d"];
+const RANGES: RangeType[] = ["1h", "6h", "24h", "7d", "30d"];
 const RANGE_LABELS: Record<RangeType, string> = {
 	"1h": "1H",
+	"6h": "6H",
 	"24h": "24H",
 	"7d": "7D",
 	"30d": "30D",
-};
-const RANGE_DAYS: Record<RangeType, number> = {
-	"1h": 1,
-	"24h": 1,
-	"7d": 7,
-	"30d": 30,
-};
-const DAYS_TO_RANGE: Record<number, RangeType> = {
-	1: "24h",
-	7: "7d",
-	30: "30d",
 };
 
 const BREAKDOWN_COLLAPSED_KEY = "quill-breakdown-collapsed";
@@ -98,11 +88,11 @@ function NowTab({
 			return false;
 		}
 	});
-	const breakdownDays = RANGE_DAYS[range] ?? 1;
 	const hasSelection = breakdownSelection !== null;
-	const tokenRange: RangeType = hasSelection
-		? (DAYS_TO_RANGE[breakdownDays] ?? "24h")
-		: range;
+	// The breakdown is scoped by the same range string as everything else,
+	// so a selected row no longer widens the token panel to a coarser
+	// window than the one the user picked.
+	const tokenRange: RangeType = range;
 
 	const { loading, error } = useAnalyticsData(
 		null,
@@ -292,7 +282,7 @@ function NowTab({
 						</button>
 						{!breakdownCollapsed && (
 							<BreakdownPanel
-								days={RANGE_DAYS[range] ?? 1}
+								range={range}
 								selection={breakdownSelection}
 								onSelect={setBreakdownSelection}
 							/>

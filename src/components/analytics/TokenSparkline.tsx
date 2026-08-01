@@ -5,6 +5,7 @@ import type { TokenDataPoint, RangeType } from "../../types";
 
 const RANGE_DISPLAY: Record<RangeType, string> = {
 	"1h": "1h",
+	"6h": "6h",
 	"24h": "24h",
 	"7d": "7d",
 	"30d": "30d",

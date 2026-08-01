@@ -105,7 +105,7 @@ function AnalyticsView({
 	const [chartsRange, setChartsRange] = useState<RangeType>(() => {
 		try {
 			const saved = localStorage.getItem("quill-charts-range");
-			if (saved === "1h" || saved === "24h" || saved === "7d" || saved === "30d") return saved as RangeType;
+			if (saved === "1h" || saved === "6h" || saved === "24h" || saved === "7d" || saved === "30d") return saved as RangeType;
 		} catch { /* ignore */ }
 		return "1h";
 	});

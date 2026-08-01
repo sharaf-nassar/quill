@@ -38,6 +38,8 @@ function getRangeMs(range: RangeType): number {
 	switch (range) {
 		case "1h":
 			return 60 * 60 * 1000;
+		case "6h":
+			return 6 * 60 * 60 * 1000;
 		case "24h":
 			return 24 * 60 * 60 * 1000;
 		case "7d":
@@ -50,6 +52,8 @@ function getRangeMs(range: RangeType): number {
 function comparisonRange(range: RangeType): RangeType {
 	switch (range) {
 		case "1h":
+			return "6h";
+		case "6h":
 			return "24h";
 		case "24h":
 			return "7d";

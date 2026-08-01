@@ -8,6 +8,7 @@ import type {
   HostBreakdown,
   IntegrationProvider,
   ProjectBreakdown,
+  RangeType,
   SessionBreakdown,
   SkillBreakdown,
 } from "../types";
@@ -33,7 +34,7 @@ const SESSION_BREAKDOWN_LIMIT = 200;
 const SKILL_BREAKDOWN_LIMIT = 100;
 const HOOK_BREAKDOWN_LIMIT = 100;
 
-export function useBreakdownData(mode: BreakdownMode, days: number, options: BreakdownOptions = {}) {
+export function useBreakdownData(mode: BreakdownMode, range: RangeType, options: BreakdownOptions = {}) {
   const [data, setData] = useState<BreakdownRow[]>([]);
   const [dataMode, setDataMode] = useState<BreakdownMode>(mode);
   const [loading, setLoading] = useState(true);
@@ -45,7 +46,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
   const hookAllTime = options.hookAllTime ?? false;
   const hookProvider = options.hookProvider ?? null;
   const requestKey =
-    `${mode}:${days}:` +
+    `${mode}:${range}:` +
     `${skillAllTime}:${skillProvider ?? "all"}:` +
     `${hookAllTime}:${hookProvider ?? "all"}`;
 
@@ -62,14 +63,14 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
     try {
       let result: BreakdownRow[];
       if (mode === "hosts") {
-        result = await invoke<HostBreakdown[]>("get_host_breakdown", { days });
+        result = await invoke<HostBreakdown[]>("get_host_breakdown", { range });
       } else if (mode === "projects") {
         result = await invoke<ProjectBreakdown[]>("get_project_breakdown", {
-          days,
+          range,
         });
       } else if (mode === "skills") {
         result = await invoke<SkillBreakdown[]>("get_skill_breakdown", {
-          days,
+          range,
           provider: skillProvider,
           allTime: skillAllTime,
           limit: SKILL_BREAKDOWN_LIMIT,
@@ -78,14 +79,14 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
         // Feature 009: Hooks breakdown reads from `hook_invocations`.
         // Same arg shape as skills so the controls map 1:1.
         result = await invoke<HookBreakdown[]>("get_hook_breakdown", {
-          days,
+          range,
           provider: hookProvider,
           allTime: hookAllTime,
           limit: HOOK_BREAKDOWN_LIMIT,
         });
       } else {
         result = await invoke<SessionBreakdown[]>("get_session_breakdown", {
-          days,
+          range,
           hostname: null,
           limit: SESSION_BREAKDOWN_LIMIT,
         });
@@ -105,7 +106,7 @@ export function useBreakdownData(mode: BreakdownMode, days: number, options: Bre
         setLoading(false);
       }
     }
-  }, [mode, days, requestKey, skillAllTime, skillProvider, hookAllTime, hookProvider]);
+  }, [mode, range, requestKey, skillAllTime, skillProvider, hookAllTime, hookProvider]);
 
   useCachedInvoke({ identity: `breakdown:${requestKey}`, request: fetchData, normalizeError: String });
 

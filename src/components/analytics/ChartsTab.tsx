@@ -23,9 +23,10 @@ import { CrosshairProvider, useCrosshair } from "./ChartCrosshairContext";
 import MiniChart from "./MiniChart";
 import type { RangeType } from "../../types";
 
-const RANGES: RangeType[] = ["1h", "24h", "7d", "30d"];
+const RANGES: RangeType[] = ["1h", "6h", "24h", "7d", "30d"];
 const RANGE_LABELS: Record<RangeType, string> = {
 	"1h": "1H",
+	"6h": "6H",
 	"24h": "24H",
 	"7d": "7D",
 	"30d": "30D",

@@ -31,10 +31,11 @@ import ModelProjectMatrix from "./models/ModelProjectMatrix";
 import ModelRunningNow from "./models/ModelRunningNow";
 import ModelUsageSpine from "./models/ModelUsageSpine";
 
-const MODEL_RANGES: readonly ModelRange[] = ["1h", "24h", "7d", "30d"];
+const MODEL_RANGES: readonly ModelRange[] = ["1h", "6h", "24h", "7d", "30d"];
 
 const RANGE_LABELS: Record<ModelRange, string> = {
 	"1h": "1H",
+	"6h": "6H",
 	"24h": "24H",
 	"7d": "7D",
 	"30d": "30D",
