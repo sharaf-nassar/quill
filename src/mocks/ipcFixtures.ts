@@ -66,6 +66,57 @@ const isoIn = (msAhead: number) => new Date(now + msAhead).toISOString();
 const sqliteUtc = (msAgo: number) =>
   new Date(now - msAgo).toISOString().replace("T", " ").slice(0, -5);
 
+// --- Range geometry (feature 018 — widget) ------------------------------------
+// The widget scopes every band by the same range toggle, including the new 6h
+// step, so the fixtures have to answer per-range rather than serving one fixed
+// window to everybody.
+
+const RANGE_DURATION_MS: Record<string, number> = {
+  "1h": H,
+  "6h": 6 * H,
+  "24h": D,
+  "7d": 7 * D,
+  "30d": 30 * D,
+};
+
+/** Read the `range` IPC argument, falling back to the app's default window. */
+function rangeArg(args?: Record<string, unknown>): string {
+  const range = args?.range;
+  return typeof range === "string" && range in RANGE_DURATION_MS ? range : "24h";
+}
+
+/** Read the `buckets` IPC argument, ignoring anything not a positive integer. */
+function bucketsArg(args: Record<string, unknown> | undefined, fallback: number): number {
+  const buckets = args?.buckets;
+  return typeof buckets === "number" && Number.isInteger(buckets) && buckets > 0
+    ? buckets
+    : fallback;
+}
+
+/** Bucket-start timestamps spanning `range`, oldest first, `count` of them. */
+function bucketTimestamps(range: string, count: number): string[] {
+  const duration = RANGE_DURATION_MS[range] ?? D;
+  const step = count > 1 ? duration / (count - 1) : duration;
+  return Array.from({ length: count }, (_, i) => iso(Math.round((count - 1 - i) * step)));
+}
+
+/** Seconds covered by one bucket of `count` across `range`. */
+function bucketSecs(range: string, count: number): number {
+  const duration = RANGE_DURATION_MS[range] ?? D;
+  return Math.round(duration / Math.max(1, count - 1) / 1000);
+}
+
+/** Nearest-neighbour resample so one hand-drawn shape serves any bucket count. */
+function resample(shape: readonly number[], count: number): number[] {
+  if (shape.length === 0) return Array.from({ length: count }, () => 0);
+  if (count === shape.length) return [...shape];
+  if (count <= 1) return [shape[shape.length - 1]];
+  return Array.from(
+    { length: count },
+    (_, i) => shape[Math.round((i * (shape.length - 1)) / (count - 1))],
+  );
+}
+
 // --- Integrations (these gate whether the app renders the dashboard) ----------
 
 const providerStatuses: ProviderStatus[] = [
@@ -167,15 +218,23 @@ const usageStats: BucketStats[] = usageData.buckets.map((b) => ({
 
 // --- Tokens -------------------------------------------------------------------
 
-function tokenHistory(): TokenDataPoint[] {
+/** Point spacing per range; hour-granular ranges get sub-hour buckets. */
+const TOKEN_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> = {
+  "1h": { count: 12, stepMs: 5 * M },
+  "6h": { count: 24, stepMs: 15 * M },
+};
+const DEFAULT_TOKEN_HISTORY = { count: 48, stepMs: H };
+
+function tokenHistory(range: string): TokenDataPoint[] {
+  const { count, stepMs } = TOKEN_HISTORY_GEOMETRY[range] ?? DEFAULT_TOKEN_HISTORY;
   const pts: TokenDataPoint[] = [];
-  for (let i = 47; i >= 0; i--) {
+  for (let i = count - 1; i >= 0; i--) {
     const input = 8_000 + ((i * 37) % 5_000);
     const output = 3_000 + ((i * 53) % 2_500);
     const cacheCreate = 1_500 + ((i * 17) % 1_200);
     const cacheRead = 12_000 + ((i * 91) % 9_000);
     pts.push({
-      timestamp: iso(i * H),
+      timestamp: iso(i * stepMs),
       input_tokens: input,
       output_tokens: output,
       cache_creation_input_tokens: cacheCreate,
@@ -213,12 +272,25 @@ const codeStats: CodeStats = {
   ],
 };
 
-function codeHistory(): CodeStatsHistoryPoint[] {
+/** The widget's readout grid asks for 8 buckets; hour ranges shrink the step. */
+const CODE_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> = {
+  "1h": { count: 8, stepMs: 7.5 * M },
+  "6h": { count: 8, stepMs: 45 * M },
+};
+const DEFAULT_CODE_HISTORY = { count: 14, stepMs: D };
+
+function codeHistory(range: string): CodeStatsHistoryPoint[] {
+  const { count, stepMs } = CODE_HISTORY_GEOMETRY[range] ?? DEFAULT_CODE_HISTORY;
   const pts: CodeStatsHistoryPoint[] = [];
-  for (let i = 13; i >= 0; i--) {
+  for (let i = count - 1; i >= 0; i--) {
     const added = 200 + ((i * 47) % 600);
     const removed = 80 + ((i * 31) % 300);
-    pts.push({ timestamp: iso(i * D), lines_added: added, lines_removed: removed, total_changed: added + removed });
+    pts.push({
+      timestamp: iso(i * stepMs),
+      lines_added: added,
+      lines_removed: removed,
+      total_changed: added + removed,
+    });
   }
   return pts;
 }
@@ -2616,6 +2688,93 @@ function setRetentionPolicyFixture(
   return retentionPolicy();
 }
 
+// --- Widget aggregates (feature 018) ------------------------------------------
+// Shapes for `get_provider_token_series` and `get_activity_series`. The types
+// are declared locally rather than imported from ../types so the browser mock
+// can render the widget before the Rust/TS contract for these commands lands.
+
+/** One provider's aligned bucket values plus its total for the range. */
+interface ProviderSeriesFixture {
+  provider: string;
+  values: number[];
+  total_tokens: number;
+}
+
+interface ProviderTokenSeriesFixture {
+  range: string;
+  bucket_secs: number;
+  /** Bucket starts shared by every series, oldest first. */
+  timestamps: string[];
+  series: ProviderSeriesFixture[];
+  /** Equals the sum of the per-provider totals, by construction. */
+  total_tokens: number;
+}
+
+interface ActivitySeriesFixture {
+  range: string;
+  bucket_secs: number;
+  timestamps: string[];
+  session_counts: number[];
+  project_counts: number[];
+}
+
+/** Curves lifted from the mockup so browser mode matches the design intent. */
+const CODEX_CURVE = [9, 12, 15, 14, 19, 23, 26, 25, 31, 36, 40, 45, 52] as const;
+const CLAUDE_CURVE = [4, 5, 7, 9, 8, 11, 13, 15, 14, 17, 19, 20, 21] as const;
+const SESSION_CURVE = [2, 3, 3, 5, 4, 6, 7, 8, 7, 9, 10, 12, 13] as const;
+const PROJECT_CURVE = [1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 9] as const;
+
+/** Tokens per curve unit, so a wider range reads as a bigger number. */
+const RANGE_TOKEN_SCALE: Record<string, number> = {
+  "1h": 3_200,
+  "6h": 24_000,
+  "24h": 78_000,
+  "7d": 410_000,
+  "30d": 1_450_000,
+};
+
+const PROVIDER_SERIES_BUCKETS = 13;
+const ACTIVITY_SERIES_BUCKETS = 8;
+
+function providerSeries(
+  provider: string,
+  curve: readonly number[],
+  scale: number,
+  count: number,
+): ProviderSeriesFixture {
+  const values = resample(curve, count).map((unit) => unit * scale);
+  return {
+    provider,
+    values,
+    total_tokens: values.reduce((sum, value) => sum + value, 0),
+  };
+}
+
+function providerTokenSeries(range: string, buckets: number): ProviderTokenSeriesFixture {
+  const scale = RANGE_TOKEN_SCALE[range] ?? RANGE_TOKEN_SCALE["24h"];
+  const series = [
+    providerSeries("codex", CODEX_CURVE, scale, buckets),
+    providerSeries("claude", CLAUDE_CURVE, scale, buckets),
+  ];
+  return {
+    range,
+    bucket_secs: bucketSecs(range, buckets),
+    timestamps: bucketTimestamps(range, buckets),
+    series,
+    total_tokens: series.reduce((sum, entry) => sum + entry.total_tokens, 0),
+  };
+}
+
+function activitySeries(range: string, buckets: number): ActivitySeriesFixture {
+  return {
+    range,
+    bucket_secs: bucketSecs(range, buckets),
+    timestamps: bucketTimestamps(range, buckets),
+    session_counts: resample(SESSION_CURVE, buckets),
+    project_counts: resample(PROJECT_CURVE, buckets),
+  };
+}
+
 // --- Command → fixture map ----------------------------------------------------
 
 type FixtureHandler = (args?: Record<string, unknown>) => unknown;
@@ -2656,12 +2815,16 @@ const fixtures: Record<string, FixtureHandler> = {
   get_usage_history: () => usageHistory(),
   get_usage_stats: () => usageStats,
   // tokens
-  get_token_history: () => tokenHistory(),
+  get_token_history: (args) => tokenHistory(rangeArg(args)),
   get_token_stats: () => tokenStats,
+  get_provider_token_series: (args) =>
+    providerTokenSeries(rangeArg(args), bucketsArg(args, PROVIDER_SERIES_BUCKETS)),
+  get_activity_series: (args) =>
+    activitySeries(rangeArg(args), bucketsArg(args, ACTIVITY_SERIES_BUCKETS)),
   get_token_hostnames: () => ["mbp.local", "devbox", "ci-runner-3"],
   // code
   get_code_stats: () => codeStats,
-  get_code_stats_history: () => codeHistory(),
+  get_code_stats_history: (args) => codeHistory(rangeArg(args)),
   get_batch_session_code_stats: () => ({}),
   // breakdowns
   get_host_breakdown: () => hostBreakdown,

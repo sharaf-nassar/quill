@@ -53,6 +53,31 @@
   --provider-minimax: #a78bfa;
   --provider-agent: #c084fc;
 
+  /* ── Flat Polish — widget surface system (specs/018-widget-ui-redesign) ──
+     One flat plane, hairline dividers only: no boxes, gradients, or glow.
+     These sit alongside the Graphite Stack; they do not replace it. */
+  --surface: #14181f;
+  --inset: #0f1319;
+  --line: rgba(255, 255, 255, 0.065);
+  --line-soft: rgba(255, 255, 255, 0.045);
+  --hover: rgba(255, 255, 255, 0.04);
+
+  /* Flat Polish text ladder — hierarchy by brightness, never by hue.
+     --label / --label-faint above stay the shared labels; --faint is the
+     widget's dimmest step and matches --label-faint by construction. */
+  --text-hi: #e6edf3;
+  --text: #c9d1d9;
+  --faint: #6e7681;
+
+  /* Metric identity — allowed on sparkline strokes, endpoints, and label
+     swatches only. Values stay --text-hi; these are never severity. */
+  --metric-runtime: #22d3ee;
+  --metric-tok-per-loc: #a78bfa;
+  --metric-loc-per-hr: #f472b6;
+  --metric-sessions: #818cf8;
+  --metric-projects: #2dd4bf;
+  --metric-net-lines: #a3e635;
+
   /* Radius */
   --radius-xs: 2px;
   --radius-sm: 4px;
@@ -6727,4 +6752,413 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
   .release-notes-source {
     max-width: 100%;
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Widget primitives — Flat Polish (specs/018-widget-ui-redesign)
+
+   Shared vocabulary for the 360px widget: keycaps, toggle strips, status
+   pills, per-band empty/loading states, and the internal SVG viz kit
+   (src/components/widget/viz/). Accessibility is baked into the selectors,
+   not bolted on by consumers:
+     - toggle strips style off [aria-pressed], so an unlabelled toggle simply
+       never renders as selected;
+     - utilization bars are styled as role="progressbar" elements;
+     - every interactive primitive inherits the global :focus-visible ring.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.wg-num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Keycap — 24px icon button in the titlebar and footer ─── */
+.wg-key {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+
+.wg-key:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.wg-key[aria-pressed="true"] {
+  color: var(--text-hi);
+  background: var(--hover);
+}
+
+.wg-key:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.wg-key svg {
+  display: block;
+}
+
+/* Wide keycap — icon plus a label or accelerator hint (Manage ⌘M). */
+.wg-key-wide {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  width: auto;
+  height: 24px;
+  padding: 0 var(--space-lg);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--label);
+}
+
+.wg-key-wide:hover:not(:disabled) {
+  color: var(--text-hi);
+}
+
+.wg-kbd {
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 8.5px;
+  color: var(--faint);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-xs);
+}
+
+/* ─── Toggle strip — range (1H/6H/24H/7D) and breakdown mode switches ───
+   Selection is expressed with aria-pressed on each button; the group carries
+   role="group" and an accessible name. */
+.wg-toggles {
+  display: flex;
+  gap: 1px;
+}
+
+.wg-toggle {
+  padding: 3px 9px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--faint);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+
+.wg-toggle:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.wg-toggle[aria-pressed="true"] {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-hi);
+  font-weight: 600;
+}
+
+.wg-toggle:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ─── Status pill — sync freshness and degraded data states ───
+   Rendered as role="status" aria-live="polite". Degraded variants are slate,
+   never red: a stale read is not an alarm. */
+.wg-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wg-pill-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--radius-pill);
+  background: var(--label-faint);
+  flex: 0 0 5px;
+}
+
+.wg-pill[data-state="live"] .wg-pill-dot {
+  background: var(--meter-green);
+}
+
+.wg-pill[data-state="offline"],
+.wg-pill[data-state="paused"],
+.wg-pill[data-state="cached"] {
+  color: var(--label-faint);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .wg-pill[data-state="live"] .wg-pill-dot {
+    animation: wg-pulse 2.6s ease-in-out infinite;
+  }
+}
+
+@keyframes wg-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ─── Hairline divider between bands ─── */
+.wg-rule {
+  height: 1px;
+  background: var(--line-soft);
+}
+
+/* ─── Per-band empty / loading / error states ───
+   Every band owns exactly one of these; they occupy the band's own height so
+   swapping between loaded and empty never shifts the layout below. */
+.wg-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  min-height: 40px;
+  padding: var(--space-lg) 0;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--faint);
+}
+
+.wg-state-error {
+  color: var(--label);
+}
+
+.wg-state-lamp {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--label-faint);
+  flex: 0 0 6px;
+}
+
+.wg-state-error .wg-state-lamp {
+  background: var(--meter-amber);
+}
+
+/* Loading is a shape, not a spinner: skeleton bars that match the band's
+   real geometry so first paint does not jump. */
+.wg-skeleton {
+  border-radius: var(--radius-xs);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .wg-skeleton {
+    animation: wg-breathe 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes wg-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.wg-skeleton-line {
+  height: 9px;
+}
+
+.wg-skeleton-block {
+  width: 100%;
+  height: 100%;
+}
+
+/* ─── Utilization bar — role="progressbar" ─── */
+.wg-bar {
+  position: relative;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.wg-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: var(--radius-pill);
+  background: var(--label);
+}
+
+.wg-bar[data-severity="caution"] .wg-bar-fill {
+  background: var(--meter-amber);
+}
+
+.wg-bar[data-severity="critical"] .wg-bar-fill {
+  background: var(--meter-red);
+}
+
+/* ═══ Viz kit — internal SVG primitives (src/components/widget/viz/) ═══ */
+
+.viz-sparkline {
+  display: block;
+  width: 100%;
+}
+
+.viz-chart {
+  position: relative;
+}
+
+.viz-chart-svg {
+  display: block;
+  width: 100%;
+}
+
+/* Overlay slot — headline + delta drawn over the chart's top-left, faded into
+   the surface so the series stay readable behind it. */
+.viz-chart-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: var(--space-sm) 0 0 1px;
+  pointer-events: none;
+}
+
+.viz-chart-overlay-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: var(--space-md) 34px var(--space-md) 0;
+  background: linear-gradient(90deg, var(--surface) 55%, rgba(20, 24, 31, 0));
+}
+
+/* Hover chip — per-series totals, hidden at rest. */
+.viz-chart-legend {
+  position: absolute;
+  top: var(--space-sm);
+  right: 2px;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  align-items: flex-start;
+  padding: var(--space-sm) 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(20, 24, 31, 0.88);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.07em;
+  color: var(--label);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.viz-chart:hover .viz-chart-legend,
+.viz-chart:focus-within .viz-chart-legend,
+.viz-chart-legend[data-visible="true"] {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .viz-chart-legend {
+    transition: none;
+  }
+}
+
+.viz-chart-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.viz-chart-legend-swatch {
+  width: 8px;
+  height: 2.5px;
+  border-radius: var(--radius-xs);
+  flex: 0 0 8px;
+}
+
+.viz-chart-legend-value {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Bars — horizontal magnitude rows (Trends pairs, Models session ranks). */
+.viz-bars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+.viz-bar-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  min-width: 0;
+}
+
+.viz-bar-label {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.viz-bar-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.viz-bar-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: var(--radius-pill);
+  background: var(--label);
+}
+
+.viz-bar-value {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-hi);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Heat — a coarse density strip (activity per bucket). */
+.viz-heat {
+  display: grid;
+  gap: 2px;
+}
+
+.viz-heat-cell {
+  height: 10px;
+  border-radius: var(--radius-xs);
 }
