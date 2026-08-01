@@ -346,6 +346,8 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useAnalyticsData` | Range-scoped usage history and stats; receives the parent-owned snapshot state for empty-state consumers | `get_usage_history`, `get_usage_stats` |
 | `useLiveSummaryData` | Aggregate live `Sessions`, `Projects`, and range-scoped `Tokens` cards across enabled providers | `get_session_breakdown`, `get_token_history` |
 | `useTokenData` | Token history with hostname/session filtering; hostnames load independently of range changes | `get_token_history`, `get_token_stats`, `get_token_hostnames` |
+| `useProviderTokenSeries` | Aligned per-provider token series for the widget hero chart, on the shared 8-bucket grid | `get_provider_token_series` |
+| `useActivitySeries` | Per-bucket distinct session and project counts for the widget sparklines, on the same grid | `get_activity_series` |
 | `useCodeStats` | Lines added/removed by language | `get_code_stats`, `get_code_stats_history` |
 | `useBreakdownData` | Host/project/session breakdown tables | `get_host_breakdown`, `get_project_breakdown`, `get_session_breakdown` |
 | `useSessionHealth` | Avg duration, tokens, sessions/day with trend | `get_session_stats` |
@@ -384,7 +386,7 @@ separate cache identity, avoiding a hostname IPC call on range changes.
 
 `useLiveSummaryData` fetches provider-filtered token and session history on demand so the top workload rail can aggregate `Sessions`, `Projects`, and range-scoped `Tokens` across whichever providers are enabled, while the grouped row sections continue to consume the already-fetched `UsageData` snapshot from `fetch_usage_data`.
 
-The analytics hooks for the `Now` tab subscribe to backend push events instead of relying only on the 60-second polling fallback. `useLlmRuntimeStats` and `useBreakdownData` refresh on `sessions-index-updated`; `useCodeStats` and `useCodeInsights` also subscribe to `transcript-analytics-updated`, because after migration 30 `tool_actions` is written exclusively by source-owned reconciliation and `sessions-index-updated` no longer covers it. `useCodeInsights` additionally listens to `tokens-updated` because it combines code and token history.
+The analytics hooks for the `Now` tab subscribe to backend push events instead of relying only on the 60-second polling fallback. `useLlmRuntimeStats` and `useBreakdownData` refresh on `sessions-index-updated`; `useCodeStats` and `useCodeInsights` also subscribe to `transcript-analytics-updated`, because after migration 30 `tool_actions` is written exclusively by source-owned reconciliation and `sessions-index-updated` no longer covers it. `useCodeInsights` additionally listens to `tokens-updated` because it combines code and token history. The widget series hooks in [[src/hooks/useWidgetSeries.ts]] share one refresh path — both read `token_snapshots`, so both debounce on `tokens-updated` and poll on the same 60-second interval, and neither can end up a refresh behind the other.
 
 `useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 

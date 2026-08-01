@@ -93,6 +93,52 @@ export interface TokenStats {
   avg_output_per_turn: number;
 }
 
+/**
+ * One provider's token totals from `get_provider_token_series`, aligned to the
+ * response's shared `timestamps` grid.
+ *
+ * `provider` is the raw snapshot value rather than an {@link IntegrationProvider}:
+ * a producer the app does not recognize still has to be charted, because the
+ * summed series must equal the headline total (constitution #1).
+ */
+export interface ProviderTokenSeries {
+  provider: string;
+  values: number[];
+  total_tokens: number;
+}
+
+/**
+ * Bucketed per-provider token series behind the widget's hero chart.
+ *
+ * `total_tokens` equals `get_token_stats(range).total_tokens` for the same
+ * range by construction, so the headline overlaid on the chart always agrees
+ * with the areas beneath it.
+ */
+export interface ProviderTokenSeriesResponse {
+  range: string;
+  bucket_secs: number;
+  /** Bucket starts shared by every series, oldest first. */
+  timestamps: string[];
+  series: ProviderTokenSeries[];
+  total_tokens: number;
+}
+
+/**
+ * Per-bucket distinct session and project counts from `get_activity_series`,
+ * on the same grid as {@link ProviderTokenSeriesResponse}.
+ *
+ * Counts are distinct within a bucket and therefore do not sum to a range
+ * total — a session spanning three buckets appears in each. Snapshots with no
+ * project path are excluded from `project_counts`.
+ */
+export interface ActivitySeriesResponse {
+  range: string;
+  bucket_secs: number;
+  timestamps: string[];
+  session_counts: number[];
+  project_counts: number[];
+}
+
 export interface BucketStats {
   provider: IntegrationProvider;
   key: string;

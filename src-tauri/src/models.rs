@@ -59,6 +59,52 @@ pub struct TokenStats {
     pub avg_output_per_turn: f64,
 }
 
+/// One provider's token totals over the shared bucket grid.
+///
+/// `values` always has one entry per timestamp in the enclosing
+/// [`ProviderTokenSeriesResponse`], so every provider is aligned on the same
+/// x-axis and the widget chart can stack them without re-bucketing.
+#[derive(Serialize, Clone, Debug)]
+pub struct ProviderTokenSeries {
+    /// Raw `token_snapshots.provider` value, not a parsed enum: an unknown
+    /// producer must still be charted, never silently dropped from the sum.
+    pub provider: String,
+    pub values: Vec<i64>,
+    pub total_tokens: i64,
+}
+
+/// Bucketed per-provider token series backing the widget's hero chart.
+///
+/// `total_tokens` equals `get_token_stats(range).total_tokens` for the same
+/// range by construction — both read `token_snapshots` through the same
+/// lower-bound filter, and every matching row lands in exactly one bucket.
+#[derive(Serialize, Clone, Debug)]
+pub struct ProviderTokenSeriesResponse {
+    /// Echo of the requested range, so a late response can be matched to the
+    /// toggle that asked for it.
+    pub range: String,
+    pub bucket_secs: i64,
+    /// Bucket start instants, oldest first.
+    pub timestamps: Vec<String>,
+    pub series: Vec<ProviderTokenSeries>,
+    pub total_tokens: i64,
+}
+
+/// Per-bucket distinct session and project counts over the same bucket grid.
+///
+/// Counts are distinct *within* a bucket, so they do not sum to a range total:
+/// a session spanning three buckets is counted in each. Snapshots with no
+/// `cwd` are excluded from `project_counts` rather than counted as one unknown
+/// project.
+#[derive(Serialize, Clone, Debug)]
+pub struct ActivitySeriesResponse {
+    pub range: String,
+    pub bucket_secs: i64,
+    pub timestamps: Vec<String>,
+    pub session_counts: Vec<i64>,
+    pub project_counts: Vec<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct UsageBucket {
     pub provider: IntegrationProvider,

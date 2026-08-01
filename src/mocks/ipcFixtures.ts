@@ -5,6 +5,7 @@
 
 import { emit } from "@tauri-apps/api/event";
 import type {
+  ActivitySeriesResponse,
   BucketStats,
   CodeStats,
   CodeStatsHistoryPoint,
@@ -29,6 +30,8 @@ import type {
   ProjectBreakdown,
   ProjectTokensRaw,
   ProviderStatus,
+  ProviderTokenSeries,
+  ProviderTokenSeriesResponse,
   RestartStatus,
   RetentionAuditRecord,
   RetentionMaintenanceProgress,
@@ -2702,34 +2705,10 @@ function setRetentionPolicyFixture(
 }
 
 // --- Widget aggregates (feature 018) ------------------------------------------
-// Shapes for `get_provider_token_series` and `get_activity_series`. The types
-// are declared locally rather than imported from ../types so the browser mock
-// can render the widget before the Rust/TS contract for these commands lands.
-
-/** One provider's aligned bucket values plus its total for the range. */
-interface ProviderSeriesFixture {
-  provider: string;
-  values: number[];
-  total_tokens: number;
-}
-
-interface ProviderTokenSeriesFixture {
-  range: string;
-  bucket_secs: number;
-  /** Bucket starts shared by every series, oldest first. */
-  timestamps: string[];
-  series: ProviderSeriesFixture[];
-  /** Equals the sum of the per-provider totals, by construction. */
-  total_tokens: number;
-}
-
-interface ActivitySeriesFixture {
-  range: string;
-  bucket_secs: number;
-  timestamps: string[];
-  session_counts: number[];
-  project_counts: number[];
-}
+// Sample answers for `get_provider_token_series` and `get_activity_series`,
+// typed by the same contract the Rust commands serialize, so a drift between
+// the mock and the backend shape fails typecheck instead of only showing up in
+// the browser.
 
 /** Curves lifted from the mockup so browser mode matches the design intent. */
 const CODEX_CURVE = [9, 12, 15, 14, 19, 23, 26, 25, 31, 36, 40, 45, 52] as const;
@@ -2754,7 +2733,7 @@ function providerSeries(
   curve: readonly number[],
   scale: number,
   count: number,
-): ProviderSeriesFixture {
+): ProviderTokenSeries {
   const values = resample(curve, count).map((unit) => unit * scale);
   return {
     provider,
@@ -2763,7 +2742,7 @@ function providerSeries(
   };
 }
 
-function providerTokenSeries(range: string, buckets: number): ProviderTokenSeriesFixture {
+function providerTokenSeries(range: string, buckets: number): ProviderTokenSeriesResponse {
   const scale = RANGE_TOKEN_SCALE[range] ?? RANGE_TOKEN_SCALE["24h"];
   const series = [
     providerSeries("codex", CODEX_CURVE, scale, buckets),
@@ -2778,7 +2757,7 @@ function providerTokenSeries(range: string, buckets: number): ProviderTokenSerie
   };
 }
 
-function activitySeries(range: string, buckets: number): ActivitySeriesFixture {
+function activitySeries(range: string, buckets: number): ActivitySeriesResponse {
   return {
     range,
     bucket_secs: bucketSecs(range, buckets),

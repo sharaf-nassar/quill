@@ -50,15 +50,16 @@ mod tray_keepalive;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
-    BucketStats, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
-    ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown, LearnedRule, LearningRun,
-    LearningSettings, LlmRuntimeStats, ModelAnalyticsError, ModelAnalyticsErrorCode,
-    ModelAnalyticsResponse, ModelAnalyticsUpdatedEvent, ModelBackfillState, ModelBackfillStatus,
-    ModelHistoryResponse, ModelIdentity, ModelRange, ModelSessionsResponse,
-    ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens, ProviderErrorKind, ProviderStatus,
-    RuntimeSettings, SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef,
-    SessionStats, SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode,
-    TokenDataPoint, TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
+    ActivitySeriesResponse, BucketStats, CodeStats, CodeStatsHistoryPoint,
+    ContextPreservationStatus, ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown,
+    LearnedRule, LearningRun, LearningSettings, LlmRuntimeStats, ModelAnalyticsError,
+    ModelAnalyticsErrorCode, ModelAnalyticsResponse, ModelAnalyticsUpdatedEvent,
+    ModelBackfillState, ModelBackfillStatus, ModelHistoryResponse, ModelIdentity, ModelRange,
+    ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens,
+    ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
+    SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats,
+    SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
+    TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
 };
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rand::RngCore;
@@ -2904,6 +2905,31 @@ async fn get_token_stats(
     })
 }
 
+/// Per-provider token series for the widget's hero chart.
+///
+/// `buckets` defaults to the widget's 8-point grid. The summed series equals
+/// `get_token_stats` for the same range, so the chart and the headline printed
+/// over it can never disagree.
+#[tauri::command]
+async fn get_provider_token_series(
+    range: String,
+    buckets: Option<u32>,
+) -> Result<ProviderTokenSeriesResponse, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_provider_token_series(&range, buckets))
+}
+
+/// Per-bucket distinct session and project counts feeding the sessions and
+/// projects sparklines, on the same grid as `get_provider_token_series`.
+#[tauri::command]
+async fn get_activity_series(
+    range: String,
+    buckets: Option<u32>,
+) -> Result<ActivitySeriesResponse, String> {
+    let storage = get_storage()?;
+    run_blocking(move || storage.get_activity_series(&range, buckets))
+}
+
 #[tauri::command]
 async fn get_token_hostnames() -> Result<Vec<String>, String> {
     let storage = get_storage()?;
@@ -5393,6 +5419,8 @@ pub fn run() {
             retry_model_history_backfill,
             get_token_history,
             get_token_stats,
+            get_provider_token_series,
+            get_activity_series,
             get_token_hostnames,
             get_host_breakdown,
             get_project_breakdown,

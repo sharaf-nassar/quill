@@ -72,7 +72,7 @@ pub(crate) enum TranscriptAnalyticsReplacement {
     StaleGeneration,
 }
 use crate::models::{
-    BucketStats, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
+    ActivitySeriesResponse, BucketStats, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
     ContextSavingsBreakdownItem, ContextSavingsBreakdowns, ContextSavingsEvent,
     ContextSavingsEventPayload, ContextSavingsInsertResult, ContextSavingsSummary,
     ContextSavingsTimeseriesPoint, DataPoint, EvidenceRef, GitSnapshot, HostBreakdown,
@@ -85,11 +85,11 @@ use crate::models::{
     ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
     ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse,
     ModelUsageOverviewResponse, ModelUsageRow, ObservationPayload, ObservationSummary,
-    ProjectBreakdown, ProjectTokens, RunInferenceCall, RunInferenceConfinement,
-    RunInferenceSummary, SessionBreakdown, SessionCodeStats, SessionModelChain,
-    SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment, SessionRef,
-    SessionStats, SkillBreakdown, SkillProjectBreakdown, SubagentNode, TokenDataPoint,
-    TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    ProjectBreakdown, ProjectTokens, ProviderTokenSeries, ProviderTokenSeriesResponse,
+    RunInferenceCall, RunInferenceConfinement, RunInferenceSummary, SessionBreakdown,
+    SessionCodeStats, SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse,
+    SessionModelSegment, SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown,
+    SubagentNode, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -1304,6 +1304,102 @@ fn range_from_timestamp(range: &str) -> String {
     }
 
     (Utc::now() - range_to_duration(range)).to_rfc3339()
+}
+
+/// Bucket count used when a caller does not ask for one — the widget's
+/// readout sparklines and hero chart are both drawn on an 8-point grid.
+const DEFAULT_SERIES_BUCKETS: u32 = 8;
+/// Ceiling on the bucket grid so a malformed argument cannot ask the
+/// aggregates for an unbounded number of columns.
+const MAX_SERIES_BUCKETS: u32 = 240;
+
+/// The bucket grid shared by the widget's series aggregates.
+///
+/// Every series answered for one range is laid out on this grid, so the hero
+/// chart's providers and the activity sparklines line up on a single x-axis
+/// instead of each command inventing its own bucketing.
+struct TokenSeriesWindow {
+    /// Inclusive lower bound applied in SQL — the same string every other
+    /// range-scoped read uses, so a series and its headline total can never
+    /// describe different windows.
+    from: String,
+    /// Unix second the first bucket starts at.
+    start_epoch: i64,
+    bucket_secs: i64,
+    bucket_count: usize,
+    /// Bucket start instants, oldest first.
+    timestamps: Vec<String>,
+}
+
+impl TokenSeriesWindow {
+    /// Bucket a raw index, clamping instead of discarding.
+    ///
+    /// A row can fall outside the computed grid when it is written between the
+    /// grid calculation and the aggregate query, or when its stored offset
+    /// makes the string lower-bound comparison and `strftime` disagree by a
+    /// bucket. Clamping keeps such a row in the total (constitution #1);
+    /// dropping it would make the summed series disagree with
+    /// `get_token_stats`.
+    fn bucket_index(&self, raw: i64) -> usize {
+        raw.clamp(0, self.bucket_count as i64 - 1) as usize
+    }
+}
+
+/// SQL expression yielding a row's zero-based bucket index.
+///
+/// `?2` is the grid start in unix seconds and `?3` the bucket width. A
+/// timestamp SQLite cannot parse collapses to the first bucket rather than to
+/// `NULL`, so its tokens stay in the series total.
+const SERIES_BUCKET_EXPR: &str =
+    "CAST((COALESCE(CAST(strftime('%s', timestamp) AS INTEGER), ?2) - ?2) / ?3 AS INTEGER)";
+
+fn token_series_window(
+    conn: &Connection,
+    range: &str,
+    buckets: Option<u32>,
+) -> Result<TokenSeriesWindow, String> {
+    let from = range_from_timestamp(range);
+    let now = Utc::now();
+    let bucket_count = buckets
+        .unwrap_or(DEFAULT_SERIES_BUCKETS)
+        .clamp(1, MAX_SERIES_BUCKETS) as usize;
+
+    // `all` has no fixed width, so its grid starts at the oldest snapshot
+    // rather than at the epoch — otherwise every bucket but the last would be
+    // empty by decades.
+    let start = if range == "all" {
+        let earliest: Option<String> = conn
+            .query_row(
+                "SELECT MIN(timestamp) FROM token_snapshots WHERE timestamp >= ?1",
+                [&from],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Series window query error: {e}"))?;
+        earliest
+            .and_then(|value| value.parse::<DateTime<Utc>>().ok())
+            .unwrap_or(now - range_to_duration(range))
+    } else {
+        now - range_to_duration(range)
+    };
+
+    let span_secs = (now - start).num_seconds().max(bucket_count as i64);
+    let bucket_secs = (span_secs / bucket_count as i64).max(1);
+    let start_epoch = start.timestamp();
+    let timestamps = (0..bucket_count)
+        .map(|index| {
+            DateTime::from_timestamp(start_epoch + index as i64 * bucket_secs, 0)
+                .unwrap_or(start)
+                .to_rfc3339()
+        })
+        .collect();
+
+    Ok(TokenSeriesWindow {
+        from,
+        start_epoch,
+        bucket_secs,
+        bucket_count,
+        timestamps,
+    })
 }
 
 fn context_savings_bucket_expr(range: &str) -> &'static str {
@@ -10087,6 +10183,157 @@ impl Storage {
             })
         })
         .map_err(|e| format!("Query error: {e}"))
+    }
+
+    /// Per-provider token totals on the shared bucket grid for `range`.
+    ///
+    /// Reads `token_snapshots` through the same lower bound as
+    /// [`Storage::get_token_stats`] and buckets every matching row exactly
+    /// once, so the summed series equals the headline total the widget prints
+    /// over the chart. Debug builds assert that identity against the headline
+    /// query on the same connection and window.
+    pub fn get_provider_token_series(
+        &self,
+        range: &str,
+        buckets: Option<u32>,
+    ) -> Result<ProviderTokenSeriesResponse, String> {
+        let conn = self.conn.lock();
+        let window = token_series_window(&conn, range, buckets)?;
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT provider,
+                        {SERIES_BUCKET_EXPR},
+                        COALESCE(SUM(input_tokens + output_tokens
+                                     + cache_creation_input_tokens
+                                     + cache_read_input_tokens), 0)
+                 FROM token_snapshots
+                 WHERE timestamp >= ?1
+                 GROUP BY 1, 2"
+            ))
+            .map_err(|e| format!("Prepare error: {e}"))?;
+
+        let rows = stmt
+            .query_map(
+                params![&window.from, window.start_epoch, window.bucket_secs],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        let mut by_provider: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for row in rows {
+            let (provider, bucket, tokens) = row.map_err(|e| format!("Row error: {e}"))?;
+            let values = by_provider
+                .entry(provider)
+                .or_insert_with(|| vec![0; window.bucket_count]);
+            values[window.bucket_index(bucket)] += tokens;
+        }
+
+        let mut series: Vec<ProviderTokenSeries> = by_provider
+            .into_iter()
+            .map(|(provider, values)| ProviderTokenSeries {
+                total_tokens: values.iter().sum(),
+                provider,
+                values,
+            })
+            .collect();
+        // Busiest provider first; the map already ties by name for stability.
+        series.sort_by_key(|entry| std::cmp::Reverse(entry.total_tokens));
+
+        let total_tokens = series.iter().map(|entry| entry.total_tokens).sum();
+
+        #[cfg(debug_assertions)]
+        {
+            let headline: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(SUM(input_tokens + output_tokens
+                                         + cache_creation_input_tokens
+                                         + cache_read_input_tokens), 0)
+                     FROM token_snapshots
+                     WHERE timestamp >= ?1",
+                    [&window.from],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Series invariant query error: {e}"))?;
+            debug_assert_eq!(
+                total_tokens, headline,
+                "provider token series must sum to the get_token_stats total for range {range}"
+            );
+        }
+
+        Ok(ProviderTokenSeriesResponse {
+            range: range.to_string(),
+            bucket_secs: window.bucket_secs,
+            timestamps: window.timestamps,
+            series,
+            total_tokens,
+        })
+    }
+
+    /// Distinct session and project counts per bucket for `range`.
+    ///
+    /// Shares [`Storage::get_provider_token_series`]'s grid so the sessions and
+    /// projects sparklines align with the hero chart. Counts are distinct
+    /// within a bucket, never across the range, and snapshots without a `cwd`
+    /// are left out of the project count instead of being folded into an
+    /// invented "unknown" project.
+    pub fn get_activity_series(
+        &self,
+        range: &str,
+        buckets: Option<u32>,
+    ) -> Result<ActivitySeriesResponse, String> {
+        let conn = self.conn.lock();
+        let window = token_series_window(&conn, range, buckets)?;
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {SERIES_BUCKET_EXPR},
+                        COUNT(DISTINCT session_id),
+                        COUNT(DISTINCT cwd)
+                 FROM token_snapshots
+                 WHERE timestamp >= ?1
+                 GROUP BY 1"
+            ))
+            .map_err(|e| format!("Prepare error: {e}"))?;
+
+        let rows = stmt
+            .query_map(
+                params![&window.from, window.start_epoch, window.bucket_secs],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Query error: {e}"))?;
+
+        let mut session_counts = vec![0i64; window.bucket_count];
+        let mut project_counts = vec![0i64; window.bucket_count];
+        for row in rows {
+            let (bucket, sessions, projects) = row.map_err(|e| format!("Row error: {e}"))?;
+            let index = window.bucket_index(bucket);
+            // Clamped rows merge into an existing bucket; the distinct counts
+            // of two groups cannot be added without double counting, so keep
+            // the larger rather than inflating the series.
+            session_counts[index] = session_counts[index].max(sessions);
+            project_counts[index] = project_counts[index].max(projects);
+        }
+
+        Ok(ActivitySeriesResponse {
+            range: range.to_string(),
+            bucket_secs: window.bucket_secs,
+            timestamps: window.timestamps,
+            session_counts,
+            project_counts,
+        })
     }
 
     pub fn store_context_savings_events(
