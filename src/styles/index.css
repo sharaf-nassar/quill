@@ -78,6 +78,13 @@
   --metric-projects: #2dd4bf;
   --metric-net-lines: #a3e635;
 
+  /* Context identity — the three token categories the Context view accounts
+     for. Same law as the metric hues: swatches and split segments only, and
+     none of them is a severity colour. */
+  --context-preserved: #22d3ee;
+  --context-retrieved: #60a5fa;
+  --context-routing: #a78bfa;
+
   /* Radius */
   --radius-xs: 2px;
   --radius-sm: 4px;
@@ -8497,6 +8504,126 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
 .wg-chart-note {
   font-size: 9.5px;
   font-weight: 500;
+  color: var(--faint);
+  text-wrap: pretty;
+}
+
+/* ═══ Context view — preservation, retrieval, and what routing costs ═══════
+   Deliberately chartless: the summary totals and the per-bucket series are
+   computed from different token columns, so drawing one under the other
+   would put two disagreeing numbers in one band. The split bar is the only
+   graphic here, and every pixel of it is one of the three figures printed
+   around it.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+.wg-ctx-band {
+  padding: 0 14px 14px;
+}
+
+/* Two headlines, equal tracks — neither category is the lead. */
+.wg-ctx-heads {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-xl);
+}
+
+.wg-ctx-head {
+  min-width: 0;
+}
+
+.wg-ctx-value {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 23px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--text-hi);
+  white-space: nowrap;
+}
+
+.wg-ctx-unit {
+  font-size: 10.5px;
+  font-weight: 450;
+  color: var(--label);
+}
+
+.wg-ctx-head .wg-cell-key {
+  margin-top: var(--space-sm);
+}
+
+.wg-ctx-sub {
+  display: block;
+  margin-top: 3px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Segments grow by token count and never collapse below a visible sliver, so
+   a small category reads as small rather than as absent. */
+.wg-ctx-split {
+  display: flex;
+  gap: 2px;
+  height: 4px;
+  margin-top: var(--space-lg);
+}
+
+.wg-ctx-split-seg {
+  flex-basis: 0;
+  min-width: 3px;
+  border-radius: var(--radius-pill);
+}
+
+.wg-ctx-band .wg-insight {
+  margin-top: var(--space-lg);
+}
+
+.wg-ctx-pending {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-xl);
+}
+
+.wg-ctx-pending-head {
+  height: 42px;
+}
+
+.wg-ctx-pending-bar {
+  height: 4px;
+  margin-top: var(--space-lg);
+  border-radius: var(--radius-pill);
+}
+
+/* Routing cost — the one readout, stated next to its own disclosure so the
+   overhead is never quoted without saying what it buys. */
+.wg-ctx-routing {
+  padding: var(--space-xl) 14px var(--space-2xl);
+}
+
+.wg-ctx-routing-top {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-md);
+}
+
+.wg-ctx-routing-meta {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.wg-ctx-note {
+  margin-top: var(--space-sm);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1.5;
   color: var(--faint);
   text-wrap: pretty;
 }

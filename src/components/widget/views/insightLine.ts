@@ -87,6 +87,27 @@ interface Candidate {
 }
 
 /**
+ * The context-savings sentence on its own, exported because the Context view
+ * states it unconditionally while the Usage view only offers it as this set's
+ * first candidate. Both read this one builder so the two surfaces cannot word
+ * or round the same claim differently (constitution #1).
+ */
+export function contextSavingsInsight(
+  savings: InsightInputs["savings"],
+): InsightLine | null {
+  const saved = savings.tokensSaved;
+  if (saved === null || saved <= 0) return null;
+  return {
+    id: "context-savings",
+    headline: `${formatTokenCount(saved)} tokens saved`,
+    detail:
+      savings.reusePercent === null
+        ? null
+        : `${savings.reusePercent}% of preserved sources reused`,
+  };
+}
+
+/**
  * Candidates in priority order. Adding one is a deliberate act: it must
  * restate a figure the widget already reads for the selected window, and it
  * must go silent rather than round to zero.
@@ -95,18 +116,7 @@ const CANDIDATES: readonly Candidate[] = [
   {
     id: "context-savings",
     pending: ({ savings }) => savings.loading && savings.tokensSaved === null,
-    build: ({ savings }) => {
-      const saved = savings.tokensSaved;
-      if (saved === null || saved <= 0) return null;
-      return {
-        id: "context-savings",
-        headline: `${formatTokenCount(saved)} tokens saved`,
-        detail:
-          savings.reusePercent === null
-            ? null
-            : `${savings.reusePercent}% of preserved sources reused`,
-      };
-    },
+    build: ({ savings }) => contextSavingsInsight(savings),
   },
   {
     id: "cache-reuse",

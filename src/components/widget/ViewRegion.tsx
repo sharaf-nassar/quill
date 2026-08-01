@@ -13,6 +13,7 @@ import { useState, type ReactNode } from "react";
 import type { RangeType } from "../../types";
 import ViewSwitcher, { type ViewOption, type WidgetView } from "./ViewSwitcher";
 import ChartsView from "./views/ChartsView";
+import ContextView from "./views/ContextView";
 import ModelsView from "./views/ModelsView";
 import TrendsView from "./views/TrendsView";
 import UsageView from "./views/UsageView";
@@ -68,6 +69,11 @@ const VIEWS: readonly ViewDefinition[] = [
     id: "models",
     label: "Models",
     render: (range) => <ModelsView range={range} />,
+  },
+  {
+    id: "context",
+    label: "Context",
+    render: (range) => <ContextView range={range} />,
   },
 ];
 

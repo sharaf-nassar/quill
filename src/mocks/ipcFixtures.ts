@@ -426,6 +426,13 @@ const contextSavings: ContextSavingsAnalytics = {
     tokensPreserved: 588_000,
     tokensRetrieved: 301_000,
     tokensRouting: 113_000,
+    // Category-scoped counts and source retention, so the widget's Context
+    // view renders the same coherent story in browser mode that a real
+    // backend produces: 103/412 sources reused is the 0.25 ratio below.
+    routingEventCount: 188,
+    telemetryEventCount: 124,
+    sourcesPreserved: 412,
+    sourcesRetrieved: 103,
     retentionRatio: 0.25,
   },
   timeSeries: Array.from({ length: 24 }, (_unused, idx) => {

@@ -154,6 +154,16 @@ Identity obeys DESIGN.md's Model-Shade Rule exactly as the full page does. Each 
 
 Two disclosures keep a compact home here. Coverage states the share of token activity that carries model evidence whenever it is short of 100%, because activity recorded before a chain's first observation stays unattributed instead of being assigned a model. A retained-history line appears only while the backfill needs attention, carrying its state, its processed-source count, and a Retry while the run is retryable; a refused retry states its reason rather than vanishing. Emptiness is a claim the view has to earn: it names the specific negative — no retained sessions, no sessions in range, or sessions carrying no model identifier — only when the backend calls the scope final and the history inventory complete, and otherwise says the evidence is still being processed.
 
+#### Context View
+
+[[src/components/widget/views/ContextView.tsx#ContextView]] states what the working-context store did with the selected range: preserved and retrieved token headlines, the shared savings line, and what routing cost.
+
+The view is deliberately chartless. Its `summary` totals and the per-bucket `timeSeries` are computed from different token columns — the category-scoped totals the savings taxonomy introduced versus the legacy per-bucket estimates that also counted telemetry — so plotting the series beneath these headlines would put two disagreeing numbers in one band, and a headline the graphic contradicts is worse than no graphic. The single visualization is a split bar assembled from the exact three figures printed around it: how the range's accounted context tokens divide between preservation, retrieval and routing.
+
+Only category-scoped totals are read, never the legacy `tokens*Est` columns, because those counted telemetry as savings and quoting them here would re-inflate the very headline the taxonomy exists to correct. A backend that does not categorize therefore reads as zero and the view says which nothing it is looking at — "context events recorded, none carrying token categories" is a different fact from "no context events in this range". The guidance-event count follows the same rule: [[src/hooks/useContextSavingsStats.ts#useContextSavingsStats]] normalizes an absent category count to zero, so a zero beside non-zero routing tokens can only mean unreported and falls back to the event-type-scoped `routerEventCount`; with neither count present the clause is dropped rather than printed as a zero that contradicts the value next to it.
+
+The savings sentence comes from [[src/components/widget/views/insightLine.ts#contextSavingsInsight]] — the same builder behind the Usage view's first insight candidate — so the two surfaces cannot word or round one claim differently. Here it is unconditional rather than one candidate among several: on this view the context store is the subject, not one story competing with two others.
+
 ### Analytics Components
 
 Analytics components in `src/components/analytics/` provide Now, Trends, Charts, Models, and an optional Context tab.
