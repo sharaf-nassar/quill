@@ -10,6 +10,7 @@ python3 scripts/populate_dummy_data.py
        [--rules-dir PATH]
        [--projects-dir PATH]
        [--codex-sessions-dir PATH]
+       [--home-dir PATH]
        [--no-projects]
        [--no-backup]
        [--seed INT]
@@ -24,6 +25,7 @@ python3 scripts/populate_dummy_data.py
 | `--rules-dir`    | path | `~/.claude/rules/learned/` (legacy; today's seeder writes here) | Directory the seeder writes sample learned-rule `.md` files into.          |
 | `--projects-dir` | path | `~/.claude/projects/`                                      | Directory the seeder writes fictional Claude session JSONL files into (one subdir per project, two `<sessionId>.jsonl` files per subdir). Created if it does not exist. |
 | `--codex-sessions-dir` | path | unset | Isolated directory for fictional Codex rollout JSONLs. Supplying it with explicit data and Claude paths enables coherent dual-provider model fixtures. |
+| `--home-dir`     | path | unset | Isolated HOME the seeder writes per-project memory documents into (`<home>/.claude/projects/<slug>/memory/<name>.md`, one per seeded project, with `type:`/`description:` frontmatter). Omitted by default because the app resolves memory files from the real home directory. |
 | `--no-projects`  | flag | OFF                                                        | Skip writing session JSONL files (Session Search demo data omitted).      |
 | `--no-backup`    | flag | OFF                                                        | Skip the existing-DB backup. Used by the launcher when seeding a fresh sandbox. |
 | `--seed`         | int  | `42`                                                       | RNG seed for reproducibility.                                              |
@@ -38,7 +40,8 @@ python3 scripts/populate_dummy_data.py
 5. **`--seed` exposed for forward compatibility** — same default produces same byte-output (regression-safe). Legacy Claude-only reruns retain their regular-file replacement behavior, while symlink/junction parents and targets remain forbidden.
 6. **Complete model fixtures require an isolated triple override** — `--data-dir`, `--projects-dir`, and `--codex-sessions-dir`. This mode writes ownership-marked Claude and Codex JSONLs, exact migration-28 source fingerprints/keys and observations, plus root-complete state only when runtime discovery exactly matches seeded sources. Reruns remove only marker-owned JSONLs. Every target must remain beneath its canonical configured root through ordinary directories: symlink/junction parents and targets are refused, and exclusive creation never truncates an unmarked collision. Production Claude/Codex roots cannot be used.
 7. **Post-core failures attempt migration-safe recovery** — after the core schema/data commit, a cleanup, JSONL, fingerprint, observation, or model-state failure attempts to restore the migration-28 singleton to `pending` with incomplete/zero progress in a separate transaction, warns if recovery itself fails, and preserves the original error.
-8. **Canonical source keys mirror Rust bytes** — Unix uses canonical path bytes. Windows restores the verbatim `\\?\` drive or `\\?\UNC\` form returned by `std::fs::canonicalize`, then hex-encodes each UTF-16 code unit's big-endian bytes exactly like `sessions.rs`.
+8. **The DB is stamped at the app's latest schema version and built in that shape** — the seeder creates every analytics table exactly as migrations 30/31/33/35 leave it (source-owned identity columns, stored `lines_added`/`lines_removed`, the reconciliation and retention tables) and records versions 1..35, so opening it runs zero migrations. A stamped-but-stale shape is the failure mode this guards: migration 20 would leave `token_snapshots` without `is_sidechain`, and migration 30 would archive every seeded analytics row for migration 34 to drop. A seeder-owned table found on disk in an older shape is dropped and rebuilt rather than reused, so reruns over an existing sandbox never fail on a missing `action_key`.
+9. **Canonical source keys mirror Rust bytes** — Unix uses canonical path bytes. Windows restores the verbatim `\\?\` drive or `\\?\UNC\` form returned by `std::fs::canonicalize`, then hex-encodes each UTF-16 code unit's big-endian bytes exactly like `sessions.rs`.
 
 ## Exit codes
 
@@ -52,7 +55,8 @@ python3 scripts/populate_dummy_data.py
 ## Side effects
 
 - Writes / overwrites `usage.db` (+ WAL/SHM at runtime by Quill).
-- Writes a small set of sample rule `.md` files into the rules dir.
+- Writes a small set of sample rule `.md` files into the rules dir, under the `claude/`, `codex/` and `shared/` scope subdirectories the app scans; a rule that is meant to read as a discovered candidate gets no file and an empty `file_path`.
+- When `--home-dir` is passed, writes one memory document per seeded project under `<home>/.claude/projects/<slug>/memory/`.
 - When `--data-dir` is unset, also writes a `usage.db.bak` next to the DB before mutating it (current behavior, preserved).
 - In complete isolated mode, writes retained Claude JSONLs under `--projects-dir` and Codex JSONLs under `--codex-sessions-dir`; never writes a model catalog or provider credential/config file. Cleanup is limited to JSONLs carrying the exact ownership marker inside canonical roots. Writes refuse existing targets and symlink/junction descendants; arbitrary files and unmarked transcripts are never changed or deleted.
 

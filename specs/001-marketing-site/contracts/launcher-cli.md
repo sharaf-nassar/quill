@@ -45,16 +45,17 @@ If none resolve, exit with code `4` and print a message instructing the maintain
 
 1. **Discover Quill binary**. If absent, exit `4`.
 2. **Resolve `$SANDBOX`**. Optionally `rm -rf $SANDBOX` (`--clean` / `-Clean`).
-3. **Create `$SANDBOX/data`, `$SANDBOX/rules`, `$SANDBOX/projects`, and `$SANDBOX/codex-sessions`** (`mkdir -p`).
+3. **Create `$SANDBOX/data`, `$SANDBOX/rules`, `$SANDBOX/projects`, `$SANDBOX/codex-sessions`, and (POSIX) `$SANDBOX/home`** (`mkdir -p`).
 4. **Set environment** for the seeder + Quill child:
    - `QUILL_DEMO_MODE=1`
    - `QUILL_DATA_DIR=$SANDBOX/data`
    - `QUILL_RULES_DIR=$SANDBOX/rules`
    - `QUILL_CLAUDE_PROJECTS_DIR=$SANDBOX/projects`
    - `QUILL_CODEX_SESSIONS_DIR=$SANDBOX/codex-sessions`
-5. **Invoke seeder**: `python3 scripts/populate_dummy_data.py --data-dir "$QUILL_DATA_DIR" --rules-dir "$QUILL_RULES_DIR" --projects-dir "$QUILL_CLAUDE_PROJECTS_DIR" --codex-sessions-dir "$QUILL_CODEX_SESSIONS_DIR" --no-backup`. POSIX passes quoted arguments directly; PowerShell invokes `& python3 @seederArgs` so paths containing spaces remain distinct arguments. Exit `3` on seeder failure.
+   - POSIX only: `HOME=$SANDBOX/home`. The app resolves memory documents and its own context assets from the home directory rather than from the `QUILL_*` overrides, so isolating it is what keeps the demo's writes out of the maintainer's `~/.claude` and what makes the Memories panel show the seeded documents. Windows resolves the profile directory through the Known Folder API, which no environment variable overrides, so the PowerShell launcher does not isolate it and correspondingly does not pass `--home-dir`.
+5. **Invoke seeder**: `python3 scripts/populate_dummy_data.py --data-dir "$QUILL_DATA_DIR" --rules-dir "$QUILL_RULES_DIR" --projects-dir "$QUILL_CLAUDE_PROJECTS_DIR" --codex-sessions-dir "$QUILL_CODEX_SESSIONS_DIR" --home-dir "$HOME" --no-backup` (POSIX; the PowerShell launcher omits `--home-dir`). POSIX passes quoted arguments directly; PowerShell invokes `& python3 @seederArgs` so paths containing spaces remain distinct arguments. Exit `3` on seeder failure.
 6. **Print sandbox banner** to stderr: `[demo] sandbox at /tmp/quill-demo-alex` and `[demo] launching quill ...`.
-7. **Exec the Quill binary** with the prepared environment.
+7. **Exec the Quill binary** with the prepared environment. On POSIX this runs under `dbus-run-session` when that binary exists, so the demo owns a private session bus and therefore its own `tauri-plugin-single-instance` lock and can run beside a personal Quill; without it the launcher warns that the personal instance must be closed first. A bounded background watcher removes `<home>/.claude/CLAUDE.md` as soon as the app recreates it, because the Memories panel counts that one global file once per project and it would otherwise double every project count.
 8. **On exit**, unless `--keep-on-exit` / `-KeepOnExit` is set, print the teardown command (`rm -rf /tmp/quill-demo-alex` or `Remove-Item -Recurse $env:TEMP\quill-demo-alex`) WITHOUT executing it. Maintainer decides.
 
 ## Exit codes

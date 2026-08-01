@@ -11,6 +11,7 @@ Sandboxed usage (writes only inside an arbitrary dir, no backup, no running-Quil
         --rules-dir /tmp/quill-demo/rules \\
         --projects-dir /tmp/quill-demo/projects \\
         --codex-sessions-dir /tmp/quill-demo/codex-sessions \\
+        --home-dir /tmp/quill-demo/home \\
         --no-backup
 
 The CLI surface is documented in
@@ -42,6 +43,8 @@ DB_PATH: Path = DEFAULT_DATA_DIR / "usage.db"
 BAK_PATH: Path = DB_PATH.with_suffix(".db.bak")
 PROJECTS_DIR: Path = DEFAULT_PROJECTS_DIR
 CODEX_SESSIONS_DIR: Path | None = None
+# Isolated HOME for the per-project memory documents; None leaves them unwritten.
+MEMORY_HOME: Path | None = None
 QUIET: bool = False
 NO_BACKUP: bool = False
 USING_OVERRIDE: bool = False  # True when --data-dir was passed; skips running-Quill guard
@@ -131,8 +134,44 @@ def backup_db() -> None:
 	print(f"  Backed up DB to {BAK_PATH}")
 
 
+# Tables the seeder wipes and rewrites in full, each mapped to the columns that
+# only exist in the CURRENT app schema. A sandbox left over from an older seeder
+# revision — or one the running app has since migrated — can hold the same table
+# under a different shape, and `CREATE TABLE IF NOT EXISTS` silently keeps it. A
+# rerun then dies on the first INSERT ("NOT NULL constraint failed:
+# tool_actions.action_key"). Dropping the stale table costs nothing here because
+# every row of it is rewritten later in the same run.
+SCHEMA_SHAPE_MARKERS: dict[str, tuple[str, ...]] = {
+	"token_snapshots": ("is_sidechain", "agent_id", "parent_uuid"),
+	"tool_actions": ("action_key", "chain_id", "lines_added", "lines_removed"),
+	"response_times": ("chain_id", "source_key"),
+	"session_events": ("event_key", "chain_id"),
+	"skill_usages": ("chain_id", "source_key"),
+	"hook_invocations": ("chain_id", "source_key"),
+	"model_usage_observations": ("derived_model_id",),
+}
+
+
+def drop_stale_tables(conn: sqlite3.Connection) -> None:
+	"""Drop any seeder-owned table whose on-disk shape predates this script."""
+	for table, required in SCHEMA_SHAPE_MARKERS.items():
+		exists = conn.execute(
+			"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+			(table,),
+		).fetchone()
+		if exists is None:
+			continue
+		# Table names come from the literal map above, never from user input.
+		columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+		missing = [column for column in required if column not in columns]
+		if missing:
+			conn.execute(f"DROP TABLE {table}")
+			log(f"  rebuilt stale {table} (missing {', '.join(missing)})")
+
+
 def ensure_schema(conn: sqlite3.Connection) -> None:
 	"""Run the same migrations the Rust app would run so all tables exist."""
+	drop_stale_tables(conn)
 	conn.executescript("""
 		PRAGMA journal_mode=WAL;
 		PRAGMA busy_timeout=5000;
@@ -168,7 +207,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			UNIQUE(hour, provider, bucket_key)
 		);
 
-		-- token_snapshots: `cwd` (mig 1) + `provider` (mig 12) folded in.
+		-- token_snapshots: `cwd` (mig 1) + `provider` (mig 12) + the sub-agent
+		-- trio from mig 20 folded in. `is_sidechain` is NOT optional: it is
+		-- read by get_session_breakdown, and a DB stamped past migration 20
+		-- without it makes the Usage view's breakdown read "unavailable".
 		CREATE TABLE IF NOT EXISTS token_snapshots (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -180,8 +222,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
 			cwd TEXT DEFAULT NULL,
 			created_at TEXT DEFAULT (datetime('now')),
-			provider TEXT NOT NULL DEFAULT 'claude'
+			provider TEXT NOT NULL DEFAULT 'claude',
+			is_sidechain INTEGER NOT NULL DEFAULT 0,
+			agent_id TEXT DEFAULT NULL,
+			parent_uuid TEXT DEFAULT NULL
 		);
+		CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_sidechain
+			ON token_snapshots(provider, session_id, is_sidechain);
+		CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_agent
+			ON token_snapshots(provider, session_id, agent_id);
 
 		-- token_hourly: rebuilt by mig 12 with `provider` and UNIQUE(hour,
 		-- provider, hostname).
@@ -284,20 +333,56 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			UNIQUE(period, provider, project)
 		);
 
-		-- tool_actions: `provider` added by mig 12.
+		-- tool_actions: rebuilt by mig 30 (source-owned identity: source_key +
+		-- action_key + chain_id) and extended by mig 33 with the stored line
+		-- counts the code-stat queries read directly. Seeded rows are LIVE rows
+		-- (source_key NULL), which is the shape `uidx_ta_live` keys and the one
+		-- reconciliation never deletes.
 		CREATE TABLE IF NOT EXISTS tool_actions (
-			id            INTEGER PRIMARY KEY AUTOINCREMENT,
-			message_id    TEXT NOT NULL,
-			session_id    TEXT NOT NULL,
-			tool_name     TEXT NOT NULL,
-			category      TEXT NOT NULL,
-			file_path     TEXT,
-			summary       TEXT NOT NULL,
-			full_input    TEXT,
-			full_output   TEXT,
-			timestamp     TEXT NOT NULL,
-			provider      TEXT NOT NULL DEFAULT 'claude'
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			provider        TEXT NOT NULL DEFAULT 'claude',
+			source_key      TEXT,
+			action_key      TEXT NOT NULL CHECK(length(action_key) > 0),
+			message_id      TEXT NOT NULL,
+			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+			parent_chain_id TEXT,
+			tool_name       TEXT NOT NULL,
+			category        TEXT NOT NULL,
+			file_path       TEXT,
+			summary         TEXT NOT NULL,
+			full_input      TEXT,
+			full_output     TEXT,
+			timestamp       TEXT NOT NULL,
+			is_sidechain    INTEGER NOT NULL DEFAULT 0,
+			agent_id        TEXT,
+			parent_uuid     TEXT,
+			lines_added     INTEGER,
+			lines_removed   INTEGER,
+			CHECK(source_key IS NULL OR length(source_key) > 0)
 		);
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_ta_owned
+			ON tool_actions(provider, source_key, action_key)
+			WHERE source_key IS NOT NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_ta_live
+			ON tool_actions(provider, session_id, action_key)
+			WHERE source_key IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_source
+			ON tool_actions(provider, source_key);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session
+			ON tool_actions(provider, session_id);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_session
+			ON tool_actions(session_id);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_message
+			ON tool_actions(message_id);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_file
+			ON tool_actions(file_path);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_category
+			ON tool_actions(category);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session_sidechain
+			ON tool_actions(provider, session_id, is_sidechain);
+		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session_agent
+			ON tool_actions(provider, session_id, agent_id);
 
 		CREATE TABLE IF NOT EXISTS memory_files (
 			id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -353,18 +438,42 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			created_at   TEXT DEFAULT (datetime('now'))
 		);
 
-		-- response_times: rebuilt by mig 12 with `provider` and
-		-- UNIQUE(provider, session_id, timestamp).
+		-- response_times: rebuilt by mig 30 around the source-owned identity
+		-- (source_key + chain_id); the old UNIQUE became two partial indexes.
 		CREATE TABLE IF NOT EXISTS response_times (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider     TEXT NOT NULL DEFAULT 'claude',
-			session_id   TEXT NOT NULL,
-			timestamp    TEXT NOT NULL,
-			response_secs REAL,
-			idle_secs    REAL,
-			created_at   TEXT DEFAULT (datetime('now')),
-			UNIQUE(provider, session_id, timestamp)
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			provider        TEXT NOT NULL DEFAULT 'claude',
+			source_key      TEXT,
+			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+			parent_chain_id TEXT,
+			timestamp       TEXT NOT NULL,
+			response_secs   REAL,
+			idle_secs       REAL,
+			created_at      TEXT DEFAULT (datetime('now')),
+			is_sidechain    INTEGER NOT NULL DEFAULT 0,
+			agent_id        TEXT,
+			parent_uuid     TEXT,
+			CHECK(source_key IS NULL OR length(source_key) > 0)
 		);
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_rt_owned
+			ON response_times(provider, source_key, chain_id, timestamp)
+			WHERE source_key IS NOT NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_rt_live
+			ON response_times(provider, session_id, chain_id, timestamp)
+			WHERE source_key IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_response_times_provider_source
+			ON response_times(provider, source_key);
+		CREATE INDEX IF NOT EXISTS idx_rt_provider_session
+			ON response_times(provider, session_id);
+		CREATE INDEX IF NOT EXISTS idx_rt_session
+			ON response_times(session_id);
+		CREATE INDEX IF NOT EXISTS idx_rt_timestamp
+			ON response_times(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_rt_provider_session_sidechain
+			ON response_times(provider, session_id, is_sidechain);
+		CREATE INDEX IF NOT EXISTS idx_rt_provider_session_agent
+			ON response_times(provider, session_id, agent_id);
 
 		CREATE TABLE IF NOT EXISTS context_savings_events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,27 +506,42 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 		);
 
 		-- session_events: the per-JSONL-line timeline feeding get_llm_runtime_stats
-		-- (feature 008). Mirrors Rust migration 26 exactly (table + indexes) so
-		-- the app's `CREATE TABLE IF NOT EXISTS` becomes a no-op. The LLM RUNTIME
+		-- (feature 008), rebuilt by mig 30 around (source_key, event_key) and
+		-- indexed for the bounded runtime walk by migs 31/32. The LLM RUNTIME
 		-- card reads this table EXCLUSIVELY; without rows it shows "no data".
 		CREATE TABLE IF NOT EXISTS session_events (
-			provider     TEXT NOT NULL,
-			session_id   TEXT NOT NULL,
-			agent_id     TEXT,
-			is_sidechain INTEGER NOT NULL DEFAULT 0,
-			timestamp    TEXT NOT NULL,
-			kind         TEXT NOT NULL,
-			uuid         TEXT,
-			parent_uuid  TEXT
+			provider        TEXT NOT NULL,
+			source_key      TEXT,
+			event_key       TEXT NOT NULL CHECK(length(event_key) > 0),
+			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+			parent_chain_id TEXT,
+			agent_id        TEXT,
+			is_sidechain    INTEGER NOT NULL DEFAULT 0,
+			timestamp       TEXT NOT NULL,
+			kind            TEXT NOT NULL,
+			uuid            TEXT,
+			parent_uuid     TEXT,
+			CHECK(source_key IS NULL OR length(source_key) > 0)
 		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_identity
-			ON session_events(provider, session_id, COALESCE(agent_id, ''), timestamp, kind);
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_owned
+			ON session_events(provider, source_key, event_key)
+			WHERE source_key IS NOT NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_live
+			ON session_events(provider, session_id, event_key)
+			WHERE source_key IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_session_events_provider_source
+			ON session_events(provider, source_key);
 		CREATE INDEX IF NOT EXISTS idx_se_timestamp
 			ON session_events(timestamp);
 		CREATE INDEX IF NOT EXISTS idx_se_chain
-			ON session_events(provider, session_id, agent_id, timestamp);
+			ON session_events(provider, session_id, chain_id, timestamp);
 		CREATE INDEX IF NOT EXISTS idx_se_provider_session_sidechain
 			ON session_events(provider, session_id, is_sidechain, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_se_provider_chain_timestamp
+			ON session_events(provider, chain_id, timestamp);
+		CREATE INDEX IF NOT EXISTS idx_se_timestamp_chain
+			ON session_events(timestamp, provider, chain_id, is_sidechain, kind, session_id);
 
 		-- ── Tables created by migrations 21/25/27 ──────────────────────────────
 		-- The app records schema_version up to the latest (28), so it runs ZERO
@@ -425,21 +549,35 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 		-- CREATE must therefore exist here in final shape, or the app's queries
 		-- against them fail. Shapes copied verbatim from src-tauri/src/storage.rs.
 
-		-- skill_usages: mig 21 (table) + mig 22 (cwd, hostname).
+		-- skill_usages: mig 21 (table) + mig 22 (cwd, hostname), rebuilt by
+		-- mig 30 with the source-owned identity columns.
 		CREATE TABLE IF NOT EXISTS skill_usages (
-			id          INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider    TEXT NOT NULL,
-			session_id  TEXT NOT NULL,
-			message_id  TEXT NOT NULL,
-			skill_name  TEXT NOT NULL,
-			skill_path  TEXT NOT NULL,
-			timestamp   TEXT NOT NULL,
-			tool_name   TEXT,
-			created_at  TEXT DEFAULT (datetime('now')),
-			cwd         TEXT,
-			hostname    TEXT,
-			UNIQUE(provider, session_id, message_id, skill_name, skill_path, timestamp)
+			id              INTEGER PRIMARY KEY AUTOINCREMENT,
+			provider        TEXT NOT NULL,
+			source_key      TEXT,
+			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
+			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
+			parent_chain_id TEXT,
+			message_id      TEXT NOT NULL,
+			skill_name      TEXT NOT NULL,
+			skill_path      TEXT NOT NULL,
+			timestamp       TEXT NOT NULL,
+			tool_name       TEXT,
+			created_at      TEXT DEFAULT (datetime('now')),
+			cwd             TEXT,
+			hostname        TEXT,
+			CHECK(source_key IS NULL OR length(source_key) > 0)
 		);
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_su_owned
+			ON skill_usages(provider, source_key, message_id, skill_name,
+							skill_path, timestamp)
+			WHERE source_key IS NOT NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_su_live
+			ON skill_usages(provider, session_id, message_id, skill_name,
+							skill_path, timestamp)
+			WHERE source_key IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_source
+			ON skill_usages(provider, source_key);
 		CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_ts
 			ON skill_usages(provider, timestamp);
 		CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_session
@@ -554,10 +692,14 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			overridden_at      TEXT NOT NULL DEFAULT (datetime('now'))
 		);
 
-		-- hook_invocations: mig 27 (hooks-breakdown tab source).
+		-- hook_invocations: mig 27 (hooks-breakdown tab source), rebuilt by
+		-- mig 30 with the source-owned identity columns.
 		CREATE TABLE IF NOT EXISTS hook_invocations (
 			provider           TEXT NOT NULL,
-			session_id         TEXT NOT NULL,
+			source_key         TEXT,
+			session_id         TEXT NOT NULL CHECK(length(session_id) > 0),
+			chain_id           TEXT NOT NULL CHECK(length(chain_id) > 0),
+			parent_chain_id    TEXT,
 			agent_id           TEXT,
 			is_sidechain       INTEGER NOT NULL DEFAULT 0,
 			timestamp          TEXT NOT NULL,
@@ -570,11 +712,19 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			duration_ms        INTEGER,
 			cwd                TEXT,
 			hostname           TEXT,
-			message_id         TEXT
+			message_id         TEXT,
+			CHECK(source_key IS NULL OR length(source_key) > 0)
 		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_hook_invocations_identity
-			ON hook_invocations(provider, session_id, COALESCE(agent_id, ''),
-								timestamp, hook_identity);
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_hi_owned
+			ON hook_invocations(provider, source_key, chain_id, timestamp,
+								hook_identity)
+			WHERE source_key IS NOT NULL;
+		CREATE UNIQUE INDEX IF NOT EXISTS uidx_hi_live
+			ON hook_invocations(provider, session_id, chain_id, timestamp,
+								hook_identity)
+			WHERE source_key IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_source
+			ON hook_invocations(provider, source_key);
 		CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_ts
 			ON hook_invocations(provider, timestamp);
 		CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_session
@@ -611,6 +761,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			cache_read_tokens     INTEGER,
 			model_evidence        TEXT NOT NULL,
 			token_evidence        TEXT NOT NULL,
+			derived_model_id      TEXT,
 			UNIQUE(provider, source_key, source_record_key),
 			CHECK(source_ordinal >= 0),
 			CHECK(observation_kind IN ('turn', 'token')),
@@ -633,6 +784,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			ON model_usage_observations(provider, analytics_session_id, chain_id, observed_at_ms, source_ordinal);
 		CREATE INDEX IF NOT EXISTS idx_model_observations_source
 			ON model_usage_observations(provider, source_key);
+		CREATE INDEX IF NOT EXISTS idx_model_observations_derived_model_time
+			ON model_usage_observations(provider, derived_model_id, observed_at_ms);
 
 		CREATE TABLE IF NOT EXISTS model_observation_sources (
 			provider              TEXT NOT NULL,
@@ -722,6 +875,109 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 			CHECK(updated_at_ms >= 0),
 			CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0)
 		);
+
+		-- ── Tables created by migrations 30/31/35 ──────────────────────────────
+		-- Nothing seeds these, but a DB stamped at the latest version runs zero
+		-- migrations, so the app would query tables that were never created.
+
+		-- transcript_analytics_sources: mig 30 (per-JSONL reconciliation state).
+		CREATE TABLE IF NOT EXISTS transcript_analytics_sources (
+			provider             TEXT NOT NULL,
+			source_key           TEXT NOT NULL,
+			source_root_key      TEXT NOT NULL,
+			source_path          TEXT NOT NULL,
+			source_session_id    TEXT,
+			analytics_session_id TEXT,
+			chain_id             TEXT,
+			parent_chain_id      TEXT,
+			agent_id             TEXT,
+			is_sidechain         INTEGER NOT NULL DEFAULT 0,
+			project              TEXT,
+			cwd                  TEXT,
+			hostname             TEXT,
+			mtime_ns             INTEGER,
+			size_bytes           INTEGER,
+			content_sha256       TEXT,
+			seen_generation      INTEGER NOT NULL DEFAULT 0,
+			processing_status    TEXT NOT NULL DEFAULT 'pending',
+			last_attempt_at_ms   INTEGER,
+			last_success_at_ms   INTEGER,
+			last_error           TEXT,
+			suppressed_sha256    TEXT,
+			suppressed_at_ms     INTEGER,
+			PRIMARY KEY(provider, source_key),
+			CHECK(length(source_key) > 0),
+			CHECK(length(source_root_key) > 0),
+			CHECK(length(source_path) > 0),
+			CHECK(source_session_id IS NULL OR length(source_session_id) > 0),
+			CHECK(analytics_session_id IS NULL OR length(analytics_session_id) > 0),
+			CHECK(chain_id IS NULL OR length(chain_id) > 0),
+			CHECK(is_sidechain IN (0, 1)),
+			CHECK(mtime_ns IS NULL OR mtime_ns >= 0),
+			CHECK(size_bytes IS NULL OR size_bytes >= 0),
+			CHECK(seen_generation >= 0),
+			CHECK(processing_status IN ('pending', 'ok', 'stale', 'failed', 'suppressed')),
+			CHECK(last_attempt_at_ms IS NULL OR last_attempt_at_ms >= 0),
+			CHECK(last_success_at_ms IS NULL OR last_success_at_ms >= 0),
+			CHECK(suppressed_at_ms IS NULL OR suppressed_at_ms >= 0)
+		);
+		CREATE INDEX IF NOT EXISTS idx_tas_root_generation
+			ON transcript_analytics_sources(provider, source_root_key, seen_generation);
+		CREATE INDEX IF NOT EXISTS idx_tas_session
+			ON transcript_analytics_sources(provider, analytics_session_id);
+		CREATE INDEX IF NOT EXISTS idx_tas_project
+			ON transcript_analytics_sources(project);
+		CREATE INDEX IF NOT EXISTS idx_tas_cwd
+			ON transcript_analytics_sources(cwd);
+		CREATE INDEX IF NOT EXISTS idx_tas_host
+			ON transcript_analytics_sources(hostname);
+
+		-- live_analytics_sessions: mig 30 (origin registry for source-less rows).
+		CREATE TABLE IF NOT EXISTS live_analytics_sessions (
+			provider   TEXT NOT NULL,
+			session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+			project    TEXT,
+			cwd        TEXT,
+			hostname   TEXT,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY(provider, session_id)
+		);
+		CREATE INDEX IF NOT EXISTS idx_las_project
+			ON live_analytics_sessions(project);
+		CREATE INDEX IF NOT EXISTS idx_las_cwd
+			ON live_analytics_sessions(cwd);
+		CREATE INDEX IF NOT EXISTS idx_las_host
+			ON live_analytics_sessions(hostname);
+
+		-- project_path_renames: mig 31.
+		CREATE TABLE IF NOT EXISTS project_path_renames (
+			old_path   TEXT PRIMARY KEY CHECK(length(old_path) > 0),
+			new_path   TEXT NOT NULL CHECK(length(new_path) > 0),
+			updated_at TEXT NOT NULL,
+			CHECK(old_path != new_path)
+		);
+		CREATE INDEX IF NOT EXISTS idx_project_path_renames_new
+			ON project_path_renames(new_path);
+
+		-- retention_daily_aggregates: mig 35.
+		CREATE TABLE IF NOT EXISTS retention_daily_aggregates (
+			provider            TEXT NOT NULL,
+			source_key          TEXT NOT NULL,
+			session_id          TEXT NOT NULL,
+			day                 TEXT NOT NULL,
+			agent_id            TEXT NOT NULL DEFAULT '',
+			file_path           TEXT NOT NULL DEFAULT '',
+			tool_action_count   INTEGER NOT NULL DEFAULT 0,
+			session_event_count INTEGER NOT NULL DEFAULT 0,
+			code_change_count   INTEGER NOT NULL DEFAULT 0,
+			lines_added         INTEGER NOT NULL DEFAULT 0,
+			lines_removed       INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY(provider, source_key, session_id, day, agent_id, file_path)
+		);
+		CREATE INDEX IF NOT EXISTS idx_retention_daily_session
+			ON retention_daily_aggregates(provider, session_id);
+		CREATE INDEX IF NOT EXISTS idx_retention_daily_day
+			ON retention_daily_aggregates(day);
 	""")
 
 
@@ -752,31 +1008,34 @@ def populate_usage_snapshots(conn: sqlite3.Connection) -> None:
 	#
 	# Claude bucket_key values mirror Rust migration 14's CASE mapping; Codex
 	# keys mirror fetcher.rs::parse_codex_rate_limits ("{scope}_{minutes}m").
+	#
+	# THREE Claude buckets, not six. The 360px LIMITS row lays one fixed-width
+	# cell per window beside the provider name, and the mockup's composition is
+	# three (specs/018-widget-ui-redesign/mockup.tpl.html). A real account only
+	# reports the model/OAuth buckets it actually has, so seeding the plan pair
+	# plus one model window is both truthful and photographable; six overflow
+	# the row.
 	claude_buckets = [
 		("five_hour", "5 hours"),
 		("seven_day", "7 days"),
-		("seven_day_sonnet", "Sonnet"),
 		("seven_day_opus", "Opus"),
-		("seven_day_cowork", "Code"),
-		("seven_day_oauth_apps", "OAuth"),
 	]
 	codex_buckets = [
 		("primary_300m", "5 hours"),
 		("secondary_10080m", "7 days"),
 	]
 	# Final "current" utilization per bucket_key on the app 0..100 PERCENT scale
-	# (utilization is rendered directly as "N%"; 0..1 fractions show as ~0%). Short windows run hot,
-	# weekly windows higher, model/other buckets moderate — so the bars read as
-	# an actively-used account rather than an idle one.
+	# (utilization is rendered directly as "N%"; 0..1 fractions show as ~0%).
+	# The rolling window runs hottest and the model window coolest, so the row
+	# reads as an actively-used account rather than an idle one. Exactly one
+	# cell lands in the amber band (>=50) and none in the red (>=80), so the
+	# published shot shows the severity meter working without reading alarmed.
 	current_util = {
-		"five_hour": 42.0,
-		"seven_day": 58.0,
-		"seven_day_sonnet": 31.0,
-		"seven_day_opus": 19.0,
-		"seven_day_cowork": 27.0,
-		"seven_day_oauth_apps": 14.0,
-		"primary_300m": 48.0,
-		"secondary_10080m": 63.0,
+		"five_hour": 62.0,
+		"seven_day": 31.0,
+		"seven_day_opus": 18.0,
+		"primary_300m": 44.0,
+		"secondary_10080m": 26.0,
 	}
 	all_buckets = [("claude", k, l) for k, l in claude_buckets] + [
 		("codex", k, l) for k, l in codex_buckets
@@ -822,10 +1081,7 @@ def populate_usage_hourly(conn: sqlite3.Connection) -> None:
 	buckets = [
 		("claude", "five_hour", "5 hours"),
 		("claude", "seven_day", "7 days"),
-		("claude", "seven_day_sonnet", "Sonnet"),
 		("claude", "seven_day_opus", "Opus"),
-		("claude", "seven_day_cowork", "Code"),
-		("claude", "seven_day_oauth_apps", "OAuth"),
 		("codex", "primary_300m", "5 hours"),
 		("codex", "secondary_10080m", "7 days"),
 	]
@@ -856,25 +1112,46 @@ def populate_usage_hourly(conn: sqlite3.Connection) -> None:
 
 # ── 3. token_snapshots ────────────────────────────────────────────────────────
 
-def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-	"""Return list of (session_id, hostname) for reuse.
+def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str, datetime, datetime]]:
+	"""Seed the token corpus behind the usage chart, live summary and breakdown.
+
+	Returns one `(session_id, provider, first_seen, last_seen)` per session so
+	[[scripts/populate_dummy_data.py#populate_response_times]] can put this
+	corpus's turns on this corpus's sessions.
 
 	Drives the token CHARTS (30D/7D ranges) and the LIVE 6h summary. The Live
 	summary (useLiveSummaryData.ts) and get_session_breakdown derive
 	`last_active`/`project` from token_snapshots, then filter client-side to the
 	rolling 6h window — so we seed BOTH a 30-day historical spread AND a
 	dedicated recent cluster (0.5-5.5h old) across distinct projects.
+
+	Every row carries a `provider`: get_provider_token_series groups by it and
+	emits one chart series per distinct value, so a claude-only corpus draws a
+	single line no matter how many providers are enabled. Claude leads the mix
+	because it also owns the sub-agent rows below.
+
+	A slice of the recent Claude sessions is written as sub-agent rows
+	(`is_sidechain = 1` with an `agent_id`), which is what makes the Usage
+	view's session breakdown show a rolled-up sub-agent count instead of a flat
+	list — the same signal `get_session_breakdown` reads for `has_subagents`.
 	"""
 	HISTORICAL_WINDOW_DAYS = 30
+	# Weighted so both series are legible at every range while Claude stays the
+	# dominant one, matching the provider mix the rest of the dataset seeds.
+	def pick_provider() -> str:
+		return "claude" if random.random() < 0.62 else "codex"
 
 	sessions = []
 	for _ in range(40):
-		sessions.append((rand_session(), random.choice(HOSTNAMES), random.choice(PROJECTS)))
+		sessions.append((
+			rand_session(), random.choice(HOSTNAMES),
+			random.choice(PROJECTS), pick_provider(),
+		))
 
 	rows = []
 	start = NOW - timedelta(days=HISTORICAL_WINDOW_DAYS)
 	span_hours = HISTORICAL_WINDOW_DAYS * 24
-	for session_id, hostname, project in sessions:
+	for session_id, hostname, project, provider in sessions:
 		# Spread session starts across the full 30-day window so the 30D chart
 		# is filled rather than clumped in the last week.
 		t = start + timedelta(hours=random.randint(0, span_hours - 4))
@@ -886,7 +1163,7 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 				random.randint(200, 3000),
 				random.randint(0, 2000),
 				random.randint(0, 5000),
-				project,
+				project, provider, 0, None,
 			))
 			t += timedelta(minutes=random.randint(1, 15))
 
@@ -895,42 +1172,55 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 	# Tokens and the 1H/24H analytics ranges are populated. Projects cycle
 	# through the fictional PROJECTS list (more sessions than projects is fine —
 	# the live "Projects" count is over distinct cwd values that are recent).
-	# These start 70-330 min ago (mostly in the 1h..6h band) so they do NOT
-	# dominate the last-hour token total that the efficiency card divides by.
+	# Providers alternate so the 1H and 6H ranges carry BOTH series, not just
+	# the 30D one. These start 70-330 min ago (mostly in the 1h..6h band) so
+	# they do NOT dominate the last-hour token total that the efficiency card
+	# divides by.
 	recent_sessions = []
 	for idx in range(7):
 		session_id = rand_session()
 		hostname = random.choice(HOSTNAMES)
 		project = PROJECTS[idx % len(PROJECTS)]
-		recent_sessions.append((session_id, hostname, project))
+		provider = "claude" if idx % 3 != 2 else "codex"
+		recent_sessions.append((session_id, hostname, project, provider))
 		start_minutes_ago = random.randint(70, 330)
 		t = NOW - timedelta(minutes=start_minutes_ago)
 		num_turns = random.randint(4, 12)
-		for _ in range(num_turns):
+		# Two of the Claude sessions delegate to a sub-agent; its turns are
+		# tagged so the breakdown rolls them into the parent row.
+		agent_id = f"demo-agent-{idx}" if provider == "claude" and idx < 2 else None
+		for turn in range(num_turns):
 			if t >= NOW - timedelta(minutes=62):
 				break
+			# Sub-agent work is a contiguous middle stretch of the session, the
+			# way a delegated task actually lands in a transcript.
+			sidechain = agent_id is not None and 1 <= turn <= 3
 			rows.append((
 				session_id, hostname, ts(t),
 				random.randint(800, 9000),
 				random.randint(400, 3500),
 				random.randint(0, 2500),
 				random.randint(0, 6000),
-				project,
+				project, provider,
+				1 if sidechain else 0,
+				agent_id if sidechain else None,
 			))
 			t += timedelta(minutes=random.randint(1, 8))
 
 	# LAST-HOUR micro-cluster: the EFFICIENCY card is tokens / lines-changed over
 	# the default 1h range. With ~90 changed lines in the last hour (seeded in
 	# populate_tool_actions), a ~18k-token budget here lands efficiency at
-	# ~200 tokens/line. Two small sessions on distinct projects keep the live
-	# Projects count and 1H token range populated without swamping the ratio.
+	# ~200 tokens/line. Two small sessions on distinct projects — one per
+	# provider — keep the live Projects count and the 1H token range populated
+	# for both series without swamping the ratio.
 	LAST_HOUR_TOKEN_BUDGET = 18_000
 	emitted = 0
 	for idx in range(2):
 		session_id = rand_session()
 		hostname = random.choice(HOSTNAMES)
 		project = PROJECTS[idx % len(PROJECTS)]
-		recent_sessions.append((session_id, hostname, project))
+		provider = "claude" if idx == 0 else "codex"
+		recent_sessions.append((session_id, hostname, project, provider))
 		t = NOW - timedelta(minutes=random.randint(45, 55))
 		# ~5 modest turns per session; per-turn tokens sized to the budget.
 		for _ in range(5):
@@ -941,7 +1231,10 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 			cc = random.randint(0, 400)
 			cr = random.randint(0, 600)
 			emitted += inp + out + cc + cr
-			rows.append((session_id, hostname, ts(t), inp, out, cc, cr, project))
+			rows.append((
+				session_id, hostname, ts(t), inp, out, cc, cr,
+				project, provider, 0, None,
+			))
 			t += timedelta(minutes=random.randint(1, 4))
 			if emitted >= LAST_HOUR_TOKEN_BUDGET:
 				break
@@ -951,12 +1244,35 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 	conn.executemany(
 		"INSERT INTO token_snapshots "
 		"(session_id, hostname, timestamp, input_tokens, output_tokens, "
-		" cache_creation_input_tokens, cache_read_input_tokens, cwd) "
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		" cache_creation_input_tokens, cache_read_input_tokens, cwd, "
+		" provider, is_sidechain, agent_id) "
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		rows,
 	)
-	print(f"  token_snapshots: {len(rows)} rows ({len(sessions)} historical + {len(recent_sessions)} recent sessions)")
-	return [(s, h) for s, h, _ in sessions] + [(s, h) for s, h, _ in recent_sessions]
+	providers = sorted({row[8] for row in rows})
+	subagent_rows = sum(1 for row in rows if row[9] == 1)
+	print(
+		f"  token_snapshots: {len(rows)} rows ({len(sessions)} historical + "
+		f"{len(recent_sessions)} recent sessions, providers: {', '.join(providers)}, "
+		f"{subagent_rows} sub-agent rows)"
+	)
+
+	# Collapse the emitted rows into one activity window per session. Deriving
+	# it here rather than tracking it alongside every append keeps the emitters
+	# above single-purpose.
+	windows: dict[str, tuple[str, datetime, datetime]] = {}
+	for row in rows:
+		session_id, moment, provider = row[0], datetime.fromisoformat(row[2]), row[8]
+		moment = moment.replace(tzinfo=timezone.utc)
+		known = windows.get(session_id)
+		windows[session_id] = (
+			(provider, moment, moment) if known is None
+			else (known[0], min(known[1], moment), max(known[2], moment))
+		)
+	return [
+		(session_id, provider, first_seen, last_seen)
+		for session_id, (provider, first_seen, last_seen) in windows.items()
+	]
 
 
 # ── 4. token_hourly ───────────────────────────────────────────────────────────
@@ -993,8 +1309,11 @@ def populate_settings(conn: sqlite3.Connection) -> None:
 	# integration.providers.v1 is deserialized by manager.rs::load_saved_statuses
 	# into Vec<ProviderStatus> (serde rename_all = "camelCase"). Seeding it makes
 	# the demo self-rendering: claude + codex enabled so both providers' rate
-	# bars, live summaries, and provider toggles populate without manual setup.
-	# setupState uses the snake_case serde variant "installed".
+	# bars, live summaries, and provider toggles populate without manual setup,
+	# plus mini_max enabled-but-unconfigured so the SETUP row renders.
+	# setupState uses the snake_case serde variants ("installed",
+	# "not_installed"); merge_saved_statuses keeps `enabled` from this row and
+	# re-derives the rest from live detection.
 	verified_at = ts_tz(NOW - timedelta(minutes=4))
 	provider_statuses = [
 		{
@@ -1016,6 +1335,21 @@ def populate_settings(conn: sqlite3.Connection) -> None:
 			"userHasMadeChoice": True,
 			"lastError": None,
 			"lastVerifiedAt": verified_at,
+		},
+		# MiniMax is enabled but not installed, which is the exact state the
+		# LIMITS row renders as SETUP (LimitsSection.emptyRowState: an enabled
+		# provider with no buckets and a missing/not_installed setup state is
+		# actionable, not broken). The marketing copy for the live section
+		# describes that row, and a disabled provider gets no row at all.
+		{
+			"provider": "mini_max",
+			"detectedCli": False,
+			"detectedHome": False,
+			"enabled": True,
+			"setupState": "not_installed",
+			"userHasMadeChoice": True,
+			"lastError": None,
+			"lastVerifiedAt": None,
 		},
 	]
 
@@ -1119,6 +1453,7 @@ def populate_learning_runs(conn: sqlite3.Connection) -> list[int]:
 RULE_DEFS = [
 	{
 		"name": "prefer-immutable-updates",
+		"scope": "shared",
 		"domain": "coding-style",
 		"confidence": 0.92,
 		"observation_count": 87,
@@ -1128,6 +1463,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "use-async-await",
+		"scope": "claude",
 		"domain": "coding-style",
 		"confidence": 0.88,
 		"observation_count": 64,
@@ -1137,6 +1473,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "small-focused-functions",
+		"scope": "claude",
 		"domain": "coding-style",
 		"confidence": 0.79,
 		"observation_count": 45,
@@ -1146,6 +1483,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "validate-inputs-at-boundary",
+		"scope": "shared",
 		"domain": "security",
 		"confidence": 0.95,
 		"observation_count": 103,
@@ -1155,6 +1493,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "native-python-types",
+		"scope": "codex",
 		"domain": "coding-style",
 		"confidence": 0.83,
 		"observation_count": 58,
@@ -1164,6 +1503,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "avoid-blanket-exceptions",
+		"scope": "codex",
 		"domain": "error-handling",
 		"confidence": 0.91,
 		"observation_count": 72,
@@ -1173,6 +1513,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "tabs-over-spaces",
+		"scope": "claude",
 		"domain": "formatting",
 		"confidence": 0.97,
 		"observation_count": 200,
@@ -1182,6 +1523,7 @@ RULE_DEFS = [
 	},
 	{
 		"name": "no-console-log-in-production",
+		"scope": "claude",
 		"domain": "coding-style",
 		"confidence": 0.71,
 		"observation_count": 38,
@@ -1195,25 +1537,42 @@ RULE_DEFS = [
 LEARNED_DIR: Path = DEFAULT_RULES_DIR
 
 
+# Rules root -> scope directory, and the `provider_scope` JSON each one means.
+# Demo mode collapses every scope under the resolved rules root
+# (learning.rs::learned_rules_dir_for_scope), and the reconciler infers a
+# rule's scope from which of those three directories holds its `.md`
+# (storage.rs::inferred_rule_provider_scope) — so the directory and the DB
+# column have to agree or the next reconcile rewrites the row.
+RULE_SCOPE_DIRS = {
+	"claude": '["claude"]',
+	"codex": '["codex"]',
+	"shared": '["claude","codex"]',
+}
+
+
 def populate_learned_rules(conn: sqlite3.Connection) -> None:
 	LEARNED_DIR.mkdir(parents=True, exist_ok=True)
-	# A rule reads as "active" only when its .md sits in the provider-scope dir the
-	# app scans in demo mode (resolve_rules_dir()/claude). Rules written to
-	# LEARNED_DIR alone stay discovered candidates. Route confirmed rules into the
-	# scope dir so the Learning view shows a populated ACTIVE RULES section rather
-	# than an empty one.
-	active_dir = LEARNED_DIR / "claude"
-	active_dir.mkdir(parents=True, exist_ok=True)
+	for scope in RULE_SCOPE_DIRS:
+		(LEARNED_DIR / scope).mkdir(parents=True, exist_ok=True)
 
+	# A rule reads as ACTIVE when it has a `file_path` and a non-terminal state
+	# (types.ts::isActiveRule), and the app only ever finds a rule file inside
+	# one of the three scope directories above. A confirmed rule therefore gets
+	# its `.md` written into its scope directory; an emerging one gets NO file
+	# and an empty `file_path`, which is exactly how the app stores a
+	# discovered-but-unpromoted candidate. Writing candidate files flat in the
+	# rules root would leave orphans the app never scans.
 	rows = []
-	for i, rule in enumerate(RULE_DEFS):
-		file_name = f"{rule['name']}.md"
+	written = 0
+	for rule in RULE_DEFS:
+		scope = rule["scope"]
 		is_active = rule.get("state") == "confirmed"
-		file_path = str((active_dir if is_active else LEARNED_DIR) / file_name)
-
-		# Write the .md file
-		with open(file_path, "w") as fh:
-			fh.write(rule["content"])
+		file_path = ""
+		if is_active:
+			path = LEARNED_DIR / scope / f"{rule['name']}.md"
+			path.write_text(rule["content"])
+			file_path = str(path)
+			written += 1
 
 		age_days = random.randint(1, 30)
 		created_at = ts(NOW - timedelta(days=age_days))
@@ -1240,30 +1599,45 @@ def populate_learned_rules(conn: sqlite3.Connection) -> None:
 			None,  # project
 			1 if rule.get("is_anti_pattern") else 0,
 			None,  # confirmed_projects
+			RULE_SCOPE_DIRS[scope],
+			# An on-disk rule is `lifecycle='active'` (storage.rs promote path);
+			# an unpromoted one stays a candidate. Storing the body for both is
+			# what lets a discovered card expand without a file to read.
+			"active" if is_active else "candidate",
+			rule["content"],
+			hashlib.sha256(rule["content"].encode()).hexdigest(),
 		))
 
 	conn.executemany(
 		"INSERT OR IGNORE INTO learned_rules "
 		"(name, domain, confidence, observation_count, file_path, "
 		" created_at, updated_at, source, alpha, beta_param, last_evidence_at, "
-		" state, project, is_anti_pattern, confirmed_projects) "
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		" state, project, is_anti_pattern, confirmed_projects, provider_scope, "
+		" lifecycle, content, content_hash) "
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		rows,
 	)
-	print(f"  learned_rules: {len(rows)} rows  ({len(rows)} .md files in {LEARNED_DIR})")
+	print(
+		f"  learned_rules: {len(rows)} rows  ({written} active .md files under "
+		f"{LEARNED_DIR}/{{{','.join(RULE_SCOPE_DIRS)}}}, "
+		f"{len(rows) - written} discovered candidates)"
+	)
 
 
 # ── 9. schema_version ─────────────────────────────────────────────────────────
 
 def populate_schema_version(conn: sqlite3.Connection) -> None:
-	# Record EVERY migration version up to the app's latest (28). The Rust
+	# Record EVERY migration version up to the app's latest (35). The Rust
 	# migration runner guards each block with `if current_version < N`, so
-	# recording 1..28 makes the app run ZERO migrations against the seeded DB.
+	# recording 1..35 makes the app run ZERO migrations against the seeded DB.
 	# This is required because ensure_schema already builds every table in its
 	# final post-migration shape — re-running ALTER ADD COLUMN migrations would
-	# collide (e.g. "duplicate column name: cwd"). Bump this if storage.rs adds
-	# a migration beyond 28 (search: INSERT INTO schema_version (version) VALUES).
-	LATEST_SCHEMA_VERSION = 28
+	# collide (e.g. "duplicate column name: cwd"), and migration 30 would move
+	# every seeded analytics row into a `_legacy_v30` archive that migration 34
+	# then drops, emptying the Charts CODE timeline the capture photographs.
+	# Bump this together with ensure_schema when storage.rs adds a migration
+	# beyond 35 (search: INSERT INTO schema_version (version) VALUES).
+	LATEST_SCHEMA_VERSION = 35
 	for v in range(1, LATEST_SCHEMA_VERSION + 1):
 		conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (v,))
 	print(f"  schema_version: versions 1-{LATEST_SCHEMA_VERSION}")
@@ -1301,9 +1675,14 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 	"""Drive the code VELOCITY (lines/hr) and EFFICIENCY (tokens/line) cards.
 
 	Both metrics (useCodeInsights.ts) read `total_changed` from
-	get_code_stats_history(), which parses category='code_change' rows via
-	storage.rs::parse_code_change: Edit counts new_string/old_string LINES;
-	Write counts content LINES. The default NOW tab runs the 1h range, so
+	get_code_stats_history(), which since migration 33 reads the STORED
+	`lines_added` / `lines_removed` columns and only falls back to re-parsing
+	`full_input` for legacy rows. Every code_change row therefore carries its
+	own counts, computed exactly the way sessions.rs::count_code_change_lines
+	does at ingest — otherwise TOK/LOC, LOC/HR and NET LINES read empty and the
+	Charts CODE timeline reads "no code changes in this range".
+
+	The default NOW tab runs the 1h range, so
 	velocity = (lines changed in the last hour). We therefore (a) spread ~80%
 	Edit/Write actions with realistic MULTI-LINE snippets across the last 30
 	days to fill the 24h/7d/30d ranges and the history chart, and (b) land a
@@ -1318,7 +1697,13 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 	}
 	non_code_tools = ["Read", "Bash", "Grep", "Glob", "WebSearch", "WebFetch", "Task", "TodoWrite"]
 
-	sessions = [rand_session() for _ in range(8)]
+	# (session_id, provider). Tool work is attributed the same way the token
+	# corpus is, so the Charts CODE timeline and the token series describe one
+	# consistent two-provider workspace.
+	sessions = [
+		(rand_session(), "claude" if idx % 3 != 2 else "codex")
+		for idx in range(8)
+	]
 
 	# Varied fictional multi-line code bodies (8-30 lines each) used as Write
 	# content and as Edit new_string. Counting lines on these is what feeds the
@@ -1450,8 +1835,12 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 
 	exts = ["rs", "ts", "tsx", "py", "go"]
 
+	def action_key() -> str:
+		"""A live row's identity within its session; mirrors a `tool_use_id`."""
+		return f"toolu_{rand_hex(24)}"
+
 	def code_change_row(t: datetime, prefer_write: bool | None = None) -> tuple:
-		session_id = random.choice(sessions)
+		session_id, provider = random.choice(sessions)
 		project = random.choice(PROJECTS)
 		message_id = rand_session()
 		ext = random.choice(exts)
@@ -1461,25 +1850,23 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 			tool_name = "Write"
 			content = random.choice(code_blocks)
 			full_input = json.dumps({"file_path": file_path, "content": content})
+			# Mirrors sessions.rs::count_code_change_lines for Write: the whole
+			# body is added and nothing is removed. `splitlines()` matches
+			# Rust's `str::lines()` on a trailing newline, `count("\n") + 1`
+			# does not.
+			added, removed = len(content.splitlines()), 0
 		else:
 			tool_name = "Edit"
 			old_s, new_s = random.choice(edit_pairs)
 			full_input = json.dumps({"file_path": file_path, "old_string": old_s, "new_string": new_s})
+			added, removed = len(new_s.splitlines()), len(old_s.splitlines())
 		full_output = json.dumps({"result": "ok"})
 		summary = f"{tool_name} on {os.path.basename(file_path)}"
 		return (
-			message_id, session_id, tool_name, "code_change",
-			file_path, summary, full_input, full_output, ts_tz(t),
+			provider, action_key(), message_id, session_id, session_id,
+			tool_name, "code_change", file_path, summary,
+			full_input, full_output, ts_tz(t), added, removed,
 		)
-
-	def lines_changed(row: tuple) -> int:
-		"""Mirror parse_code_change line-counting to budget the recent window."""
-		payload = json.loads(row[6])
-		if "content" in payload:
-			return payload["content"].count("\n") + 1
-		added = payload["new_string"].count("\n") + 1
-		removed = payload["old_string"].count("\n") + 1
-		return added + removed
 
 	rows = []
 	# ~300 total actions, ~80% Edit/Write code_change spread across 30 days.
@@ -1489,20 +1876,24 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 		t = NOW - timedelta(minutes=random.randint(90, 30 * 24 * 60))
 		rows.append(code_change_row(t))
 
-	# Remaining ~20% are non-code tools, also spread across 30 days.
+	# Remaining ~20% are non-code tools, also spread across 30 days. A
+	# non-code action changes nothing, so its line counts are 0/0 rather than
+	# NULL — NULL is the legacy marker that sends the reader back to
+	# re-parsing `full_input`.
 	for _ in range(TOTAL - code_change_target):
 		t = NOW - timedelta(minutes=random.randint(90, 30 * 24 * 60))
-		session_id = random.choice(sessions)
+		session_id, provider = random.choice(sessions)
 		project = random.choice(PROJECTS)
 		tool_name = random.choice(non_code_tools)
 		file_path = f"{project}/src/module_{random.randint(1, 18)}.py"
 		category = tool_category_map.get(tool_name, "command")
 		full_input = json.dumps({"file_path": file_path, "command": "build"})
-		full_output = json.dumps({"result": "ok", "lines_changed": random.randint(1, 50)})
+		full_output = json.dumps({"result": "ok"})
 		summary = f"{tool_name} on {os.path.basename(file_path)}"
 		rows.append((
-			rand_session(), session_id, tool_name, category,
-			file_path, summary, full_input, full_output, ts_tz(t),
+			provider, action_key(), rand_session(), session_id, session_id,
+			tool_name, category, file_path, summary,
+			full_input, full_output, ts_tz(t), 0, 0,
 		))
 
 	# RECENT 1h cluster: accumulate code_change rows until ~75-100 changed lines
@@ -1515,19 +1906,22 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 		# Bias slightly toward Edit so churn stays granular and realistic.
 		row = code_change_row(t, prefer_write=random.random() < 0.35)
 		rows.append(row)
-		recent_lines += lines_changed(row)
+		recent_lines += row[12] + row[13]
 		recent_count += 1
 
 	conn.executemany(
 		"INSERT INTO tool_actions "
-		"(message_id, session_id, tool_name, category, file_path, "
-		" summary, full_input, full_output, timestamp) "
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"(provider, action_key, message_id, session_id, chain_id, "
+		" tool_name, category, file_path, summary, full_input, full_output, "
+		" timestamp, lines_added, lines_removed) "
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		rows,
 	)
+	net_lines = sum(row[12] - row[13] for row in rows)
 	print(
 		f"  tool_actions: {len(rows)} rows "
-		f"(~{code_change_target} code_change + {recent_count} recent, ~{recent_lines} lines in last 1h)"
+		f"(~{code_change_target} code_change + {recent_count} recent, "
+		f"~{recent_lines} lines in last 1h, {net_lines:+} net lines)"
 	)
 
 
@@ -1554,6 +1948,72 @@ def populate_memory_files(conn: sqlite3.Connection) -> None:
 		rows,
 	)
 	print(f"  memory_files: {len(rows)} rows")
+
+
+# One memory document per seeded project. The Memories panel's "All Projects
+# (N)" is the SUM of per-project context files, so one file each is what makes
+# it read (4) — as long as the global CLAUDE.md that `claude_setup` recreates
+# on every launch is removed, because that file is counted once per project.
+# `type:` drives the badge and `description:` the one-line subtitle.
+MEMORY_DOCS = [
+	(
+		"/home/alex/quill", "architecture.md", "context",
+		"How the collector, store and widget split responsibility.",
+		"# Architecture\n\nThe collector writes snapshots, the store owns\n"
+		"aggregation, and the widget only reads. Nothing in the UI layer\n"
+		"queries the database directly.\n",
+	),
+	(
+		"/home/alex/gateway", "routing.md", "convention",
+		"Route naming, versioning and deprecation rules.",
+		"# Routing Conventions\n\nRoutes are versioned by prefix and never\n"
+		"renamed in place. A retired route answers with a deprecation header\n"
+		"for one release before it is removed.\n",
+	),
+	(
+		"/home/alex/pipeline", "ingest.md", "context",
+		"Batch sizes, retry policy and the replay window.",
+		"# Ingest\n\nBatches cap at 500 records. A failed batch retries three\n"
+		"times with backoff, then lands in the replay queue with its offset\n"
+		"so a rerun is exact rather than approximate.\n",
+	),
+	(
+		"/home/alex/dashboard", "components.md", "convention",
+		"Component structure, prop shape and state boundaries.",
+		"# Components\n\nOne component per file, props typed at the boundary,\n"
+		"no state above the screen that owns it. Shared primitives live in\n"
+		"the kit and never import from a screen.\n",
+	),
+]
+
+
+def populate_memory_markdown() -> None:
+	"""Write the per-project memory documents the Memories panel lists.
+
+	memory_optimizer::memory_dir resolves these under `dirs::home_dir()` — NOT
+	through QUILL_CLAUDE_PROJECTS_DIR — so a demo that isolates HOME has to be
+	handed that HOME here or the panel photographs empty. The slug is the
+	project path with `/` replaced by `-`, matching
+	memory_optimizer::project_path_to_slug.
+
+	Skipped unless --home-dir is passed, so a default run never writes
+	fictional projects into the maintainer's real ~/.claude.
+	"""
+	if MEMORY_HOME is None:
+		print("  memory docs: skipped (--home-dir not set)")
+		return
+
+	written = 0
+	for project, file_name, memory_type, description, body in MEMORY_DOCS:
+		slug = project.replace("/", "-")
+		directory = MEMORY_HOME / ".claude" / "projects" / slug / "memory"
+		directory.mkdir(parents=True, exist_ok=True)
+		(directory / file_name).write_text(
+			f"---\ntype: {memory_type}\ndescription: {description}\n---\n\n{body}"
+		)
+		written += 1
+
+	print(f"  memory docs: {written} files under {MEMORY_HOME}/.claude/projects/")
 
 
 # ── 13 + 14. optimization_runs + optimization_suggestions ────────────────────
@@ -1671,37 +2131,56 @@ def populate_git_snapshots(conn: sqlite3.Connection) -> None:
 
 # ── 16. response_times ────────────────────────────────────────────────────────
 
-def populate_response_times(conn: sqlite3.Connection) -> None:
-	sessions = [rand_session() for _ in range(8)]
-	rows = []
-	seen: set[tuple[str, str]] = set()
+def populate_response_times(
+	conn: sqlite3.Connection,
+	session_windows: list[tuple[str, str, datetime, datetime]],
+) -> None:
+	"""Seed per-turn latency for the SAME sessions the token corpus recorded.
 
-	for session_id in sessions:
-		start = NOW - timedelta(hours=random.randint(1, 48))
-		num_turns = random.randint(5, 25)
-		t = start
-		for _ in range(num_turns):
+	get_session_breakdown reads `turn_count` from here keyed by (provider,
+	session_id), so turns on unrelated session ids leave every breakdown row in
+	the Usage view reading "0 turns". Each session's turns are spread across
+	its own token activity window, which also keeps `last_active` — a MAX over
+	both tables — inside the window the tokens describe.
+
+	A live row's chain is its own session (`chain_id = session_id`), the shape
+	`uidx_rt_live` keys.
+	"""
+	rows = []
+	seen: set[tuple[str, str, str]] = set()
+
+	for session_id, provider, first_seen, last_seen in session_windows:
+		span_secs = (last_seen - first_seen).total_seconds()
+		# Roughly one turn per 10 minutes of session, floored at three so even
+		# a short session reads as a conversation, capped so one long session
+		# does not dominate the breakdown.
+		turns = 1 if span_secs <= 0 else max(3, min(24, int(span_secs // 600) + 3))
+		step = timedelta(seconds=span_secs / turns) if turns > 1 else timedelta(0)
+		t = first_seen
+		for _ in range(turns):
 			# response_times.timestamp is read by parse_ts_diff (chrono::parse_from_rfc3339);
 			# must be tz-aware or LLM RUNTIME aggregations silently return 0.
 			ts_val = ts_tz(t)
-			key = (session_id, ts_val)
+			key = (provider, session_id, ts_val)
 			if key not in seen:
 				seen.add(key)
 				rows.append((
+					provider,
+					session_id,
 					session_id,
 					ts_val,
 					round(random.uniform(0.5, 45.0), 2),
 					round(random.uniform(10.0, 600.0), 2),
 				))
-			t += timedelta(seconds=random.randint(30, 900))
+			t += step
 
 	conn.executemany(
 		"INSERT OR IGNORE INTO response_times "
-		"(session_id, timestamp, response_secs, idle_secs) "
-		"VALUES (?, ?, ?, ?)",
+		"(provider, session_id, chain_id, timestamp, response_secs, idle_secs) "
+		"VALUES (?, ?, ?, ?, ?, ?)",
 		rows,
 	)
-	print(f"  response_times: {len(rows)} rows")
+	print(f"  response_times: {len(rows)} rows across {len(session_windows)} sessions")
 
 
 # ── 17. context_savings_events ────────────────────────────────────────────────
@@ -2007,11 +2486,21 @@ def populate_session_events(conn: sqlite3.Connection) -> None:
 		start = NOW - timedelta(hours=random.uniform(6.0, 30 * 24))
 		emit_session(rows, provider, session_id, start, random.randint(3, 8), None)
 
+	# Migration 30 re-keyed this table on (source_key, event_key) and made
+	# `chain_id` mandatory. These are live rows (source_key NULL), so the event
+	# uuid is the event key and a parent chain is its own session — the same
+	# shape `ingest_session_events` writes and `uidx_se_live` enforces.
 	conn.executemany(
 		"INSERT OR IGNORE INTO session_events "
-		"(provider, session_id, agent_id, is_sidechain, timestamp, kind, uuid, parent_uuid) "
-		"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		rows,
+		"(provider, event_key, session_id, chain_id, agent_id, is_sidechain, "
+		" timestamp, kind, uuid, parent_uuid) "
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		[
+			(provider, uuid_val, session_id, session_id, agent_id, is_sidechain,
+			 timestamp, kind, uuid_val, parent_uuid)
+			for provider, session_id, agent_id, is_sidechain, timestamp, kind,
+			uuid_val, parent_uuid in rows
+		],
 	)
 	# Distinct sessions for the operator's sanity check.
 	distinct_sessions = len({(r[0], r[1]) for r in rows})
@@ -2964,6 +3453,14 @@ def parse_args() -> argparse.Namespace:
 		help="Isolated directory to write fictional Codex session JSONL files into.",
 	)
 	parser.add_argument(
+		"--home-dir", type=Path, default=None,
+		help=(
+			"Isolated HOME to write per-project memory documents into "
+			"(<home>/.claude/projects/<slug>/memory/). Omit to skip them — the "
+			"app resolves memory files from the real home directory."
+		),
+	)
+	parser.add_argument(
 		"--no-projects", action="store_true",
 		help="Skip writing session JSONL files (omits the Session Search demo data).",
 	)
@@ -3000,6 +3497,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
 	global DB_PATH, BAK_PATH, LEARNED_DIR, PROJECTS_DIR, CODEX_SESSIONS_DIR
 	global QUIET, NO_BACKUP, USING_OVERRIDE, SKIP_PROJECTS, MODEL_FIXTURE_MODE
+	global MEMORY_HOME
 
 	args = parse_args()
 
@@ -3023,6 +3521,7 @@ def main() -> None:
 	LEARNED_DIR = rules_dir
 	PROJECTS_DIR = projects_dir
 	CODEX_SESSIONS_DIR = args.codex_sessions_dir
+	MEMORY_HOME = args.home_dir
 
 	random.seed(args.seed)
 
@@ -3065,7 +3564,7 @@ def main() -> None:
 		log("Step 4: Populating tables...")
 		populate_usage_snapshots(conn)
 		populate_usage_hourly(conn)
-		populate_token_snapshots(conn)
+		session_windows = populate_token_snapshots(conn)
 		populate_token_hourly(conn)
 		populate_settings(conn)
 		populate_observations(conn)
@@ -3075,9 +3574,10 @@ def main() -> None:
 		populate_observation_summaries(conn)
 		populate_tool_actions(conn)
 		populate_memory_files(conn)
+		populate_memory_markdown()
 		populate_optimization(conn)
 		populate_git_snapshots(conn)
-		populate_response_times(conn)
+		populate_response_times(conn, session_windows)
 		populate_context_savings_events(conn)
 		populate_session_events(conn)
 		log()
@@ -3121,6 +3621,8 @@ def main() -> None:
 			print(f"  projects: {PROJECTS_DIR}")
 			if CODEX_SESSIONS_DIR is not None:
 				print(f"  codex:    {CODEX_SESSIONS_DIR}")
+		if MEMORY_HOME is not None:
+			print(f"  home:     {MEMORY_HOME}")
 	elif BAK_PATH.exists():
 		print("To restore the original DB, STOP QUILL FIRST then run:")
 		print(f"  pkill -f quill; sleep 1; cp {BAK_PATH} {DB_PATH}")
