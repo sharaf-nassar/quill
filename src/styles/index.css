@@ -39,6 +39,18 @@
   --hairline: var(--graphite-line);
   --hairline-strong: rgba(255, 255, 255, 0.18);
 
+  /* Graphite Stack interaction fills — the white-alpha rungs under the
+     hairlines, for the same DESIGN.md §6 windows. Declared independently
+     rather than aliased to the Flat Polish --hover for the same reason as
+     --hairline: §6 forbids back-porting Flat Polish tokens piecemeal.
+     NAMING TRAP: --fill-ghost is the *hover* step and --fill-hover is the
+     heavier *selected/active* step, despite the names. 4% matches the
+     DESIGN.md §2 hover fill, 8% its "selected is an 8% white fill" rule;
+     both stay grayscale so selection never competes with the severity
+     meter or the signal-blue active indicator. */
+  --fill-ghost: rgba(255, 255, 255, 0.04);
+  --fill-hover: rgba(255, 255, 255, 0.08);
+
   /* Text */
   --readout: #d4d4d4;
   --readout-bright: #e6edf3;
