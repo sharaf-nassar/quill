@@ -208,6 +208,19 @@ const CRASH_REPORTING_ENABLED_KEY: &str = "crash_reporting.enabled";
 // must keep that choice, so the seed only writes when no value exists.
 const WIDGET_UI_MARKER_KEY: &str = "widget_ui_v1";
 
+// One-time marker for the widget's stored window size. The pre-widget main
+// window was a split-pane surface users had grown to several hundred pixels
+// wider and taller than the 360x560 widget, and that geometry is still sitting
+// in `.window-state.json` after an upgrade, so restoring SIZE on the first
+// widget launch would open the widget at the old window's size instead of its
+// design size. The first launch therefore restores position only and lets the
+// config win; the plugin saves the widget's real geometry on exit, so every
+// later launch can restore the size the user actually chose. This is a
+// separate key from `widget_ui_v1` on purpose: that marker may already have
+// been written by a build that predates this reset, and reusing it would skip
+// the reset for exactly the users who need it.
+const WIDGET_SIZE_RESET_MARKER_KEY: &str = "widget_size_reset_v1";
+
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
 
@@ -3348,6 +3361,38 @@ fn seed_widget_always_on_top(storage: &Storage) -> bool {
     }
 }
 
+/// Pick the geometry flags the widget window restores, resetting size once.
+///
+/// Position is always restored — where the user parked the widget survives any
+/// upgrade. Size is held back on the single launch that consumes the
+/// `widget_size_reset_v1` marker, because a profile upgrading from the
+/// split-pane main window still has that window's much larger size saved under
+/// `main` and restoring it would override the widget's 360x560 config default.
+/// Dropping SIZE lets the config win; the plugin still saves on exit, so the
+/// stale entry is replaced by the widget's own geometry and every later launch
+/// restores the size the user chose.
+///
+/// The marker is written as soon as the decision is made rather than after the
+/// window is up, so a later startup failure cannot replay the reset and discard
+/// a size the user has already picked. A failed write only means the reset runs
+/// again next launch, so it degrades into a repeat rather than a lost widget.
+fn widget_restore_flags(storage: &Storage) -> StateFlags {
+    let already_reset = storage
+        .get_setting(WIDGET_SIZE_RESET_MARKER_KEY)
+        .ok()
+        .flatten()
+        .is_some();
+
+    if already_reset {
+        return StateFlags::POSITION | StateFlags::SIZE;
+    }
+
+    if let Err(error) = storage.set_setting(WIDGET_SIZE_RESET_MARKER_KEY, "1") {
+        log::warn!("Failed to record widget size reset marker: {error}");
+    }
+    StateFlags::POSITION
+}
+
 fn read_i64_setting(storage: &Storage, key: &str, default: i64) -> i64 {
     storage
         .get_setting(key)
@@ -5282,8 +5327,16 @@ pub fn run() {
                 // Only these two flags: the widget is deliberately
                 // decorationless and its visibility is owned by close-to-tray,
                 // so restoring DECORATIONS, VISIBLE, MAXIMIZED, or FULLSCREEN
-                // would let a stale state file undo that.
-                if let Err(error) = w.restore_state(StateFlags::POSITION | StateFlags::SIZE) {
+                // would let a stale state file undo that. SIZE is additionally
+                // withheld on the one launch that resets a pre-widget size —
+                // see `widget_restore_flags`. With no storage the marker can
+                // neither be read nor written, so fall back to the safe half of
+                // that decision and let the config size stand.
+                let restore_flags = STORAGE
+                    .get()
+                    .map(widget_restore_flags)
+                    .unwrap_or(StateFlags::POSITION);
+                if let Err(error) = w.restore_state(restore_flags) {
                     log::warn!("Failed to restore widget window geometry: {error}");
                 }
                 // Use the opaque taskbar icon (transparent PNGs render as black in _NET_WM_ICON)
