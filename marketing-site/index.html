@@ -11,7 +11,7 @@
 	<link rel="canonical" href="https://sharaf-nassar.github.io/quill/">
 	<link rel="icon" type="image/png" href="assets/logo.png">
 	<link rel="preload" as="image" href="assets/logo-mark.png">
-	<link rel="preload" as="image" href="assets/screenshots/hero.png?v=5" fetchpriority="high">
+	<link rel="preload" as="image" href="assets/screenshots/hero.png?v=6" fetchpriority="high">
 	<link rel="preload" as="font" type="font/woff2" href="assets/fonts/SpaceGrotesk-wght.woff2" crossorigin>
 	<link rel="preload" as="font" type="font/woff2" href="assets/fonts/Geist-wght.woff2" crossorigin>
 
@@ -45,7 +45,7 @@
 	}
 	</script>
 
-	<link rel="stylesheet" href="styles.css?v=slim-4">
+	<link rel="stylesheet" href="styles.css?v=widget-1">
 </head>
 <body>
 	<a class="skip-link" href="#main">Skip to content</a>
@@ -110,17 +110,11 @@
 
 			<figure class="hero-stage motion-rise">
 				<div class="hero-window">
-					<div class="window-chrome" aria-hidden="true">
-						<span></span>
-						<span></span>
-						<span></span>
-						<strong>main window</strong>
-					</div>
 					<img
-						src="assets/screenshots/hero.png?v=5"
-						alt="Quill main window: the Live usage pane — session, project, and token sparklines with Claude and Codex rate-limit bars — stacked above the Analytics dashboard on its 7-day Now view (runtime, efficiency, velocity, preserved and retrieved tokens, routing cost, and a session breakdown)."
-						width="453"
-						height="1098"
+						src="assets/screenshots/hero.png?v=6"
+						alt="The Quill widget: a 360-pixel always-on-top window with a LIMITS band showing Claude and Codex utilization bars with reset countdowns, and below it the Usage view — a six-hour token chart, runtime, tokens-per-line and lines-per-hour readouts with sparklines, and a session breakdown."
+						width="360"
+						height="756"
 						loading="eager"
 						fetchpriority="high"
 					>
@@ -128,25 +122,25 @@
 			</figure>
 		</section>
 
-		<section id="analytics" class="spotlight motion-rise" aria-labelledby="analytics-heading">
+		<section id="analytics" class="spotlight motion-rise" style="--shot-w: 360px" aria-labelledby="analytics-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Usage over time</p>
 				<h2 id="analytics-heading">Every token accounted for — not estimated.</h2>
 				<p>
 					Token usage, code added and removed, and cache-hit efficiency on
-					three synchronized timelines — zoom from the last hour out to 30
-					days. Every point is measured from real Claude and Codex sessions,
-					not sampled or estimated.
+					three synchronized timelines — scoped from the last hour out to
+					seven days. Every point is measured from real Claude and Codex
+					sessions, not sampled or estimated.
 				</p>
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot">
-					<img src="assets/screenshots/analytics-charts.png?v=3" alt="Quill Analytics Charts view: three synchronized timelines of token usage, code added and removed, and cache-hit efficiency over the selected range." width="480" height="420" loading="lazy">
+					<img src="assets/screenshots/analytics-charts.png?v=4" alt="The Quill widget on its Charts view: three stacked timelines — tokens, code added and removed, and cache-hit rate — under the LIMITS band, with the six-hour range selected." width="360" height="490" loading="lazy">
 				</div>
 			</figure>
 		</section>
 
-		<section id="context" class="spotlight spotlight-reverse motion-rise" aria-labelledby="context-heading">
+		<section id="context" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 360px" aria-labelledby="context-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Working memory · your agents use it too</p>
 				<h2 id="context-heading">Keep bloated context out of the model's window.</h2>
@@ -168,7 +162,7 @@
 			</div>
 			<figure class="spotlight-media">
 				<div class="shot">
-					<img src="assets/screenshots/analytics-context.png?v=2" alt="Quill Context tab with preserved, retrieved, routing-cost, and telemetry columns, a stacked-bar trend, and a directional event log." width="480" height="600" loading="lazy">
+					<img src="assets/screenshots/analytics-context.png?v=3" alt="The Quill widget on its Context view: preserved and retrieved token totals with a split ratio bar, the tokens-saved insight line, and the routing cost the offloading itself spends." width="360" height="446" loading="lazy">
 				</div>
 			</figure>
 		</section>
@@ -191,15 +185,15 @@
 			</figure>
 		</section>
 
-		<section id="live" class="spotlight spotlight-reverse motion-rise" aria-labelledby="live-heading">
+		<section id="live" class="spotlight spotlight-reverse motion-rise" style="--shot-w: 360px" aria-labelledby="live-heading">
 			<div class="spotlight-copy">
 				<p class="card-label">Live limits</p>
 				<h2 id="live-heading">Know the cap before it cuts the run.</h2>
-				<p>Real-time quota pressure for Claude and Codex — utilization, reset countdowns, and severity, side by side, refreshing while the agents work.</p>
+				<p>Real-time quota pressure for Claude and Codex — utilization, reset countdowns, and severity, in the band that sits above every view, refreshing while the agents work.</p>
 			</div>
-			<figure class="spotlight-media spotlight-media-wide">
-				<div class="shot">
-					<img src="assets/screenshots/live.png?v=2" alt="Quill live pane with provider limit buckets, token totals, reset countdowns, and utilization bars." width="480" height="600" loading="lazy">
+			<figure class="spotlight-media">
+				<div class="shot shot-band">
+					<img src="assets/screenshots/live.png?v=3" alt="The LIMITS band of the Quill widget: a row per provider — Claude at 34 percent of its five-hour window and 68 percent of its week, Codex at 86 percent in red — each with utilization bars and a reset countdown, and MiniMax offering setup." width="360" height="756" loading="lazy">
 				</div>
 			</figure>
 		</section>

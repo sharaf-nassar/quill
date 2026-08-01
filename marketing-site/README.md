@@ -14,18 +14,25 @@ marketing-site/
     ├── favicon.svg         Legacy SVG fallback; cyan/dark scheme aware
     ├── logo.png            Real Quill app icon (tiled) — used as favicon
     ├── logo-mark.png       Borderless feather mark (app-icon frame stripped) — header brand
-    ├── og-image.png        1200×630 social-share preview (regenerate after hero copy change)
+    ├── og-image.png        1200×630 social-share preview — logo mark beside the widget's
+    │                       Usage frame with its Charts view behind; composed from the
+    │                       shots below, carries no baked-in copy, recompose on recapture
     ├── fonts/              Self-hosted woff2 — Space Grotesk (display) + Geist (body), OFL
     └── screenshots/        @2x captures from the dummy-data Quill instance
-        ├── hero.png            Combined main window — Live stacked above Analytics (Now @ 7D)
-        ├── analytics-charts.png  Analytics "Charts" view (the #analytics section)
-        ├── analytics-context.png
-        ├── live.png
+        ├── hero.png            The widget on its Usage view — the whole 360px window
+        ├── live.png            Same frame; the #live section clips it to LIMITS
+        ├── analytics-charts.png  The widget on its Charts view (the #analytics section)
+        ├── analytics-context.png The widget on its Context view (the #context section)
         ├── sessions.png
         ├── learning.png
         ├── memory.png          Memories panel — "All Projects (4)" (the #memory section)
         └── brevity.png         Brevity profile toggle (the #brevity section)
 ```
+
+The main window is the 360px widget, so the first four PNGs are all the same
+window on different views rather than four separate surfaces. `sessions.png`,
+`learning.png`, `memory.png`, and `brevity.png` still show the pre-Manage
+standalone windows and are queued for recapture.
 
 ## Anchored sections
 
@@ -61,17 +68,26 @@ varied aspect ratios. They are displayed **whole at their natural aspect ratio**
   carries explicit `width`/`height` attributes matching its 2× source so the
   browser reserves correct space (no layout shift) and the aspect ratio is right.
 - The PNGs are stored at 2× for retina; their display sizes are half the pixel
-  dimensions (e.g. `hero.png` 906×2196 → 453×1098).
+  dimensions (e.g. `hero.png` 720×1512 → 360×756).
 - **Slim, never upscaled.** Each `.spotlight` sets a `--shot-w` custom property
   equal to the shot's native retina display width (its `width` attribute), and
   the media grid track is `minmax(0, var(--shot-w, 480px))`. So the product
   window renders at — or below — its captured size, never stretched wider or
-  taller to fill the column. Default is 480px; sessions/learning/memory use 520px
-  and brevity 560px. The copy column (`1fr`) takes the remaining width.
+  taller to fill the column. The four widget shots use 360px (the widget's own
+  width); sessions/learning/memory use 520px and brevity 560px. The copy column
+  (`1fr`) takes the remaining width.
+- **One exception to "shown whole":** `#live` reuses the widget frame through a
+  `.shot-band` frame with `aspect-ratio: 360 / 185`, clipping it to the LIMITS
+  band at that band's own hairline. The widget is a single window, so LIMITS has
+  no capture of its own, and clipping beats publishing the hero shot twice. The
+  image itself is still rendered at native width and never scaled.
 - Feature sections use a single, consistent **alternating two-column
   `.spotlight` rhythm**: copy on one side, the slim screenshot on the other,
   sides flipping down the page (`.spotlight-reverse` swaps order). `#hero` stays
-  in the right column beside the copy as `hero.png` (the combined Live + Analytics stacked view) capped at a 400px stage and height-clipped to ~760px (the tall shot fades out before its breakdown so it stays compact); the hero collapses to a single centered column under 980px.
+  in the right column beside the copy as `hero.png` (the widget on its Usage
+  view) on a 360px stage — shown whole, with no height clip or bottom fade,
+  because the widget frame ends at its own footer row; the hero collapses to a
+  single centered column under 980px.
 - On `<980px` each spotlight collapses to a single column (copy then image) with
   no horizontal scroll; the `--shot-w` cap still prevents any upscaling.
 
@@ -92,7 +108,8 @@ Screenshots come from a sandboxed Quill instance — never the maintainer's pers
 # 1. Spin up a sandboxed Quill against dummy data
 ./scripts/run_quill_demo.sh --clean
 
-# 2. Capture all 8 canonical PNGs into marketing-site/assets/screenshots/
+# 2. Capture the canonical widget and Manage PNGs into
+#    marketing-site/assets/screenshots/ (memory.png and brevity.png are manual)
 ./scripts/take_screenshots.sh
 
 # 3. Privacy review — open every PNG, confirm only fictional identifiers

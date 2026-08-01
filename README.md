@@ -100,28 +100,24 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 ## Screenshots
 
+The main window is a 360px always-on-top widget: a LIMITS band that never
+leaves the frame, and one view below it that the header's dropdown swaps.
+
 <table>
   <tr>
-    <td align="center"><strong>Live + Analytics</strong></td>
-    <td align="center"><strong>Learning</strong></td>
-    <td align="center"><strong>Session search</strong></td>
+    <td align="center"><strong>Usage</strong></td>
+    <td align="center"><strong>Charts</strong></td>
+    <td align="center"><strong>Context</strong></td>
   </tr>
   <tr>
-    <td><img src="screenshots/live-view.png" width="320" alt="Live usage with progress bars, token sparkline, analytics with efficiency/velocity/response time cards, code stats, and host breakdown" /></td>
-    <td><img src="screenshots/learning-panel.png" width="280" alt="Learning panel with rules, confidence scores, and domains" /></td>
-    <td><img src="screenshots/session-search.png" width="300" alt="Session search with filters and highlighted results" /></td>
-  </tr>
-  <tr>
-    <td align="center"><strong>Restart orchestrator</strong></td>
-    <td></td>
-    <td></td>
-  </tr>
-  <tr>
-    <td><img src="screenshots/restart.png" width="280" alt="Restart panel showing Claude Code instances with idle/processing status" /></td>
-    <td></td>
-    <td></td>
+    <td valign="top"><img src="screenshots/widget-usage.png" width="300" alt="The Quill widget on its Usage view: LIMITS rows for Claude and Codex with utilization bars and reset countdowns, a six-hour token chart, runtime and tokens-per-line readouts with sparklines, and a session breakdown" /></td>
+    <td valign="top"><img src="screenshots/widget-charts.png" width="300" alt="The Quill widget on its Charts view: stacked tokens, code-added-and-removed, and cache-hit timelines under the LIMITS band" /></td>
+    <td valign="top"><img src="screenshots/widget-context.png" width="300" alt="The Quill widget on its Context view: preserved and retrieved token totals with a ratio bar, the tokens-saved insight line, and routing cost" /></td>
   </tr>
 </table>
+
+Learning, session search, instances, and settings live in the Manage workspace
+(⌘M / Ctrl+M); their shots are captured by `scripts/take_screenshots.sh`.
 
 ## Architecture
 
