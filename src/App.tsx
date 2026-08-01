@@ -17,6 +17,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { check } from "@tauri-apps/plugin-updater";
 import LimitsSection from "./components/widget/LimitsSection";
+import ViewRegion from "./components/widget/ViewRegion";
 import WidgetTitleBar, {
   type WidgetSyncState,
 } from "./components/widget/WidgetTitleBar";
@@ -271,7 +272,11 @@ function App({ integrations }: AppProps) {
               </button>
             </div>
           ) : (
-            <LimitsSection data={usageData} statuses={statuses} />
+            <>
+              <LimitsSection data={usageData} statuses={statuses} />
+              <div className="wg-rule" />
+              <ViewRegion />
+            </>
           )}
         </div>
       </div>

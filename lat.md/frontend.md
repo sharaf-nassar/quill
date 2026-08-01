@@ -52,7 +52,7 @@ Height is content-derived: a `ResizeObserver` on the content column asks the win
 
 ### Component Tree
 
-The widget nests [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]] above a scrolling content column holding [[src/components/widget/LimitsSection.tsx]] and, below it, the switchable view region.
+The widget nests [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]] above a scrolling content column holding [[src/components/widget/LimitsSection.tsx]] and, below it, the switchable view region ([[lat.md/frontend#Frontend#Components#Widget View Region]]).
 
 `WidgetTitleBar` carries the widget's whole chrome contract in three grid tracks: the brand glyph and `QUILL` wordmark on the left, the update button centred on the window (rendered only once the updater check has found a release, wired to `install_app_update`), and a right cluster of the sync freshness pill, the always-on-top toggle, the settings key, and the close key. The bar and its non-interactive children carry `data-tauri-drag-region`, so a decorationless window stays draggable. The sync pill is a `role="status"` `aria-live="polite"` region showing real elapsed time since the last successful read; it absorbs the old usage pill vocabulary as slate variants (`offline` beats `cached` beats `paused`, mirroring the precedence those pills used) and never turns red. The always-on-top toggle reads and writes the persisted `always_on_top` setting through [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]], so the tray checkitem, the Settings toggle, and the titlebar are one state; a failed write surfaces as a toast rather than a button that lies. Both the settings key and the ⌘M/Ctrl+M accelerator registered in [[src/main.tsx]] go through [[src/lib/manageWindow.ts#openManageWindow]], which focuses an existing Manage window instead of stacking a second one.
 
@@ -95,6 +95,28 @@ Each row is an identity swatch (the fixed provider hue), the provider name, one 
 Severity is carried on `[data-severity]` and follows the same 50/80 thresholds as [[lat.md/features#Features#Live Usage View]]: amber from 50%, red from 80%. A bucket whose `resets_at` has already elapsed is marked stale instead, which matches no severity rule and therefore renders neutral — a utilization measured against a bygone window must never read as a live severity. For the same reason an elapsed window is not a candidate for the row's nearest-reset countdown; the countdown falls back to "now" only when every dated window in the row has rolled over.
 
 A provider with no live buckets still gets a row, stating why in the app's existing pill wording but in the widget's flat dress (a lamp and a word, no box): `SETUP` in amber when the failure is actionable — a `config`/`auth` provider error, or an unfinished install — and `UNAVAILABLE` in slate otherwise, since a degraded read is never an alarm. Before the first usage poll lands the row shows skeleton cells of the same geometry, so the real numbers do not move the rows beneath them. MiniMax rows keep the plan-level bucket filter (M\*, coding-plan-search, coding-plan-vlm) that [[src/components/live/ProviderUsageModule.tsx]] applies, because the per-model long tail does not fit a 360px row.
+
+### Widget View Region
+
+[[src/components/widget/ViewRegion.tsx#ViewRegion]] owns everything below LIMITS: one band header carrying the view name and the shared range strip, then whichever view that name selects.
+
+View and range both live in the region rather than inside a view, so switching views keeps the operator's range and the mockup's single control strip stays single. A compact view is registered by adding one entry to the region's `VIEWS` list; only registered views reach the dropdown, so the list can never offer a view that would render nothing. The range vocabulary is 1H/6H/24H/7D — `30d` is deliberately absent, because a month is not a widget scope — and defaults to 6H, the shortest window that still spans a working session.
+
+[[src/components/widget/ViewSwitcher.tsx#ViewSwitcher]] is a listbox rather than a menu, because the control has a value: the trigger is `aria-haspopup="listbox"` with `aria-expanded`, the popup carries exactly one `aria-selected` option, and keyboard movement runs through `aria-activedescendant` so focus never leaves the list. Escape, Tab and an outside click all close it, and Escape returns focus to the trigger.
+
+#### Usage View
+
+[[src/components/widget/views/UsageView.tsx#UsageView]] is the widget's default view and the product's core surface: hero chart, insight line, a 3×2 readout grid, the switchable breakdown, and the totals footer.
+
+Every band reads the region's selected range, so chart, delta, insight, all six readouts, all six sparklines and the footer always describe the same window — a band quietly using a different window would be a lie about the instrument. The headline overlaid on the chart is `total_tokens` from [[src/hooks/useWidgetSeries.ts#useProviderTokenSeries]], which is the same figure the plotted areas sum to by construction. Its delta is momentum *inside* the range (the back half of the buckets against the front half) rather than a comparison with the previous window: a headline delta whose evidence the chart does not draw is not evidence.
+
+Colour carries meaning and nothing else. Each readout's fixed metric hue appears only on its label swatch, its sparkline stroke and that stroke's endpoint; values stay `--text-hi`. Green and red on a delta are assigned by *meaning*, never by arrow direction — `InsightTrend.upIsGood` decides, so a falling tokens-per-LOC reads as the improvement it is, and a trend whose goodness is unknown stays neutral.
+
+Per-metric sources: runtime and its sparkline from [[src/hooks/useLlmRuntimeStats.ts#useLlmRuntimeStats]]; tokens-per-LOC and LOC-per-hour with their trends from [[src/hooks/useCodeInsights.ts#useCodeInsights]]; sessions and projects sparklines from [[src/hooks/useWidgetSeries.ts#useActivitySeries]]; net lines from [[src/hooks/useCodeStats.ts#useCodeStats]], bucketed as `lines_added − lines_removed`. The footer's In/Out/Cache totals come from a range-scoped `get_token_stats` read rather than [[src/hooks/useTokenData.ts#useTokenData]], because a background instrument should not pay for the point history and hostname list it never draws.
+
+The insight line states what Quill's own context store kept out of the prompt, from [[src/hooks/useContextSavingsStats.ts#useContextSavingsStats]]. With nothing preserved in the range the line is absent rather than zeroed.
+
+The breakdown switches five modes over one row grammar — status dot, name, identity chip, dim secondary count, primary value, recency — filled per mode: Sessions (provider chip, tokens, live count in the header), Projects (session count, tokens), Hosts (turns, tokens), Skills (uses, last used), Hooks (QUILL chip where Quill-deployed, fires, last fired). Honesty disclosures keep the home that matches their data: the Hooks header carries the Claude/Codex tracking-asymmetry help, and the condensed retention line sits in Sessions, the only mode whose source [[lat.md/frontend#Frontend#Components#Retention Degradation]] actually prunes — skill and hook counts are never pruned, so claiming loss there would be its own lie.
 
 ### Analytics Components
 
