@@ -2,9 +2,9 @@
 //
 // The main window *is* the widget now: a fixed-width, always-on-top instrument
 // made of a titlebar and a single content column. The split-pane layout, the
-// draggable divider, the `--s` fit-to-height scaling system, arrow-key resize
-// and the `quill-size-*` / `quill-split-ratio*` / `quill-layout-mode`
-// preferences that fed them are gone. What survives here is the app-lifecycle
+// draggable divider, the fit-to-height CSS scaling system, arrow-key resize and
+// every stored layout/size/split preference that fed them are gone — the widget
+// derives its own height. What survives here is the app-lifecycle
 // work that has no other home: usage polling, the four-hour update check, the
 // right-click Refresh/Quit menu, close-to-tray, and driving the window's
 // content-derived height.

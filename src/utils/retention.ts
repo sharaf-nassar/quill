@@ -107,28 +107,9 @@ export function isPruned(
 	return retentionSpanFor(timestamp, timestamp, cutoff) === "pruned";
 }
 
-/** A row paired with its classification against the retention cutoff. */
-export interface RetentionMarked<T> {
-	readonly row: T;
-	readonly span: RetentionSpan;
-}
-
-/**
- * Mark every row in a time-ordered range against the cutoff, returning a new
- * array of `{ row, span }` pairs — the inputs are never mutated.
- *
- * This is the "mark the pre-cutoff range rather than draw it as zeros"
- * treatment in its general form. Callers that would rather drop the pre-cutoff
- * rows entirely can filter the result on `span !== "pruned"`; marking is
- * preferred because a truncated axis hides that anything was ever there.
+/*
+ * A per-row range-marking generic lived here while the split-pane analytics
+ * charts drew multi-day axes. The widget's compact views classify whole ranges
+ * with `retentionSpanFor` and single instants with `isPruned`, so it went with
+ * the rest of the legacy main window rather than survive as unused surface.
  */
-export function markPrunedRange<T>(
-	rows: readonly T[],
-	cutoff: string | null,
-	boundsOf: (row: T) => readonly [string, string],
-): readonly RetentionMarked<T>[] {
-	return rows.map((row) => {
-		const [from, to] = boundsOf(row);
-		return { row, span: retentionSpanFor(from, to, cutoff) };
-	});
-}

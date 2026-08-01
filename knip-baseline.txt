@@ -1,0 +1,40 @@
+# knip baseline — dead code that predates specs/018-widget-ui-redesign.
+#
+# Captured at commit 3136818 (the feature's spec commit, before any of its
+# code landed) with the repository's knip.json, so the legacy teardown could
+# prove it introduced no new unused surface. Regenerate the same way: check
+# that tree out into a worktree, copy knip.json in, and run
+#   npx knip --reporter json
+# then normalise to the "<kind>\t<file>\t<symbol>" lines below.
+#
+# Everything listed here is pre-existing debt owned by bead quill-avo (repo-wide
+# dead-code sweep) — not by the widget redesign. `npm run knip` reporting
+# anything NOT in this list is a regression.
+
+unused-dependency	package.json	@tauri-apps/plugin-process
+unused-dependency	package.json	@tauri-apps/plugin-window-state
+unused-dependency	package.json	geist
+unused-export	src/components/RetentionBanner.tsx	default
+unused-export	src/components/settings/ContextTab.tsx	ContextTab
+unused-export	src/components/settings/GeneralTab.tsx	GeneralTab
+unused-export	src/components/settings/IntegrationsTab.tsx	IntegrationsTab
+unused-export	src/components/settings/LearningTab.tsx	LearningTab
+unused-export	src/components/settings/PerformanceTab.tsx	PerformanceTab
+unused-export	src/components/settings/SettingRow.tsx	SettingRow
+unused-export	src/components/settings/SettingsTabs.tsx	SettingsTabs
+unused-export	src/components/settings/Toggle.tsx	Toggle
+unused-export	src/types.ts	mergeBucketsByLabel
+unused-export	src/utils/chartHelpers.ts	getAreaColor
+unused-file	src/components/SectionHeader.tsx	src/components/SectionHeader.tsx
+unused-file	src/components/analytics/StatsPanel.tsx	src/components/analytics/StatsPanel.tsx
+unused-file	src/components/analytics/TogglePills.tsx	src/components/analytics/TogglePills.tsx
+unused-file	src/components/analytics/UsageChart.tsx	src/components/analytics/UsageChart.tsx
+unused-file	src/components/analytics/shared.tsx	src/components/analytics/shared.tsx
+unused-file	src/components/live/ClaudeLiveModule.tsx	src/components/live/ClaudeLiveModule.tsx
+unused-file	src/components/live/CodexLiveModule.tsx	src/components/live/CodexLiveModule.tsx
+unused-file	src/hooks/useCodexLiveData.ts	src/hooks/useCodexLiveData.ts
+unused-type	src/types.ts	ChartSeriesVisibility
+unused-type	src/types.ts	CodexLiveData
+unused-type	src/types.ts	CodexLiveRange
+unused-type	src/types.ts	MergedDataPoint
+unused-type	src/types.ts	SectionConfig

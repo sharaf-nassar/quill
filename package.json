@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src/"
+    "lint": "eslint src/",
+    "knip": "knip"
   },
   "dependencies": {
     "@sentry/react": "^10.54.0",
@@ -18,11 +19,9 @@
     "@tauri-apps/plugin-updater": "^2.10.0",
     "@tauri-apps/plugin-window-state": "^2.0.0",
     "dompurify": "^3.4.2",
-    "geist": "^1.7.2",
     "marked": "^18.0.3",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "recharts": "^3.7.0"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.3",
@@ -35,6 +34,7 @@
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.0.1",
     "globals": "^17.3.0",
+    "knip": "^6.31.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.56.1",
     "vite": "^6.0.0"

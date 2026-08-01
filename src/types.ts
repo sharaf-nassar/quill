@@ -19,14 +19,14 @@ export type ProviderErrorKind =
   | "rate_limit"
   | "server"
   // Live polling is paused for a transient, non-failure reason (a stale Claude
-  // access token returned 401 while still logged in). Rendered as a muted
-  // "Paused" badge by src/components/UsageDisplay.tsx, never a red prompt.
+  // access token returned 401 while still logged in). Rendered as the muted
+  // "Paused" variant of the widget's sync pill
+  // (src/components/widget/WidgetTitleBar.tsx), never a red prompt.
   | "paused"
   // Rows are being served from the last-persisted snapshot during a rate-limit
   // cooldown (a 429 armed it, or one just landed), so the values may be out of
-  // date. Rendered as a single muted "Showing cached data" pill (slate, never
-  // red) by src/components/UsageDisplay.tsx; the offline pill wins when both
-  // network and stale errors are present.
+  // date. Rendered as the muted "cached" sync-pill variant (slate, never red);
+  // the offline variant wins when both network and stale errors are present.
   | "stale";
 
 export interface UsageProviderError {
@@ -206,16 +206,6 @@ export interface SkillBreakdown {
   last_used: string;
 }
 
-export interface SkillProjectBreakdown {
-  skill_name: string;
-  project: string | null;
-  hostname: string | null;
-  total_count: number;
-  claude_count: number;
-  codex_count: number;
-  last_used: string;
-}
-
 /**
  * One row of the Now-tab Hooks breakdown (feature 009). Identity is
  * canonicalized at the backend per FR-003 — Quill-deployed scripts
@@ -235,28 +225,6 @@ export interface HookBreakdown {
   last_fired_at: string;
 }
 
-/**
- * One node in a session's sub-agent tree returned by
- * `get_session_subagent_tree`. Today every chain originates from the parent
- * transcript so depth-1 sub-agents always carry `parent_agent_id = null`,
- * but the field is reserved for future depth-N chains.
- */
-export interface SubagentNode {
-  agent_id: string;
-  parent_agent_id: string | null;
-  first_seen: string;
-  last_active: string;
-  turn_count: number;
-  total_tokens: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_tokens: number;
-  cache_read_tokens: number;
-  tool_call_count: number;
-  /** Human-readable label. Null today; populated in a future wave. */
-  label: string | null;
-}
-
 export interface ProjectBreakdown {
   project: string;
   hostname: string;
@@ -265,10 +233,6 @@ export interface ProjectBreakdown {
   session_count: number;
   last_active: string;
 }
-
-export type LayoutMode = "stacked" | "side-by-side";
-
-export type TimeMode = "marker" | "dual" | "background";
 
 /**
  * The analytics range vocabulary. Note what is *absent*: there is no `all`
@@ -286,34 +250,18 @@ export type TimeMode = "marker" | "dual" | "background";
  *    retention watermark is deleted, not zero; and
  * 2. render `RetentionBanner` on every surface that draws it.
  *
- * The two "All time" toggles in `BreakdownPanel` are exempt and must stay
- * labelled "All time": they read `skill_usages` and `hook_invocations`, which
- * retention never prunes, so relabelling them would itself be a lie.
+ * The `skillAllTime` / `hookAllTime` options on `useBreakdownData` are exempt
+ * and must stay labelled "All time" wherever they are surfaced: they read
+ * `skill_usages` and `hook_invocations`, which retention never prunes, so
+ * relabelling them would itself be a lie.
  */
 export type RangeType = "1h" | "6h" | "24h" | "7d" | "30d";
-export type CodexLiveRange = "1h" | "6h" | "12h" | "24h";
 
 export type TrendType = "up" | "down" | "flat" | "unknown";
 
 export type BreakdownMode = "hosts" | "projects" | "sessions" | "skills" | "hooks";
 
 export type SortMode = "relevance" | "recency";
-
-export interface BreakdownSelection {
-  type: "host" | "project" | "session";
-  key: string;
-  firstSeen: string;
-  lastActive: string;
-  provider?: IntegrationProvider;
-  sessionId?: string;
-}
-
-export type SectionId = "live" | "analytics";
-
-export interface SectionConfig {
-  id: SectionId;
-  visible: boolean;
-}
 
 export interface PendingUpdate {
   version: string;
@@ -393,42 +341,6 @@ export interface SessionCodeStats {
 	lines_added: number;
 	lines_removed: number;
 	net_change: number;
-}
-
-export interface CodexLiveCountSeries {
-  value: number;
-  sparkline: SparklinePoint[];
-  lastActivityAt: string | null;
-}
-
-export interface CodexLiveTokenSeries {
-  value: number;
-  sparkline: SparklinePoint[];
-  lastActivityAt: string | null;
-}
-
-export interface CodexLiveSessionRow {
-  provider: "codex";
-  sessionId: string;
-  hostname: string;
-  project: string | null;
-  firstSeen: string;
-  lastActive: string;
-  tokens: number;
-  turnEstimate: number;
-  linesAdded: number;
-  linesRemoved: number;
-  netChange: number;
-}
-
-export interface CodexLiveData {
-  fetchedAt: string;
-  lastActivityAt: string | null;
-  tokens: CodexLiveTokenSeries;
-  activeSessions: CodexLiveCountSeries;
-  activeProjects: CodexLiveCountSeries;
-  activityPulse: SparklinePoint[];
-  sessions: CodexLiveSessionRow[];
 }
 
 // Learning system types
@@ -640,40 +552,6 @@ export interface ToolCount {
 export interface SessionRef {
   provider: IntegrationProvider;
   session_id: string;
-}
-
-export function usageBucketRefKey(
-  bucket: Pick<UsageBucket, "provider" | "key">,
-): string {
-  return `${bucket.provider}:${bucket.key}`;
-}
-
-// Unified bucket that groups multiple providers sharing the same label
-export interface MergedBucket {
-  label: string;
-  sources: UsageBucket[];
-  utilization: number;
-  resets_at: string | null;
-}
-
-export function mergeBucketsByLabel(buckets: UsageBucket[]): MergedBucket[] {
-  const groups = new Map<string, UsageBucket[]>();
-  for (const bucket of buckets) {
-    const existing = groups.get(bucket.label) ?? [];
-    existing.push(bucket);
-    groups.set(bucket.label, existing);
-  }
-  return Array.from(groups.entries()).map(([label, sources]) => ({
-    label,
-    sources,
-    utilization:
-      sources.reduce((sum, s) => sum + s.utilization, 0) / sources.length,
-    resets_at:
-      sources
-        .map((s) => s.resets_at)
-        .filter((r): r is string => r !== null)
-        .sort()[0] ?? null,
-  }));
 }
 
 export function sessionRefKey(ref: SessionRef): string {
@@ -994,8 +872,6 @@ export interface ModelAnalyticsError {
   message: string;
 }
 
-export type AnalyticsTab = "now" | "trends" | "charts" | "models" | "context";
-
 export type ContextSavingsEstimateConfidence =
 	| "exact"
 	| "high"
@@ -1134,35 +1010,6 @@ export interface SparklinePoint {
 	value: number;
 }
 
-export interface SessionHealthStats {
-	avgDurationSeconds: number;
-	avgTokens: number;
-	sessionsPerDay: number;
-	sessionCount: number;
-	prev: {
-		avgDurationSeconds: number;
-		avgTokens: number;
-		sessionsPerDay: number;
-		sessionCount: number;
-	};
-}
-
-export interface ActivityPatternData {
-	/** 24 values, index 0 = midnight, index 23 = 11pm */
-	hourlyTokens: number[];
-	peakStart: number;
-	peakEnd: number;
-}
-
-export interface LearningStatsData {
-	total: number;
-	emerging: number;
-	confirmed: number;
-	/** 5 buckets: [0-20%, 20-40%, 40-60%, 60-80%, 80-100%] */
-	confidenceBuckets: number[];
-	newThisWeek: number;
-}
-
 export interface ProjectTokensRaw {
 	project: string;
 	total_tokens: number;
@@ -1174,20 +1021,6 @@ export interface SessionStatsRaw {
 	avg_tokens: number;
 	session_count: number;
 	total_tokens: number;
-}
-
-// Charts types
-
-export interface MergedDataPoint {
-	timestamp: string;
-	utilization: number | null;
-	total_tokens: number | null;
-	total_lines_changed: number | null;
-}
-
-export interface ChartSeriesVisibility {
-	utilization: boolean;
-	tokens: boolean;
 }
 
 // LLM runtime types

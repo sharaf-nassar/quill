@@ -25,7 +25,8 @@ const LearningSection = lazy(() => import("./LearningWindow"));
 const InstancesSection = lazy(() => import("./RestartWindowView"));
 const SettingsSection = lazy(() => import("./SettingsWindowView"));
 
-// ── Section icons (14px line glyphs, shared visual language with TitleBar) ──
+// ── Section icons (14px line glyphs, shared visual language with the widget
+//    titlebar) ──
 
 const SVG = {
   viewBox: "0 0 14 14",

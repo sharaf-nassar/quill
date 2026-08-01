@@ -255,8 +255,9 @@ function netLineBuckets(
 /**
  * Range-scoped token totals for the footer.
  *
- * Deliberately not `useTokenData`: that hook also pulls the full point history
- * and the hostname list, neither of which the widget draws, and a background
+ * Deliberately narrow: it asks for `get_token_stats` and nothing else. The
+ * legacy analytics hook this replaces also pulled the full point history and
+ * the hostname list, neither of which the widget draws, and a background
  * instrument should not pay for reads it never renders.
  */
 function useWidgetTokenStats(range: RangeType) {

@@ -254,9 +254,10 @@ function formatDiff(added: number, removed: number): string {
 /**
  * Token history for the selected range.
  *
- * Deliberately not `useTokenData`: that hook also fetches range totals and the
- * hostname list, and this view draws neither. Only the four token components
- * are needed, and only to derive a per-bucket cache hit rate.
+ * Deliberately narrow: the legacy analytics hook this replaces also fetched
+ * range totals and the hostname list, and this view draws neither. Only the
+ * four token components are needed, and only to derive a per-bucket cache hit
+ * rate.
  */
 function useWidgetTokenHistory(range: RangeType) {
   const request = useCallback(
