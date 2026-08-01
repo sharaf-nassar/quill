@@ -8257,3 +8257,131 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
     transition: none;
   }
 }
+
+/* ─── Trends view — three week-over-week rows ───
+   Hairline-separated rows, no cards: metric name and this week's value on the
+   head line, the week pair as bars beneath it. Hue is spent only on the delta,
+   and only where the direction has a meaning; the bars separate the two weeks
+   by brightness (this week bright, last week dim) so the comparison never
+   borrows the severity palette. */
+.wg-trends {
+  padding: 0 14px var(--space-xl);
+}
+
+/* Dates stay sentence case: an uppercased date range reads as shouting, and
+   the caption is prose about the windows, not a label on a control. */
+.wg-trends-caption {
+  margin-bottom: var(--space-xs);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--faint);
+}
+
+.wg-trends-pending {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-lg) 0;
+}
+
+.wg-trend-skeleton {
+  height: 46px;
+}
+
+.wg-trend-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wg-trend {
+  padding: var(--space-lg) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.wg-trend:last-child {
+  border-bottom: none;
+  padding-bottom: var(--space-sm);
+}
+
+.wg-trend-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-md);
+}
+
+.wg-trend-name {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+
+.wg-trend-unit {
+  font-size: 9px;
+  font-weight: 450;
+  color: var(--faint);
+}
+
+.wg-trend-value {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  margin-left: auto;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  color: var(--text-hi);
+  white-space: nowrap;
+}
+
+.wg-trend-delta {
+  font-size: 9px;
+  font-weight: 600;
+}
+
+/* Tone is assigned by meaning, never by arrow direction. */
+.wg-trend-delta[data-tone="positive"] {
+  color: var(--meter-green);
+}
+
+.wg-trend-delta[data-tone="negative"] {
+  color: var(--meter-red);
+}
+
+.wg-trend-delta[data-tone="flat"] {
+  color: var(--faint);
+}
+
+/* This week reads as the value, last week as the reference behind it. */
+.wg-trend-bars .viz-bar-row:first-child .viz-bar-fill {
+  background: var(--text);
+}
+
+.wg-trend-bars .viz-bar-row:last-child .viz-bar-fill {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.wg-trend-bars .viz-bar-row:last-child .viz-bar-value {
+  color: var(--label);
+  font-weight: 500;
+}
+
+/* One value column across all three rows, so the tracks start and end on the
+   same grid instead of jittering with the width of each week's figure. */
+.wg-trend-bars .viz-bar-value {
+  min-width: 50px;
+  text-align: right;
+}
+
+.wg-trend-note {
+  margin-top: var(--space-lg);
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--faint);
+  text-wrap: pretty;
+}

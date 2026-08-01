@@ -73,7 +73,11 @@ function computeEfficiency(tokens: number, loc: number): number | null {
 // nights/weekends no longer crush the number. When runtime is 0/unknown for
 // the window we fall back to the wall-clock span so the card still shows a
 // number instead of dropping to an em-dash.
-function computeVelocity(
+//
+// Exported because the widget's week-over-week Trends view has to divide by the
+// same denominator; two copies of this formula would let one surface disagree
+// with the other about the same week.
+export function computeVelocity(
 	loc: number,
 	activeSecs: number,
 	fallbackMs: number,
@@ -91,7 +95,7 @@ function computeVelocity(
 // runtime from the wider comparison-range fetch, since get_llm_runtime_stats
 // only accepts the four fixed ranges and cannot query the prior window
 // directly.
-function activeSecsInWindow(
+export function activeSecsInWindow(
 	sparkline: number[],
 	compStart: number,
 	compMs: number,

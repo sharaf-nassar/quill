@@ -236,6 +236,9 @@ const usageStats: BucketStats[] = usageData.buckets.map((b) => ({
 const TOKEN_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> = {
   "1h": { count: 12, stepMs: 5 * M },
   "6h": { count: 24, stepMs: 15 * M },
+  // A month of daily points — the window the widget's week-over-week Trends
+  // rows read, and the comparison window `useCodeInsights` already fetched.
+  "30d": { count: 30, stepMs: D },
 };
 const DEFAULT_TOKEN_HISTORY = { count: 48, stepMs: H };
 
@@ -243,10 +246,17 @@ function tokenHistory(range: string): TokenDataPoint[] {
   const { count, stepMs } = TOKEN_HISTORY_GEOMETRY[range] ?? DEFAULT_TOKEN_HISTORY;
   const pts: TokenDataPoint[] = [];
   for (let i = count - 1; i >= 0; i--) {
-    const input = 8_000 + ((i * 37) % 5_000);
-    const output = 3_000 + ((i * 53) % 2_500);
-    const cacheCreate = 1_500 + ((i * 17) % 1_200);
-    const cacheRead = 12_000 + ((i * 91) % 9_000);
+    // Daily points span more than one week, so they carry a week-over-week
+    // story as well: the current week runs busier and caches better than the
+    // one before it, which is what the Trends rows are drawn to show. Sub-daily
+    // ranges keep the flat shape the usage chart is verified against.
+    const thisWeek = stepMs >= D && i * stepMs < 7 * D;
+    const volume = thisWeek ? 1.18 : 1;
+    const cacheShare = thisWeek ? 1.12 : 1;
+    const input = Math.round((8_000 + ((i * 37) % 5_000)) * volume);
+    const output = Math.round((3_000 + ((i * 53) % 2_500)) * volume);
+    const cacheCreate = Math.round((1_500 + ((i * 17) % 1_200)) * volume);
+    const cacheRead = Math.round((12_000 + ((i * 91) % 9_000)) * volume * cacheShare);
     pts.push({
       timestamp: iso(i * stepMs),
       input_tokens: input,
@@ -361,13 +371,34 @@ const sessionStats: SessionStatsRaw = {
   total_tokens: 1_258_100,
 };
 
-const llmRuntimeStats: LlmRuntimeStats = {
-  total_runtime_secs: 184_920,
-  turn_count: 1_284,
-  session_count: 96,
-  avg_per_turn_secs: 144,
-  sparkline: [120, 138, 110, 152, 144, 168, 131, 149, 158, 142, 137, 162],
-};
+/**
+ * Runtime answers per range, and its sparkline always sums to the total it
+ * reports.
+ *
+ * The real command derives both from one walk over `session_events`, and
+ * consumers rely on that: `useCodeInsights` and the widget's week-over-week
+ * Trends rows recover a prior window's active seconds by prorating this
+ * sparkline, so a shape that did not add up to the total would make the same
+ * week read differently depending on which side of the comparison it landed
+ * on. Seven buckets, matching the backend's fixed grid.
+ */
+const RUNTIME_SHAPE = [0.11, 0.14, 0.12, 0.17, 0.15, 0.18, 0.13];
+/** Active LLM seconds per day of window — about 7.3 hours of real work. */
+const RUNTIME_SECS_PER_DAY = 26_400;
+
+function llmRuntimeStats(range: string): LlmRuntimeStats {
+  const windowMs = RANGE_DURATION_MS[range] ?? D;
+  const days = windowMs / D;
+  const totalRuntimeSecs = Math.round(days * RUNTIME_SECS_PER_DAY);
+  const turnCount = Math.max(1, Math.round(days * 183));
+  return {
+    total_runtime_secs: totalRuntimeSecs,
+    turn_count: turnCount,
+    session_count: Math.max(1, Math.round(days * 13.7)),
+    avg_per_turn_secs: Math.round(totalRuntimeSecs / turnCount),
+    sparkline: RUNTIME_SHAPE.map((share) => Math.round(totalRuntimeSecs * share)),
+  };
+}
 
 const topTools: ToolCount[] = [
   { tool_name: "Bash", count: 1_842 },
@@ -2392,7 +2423,10 @@ type RetentionScenario =
   // Chunks committed, then the run stopped. Carries error_reason.
   | "partial"
   // The cutoff covers every owned row — drives the explicit-loss copy.
-  | "everything_older";
+  | "everything_older"
+  // The watermark sits inside the widget's two compared weeks, so surfaces
+  // that degrade under retention (the Trends velocity row) have to disclose it.
+  | "recent_watermark";
 
 const RETENTION_SCENARIOS: ReadonlySet<RetentionScenario> = new Set([
   "preview",
@@ -2402,6 +2436,7 @@ const RETENTION_SCENARIOS: ReadonlySet<RetentionScenario> = new Set([
   "skipped_compaction",
   "partial",
   "everything_older",
+  "recent_watermark",
 ]);
 
 const warnedInvalidRetentionScenarios = new Set<string>();
@@ -2431,6 +2466,13 @@ const RETENTION_WINDOW_PRESETS = [30, 90, 180, 365] as const;
 // against stored transcript timestamps. `toISOString()` produces this form.
 const retentionCutoff = (windowDays: number) => iso(windowDays * D);
 
+// How far back the mock watermark sits. The default keeps every recent surface
+// undegraded; `recent_watermark` moves it inside the last fortnight so the
+// widget's week-over-week Trends rows have to state that the earlier week's
+// code activity was pruned.
+const watermarkDays = (scenario: RetentionScenario) =>
+  scenario === "recent_watermark" ? 10 : 90;
+
 // Reassigned, never mutated, so `set_retention_policy` in the browser behaves
 // like the real write-then-reread.
 let retentionWindowDays: number | null = 90;
@@ -2443,7 +2485,7 @@ const affectedSurfaces = [
 
 function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord | null {
   if (scenario === "noop") return null;
-  const cutoff = retentionCutoff(90);
+  const cutoff = retentionCutoff(watermarkDays(scenario));
   const base: RetentionAuditRecord = {
     schema: 1,
     status: "completed",
@@ -2495,7 +2537,8 @@ function retentionPolicy(): RetentionPolicy {
   const scenario = readRetentionScenario();
   return {
     window_days: retentionWindowDays,
-    watermark: retentionWindowDays === null ? null : retentionCutoff(90),
+    watermark:
+      retentionWindowDays === null ? null : retentionCutoff(watermarkDays(scenario)),
     last_run: retentionAuditRecord(scenario),
   };
 }
@@ -2829,7 +2872,7 @@ const fixtures: Record<string, FixtureHandler> = {
   get_session_subagent_tree: () => [],
   // stats
   get_session_stats: () => sessionStats,
-  get_llm_runtime_stats: () => llmRuntimeStats,
+  get_llm_runtime_stats: (args) => llmRuntimeStats(rangeArg(args)),
   get_snapshot_count: () => 1_440,
   get_top_tools: () => topTools,
   get_observation_count: () => 184,

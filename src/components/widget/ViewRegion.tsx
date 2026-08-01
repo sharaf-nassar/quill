@@ -13,6 +13,7 @@ import { useState, type ReactNode } from "react";
 import type { RangeType } from "../../types";
 import ViewSwitcher, { type ViewOption, type WidgetView } from "./ViewSwitcher";
 import ModelsView from "./views/ModelsView";
+import TrendsView from "./views/TrendsView";
 import UsageView from "./views/UsageView";
 
 /** The widget's range vocabulary. `30d` stays out — it is not a widget scope. */
@@ -32,6 +33,12 @@ const DEFAULT_RANGE: RangeType = "6h";
 
 interface ViewDefinition extends ViewOption {
   render: (range: RangeType) => ReactNode;
+  /**
+   * Whether the shared range strip applies. A view that fixes its own windows
+   * (Trends compares whole weeks) sets this false, and the strip is hidden
+   * rather than left standing as a control that would change nothing.
+   */
+  ranged?: boolean;
 }
 
 /**
@@ -44,6 +51,12 @@ const VIEWS: readonly ViewDefinition[] = [
     id: "usage",
     label: "Usage",
     render: (range) => <UsageView range={range} />,
+  },
+  {
+    id: "trends",
+    label: "Trends",
+    ranged: false,
+    render: () => <TrendsView />,
   },
   {
     id: "models",
@@ -64,19 +77,23 @@ function ViewRegion() {
           space the view name happens to leave over. */}
       <div className="wg-view-head">
         <ViewSwitcher options={VIEWS} view={active.id} onSelect={setView} />
-        <div className="wg-toggles wg-num" role="group" aria-label="Time range">
-          {RANGES.map((entry) => (
-            <button
-              key={entry.id}
-              type="button"
-              className="wg-toggle"
-              aria-pressed={entry.id === range}
-              onClick={() => setRange(entry.id)}
-            >
-              {entry.label}
-            </button>
-          ))}
-        </div>
+        {active.ranged === false ? (
+          <span />
+        ) : (
+          <div className="wg-toggles wg-num" role="group" aria-label="Time range">
+            {RANGES.map((entry) => (
+              <button
+                key={entry.id}
+                type="button"
+                className="wg-toggle"
+                aria-pressed={entry.id === range}
+                onClick={() => setRange(entry.id)}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
+        )}
         <span />
       </div>
       {active.render(range)}
