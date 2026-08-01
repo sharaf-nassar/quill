@@ -88,6 +88,16 @@ Recharts is hostile to those treatments and costs 3.7 MB for shapes the widget c
 - **Heat** — [[src/components/widget/viz/Heat.tsx#Heat]] renders a coarse density strip: one cell per bucket, magnitude carried by opacity of a single hue with a floor so an empty bucket still reads as a bucket.
 - **geometry** — [[src/components/widget/viz/geometry.ts#scalePoints]] maps values into viewBox coordinates and [[src/components/widget/viz/geometry.ts#smoothPath]] builds the catmull-rom-to-bezier curve used by `specs/018-widget-ui-redesign/mockup.tpl.html`, so shipped charts trace the mockup's silhouette. Every helper returns new arrays or strings and never mutates its input.
 
+### Widget Limits Band
+
+[[src/components/widget/LimitsSection.tsx#LimitsSection]] is the widget's whole subscription readout: one row per enabled provider, and no section at all when none is enabled.
+
+Each row is an identity swatch (the fixed provider hue), the provider name, one fixed-width cell per rate-limit window, and a right-aligned countdown to that row's nearest upcoming reset. The cells hold their column width so rows scan as a table at 360px whatever their bucket count, shrinking only when a provider reports more windows than the row can seat. A cell states the rounded percent, a window label compressed from the bucket label (the untouched label stays in the cell title and the bar's accessible name), and a 4px `role="progressbar"` bar carrying `aria-valuenow`/`min`/`max`.
+
+Severity is carried on `[data-severity]` and follows the same 50/80 thresholds as [[lat.md/features#Features#Live Usage View]]: amber from 50%, red from 80%. A bucket whose `resets_at` has already elapsed is marked stale instead, which matches no severity rule and therefore renders neutral — a utilization measured against a bygone window must never read as a live severity. For the same reason an elapsed window is not a candidate for the row's nearest-reset countdown; the countdown falls back to "now" only when every dated window in the row has rolled over.
+
+A provider with no live buckets still gets a row, stating why in the app's existing pill wording but in the widget's flat dress (a lamp and a word, no box): `SETUP` in amber when the failure is actionable — a `config`/`auth` provider error, or an unfinished install — and `UNAVAILABLE` in slate otherwise, since a degraded read is never an alarm. Before the first usage poll lands the row shows skeleton cells of the same geometry, so the real numbers do not move the rows beneath them. MiniMax rows keep the plan-level bucket filter (M\*, coding-plan-search, coding-plan-vlm) that [[src/components/live/ProviderUsageModule.tsx]] applies, because the per-model long tail does not fit a 360px row.
+
 ### Analytics Components
 
 Analytics components in `src/components/analytics/` provide Now, Trends, Charts, Models, and an optional Context tab.

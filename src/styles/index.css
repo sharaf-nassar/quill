@@ -7013,6 +7013,180 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
   background: var(--meter-red);
 }
 
+/* ═══ LIMITS band — one row per enabled provider ═══════════════════════════
+   The widget's only subscription readout: identity swatch + name, one
+   fixed-width cell per rate-limit window, right-aligned nearest-reset
+   countdown. Fixed cells are what make the rows scan as a table — every
+   provider's first window starts at the same x whatever its bucket count.
+   Severity lives on [data-severity]; a bucket past its reset carries
+   "stale" and therefore matches no severity rule, so it renders neutral.
+   ═════════════════════════════════════════════════════════════════════════ */
+
+.wg-limits {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: var(--space-lg) 14px var(--space-xl);
+}
+
+.wg-limits-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+
+.wg-limits-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  min-height: 26px;
+}
+
+.wg-limits-swatch {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: var(--radius-xs);
+  background: var(--label-faint);
+}
+
+.wg-limits-swatch[data-provider="claude"] {
+  background: var(--provider-claude);
+}
+
+.wg-limits-swatch[data-provider="codex"] {
+  background: var(--provider-codex);
+}
+
+.wg-limits-swatch[data-provider="mini_max"] {
+  background: var(--provider-minimax);
+}
+
+.wg-limits-name {
+  width: 50px;
+  flex: 0 0 50px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--label);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Cells hold their 60px column until a provider reports more windows than the
+   360px row can seat; only then do they shrink, so nothing is ever clipped. */
+.wg-limits-bucket {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  flex: 0 1 62px;
+  min-width: 44px;
+}
+
+.wg-limits-bucket-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-xs);
+}
+
+.wg-limits-pct {
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text);
+}
+
+.wg-limits-pct[data-severity="caution"] {
+  color: var(--meter-amber);
+}
+
+.wg-limits-pct[data-severity="critical"] {
+  color: var(--meter-red);
+}
+
+.wg-limits-pct[data-severity="stale"] {
+  color: var(--faint);
+}
+
+.wg-limits-window {
+  font-size: 8px;
+  font-weight: 500;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .wg-limits .wg-bar-fill {
+    transition: width 0.3s ease;
+  }
+}
+
+/* Loading occupies the same geometry as two real cells, so the first real
+   paint does not move the rows beneath it. */
+.wg-limits-pending {
+  display: flex;
+  gap: var(--space-md);
+  flex: 0 1 132px;
+}
+
+.wg-limits-pending .wg-skeleton-line {
+  flex: 1 1 0;
+}
+
+/* Config states keep the app's SETUP / UNAVAILABLE wording but wear the
+   widget's flat status-pill dress — a lamp and a word, no box. SETUP is
+   actionable so it takes the integrations toggle's amber; UNAVAILABLE is a
+   degraded read, which the widget always states in slate, never in alarm. */
+.wg-limits-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  color: var(--label-faint);
+}
+
+.wg-limits-lamp {
+  width: 5px;
+  height: 5px;
+  flex: 0 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--label-faint);
+}
+
+.wg-limits-status[data-tone="setup"] {
+  color: var(--meter-amber);
+}
+
+.wg-limits-status[data-tone="setup"] .wg-limits-lamp {
+  background: var(--meter-amber);
+}
+
+.wg-limits-reset {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.wg-limits-reset[data-severity="caution"] {
+  color: var(--meter-amber);
+  font-weight: 600;
+}
+
+.wg-limits-reset[data-severity="critical"] {
+  color: var(--meter-red);
+  font-weight: 600;
+}
+
 /* ═══ Viz kit — internal SVG primitives (src/components/widget/viz/) ═══ */
 
 .viz-sparkline {

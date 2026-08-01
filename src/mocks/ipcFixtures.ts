@@ -140,15 +140,18 @@ const providerStatuses: ProviderStatus[] = [
     lastError: null,
     lastVerifiedAt: iso(90 * 1000),
   },
+  // Enabled but not answering: exercises the widget LIMITS row's SETUP state
+  // (paired with the `auth` provider error below), which is the only way to
+  // see a provider row that has no live buckets in browser mode.
   {
     provider: "mini_max",
     detectedCli: false,
-    detectedHome: false,
-    enabled: false,
-    setupState: "not_installed",
-    userHasMadeChoice: false,
-    lastError: null,
-    lastVerifiedAt: null,
+    detectedHome: true,
+    enabled: true,
+    setupState: "installed",
+    userHasMadeChoice: true,
+    lastError: "MiniMax API key was rejected",
+    lastVerifiedAt: iso(20 * M),
   },
 ];
 
@@ -186,11 +189,19 @@ const usageData: UsageData = {
   buckets: [
     { provider: "claude", key: "claude_5h", label: "Sonnet · 5h", utilization: 34, resets_at: isoIn(2 * H + 14 * M), sort_order: 0 },
     { provider: "claude", key: "claude_week", label: "Weekly", utilization: 68, resets_at: isoIn(3 * D), sort_order: 1 },
-    { provider: "claude", key: "weekly_scoped_fable", label: "Fable", utilization: 22, resets_at: isoIn(6 * D), sort_order: 1 },
+    // Reset already elapsed: the row must render neutral (muted %, slate bar)
+    // instead of carrying a bygone window's utilization as a live severity.
+    { provider: "claude", key: "weekly_scoped_fable", label: "Fable", utilization: 22, resets_at: iso(35 * M), sort_order: 1 },
     { provider: "codex", key: "codex_5h", label: "Codex · 5h", utilization: 86, resets_at: isoIn(48 * M), sort_order: 2 },
     { provider: "codex", key: "codex_week", label: "Codex · Weekly", utilization: 52, resets_at: isoIn(4 * D), sort_order: 3 },
   ],
-  provider_errors: [],
+  provider_errors: [
+    {
+      provider: "mini_max",
+      kind: "auth",
+      message: "MiniMax API key was rejected",
+    },
+  ],
   provider_credits: [{ provider: "codex", balance: "$4.20" }],
   error: null,
 };
