@@ -23,16 +23,17 @@ marketing-site/
         ├── live.png            Same frame; the #live section clips it to LIMITS
         ├── analytics-charts.png  The widget on its Charts view (the #analytics section)
         ├── analytics-context.png The widget on its Context view (the #context section)
-        ├── sessions.png
-        ├── learning.png
+        ├── sessions.png         Manage → Sessions, a query typed and a result open
+        ├── learning.png         Manage → Learning, active rules over candidates
         ├── memory.png          Memories panel — "All Projects (4)" (the #memory section)
         └── brevity.png         Brevity profile toggle (the #brevity section)
 ```
 
 The main window is the 360px widget, so the first four PNGs are all the same
-window on different views rather than four separate surfaces. `sessions.png`,
-`learning.png`, `memory.png`, and `brevity.png` still show the pre-Manage
-standalone windows and are queued for recapture.
+window on different views rather than four separate surfaces. The last four
+come from the Manage workspace: `sessions.png` and `learning.png` are whole
+sections captured by `take_screenshots.sh`, while `memory.png` and
+`brevity.png` are sub-panels inside a section and stay manual.
 
 ## Anchored sections
 
@@ -68,13 +69,14 @@ varied aspect ratios. They are displayed **whole at their natural aspect ratio**
   carries explicit `width`/`height` attributes matching its 2× source so the
   browser reserves correct space (no layout shift) and the aspect ratio is right.
 - The PNGs are stored at 2× for retina; their display sizes are half the pixel
-  dimensions (e.g. `hero.png` 720×1512 → 360×756).
+  dimensions (e.g. `hero.png` 720×1532 → 360×766).
 - **Slim, never upscaled.** Each `.spotlight` sets a `--shot-w` custom property
-  equal to the shot's native retina display width (its `width` attribute), and
+  at or below the shot's native retina display width (its `width` attribute), and
   the media grid track is `minmax(0, var(--shot-w, 480px))`. So the product
   window renders at — or below — its captured size, never stretched wider or
   taller to fill the column. The four widget shots use 360px (the widget's own
-  width); sessions/learning/memory use 520px and brevity 560px. The copy column
+  width); the landscape Manage shots use 640px and the two sub-panel shots
+  600px — each still at or under its own captured width. The copy column
   (`1fr`) takes the remaining width.
 - **One exception to "shown whole":** `#live` reuses the widget frame through a
   `.shot-band` frame with `aspect-ratio: 360 / 185`, clipping it to the LIMITS
