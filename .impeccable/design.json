@@ -1,166 +1,167 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-06-28T12:00:00Z",
+  "generatedAt": "2026-07-31T12:00:00Z",
   "title": "Design System: Quill",
   "extensions": {
     "colorMeta": {
-      "console-black": { "role": "neutral", "displayName": "Console Black", "canonical": "#121216", "tonalRamp": ["#0a0a0d", "#121216", "#1c1c22", "#26262e", "#34343d", "#45454f", "#5a5a66", "#74747f"] },
-      "card-graphite": { "role": "neutral", "displayName": "Card Graphite", "canonical": "#161b22", "tonalRamp": ["#0d1117", "#161b22", "#21262d", "#2d333b", "#3a414b", "#4a525e", "#5d6671", "#717b87"] },
-      "signal-blue": { "role": "primary", "displayName": "Signal Blue", "canonical": "#60a5fa", "tonalRamp": ["#0b1f3a", "#102a4d", "#1b3e6b", "#2b5894", "#3f72bd", "#60a5fa", "#93c2fc", "#c7e0fe"] },
+      "surface": { "role": "neutral", "displayName": "Surface", "canonical": "#14181f", "tonalRamp": ["#0b0e13", "#0f1319", "#14181f", "#1b212b", "#242c38", "#313b4a", "#42505f", "#586878"] },
+      "inset": { "role": "neutral", "displayName": "Inset", "canonical": "#0f1319", "tonalRamp": ["#080a0e", "#0b0e13", "#0f1319", "#161c25", "#1f2733", "#2b3542", "#3b4756", "#4f5d6e"] },
+      "signal-blue": { "role": "primary", "displayName": "Signal Blue (selection + focus)", "canonical": "#60a5fa", "tonalRamp": ["#0b1f3a", "#102a4d", "#1b3e6b", "#2b5894", "#3f72bd", "#60a5fa", "#93c2fc", "#c7e0fe"] },
       "meter-green": { "role": "secondary", "displayName": "Meter Green", "canonical": "#34d399", "tonalRamp": ["#06241a", "#0a3a2a", "#0f5740", "#157a59", "#1fa074", "#34d399", "#6ee7b7", "#b5f3da"] },
       "meter-amber": { "role": "secondary", "displayName": "Caution Amber", "canonical": "#fbbf24", "tonalRamp": ["#2a1d02", "#3f2c05", "#5e420a", "#856010", "#b8851a", "#fbbf24", "#fcd569", "#fde9ad"] },
       "meter-red": { "role": "secondary", "displayName": "Master-Warning Red", "canonical": "#f87171", "tonalRamp": ["#2e0f0f", "#471717", "#6b2222", "#963030", "#c84444", "#f87171", "#fba5a5", "#fdd0d0"] },
-      "signal-cyan": { "role": "tertiary", "displayName": "Signal Cyan (brand accent)", "canonical": "#22d3ee", "tonalRamp": ["#04282e", "#063d46", "#0a5b68", "#0f7e90", "#1aa6bd", "#22d3ee", "#67e3f4", "#a9f0f9"] },
+      "signal-cyan": { "role": "tertiary", "displayName": "Signal Cyan (brand + runtime metric)", "canonical": "#22d3ee", "tonalRamp": ["#04282e", "#063d46", "#0a5b68", "#0f7e90", "#1aa6bd", "#22d3ee", "#67e3f4", "#a9f0f9"] },
       "provider-claude": { "role": "tertiary", "displayName": "Claude Orange", "canonical": "#fb923c", "tonalRamp": ["#2b1204", "#431d07", "#66300c", "#8f4712", "#c4661f", "#fb923c", "#fdb87b", "#fedcba"] },
       "provider-codex": { "role": "tertiary", "displayName": "Codex Blue", "canonical": "#60a5fa", "tonalRamp": ["#0b1f3a", "#102a4d", "#1b3e6b", "#2b5894", "#3f72bd", "#60a5fa", "#93c2fc", "#c7e0fe"] },
-      "signal-violet": { "role": "tertiary", "displayName": "MiniMax Violet", "canonical": "#a78bfa", "tonalRamp": ["#1c1340", "#2b1d5e", "#3f2c84", "#5840ad", "#7660d4", "#a78bfa", "#c4b1fc", "#e0d6fe"] },
-      "signal-orchid": { "role": "tertiary", "displayName": "Agent Orchid", "canonical": "#c084fc", "tonalRamp": ["#22113f", "#341a5e", "#4b2785", "#6738ad", "#8f57d8", "#c084fc", "#d6aefd", "#ebd7fe"] }
+      "provider-minimax": { "role": "tertiary", "displayName": "MiniMax Violet", "canonical": "#a78bfa", "tonalRamp": ["#1c1340", "#2b1d5e", "#3f2c84", "#5840ad", "#7660d4", "#a78bfa", "#c4b1fc", "#e0d6fe"] },
+      "provider-agent": { "role": "tertiary", "displayName": "Agent Orchid", "canonical": "#c084fc", "tonalRamp": ["#22113f", "#341a5e", "#4b2785", "#6738ad", "#8f57d8", "#c084fc", "#d6aefd", "#ebd7fe"] },
+      "metric-loc-per-hr": { "role": "tertiary", "displayName": "Metric — LOC per hour", "canonical": "#f472b6", "tonalRamp": ["#3b0a25", "#571038", "#7c1a51", "#a5266d", "#cd3d8c", "#f472b6", "#f9a3d0", "#fcd0e7"] },
+      "metric-sessions": { "role": "tertiary", "displayName": "Metric — Sessions", "canonical": "#818cf8", "tonalRamp": ["#141a4a", "#1e2668", "#2c368f", "#3f4bb6", "#5b67d6", "#818cf8", "#aeb5fb", "#d6dafd"] },
+      "metric-projects": { "role": "tertiary", "displayName": "Metric — Projects", "canonical": "#2dd4bf", "tonalRamp": ["#052e2a", "#07463f", "#0a675c", "#0f8b7c", "#1cb0a0", "#2dd4bf", "#79e6d9", "#bcf2ec"] },
+      "metric-net-lines": { "role": "tertiary", "displayName": "Metric — Net lines", "canonical": "#a3e635", "tonalRamp": ["#20300a", "#324a0f", "#4a6d16", "#66931e", "#84bb28", "#a3e635", "#c5ef7c", "#e2f7bd"] }
     },
     "typographyMeta": {
-      "data": { "displayName": "Data", "purpose": "Large live readouts — token totals, the headline number on an insight card. Tabular, weight 700." },
-      "title": { "displayName": "Title", "purpose": "Section and card headings, panel names." },
-      "body": { "displayName": "Body", "purpose": "Rows and primary text. The 11px base size of the instrument." },
-      "label": { "displayName": "Label", "purpose": "Uppercase meta, badges, and the small tags on controls. The dense cockpit's connective tissue." },
-      "mono": { "displayName": "Mono", "purpose": "Geist Mono for ids, paths, code, diffs, and aligned numeric columns only — never decorative." }
+      "hero": { "displayName": "Hero", "purpose": "The single headline value overlaid on the usage chart. 26px, weight 650, tabular. Exactly one per view." },
+      "value": { "displayName": "Value", "purpose": "Readout-cell and trend values — the numbers in the grid. 15px, weight 600, tabular." },
+      "row": { "displayName": "Row", "purpose": "Entity names and their primary values in list rows. 11.5px." },
+      "body": { "displayName": "Body", "purpose": "Running sentences — the insight line, empty-state copy, disclosures. 10.5px." },
+      "meta": { "displayName": "Meta", "purpose": "The working size of the instrument: labels, toggles, the sync pill, the view switcher, chips. 10px." },
+      "micro": { "displayName": "Micro", "purpose": "The 8px floor. Rate-limit window labels and chart axis ticks only — never text a user must read to act." },
+      "mono": { "displayName": "Mono", "purpose": "Geist Mono for raw model ids, session ids, and paths only — never decorative." }
     },
     "shadows": [
-      { "name": "menu", "value": "0 4px 12px rgba(0,0,0,0.5)", "purpose": "Dropdown and context menus raised off the canvas." },
-      { "name": "popover", "value": "0 8px 24px rgba(0,0,0,0.6)", "purpose": "Tooltips and detached floating panels — the highest everyday layer." },
-      { "name": "modal", "value": "0 24px 40px rgba(0,0,0,0.45)", "purpose": "Confirmation dialogs; the rare full-attention layer." },
-      { "name": "inset-ring", "value": "inset 0 0 0 1px rgba(255,255,255,0.20)", "purpose": "1px keyboard-focus keyline on chrome where an outline would clip." }
+      { "name": "listbox", "value": "0 8px 24px rgba(0,0,0,0.6)", "purpose": "The view switcher menu and tooltips — the only everyday layer that leaves the plane." },
+      { "name": "modal", "value": "0 24px 40px rgba(0,0,0,0.45)", "purpose": "Confirmation dialogs in the management windows; the rare full-attention layer." }
     ],
     "motion": [
-      { "name": "ease-standard", "value": "0.15s ease", "purpose": "Default for color/background/border state transitions." },
-      { "name": "ease-titlebar", "value": "140ms ease", "purpose": "Titlebar control hover transitions." },
-      { "name": "meter-fill", "value": "width 0.3s ease", "purpose": "Meter and time-bar fills — calm ballistics, not twitchy." },
-      { "name": "reveal", "value": "200ms cubic-bezier(0.32, 0.72, 0, 1)", "purpose": "The active-tab underline wipe; the system's one expressive easing." },
-      { "name": "reduced-motion", "value": "prefers-reduced-motion: reduce", "purpose": "Crossfade or instant; meter fills snap to value, the underline appears without a wipe." }
+      { "name": "control", "value": "0.12s ease", "purpose": "Default for control color/background transitions (keys, toggles, rows)." },
+      { "name": "chevron", "value": "0.15s ease", "purpose": "The view-switcher chevron rotation." },
+      { "name": "fill", "value": "width 0.3s ease", "purpose": "Limit-bar and progress fills — calm ballistics, not twitchy." },
+      { "name": "reveal", "value": "200ms cubic-bezier(0.32, 0.72, 0, 1)", "purpose": "The system's one expressive easing, used for a single reveal." },
+      { "name": "reduced-motion", "value": "prefers-reduced-motion: no-preference", "purpose": "Every animation, pulse, and skeleton shimmer is gated behind this query; fills snap to value under reduce." }
     ],
     "breakpoints": [
-      { "name": "hud-min", "value": "280px", "purpose": "Default always-on-top window width; the PFD must stay legible at this size." }
+      { "name": "widget", "value": "360px", "purpose": "The main window is fixed at 360px wide with a content-derived height. It does not scale; it is the density reference for the whole system." }
     ]
   },
   "components": [
     {
-      "name": "Usage Meter Row",
+      "name": "Limit Cell",
       "kind": "custom",
       "refersTo": "signature",
-      "description": "The PFD hero: label/value/countdown over a thin track with a discrete severity fill and a pace marker. The clearest expression of the Glass Cockpit.",
-      "html": "<div class='ds-meter-row'><div class='ds-meter-top'><span class='ds-meter-label'>Sonnet · 5h</span><span class='ds-meter-pct'>68%</span><span class='ds-meter-countdown'>2h 14m</span></div><div class='ds-meter-track'><div class='ds-meter-fill ds-meter-fill--amber' style='width:68%'></div><div class='ds-meter-marker' style='left:55%'></div></div></div>",
-      "css": ".ds-meter-row{background:rgba(255,255,255,0.03);border-radius:8px;padding:8px 10px;font-family:Geist,-apple-system,'Segoe UI',sans-serif;} .ds-meter-top{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;margin-bottom:6px;font-size:11px;font-variant-numeric:tabular-nums;} .ds-meter-label{color:#8b949e;font-weight:600;} .ds-meter-pct{color:#fbbf24;font-weight:700;text-align:center;} .ds-meter-countdown{color:#6e7681;font-weight:600;text-align:right;} .ds-meter-track{position:relative;height:4px;border-radius:2px;background:rgba(255,255,255,0.04);} .ds-meter-fill{height:100%;border-radius:2px;transition:width 0.3s ease;} .ds-meter-fill--green{background:#34d399;} .ds-meter-fill--amber{background:#fbbf24;} .ds-meter-fill--red{background:#f87171;} .ds-meter-marker{position:absolute;top:-1px;width:2px;height:6px;border-radius:1px;background:rgba(200,200,220,0.7);transform:translateX(-50%);}"
+      "description": "The signature component: rounded percent, 8px window label, and a 4px severity track on the flat plane. No box, no border — the cell is a region of the surface.",
+      "html": "<div class='ds-cell'><span class='ds-cell-pct'>68%</span><span class='ds-cell-window'>5H</span><div class='ds-cell-bar' role='progressbar' aria-valuenow='68' aria-valuemin='0' aria-valuemax='100'><i class='ds-cell-fill ds-cell-fill--amber' style='width:68%'></i></div></div>",
+      "css": ".ds-cell{display:flex;flex-direction:column;gap:4px;min-width:52px;font-family:Geist,-apple-system,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums;} .ds-cell-pct{font-size:11px;font-weight:600;line-height:1;color:#c9d1d9;} .ds-cell-pct--stale{color:#6e7681;} .ds-cell-window{font-size:8px;font-weight:500;color:#6e7681;white-space:nowrap;} .ds-cell-bar{position:relative;height:4px;border-radius:999px;background:rgba(255,255,255,0.08);overflow:hidden;} .ds-cell-fill{display:block;height:100%;border-radius:999px;transition:width 0.3s ease;} .ds-cell-fill--green{background:#34d399;} .ds-cell-fill--amber{background:#fbbf24;} .ds-cell-fill--red{background:#f87171;} .ds-cell-fill--stale{background:#6e7681;} @media (prefers-reduced-motion: reduce){.ds-cell-fill{transition:none;}}"
     },
     {
-      "name": "Primary Button",
-      "kind": "button",
-      "refersTo": "button-primary",
-      "description": "The one place blue becomes a background — a committed/active action. Used sparingly.",
-      "html": "<button class='ds-btn-primary'>&#8734; All time</button>",
-      "css": ".ds-btn-primary{display:inline-flex;align-items:center;gap:6px;background:rgba(96,165,250,0.92);color:#0a0f1a;border:1px solid rgba(96,165,250,0.92);border-radius:2px;font-family:Geist,sans-serif;font-size:9px;font-weight:700;letter-spacing:0.11em;text-transform:uppercase;padding:4px 9px;min-height:24px;cursor:pointer;transition:background 0.15s ease,border-color 0.15s ease;} .ds-btn-primary:hover{background:#7ab8ff;border-color:#7ab8ff;} .ds-btn-primary:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
-    },
-    {
-      "name": "Feature Tab",
+      "name": "Toggle Strip",
       "kind": "nav",
-      "refersTo": "button-ghost",
-      "description": "The cockpit's primary navigation gesture: a ghost text tab whose active state grows a wiping underline.",
-      "html": "<button class='ds-tab ds-tab--active'>Analytics</button>",
-      "css": ".ds-tab{position:relative;background:none;border:none;color:rgba(255,255,255,0.42);font-family:Geist,sans-serif;font-size:10px;font-weight:600;letter-spacing:1.6px;text-transform:uppercase;padding:0 11px;height:26px;border-radius:2px;cursor:pointer;transition:color 140ms ease;} .ds-tab::after{content:'';position:absolute;left:50%;bottom:3px;width:0;height:1.5px;background:rgba(255,255,255,0.92);transform:translateX(-50%);transition:width 200ms cubic-bezier(0.32,0.72,0,1);border-radius:1px;} .ds-tab:hover{color:rgba(255,255,255,0.78);} .ds-tab--active{color:rgba(255,255,255,0.96);} .ds-tab--active::after{width:calc(100% - 22px);} .ds-tab:focus-visible{outline:none;box-shadow:inset 0 0 0 1px rgba(255,255,255,0.20);}"
-    },
-    {
-      "name": "Status Toggle",
-      "kind": "button",
       "refersTo": "toggle-on",
-      "description": "Provider/feature switch whose tone IS the status light: on=green, off=dim, setup=amber, unavailable=red, busy=blue (pulsing).",
-      "html": "<button class='ds-toggle ds-toggle--on'>On</button>",
-      "css": ".ds-toggle{min-width:48px;padding:4px 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;color:rgba(255,255,255,0.55);font-family:Geist,sans-serif;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;font-variant-numeric:tabular-nums;cursor:pointer;transition:background 0.12s,border-color 0.12s,color 0.12s;} .ds-toggle:hover{background:rgba(255,255,255,0.08);border-color:rgba(255,255,255,0.16);color:#d4d4d4;} .ds-toggle--on{background:rgba(52,211,153,0.12);border-color:rgba(52,211,153,0.32);color:#34d399;} .ds-toggle--on:hover{background:rgba(52,211,153,0.18);border-color:rgba(52,211,153,0.5);color:#6ee7b7;} .ds-toggle--setup{background:rgba(251,191,36,0.12);border-color:rgba(251,191,36,0.32);color:#fbbf24;} .ds-toggle--na{background:rgba(248,113,113,0.08);border-color:rgba(248,113,113,0.22);color:#f87171;} .ds-toggle:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+      "description": "Range and breakdown-mode selection. Transparent at rest; the pressed state is an 8% white fill plus brightness — never a hue, which would compete with severity.",
+      "html": "<div class='ds-toggles'><button class='ds-toggle' aria-pressed='false'>1H</button><button class='ds-toggle' aria-pressed='true'>6H</button><button class='ds-toggle' aria-pressed='false'>24H</button><button class='ds-toggle' aria-pressed='false'>7D</button></div>",
+      "css": ".ds-toggles{display:inline-flex;gap:2px;} .ds-toggle{padding:3px 9px;border:none;border-radius:6px;background:transparent;font-family:Geist,sans-serif;font-size:10px;font-weight:500;color:#6e7681;white-space:nowrap;cursor:pointer;font-variant-numeric:tabular-nums;transition:color 0.12s ease,background-color 0.12s ease;} .ds-toggle:hover{color:#c9d1d9;background:rgba(255,255,255,0.04);} .ds-toggle[aria-pressed='true']{background:rgba(255,255,255,0.08);color:#e6edf3;font-weight:600;} .ds-toggle:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
     },
     {
-      "name": "Range Tabs",
+      "name": "View Switcher",
       "kind": "nav",
-      "refersTo": "range-tab-active",
-      "description": "Segmented time-range selector on a recessed ground; the active segment fills.",
-      "html": "<div class='ds-range-tabs'><button class='ds-range-tab ds-range-tab--active'>1H</button><button class='ds-range-tab'>24H</button><button class='ds-range-tab'>7D</button><button class='ds-range-tab'>30D</button></div>",
-      "css": ".ds-range-tabs{display:inline-flex;background:rgba(255,255,255,0.04);border-radius:6px;padding:2px;gap:1px;} .ds-range-tab{background:none;border:none;color:rgba(255,255,255,0.5);font-family:Geist,sans-serif;font-size:11px;font-weight:600;padding:4px 10px;border-radius:4px;cursor:pointer;font-variant-numeric:tabular-nums;transition:color 0.15s ease,background 0.15s ease;} .ds-range-tab:hover{color:rgba(255,255,255,0.7);background:rgba(255,255,255,0.05);} .ds-range-tab--active{background:rgba(255,255,255,0.1);color:#d4d4d4;} .ds-range-tab:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+      "refersTo": "listbox",
+      "description": "A listbox, not a menu, because the control has a value. The popup is the system's single raised surface — the only place a shadow is allowed.",
+      "html": "<div class='ds-vs'><button class='ds-vs-btn' aria-haspopup='listbox' aria-expanded='true'>Usage<svg class='ds-vs-chev' width='8' height='5' viewBox='0 0 8 5' aria-hidden='true'><path d='M1 1l3 3 3-3' fill='none' stroke='currentColor' stroke-width='1.4'/></svg></button><ul class='ds-vs-menu' role='listbox'><li class='ds-vs-opt' role='option' aria-selected='true'>Usage</li><li class='ds-vs-opt' role='option' aria-selected='false'>Trends</li><li class='ds-vs-opt' role='option' aria-selected='false'>Charts</li></ul></div>",
+      "css": ".ds-vs{position:relative;font-family:Geist,sans-serif;} .ds-vs-btn{display:flex;align-items:center;gap:5px;padding:3px 7px;border:none;border-radius:6px;background:transparent;font-size:10px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:#8b949e;cursor:pointer;transition:color 0.12s ease,background-color 0.12s ease;} .ds-vs-btn:hover{color:#e6edf3;background:rgba(255,255,255,0.04);} .ds-vs-btn[aria-expanded='true'] .ds-vs-chev{transform:rotate(180deg);} .ds-vs-chev{display:block;transition:transform 0.15s ease;} .ds-vs-menu{position:absolute;top:calc(100% + 6px);left:-7px;z-index:5;min-width:132px;margin:0;padding:4px;list-style:none;border:1px solid rgba(255,255,255,0.065);border-radius:8px;background:#1b212b;box-shadow:0 8px 24px rgba(0,0,0,0.6);} .ds-vs-opt{padding:6px 9px;border-radius:4px;font-size:10px;font-weight:500;color:#c9d1d9;cursor:pointer;} .ds-vs-opt[aria-selected='true']{background:rgba(255,255,255,0.08);color:#e6edf3;} @media (prefers-reduced-motion: reduce){.ds-vs-chev{transition:none;}}"
     },
     {
-      "name": "Provider Badge",
+      "name": "Titlebar Key",
+      "kind": "button",
+      "refersTo": "key",
+      "description": "The whole titlebar control cluster: a 24px transparent grid cell whose glyph brightens on hover. Latched controls keep the brighter glyph.",
+      "html": "<button class='ds-key' aria-label='Always on top' aria-pressed='true'><svg width='12' height='12' viewBox='0 0 12 12' aria-hidden='true'><path d='M6 1v10M2 5l4-4 4 4' fill='none' stroke='currentColor' stroke-width='1.4'/></svg></button>",
+      "css": ".ds-key{display:grid;place-items:center;width:24px;height:24px;padding:0;border:none;border-radius:6px;background:transparent;color:#6e7681;cursor:pointer;transition:color 0.12s ease,background-color 0.12s ease;} .ds-key:hover{color:#e6edf3;background:rgba(255,255,255,0.04);} .ds-key[aria-pressed='true']{color:#c9d1d9;} .ds-key:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+    },
+    {
+      "name": "Sync Pill",
+      "kind": "chip",
+      "refersTo": "pill-status",
+      "description": "Freshness as text and a hairline dot — no capsule. A polite live region; its degraded variants stay slate because a freshness pill never turns red.",
+      "html": "<span class='ds-pill' role='status' aria-live='polite' data-state='offline'><i class='ds-pill-dot'></i>Offline · 4m</span>",
+      "css": ".ds-pill{display:inline-flex;align-items:center;gap:6px;font-family:Geist,sans-serif;font-size:10px;font-weight:500;color:#6e7681;font-variant-numeric:tabular-nums;white-space:nowrap;} .ds-pill-dot{width:5px;height:5px;border-radius:999px;background:#34d399;} .ds-pill[data-state='offline'] .ds-pill-dot,.ds-pill[data-state='paused'] .ds-pill-dot,.ds-pill[data-state='cached'] .ds-pill-dot{background:#6e7681;}"
+    },
+    {
+      "name": "Update Invitation",
+      "kind": "button",
+      "refersTo": "update-invite",
+      "description": "The app's only update affordance, centered in the titlebar and rendered only when a release was found. Brand cyan because it is an invitation, not an alarm.",
+      "html": "<button class='ds-update'>Update 1.4.2</button>",
+      "css": ".ds-update{display:inline-flex;align-items:center;height:22px;padding:0 10px;border:1px solid rgba(34,211,238,0.3);border-radius:6px;background:rgba(34,211,238,0.1);font-family:Geist,sans-serif;font-size:10px;font-weight:600;letter-spacing:0.02em;color:#22d3ee;white-space:nowrap;cursor:pointer;transition:background-color 0.12s ease,border-color 0.12s ease;} .ds-update:hover:not(:disabled){background:rgba(34,211,238,0.16);border-color:rgba(34,211,238,0.45);} .ds-update:disabled{opacity:0.55;cursor:default;} .ds-update:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+    },
+    {
+      "name": "Provider Chip",
       "kind": "chip",
       "refersTo": "badge-provider",
-      "description": "The fixed provider color-code as a pill: Claude orange, Codex blue, MiniMax violet, Agent orchid. One provider, one color, every surface.",
-      "html": "<span class='ds-badge ds-badge--codex'>Codex</span>",
-      "css": ".ds-badge{display:inline-flex;align-items:center;border-radius:999px;padding:1px 6px;font-family:Geist,sans-serif;font-size:9px;font-weight:700;letter-spacing:0.11em;text-transform:uppercase;} .ds-badge--claude{background:rgba(251,146,60,0.12);color:#fb923c;} .ds-badge--codex{background:rgba(96,165,250,0.12);color:#60a5fa;} .ds-badge--minimax{background:rgba(167,139,250,0.14);color:#a78bfa;} .ds-badge--agent{background:rgba(192,132,252,0.14);color:#c084fc;}"
+      "description": "The fixed provider color-code: Claude orange, Codex blue, MiniMax violet, Agent orchid. One provider, one color, every surface — and never a severity hue.",
+      "html": "<span class='ds-chip ds-chip--codex'>Codex</span>",
+      "css": ".ds-chip{display:inline-flex;align-items:center;border-radius:999px;padding:1px 6px;font-family:Geist,sans-serif;font-size:8px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;} .ds-chip--claude{background:rgba(251,146,60,0.12);color:#fb923c;} .ds-chip--codex{background:rgba(96,165,250,0.12);color:#60a5fa;} .ds-chip--minimax{background:rgba(167,139,250,0.14);color:#a78bfa;} .ds-chip--agent{background:rgba(192,132,252,0.14);color:#c084fc;} .ds-chip--neutral{background:rgba(255,255,255,0.06);color:#8b949e;}"
     },
     {
-      "name": "Search Input",
-      "kind": "input",
-      "refersTo": "input-search",
-      "description": "Text field with a signal-blue focus ring (the corrected behavior — green focus is forbidden, it collides with the meter).",
-      "html": "<input class='ds-input' type='text' placeholder='Search sessions…' />",
-      "css": ".ds-input{width:100%;box-sizing:border-box;padding:8px 10px;background:#1a1a1f;border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:#d4d4d4;font-family:Geist,sans-serif;font-size:12px;outline:none;transition:border-color 0.15s,box-shadow 0.15s;} .ds-input::placeholder{color:rgba(255,255,255,0.3);} .ds-input:focus{border-color:#60a5fa;box-shadow:0 0 0 1px rgba(96,165,250,0.25);}"
-    },
-    {
-      "name": "Insight Card",
-      "kind": "card",
-      "refersTo": "card",
-      "description": "Resting surface defined by a graphite fill + 1px border, no shadow. Big tabular value, dim label, severity-tinted trend.",
-      "html": "<div class='ds-card'><div class='ds-card-head'><span class='ds-card-label'>Tokens / hr</span><span class='ds-card-trend'>+12%</span></div><div class='ds-card-value'>48.2k</div><div class='ds-card-sub'>last 24h</div></div>",
-      "css": ".ds-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:10px;font-family:Geist,sans-serif;} .ds-card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;} .ds-card-label{font-size:9px;color:#8b949e;text-transform:uppercase;letter-spacing:0.11em;} .ds-card-trend{font-size:8px;padding:1px 6px;border-radius:8px;color:#34d399;background:rgba(52,211,153,0.12);} .ds-card-value{font-size:20px;font-weight:700;line-height:1;color:#e6edf3;font-variant-numeric:tabular-nums;} .ds-card-sub{font-size:9px;color:#6e7681;margin-top:2px;}"
-    },
-    {
-      "name": "Tooltip",
+      "name": "Readout Cell",
       "kind": "custom",
-      "refersTo": "popover",
-      "description": "Square dark popover, 1px border, popover shadow. No arrow, no diamond — the instrument doesn't decorate.",
-      "html": "<div class='ds-tooltip'>Working-context preservation keeps large transient data out of the transcript.</div>",
-      "css": ".ds-tooltip{max-width:240px;padding:8px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-family:Geist,sans-serif;font-size:11px;line-height:1.45;box-shadow:0 8px 24px rgba(0,0,0,0.6);}"
+      "refersTo": "value",
+      "description": "One cell of the 3x2 metric grid. The metric hue appears only on the swatch and the sparkline stroke plus its endpoint; the value stays Text Hi.",
+      "html": "<div class='ds-readout'><span class='ds-readout-label'><i class='ds-readout-swatch'></i>Runtime</span><span class='ds-readout-value'>4h 12m</span><svg class='ds-readout-spark' viewBox='0 0 60 13' aria-hidden='true'><path d='M0 10L12 8L24 9L36 4L48 6L60 2' fill='none' stroke='#22d3ee' stroke-opacity='0.6' stroke-width='1.2'/><circle cx='60' cy='2' r='1.6' fill='#22d3ee'/></svg></div>",
+      "css": ".ds-readout{display:flex;flex-direction:column;gap:3px;font-family:Geist,sans-serif;} .ds-readout-label{display:flex;align-items:center;gap:5px;font-size:9px;font-weight:500;color:#6e7681;} .ds-readout-swatch{width:5px;height:5px;border-radius:999px;background:#22d3ee;} .ds-readout-value{font-size:15px;font-weight:600;letter-spacing:-0.01em;line-height:1.15;color:#e6edf3;font-variant-numeric:tabular-nums;} .ds-readout-spark{display:block;width:100%;height:13px;}"
     },
     {
-      "name": "Analytics Tab",
-      "kind": "nav",
-      "refersTo": "tab-active",
-      "description": "Five-tab underline navigation (never a pill). Models uses signal-blue only as active selection chrome; raw model IDs remain neutral and provider badges retain provider hues.",
-      "html": "<div class='ds-atabs' role='tablist' aria-label='Analytics'><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Now</button><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Trends</button><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Charts</button><button class='ds-atab ds-atab--active' role='tab' aria-selected='true' tabindex='0'>Models</button><button class='ds-atab' role='tab' aria-selected='false' tabindex='-1'>Context</button></div>",
-      "css": ".ds-atabs{display:flex;gap:0;max-width:100%;min-width:0;overflow-x:auto;} .ds-atab{flex:0 0 auto;background:none;border:none;border-bottom:2px solid transparent;color:#484f58;font-family:Geist,sans-serif;font-size:11px;font-weight:600;padding:5px 14px;cursor:pointer;transition:color 0.15s ease;} .ds-atab:hover{color:rgba(255,255,255,0.7);} .ds-atab--active{color:#e6edf3;border-bottom-color:#60a5fa;} .ds-atab:focus-visible{outline:2px solid rgba(96,165,250,0.7);outline-offset:2px;}"
+      "name": "Band Rule",
+      "kind": "custom",
+      "refersTo": "rule",
+      "description": "The only structural device in the system. One hairline between two bands — never a border on each, never a card around either.",
+      "html": "<div class='ds-band'>LIMITS</div><div class='ds-rule'></div><div class='ds-band'>USAGE</div>",
+      "css": ".ds-band{padding:12px 14px;font-family:Geist,sans-serif;font-size:10px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;color:#8b949e;background:#14181f;} .ds-rule{height:1px;background:rgba(255,255,255,0.045);}"
     }
   ],
   "narrative": {
-    "northStar": "The Glass Cockpit",
-    "overview": "Quill is an instrument, not a dashboard. A glass cockpit is a calm, dark panel that surfaces system state and tiers its alarms by severity, so the operator stays ahead of the aircraft without staring. Quill watches what a coding agent can't see about itself — what it is burning and where it stands against the limits — and reports it with the exactness of a flight instrument. The aesthetic borrows the principles of that world (a strict color budget, severity tiers, numbers that never jitter, hairlines instead of chrome), not its skin. The system runs in two densities of the same instrument: the always-on Primary Flight Display (the dense live analytics you monitor at a glance) and the roomier Systems Pages (search, learning, agents, memory, settings — the same instrument zoomed out, for managing). Same tokens, same control vocabulary, inverted spacing.",
+    "northStar": "Flat Polish",
+    "overview": "Quill is an instrument, not a dashboard. The whole app is one flat plane — a single near-black surface (#14181f) ruled into bands by hairlines, carrying nothing that is not a number, a label, or the shape of a number. No cards, no raised panels, no gradients, no glow. Depth is spent only on layers that genuinely leave the plane: a dropdown, a tooltip, a dialog. This is the discipline of a glass cockpit taken to its conclusion: keep the severity meter, the tabular figures, and the strict color budget, and remove the last of the chrome — the boxes. The system runs at one density, set by the 360px always-on-top widget: a 14px gutter, an 8/10/12/16px vertical ladder, 10px base type. The legacy Manage, settings, and release-notes windows keep their current roomier density until their own redesign pass; that is a stated migration exception, not a second doctrine.",
     "keyCharacteristics": [
-      "Near-black canvas, chosen for contrast headroom.",
-      "A reserved three-color severity meter (green / amber / red) is the system's spine.",
-      "Color is semantic-only and on a strict budget; chrome is grayscale.",
+      "One flat surface for the whole widget; bands are separated by hairlines, never by boxes.",
+      "A reserved three-color severity meter (green / amber / red) is the system's spine and carries no other meaning.",
+      "Color is identity or severity, never decoration; chrome is grayscale and degraded reads are slate.",
       "Numbers are tabular and never reflow; values are bright, labels are dim.",
-      "Structure is carried by 1px hairlines and flat tonal panels, never by cards and shadows.",
-      "Two densities, one identity: a dense cockpit and roomy systems pages."
+      "Type runs 8px to 26px, with 8px as a hard floor.",
+      "A single density; motion is short, functional, and reduced-motion aware."
     ],
     "rules": [
-      { "name": "The Severity Code Rule", "body": "Green, amber, and red are reserved for threshold state. They never decorate, brand, or indicate category. If a green thing is not 'healthy', it is a bug.", "section": "colors" },
-      { "name": "The Reserved-Status Rule", "body": "Provider identity (Claude orange / Codex blue / MiniMax violet / Agent orchid) never overlaps the severity meter. Claude orange is deliberately redder than caution amber #fbbf24, which stays severity-only; a provider hue rendering as green or amber is forbidden.", "section": "colors" },
-      { "name": "The Model-Shade Rule", "body": "A model is a shade of its provider's family ramp, assigned by in-scope rank within the provider; rank seven and beyond folds to neutral. Identity always renders swatch + name, and the chart adjacency palette is validated against the canvas. The same model keeps the same shade on every surface of a page.", "section": "colors" },
-      { "name": "The Dimming Ladder Rule", "body": "Hierarchy is built by brightness, not hue. Step down a ladder of white alpha or Readout to Label to Label-Faint. Reach for a new color only when it carries new meaning.", "section": "colors" },
+      { "name": "The Severity Code Rule", "body": "Green, amber, and red are reserved for threshold state. They never decorate, brand, or indicate category, and they never mark a failed or degraded read — that is slate. A delta takes green or red only when its meaning is known to be good or bad; unknown goodness stays neutral.", "section": "colors" },
+      { "name": "The Reserved-Status Rule", "body": "Provider identity and metric identity never overlap the severity meter in either direction. Where a diverging pair is a category rather than a threshold (added versus removed lines), it is drawn from the metric ramp, never from green/red.", "section": "colors" },
+      { "name": "The Cyan Dual-Role Rule", "body": "Signal Cyan #22d3ee is Quill's brand accent and the runtime/throughput metric hue. Both roles are Quill speaking about itself, which is why cyan is never assigned to a provider family. Cyan is not an interactive accent: selection and focus remain Signal Blue.", "section": "colors" },
+      { "name": "The Model-Shade Rule", "body": "A model is a shade of its provider's family ramp, assigned by in-scope rank; rank seven and beyond folds to neutral. Identity always renders swatch plus raw id, and the same model keeps the same shade on every surface of a view.", "section": "colors" },
+      { "name": "The Dimming Ladder Rule", "body": "Hierarchy is built by brightness, not hue. Step down Text Hi to Text to Label to Faint. Reach for a new color only when it carries new meaning.", "section": "colors" },
+      { "name": "The No-Decorative-Gradient Rule", "body": "Gradients are permitted in exactly one place: the vertical fade under a chart area, where it is the series' own value-encoding surface. No gradient backgrounds, buttons, borders, headers, or text.", "section": "colors" },
+      { "name": "The 8px Floor Rule", "body": "No text renders below 8px. 8px is reserved for non-essential orientation labels (window names, axis ticks); anything a user must read to act is 10px or larger.", "section": "typography" },
       { "name": "The Tabular Rule", "body": "Every live or comparative number uses tabular figures. A readout that reflows as its value ticks is broken.", "section": "typography" },
       { "name": "The Mono-for-Truth Rule", "body": "Monospace is for things that are code or identifiers. It is never used on a label to look technical; jitter-free digits are tabular-nums, not a mono font.", "section": "typography" },
-      { "name": "The Floats-Only Rule", "body": "A shadow means 'this floats'. A surface sitting on the canvas never has one. Glow, neon, and colored shadows are forbidden.", "section": "elevation" }
+      { "name": "The Floats-Only Rule", "body": "A shadow means 'this floats'. A region of the plane never has one. Glow, neon, and colored shadows are forbidden.", "section": "elevation" },
+      { "name": "The Hairline Rule", "body": "Structure is carried by 1px lines at 4-6% white and by the spacing ladder. Two adjacent bands get one rule between them, never a rule each.", "section": "elevation" }
     ],
     "dos": [
-      "Do reserve green / amber / red for status only, on the 50% / 80% thresholds.",
-      "Do give every provider exactly one fixed family hue (Claude orange, Codex blue, MiniMax violet, Agent orchid) — never a severity hue — and shade models within their provider family by in-scope rank.",
-      "Do set font-variant-numeric: tabular-nums on every live or compared number.",
-      "Do structure with 1px hairlines and flat graphite panels.",
+      "Do build on one flat surface and separate bands with a hairline and space.",
+      "Do reserve green / amber / red for threshold state on the 50% / 80% thresholds, and render degraded or failed reads in slate.",
+      "Do give every provider exactly one fixed family hue (Claude orange, Codex blue, MiniMax violet, Agent orchid) and shade models within their provider family by in-scope rank.",
+      "Do keep metric hues on sparkline strokes, endpoints, and swatches only — values stay Text Hi.",
+      "Do set font-variant-numeric: tabular-nums on every live or compared number, and keep type at 8px or above.",
       "Do make values bright and labels dim; build hierarchy with brightness and weight, not new hues.",
-      "Do invert density by mode — pack the PFD, give the Systems Pages room — keeping one control vocabulary.",
-      "Do keep motion functional and fast, and honor prefers-reduced-motion."
+      "Do keep motion functional and fast and honor prefers-reduced-motion.",
+      "Do expose the value: progressbar roles, live regions, and labeled button groups, so nothing is inferred from pixel width."
     ],
     "donts": [
+      "Don't introduce a card, a panel border, or a second resting surface; a band that needs separating needs a rule and more space.",
+      "Don't use a gradient anywhere except a chart area's own surface fade, and never a shadow on anything that has not left the plane.",
       "Don't ship a generic SaaS template: no gradient hero, no big-number metric panels, no pill buttons, no identical card grids.",
-      "Don't reach for AI-hype / crypto finishes: no neon gradients, no glassmorphism, no glow, no colored shadows.",
-      "Don't go playful-consumer: no bubbly palette, no radius above 8px (pills excepted), no emoji, no mascots.",
-      "Don't drift corporate-enterprise: no stock-photo blue, no gray-on-gray with acres of padding and three numbers on screen.",
-      "Don't let a provider change color between panels, and don't let a category hue borrow a status color.",
-      "Don't focus inputs in green; focus is signal-blue.",
-      "Don't use proportional figures for live numbers.",
-      "Don't cram editable controls into the always-on PFD; they belong in the Systems Pages.",
-      "Don't add another launcher window to the titlebar junk drawer; consolidate, don't extend."
+      "Don't reach for AI-hype / crypto finishes: no glassmorphism, no glow, no colored shadows.",
+      "Don't go playful-consumer: no bubbly palette, no radius above 12px (the shell) or 8px (anything inside it), no emoji, no mascots.",
+      "Don't let a provider or metric hue borrow a status color, or let a status color mark a failed read.",
+      "Don't color a selected state; selection is an 8% white fill plus brightness, and focus is signal-blue.",
+      "Don't render text below 8px, or use proportional figures for live numbers.",
+      "Don't put editable controls in the widget; search, forms, and settings belong in the management windows."
     ]
   }
 }

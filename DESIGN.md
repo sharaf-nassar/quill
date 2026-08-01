@@ -1,21 +1,24 @@
 ---
 name: Quill
-description: A calm, exact instrument for AI coding agents — the Glass Cockpit.
+description: A calm, exact instrument for AI coding agents — one flat plane, ruled by hairlines.
 colors:
+  surface: "#14181f"
+  inset: "#0f1319"
+  menu-raised: "#1b212b"
   console-black: "#121216"
   panel-deep: "#0d1117"
   panel-raised: "#1e1e24"
   card-graphite: "#161b22"
   slate-input: "#1a1a1f"
   graphite-line: "#21262d"
-  hairline: "#ffffff1a"
-  hairline-faint: "#ffffff0f"
-  fill-ghost: "#ffffff0a"
-  fill-hover: "#ffffff14"
+  line: "#ffffff10"
+  line-soft: "#ffffff0b"
+  hover: "#ffffff0a"
+  text-hi: "#e6edf3"
+  text: "#c9d1d9"
   readout: "#d4d4d4"
-  readout-bright: "#e6edf3"
   label: "#8b949e"
-  label-faint: "#6e7681"
+  faint: "#6e7681"
   meter-green: "#34d399"
   meter-amber: "#fbbf24"
   meter-red: "#f87171"
@@ -25,35 +28,63 @@ colors:
   signal-orchid: "#c084fc"
   provider-claude: "#fb923c"
   provider-codex: "#60a5fa"
+  provider-minimax: "#a78bfa"
+  provider-agent: "#c084fc"
+  metric-runtime: "#22d3ee"
+  metric-tok-per-loc: "#a78bfa"
+  metric-loc-per-hr: "#f472b6"
+  metric-sessions: "#818cf8"
+  metric-projects: "#2dd4bf"
+  metric-net-lines: "#a3e635"
+  context-preserved: "#22d3ee"
+  context-retrieved: "#60a5fa"
+  context-routing: "#a78bfa"
 typography:
-  data:
+  hero:
     fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-    fontSize: "20px"
-    fontWeight: 700
+    fontSize: "26px"
+    fontWeight: 650
     lineHeight: 1
+    letterSpacing: "-0.02em"
+    fontFeature: "'tnum' 1"
+  value:
+    fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    fontSize: "15px"
+    fontWeight: 600
+    lineHeight: 1.15
     letterSpacing: "-0.01em"
     fontFeature: "'tnum' 1"
-  title:
+  row:
     fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-    fontSize: "13px"
-    fontWeight: 600
+    fontSize: "11.5px"
+    fontWeight: 500
     lineHeight: 1.3
   body:
     fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-    fontSize: "11px"
+    fontSize: "10.5px"
     fontWeight: 500
     lineHeight: 1.45
+  meta:
+    fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    fontSize: "10px"
+    fontWeight: 500
+    lineHeight: 1.2
   label:
     fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-    fontSize: "9px"
-    fontWeight: 700
+    fontSize: "10px"
+    fontWeight: 600
     lineHeight: 1
-    letterSpacing: "0.11em"
+    letterSpacing: "0.1em"
+  micro:
+    fontFamily: "Geist, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    fontSize: "8px"
+    fontWeight: 500
+    lineHeight: 1.2
   mono:
     fontFamily: "'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace"
-    fontSize: "11px"
+    fontSize: "10px"
     fontWeight: 500
-    lineHeight: 1.45
+    lineHeight: 1.4
     fontFeature: "'tnum' 1, 'zero' 1"
 rounded:
   sharp: "0"
@@ -61,6 +92,7 @@ rounded:
   sm: "4px"
   md: "6px"
   lg: "8px"
+  shell: "12px"
   pill: "999px"
 spacing:
   "2xs": "2px"
@@ -70,338 +102,434 @@ spacing:
   lg: "10px"
   xl: "12px"
   "2xl": "16px"
+  gutter: "14px"
 components:
-  button-primary:
-    backgroundColor: "{colors.signal-blue}"
-    textColor: "#0a0f1a"
-    rounded: "{rounded.xs}"
-    padding: "4px 9px"
-    typography: "{typography.label}"
-  button-ghost:
+  key:
     backgroundColor: "transparent"
-    textColor: "{colors.label}"
-    rounded: "{rounded.xs}"
-    padding: "4px 11px"
-    typography: "{typography.label}"
+    textColor: "{colors.faint}"
+    rounded: "{rounded.md}"
+    padding: "0"
+    typography: "{typography.meta}"
   toggle-on:
-    backgroundColor: "#34d3991f"
-    textColor: "{colors.meter-green}"
-    rounded: "{rounded.sm}"
-    padding: "4px 10px"
-    typography: "{typography.label}"
+    backgroundColor: "#ffffff14"
+    textColor: "{colors.text-hi}"
+    rounded: "{rounded.md}"
+    padding: "3px 9px"
+    typography: "{typography.meta}"
   toggle-off:
-    backgroundColor: "{colors.fill-ghost}"
-    textColor: "{colors.label}"
-    rounded: "{rounded.sm}"
-    padding: "4px 10px"
-    typography: "{typography.label}"
-  range-tab-active:
-    backgroundColor: "{colors.fill-hover}"
-    textColor: "{colors.readout}"
-    rounded: "{rounded.sm}"
-    padding: "4px 10px"
+    backgroundColor: "transparent"
+    textColor: "{colors.faint}"
+    rounded: "{rounded.md}"
+    padding: "3px 9px"
+    typography: "{typography.meta}"
+  update-invite:
+    backgroundColor: "#22d3ee1a"
+    textColor: "{colors.signal-cyan}"
+    rounded: "{rounded.md}"
+    padding: "0 10px"
+    typography: "{typography.meta}"
+  pill-status:
+    backgroundColor: "transparent"
+    textColor: "{colors.faint}"
+    rounded: "{rounded.sharp}"
+    padding: "0"
+    typography: "{typography.meta}"
+  bar-track:
+    backgroundColor: "#ffffff14"
+    textColor: "{colors.text}"
+    rounded: "{rounded.pill}"
+    padding: "0"
+  rule:
+    backgroundColor: "{colors.line-soft}"
+    textColor: "{colors.faint}"
+    rounded: "{rounded.sharp}"
+    padding: "0"
+  listbox:
+    backgroundColor: "{colors.menu-raised}"
+    textColor: "{colors.text}"
+    rounded: "{rounded.lg}"
+    padding: "4px"
+    typography: "{typography.meta}"
   badge-provider:
-    backgroundColor: "{colors.fill-ghost}"
+    backgroundColor: "#ffffff0a"
     textColor: "{colors.provider-codex}"
     rounded: "{rounded.pill}"
     padding: "1px 6px"
-    typography: "{typography.label}"
+    typography: "{typography.micro}"
   input-search:
     backgroundColor: "{colors.slate-input}"
     textColor: "{colors.readout}"
     rounded: "{rounded.md}"
     padding: "8px 10px"
     typography: "{typography.body}"
-  card:
-    backgroundColor: "{colors.card-graphite}"
-    textColor: "{colors.readout}"
-    rounded: "{rounded.lg}"
-    padding: "10px"
-  tab-active:
-    backgroundColor: "transparent"
-    textColor: "{colors.readout-bright}"
-    padding: "5px 14px"
 ---
 
 # Design System: Quill
 
 ## 1. Overview
 
-**Creative North Star: "The Glass Cockpit"**
+**Creative North Star: "Flat Polish"**
 
-Quill is an instrument, not a dashboard. A glass cockpit is a calm, dark panel that
-surfaces system state and tiers its alarms by severity, so the operator stays ahead
-of the aircraft without staring. Quill watches the one thing a coding agent can't see
-about itself — what it is burning and where it stands against the limits — and reports
-it with the exactness of a flight instrument. The aesthetic is borrowed from the
-principles of that world (a strict color budget, severity tiers, numbers that never
-jitter, hairlines instead of chrome), not from its skin. There are no rivets, no
-gauges-as-decoration, no aviation cosplay.
+Quill is an instrument, not a dashboard. The whole app is **one flat plane** —
+a single near-black surface, ruled into bands by hairlines, carrying nothing
+that is not a number, a label, or the shape of a number. There are no cards, no
+raised panels, no gradients, no glow. Depth is spent only on things that
+genuinely leave the plane: a dropdown, a tooltip, a dialog. Everything else is
+separated by a 1px line and 12–16px of quiet.
 
-The system runs in **two densities of the same instrument.** The **Primary Flight
-Display (PFD)** — the always-on-top live analytics — is maximally dense: 11px type,
-hairline dividers, tabular numerics, semantic meters you read at a glance while you
-fly. The **Systems Pages** — session search, learning, agents, memory,
-settings — are the same instrument zoomed out: roomier spacing, larger hit targets,
-visible labels, one task per view. Same tokens, same control vocabulary, inverted
-spacing. The PFD is for monitoring; the Systems Pages are for managing. Nothing
-editable belongs in the PFD, and nothing glanceable needs the Systems Pages.
+This is the discipline of a glass cockpit taken to its conclusion. A cockpit
+tiers its alarms by severity and refuses to decorate; Flat Polish keeps the
+severity meter, the tabular figures, and the strict color budget, and removes
+the last of the chrome — the boxes. Quill watches the one thing a coding agent
+cannot see about itself (what it is burning and where it stands against the
+limits) and reports it at a glance, from a 360px widget that lives in a screen
+corner while the operator works.
 
-It explicitly rejects the four houses of generic dark UI. It is **not** a generic SaaS
-template (rounded cards, gradient hero, pill buttons, big-number panels). It is **not**
-AI-hype or crypto (neon gradients, glassmorphism, glow). It is **not** a playful
-consumer app (bubbly palettes, heavy rounding, emoji, mascots). It is **not** corporate
-enterprise (stock-photo blue, gray-on-gray, marketing fluff). Instrument-grade sits in
-the narrow band between over-alerting and under-informing: dense, quiet, semantic.
+The system runs at **one density.** The 360px always-on-top widget is the
+primary surface and sets the rhythm: a 14px gutter, 8/10/12/16px vertical
+spacing, a 10px base type size, hairline separators between bands. Everything
+Quill ships is meant to converge on that rhythm. See
+[§6 Density and Migration](#6-density-and-migration) for the one stated
+exception — the legacy Manage/settings/release-notes windows, which keep their
+current roomier density until their own redesign pass.
+
+It explicitly rejects the four houses of generic dark UI. It is **not** a
+generic SaaS template (rounded cards, gradient hero, pill buttons, big-number
+panels). It is **not** AI-hype or crypto (neon gradients, glassmorphism, glow).
+It is **not** a playful consumer app (bubbly palettes, heavy rounding, emoji,
+mascots). It is **not** corporate enterprise (stock-photo blue, gray-on-gray,
+marketing fluff). Instrument-grade sits in the narrow band between
+over-alerting and under-informing: dense, quiet, semantic.
 
 **Key Characteristics:**
-- Near-black canvas, chosen for contrast headroom — black gives the most room for
-  high-contrast semantic signal.
-- A reserved three-color severity meter (green / amber / red) that is the system's spine.
-- Color is semantic-only and on a strict budget; chrome is grayscale.
+- One flat surface (`#14181f`) for the whole widget; bands are separated by
+  hairlines, never by boxes.
+- A reserved three-color severity meter (green / amber / red) that is the
+  system's spine and carries no other meaning anywhere.
+- Color is identity or severity — never decoration. Chrome is grayscale.
 - Numbers are tabular and never reflow; values are bright, labels are dim.
-- Structure is carried by 1px hairlines and flat tonal panels — never by cards and shadows.
-- Two densities, one identity: a dense cockpit and roomy systems pages.
+- Type runs 8px → 26px, with 8px as a hard floor.
+- A single density; motion is short, functional, and reduced-motion aware.
 
 ## 2. Colors
 
-A near-black instrument with a disciplined semantic vocabulary: grayscale chrome,
-a reserved traffic-light meter, and a small ramp of cool hues for category identity.
+One flat plane needs fewer surfaces and stricter hues. The palette is a
+surface pair, a hairline ladder, a brightness-only text ladder, and three
+closed sets of meaningful color: severity, provider identity, and metric
+identity.
 
-### Primary
-- **Signal Blue** (`#60a5fa`): the live, interactive hue. Selection, focus, primary
-  actions, the active state of any control, the current-flight-display accent. The
-  Codex provider family is based on this same blue; identity uses are always
-  disambiguated from selection chrome by riding a badge or swatch with a name.
+### Surfaces
+- **Surface** (`#14181f`): the plane. The widget shell, every band, every row.
+  There is no second resting surface — a band is not a lighter rectangle, it is
+  the same surface between two hairlines.
+- **Inset** (`#0f1319`): the only recess — chart grounds and bar tracks where
+  a value must read *into* the plane.
+- **Menu Raised** (`#1b212b`): the single lifted layer (the view listbox and
+  any popover). It is the only surface allowed a shadow.
+- **Line** (`#ffffff10`) / **Line Soft** (`#ffffff0b`): band separators and
+  in-band rules. **Hover** (`#ffffff0a`): the only hover fill in the system.
+- The legacy Graphite Stack (`--console-black`, `--panel-deep`,
+  `--panel-raised`, `--card-graphite`, `--slate-input`, `--graphite-line`)
+  survives for the not-yet-migrated windows only; see §6.
 
-### Secondary — The Severity Meter
-The instrument's spine. These three encode threshold state and **nothing else.**
-- **Meter Green** (`#34d399`): healthy. Utilization below 50%; success; trend up.
-- **Caution Amber** (`#fbbf24`): warning. Utilization 50–80%; needs-setup state; the
-  update-available control.
-- **Master-Warning Red** (`#f87171`): danger. Utilization at or above 80%; error;
-  unavailable provider; destructive intent.
+### The Text Ladder
+Hierarchy is brightness, never hue.
+- **Text Hi** (`#e6edf3`): values, headlines, the active option. The digits you
+  came to read.
+- **Text** (`#c9d1d9`): rows and running text.
+- **Label** (`#8b949e`) / **Faint** (`#6e7681`): labels, units, meta, inactive
+  controls, and every axis.
 
-### Tertiary — Provider Identity
-Category hues for telling agents apart: two maximally separated provider families
-plus violet, kept clear of the severity ramp so a provider can never masquerade
-as a status.
-- **Claude Orange** (`#fb923c`): the Claude provider family. Deliberately redder
-  than caution amber `#fbbf24` — amber remains severity-only.
-- **Codex Blue** (`#60a5fa`): the Codex provider family. Blue/orange is the
-  canonical colorblind-safe two-group pairing.
-- **MiniMax Violet** (`#a78bfa`): the MiniMax provider (and any additional
-  provider family); doubles as the secondary data-series color in charts.
-- **Agent Orchid** (`#c084fc`): sub-agents and orchestration rows.
-- **Signal Cyan** (`#22d3ee`): Quill's brand accent tying the app to the
-  marketing surface — no longer a provider identity.
+### Severity — The Meter
+The instrument's spine. These three encode threshold state and **nothing
+else.**
+- **Meter Green** (`#34d399`): healthy — utilization below 50%; a delta whose
+  direction is good.
+- **Caution Amber** (`#fbbf24`): warning — utilization 50–80%; an actionable
+  setup state.
+- **Master-Warning Red** (`#f87171`): danger — utilization at or above 80%;
+  error; destructive intent.
+
+A degraded read is not an alarm: an unavailable provider, an offline poll, a
+paused token, and a stale bucket all render **slate** (`--faint`), never red.
+Red means a threshold was crossed, not that a request failed.
+
+### Provider Identity
+Category hues for telling agents apart, kept clear of the severity ramp so a
+provider can never masquerade as a status.
+- **Claude Orange** (`#fb923c`) — deliberately redder than caution amber.
+- **Codex Blue** (`#60a5fa`) — blue/orange is the canonical colorblind-safe
+  two-group pairing.
+- **MiniMax Violet** (`#a78bfa`), **Agent Orchid** (`#c084fc`) — additional
+  provider families and sub-agent/orchestration rows.
 
 **The Model-Shade Rule.** A model is a shade of its provider's family ramp
-(Claude `#fb923c → #7c2d12`/`#ffedd5`, Codex `#60a5fa → #16308f`/`#a7cdfd`,
-others violet), assigned by in-scope rank within the provider; rank seven and
-beyond folds to neutral. Identity is always rendered swatch + name — a shade
-never stands alone — and the chart adjacency palette is validated for contrast
-against the canvas. The same model keeps the same shade on every surface of a
-page.
+(Claude orange family, Codex blue family, every other provider violet),
+assigned by in-scope rank within the provider; rank seven and beyond folds to
+neutral. Identity is always rendered swatch + raw id — a shade never stands
+alone — and the same model keeps the same shade on every surface of a view.
 
-### Neutral — The Graphite Stack
-- **Console Black** (`#121216`): the canvas. Body, titlebar, the PFD ground.
-- **Panel Deep** (`#0d1117`): the deepest recess — tooltips, inset wells.
-- **Panel Raised** (`#1e1e24`): floating layers — menus, popovers, context menus.
-- **Card Graphite** (`#161b22`) + **Graphite Line** (`#21262d`): resting card surface
-  and its 1px border. The card is defined by its border, not a shadow.
-- **Slate Input** (`#1a1a1f`): form-field ground.
-- **Readout** (`#d4d4d4`) / **Readout Bright** (`#e6edf3`): primary text and active
-  headings — the digits you read.
-- **Label** (`#8b949e`) / **Label Faint** (`#6e7681`): muted labels and secondary meta.
+### Metric Identity
+Six fixed hues that name the six readouts, plus three that name the context
+categories. They are permitted on **sparkline strokes, their endpoint dots,
+label swatches, and split-bar segments only.** Values stay Text Hi.
+- Runtime `#22d3ee` · Tokens-per-LOC `#a78bfa` · LOC-per-hour `#f472b6` ·
+  Sessions `#818cf8` · Projects `#2dd4bf` · Net lines `#a3e635`.
+- Context: preserved `#22d3ee` · retrieved `#60a5fa` · routing `#a78bfa`.
 
 ### Named Rules
-**The Severity Code Rule.** Green, amber, and red are reserved for threshold state.
-They never decorate, never brand, never indicate category. If a green thing is not
-"healthy," it is a bug.
 
-**The Reserved-Status Rule.** Provider identity (Claude orange / Codex blue /
-MiniMax violet / Agent orchid) never overlaps the severity meter. Claude orange
-is deliberately redder than caution amber `#fbbf24`, which stays severity-only;
-a provider hue rendering as green or amber is forbidden — the exact drift this
-system was built to kill (Claude once rendered blue, green, *and* purple across
-three surfaces).
+**The Severity Code Rule (amended).** Green, amber, and red are reserved for
+threshold state. They never decorate, never brand, never indicate category,
+and they never mark a failed or degraded read — that is slate. A delta may take
+green or red only when its *meaning* is known to be good or bad (a falling
+tokens-per-LOC is an improvement and reads green); a delta whose goodness is
+unknown stays neutral. If a green thing is not "healthy," it is a bug.
 
-**The Dimming Ladder Rule.** Hierarchy is built by brightness, not hue. Step down a
-ladder of white alpha (`rgba(255,255,255, .92 → .55 → .40 → .25)`) for chrome, or
-between Readout → Label → Label-Faint for content. Reach for a new color only when it
-carries new meaning.
+**The Reserved-Status Rule.** Provider identity and metric identity never
+overlap the severity meter, in either direction. A provider or metric hue
+rendering as green or amber is forbidden — the exact drift this system was
+built to kill. Where a diverging pair is genuinely a category rather than a
+threshold (added versus removed lines), it is drawn from the metric ramp
+(`--metric-net-lines` up, `--metric-loc-per-hr` down), never from green/red.
+
+**The Cyan Dual-Role Rule.** Signal Cyan `#22d3ee` is Quill's own brand accent
+— the titlebar glyph, the update invitation, the marketing tie — *and* the
+runtime/throughput metric hue. Both roles are Quill speaking about itself, so
+they cannot be confused with a provider or a severity; that is exactly why cyan
+is never assigned to a provider family. Cyan is not an interactive accent:
+selection and focus remain Signal Blue.
+
+**The Dimming Ladder Rule.** Hierarchy is built by brightness, not hue. Step
+down Text Hi → Text → Label → Faint, or a ladder of white alpha for chrome.
+Reach for a new color only when it carries new meaning.
+
+**The No-Decorative-Gradient Rule.** Gradients are permitted in exactly one
+place: the vertical fade under a chart area, where it is the series' own
+value-encoding surface. Nowhere else — no gradient backgrounds, buttons,
+borders, headers, or text. Every other fill is flat.
 
 ## 3. Typography
 
-**Display / Data Font:** Geist (with `-apple-system`, Segoe UI fallback)
-**Body & Label Font:** Geist (same family, lower weights)
+**Display / Data / Body Font:** Geist (with `-apple-system`, Segoe UI fallback)
 **Mono Font:** Geist Mono (with `ui-monospace`, SF Mono fallback)
 
-**Character:** Geist is Vercel's typeface built for data and developer surfaces — neutral,
-sharp, with real tabular figures. It is already self-hosted in Quill's brand, so the app
-and the marketing site finally speak one voice. The family is listed first with the
-system stack behind it, so the instrument degrades gracefully to system fonts until Geist
-is wired into the app. One family in many weights carries the entire instrument; there is
-no display/body pairing — product UI doesn't need one.
+**Character:** Geist is built for data and developer surfaces — neutral, sharp,
+with real tabular figures. Both faces are self-hosted variable fonts, so the app
+and the marketing site speak one voice. One family in many weights carries the
+entire instrument; there is no display/body pairing.
 
 ### Hierarchy
-- **Data** (Geist, 700, 20px, line-height 1, tabular): the big live readouts — token
-  totals, the headline number on an insight card. The instrument's largest type.
-- **Title** (Geist, 600, 13px): section and card headings, panel names.
-- **Body** (Geist, 500, 11px, line-height 1.45): rows, primary text, the base size.
-- **Label** (Geist, 700, 9px, uppercase, letter-spacing 0.11em): meta, badges, the
-  small all-caps tags on controls. The dense cockpit's connective tissue.
-- **Mono** (Geist Mono, 500, 11px, tabular + slashed-zero): session ids, file paths,
-  code, diffs, and any aligned numeric column.
+- **Hero** (650, 26px, tracking −0.02em, tabular): the one headline value
+  overlaid on the usage chart. Exactly one per view.
+- **Value** (600, 15px, tracking −0.01em, tabular): readout-cell and trend
+  values — the numbers in the grid.
+- **Row** (500, 11.5px): entity names and their primary values in list rows.
+- **Body** (500, 10.5px): running sentences — the insight line, empty-state
+  copy, disclosures.
+- **Meta** (500/600, 10px): the working size of the instrument — labels,
+  toggles, the sync pill, the view switcher, chips.
+- **Micro** (500, 8px): the floor — rate-limit window labels and chart axis
+  ticks.
+- **Mono** (Geist Mono, 500, 10px, tabular + slashed-zero): raw model ids,
+  session ids, paths, and any aligned identifier column.
 
 ### Named Rules
+
+**The 8px Floor Rule.** No text renders below 8px. 8px is reserved for
+non-essential orientation labels (a window name already stated in the bar's
+accessible name, an axis tick); anything a user must read to act is 10px or
+larger. Below 8px the instrument stops being legible and starts being texture.
+
 **The Tabular Rule.** Every live or comparative number uses tabular figures
-(`font-variant-numeric: tabular-nums`). A readout that reflows as its value ticks is
-broken. This is non-negotiable on meters, stat values, and any numeric table column.
+(`font-variant-numeric: tabular-nums`). A readout that reflows as its value
+ticks is broken. Non-negotiable on meters, values, deltas, countdowns, and any
+numeric column.
 
-**The Mono-for-Truth Rule.** Monospace is for things that *are* code or identifiers —
-ids, paths, diffs, log lines. It is never used on a label "to look technical." If you
-only want digits to stop jittering, that is `tabular-nums`, not a monospace font.
+**The Mono-for-Truth Rule.** Monospace is for things that *are* code or
+identifiers — raw model ids, session ids, paths. It is never used on a label
+"to look technical." If you only want digits to stop jittering, that is
+`tabular-nums`, not a monospace font.
 
-## 4. Elevation
+## 4. Surface and Elevation
 
-Quill is flat at rest and lifts only what floats. A resting surface — a card, a row, a
-panel — is defined by a flat graphite fill and a 1px hairline or graphite-line border,
-never by a shadow. Depth appears exactly when a layer leaves the plane of the canvas:
-menus, tooltips, and popovers cast a soft, dark, diffuse shadow that says "this is
-above the instrument." Because the ground is near-black, these shadows are dark rather
-than gray, and they carry no colored glow.
+Quill is flat. A band, a row, a readout cell, a chart — none of them is a
+box: no fill of its own, no border, no shadow, no radius. They are regions of
+the one surface, separated by a 1px `line-soft` rule and by space. The only
+radii in the system belong to the window shell (12px), controls (4–8px), and
+tracks (pill).
+
+Depth is spent on exactly one thing: a layer that has genuinely left the plane.
 
 ### Shadow Vocabulary
-- **Menu** (`box-shadow: 0 4px 12px rgba(0,0,0,0.5)`): dropdown and context menus
-  raised off the canvas.
-- **Popover** (`box-shadow: 0 8px 24px rgba(0,0,0,0.6)`): tooltips and detached
-  floating panels — the highest everyday layer.
-- **Modal** (`box-shadow: 0 24px 40px rgba(0,0,0,0.45)`): confirmation dialogs, the
-  rare full-attention layer.
-- **Inset Ring** (`box-shadow: inset 0 0 0 1px rgba(255,255,255,0.20)`): a 1px keyline
-  for keyboard focus on chrome where an outline would clip.
+- **Listbox / Popover** (`box-shadow: 0 8px 24px rgba(0,0,0,0.6)`): the view
+  switcher's menu and any tooltip. The only everyday shadow.
+- **Modal** (`box-shadow: 0 24px 40px rgba(0,0,0,0.45)`): confirmation dialogs
+  in the management windows — the rare full-attention layer.
 
 ### Named Rules
-**The Floats-Only Rule.** A shadow means "this floats." A surface sitting on the canvas
-never has one. If a card has a drop shadow, delete the shadow and give it a
-`graphite-line` border instead. Glow, neon, and colored shadows are forbidden — they
-are the AI-hype tell.
+
+**The Floats-Only Rule.** A shadow means "this floats." A region of the plane
+never has one. If a band looks like it needs a card, it needs a hairline and
+more space instead. Glow, neon, and colored shadows are forbidden — they are
+the AI-hype tell.
+
+**The Hairline Rule.** Structure is carried by 1px lines at 4–6% white and by
+the spacing ladder. Two adjacent bands get one rule between them, never a rule
+each; a rule inside a band is `line-soft`, a rule between bands is `line`.
 
 ## 5. Components
 
-Every interactive component carries default, hover, focus-visible, and (where it
-applies) active and disabled states. Focus falls back to the global keyline:
-`outline: 2px solid rgba(96,165,250,0.7); outline-offset: 2px`. Density is the variable
-between modes — the PFD packs these tight; the Systems Pages give them room — but the
-shape, color logic, and states never change between the two.
+Every interactive element carries default, hover, focus-visible, and (where it
+applies) pressed and disabled states. Focus is the global keyline:
+`outline: 2px solid rgba(96,165,250,0.7); outline-offset: 2px`. Controls are
+transparent at rest and reveal themselves on hover with the single `hover`
+fill — the plane stays quiet until you reach for it.
 
-### Buttons
-- **Shape:** square to barely-softened (2px). Pills are reserved for status badges, not buttons.
-- **Ghost (default control — the feature tabs):** transparent ground, `label`-dim text,
-  9px uppercase with wide tracking. Hover lifts text toward `readout-bright`; the active
-  tab brightens and grows a 1.5px underline that wipes in (200ms,
-  `cubic-bezier(0.32,0.72,0,1)`). This is the cockpit's primary navigation gesture.
-- **Primary (committed action):** filled `signal-blue` with near-black (`#0a0f1a`) text —
-  the one place blue becomes a background. Used sparingly, for the active filter or the
-  one affirmative action in a view.
-- **Hover / Focus:** 0.15s ease on color and background; never animate layout.
+### Keys (icon controls)
+- **Shape:** 24×24 grid cell, 6px radius, transparent ground, `faint` glyph.
+- **States:** hover lifts the glyph to Text Hi over the `hover` fill; a
+  latched key (always-on-top engaged) keeps the brighter glyph. 120ms on
+  color and background; never animate layout.
+- This is the whole titlebar right cluster: sync pill, always-on-top, settings,
+  close.
 
-### Toggles (provider / feature switches)
-- **Shape:** 4px radius, 48px min-width, 9–10px uppercase label, tabular.
-- **States map to the severity vocabulary:** ON = `meter-green` text on a 12%-green
-  fill; OFF = `label`-dim on `fill-ghost`; SETUP = `caution-amber`; UNAVAILABLE =
-  `meter-red`; BUSY = `signal-blue` with a slow 1.1s opacity pulse. The switch *is* the
-  status light.
+### Toggle Strips (range, breakdown mode, any button group)
+- **Shape:** 6px radius, 3px × 9px padding, 10px meta type, transparent at rest.
+- **Selected** is `aria-pressed="true"` and *only* that: an 8% white fill with
+  Text Hi at weight 600. Selection is never a hue — a colored pressed state
+  would compete with severity.
+- These are labeled button groups, not tablists; the accessible state and the
+  visual state are the same attribute.
 
-### Range & Tab Controls
-- **Range tabs (1H / 24H / 7D / 30D):** a segmented group on a `fill-ghost` ground, 6px
-  radius, 2px inset. The active tab fills to `fill-hover` with `readout` text; the
-  group dims to 35% opacity when a selection elsewhere overrides it.
-- **Analytics tabs (Now / Trends / Charts / Models / Context):** underline
-  indicator, never a pill. A 2px bottom border is transparent by default and
-  appears when active. Models uses `signal-blue` as interactive selection chrome;
-  this accent never colors raw model identifiers or implies model-family identity.
-  Provider badges retain fixed provider hues, model IDs remain neutral, and the
-  five-tab layout scrolls horizontally without truncating labels. Active labels
-  brighten to `readout-bright`.
-- **Model history focus:** the selected-model chart series uses `signal-blue` and
-  a visible "Selected model" label because blue means current selection. Every
-  selected model uses that same treatment; provider badges alone carry provider
-  identity, and no raw model ID receives a generated hue.
-- **Range/provider filter semantics:** use separately labeled native-button groups
-  with `aria-pressed`; these are filters, not nested tablists. Chart buckets expose
-  the same bounds and series values in a visually hidden semantic table.
+### The View Switcher
+- A **listbox**, because the control has a value: `aria-haspopup="listbox"`
+  with `aria-expanded` on the trigger, exactly one `aria-selected` option,
+  keyboard movement via `aria-activedescendant`.
+- The trigger is 10px uppercase label type with a chevron that rotates 180° on
+  open (150ms, suppressed under reduced motion). The menu is the system's one
+  raised surface: `menu-raised` ground, `line` border, 8px radius, popover
+  shadow.
 
-### Chips & Badges
-- **Provider badge:** a 999px pill, 9px uppercase, 1px 6px. Background is a ~10% tint of
-  the provider's identity hue; text is the hue at full strength. The fixed code —
-  Claude orange, Codex blue, MiniMax violet, Agent orchid — is law (see The
-  Reserved-Status Rule). One provider, one color, every surface.
-- **Outlined glyph chip (e.g. ∞ ALL TIME):** transparent with a 1px `hairline` border,
-  2px radius, 9px uppercase. Active inverts to a filled `signal-blue` with dark text.
-- **Lifecycle badge:** 3px radius, 10px uppercase, a 12%-alpha tint of its state hue.
-  States borrow the severity logic (confirmed=green, stale=amber, rejected=red,
-  candidate=violet, retired=gray).
+### Status Pills and Chips
+- **Sync pill:** text and a hairline dot, no capsule. `role="status"`,
+  `aria-live="polite"`, tabular elapsed time in `faint`. Its degraded variants
+  (offline, paused, cached) key off `data-state` and stay slate — a freshness
+  pill never turns red.
+- **Identity chip:** 999px, 8px micro type, 1px×6px, a ~10% tint of the
+  provider's fixed hue with the hue at full strength as text. One provider, one
+  color, every surface.
+- **Lamp states:** a provider with no live data states `SETUP` in amber when
+  the failure is actionable and `UNAVAILABLE` in slate otherwise — a word and a
+  color, no box.
 
-### Cards / Containers
-- **Corner Style:** 8px (`rounded.lg`).
-- **Background / Border:** `card-graphite` fill with a 1px `graphite-line` border.
-- **Shadow Strategy:** none. Cards rest on the canvas (see The Floats-Only Rule).
-- **Internal Padding:** 10px in the PFD; step up to 12–16px in the Systems Pages.
-- Cards are containers of last resort. Prefer a hairline-divided list to a grid of
-  cards; never nest a card inside a card.
+### The Update Invitation
+The app's only update affordance, centered in the titlebar and rendered only
+once the check has found a release: brand cyan text on a 10% cyan wash with a
+30% cyan hairline, 6px radius. It is an invitation, not an alarm — which is
+precisely why it is cyan and not amber.
 
-### Inputs / Fields
-- **Style:** `slate-input` ground, 1px `hairline` border, 6px radius (4px for compact
-  selects), `readout` text, placeholder at 30% white.
-- **Focus:** border shifts to `signal-blue` with a matching 1px ring
-  (`box-shadow: 0 0 0 1px rgba(96,165,250,0.25)`). **Focus is blue, not green** — a
-  green focus ring collides with the severity meter and is prohibited.
+### Signature Component — The Limit Cell
+The clearest expression of the North Star. Per rate-limit window: a rounded
+percent (11px, tabular), an 8px window label under it, and a 4px `pill`-radius
+track on an 8% white ground whose fill is a discrete
+`green | amber | red` class chosen by the 50/80 thresholds. The fill
+transitions width at 0.3s ease — meter ballistics, calm rather than twitchy.
+The track is a real `role="progressbar"` with `aria-valuenow/min/max` and the
+untruncated window label as its accessible name. A bucket whose reset has
+already elapsed is `stale`: neutral slate, no severity, because a utilization
+measured against a bygone window is not a live threshold. Cells hold their
+column width so rows scan as a table at 360px.
 
-### Signature Component — The Usage Meter Row
-The hero of the PFD and the clearest expression of the North Star. A label/value/countdown
-top line over a thin track. The track is `fill-ghost`; the fill is a discrete
-`meter-green | amber | red` class chosen by the 50/80 thresholds. A thin pace-marker
-(a 2px tick) shows where you *should* be against elapsed time, so utilization reads
-against pace, not in a vacuum. The percent text uses a continuous green→amber→red
-gradient interpolation so the number itself carries severity. Fills transition width at
-0.3s ease — meter ballistics, calm rather than twitchy. Tabular figures throughout.
+### Charts
+- Drawn by an internal SVG kit, not a charting library. Primitives are
+  Sparkline, AreaChart (multi-series with an overlay slot and a hover-only
+  legend chip), and Bars.
+- A sparkline is a metric-hue stroke at 60% opacity plus a solid endpoint dot:
+  no axes, no ticks, no grid.
+- An area series is kept inside the lower ~62% of its box so the overlaid
+  headline never collides with the data, and its fill is the one permitted
+  gradient.
+- Every bar track is a real `role="progressbar"` with a formatted
+  `aria-valuetext`; every chart that carries values a user must read exposes
+  them to assistive tech rather than leaving them as pixel width.
+- Gaps stay gaps. A bucket with no measurable value breaks the line; it is
+  never drawn as zero.
 
-## 6. Do's and Don'ts
+### Inputs (management windows)
+- **Style:** `slate-input` ground, 1px hairline, 6px radius, `readout` text,
+  placeholder at 30% white.
+- **Focus:** border shifts to Signal Blue with a matching 1px ring. **Focus is
+  blue, not green** — a green focus ring collides with the severity meter and
+  is prohibited.
+
+### Motion
+- 120ms on control color/background; 150ms on the chevron; 0.3s ease on bar
+  and meter fills; 200ms `cubic-bezier(0.32,0.72,0,1)` for the one expressive
+  reveal.
+- Every animation, pulse, and skeleton shimmer is wrapped in
+  `prefers-reduced-motion: no-preference`. Under reduced motion fills snap to
+  value and nothing pulses.
+
+## 6. Density and Migration
+
+Flat Polish replaces the previous "two densities" doctrine (a dense Primary
+Flight Display beside roomier Systems Pages) with **one density**, set by the
+360px widget: a 14px gutter, an 8/10/12/16px vertical ladder, 10px base type,
+and hairline band separators.
+
+**The stated exception.** The Manage workspace (Sessions, Learning, Instances,
+Settings), the settings surfaces, and the release-notes window still render in
+their pre-existing roomier density on the Graphite Stack — cards, borders, and
+the older 11px/9px type ladder. That is a migration state, not a second
+doctrine: each of those windows keeps its current density until its own
+redesign pass moves it onto the flat plane. Until then:
+
+- Do **not** propagate card-and-border patterns into new surfaces. New work is
+  built flat.
+- Do **not** back-port Flat Polish tokens piecemeal into a legacy window; a
+  window converts in one pass or not at all, so no surface is ever half-flat.
+- The laws in §2 (severity reserved, provider identity fixed, no decorative
+  gradients, focus is blue) apply to **every** window today, including the
+  unmigrated ones. Only the surface treatment and spacing are deferred.
+
+## 7. Do's and Don'ts
 
 ### Do:
-- **Do** reserve green / amber / red for status only, on the 50% / 80% thresholds. The
-  meter is the spine.
-- **Do** give every provider exactly one fixed family hue (Claude orange, Codex blue,
-  MiniMax violet, Agent orchid) — never a severity hue — and shade models within
-  their provider's family by in-scope rank.
-- **Do** set `font-variant-numeric: tabular-nums` on every live or compared number so
-  readouts never reflow.
-- **Do** structure with 1px hairlines and flat graphite panels. Borders define surfaces.
-- **Do** make values bright (`readout-bright`) and labels dim (`label`); build hierarchy
-  with brightness and weight, not new hues.
-- **Do** invert density by mode: pack the PFD (2/4/6/8px rhythm), give the Systems Pages
-  room (8/10/12/16px), but keep one control vocabulary across both.
-- **Do** keep motion functional and fast (0.15s on state, 0.3s on meter fills) and honor
-  `prefers-reduced-motion`.
+- **Do** build on one flat surface and separate bands with a hairline and
+  space.
+- **Do** reserve green / amber / red for threshold state on the 50% / 80%
+  thresholds, and render degraded or failed reads in slate.
+- **Do** give every provider exactly one fixed family hue (Claude orange,
+  Codex blue, MiniMax violet, Agent orchid) and shade models within their
+  provider's family by in-scope rank.
+- **Do** keep metric hues on sparkline strokes, endpoints, and swatches only —
+  values stay Text Hi.
+- **Do** set `font-variant-numeric: tabular-nums` on every live or compared
+  number, and keep type at 8px or above.
+- **Do** make values bright and labels dim; build hierarchy with brightness and
+  weight, not new hues.
+- **Do** keep motion functional and fast (120ms on state, 0.3s on fills) and
+  honor `prefers-reduced-motion`.
+- **Do** expose the value: progressbar roles, live regions, and labeled button
+  groups, so nothing has to be inferred from pixel width.
 
 ### Don't:
-- **Don't** ship a generic SaaS template: no gradient hero, no big-number metric panels,
-  no pill buttons, no identical icon-heading-text card grids.
-- **Don't** reach for AI-hype / crypto finishes: no neon gradients, no glassmorphism, no
-  glow, no colored shadows. A shadow only ever means "this floats."
-- **Don't** go playful-consumer: no bubbly palette, no corner radius above 8px (pills
-  excepted), no emoji, no mascots.
-- **Don't** drift corporate-enterprise: no stock-photo blue, no gray-on-gray with acres
-  of padding and three real numbers on the screen.
-- **Don't** let a provider change color between panels, and don't let any category hue
-  borrow a status color. Claude is orange everywhere or it's broken.
-- **Don't** focus inputs in green (it collides with the meter) — focus is `signal-blue`.
-- **Don't** use proportional figures for live numbers; jittering digits are an instrument
-  defect.
-- **Don't** cram editable controls — search, forms, settings — into the always-on PFD;
-  they belong in the Systems Pages.
-- **Don't** add another launcher window to the titlebar. The six tool windows are already
-  a junk drawer; consolidate them, don't extend them.
+- **Don't** introduce a card, a panel border, or a second resting surface. If a
+  band needs separating, it needs a rule and more space.
+- **Don't** use a gradient anywhere except a chart area's own surface fade, and
+  never a shadow on anything that has not left the plane.
+- **Don't** ship a generic SaaS template: no gradient hero, no big-number
+  metric panels, no pill buttons, no identical icon-heading-text card grids.
+- **Don't** reach for AI-hype / crypto finishes: no glassmorphism, no glow, no
+  colored shadows.
+- **Don't** go playful-consumer: no bubbly palette, no corner radius above 12px
+  (the shell) or 8px (anything inside it), no emoji, no mascots.
+- **Don't** let a provider or metric hue borrow a status color, or let a status
+  color mark a failed read. Claude is orange everywhere or it's broken.
+- **Don't** color a selected state; selection is an 8% white fill plus
+  brightness, and focus is `signal-blue`.
+- **Don't** render text below 8px, or use proportional figures for live
+  numbers.
+- **Don't** put editable controls in the widget — search, forms, and settings
+  belong in the management windows.

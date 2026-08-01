@@ -298,7 +298,9 @@ Key runtime and dev dependencies for both frontend and backend.
 
 ### Frontend Runtime
 
-React 19, React DOM, Tauri API v2, Tauri plugins (updater, window-state, process), Recharts 3.7, DOMPurify 3.4, and Marked 18.
+React 19, React DOM, Tauri API v2, the Tauri updater plugin, Sentry React 10, DOMPurify 3.4, and Marked 18.
+
+Recharts was removed with the widget redesign — all visualization is the internal SVG kit — and the window-state and process JS bindings went with the dead-code sweep, leaving their Rust crates in place.
 
 ### Frontend Dev
 

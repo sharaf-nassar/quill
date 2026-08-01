@@ -6,7 +6,7 @@ Quill is a cross-platform Claude Code and Codex companion built with Tauri (Rust
 
 The application pairs a Rust backend with a React frontend communicating over Tauri IPC.
 
-- **Frontend**: React 19, TypeScript, Recharts, pure CSS dark theme
+- **Frontend**: React 19, TypeScript, an internal SVG viz kit (no charting dependency), pure CSS dark theme
 - **Backend**: Rust (edition 2024), Tauri 2, Axum HTTP server, SQLite (rusqlite), Tantivy full-text search
 - **AI**: Anthropic API via rig-core SDK for pattern extraction and memory optimization
 - **Build**: Vite (ES2020), Cargo, GitHub Actions CI/CD across Linux/macOS/Windows
@@ -17,11 +17,11 @@ The app runs as three Tauri windows routed by a URL query parameter in [[src/mai
 
 The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
-The Sessions, Learning, Restart, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the PFD titlebar's un-gated Manage button (the cog opens it at the Settings section). It embeds each tool's existing window-view component as a rail section — per-window chrome suppressed via `manage.css` — with inline no-provider states, and folds learning run history into the Learning section. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
+The Sessions, Learning, Restart, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the widget titlebar's settings key or the app-scoped ⌘M / Ctrl+M accelerator. It embeds each tool's existing window-view component as a rail section — per-window chrome suppressed via `manage.css` — with inline no-provider states, and folds learning run history into the Learning section. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
 
 ### Window Configuration
 
-The main widget lives in `src-tauri/tauri.conf.json`, while dynamically created windows are allowed by `src-tauri/capabilities/default.json` for `manage`, `runs`, `sessions`, `learning`, `restart`, `settings`, and `release-notes`.
+The main widget lives in `src-tauri/tauri.conf.json`, while the dynamically created `manage` and `release-notes` windows are allowed by `src-tauri/capabilities/default.json`.
 
 The main window is fixed at 360px wide (`minWidth` = `maxWidth` = 360, `resizable: false`) with a 200-900px height range the shell drives from its content, and stays borderless and transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to the Settings window, which is now the only place it appears.
 
@@ -62,12 +62,12 @@ React and TypeScript sources organized by feature domain under `src/`.
 
 | Directory | Purpose |
 |-----------|---------|
-| [[src/App.tsx]] | Main window: split-pane live + analytics layout |
+| [[src/App.tsx]] | Main window: the 360px widget shell (titlebar, LIMITS, view region) |
 | `src/components/` | UI components organized by feature domain |
-| `src/hooks/` | 15+ custom hooks for Tauri IPC data fetching |
+| `src/hooks/` | Custom hooks for Tauri IPC data fetching, over the shared `useCachedInvoke` primitive |
 | `src/windows/` | Secondary window entry points |
-| `src/utils/` | Formatting helpers (time, tokens, charts) |
-| `src/styles/` | Pure CSS stylesheets (dark theme) |
+| `src/utils/` | Formatting helpers (time, tokens, providers, retention) |
+| `src/styles/` | Pure CSS stylesheets; `index.css` carries the design tokens and every widget section |
 | [[src/types.ts]] | Shared TypeScript type definitions for Rust IPC models and frontend state |
 
 ## Communication Layers

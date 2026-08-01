@@ -116,14 +116,18 @@ restyling, or building any UI — they describe the target visual system.
 
 - **PRODUCT.md** — strategic context: register (`product` — the desktop app UI is the
   primary surface), users, brand personality, anti-references, design principles.
-- **DESIGN.md** — the visual system. North Star **"The Glass Cockpit"**: a near-black
-  instrument with a reserved green/amber/red severity meter, a fixed provider
-  color-code (Claude blue · Codex cyan · MiniMax violet · Agent orchid), Geist /
-  Geist Mono with tabular figures, and two densities (Primary Flight Display vs.
-  Systems Pages). `.impeccable/design.json` is its machine-readable sidecar.
+- **DESIGN.md** — the visual system. North Star **"Flat Polish"**: one flat `#14181f`
+  surface ruled into bands by hairlines (no cards, no gradients, no glow), a reserved
+  green/amber/red severity meter, a fixed provider color-code (Claude orange · Codex
+  blue · MiniMax violet · Agent orchid), six metric hues confined to sparklines and
+  swatches, Geist / Geist Mono with tabular figures on an 8–26px ladder, and a single
+  density set by the 360px widget. `.impeccable/design.json` is its machine-readable
+  sidecar.
 
 These describe the target system, not necessarily the current `src/` — when they
-diverge, the design files are the intent.
+diverge, the design files are the intent. The Manage, settings, and release-notes
+windows are a stated migration exception and keep their current density until their
+own redesign pass (DESIGN.md §6).
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->

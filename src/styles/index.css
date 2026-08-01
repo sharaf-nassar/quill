@@ -2546,7 +2546,7 @@ body {
 .wg-charts-axis {
   display: flex;
   min-height: 11px;
-  font-size: 7.5px;
+  font-size: 8px;
   font-weight: 500;
   line-height: 11px;
   color: var(--faint);

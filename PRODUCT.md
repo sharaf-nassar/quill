@@ -52,8 +52,10 @@ This must explicitly NOT look like:
 - **Corporate enterprise** — stiff stock-photo blue, marketing fluff, dense
   committee-designed blandness.
 
-The shipped design already commits against these: dark `#121216` base, ~11px
-system fonts, ≤6px radius, semantic status colors, density over decoration.
+The shipped design already commits against these — the "Flat Polish" system in
+DESIGN.md: one flat `#14181f` surface ruled into bands by hairlines, an 8–26px
+Geist ladder with tabular figures, ≤8px radius inside the 12px window shell,
+severity colors reserved for threshold state, density over decoration.
 
 ## Design Principles
 
@@ -63,7 +65,7 @@ system fonts, ≤6px radius, semantic status colors, density over decoration.
    at a glance; suppress everything that competes with it.
 3. **Local and honest.** The tool reports ground truth from the user's own machine
    and plan — no inflation, no cloud, no tracking. Trust is the product.
-4. **One vocabulary, eight windows.** Same control shapes, same semantic colors
+4. **One vocabulary, every window.** Same control shapes, same semantic colors
    (green = healthy, yellow = warning, red = error, blue = interactive), same
    affordances everywhere. Familiarity is the feature, not surprise.
 5. **Stay out of the way.** This is an always-on companion to a coding session, not
