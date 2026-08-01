@@ -120,6 +120,16 @@ Priority is fixed and ordered by how much of the story the rest of the widget do
 
 The breakdown switches five modes over one row grammar — status dot, name, identity chip, dim secondary count, primary value, recency — filled per mode: Sessions (provider chip, tokens, live count in the header), Projects (session count, tokens), Hosts (turns, tokens), Skills (uses, last used), Hooks (QUILL chip where Quill-deployed, fires, last fired). Honesty disclosures keep the home that matches their data: the Hooks header carries the Claude/Codex tracking-asymmetry help, and the condensed retention line sits in Sessions, the only mode whose source [[lat.md/frontend#Frontend#Components#Retention Degradation]] actually prunes — skill and hook counts are never pruned, so claiming loss there would be its own lie.
 
+#### Models View
+
+[[src/components/widget/views/ModelsView.tsx#ModelsView]] answers "what am I running, and what did the work" in two bands: a running-now strip, then the session-ranked model list.
+
+Both bands read the region's range through [[src/hooks/useModelAnalytics.ts#useModelAnalytics]], so one usage-overview snapshot serves the whole view and the hook's own coalescing — a one-second window after a committed model event, a 60-second fallback poll — keeps a background instrument off the backend's back. There is no inspect panel: session paging and chain history stay with the full page, so a widget row is deliberately inert.
+
+Identity obeys DESIGN.md's Model-Shade Rule exactly as the full page does. Each model renders as a rank-assigned shade of its provider's family ramp (Claude orange, Codex blue, every other provider violet, rank seven and beyond neutral), assigned once per response from the delivered session-ranked order so both bands agree on a model's shade. A swatch never stands alone — it rides beside the raw id, qualified by a provider chip, and an unrecognized provider keeps a neutral chip rather than borrowing another family's hue. Ids are mono, rendered exactly as observed and ellipsized when they outgrow the column with the full string in `title`; no catalog, alias, or friendly name participates. The ranked list shows the top five models on one shared session scale, each track a real `role="progressbar"`, with attributed tokens beside the id.
+
+Two disclosures keep a compact home here. Coverage states the share of token activity that carries model evidence whenever it is short of 100%, because activity recorded before a chain's first observation stays unattributed instead of being assigned a model. A retained-history line appears only while the backfill needs attention, carrying its state, its processed-source count, and a Retry while the run is retryable; a refused retry states its reason rather than vanishing. Emptiness is a claim the view has to earn: it names the specific negative — no retained sessions, no sessions in range, or sessions carrying no model identifier — only when the backend calls the scope final and the history inventory complete, and otherwise says the evidence is still being processed.
+
 ### Analytics Components
 
 Analytics components in `src/components/analytics/` provide Now, Trends, Charts, Models, and an optional Context tab.

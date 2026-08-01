@@ -12,6 +12,7 @@
 import { useState, type ReactNode } from "react";
 import type { RangeType } from "../../types";
 import ViewSwitcher, { type ViewOption, type WidgetView } from "./ViewSwitcher";
+import ModelsView from "./views/ModelsView";
 import UsageView from "./views/UsageView";
 
 /** The widget's range vocabulary. `30d` stays out — it is not a widget scope. */
@@ -43,6 +44,11 @@ const VIEWS: readonly ViewDefinition[] = [
     id: "usage",
     label: "Usage",
     render: (range) => <UsageView range={range} />,
+  },
+  {
+    id: "models",
+    label: "Models",
+    render: (range) => <ModelsView range={range} />,
   },
 ];
 

@@ -7998,3 +7998,262 @@ html.dragging-divider-h .panels--split :not(.panel-divider) {
     transition: none;
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Models view — provider-qualified model evidence at 360px
+   (src/components/widget/views/ModelsView.tsx)
+
+   Two bands over one grammar: a running-now strip and a session-ranked list.
+   Identity is always a shade swatch *beside* the raw id — the shade is a rank
+   within the provider's family ramp (DESIGN.md, The Model-Shade Rule), never a
+   hue derived from the id, and never standing alone. Ids are mono because they
+   are identifiers, and they ellipsize rather than being rewritten short.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.wg-mv {
+  display: flex;
+  flex-direction: column;
+}
+
+.wg-mv > .wg-state {
+  padding-left: 14px;
+  padding-right: 14px;
+}
+
+.wg-mv-band {
+  padding: var(--space-md) 14px var(--space-lg);
+}
+
+.wg-mv-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-md);
+  margin-bottom: var(--space-sm);
+}
+
+.wg-mv-title {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--label);
+}
+
+.wg-mv-meta {
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+/* Loading occupies the band's own geometry, so the first real paint does not
+   move the rows beneath it. */
+.wg-mv-pending {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-sm) 0;
+}
+
+.wg-mv-now-list,
+.wg-mv-rank {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* ─── Running now — one cell per provider currently producing ─── */
+.wg-mv-now {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  padding: var(--space-xs) 7px;
+  margin: 0 -7px;
+  border-radius: var(--radius-md);
+}
+
+.wg-mv-now:hover {
+  background: var(--hover);
+}
+
+.wg-mv-now-line {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+/* Indented to the id column above it, so the takeover time reads as that
+   model's caption rather than as a new row. */
+.wg-mv-since {
+  padding-left: 78px;
+  font-size: 9.5px;
+  font-weight: 450;
+  color: var(--faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.wg-mv-ago {
+  width: 32px;
+  flex: 0 0 32px;
+  text-align: right;
+  font-size: 10px;
+  font-weight: 450;
+  color: var(--faint);
+}
+
+/* ─── Identity — swatch + raw id, always together ─── */
+.wg-mv-swatch {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 8px;
+  border-radius: var(--radius-xs);
+}
+
+.wg-mv-id {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums slashed-zero;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Session rank — id and tokens over a shared-scale bar ─── */
+.wg-mv-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  padding: var(--space-xs) 7px;
+  margin: 0 -7px;
+  border-radius: var(--radius-md);
+}
+
+.wg-mv-row:hover {
+  background: var(--hover);
+}
+
+.wg-mv-row-top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.wg-mv-row-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  min-width: 0;
+}
+
+.wg-mv-tokens {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-hi);
+  white-space: nowrap;
+}
+
+/* The track is a real role="progressbar"; width is the only thing carrying
+   rank, so every bar in the band shares one denominator. */
+.wg-mv-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 4px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.wg-mv-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  min-width: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--label);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .wg-mv-fill {
+    transition: width 0.3s ease;
+  }
+}
+
+.wg-mv-count {
+  width: 24px;
+  flex: 0 0 24px;
+  text-align: right;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--faint);
+}
+
+/* Unknown providers keep a neutral chip: a family we cannot name does not get
+   to borrow another provider's hue. */
+.wg-row-chip[data-tone="other"] {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--label);
+}
+
+/* ─── Honesty lines — coverage gap, retained-history state ─── */
+.wg-mv-note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+  font-size: 9.5px;
+  font-weight: 500;
+  color: var(--faint);
+  text-wrap: pretty;
+}
+
+.wg-mv-note-alert {
+  color: var(--meter-amber);
+}
+
+.wg-mv-retry {
+  height: 18px;
+  padding: 0 var(--space-md);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-family: inherit;
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--label);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+
+.wg-mv-retry:hover:not(:disabled) {
+  color: var(--text-hi);
+  background: var(--hover);
+}
+
+.wg-mv-retry:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.wg-state .wg-mv-retry {
+  margin-left: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wg-mv-retry {
+    transition: none;
+  }
+}
