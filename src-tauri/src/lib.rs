@@ -60,10 +60,11 @@ use models::{
     ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
     SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats,
     SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
-    TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError,
+    TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError, UsageSource,
 };
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{
     Arc, OnceLock, Weak,
@@ -185,6 +186,12 @@ const MINIMAX_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.minimax.cooldown_until";
 const MINIMAX_USAGE_NETWORK_COOLDOWN_UNTIL_KEY: &str = "usage.minimax.network_cooldown_until";
 const MINIMAX_USAGE_NETWORK_FAILURES_KEY: &str = "usage.minimax.network_failures";
 const MINIMAX_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
+const CPA_USAGE_LAST_ATTEMPT_KEY: &str = "usage.cpa.last_attempt_at";
+const CPA_USAGE_LAST_ACCOUNTS_KEY: &str = "usage.cpa.last_accounts";
+const CPA_USAGE_COOLDOWN_UNTIL_KEY: &str = "usage.cpa.cooldown_until";
+const CPA_USAGE_NETWORK_COOLDOWN_UNTIL_KEY: &str = "usage.cpa.network_cooldown_until";
+const CPA_USAGE_NETWORK_FAILURES_KEY: &str = "usage.cpa.network_failures";
+const CPA_USAGE_FALLBACK_BACKOFF_SECS: i64 = 5 * 60;
 // Exponential backoff for transport-failure (offline) cooldowns. The first
 // failure waits ~30-60 s; each subsequent consecutive failure doubles the
 // target (60s, 120s, 240s, 480s, 960s, 1800s capped). Half-jitter (uniform in
@@ -1773,6 +1780,13 @@ const MINIMAX_COOLDOWN_KEYS: ProviderCooldownKeys = ProviderCooldownKeys {
     fallback_backoff_secs: MINIMAX_USAGE_FALLBACK_BACKOFF_SECS,
 };
 
+const CPA_COOLDOWN_KEYS: ProviderCooldownKeys = ProviderCooldownKeys {
+    rate_limit_cooldown_until: CPA_USAGE_COOLDOWN_UNTIL_KEY,
+    network_cooldown_until: CPA_USAGE_NETWORK_COOLDOWN_UNTIL_KEY,
+    network_failures: CPA_USAGE_NETWORK_FAILURES_KEY,
+    fallback_backoff_secs: CPA_USAGE_FALLBACK_BACKOFF_SECS,
+};
+
 enum ProviderCooldownDecision {
     Proceed,
     UseCachedAsStale,
@@ -1815,12 +1829,26 @@ fn record_network_failure(
     now: DateTime<Utc>,
     provider: integrations::IntegrationProvider,
 ) {
+    record_source_network_failure(keys, now, provider, UsageSource::Direct);
+}
+
+fn record_source_network_failure(
+    keys: ProviderCooldownKeys,
+    now: DateTime<Utc>,
+    provider: integrations::IntegrationProvider,
+    source: UsageSource,
+) {
     let attempts = increment_failure_counter(keys.network_failures);
     let backoff = compute_network_backoff(attempts);
     write_usage_setting_timestamp(keys.network_cooldown_until, now + backoff);
+    let label = if source == UsageSource::Cpa {
+        "cpa"
+    } else {
+        provider.as_str()
+    };
     log::warn!(
         "{} usage transport failure ({attempts} consecutive); cooldown {}s",
-        provider.as_str(),
+        label,
         backoff.num_seconds()
     );
 }
@@ -1981,16 +2009,28 @@ fn classify_minimax_error_kind(kind: fetcher::MiniMaxUsageErrorKind) -> Option<P
     }
 }
 
-// Only partition the usage cache by provider identity and enabled state.
-// Detection and setup metadata can churn without changing whether a fresh
-// in-memory usage snapshot is still valid to reuse.
-fn provider_status_key(statuses: &[ProviderStatus]) -> String {
+// Partition by provider identity/enabled state plus a one-way CPA endpoint
+// fingerprint. The management key never enters the cache key or logs.
+fn provider_status_key(
+    statuses: &[ProviderStatus],
+    cpa_connection: Option<&integrations::cpa::CpaConnection>,
+) -> String {
     let mut fields = statuses
         .iter()
         .map(|status| format!("{}:{}", status.provider.as_str(), status.enabled))
         .collect::<Vec<_>>();
+    if let Some(connection) = cpa_connection {
+        let digest = Sha256::digest(connection.base_url.as_bytes());
+        fields.push(format!("cpa:{}", hex::encode(&digest[..8])));
+    } else {
+        fields.push("cpa:off".to_string());
+    }
     fields.sort();
     fields.join("|")
+}
+
+fn load_cpa_connection() -> Result<Option<integrations::cpa::CpaConnection>, String> {
+    integrations::cpa::load_connection(get_storage()?)
 }
 
 fn current_usage_cache(provider_status_key: &str) -> Option<UsageData> {
@@ -2062,9 +2102,25 @@ fn sort_and_dedup_usage_buckets(buckets: &mut Vec<UsageBucket>) {
 }
 
 fn build_usage_data(
+    buckets: Vec<UsageBucket>,
+    provider_errors: Vec<UsageProviderError>,
+    provider_credits: Vec<models::ProviderCredits>,
+) -> UsageData {
+    build_usage_data_with_cpa(
+        buckets,
+        provider_errors,
+        provider_credits,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+fn build_usage_data_with_cpa(
     mut buckets: Vec<UsageBucket>,
     provider_errors: Vec<UsageProviderError>,
     provider_credits: Vec<models::ProviderCredits>,
+    cpa_accounts: Vec<models::CpaAccountHealth>,
+    cpa_pools: Vec<models::CpaPoolAggregate>,
 ) -> UsageData {
     sort_and_dedup_usage_buckets(&mut buckets);
     // `Paused` (stale Claude access token, see
@@ -2092,17 +2148,124 @@ fn build_usage_data(
         buckets,
         provider_errors,
         provider_credits,
+        cpa_accounts,
+        cpa_pools,
         error,
+    }
+}
+
+fn load_cached_cpa_snapshots() -> Vec<cpa::aggregate::CpaAccountSnapshot> {
+    let Ok(storage) = get_storage() else {
+        return Vec::new();
+    };
+    let accounts = run_blocking(move || storage.get_setting(CPA_USAGE_LAST_ACCOUNTS_KEY))
+        .ok()
+        .flatten()
+        .and_then(|value| serde_json::from_str::<Vec<models::CpaAccountHealth>>(&value).ok())
+        .unwrap_or_default();
+    let cached_buckets = get_storage()
+        .ok()
+        .and_then(|storage| run_blocking(move || storage.get_latest_cpa_usage_buckets()).ok())
+        .unwrap_or_default();
+
+    accounts
+        .into_iter()
+        .map(|health| {
+            let buckets = cached_buckets
+                .iter()
+                .filter(|bucket| {
+                    bucket.account_id.as_deref() == Some(health.auth_index.as_str())
+                        && bucket.provider.as_str() == health.provider
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            cpa::aggregate::CpaAccountSnapshot {
+                health,
+                buckets: (!buckets.is_empty()).then_some(buckets),
+            }
+        })
+        .collect()
+}
+
+fn persist_cpa_accounts(accounts: &[models::CpaAccountHealth]) {
+    let Ok(encoded) = serde_json::to_string(accounts) else {
+        log::warn!("Failed to encode CPA account health snapshot");
+        return;
+    };
+    let Ok(storage) = get_storage() else {
+        return;
+    };
+    if let Err(error) =
+        run_blocking(move || storage.set_setting(CPA_USAGE_LAST_ACCOUNTS_KEY, &encoded))
+    {
+        log::warn!("Failed to persist CPA account health snapshot: {error}");
+    }
+}
+
+fn cpa_window_smoke_gates() -> cpa::poll::WindowSmokeGates {
+    let enabled = |key: &'static str| {
+        let Ok(storage) = get_storage() else {
+            return false;
+        };
+        run_blocking(move || storage.get_setting(key))
+            .ok()
+            .flatten()
+            .is_some_and(|value| value == "true")
+    };
+    cpa::poll::WindowSmokeGates {
+        claude: enabled(integrations::cpa::CLAUDE_SMOKE_SETTING),
+        codex: enabled(integrations::cpa::CODEX_SMOKE_SETTING),
+    }
+}
+
+fn cpa_error_providers(
+    snapshots: &[cpa::aggregate::CpaAccountSnapshot],
+) -> Vec<integrations::IntegrationProvider> {
+    let mut providers = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.health.provider.parse().ok())
+        .filter(|provider| {
+            matches!(
+                provider,
+                integrations::IntegrationProvider::Claude
+                    | integrations::IntegrationProvider::Codex
+            )
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by_key(|provider| provider.as_str());
+    providers.dedup();
+    if providers.is_empty() {
+        providers.push(integrations::IntegrationProvider::Claude);
+    }
+    providers
+}
+
+fn push_cpa_error(
+    errors: &mut Vec<UsageProviderError>,
+    snapshots: &[cpa::aggregate::CpaAccountSnapshot],
+    kind: ProviderErrorKind,
+    message: &str,
+) {
+    for provider in cpa_error_providers(snapshots) {
+        errors.push(UsageProviderError {
+            provider,
+            source: UsageSource::Cpa,
+            kind,
+            message: message.to_string(),
+        });
     }
 }
 
 fn load_cached_usage_data(statuses: &[ProviderStatus]) -> UsageData {
     let enabled_providers = enabled_providers(statuses);
-    if enabled_providers.is_empty() {
+    let cpa_configured = load_cpa_connection().ok().flatten().is_some();
+    if enabled_providers.is_empty() && !cpa_configured {
         return UsageData {
             buckets: Vec::new(),
             provider_errors: Vec::new(),
             provider_credits: Vec::new(),
+            cpa_accounts: Vec::new(),
+            cpa_pools: Vec::new(),
             error: Some("No providers are enabled.".to_string()),
         };
     }
@@ -2114,7 +2277,24 @@ fn load_cached_usage_data(statuses: &[ProviderStatus]) -> UsageData {
         }
     }
 
-    build_usage_data(buckets, Vec::new(), Vec::new())
+    let cpa_snapshots = if cpa_configured {
+        load_cached_cpa_snapshots()
+    } else {
+        Vec::new()
+    };
+    buckets.extend(
+        cpa_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.buckets.as_ref())
+            .flatten()
+            .cloned(),
+    );
+    let cpa_accounts = cpa_snapshots
+        .iter()
+        .map(|snapshot| snapshot.health.clone())
+        .collect();
+    let cpa_pools = cpa::aggregate::compute_cpa_pools(&cpa_snapshots);
+    build_usage_data_with_cpa(buckets, Vec::new(), Vec::new(), cpa_accounts, cpa_pools)
 }
 
 fn build_indicator_state(
@@ -2132,7 +2312,8 @@ fn build_indicator_state(
 }
 
 fn current_indicator_state(statuses: &[ProviderStatus]) -> Result<StatusIndicatorState, String> {
-    let status_key = provider_status_key(statuses);
+    let cpa_connection = load_cpa_connection()?;
+    let status_key = provider_status_key(statuses, cpa_connection.as_ref());
     let usage =
         current_usage_cache(&status_key).unwrap_or_else(|| load_cached_usage_data(statuses));
     build_indicator_state(statuses, &usage)
@@ -2154,7 +2335,8 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
 
     loop {
         let statuses = run_blocking(integrations::detect_all)?;
-        let status_key = provider_status_key(&statuses);
+        let cpa_connection = load_cpa_connection()?;
+        let status_key = provider_status_key(&statuses, cpa_connection.as_ref());
 
         if let Some(usage) = current_recent_usage_cache(&status_key) {
             return Ok(usage);
@@ -2163,11 +2345,13 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
         let refresh_epoch = USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst);
         let enabled_providers = enabled_providers(&statuses);
 
-        if enabled_providers.is_empty() {
+        if enabled_providers.is_empty() && cpa_connection.is_none() {
             let usage = UsageData {
                 buckets: Vec::new(),
                 provider_errors: Vec::new(),
                 provider_credits: Vec::new(),
+                cpa_accounts: Vec::new(),
+                cpa_pools: Vec::new(),
                 error: Some("No providers are enabled.".to_string()),
             };
 
@@ -2188,6 +2372,8 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
         let mut display_buckets = Vec::new();
         let mut provider_errors = Vec::new();
         let mut provider_credits = Vec::new();
+        let mut cpa_snapshots = Vec::new();
+        let mut cpa_buckets_are_live = false;
 
         for provider in enabled_providers {
             match provider {
@@ -2389,6 +2575,111 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
             }
         }
 
+        // CPA runs after every native provider. A dead local proxy therefore
+        // cannot postpone native snapshots, even through its shared 15s HTTP
+        // timeout or bounded per-account fan-out.
+        if let Some(connection) = cpa_connection {
+            let phase_started = std::time::Instant::now();
+            let now = Utc::now();
+            match check_provider_cooldown(CPA_COOLDOWN_KEYS, now) {
+                ProviderCooldownDecision::UseCachedAsStale => {
+                    cpa_snapshots = load_cached_cpa_snapshots();
+                    push_cpa_error(
+                        &mut provider_errors,
+                        &cpa_snapshots,
+                        ProviderErrorKind::Stale,
+                        "Rate limited.",
+                    );
+                }
+                ProviderCooldownDecision::UseCachedAsOffline => {
+                    cpa_snapshots = load_cached_cpa_snapshots();
+                    push_cpa_error(
+                        &mut provider_errors,
+                        &cpa_snapshots,
+                        ProviderErrorKind::Network,
+                        "Offline — showing cached data.",
+                    );
+                }
+                ProviderCooldownDecision::Proceed => {
+                    write_usage_setting_timestamp(CPA_USAGE_LAST_ATTEMPT_KEY, now);
+                    match cpa::client::CpaClient::new(
+                        &connection.base_url,
+                        &connection.management_key,
+                    ) {
+                        Ok(client) => match client.auth_files().await {
+                            Ok(auth_files) => {
+                                clear_provider_cooldowns(CPA_COOLDOWN_KEYS);
+                                cpa_snapshots = cpa::poll::poll_account_snapshots(
+                                    &client,
+                                    auth_files,
+                                    cpa_window_smoke_gates(),
+                                )
+                                .await;
+                                cpa_buckets_are_live = true;
+                                let health = cpa_snapshots
+                                    .iter()
+                                    .map(|snapshot| snapshot.health.clone())
+                                    .collect::<Vec<_>>();
+                                persist_cpa_accounts(&health);
+                            }
+                            Err(cpa::client::CpaError::Unreachable) => {
+                                cpa_snapshots = load_cached_cpa_snapshots();
+                                record_source_network_failure(
+                                    CPA_COOLDOWN_KEYS,
+                                    now,
+                                    integrations::IntegrationProvider::Claude,
+                                    UsageSource::Cpa,
+                                );
+                                push_cpa_error(
+                                    &mut provider_errors,
+                                    &cpa_snapshots,
+                                    ProviderErrorKind::Network,
+                                    "Offline — showing cached data.",
+                                );
+                            }
+                            Err(cpa::client::CpaError::Unauthorized) => {
+                                cpa_snapshots = load_cached_cpa_snapshots();
+                                push_cpa_error(
+                                    &mut provider_errors,
+                                    &cpa_snapshots,
+                                    ProviderErrorKind::Auth,
+                                    "CPA management key was rejected.",
+                                );
+                            }
+                            Err(_) => {
+                                cpa_snapshots = load_cached_cpa_snapshots();
+                                push_cpa_error(
+                                    &mut provider_errors,
+                                    &cpa_snapshots,
+                                    ProviderErrorKind::Paused,
+                                    "Paused",
+                                );
+                            }
+                        },
+                        Err(_) => {
+                            cpa_snapshots = load_cached_cpa_snapshots();
+                            push_cpa_error(
+                                &mut provider_errors,
+                                &cpa_snapshots,
+                                ProviderErrorKind::Paused,
+                                "Paused",
+                            );
+                        }
+                    }
+                }
+            }
+
+            for snapshot in &cpa_snapshots {
+                if let Some(buckets) = snapshot.buckets.as_ref() {
+                    display_buckets.extend(buckets.clone());
+                    if cpa_buckets_are_live {
+                        live_buckets.extend(buckets.clone());
+                    }
+                }
+            }
+            log::info!("cpa_phase_ms={}", phase_started.elapsed().as_millis());
+        }
+
         if USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst) != refresh_epoch {
             continue;
         }
@@ -2406,8 +2697,19 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
             continue;
         }
 
+        let cpa_accounts = cpa_snapshots
+            .iter()
+            .map(|snapshot| snapshot.health.clone())
+            .collect();
+        let cpa_pools = cpa::aggregate::compute_cpa_pools(&cpa_snapshots);
         let usage = store_usage_cache(
-            build_usage_data(display_buckets, provider_errors, provider_credits),
+            build_usage_data_with_cpa(
+                display_buckets,
+                provider_errors,
+                provider_credits,
+                cpa_accounts,
+                cpa_pools,
+            ),
             &status_key,
             &statuses,
         );
@@ -2424,7 +2726,8 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
 async fn fetch_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
     match run_blocking(integrations::detect_all) {
         Ok(statuses) => {
-            let status_key = provider_status_key(&statuses);
+            let cpa_connection = load_cpa_connection()?;
+            let status_key = provider_status_key(&statuses, cpa_connection.as_ref());
             if let Some(usage) = current_recent_usage_cache(&status_key) {
                 emit_usage_updates(&app, &statuses, &usage)?;
                 return Ok(usage);
@@ -5613,7 +5916,12 @@ pub fn run() {
                                 let Ok(tray_storage) = Storage::init() else {
                                     return;
                                 };
-                                let status_key = provider_status_key(&statuses);
+                                let cpa_connection =
+                                    integrations::cpa::load_connection(&tray_storage)
+                                        .ok()
+                                        .flatten();
+                                let status_key =
+                                    provider_status_key(&statuses, cpa_connection.as_ref());
                                 let usage = current_usage_cache(&status_key).unwrap_or_else(|| {
                                     let enabled = enabled_providers(&statuses);
                                     if enabled.is_empty() {
@@ -5621,6 +5929,8 @@ pub fn run() {
                                             buckets: Vec::new(),
                                             provider_errors: Vec::new(),
                                             provider_credits: Vec::new(),
+                                            cpa_accounts: Vec::new(),
+                                            cpa_pools: Vec::new(),
                                             error: Some("No providers are enabled.".to_string()),
                                         };
                                     }
@@ -5794,6 +6104,31 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Unconfigured source null impact]]
+    #[test]
+    fn unconfigured_cpa_has_null_usage_shape_and_secret_free_cache_key() {
+        let usage = build_usage_data(Vec::new(), Vec::new(), Vec::new());
+        assert!(usage.cpa_accounts.is_empty());
+        assert!(usage.cpa_pools.is_empty());
+
+        let unconfigured_key = provider_status_key(&[], None);
+        assert_eq!(unconfigured_key, "cpa:off");
+
+        let first = integrations::cpa::CpaConnection {
+            base_url: "http://127.0.0.1:8317".to_string(),
+            management_key: "first-secret".to_string(),
+        };
+        let second = integrations::cpa::CpaConnection {
+            base_url: first.base_url.clone(),
+            management_key: "second-secret".to_string(),
+        };
+        let first_key = provider_status_key(&[], Some(&first));
+        let second_key = provider_status_key(&[], Some(&second));
+        assert_eq!(first_key, second_key);
+        assert!(!first_key.contains("first-secret"));
+        assert!(!second_key.contains("second-secret"));
+    }
 
     // Compute the deterministic upper/lower bounds for the half-jitter window
     // given the same constants the production function uses, so the asserts

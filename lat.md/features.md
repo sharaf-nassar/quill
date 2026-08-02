@@ -18,6 +18,58 @@ Transport failures (DNS, connect refused, pre-response timeout) on either Claude
 
 A provider with no live buckets still gets a row stating why: `SETUP` in amber when the failure is actionable (a `config`/`auth` provider error or an unfinished install) and `UNAVAILABLE` in slate otherwise. Codex reset countdowns are derived from the direct app-server rate-limit response, which also exposes model-specific windows such as Codex Spark; a finite Codex credit balance rides the same row.
 
+### CPA Pool Aggregation
+
+CPA pool rows derive worst-case pressure from account snapshots and are never persisted as independent facts.
+
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means `status == ready` without disabled or unavailable flags; all accounts, including runtime-only entries, remain in the total denominator. Each window takes the healthy account's maximum utilization and its reset timestamp. Missing windows are excluded, and an all-missing healthy pool has no numeric bucket.
+
+#### Worst-case healthy maximum
+
+The aggregate uses each window's highest healthy utilization and the reset timestamp from that same account.
+
+#### Full denominator with unhealthy exclusions
+
+Disabled, unavailable, and non-ready accounts count toward total but cannot influence utilization.
+
+#### Missing account buckets stay gaps
+
+A healthy account without fetched windows remains in the health count without inventing utilization.
+
+#### All healthy buckets missing
+
+A provider whose healthy accounts all lack windows yields no numeric aggregate bucket.
+
+#### Empty pool
+
+An empty account inventory yields no provider aggregate rows.
+
+#### Runtime-only accounts included
+
+Runtime-only accounts participate in health counts and aggregate math exactly like file-backed accounts.
+
+### CPA Poll Scheduling
+
+CPA window polling is smoke-gated, capped, staggered, and bounded independently from native provider work.
+
+[[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete auth-file inventory before scheduling windows. Only persisted `true` provider smoke verdicts permit calls; the first 16 healthy eligible accounts by `auth_index` launch 250ms apart with at most three requests active.
+
+#### Smoke verdict gate
+
+An absent or false provider smoke verdict produces health-only accounts and schedules no window calls.
+
+#### Bounded staggered fan-out
+
+A 12-account stub transport verifies the scheduler stays below three concurrent calls and completes within its launch budget.
+
+#### Deterministic account cap
+
+Pools larger than 16 accounts schedule only the first 16 deterministic `auth_index` entries per cycle.
+
+#### Unconfigured source null impact
+
+Without both saved connection settings, CPA contributes no usage fields, request path, phase timing, or secret-bearing cache key.
+
 ## Widget Views
 
 Everything below LIMITS is one swappable view region: Usage (the default), Trends, Charts, Models, and Context — each a compact 360px adaptation in the same visual system.

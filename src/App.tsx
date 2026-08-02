@@ -82,6 +82,8 @@ function App({ integrations }: AppProps) {
         buckets: [],
         provider_errors: [],
         provider_credits: [],
+        cpa_accounts: [],
+        cpa_pools: [],
         error: String(e),
       });
     }

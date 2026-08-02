@@ -196,11 +196,35 @@ pub struct ProviderCredits {
     pub balance: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CpaAccountHealth {
+    pub provider: String,
+    pub auth_index: String,
+    pub label: String,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub disabled: bool,
+    pub unavailable: bool,
+    pub runtime_only: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CpaPoolAggregate {
+    pub provider: IntegrationProvider,
+    pub healthy: usize,
+    pub total: usize,
+    pub buckets: Vec<UsageBucket>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct UsageData {
     pub buckets: Vec<UsageBucket>,
     pub provider_errors: Vec<UsageProviderError>,
     pub provider_credits: Vec<ProviderCredits>,
+    #[serde(default)]
+    pub cpa_accounts: Vec<CpaAccountHealth>,
+    #[serde(default)]
+    pub cpa_pools: Vec<CpaPoolAggregate>,
     pub error: Option<String>,
 }
 

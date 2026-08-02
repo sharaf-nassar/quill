@@ -206,6 +206,8 @@ const usageData: UsageData = {
     },
   ],
   provider_credits: [{ provider: "codex", balance: "$4.20" }],
+  cpa_accounts: [],
+  cpa_pools: [],
   error: null,
 };
 

@@ -46,10 +46,30 @@ export interface ProviderCredits {
   balance: string | null;
 }
 
+export interface CpaAccountHealth {
+  provider: string;
+  auth_index: string;
+  label: string;
+  status: string;
+  status_message: string | null;
+  disabled: boolean;
+  unavailable: boolean;
+  runtime_only: boolean;
+}
+
+export interface CpaPoolAggregate {
+  provider: IntegrationProvider;
+  healthy: number;
+  total: number;
+  buckets: UsageBucket[];
+}
+
 export interface UsageData {
   buckets: UsageBucket[];
   provider_errors: UsageProviderError[];
   provider_credits: ProviderCredits[];
+  cpa_accounts: CpaAccountHealth[];
+  cpa_pools: CpaPoolAggregate[];
   error: string | null;
 }
 
