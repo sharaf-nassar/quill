@@ -6,3 +6,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[features]] — Live usage, analytics, learning, session search, restart, memory optimizer
 - [[data-flow]] — Token reporting, learning analysis, session indexing, and memory optimization
 - [[infrastructure]] — CI/CD pipeline, release process, build config, code quality, scripts
+- [[runtime-rollup-tests]] — Runtime finalization, replacement, and ingest-budget test specs

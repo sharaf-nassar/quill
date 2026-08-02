@@ -129,3 +129,22 @@ cargo test --release --lib model_hourly_ingest_fold_burst_p95_stays_within_budge
 | Replacement with fold | 6,000 | 25 | 134.070 ms |
 
 Fold overhead is **5.316%**, within the required maximum of 10%.
+
+## Runtime ingest fold overhead
+
+The runtime-rollup benchmark compares production transcript replacement with
+the same transaction after disabling only runtime refold. Parsing, snapshot
+construction, storage initialization, and warm-up stay outside timing. Each
+release-mode sample replaces one source with 6,000 persisted session events;
+short burst gaps include periodic logical-turn closures and tool loops.
+
+```bash
+cargo test --release --lib runtime_hourly_ingest_fold_burst_p95_stays_within_budget -- --ignored --nocapture
+```
+
+| Variant | Rows/batch | Samples | p95 |
+| --- | ---: | ---: | ---: |
+| Raw replacement control | 6,000 | 25 | 88.230 ms |
+| Replacement with runtime fold | 6,000 | 25 | 96.017 ms |
+
+Runtime fold overhead is **8.825%**, within the required maximum of 10%.
