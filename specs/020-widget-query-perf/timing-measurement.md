@@ -110,3 +110,22 @@ The 013 cached-only endpoints therefore cost 157-169 ms for
 `get_all_bucket_stats` and 41-575 ms for `get_context_savings_analytics` on
 their first app-cache-bypassed call. Later after-measurements must use the same
 corpus, endpoint, query order, release profile, and OS-page-cache caveat.
+
+## Model ingest fold overhead
+
+The model-rollup ingest acceptance benchmark compares the production source
+replacement path against the same transaction with only its rollup fold
+disabled. Parsing, fingerprinting, storage initialization, and warm-up are
+outside the timed region. Each release-mode sample replaces one source with a
+6,000-row burst concentrated into ten minutes and two model buckets.
+
+```bash
+cargo test --release --lib model_hourly_ingest_fold_burst_p95_stays_within_budget -- --ignored --nocapture
+```
+
+| Variant | Rows/batch | Samples | p95 |
+| --- | ---: | ---: | ---: |
+| Raw replacement control | 6,000 | 25 | 127.303 ms |
+| Replacement with fold | 6,000 | 25 | 134.070 ms |
+
+Fold overhead is **5.316%**, within the required maximum of 10%.

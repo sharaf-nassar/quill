@@ -1034,6 +1034,18 @@ A flipped checksum nibble and a truncated envelope both decode to an [[src-tauri
 
 Observations seeded through the real [[src-tauri/src/storage.rs#Storage#replace_model_source|replace write path]] land attributed and unattributed tokens in their timestamp-containing fixed buckets with matching aggregate totals and coverage, while a source flipped to suppressed contributes to neither query, guarding the shared [[src-tauri/src/storage.rs#ACTIVE_MODEL_SOURCE_PREDICATE]].
 
+##### Model Hourly Ingest Fold Exactness
+
+The model replacement transaction must leave its unpruned hourly rollup exactly equal to a raw source group-by and must roll every fold mutation back on failure.
+
+Seeded observations span UTC hours, model identities, missing and invalid attribution, explicit zeroes, and absent token dimensions. Replacing the same source refolds rather than doubles counts, advances `rollup_generation` once, and a forced metadata failure preserves raw rows, rollup rows, and generation atomically.
+
+##### Model Hourly Ingest Fold Burst Budget
+
+The model ingest fold must add no more than 10% p95 latency to representative burst-shaped source replacement batches.
+
+The ignored release-mode benchmark times 25 replacements of one 6,000-row batch with production folding against the same transaction with only folding disabled. Parsing, fingerprinting, initialization, and warm-up remain outside the measured region.
+
 ##### Cache Probe Cross-Connection and Cost Spike
 
 The model cache probe records an absolute high-water timestamp, so it observes
@@ -1047,14 +1059,14 @@ deletes are bounded by the cache TTL.
 
 #### Hourly Analytics Rollups
 
-Migration 37 creates empty source-keyed rollup storage for bounded model and runtime reads without modifying raw evidence.
+Migration 37 creates source-keyed rollup storage for bounded model and runtime reads while preserving raw evidence.
 
-- **model_usage_hourly** — One row per UTC hour, provider, derived model, and source. It denormalizes analytics session identity; stores observation, turn, token, sidechain, and NULL-aware token-dimension counts and sums; retains first/last evidence bounds and a `raw_pruned` marker.
+- **model_usage_hourly** — One row per UTC hour, provider, derived model, and source. It denormalizes analytics session identity; stores observation, turn, token, sidechain, and NULL-aware token-dimension counts and sums; retains first/last evidence bounds and a `raw_pruned` marker. [[src-tauri/src/storage.rs#Storage#replace_model_source]] preaggregates each retained batch and UPSERTs it in the raw replacement transaction. A non-colliding empty derived-model key represents raw NULL attribution because normalized provider model ids cannot be empty.
 - **runtime_hourly** — One row per UTC hour, provider, and source. It denormalizes session identity and stores finalized turn count, runtime seconds, turn bounds, and a `raw_pruned` marker.
 - **runtime_turn_state** — One row per provider/source finalization bookmark, with the last finalized raw rowid and optional open-turn start.
 - **rollup_meta** — Singleton generation plus independent model/runtime backfill status and resumable bookmarks.
 
-Both hourly tables lead their unique key with `hour_utc` for bounded range reads and carry a `(provider, source_key)` index for exact source invalidation. Migration 37 initializes only the metadata singleton; it performs no raw-table fold or backfill. Recording v37 is a one-way door because older builds refuse it through `SCHEMA_TOO_NEW`, but the additive DDL preserves every pre-upgrade row.
+Both hourly tables lead their unique key with `hour_utc` for bounded range reads and carry a `(provider, source_key)` index for exact source invalidation. Model replacement deletes that source's prior `raw_pruned=0` rows before refolding, preserves sums plus separate present counts so NULL never becomes explicit zero, and advances `rollup_generation` once per transaction that mutates model rollup rows. Migration 37 itself initializes only the metadata singleton; it performs no raw-table fold or backfill. Recording v37 is a one-way door because older builds refuse it through `SCHEMA_TOO_NEW`, but the additive DDL preserves every pre-upgrade row.
 
 ##### Rollup Migration Test Specs
 

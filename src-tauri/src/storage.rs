@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::integrations::IntegrationProvider;
 use crate::model_usage::{
     CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
-    SourceProcessingStatus,
+    ObservationKind, SourceProcessingStatus,
 };
 use crate::retention::{
     RETENTION_LAST_RUN_KEY, RETENTION_WATERMARK_KEY, RETENTION_WINDOW_DAYS_KEY,
@@ -1843,6 +1843,33 @@ struct PreparedModelObservation<'a> {
     cwd: Option<String>,
 }
 
+const MODEL_ROLLUP_HOUR_MS: i64 = 3_600_000;
+// Normalized model ids are non-empty, so this value cannot collide with a
+// provider-supplied identity. The rollup schema needs a non-NULL key while
+// raw evidence keeps NULL derived ids for the unattributed bucket.
+const MODEL_ROLLUP_UNATTRIBUTED_ID: &str = "";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedModelHourlyRollup<'a> {
+    hour_utc: i64,
+    derived_model_id: &'a str,
+    analytics_session_id: &'a str,
+    obs_count: i64,
+    turn_count: i64,
+    token_count: i64,
+    sidechain_count: i64,
+    input_tokens: i64,
+    input_tokens_present: i64,
+    output_tokens: i64,
+    output_tokens_present: i64,
+    cache_creation_tokens: i64,
+    cache_creation_tokens_present: i64,
+    cache_read_tokens: i64,
+    cache_read_tokens_present: i64,
+    first_observed_at_ms: i64,
+    last_observed_at_ms: i64,
+}
+
 struct CurrentModelSourceSuppression {
     processing_status: String,
     suppressed_sha256: Option<String>,
@@ -2257,6 +2284,111 @@ fn prepare_model_observations<'a>(
             })
         })
         .collect()
+}
+
+fn checked_add_model_rollup_value(value: &mut i64, amount: i64, field: &str) -> Result<(), String> {
+    *value = value
+        .checked_add(amount)
+        .ok_or_else(|| format!("Model hourly rollup {field} exceeds SQLite INTEGER range"))?;
+    Ok(())
+}
+
+// @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups]]
+fn prepare_model_hourly_rollups<'a>(
+    source: &'a NormalizedSource,
+    observations: &'a [PreparedModelObservation<'a>],
+) -> Result<Vec<PreparedModelHourlyRollup<'a>>, String> {
+    let Some(analytics_session_id) = source.analytics_session_id.as_deref() else {
+        if observations.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err("Model source with observations must have an analytics session id".to_string());
+    };
+    let mut rollups = BTreeMap::<(i64, &'a str), PreparedModelHourlyRollup<'a>>::new();
+
+    for prepared in observations {
+        let observation = prepared.observation;
+        let metadata = observation.metadata();
+        if metadata.analytics_session_id != analytics_session_id {
+            return Err(format!(
+                "Model observation analytics session {} does not match source analytics session {analytics_session_id}",
+                metadata.analytics_session_id
+            ));
+        }
+        let hour_utc = (metadata.observed_at_ms / MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+        let derived_model_id = observation
+            .derived_model_id()
+            .unwrap_or(MODEL_ROLLUP_UNATTRIBUTED_ID);
+        let rollup = rollups
+            .entry((hour_utc, derived_model_id))
+            .or_insert_with(|| PreparedModelHourlyRollup {
+                hour_utc,
+                derived_model_id,
+                analytics_session_id,
+                obs_count: 0,
+                turn_count: 0,
+                token_count: 0,
+                sidechain_count: 0,
+                input_tokens: 0,
+                input_tokens_present: 0,
+                output_tokens: 0,
+                output_tokens_present: 0,
+                cache_creation_tokens: 0,
+                cache_creation_tokens_present: 0,
+                cache_read_tokens: 0,
+                cache_read_tokens_present: 0,
+                first_observed_at_ms: metadata.observed_at_ms,
+                last_observed_at_ms: metadata.observed_at_ms,
+            });
+
+        checked_add_model_rollup_value(&mut rollup.obs_count, 1, "observation count")?;
+        match metadata.kind {
+            ObservationKind::Turn => {
+                checked_add_model_rollup_value(&mut rollup.turn_count, 1, "turn count")?;
+            }
+            ObservationKind::Token => {
+                checked_add_model_rollup_value(&mut rollup.token_count, 1, "token count")?;
+            }
+        }
+        if metadata.is_sidechain {
+            checked_add_model_rollup_value(&mut rollup.sidechain_count, 1, "sidechain count")?;
+        }
+        for (amount, total, present, field) in [
+            (
+                observation.input_tokens(),
+                &mut rollup.input_tokens,
+                &mut rollup.input_tokens_present,
+                "input tokens",
+            ),
+            (
+                observation.output_tokens(),
+                &mut rollup.output_tokens,
+                &mut rollup.output_tokens_present,
+                "output tokens",
+            ),
+            (
+                observation.cache_creation_tokens(),
+                &mut rollup.cache_creation_tokens,
+                &mut rollup.cache_creation_tokens_present,
+                "cache creation tokens",
+            ),
+            (
+                observation.cache_read_tokens(),
+                &mut rollup.cache_read_tokens,
+                &mut rollup.cache_read_tokens_present,
+                "cache read tokens",
+            ),
+        ] {
+            if let Some(amount) = amount {
+                checked_add_model_rollup_value(total, amount, field)?;
+                checked_add_model_rollup_value(present, 1, &format!("{field} present count"))?;
+            }
+        }
+        rollup.first_observed_at_ms = rollup.first_observed_at_ms.min(metadata.observed_at_ms);
+        rollup.last_observed_at_ms = rollup.last_observed_at_ms.max(metadata.observed_at_ms);
+    }
+
+    Ok(rollups.into_values().collect())
 }
 
 /// Delete every stale source owned by one completed root and its children.
@@ -9321,6 +9453,26 @@ impl Storage {
         observations: &[NormalizedObservation],
         fingerprint: &ModelSourceFingerprint,
     ) -> Result<ModelSourceReplacementResult, String> {
+        self.replace_model_source_inner(source, observations, fingerprint, true)
+    }
+
+    #[cfg(test)]
+    fn replace_model_source_without_rollup_for_benchmark(
+        &self,
+        source: &NormalizedSource,
+        observations: &[NormalizedObservation],
+        fingerprint: &ModelSourceFingerprint,
+    ) -> Result<ModelSourceReplacementResult, String> {
+        self.replace_model_source_inner(source, observations, fingerprint, false)
+    }
+
+    fn replace_model_source_inner(
+        &self,
+        source: &NormalizedSource,
+        observations: &[NormalizedObservation],
+        fingerprint: &ModelSourceFingerprint,
+        fold_model_rollup: bool,
+    ) -> Result<ModelSourceReplacementResult, String> {
         validate_normalized_model_source(source)?;
         validate_model_source_fingerprint(source, fingerprint)?;
         if source.processing_status != SourceProcessingStatus::Ok {
@@ -9479,6 +9631,21 @@ impl Storage {
                 });
             }
         }
+        let model_hourly_rollups = if fold_model_rollup {
+            prepare_model_hourly_rollups(source, &retained_observations)?
+        } else {
+            Vec::new()
+        };
+        let deleted_model_rollup_rows = if fold_model_rollup {
+            tx.execute(
+                "DELETE FROM model_usage_hourly
+                 WHERE provider = ?1 AND source_key = ?2 AND raw_pruned = 0",
+                params![source.provider.as_str(), source.source_key],
+            )
+            .map_err(|error| format!("Delete replaced model source rollup rows: {error}"))?
+        } else {
+            0
+        };
         tx.execute(
             "DELETE FROM model_usage_observations
              WHERE provider = ?1 AND source_key = ?2",
@@ -9534,6 +9701,99 @@ impl Storage {
                     observation.token_evidence().as_str(),
                 ])
                 .map_err(|error| format!("Insert model source observation: {error}"))?;
+            }
+        }
+
+        let mut folded_model_rollup_rows = 0_usize;
+        if fold_model_rollup {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO model_usage_hourly (
+                        hour_utc, provider, derived_model_id, source_key,
+                        analytics_session_id, obs_count, turn_count,
+                        token_count, sidechain_count, input_tokens,
+                        input_tokens_present, output_tokens,
+                        output_tokens_present, cache_creation_tokens,
+                        cache_creation_tokens_present, cache_read_tokens,
+                        cache_read_tokens_present, first_observed_at_ms,
+                        last_observed_at_ms, raw_pruned
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 0
+                     )
+                     ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
+                     DO UPDATE SET
+                        analytics_session_id = excluded.analytics_session_id,
+                        obs_count = model_usage_hourly.obs_count + excluded.obs_count,
+                        turn_count = model_usage_hourly.turn_count + excluded.turn_count,
+                        token_count = model_usage_hourly.token_count + excluded.token_count,
+                        sidechain_count = model_usage_hourly.sidechain_count
+                                          + excluded.sidechain_count,
+                        input_tokens = model_usage_hourly.input_tokens
+                                       + excluded.input_tokens,
+                        input_tokens_present = model_usage_hourly.input_tokens_present
+                                               + excluded.input_tokens_present,
+                        output_tokens = model_usage_hourly.output_tokens
+                                        + excluded.output_tokens,
+                        output_tokens_present = model_usage_hourly.output_tokens_present
+                                                + excluded.output_tokens_present,
+                        cache_creation_tokens = model_usage_hourly.cache_creation_tokens
+                                                + excluded.cache_creation_tokens,
+                        cache_creation_tokens_present =
+                            model_usage_hourly.cache_creation_tokens_present
+                            + excluded.cache_creation_tokens_present,
+                        cache_read_tokens = model_usage_hourly.cache_read_tokens
+                                            + excluded.cache_read_tokens,
+                        cache_read_tokens_present =
+                            model_usage_hourly.cache_read_tokens_present
+                            + excluded.cache_read_tokens_present,
+                        first_observed_at_ms = MIN(
+                            model_usage_hourly.first_observed_at_ms,
+                            excluded.first_observed_at_ms
+                        ),
+                        last_observed_at_ms = MAX(
+                            model_usage_hourly.last_observed_at_ms,
+                            excluded.last_observed_at_ms
+                        )",
+                )
+                .map_err(|error| format!("Prepare model hourly rollup UPSERT: {error}"))?;
+            for rollup in &model_hourly_rollups {
+                folded_model_rollup_rows += stmt
+                    .execute(params![
+                        rollup.hour_utc,
+                        source.provider.as_str(),
+                        rollup.derived_model_id,
+                        source.source_key,
+                        rollup.analytics_session_id,
+                        rollup.obs_count,
+                        rollup.turn_count,
+                        rollup.token_count,
+                        rollup.sidechain_count,
+                        rollup.input_tokens,
+                        rollup.input_tokens_present,
+                        rollup.output_tokens,
+                        rollup.output_tokens_present,
+                        rollup.cache_creation_tokens,
+                        rollup.cache_creation_tokens_present,
+                        rollup.cache_read_tokens,
+                        rollup.cache_read_tokens_present,
+                        rollup.first_observed_at_ms,
+                        rollup.last_observed_at_ms,
+                    ])
+                    .map_err(|error| format!("UPSERT model hourly rollup: {error}"))?;
+            }
+        }
+        if deleted_model_rollup_rows > 0 || folded_model_rollup_rows > 0 {
+            let updated = tx
+                .execute(
+                    "UPDATE rollup_meta
+                     SET rollup_generation = rollup_generation + 1
+                     WHERE id = 1",
+                    [],
+                )
+                .map_err(|error| format!("Bump model rollup generation: {error}"))?;
+            if updated != 1 {
+                return Err("Model rollup metadata singleton is missing".to_string());
             }
         }
 
@@ -21881,12 +22141,15 @@ mod tests {
     /// write path so query tests exercise persisted evidence, not synthetic
     /// rows. The transcript is written to a real file only to derive a fast
     /// fingerprint; observation timestamps come from the caller's JSONL.
-    fn seed_claude_model_source(
-        storage: &Storage,
+    fn prepare_claude_model_source(
         dir: &TempDir,
         source_key: &str,
         session_id: &str,
         jsonl: &str,
+    ) -> (
+        NormalizedSource,
+        Vec<NormalizedObservation>,
+        ModelSourceFingerprint,
     ) {
         let parse_hint = crate::sessions::RetainedJsonlSourceLayoutHint::ClaudeParent {
             default_project: "proj".to_string(),
@@ -21938,6 +22201,18 @@ mod tests {
             last_success_at_ms: Some(now_ms),
         };
 
+        (source, observations, fingerprint)
+    }
+
+    fn seed_claude_model_source(
+        storage: &Storage,
+        dir: &TempDir,
+        source_key: &str,
+        session_id: &str,
+        jsonl: &str,
+    ) {
+        let (source, observations, fingerprint) =
+            prepare_claude_model_source(dir, source_key, session_id, jsonl);
         storage
             .replace_model_source(&source, &observations, &fingerprint)
             .expect("replace model source");
@@ -22003,6 +22278,309 @@ mod tests {
         storage
             .replace_model_source(&source, &observations, &fingerprint)
             .expect("replace model source");
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ModelHourlyRollupRow {
+        hour_utc: i64,
+        provider: String,
+        derived_model_id: String,
+        source_key: String,
+        analytics_session_id: String,
+        obs_count: i64,
+        turn_count: i64,
+        token_count: i64,
+        sidechain_count: i64,
+        input_tokens: i64,
+        input_tokens_present: i64,
+        output_tokens: i64,
+        output_tokens_present: i64,
+        cache_creation_tokens: i64,
+        cache_creation_tokens_present: i64,
+        cache_read_tokens: i64,
+        cache_read_tokens_present: i64,
+        first_observed_at_ms: i64,
+        last_observed_at_ms: i64,
+        raw_pruned: i64,
+    }
+
+    fn read_model_hourly_rollup_rows(conn: &Connection, query: &str) -> Vec<ModelHourlyRollupRow> {
+        let mut stmt = conn.prepare(query).expect("prepare rollup query");
+        stmt.query_map([], |row| {
+            Ok(ModelHourlyRollupRow {
+                hour_utc: row.get(0)?,
+                provider: row.get(1)?,
+                derived_model_id: row.get(2)?,
+                source_key: row.get(3)?,
+                analytics_session_id: row.get(4)?,
+                obs_count: row.get(5)?,
+                turn_count: row.get(6)?,
+                token_count: row.get(7)?,
+                sidechain_count: row.get(8)?,
+                input_tokens: row.get(9)?,
+                input_tokens_present: row.get(10)?,
+                output_tokens: row.get(11)?,
+                output_tokens_present: row.get(12)?,
+                cache_creation_tokens: row.get(13)?,
+                cache_creation_tokens_present: row.get(14)?,
+                cache_read_tokens: row.get(15)?,
+                cache_read_tokens_present: row.get(16)?,
+                first_observed_at_ms: row.get(17)?,
+                last_observed_at_ms: row.get(18)?,
+                raw_pruned: row.get(19)?,
+            })
+        })
+        .expect("query rollup rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read rollup rows")
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Hourly Ingest Fold Exactness]]
+    #[test]
+    #[serial]
+    fn model_hourly_ingest_fold_matches_raw_and_rolls_back_atomically() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let source_key = "rollup-source";
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:01:00Z","sessionId":"rollup-session","message":{"usage":{"output_tokens":0}}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:02:00Z","sessionId":"rollup-session","message":{"model":" ","usage":{"input_tokens":0}}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:10:00Z","sessionId":"rollup-session","message":{"model":"model-a","usage":{"input_tokens":0,"output_tokens":5,"cache_creation_input_tokens":0}}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:20:00Z","sessionId":"rollup-session","message":{"usage":{"input_tokens":3,"cache_read_input_tokens":0}}}"#.to_string(),
+            r#"{"type":"assistant","timestamp":"2026-07-30T11:01:00Z","sessionId":"rollup-session","message":{"model":"model-b","usage":{"output_tokens":7}}}"#.to_string(),
+        ]
+        .join("\n");
+        let (source, observations, fingerprint) =
+            prepare_claude_model_source(&dir, source_key, "rollup-session", &jsonl);
+
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("fold seeded source");
+
+        const RAW_GROUP_BY: &str = "SELECT (observed_at_ms / 3600000) * 3600000,
+                    provider, COALESCE(derived_model_id, ''), source_key,
+                    MIN(analytics_session_id), COUNT(*),
+                    SUM(observation_kind = 'turn'),
+                    SUM(observation_kind = 'token'), SUM(is_sidechain),
+                    SUM(COALESCE(input_tokens, 0)), COUNT(input_tokens),
+                    SUM(COALESCE(output_tokens, 0)), COUNT(output_tokens),
+                    SUM(COALESCE(cache_creation_tokens, 0)),
+                    COUNT(cache_creation_tokens),
+                    SUM(COALESCE(cache_read_tokens, 0)),
+                    COUNT(cache_read_tokens), MIN(observed_at_ms),
+                    MAX(observed_at_ms), 0
+             FROM model_usage_observations
+             WHERE provider = 'claude' AND source_key = 'rollup-source'
+             GROUP BY 1, 2, 3, 4
+             ORDER BY 1, 2, 3, 4";
+        const FOLDED_ROWS: &str = "SELECT hour_utc, provider, derived_model_id, source_key,
+                    analytics_session_id, obs_count, turn_count, token_count,
+                    sidechain_count, input_tokens, input_tokens_present,
+                    output_tokens, output_tokens_present,
+                    cache_creation_tokens, cache_creation_tokens_present,
+                    cache_read_tokens, cache_read_tokens_present,
+                    first_observed_at_ms, last_observed_at_ms, raw_pruned
+             FROM model_usage_hourly
+             WHERE provider = 'claude' AND source_key = 'rollup-source'
+             ORDER BY 1, 2, 3, 4";
+        {
+            let conn = storage.conn.lock();
+            let raw = read_model_hourly_rollup_rows(&conn, RAW_GROUP_BY);
+            let folded = read_model_hourly_rollup_rows(&conn, FOLDED_ROWS);
+            assert_eq!(folded, raw, "ingest fold must equal raw source group-by");
+            let unattributed = folded
+                .iter()
+                .find(|row| row.derived_model_id.is_empty())
+                .expect("unattributed rollup bucket");
+            assert_eq!((unattributed.obs_count, unattributed.turn_count), (2, 2));
+            assert_eq!(
+                (unattributed.input_tokens, unattributed.input_tokens_present),
+                (0, 1)
+            );
+            assert_eq!(
+                (
+                    unattributed.output_tokens,
+                    unattributed.output_tokens_present
+                ),
+                (0, 1)
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT rollup_generation FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("read generation"),
+                1
+            );
+        }
+
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("replace seeded source");
+        {
+            let conn = storage.conn.lock();
+            assert_eq!(
+                read_model_hourly_rollup_rows(&conn, FOLDED_ROWS),
+                read_model_hourly_rollup_rows(&conn, RAW_GROUP_BY),
+                "replacement must refold rather than accumulate duplicate counts"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT rollup_generation FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("read replacement generation"),
+                2,
+                "generation increments once per replacement transaction"
+            );
+            conn.execute_batch(
+                "CREATE TRIGGER fail_rollup_source_metadata
+                 BEFORE INSERT ON model_observation_sources
+                 WHEN NEW.source_key = 'rollback-source'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced source metadata failure');
+                 END;",
+            )
+            .expect("install rollback trigger");
+        }
+
+        let rollback_jsonl = r#"{"type":"assistant","timestamp":"2026-07-30T12:00:00Z","sessionId":"rollback-session","message":{"model":"model-c","usage":{"input_tokens":9}}}"#;
+        let (rollback_source, rollback_observations, rollback_fingerprint) =
+            prepare_claude_model_source(
+                &dir,
+                "rollback-source",
+                "rollback-session",
+                rollback_jsonl,
+            );
+        assert!(
+            storage
+                .replace_model_source(
+                    &rollback_source,
+                    &rollback_observations,
+                    &rollback_fingerprint,
+                )
+                .is_err(),
+            "forced metadata failure must abort replacement"
+        );
+        {
+            let conn = storage.conn.lock();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM model_usage_observations
+                     WHERE source_key = 'rollback-source'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("count rolled-back raw rows"),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM model_usage_hourly
+                     WHERE source_key = 'rollback-source'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("count rolled-back rollup rows"),
+                0
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT rollup_generation FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("read rolled-back generation"),
+                2
+            );
+        }
+        clear_env();
+    }
+
+    fn percentile_95_ms(samples: &mut [Duration]) -> f64 {
+        samples.sort_unstable();
+        let index = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+        samples[index].as_secs_f64() * 1_000.0
+    }
+
+    /// Diagnostic acceptance benchmark. Run in release mode with ignored
+    /// tests enabled so optimizer and SQLite behavior match production.
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Hourly Ingest Fold Burst Budget]]
+    #[test]
+    #[ignore = "burst-shaped ingest timing acceptance"]
+    #[serial]
+    fn model_hourly_ingest_fold_burst_p95_stays_within_budget() {
+        clear_env();
+        const BURST_ROWS: usize = 6_000;
+        const SAMPLES: usize = 25;
+        let mut lines = Vec::with_capacity(BURST_ROWS);
+        for ordinal in 0..BURST_ROWS {
+            let second = ordinal % 60;
+            let minute = (ordinal / 60) % 10;
+            let model = if ordinal % 2 == 0 {
+                "model-a"
+            } else {
+                "model-b"
+            };
+            lines.push(format!(
+                r#"{{"type":"assistant","timestamp":"2026-07-30T10:{minute:02}:{second:02}Z","sessionId":"burst-session","message":{{"model":"{model}","usage":{{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":0}}}}}}"#
+            ));
+        }
+        let jsonl = lines.join("\n");
+        let control_dir = TempDir::new().expect("control tempdir");
+        let control = init_storage_in(&control_dir);
+        let (control_source, control_observations, control_fingerprint) =
+            prepare_claude_model_source(&control_dir, "burst-source", "burst-session", &jsonl);
+        let fold_dir = TempDir::new().expect("fold tempdir");
+        let fold = init_storage_in(&fold_dir);
+        let (fold_source, fold_observations, fold_fingerprint) =
+            prepare_claude_model_source(&fold_dir, "burst-source", "burst-session", &jsonl);
+
+        control
+            .replace_model_source_without_rollup_for_benchmark(
+                &control_source,
+                &control_observations,
+                &control_fingerprint,
+            )
+            .expect("warm control replacement");
+        fold.replace_model_source(&fold_source, &fold_observations, &fold_fingerprint)
+            .expect("warm folded replacement");
+
+        let mut control_samples = Vec::with_capacity(SAMPLES);
+        let mut fold_samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let started = Instant::now();
+            control
+                .replace_model_source_without_rollup_for_benchmark(
+                    &control_source,
+                    &control_observations,
+                    &control_fingerprint,
+                )
+                .expect("control replacement");
+            control_samples.push(started.elapsed());
+
+            let started = Instant::now();
+            fold.replace_model_source(&fold_source, &fold_observations, &fold_fingerprint)
+                .expect("folded replacement");
+            fold_samples.push(started.elapsed());
+        }
+
+        let control_p95_ms = percentile_95_ms(&mut control_samples);
+        let fold_p95_ms = percentile_95_ms(&mut fold_samples);
+        let delta_percent = ((fold_p95_ms - control_p95_ms) / control_p95_ms) * 100.0;
+        eprintln!("model_rollup_fold.burst_rows={BURST_ROWS}");
+        eprintln!("model_rollup_fold.samples={SAMPLES}");
+        eprintln!("model_rollup_fold.control_p95_ms={control_p95_ms:.3}");
+        eprintln!("model_rollup_fold.fold_p95_ms={fold_p95_ms:.3}");
+        eprintln!("model_rollup_fold.delta_percent={delta_percent:.3}");
+        assert!(
+            delta_percent <= 10.0,
+            "fold p95 overhead {delta_percent:.3}% exceeds 10% budget"
+        );
+        clear_env();
     }
 
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Sessions Cursor Codec]]
