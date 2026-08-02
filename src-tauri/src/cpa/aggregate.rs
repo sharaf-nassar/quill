@@ -10,8 +10,15 @@ pub(crate) struct CpaAccountSnapshot {
 
 impl CpaAccountSnapshot {
     pub(crate) fn is_healthy(&self) -> bool {
-        self.health.status == "ready" && !self.health.disabled && !self.health.unavailable
+        is_usable_account_status(&self.health.status)
+            && !self.health.disabled
+            && !self.health.unavailable
     }
+}
+
+pub(crate) fn is_usable_account_status(status: &str) -> bool {
+    let status = status.trim();
+    status.eq_ignore_ascii_case("active") || status.eq_ignore_ascii_case("ready")
 }
 
 // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation]]
@@ -195,6 +202,29 @@ mod tests {
         let pool = &compute_cpa_pools(&accounts)[0];
         assert_eq!((pool.healthy, pool.total), (1, 4));
         assert_eq!(pool.buckets[0].utilization, 25.0);
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Usable lifecycle compatibility]]
+    #[test]
+    fn accepts_active_and_ready_but_rejects_other_lifecycle_states() {
+        for status in ["active", "ACTIVE", "ready", "READY"] {
+            assert!(account(status, status, false, false, false, None).is_healthy());
+        }
+
+        for status in [
+            "cooling",
+            "degraded",
+            "error",
+            "unknown",
+            "pending",
+            "refreshing",
+            "disabled",
+        ] {
+            assert!(!account(status, status, false, false, false, None).is_healthy());
+        }
+
+        assert!(!account("disabled", "active", true, false, false, None).is_healthy());
+        assert!(!account("unavailable", "ready", false, true, false, None).is_healthy());
     }
 
     // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Missing account buckets stay gaps]]

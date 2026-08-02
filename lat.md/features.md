@@ -22,9 +22,13 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 
 CPA pool rows derive worst-case pressure from account snapshots and are never persisted as independent facts.
 
-[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means `status == ready` without disabled or unavailable flags; all accounts, including runtime-only entries, remain in the total denominator. Each window takes the healthy account's maximum utilization and its reset timestamp. Missing windows are excluded, and an all-missing healthy pool has no numeric bucket.
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or the compatible `ready` status without disabled or unavailable flags; all accounts, including runtime-only entries, remain in the total denominator. Each window takes the healthy account's maximum utilization and its reset timestamp. Missing windows are excluded, and an all-missing healthy pool has no numeric bucket.
 
-The widget renders each aggregate before optional account detail: fixed provider identity, a visible `CPA` tag, healthy/total count, worst-case window cells, and the nearest upcoming reset. A semantic disclosure button reveals at most six account rows plus a remainder count. Missing account windows stay nonnumeric; ready accounts carry no badge, while disabled, unavailable, and cooling states remain visibly distinct. Unsupported CPA providers collapse into one neutral account-count line with no new provider identity.
+The widget renders each aggregate before optional account detail: fixed provider identity, a visible `CPA` tag, healthy/total count, worst-case window cells, and the nearest upcoming reset. A semantic disclosure button reveals at most six account rows plus a remainder count. Missing account windows stay nonnumeric; usable accounts carry no badge, while disabled, unavailable, and cooling states remain visibly distinct. Unsupported CPA providers collapse into one neutral account-count line with no new provider identity.
+
+#### Usable lifecycle compatibility
+
+CPA v7 reports usable credentials as `active`; Quill also accepts the compatible `ready` form, while every other lifecycle state and either disabled or unavailable flag remains unhealthy.
 
 #### Worst-case healthy maximum
 
@@ -32,7 +36,7 @@ The aggregate uses each window's highest healthy utilization and the reset times
 
 #### Full denominator with unhealthy exclusions
 
-Disabled, unavailable, and non-ready accounts count toward total but cannot influence utilization.
+Disabled, unavailable, and non-usable accounts count toward total but cannot influence utilization.
 
 #### Missing account buckets stay gaps
 
@@ -55,6 +59,10 @@ Runtime-only accounts participate in health counts and aggregate math exactly li
 CPA window polling is smoke-gated, capped, staggered, and bounded independently from native provider work.
 
 [[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete auth-file inventory before scheduling windows. Only persisted `true` provider smoke verdicts permit calls; the first 16 healthy eligible accounts by `auth_index` launch 250ms apart with at most three requests active.
+
+#### Usable lifecycle scheduling
+
+The poll mapper canonicalizes CPA `active` and compatible `ready` credentials to the frontend's ready state and schedules only those usable accounts when their provider smoke gate is open.
 
 #### Smoke verdict gate
 

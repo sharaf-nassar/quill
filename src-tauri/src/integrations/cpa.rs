@@ -1,3 +1,4 @@
+use crate::cpa::aggregate::is_usable_account_status;
 use crate::cpa::client::{CpaAuthFile, CpaClient, CpaError, validate_loopback_url};
 use crate::cpa::quota::{fetch_claude_usage, fetch_codex_usage};
 use crate::storage::Storage;
@@ -215,9 +216,7 @@ fn first_provider_account<'a>(
         .iter()
         .filter(|account| account.provider.eq_ignore_ascii_case(provider))
         .find(|account| {
-            account.status.eq_ignore_ascii_case("ready")
-                && !account.disabled
-                && !account.unavailable
+            is_usable_account_status(&account.status) && !account.disabled && !account.unavailable
         })
         .or_else(|| {
             auth_files
@@ -327,6 +326,30 @@ mod tests {
         assert_eq!(
             first_provider_account(&accounts, "claude").map(|item| item.auth_index.as_str()),
             Some("ready")
+        );
+    }
+
+    #[test]
+    fn chooses_active_account_before_degraded_account() {
+        let account = |auth_index: &str, status: &str| CpaAuthFile {
+            auth_index: auth_index.to_string(),
+            provider: "claude".to_string(),
+            name: None,
+            email: None,
+            label: None,
+            account: None,
+            status: status.to_string(),
+            status_message: None,
+            disabled: false,
+            unavailable: false,
+            runtime_only: false,
+            chatgpt_account_id: None,
+        };
+        let accounts = [account("degraded", "degraded"), account("active", "active")];
+
+        assert_eq!(
+            first_provider_account(&accounts, "claude").map(|item| item.auth_index.as_str()),
+            Some("active")
         );
     }
 

@@ -1,4 +1,4 @@
-use super::aggregate::CpaAccountSnapshot;
+use super::aggregate::{CpaAccountSnapshot, is_usable_account_status};
 use super::client::{CpaAuthFile, CpaClient, CpaError};
 use super::quota::{fetch_claude_usage, fetch_codex_usage};
 use crate::integrations::IntegrationProvider;
@@ -79,12 +79,17 @@ pub(crate) async fn poll_account_snapshots(
 }
 
 fn auth_file_snapshot(auth_file: &CpaAuthFile) -> CpaAccountSnapshot {
+    let status = auth_file.status.trim().to_ascii_lowercase();
     CpaAccountSnapshot {
         health: CpaAccountHealth {
             provider: auth_file.provider.trim().to_ascii_lowercase(),
             auth_index: auth_file.auth_index.clone(),
             label: account_label(auth_file),
-            status: auth_file.status.trim().to_ascii_lowercase(),
+            status: if is_usable_account_status(&status) {
+                "ready".to_string()
+            } else {
+                status
+            },
             status_message: auth_file.status_message.clone(),
             disabled: auth_file.disabled,
             unavailable: auth_file.unavailable,
@@ -224,6 +229,41 @@ mod tests {
                 },
             )
             .is_empty()
+        );
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Usable lifecycle scheduling]]
+    #[test]
+    fn active_and_ready_accounts_schedule_while_other_states_do_not() {
+        let mut files = [
+            auth_file("active", "claude"),
+            auth_file("ready", "claude"),
+            auth_file("cooling", "claude"),
+            auth_file("degraded", "claude"),
+            auth_file("error", "claude"),
+            auth_file("unknown", "claude"),
+        ];
+        for file in &mut files {
+            file.status = file.auth_index.clone();
+        }
+        let snapshots = files.iter().map(auth_file_snapshot).collect::<Vec<_>>();
+        let calls = window_calls(
+            &snapshots,
+            &files,
+            WindowSmokeGates {
+                claude: true,
+                codex: false,
+            },
+        );
+
+        assert_eq!(snapshots[0].health.status, "ready");
+        assert_eq!(snapshots[1].health.status, "ready");
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.auth_index.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "ready"]
         );
     }
 
