@@ -433,18 +433,25 @@ once the check has found a release: brand cyan text on a 10% cyan wash with a
 precisely why it is cyan and not amber.
 
 ### Signature Component — The Limit Cell
-The clearest expression of the North Star. Per rate-limit window: a rounded
-percent (11px, tabular), an 8px window label under it, and a 4px `pill`-radius
-track on an 8% white ground whose fill is a discrete
+The clearest expression of the North Star. Per rate-limit window: a compact
+header places the rounded percent (12px on provider summaries, 11px on account
+rows, tabular) at left and its 8px window label geometrically centered over the
+track. Below it, a 4px `pill`-radius track on an 8% white ground has a discrete
 `green | amber | red` class chosen by the 50/80 thresholds. The fill
 transitions width at 0.3s ease — meter ballistics, calm rather than twitchy.
 The track is a real `role="progressbar"` with `aria-valuenow/min/max` and the
 untruncated window label as its accessible name. A bucket whose reset has
 already elapsed is `stale`: neutral slate, no severity, because a utilization
-measured against a bygone window is not a live threshold. Cells hold their
-column width so rows scan as a table at the 360px design width, and keep it as
-the window widens — the row grows by pushing its reset countdown right, never
-by stretching the meters.
+measured against a bygone window is not a live threshold. An optional CPA reset
+sits centered on a dedicated footer beneath that same track. Its 10px tabular
+countdown uses the brighter secondary label tone so it stays legible without
+competing with the utilization plane above.
+
+Cells divide the available meter region evenly. Direct cells hold a 60px
+legibility floor; CPA cells hold 88px so utilization, window, and reset remain
+associated before dynamic extras reflow. Provider and disclosed account rows
+repeat the same 70px identity column and meter grid, making their values scan
+vertically from the 320px floor through a full-screen drag.
 
 ### Charts
 - Drawn by an internal SVG kit, not a charting library. Primitives are

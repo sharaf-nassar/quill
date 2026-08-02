@@ -299,9 +299,9 @@ function CpaConnectionSettings() {
       ) : null}
 
       <p className="cpa-settings-overlap">
-        Direct Claude and Codex integrations remain active alongside CPA. If
-        the same account exists in both, Quill displays both and usage may be
-        counted twice.
+        Direct Claude and Codex integrations remain active. In LIMITS, a CPA
+        pool replaces the matching direct row; the direct row returns when
+        that provider has no CPA pool.
       </p>
 
       {confirmDisconnect ? (

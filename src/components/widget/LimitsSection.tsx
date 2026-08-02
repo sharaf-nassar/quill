@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import type {
   CpaAccountHealth,
   CpaPoolAggregate,
@@ -10,11 +10,11 @@ import type {
 import { providerLabel } from "../../utils/providers";
 
 /**
- * LIMITS — direct-provider rows plus source-keyed CPA pool rows.
+ * LIMITS — one authoritative row per provider.
  *
- * Direct rows retain their compact fixed-window treatment. CPA accounts are
- * summarized first by provider and source, then disclosed on demand so the
- * 360px widget remains a glanceable instrument rather than an account table.
+ * A CPA pool replaces its matching direct row while preserving account detail
+ * behind disclosure. Without a pool, the direct row remains the provider's
+ * readout so the 360px widget never repeats one identity.
  *
  * Severity rules follow [[lat.md/features#Features#Live Usage View]]: amber at
  * 50%, red at 80%, and any bucket whose reset elapsed renders neutral.
@@ -68,6 +68,15 @@ interface CpaLimitsRow extends LimitsRow {
   accounts: CpaAccountRow[];
 }
 
+interface CpaResetReadout {
+  key: string;
+  shortLabel: "5H" | "7D";
+  fullLabel: string;
+  remainingMs: number | null;
+  resetText: string;
+  severity: Severity;
+}
+
 function isPrimaryMinimaxBucket(bucket: UsageBucket): boolean {
   return PRIMARY_MINIMAX_MODELS.some(
     (model) => bucket.label.startsWith(`${model} `) || bucket.label === model,
@@ -110,11 +119,19 @@ function shortBucketLabel(
   return (withoutProvider.length > 0 ? withoutProvider : base).toUpperCase();
 }
 
-function cpaWindowKey(bucket: UsageBucket): string {
+function cpaWindowKey(
+  provider: CpaProvider,
+  bucket: UsageBucket,
+): string {
   const parts = bucket.key.split("/");
-  return parts[0] === "cpa" && parts.length >= 3
+  const key = parts[0] === "cpa" && parts.length >= 3
     ? parts.slice(2).join("/")
     : bucket.key;
+  if (provider === "codex") {
+    const duration = key.match(/(?:^|_)(\d+)m$/)?.[1];
+    if (duration) return `codex_${duration}m`;
+  }
+  return key;
 }
 
 function numericCell(
@@ -153,22 +170,17 @@ function directCells(
     .map((bucket) => numericCell(provider, bucket, nowMs));
 }
 
-function fallbackWindows(provider: CpaProvider): WindowDefinition[] {
-  if (provider === "claude") {
-    return [
-      { key: "five_hour", fullLabel: "5 hours", shortLabel: "5 HOURS", sortOrder: 0 },
-      { key: "seven_day", fullLabel: "7 days", shortLabel: "7 DAYS", sortOrder: 0 },
-    ];
-  }
+function seededWindows(provider: CpaProvider): WindowDefinition[] {
+  if (provider !== "claude") return [];
   return [
     {
-      key: "primary_300m",
+      key: "five_hour",
       fullLabel: "5 hours",
       shortLabel: "5 HOURS",
       sortOrder: 0,
     },
     {
-      key: "secondary_10080m",
+      key: "seven_day",
       fullLabel: "7 days",
       shortLabel: "7 DAYS",
       sortOrder: 0,
@@ -181,9 +193,14 @@ function cpaWindowDefinitions(
   aggregateBuckets: UsageBucket[],
   accountBuckets: UsageBucket[],
 ): WindowDefinition[] {
-  const definitions = new Map<string, WindowDefinition>();
+  const definitions = new Map(
+    seededWindows(provider).map((definition) => [
+      definition.key,
+      definition,
+    ]),
+  );
   for (const bucket of [...aggregateBuckets, ...accountBuckets]) {
-    const key = cpaWindowKey(bucket);
+    const key = cpaWindowKey(provider, bucket);
     if (definitions.has(key)) continue;
     definitions.set(key, {
       key,
@@ -198,7 +215,7 @@ function cpaWindowDefinitions(
       left.fullLabel.localeCompare(right.fullLabel) ||
       left.key.localeCompare(right.key),
   );
-  return windows.length > 0 ? windows : fallbackWindows(provider);
+  return windows;
 }
 
 function cpaCells(
@@ -208,7 +225,7 @@ function cpaCells(
   nowMs: number,
 ): LimitCell[] {
   const byWindow = new Map(
-    buckets.map((bucket) => [cpaWindowKey(bucket), bucket] as const),
+    buckets.map((bucket) => [cpaWindowKey(provider, bucket), bucket] as const),
   );
   return definitions.map((definition) => {
     const bucket = byWindow.get(definition.key);
@@ -245,6 +262,50 @@ function rowTiming(cells: LimitCell[]): Pick<
           : null,
     resetSeverity: nearest?.cell.severity ?? "nominal",
   };
+}
+
+function canonicalResetLabel(key: string): "5H" | "7D" | null {
+  if (key === "five_hour" || key === "codex_300m") return "5H";
+  if (key === "seven_day" || key === "codex_10080m") return "7D";
+  return null;
+}
+
+function cpaResetReadouts(cells: LimitCell[]): CpaResetReadout[] {
+  return cells.flatMap((cell) => {
+    const shortLabel = canonicalResetLabel(cell.key);
+    if (shortLabel === null) return [];
+    const remainingMs = cell?.remainingMs ?? null;
+    const live = remainingMs !== null && remainingMs > 0;
+    return [
+      {
+        key: cell.key,
+        shortLabel,
+        fullLabel: cell.fullLabel,
+        remainingMs,
+        resetText:
+          remainingMs === null
+            ? "—"
+            : live
+              ? formatCountdown(remainingMs)
+              : "now",
+        severity: live ? cell.severity : "stale",
+      },
+    ];
+  });
+}
+
+function accessibleCountdown(remainingMs: number): string {
+  const totalMinutes = Math.max(0, Math.floor(remainingMs / 60_000));
+  const days = Math.floor(totalMinutes / 1_440);
+  const hours = Math.floor((totalMinutes % 1_440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} ${days === 1 ? "day" : "days"}`);
+  if (hours > 0) parts.push(`${hours} ${hours === 1 ? "hour" : "hours"}`);
+  if (days === 0 && minutes > 0) {
+    parts.push(`${minutes} ${minutes === 1 ? "minute" : "minutes"}`);
+  }
+  return parts.length > 0 ? parts.join(" ") : "less than one minute";
 }
 
 function emptyRowState(
@@ -413,50 +474,78 @@ function CpaChevron() {
 function WindowCells({
   cells,
   ownerLabel,
+  resetReadouts = [],
 }: {
   cells: LimitCell[];
   ownerLabel: string;
+  resetReadouts?: CpaResetReadout[];
 }) {
+  const resetsByWindow = new Map(
+    resetReadouts.map((reset) => [reset.key, reset] as const),
+  );
+
   return (
     <div className="wg-limits-cells">
-      {cells.map((cell) => (
-        <div
-          className="wg-limits-bucket"
-          data-placeholder={cell.percent === null ? "true" : undefined}
-          key={cell.key}
-        >
-          <div className="wg-limits-bucket-top">
-            <span className="wg-limits-pct" data-severity={cell.severity}>
-              {cell.percent === null ? "—" : `${cell.percent}%`}
-            </span>
-            <span className="wg-limits-window" title={cell.fullLabel}>
-              {cell.shortLabel}
-            </span>
-          </div>
-          {cell.percent === null ? (
-            <div
-              className="wg-bar"
-              data-severity="stale"
-              aria-label={`${ownerLabel} ${cell.fullLabel} utilization unavailable`}
-            />
-          ) : (
-            <div
-              className="wg-bar"
-              data-severity={cell.severity}
-              role="progressbar"
-              aria-valuenow={cell.percent}
-              aria-valuemin={0}
-              aria-valuemax={100}
-              aria-label={`${ownerLabel} ${cell.fullLabel} utilization`}
-            >
-              <div
-                className="wg-bar-fill"
-                style={{ width: `${cell.fraction * 100}%` }}
-              />
+      {cells.map((cell) => {
+        const reset = resetsByWindow.get(cell.key);
+        return (
+          <div
+            className="wg-limits-bucket"
+            data-placeholder={cell.percent === null ? "true" : undefined}
+            key={cell.key}
+          >
+            <div className="wg-limits-bucket-top">
+              <span className="wg-limits-pct" data-severity={cell.severity}>
+                {cell.percent === null ? "—" : `${cell.percent}%`}
+              </span>
+              <span className="wg-limits-window" title={cell.fullLabel}>
+                {cell.shortLabel}
+              </span>
             </div>
-          )}
-        </div>
-      ))}
+            {cell.percent === null ? (
+              <div
+                className="wg-bar"
+                data-severity="stale"
+                aria-label={`${ownerLabel} ${cell.fullLabel} utilization unavailable`}
+              />
+            ) : (
+              <div
+                className="wg-bar"
+                data-severity={cell.severity}
+                role="progressbar"
+                aria-valuenow={cell.percent}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-label={`${ownerLabel} ${cell.fullLabel} utilization`}
+              >
+                <div
+                  className="wg-bar-fill"
+                  style={{ width: `${cell.fraction * 100}%` }}
+                />
+              </div>
+            )}
+            {reset && (
+              <span
+                className="wg-limits-cell-reset"
+                data-severity={reset.severity}
+                title={`${reset.fullLabel} reset: ${reset.resetText}`}
+                role="group"
+                aria-label={
+                  reset.remainingMs === null
+                    ? `${ownerLabel} ${reset.fullLabel} quota reset unavailable`
+                    : reset.remainingMs <= 0
+                      ? `${ownerLabel} ${reset.fullLabel} quota reset is due now`
+                      : `${ownerLabel} ${reset.fullLabel} quota resets in ${accessibleCountdown(reset.remainingMs)}`
+                }
+              >
+                <span className="wg-limits-cell-reset-value" aria-hidden="true">
+                  {reset.resetText}
+                </span>
+              </span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -537,6 +626,7 @@ function CpaRow({
     row.healthy === null || row.total === null
       ? `${name} CPA health count unavailable`
       : `${row.healthy} healthy of ${row.total} ${name} CPA accounts`;
+  const resetReadouts = cpaResetReadouts(row.cells);
 
   return (
     <div
@@ -567,16 +657,17 @@ function CpaRow({
         />
         <span className="wg-cpa-identity">
           <span className="wg-limits-name">{name.toUpperCase()}</span>
-          <span className="wg-cpa-meta">
-            <span className="wg-cpa-source">CPA</span>
-            <span className="wg-cpa-health" aria-label={healthLabel}>
-              {healthText}
-            </span>
+          <span className="wg-cpa-health" aria-label={healthLabel}>
+            {healthText}
           </span>
         </span>
 
         {row.state === "ready" && (
-          <WindowCells cells={row.cells} ownerLabel={`${name} CPA pool`} />
+          <WindowCells
+            cells={row.cells}
+            ownerLabel={`${name} CPA pool`}
+            resetReadouts={resetReadouts}
+          />
         )}
         {(row.state === "setup" || row.state === "unavailable") && (
           <span
@@ -588,10 +679,6 @@ function CpaRow({
             {row.state === "setup" ? "SETUP" : "UNAVAILABLE"}
           </span>
         )}
-
-        <span className="wg-limits-reset" data-severity={row.resetSeverity}>
-          {row.resetText}
-        </span>
       </div>
 
       {row.accounts.length > 0 && (
@@ -651,6 +738,9 @@ function LimitsSection({ data, statuses }: LimitsSectionProps) {
   const cpa = useMemo(() => cpaRows(data, nowMs), [data, nowMs]);
   const directByProvider = new Map(direct.map((row) => [row.provider, row]));
   const cpaByProvider = new Map(cpa.map((row) => [row.provider, row]));
+  const cpaPoolProviders = new Set(
+    (data?.cpa_pools ?? []).map((pool) => pool.provider),
+  );
   const providerOrder = [
     ...new Set<IntegrationProvider>([
       ...statuses.map((status) => status.provider),
@@ -672,25 +762,29 @@ function LimitsSection({ data, statuses }: LimitsSectionProps) {
         const directRow = directByProvider.get(provider);
         const cpaRow =
           provider === "mini_max" ? undefined : cpaByProvider.get(provider);
+        const showCpa =
+          cpaRow !== undefined &&
+          (cpaPoolProviders.has(cpaRow.provider) || directRow === undefined);
+
+        if (!showCpa) {
+          return directRow ? <DirectRow key={provider} row={directRow} /> : null;
+        }
+
         return (
-          <Fragment key={provider}>
-            {directRow && <DirectRow row={directRow} />}
-            {cpaRow && (
-              <CpaRow
-                row={cpaRow}
-                expanded={expanded.has(cpaRow.provider)}
-                controlsId={`${disclosurePrefix}-${cpaRow.provider}-accounts`}
-                onToggle={() =>
-                  setExpanded((current) => {
-                    const next = new Set(current);
-                    if (next.has(cpaRow.provider)) next.delete(cpaRow.provider);
-                    else next.add(cpaRow.provider);
-                    return next;
-                  })
-                }
-              />
-            )}
-          </Fragment>
+          <CpaRow
+            key={provider}
+            row={cpaRow}
+            expanded={expanded.has(cpaRow.provider)}
+            controlsId={`${disclosurePrefix}-${cpaRow.provider}-accounts`}
+            onToggle={() =>
+              setExpanded((current) => {
+                const next = new Set(current);
+                if (next.has(cpaRow.provider)) next.delete(cpaRow.provider);
+                else next.add(cpaRow.provider);
+                return next;
+              })
+            }
+          />
         );
       })}
       {otherAccountCount > 0 && (

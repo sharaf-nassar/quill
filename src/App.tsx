@@ -57,6 +57,17 @@ function App({ integrations }: AppProps) {
     .join(",");
   const hasUsageSource = hasEnabledProvider || cpaConfigured === true;
   const usageSourcesLoading = providersLoading || cpaConfigured === null;
+  const cpaPoolProviders = new Set(
+    (usageData?.cpa_pools ?? []).map((pool) => pool.provider),
+  );
+  const titlebarProviderErrors =
+    usageData === null
+      ? null
+      : usageData.provider_errors.filter(
+          (error) =>
+            (error.source ?? "direct") !== "direct" ||
+            !cpaPoolProviders.has(error.provider),
+        );
 
   const requestUsageData = useCallback(() => {
     if (usageRequestRef.current) return usageRequestRef.current;
@@ -270,7 +281,7 @@ function App({ integrations }: AppProps) {
   return (
     <div className="wg-shell" onContextMenu={handleContextMenu} onClick={closeMenu}>
       <WidgetTitleBar
-        providerErrors={usageData?.provider_errors ?? null}
+        providerErrors={titlebarProviderErrors}
         hasUsageSource={hasUsageSource}
         lastSyncAt={lastSyncAt}
         pendingUpdate={pendingUpdate}

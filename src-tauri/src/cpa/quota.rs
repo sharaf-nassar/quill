@@ -116,11 +116,11 @@ fn parse_codex_usage(
         .get("rate_limit")
         .and_then(Value::as_object)
         .ok_or_else(|| account_call_error(auth_index))?;
-    let mut buckets = Vec::new();
+    let mut buckets = Vec::<UsageBucket>::new();
 
-    for (window_key, scope, default_seconds) in [
-        ("primary_window", "primary", 5 * 60 * 60_i64),
-        ("secondary_window", "secondary", 7 * 24 * 60 * 60_i64),
+    for (window_key, default_seconds) in [
+        ("primary_window", 5 * 60 * 60_i64),
+        ("secondary_window", 7 * 24 * 60 * 60_i64),
     ] {
         let Some(window) = rate_limit.get(window_key) else {
             continue;
@@ -135,6 +135,10 @@ fn parse_codex_usage(
             .filter(|seconds| *seconds > 0)
             .unwrap_or(default_seconds);
         let window_minutes = window_seconds / 60;
+        let bucket_key = account_bucket_key(auth_index, &format!("codex_{window_minutes}m"));
+        if buckets.iter().any(|bucket| bucket.key == bucket_key) {
+            continue;
+        }
         let resets_at = if window.get("reset_at").is_some_and(|value| !value.is_null()) {
             parse_reset_value(window.get("reset_at"), auth_index)?
         } else {
@@ -143,7 +147,7 @@ fn parse_codex_usage(
 
         buckets.push(UsageBucket {
             provider: IntegrationProvider::Codex,
-            key: account_bucket_key(auth_index, &format!("{scope}_{window_minutes}m")),
+            key: bucket_key,
             label: codex_window_label(window_minutes),
             utilization,
             resets_at,
@@ -344,13 +348,13 @@ mod tests {
 
         let buckets = parse_codex_usage("codex-3", &fixture).expect("fixture should parse");
         assert_eq!(buckets.len(), 2);
-        assert_eq!(buckets[0].key, "cpa/codex-3/primary_300m");
+        assert_eq!(buckets[0].key, "cpa/codex-3/codex_300m");
         assert_eq!(buckets[0].label, "5 hours");
         assert_eq!(buckets[0].utilization, 38.0);
         assert_eq!(buckets[0].source, UsageSource::Cpa);
         assert_eq!(buckets[0].account_id.as_deref(), Some("codex-3"));
         assert_eq!(buckets[0].account_label, None);
-        assert_eq!(buckets[1].key, "cpa/codex-3/secondary_10080m");
+        assert_eq!(buckets[1].key, "cpa/codex-3/codex_10080m");
         assert_eq!(buckets[1].label, "7 days");
     }
 

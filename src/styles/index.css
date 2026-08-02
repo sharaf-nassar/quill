@@ -1127,10 +1127,10 @@ body {
 }
 
 /* ═══ LIMITS band — one row per enabled provider ═══════════════════════════
-   The widget's only subscription readout: identity swatch + name, one
-   fixed-width cell per rate-limit window, right-aligned nearest-reset
-   countdown. Fixed cells are what make the rows scan as a table — every
-   provider's first window starts at the same x whatever its bucket count.
+   The widget's only subscription readout: identity swatch + name and one
+   fluid cell per rate-limit window. Direct rows end with their nearest reset;
+   CPA reset countdowns sit inside their matching window cells. Provider and
+   account rows share one identity edge and one fluid meter grid.
    Severity lives on [data-severity]; a bucket past its reset carries
    "stale" and therefore matches no severity rule, so it renders neutral.
    ═════════════════════════════════════════════════════════════════════════ */
@@ -1191,20 +1191,21 @@ body {
 }
 
 .wg-limits-cells {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
   gap: var(--space-md);
   min-width: 0;
-  flex: 0 1 auto;
+  flex: 1 1 0;
 }
 
-/* Cells hold their 60px column until a provider reports more windows than the
-   360px row can seat; only then do they shrink, so nothing is ever clipped. */
+/* Every visible window receives an equal share of the meter region. A 60px
+   track keeps percent and label legible; dynamic extras reflow into another
+   grid row when the widget reaches its 320px floor. */
 .wg-limits-bucket {
   display: flex;
   flex-direction: column;
   gap: var(--space-xs);
-  flex: 0 1 62px;
-  min-width: 44px;
+  min-width: 0;
 }
 
 .wg-limits-bucket[data-placeholder="true"] .wg-bar {
@@ -1212,17 +1213,22 @@ body {
 }
 
 .wg-limits-bucket-top {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-xs);
+  min-width: 0;
 }
 
 .wg-limits-pct {
+  grid-column: 1;
+  grid-row: 1;
+  justify-self: start;
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
-  color: var(--text);
+  color: var(--text-hi);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .wg-limits-pct[data-severity="caution"] {
@@ -1238,12 +1244,43 @@ body {
 }
 
 .wg-limits-window {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: center;
   font-size: 8px;
   font-weight: 500;
+  letter-spacing: 0.04em;
   color: var(--faint);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.wg-limits-cell-reset {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  min-width: 0;
+  color: var(--faint);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.wg-limits-cell-reset-value {
+  color: var(--label);
+  font-size: 10px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.wg-limits-cell-reset[data-severity="caution"] .wg-limits-cell-reset-value {
+  color: var(--meter-amber);
+  font-weight: 600;
+}
+
+.wg-limits-cell-reset[data-severity="critical"] .wg-limits-cell-reset-value {
+  color: var(--meter-red);
+  font-weight: 600;
 }
 
 @media (prefers-reduced-motion: no-preference) {
@@ -1257,7 +1294,8 @@ body {
 .wg-limits-pending {
   display: flex;
   gap: var(--space-md);
-  flex: 0 1 132px;
+  min-width: 0;
+  flex: 1 1 0;
 }
 
 .wg-limits-pending .wg-skeleton-line {
@@ -1312,10 +1350,9 @@ body {
   font-weight: 600;
 }
 
-/* CPA is a source, not a provider identity. Its aggregate row keeps the
-   provider swatch and name, then adds a neutral source/count readout. The
-   meter region wraps at its existing minimum cell width instead of shrinking
-   the widget's type below the cockpit density floor. */
+/* A CPA pool is the provider's authoritative row while it exists. The row
+   keeps provider identity and a compact health count; account provenance stays
+   behind disclosure instead of consuming a second label line. */
 .wg-cpa-group {
   display: flex;
   flex-direction: column;
@@ -1323,25 +1360,18 @@ body {
 }
 
 .wg-limits-row[data-source="cpa"] {
-  align-items: flex-start;
   gap: var(--space-sm);
 }
 
-.wg-limits-row[data-source="cpa"] .wg-limits-swatch {
-  margin-top: 10px;
-}
-
 .wg-limits-row[data-source="cpa"] .wg-limits-cells {
-  flex: 1 1 0;
-  flex-wrap: wrap;
+  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+  column-gap: var(--space-sm);
   row-gap: var(--space-sm);
-  padding-top: var(--space-2xs);
 }
 
-.wg-limits-row[data-source="cpa"] .wg-limits-bucket,
-.wg-cpa-account-row .wg-limits-bucket {
-  flex: 1 1 48px;
-  max-width: 62px;
+.wg-limits-row > .wg-limits-cells .wg-limits-pct {
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .wg-cpa-toggle,
@@ -1381,12 +1411,11 @@ body {
 
 .wg-cpa-identity {
   display: flex;
-  width: 58px;
-  flex: 0 0 58px;
+  align-items: baseline;
+  width: 70px;
+  flex: 0 0 70px;
   min-width: 0;
-  flex-direction: column;
-  gap: 3px;
-  padding-top: 4px;
+  gap: var(--space-xs);
 }
 
 .wg-cpa-identity .wg-limits-name {
@@ -1395,32 +1424,12 @@ body {
   flex: none;
 }
 
-.wg-cpa-meta {
-  display: flex;
-  align-items: center;
-  min-width: 0;
-  gap: var(--space-xs);
+.wg-cpa-health {
   color: var(--faint);
   font-size: 9px;
   line-height: 1;
   white-space: nowrap;
-}
-
-.wg-cpa-source {
-  padding-right: var(--space-xs);
-  border-right: 1px solid var(--line-soft);
-  color: var(--label);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-}
-
-.wg-cpa-health {
   font-variant-numeric: tabular-nums;
-}
-
-.wg-limits-row[data-source="cpa"] > .wg-limits-status,
-.wg-limits-row[data-source="cpa"] > .wg-limits-reset {
-  margin-top: 4px;
 }
 
 .wg-cpa-accounts {
@@ -1430,11 +1439,11 @@ body {
 
 .wg-cpa-account-row {
   display: grid;
-  grid-template-columns: minmax(64px, 82px) minmax(0, 1fr);
+  grid-template-columns: 70px minmax(0, 1fr);
   align-items: start;
-  gap: var(--space-md);
+  gap: var(--space-sm);
   min-width: 0;
-  padding: 7px 0 7px 30px;
+  padding: 7px 0 7px 36px;
 }
 
 .wg-cpa-account-row + .wg-cpa-account-row,
@@ -1487,7 +1496,8 @@ body {
 }
 
 .wg-cpa-account-row .wg-limits-cells {
-  flex-wrap: wrap;
+  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
+  column-gap: var(--space-sm);
   row-gap: var(--space-sm);
 }
 
@@ -1511,13 +1521,13 @@ body {
   }
 
   .wg-cpa-identity {
-    width: 54px;
-    flex-basis: 54px;
+    width: 70px;
+    flex-basis: 70px;
   }
 
   .wg-cpa-account-row {
-    grid-template-columns: minmax(58px, 72px) minmax(0, 1fr);
-    padding-left: 26px;
+    grid-template-columns: 70px minmax(0, 1fr);
+    padding-left: 36px;
   }
 }
 

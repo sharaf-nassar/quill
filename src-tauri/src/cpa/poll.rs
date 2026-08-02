@@ -128,7 +128,7 @@ fn window_calls(
         .iter()
         .zip(auth_files)
         .enumerate()
-        .filter(|(_, (snapshot, _))| snapshot.is_healthy())
+        .filter(|(_, (snapshot, _))| snapshot.is_quota_readable())
         .filter_map(|(account_position, (snapshot, auth_file))| {
             let provider = match snapshot.health.provider.as_str() {
                 "claude" if smoke.claude => IntegrationProvider::Claude,
@@ -232,9 +232,9 @@ mod tests {
         );
     }
 
-    // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Usable lifecycle scheduling]]
+    // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Quota readability scheduling]]
     #[test]
-    fn active_and_ready_accounts_schedule_while_other_states_do_not() {
+    fn routing_status_does_not_suppress_readable_account_quota_calls() {
         let mut files = [
             auth_file("active", "claude"),
             auth_file("ready", "claude"),
@@ -258,13 +258,7 @@ mod tests {
 
         assert_eq!(snapshots[0].health.status, "ready");
         assert_eq!(snapshots[1].health.status, "ready");
-        assert_eq!(
-            calls
-                .iter()
-                .map(|call| call.auth_index.as_str())
-                .collect::<Vec<_>>(),
-            ["active", "ready"]
-        );
+        assert_eq!(calls.len(), files.len());
     }
 
     // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Bounded staggered fan-out]]

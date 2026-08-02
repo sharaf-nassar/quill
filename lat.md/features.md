@@ -6,9 +6,9 @@ Quill provides live usage monitoring, analytics, behavioral learning, session se
 
 Live provider-aware rate-limit pressure, rendered as the widget's LIMITS band above everything else.
 
-Each enabled direct provider gets an identity row with fixed-width window cells and its nearest reset. CPA adds separate source-tagged Claude/Codex pool rows after their direct counterparts, including in CPA-only setups, so either source keeps the LIMITS band present and neither leaves it absent. Severity follows the 50/80 thresholds — green below 50%, amber from 50%, red from 80%. Data refreshes every 3 minutes via `fetch_usage_data()`. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
+Each provider gets one identity row whose visible window cells evenly divide the fluid meter region and reflow at their legible minimum. Direct rows show their nearest reset; CPA rows place each visible canonical reset inside its matching meter cell. A CPA pool replaces that provider's direct row while present; without one, the direct row remains. Severity follows the 50/80 thresholds. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
 
-When a bucket's `resets_at` has already passed (its countdown reads "now"), the cell renders as stale — muted percentage and a neutral slate bar — so a utilization carried over from a bygone window can never read as a live severity state. The meter colors are reserved for real thresholds, and an elapsed window is likewise excluded from the row's nearest-reset countdown.
+When a bucket's `resets_at` has passed, the cell renders as stale — muted percentage and a neutral slate bar — so bygone utilization never reads as a live severity. Direct rows exclude it from their nearest reset; a dated CPA window keeps a neutral `now` reset while a missing reset renders a dash.
 
 Claude rows come from the Anthropic OAuth usage API, Codex rows come from `codex app-server` `account/rateLimits/read` (with transcript `token_count` data as a compatibility fallback), and MiniMax rows come from the MiniMax coding plan API at `api.minimax.io`. MiniMax is a service-only provider that requires an API key (stored in SQLite) rather than a local CLI; its rows keep the plan-level bucket filter (M\*, coding-plan-search, coding-plan-vlm) because the per-model long tail does not fit a 360px row. The backend can keep serving cached rows for a provider whose live poll fails so other providers do not blank the band. Its in-memory usage cache is keyed only by provider identity and enabled state so transient detection churn does not dislodge a fresh snapshot. Claude reuses recently persisted snapshots across window reopens and app restarts, and a 429 response arms a short-lived rate-limit cooldown so Quill serves the last snapshot without retrying the live endpoint on every remount.
 
@@ -20,23 +20,27 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 
 ### CPA Pool Aggregation
 
-CPA pool rows derive worst-case pressure from account snapshots and are never persisted as independent facts.
+CPA pool rows derive mean account pressure from readable account snapshots and are never persisted as independent facts.
 
-[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or the compatible `ready` status without disabled or unavailable flags; all accounts, including runtime-only entries, remain in the total denominator. Each window takes the healthy account's maximum utilization and its reset timestamp. Missing windows are excluded, and an all-missing healthy pool has no numeric bucket.
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags; every account remains in that denominator. Each window is the arithmetic mean of accounts returning that window, so missing buckets are excluded rather than read as zero. Disabled or unavailable accounts never contribute.
 
-The widget renders each aggregate before optional account detail: fixed provider identity, a visible `CPA` tag, healthy/total count, worst-case window cells, and the nearest upcoming reset. A semantic disclosure button reveals at most six account rows plus a remainder count. Missing account windows stay nonnumeric; usable accounts carry no badge, while disabled, unavailable, and cooling states remain visibly distinct. Unsupported CPA providers collapse into one neutral account-count line with no new provider identity.
+The widget renders each aggregate as that provider's sole top-level row while the pool exists: fixed provider identity, inline healthy/total count, mean window cells, and reset readouts for visible canonical windows. Each reset uses only its matching aggregate window's earliest contributing timestamp; missing timestamps show a dash and elapsed timestamps show neutral `now`. A semantic disclosure reveals at most six account rows plus a remainder count.
+
+Claude always projects its canonical 5-hour and 7-day schema so missing data remains explicit. Codex projects only durations returned by its pool or accounts; an absent 300-minute window therefore removes the 5-hour cell and reset from the pool and every disclosed account row.
 
 #### Usable lifecycle compatibility
 
 CPA v7 reports usable credentials as `active`; Quill also accepts the compatible `ready` form, while every other lifecycle state and either disabled or unavailable flag remains unhealthy.
 
-#### Worst-case healthy maximum
+#### Readable account mean
 
-The aggregate uses each window's highest healthy utilization and the reset timestamp from that same account.
+Each normalized window averages returned utilization across non-disabled, available accounts that contain it; routing health does not affect quota math.
 
-#### Full denominator with unhealthy exclusions
+Its reset is the earliest parseable contributing reset because that is when the displayed mean can first change.
 
-Disabled, unavailable, and non-usable accounts count toward total but cannot influence utilization.
+#### Health denominator with unreadable exclusions
+
+Disabled and unavailable accounts count toward total but cannot influence utilization. Other routing-unhealthy accounts keep their honest health state and can contribute successfully read quota buckets.
 
 #### Missing account buckets stay gaps
 
@@ -58,13 +62,15 @@ Runtime-only accounts participate in health counts and aggregate math exactly li
 
 CPA window polling is smoke-gated, capped, staggered, and bounded independently from native provider work.
 
-[[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete auth-file inventory before scheduling windows. Only persisted `true` provider smoke verdicts permit calls; the first 16 healthy eligible accounts by `auth_index` launch 250ms apart with at most three requests active.
+[[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete auth-file inventory before scheduling windows. Only persisted `true` provider smoke verdicts permit calls; the first 16 non-disabled, available accounts by `auth_index` launch 250ms apart with at most three requests active.
 
 Each configured CPA phase logs `cpa_phase_ms` after native polling so its real-pool duration can be checked against the 3-minute cadence without delaying or obscuring direct-provider timing.
 
-#### Usable lifecycle scheduling
+#### Quota readability scheduling
 
-The poll mapper canonicalizes CPA `active` and compatible `ready` credentials to the frontend's ready state and schedules only those usable accounts when their provider smoke gate is open.
+Quota scheduling depends on credential readability, not CPA routing health.
+
+The poll mapper canonicalizes `active` and compatible `ready` to the frontend's ready state, but schedules every non-disabled, available Claude or Codex account when its provider smoke gate is open. Successful buckets render and enter pool pressure even when CPA reports a routing `error`.
 
 #### Smoke verdict gate
 
@@ -132,7 +138,7 @@ Missing or invalid Anthropic utilization fields produce an account-scoped failur
 
 #### Codex windows fixture
 
-The researched Codex response maps primary and secondary rate-limit windows to account-qualified CPA buckets and stable labels.
+The researched Codex response maps primary and secondary rate-limit windows to duration-normalized, account-qualified CPA buckets and stable labels, regardless of field position.
 
 #### Codex malformed windows
 
@@ -493,7 +499,7 @@ An exact bcrypt hash shape is rejected before any CPA request with safe recovery
 
 [[src-tauri/src/lib.rs#get_cpa_connection_status]] returns only the saved URL and configured state, never the management key. [[src-tauri/src/lib.rs#clear_cpa_connection]] runs the guarded manager purge, deletes both connection settings, every `usage.cpa.*` runtime row, raw CPA snapshots and `usage_hourly` keys under `cpa/%`, then clears the usage cache and advances its epoch so an older in-flight refresh cannot restore disconnected rows. Direct provider snapshots remain intact.
 
-Direct Claude and Codex integrations remain active when CPA is configured. The settings copy names the accepted v1 overlap explicitly: the same account can appear through both sources and may be counted twice.
+Direct Claude and Codex integrations remain active when CPA is configured, but a matching CPA pool takes provider-level precedence in LIMITS. The direct row returns whenever that provider has no CPA pool, so one provider never appears twice.
 
 #### Ready account smoke selection
 
