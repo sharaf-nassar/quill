@@ -6,7 +6,7 @@ Quill provides live usage monitoring, analytics, behavioral learning, session se
 
 Live provider-aware rate-limit pressure, rendered as the widget's LIMITS band above everything else.
 
-One row per enabled provider: an identity swatch, the provider name, one fixed-width cell per rate-limit window (rounded percent, compressed window label, a 4px severity bar), and a right-aligned countdown to that row's nearest upcoming reset. Severity follows the 50/80 thresholds — green below 50%, amber from 50%, red from 80%. Data refreshes every 3 minutes via `fetch_usage_data()`. The band is absent entirely when no provider is enabled. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
+Each enabled direct provider gets an identity row with fixed-width window cells and its nearest reset. CPA adds separate source-tagged Claude/Codex pool rows after their direct counterparts, so either source can keep the LIMITS band present. Severity follows the 50/80 thresholds — green below 50%, amber from 50%, red from 80%. Data refreshes every 3 minutes via `fetch_usage_data()`. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
 
 When a bucket's `resets_at` has already passed (its countdown reads "now"), the cell renders as stale — muted percentage and a neutral slate bar — so a utilization carried over from a bygone window can never read as a live severity state. The meter colors are reserved for real thresholds, and an elapsed window is likewise excluded from the row's nearest-reset countdown.
 
@@ -23,6 +23,8 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 CPA pool rows derive worst-case pressure from account snapshots and are never persisted as independent facts.
 
 [[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means `status == ready` without disabled or unavailable flags; all accounts, including runtime-only entries, remain in the total denominator. Each window takes the healthy account's maximum utilization and its reset timestamp. Missing windows are excluded, and an all-missing healthy pool has no numeric bucket.
+
+The widget renders each aggregate before optional account detail: fixed provider identity, a visible `CPA` tag, healthy/total count, worst-case window cells, and the nearest upcoming reset. A semantic disclosure button reveals at most six account rows plus a remainder count. Missing account windows stay nonnumeric; ready accounts carry no badge, while disabled, unavailable, and cooling states remain visibly distinct. Unsupported CPA providers collapse into one neutral account-count line with no new provider identity.
 
 #### Worst-case healthy maximum
 
