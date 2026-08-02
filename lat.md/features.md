@@ -6,7 +6,7 @@ Quill provides live usage monitoring, analytics, behavioral learning, session se
 
 Live provider-aware rate-limit pressure, rendered as the widget's LIMITS band above everything else.
 
-Each enabled direct provider gets an identity row with fixed-width window cells and its nearest reset. CPA adds separate source-tagged Claude/Codex pool rows after their direct counterparts, so either source can keep the LIMITS band present. Severity follows the 50/80 thresholds — green below 50%, amber from 50%, red from 80%. Data refreshes every 3 minutes via `fetch_usage_data()`. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
+Each enabled direct provider gets an identity row with fixed-width window cells and its nearest reset. CPA adds separate source-tagged Claude/Codex pool rows after their direct counterparts, including in CPA-only setups, so either source keeps the LIMITS band present and neither leaves it absent. Severity follows the 50/80 thresholds — green below 50%, amber from 50%, red from 80%. Data refreshes every 3 minutes via `fetch_usage_data()`. Component detail lives in [[frontend#Frontend#Components#Widget Limits Band]].
 
 When a bucket's `resets_at` has already passed (its countdown reads "now"), the cell renders as stale — muted percentage and a neutral slate bar — so a utilization carried over from a bygone window can never read as a live severity state. The meter colors are reserved for real thresholds, and an elapsed window is likewise excluded from the row's nearest-reset countdown.
 

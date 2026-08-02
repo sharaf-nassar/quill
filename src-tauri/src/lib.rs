@@ -2325,7 +2325,7 @@ fn emit_usage_updates(
     usage: &UsageData,
 ) -> Result<(), String> {
     let indicator_state = build_indicator_state(statuses, usage)?;
-    let _ = app.emit("usage-updated", ());
+    let _ = app.emit("usage-updated", usage.clone());
     let _ = app.emit(indicator::INDICATOR_UPDATED_EVENT, indicator_state);
     Ok(())
 }

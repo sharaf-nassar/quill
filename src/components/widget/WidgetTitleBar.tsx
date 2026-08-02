@@ -32,7 +32,7 @@ export type WidgetSyncState = "live" | "offline" | "paused" | "cached" | "idle";
 export interface WidgetTitleBarProps {
   /** Null before the first read; source tags keep CPA and native state distinct. */
   providerErrors: UsageProviderError[] | null;
-  /** Whether a native provider is enabled or any usage read has completed. */
+  /** Whether a native provider or configured CPA source is active. */
   hasUsageSource: boolean;
   /** Epoch ms of the last successful usage read, or null before the first. */
   lastSyncAt: number | null;

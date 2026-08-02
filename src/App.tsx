@@ -11,8 +11,9 @@
 //
 // See specs/018-widget-ui-redesign/plan.md#Affected Components.
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check } from "@tauri-apps/plugin-updater";
 import LimitsSection from "./components/widget/LimitsSection";
@@ -20,7 +21,7 @@ import ViewRegion from "./components/widget/ViewRegion";
 import WidgetTitleBar from "./components/widget/WidgetTitleBar";
 import type { UseIntegrationsResult } from "./hooks/useIntegrations";
 import { useToast } from "./hooks/useToast";
-import type { UsageData, PendingUpdate } from "./types";
+import type { CpaConnectionStatus, UsageData, PendingUpdate } from "./types";
 
 const USAGE_REFRESH_MS = 3 * 60_000;
 const UPDATE_CHECK_MS = 4 * 60 * 60_000;
@@ -33,10 +34,14 @@ function App({ integrations }: AppProps) {
   const { toast } = useToast();
   const [usageData, setUsageData] = useState<UsageData | null>(null);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [cpaConfigured, setCpaConfigured] = useState<boolean | null>(null);
   const [showMenu, setShowMenu] = useState(false);
   const [menuPos, setMenuPos] = useState({ x: 0, y: 0 });
   const [pendingUpdate, setPendingUpdate] = useState<PendingUpdate | null>(null);
   const [updating, setUpdating] = useState(false);
+  const usageRequestRef = useRef<Promise<UsageData> | null>(null);
+  const appliedUsageRequestRef = useRef<Promise<UsageData> | null>(null);
+  const cpaStatusRequestRef = useRef<Promise<CpaConnectionStatus> | null>(null);
 
   const {
     statuses,
@@ -50,13 +55,32 @@ function App({ integrations }: AppProps) {
     .filter((status) => status.enabled)
     .map((status) => status.provider)
     .join(",");
+  const hasUsageSource = hasEnabledProvider || cpaConfigured === true;
+  const usageSourcesLoading = providersLoading || cpaConfigured === null;
 
-  const refresh = useCallback(async () => {
+  const requestUsageData = useCallback(() => {
+    if (usageRequestRef.current) return usageRequestRef.current;
+
+    const request = invoke<UsageData>("fetch_usage_data");
+    usageRequestRef.current = request;
+    const clearRequest = () => {
+      if (usageRequestRef.current === request) usageRequestRef.current = null;
+    };
+    void request.then(clearRequest, clearRequest);
+    return request;
+  }, []);
+
+  const refresh = useCallback(async (isActive: () => boolean = () => true) => {
+    const request = requestUsageData();
     try {
-      const data = await invoke<UsageData>("fetch_usage_data");
+      const data = await request;
+      if (!isActive() || appliedUsageRequestRef.current === request) return;
+      appliedUsageRequestRef.current = request;
       setUsageData(data);
       setLastSyncAt(Date.now());
     } catch (e) {
+      if (!isActive() || appliedUsageRequestRef.current === request) return;
+      appliedUsageRequestRef.current = request;
       toast("error", `Usage data fetch failed: ${e}`);
       setUsageData({
         buckets: [],
@@ -67,21 +91,92 @@ function App({ integrations }: AppProps) {
         error: String(e),
       });
     }
-  }, [toast]);
+  }, [requestUsageData, toast]);
+
+  const refreshCpaConnectionStatus = useCallback(
+    async (isActive: () => boolean = () => true) => {
+      let request = cpaStatusRequestRef.current;
+      if (!request) {
+        request = invoke<CpaConnectionStatus>("get_cpa_connection_status");
+        cpaStatusRequestRef.current = request;
+        const clearRequest = () => {
+          if (cpaStatusRequestRef.current === request) {
+            cpaStatusRequestRef.current = null;
+          }
+        };
+        void request.then(clearRequest, clearRequest);
+      }
+
+      try {
+        const status = await request;
+        if (isActive()) setCpaConfigured(status.configured);
+      } catch (e) {
+        if (!isActive()) return;
+        setCpaConfigured(false);
+        toast("error", `CPA connection status failed: ${e}`);
+      }
+    },
+    [toast],
+  );
+
+  useEffect(() => {
+    let active = true;
+    void refreshCpaConnectionStatus(() => active);
+    return () => {
+      active = false;
+    };
+  }, [refreshCpaConnectionStatus]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+
+    void listen<UsageData>("usage-updated", (event) => {
+      if (!active) return;
+      if (usageRequestRef.current) {
+        appliedUsageRequestRef.current = usageRequestRef.current;
+      }
+      setUsageData(event.payload);
+      setLastSyncAt(Date.now());
+      void refreshCpaConnectionStatus(() => active);
+    })
+      .then((stop) => {
+        if (active) unlisten = stop;
+        else stop();
+      })
+      .catch((e) => {
+        if (active) toast("error", `Usage refresh listener failed: ${e}`);
+      });
+
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [refreshCpaConnectionStatus, toast]);
 
   // Usage polling. Cadence is unchanged from the split-pane UI — the widget
   // changed the presentation of freshness, not how often Quill reads.
   useEffect(() => {
-    if (providersLoading) return;
-    if (!hasEnabledProvider) {
+    let active = true;
+    if (usageSourcesLoading) {
+      return () => {
+        active = false;
+      };
+    }
+    if (!hasUsageSource) {
       setUsageData(null);
       setLastSyncAt(null);
-      return;
+      return () => {
+        active = false;
+      };
     }
-    void refresh();
-    const interval = setInterval(() => void refresh(), USAGE_REFRESH_MS);
-    return () => clearInterval(interval);
-  }, [hasEnabledProvider, liveProviderKey, providersLoading, refresh]);
+    void refresh(() => active);
+    const interval = setInterval(() => void refresh(() => active), USAGE_REFRESH_MS);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [hasUsageSource, liveProviderKey, refresh, usageSourcesLoading]);
 
   const checkForUpdate = useCallback(() => {
     check()
@@ -176,7 +271,7 @@ function App({ integrations }: AppProps) {
     <div className="wg-shell" onContextMenu={handleContextMenu} onClick={closeMenu}>
       <WidgetTitleBar
         providerErrors={usageData?.provider_errors ?? null}
-        hasUsageSource={hasEnabledProvider || usageData !== null}
+        hasUsageSource={hasUsageSource}
         lastSyncAt={lastSyncAt}
         pendingUpdate={pendingUpdate}
         updating={updating}
@@ -189,12 +284,12 @@ function App({ integrations }: AppProps) {
           {/* Content column: the LIMITS section, then the switchable view
               region. The shell owns only the provider-level states that gate
               them. */}
-          {providersLoading ? (
+          {usageSourcesLoading ? (
             <div className="wg-state">
               <span className="wg-state-lamp" aria-hidden="true" />
               Checking integrations…
             </div>
-          ) : !hasEnabledProvider ? (
+          ) : !hasUsageSource ? (
             <div className="wg-empty">
               <p className="wg-empty-title">{emptyState.title}</p>
               <p className="wg-empty-body">{emptyState.description}</p>
