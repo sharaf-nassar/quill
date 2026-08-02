@@ -16,7 +16,11 @@ import { useCallback, useEffect, useState } from "react";
 import { openManageWindow } from "../../lib/manageWindow";
 import { useRuntimeSettings } from "../../hooks/useRuntimeSettings";
 import { useToast } from "../../hooks/useToast";
-import type { PendingUpdate } from "../../types";
+import type {
+  PendingUpdate,
+  UsageProviderError,
+  UsageSource,
+} from "../../types";
 
 /**
  * Freshness of the live usage read, as the titlebar pill states it. The three
@@ -26,8 +30,10 @@ import type { PendingUpdate } from "../../types";
 export type WidgetSyncState = "live" | "offline" | "paused" | "cached" | "idle";
 
 export interface WidgetTitleBarProps {
-  /** Current freshness state; drives the pill's dot colour and wording. */
-  syncState: WidgetSyncState;
+  /** Null before the first read; source tags keep CPA and native state distinct. */
+  providerErrors: UsageProviderError[] | null;
+  /** Whether a native provider is enabled or any usage read has completed. */
+  hasUsageSource: boolean;
   /** Epoch ms of the last successful usage read, or null before the first. */
   lastSyncAt: number | null;
   /** Non-null once the updater check finds a release; shows the update button. */
@@ -87,6 +93,46 @@ const SYNC_BADGE: Partial<Record<WidgetSyncState, string>> = {
   cached: "Cached",
 };
 
+const DEGRADED_SYNC_PRECEDENCE = ["offline", "cached", "paused"] as const;
+
+/**
+ * Derive one source independently so a CPA failure never becomes a native
+ * Claude/Codex failure. Missing source tags are legacy direct-provider data.
+ */
+function syncStateForSource(
+  errors: UsageProviderError[],
+  source: UsageSource,
+): Exclude<WidgetSyncState, "idle"> {
+  const kinds = errors
+    .filter((error) => (error.source ?? "direct") === source)
+    .map((error) => error.kind);
+  if (kinds.includes("network")) return "offline";
+  if (kinds.includes("stale")) return "cached";
+  if (kinds.includes("paused")) return "paused";
+  return "live";
+}
+
+/**
+ * Collapse independently derived source states into the titlebar's existing
+ * vocabulary. A fresh poll naturally recovers when it returns no CPA error.
+ */
+function syncStateFor(
+  providerErrors: UsageProviderError[] | null,
+  hasUsageSource: boolean,
+): WidgetSyncState {
+  if (providerErrors === null) return "idle";
+
+  const sourceStates = [
+    syncStateForSource(providerErrors, "direct"),
+    syncStateForSource(providerErrors, "cpa"),
+  ];
+  const degradedState = DEGRADED_SYNC_PRECEDENCE.find((state) =>
+    sourceStates.includes(state),
+  );
+  if (degradedState) return degradedState;
+  return hasUsageSource ? "live" : "idle";
+}
+
 /**
  * Real elapsed time since the last successful read — never a fixed cadence.
  * Returns an em dash before the first read so the pill still occupies its
@@ -104,7 +150,8 @@ function formatElapsed(lastSyncAt: number | null, now: number): string {
 }
 
 function WidgetTitleBar({
-  syncState,
+  providerErrors,
+  hasUsageSource,
   lastSyncAt,
   pendingUpdate,
   updating,
@@ -138,6 +185,7 @@ function WidgetTitleBar({
     }
   }, [settings, save, toast]);
 
+  const syncState = syncStateFor(providerErrors, hasUsageSource);
   const badge = SYNC_BADGE[syncState];
   const sentence = SYNC_SENTENCE[syncState];
 

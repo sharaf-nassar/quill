@@ -17,33 +17,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check } from "@tauri-apps/plugin-updater";
 import LimitsSection from "./components/widget/LimitsSection";
 import ViewRegion from "./components/widget/ViewRegion";
-import WidgetTitleBar, {
-  type WidgetSyncState,
-} from "./components/widget/WidgetTitleBar";
+import WidgetTitleBar from "./components/widget/WidgetTitleBar";
 import type { UseIntegrationsResult } from "./hooks/useIntegrations";
 import { useToast } from "./hooks/useToast";
 import type { UsageData, PendingUpdate } from "./types";
 
 const USAGE_REFRESH_MS = 3 * 60_000;
 const UPDATE_CHECK_MS = 4 * 60 * 60_000;
-
-/**
- * Collapse the poller's per-provider error kinds into the single freshness
- * state the titlebar pill shows. Offline wins over cached because both say
- * "showing cached data" and the widget must not stack two near-identical
- * statements; this mirrors the precedence the old usage pills used.
- */
-function syncStateFor(
-  usageData: UsageData | null,
-  hasEnabledProvider: boolean,
-): WidgetSyncState {
-  if (!hasEnabledProvider || !usageData) return "idle";
-  const kinds = usageData.provider_errors.map((error) => error.kind);
-  if (kinds.includes("network")) return "offline";
-  if (kinds.includes("stale")) return "cached";
-  if (kinds.includes("paused")) return "paused";
-  return "live";
-}
 
 interface AppProps {
   integrations: UseIntegrationsResult;
@@ -195,7 +175,8 @@ function App({ integrations }: AppProps) {
   return (
     <div className="wg-shell" onContextMenu={handleContextMenu} onClick={closeMenu}>
       <WidgetTitleBar
-        syncState={syncStateFor(usageData, hasEnabledProvider)}
+        providerErrors={usageData?.provider_errors ?? null}
+        hasUsageSource={hasEnabledProvider || usageData !== null}
         lastSyncAt={lastSyncAt}
         pendingUpdate={pendingUpdate}
         updating={updating}
