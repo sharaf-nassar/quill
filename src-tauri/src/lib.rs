@@ -1839,6 +1839,7 @@ fn push_offline_error(
 ) {
     errors.push(UsageProviderError {
         provider,
+        source: Default::default(),
         kind: ProviderErrorKind::Network,
         message: "Offline — showing cached data.".into(),
     });
@@ -1853,6 +1854,7 @@ fn push_paused_error(
 ) {
     errors.push(UsageProviderError {
         provider,
+        source: Default::default(),
         kind: ProviderErrorKind::Paused,
         message: "Paused".into(),
     });
@@ -1869,6 +1871,7 @@ fn push_stale_error(
 ) {
     errors.push(UsageProviderError {
         provider,
+        source: Default::default(),
         kind: ProviderErrorKind::Stale,
         message: "Rate limited.".into(),
     });
@@ -2261,6 +2264,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                                             ) {
                                                 provider_errors.push(UsageProviderError {
                                                     provider,
+                                                    source: Default::default(),
                                                     kind,
                                                     message: error.message,
                                                 });
@@ -2275,6 +2279,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                                     if let Some(kind) = classify_claude_error_kind(other_kind) {
                                         provider_errors.push(UsageProviderError {
                                             provider,
+                                            source: Default::default(),
                                             kind,
                                             message: error.message,
                                         });
@@ -2297,6 +2302,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                         Err(message) => {
                             provider_errors.push(UsageProviderError {
                                 provider,
+                                source: Default::default(),
                                 kind: ProviderErrorKind::Server,
                                 message,
                             });
@@ -2358,6 +2364,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                                             {
                                                 provider_errors.push(UsageProviderError {
                                                     provider,
+                                                    source: Default::default(),
                                                     kind,
                                                     message: error.message,
                                                 });
@@ -2371,6 +2378,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                         Err(message) => {
                             provider_errors.push(UsageProviderError {
                                 provider,
+                                source: Default::default(),
                                 kind: ProviderErrorKind::Config,
                                 message,
                             });

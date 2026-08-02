@@ -120,6 +120,9 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
                     utilization: util,
                     resets_at: None,
                     sort_order: 0,
+                    source: Default::default(),
+                    account_id: None,
+                    account_label: None,
                 });
             }
             continue;
@@ -142,6 +145,9 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
             utilization: util,
             resets_at,
             sort_order: 0,
+            source: Default::default(),
+            account_id: None,
+            account_label: None,
         });
     }
 
@@ -207,6 +213,9 @@ fn parse_scoped_weekly_limits(
             utilization: util,
             resets_at: entry.get("resets_at").and_then(parse_resets_at),
             sort_order: 1,
+            source: Default::default(),
+            account_id: None,
+            account_label: None,
         });
     }
 
@@ -454,6 +463,9 @@ fn parse_codex_rate_limit_snapshot(
             utilization,
             resets_at: codex_window_resets_at(entry.resets_at),
             sort_order: u32::from(!is_base_limit),
+            source: Default::default(),
+            account_id: None,
+            account_label: None,
         });
     }
 
@@ -557,6 +569,9 @@ fn parse_codex_rate_limits(rate_limits: &serde_json::Value) -> Vec<UsageBucket> 
             utilization,
             resets_at,
             sort_order: 0,
+            source: Default::default(),
+            account_id: None,
+            account_label: None,
         });
     }
 
@@ -886,6 +901,9 @@ pub async fn fetch_minimax_usage(api_key: &str) -> Result<Vec<UsageBucket>, Mini
                 ),
                 resets_at: minimax_resets_at(model.remains_time),
                 sort_order: 0,
+                source: Default::default(),
+                account_id: None,
+                account_label: None,
             });
         }
 
@@ -900,6 +918,9 @@ pub async fn fetch_minimax_usage(api_key: &str) -> Result<Vec<UsageBucket>, Mini
                 ),
                 resets_at: minimax_resets_at(model.weekly_remains_time),
                 sort_order: 1,
+                source: Default::default(),
+                account_id: None,
+                account_label: None,
             });
         }
     }

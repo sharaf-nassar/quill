@@ -90,6 +90,7 @@ use crate::models::{
     SessionCodeStats, SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse,
     SessionModelSegment, SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown,
     SubagentNode, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
+    UsageSource,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -97,7 +98,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 35;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 36;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -6137,6 +6138,27 @@ impl Storage {
                 .map_err(|e| format!("Migration 35 commit: {e}"))?;
         }
 
+        // Migration 36: distinguish native usage snapshots from CPA-backed
+        // per-account snapshots without changing the provider identity. The
+        // nullable columns preserve existing rows; a NULL source is read as
+        // `direct` by the native cache query.
+        // @lat: [[backend#Backend#Database#Schema#Usage Tracking]]
+        if current_version < 36 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 36 transaction: {e}"))?;
+            tx.execute_batch(
+                "ALTER TABLE usage_snapshots ADD COLUMN account_id TEXT NULL;
+                 ALTER TABLE usage_snapshots ADD COLUMN account_label TEXT NULL;
+                 ALTER TABLE usage_snapshots ADD COLUMN source TEXT NULL;",
+            )
+            .map_err(|e| format!("Migration 36 (usage snapshot account dimension): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (36)", [])
+                .map_err(|e| format!("Failed to record migration 36: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 36 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -9550,8 +9572,11 @@ impl Storage {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO usage_snapshots (timestamp, provider, bucket_key, bucket_label, utilization, resets_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO usage_snapshots
+                         (timestamp, provider, bucket_key, bucket_label,
+                          utilization, resets_at, source, account_id,
+                          account_label)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
@@ -9562,7 +9587,10 @@ impl Storage {
                     bucket.key,
                     bucket.label,
                     bucket.utilization,
-                    bucket.resets_at
+                    bucket.resets_at,
+                    bucket.source.as_str(),
+                    bucket.account_id,
+                    bucket.account_label,
                 ])
                 .map_err(|e| format!("Insert error: {e}"))?;
             }
@@ -9829,11 +9857,13 @@ impl Storage {
                      SELECT bucket_key, MAX(timestamp) AS latest_timestamp
                      FROM usage_snapshots
                      WHERE provider = ?1
+                       AND (source IS NULL OR source = 'direct')
                      GROUP BY bucket_key
                  ) latest
                    ON latest.bucket_key = snapshot.bucket_key
                   AND latest.latest_timestamp = snapshot.timestamp
                  WHERE snapshot.provider = ?1
+                   AND (snapshot.source IS NULL OR snapshot.source = 'direct')
                  ORDER BY
                      CASE snapshot.provider WHEN 'claude' THEN 0 ELSE 1 END,
                      snapshot.bucket_label ASC",
@@ -9854,6 +9884,9 @@ impl Storage {
                         utilization: row.get(2)?,
                         resets_at: row.get(3)?,
                         sort_order: 0,
+                        source: UsageSource::Direct,
+                        account_id: None,
+                        account_label: None,
                     },
                     parsed,
                 ))
@@ -9890,6 +9923,82 @@ impl Storage {
         };
 
         Ok(buckets)
+    }
+
+    #[allow(dead_code)] // Sequencing item 3 consumes the CPA cache reader.
+    pub fn get_latest_cpa_usage_buckets(&self) -> Result<Vec<UsageBucket>, String> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT snapshot.provider, snapshot.bucket_key,
+                        snapshot.bucket_label, snapshot.utilization,
+                        snapshot.resets_at, snapshot.account_id,
+                        snapshot.account_label
+                 FROM usage_snapshots snapshot
+                 INNER JOIN (
+                     SELECT provider, account_id, bucket_key,
+                            MAX(timestamp) AS latest_timestamp
+                     FROM usage_snapshots
+                     WHERE source = 'cpa'
+                     GROUP BY provider, account_id, bucket_key
+                 ) latest
+                   ON latest.provider = snapshot.provider
+                  AND latest.account_id IS snapshot.account_id
+                  AND latest.bucket_key = snapshot.bucket_key
+                  AND latest.latest_timestamp = snapshot.timestamp
+                 WHERE snapshot.source = 'cpa'
+                 ORDER BY snapshot.provider, snapshot.account_label,
+                          snapshot.bucket_label",
+            )
+            .map_err(|e| format!("Prepare CPA usage cache query: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| format!("Query CPA usage cache: {e}"))?;
+
+        let mut buckets = Vec::new();
+        for row in rows {
+            let (provider, key, label, utilization, resets_at, account_id, account_label) =
+                row.map_err(|e| format!("Read CPA usage cache row: {e}"))?;
+            buckets.push(UsageBucket {
+                provider: provider.parse::<IntegrationProvider>()?,
+                key,
+                label,
+                utilization,
+                resets_at,
+                sort_order: 0,
+                source: UsageSource::Cpa,
+                account_id,
+                account_label,
+            });
+        }
+
+        Ok(buckets)
+    }
+
+    #[allow(dead_code)] // Sequencing item 4 consumes the CPA cleanup path.
+    pub fn delete_cpa_usage_snapshots(&self) -> Result<(), String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin CPA usage cleanup: {e}"))?;
+        tx.execute("DELETE FROM usage_snapshots WHERE source = 'cpa'", [])
+            .map_err(|e| format!("Delete CPA usage snapshots: {e}"))?;
+        tx.execute("DELETE FROM usage_hourly WHERE bucket_key LIKE 'cpa/%'", [])
+            .map_err(|e| format!("Delete CPA hourly usage: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("Commit CPA usage cleanup: {e}"))?;
+        Ok(())
     }
 
     pub fn get_latest_usage_snapshot_timestamp(
@@ -23802,6 +23911,160 @@ mod tests {
             "re-running migrations must not re-enter migration {migration}"
         );
         drop(storage);
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Usage Tracking#Usage Snapshot Source Test Specs#Migration 36 Account Dimension]]
+    #[test]
+    #[serial]
+    fn migration_36_preserves_direct_usage_and_isolates_cpa_rows() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+
+        // Build a complete v35 fixture by initializing the current schema,
+        // then removing only migration 36's additive surface.
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock();
+            conn.execute_batch(
+                "DELETE FROM schema_version WHERE version = 36;
+                 ALTER TABLE usage_snapshots DROP COLUMN source;
+                 ALTER TABLE usage_snapshots DROP COLUMN account_label;
+                 ALTER TABLE usage_snapshots DROP COLUMN account_id;
+                 INSERT INTO usage_snapshots
+                     (timestamp, provider, bucket_key, bucket_label,
+                      utilization, resets_at)
+                 VALUES
+                     ('2026-08-01T00:00:00Z', 'claude', 'five_hour',
+                      '5 hours', 25.0, NULL);",
+            )
+            .expect("prepare v35 usage fixture");
+        }
+        drop(storage);
+
+        let migrated = init_storage_in(&dir);
+        {
+            let conn = migrated.conn.lock();
+            for column in ["source", "account_id", "account_label"] {
+                assert!(
+                    table_has_column(&conn, "usage_snapshots", column),
+                    "usage_snapshots.{column} missing after migration 36"
+                );
+            }
+            let migration_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 36",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count migration 36 records");
+            assert_eq!(migration_rows, 1);
+        }
+        let direct = migrated
+            .get_latest_usage_buckets(IntegrationProvider::Claude)
+            .expect("read migrated direct usage");
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].source, UsageSource::Direct);
+        assert_eq!(direct[0].account_id, None);
+        assert_eq!(direct[0].account_label, None);
+        drop(migrated);
+
+        // A normal restart must skip migration 36 and reopen cleanly.
+        let reopened = init_storage_in(&dir);
+        {
+            let conn = reopened.conn.lock();
+            let migration_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 36",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count migration 36 records after reopen");
+            assert_eq!(migration_rows, 1);
+        }
+
+        reopened
+            .store_snapshot(&[UsageBucket {
+                provider: IntegrationProvider::Claude,
+                key: "cpa/17/five_hour".into(),
+                label: "5 hours".into(),
+                utilization: 80.0,
+                resets_at: None,
+                sort_order: 0,
+                source: UsageSource::Cpa,
+                account_id: Some("17".into()),
+                account_label: Some("account@example.com".into()),
+            }])
+            .expect("store CPA usage snapshot");
+
+        let direct = reopened
+            .get_latest_usage_buckets(IntegrationProvider::Claude)
+            .expect("read direct-only usage");
+        assert_eq!(direct.len(), 1);
+        assert!(
+            direct
+                .iter()
+                .all(|bucket| bucket.source == UsageSource::Direct)
+        );
+
+        let cpa = reopened
+            .get_latest_cpa_usage_buckets()
+            .expect("read CPA usage");
+        assert_eq!(cpa.len(), 1);
+        assert_eq!(cpa[0].source, UsageSource::Cpa);
+        assert_eq!(cpa[0].account_id.as_deref(), Some("17"));
+        assert_eq!(cpa[0].account_label.as_deref(), Some("account@example.com"));
+
+        {
+            let conn = reopened.conn.lock();
+            conn.execute_batch(
+                "INSERT INTO usage_hourly
+                     (hour, provider, bucket_key, bucket_label,
+                      avg_utilization, max_utilization, min_utilization,
+                      sample_count)
+                 VALUES
+                     ('2026-07-01T00:00:00Z', 'claude',
+                      'cpa/17/five_hour', '5 hours', 80.0, 80.0, 80.0, 1),
+                     ('2026-07-01T00:00:00Z', 'claude',
+                      'five_hour', '5 hours', 25.0, 25.0, 25.0, 1);",
+            )
+            .expect("seed hourly cleanup rows");
+        }
+
+        reopened
+            .delete_cpa_usage_snapshots()
+            .expect("delete CPA usage snapshots");
+        {
+            let conn = reopened.conn.lock();
+            let cpa_snapshots: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_snapshots WHERE source = 'cpa'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count CPA snapshots");
+            let cpa_hourly: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_hourly
+                     WHERE bucket_key LIKE 'cpa/%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count CPA hourly rows");
+            let direct_hourly: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM usage_hourly
+                     WHERE bucket_key = 'five_hour'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count direct hourly rows");
+            assert_eq!(cpa_snapshots, 0);
+            assert_eq!(cpa_hourly, 0);
+            assert_eq!(direct_hourly, 1);
+        }
+
+        drop(reopened);
         clear_env();
     }
 

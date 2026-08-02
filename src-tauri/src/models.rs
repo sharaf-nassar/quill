@@ -114,6 +114,29 @@ pub struct UsageBucket {
     pub resets_at: Option<String>,
     #[serde(default)]
     pub sort_order: u32,
+    #[serde(default)]
+    pub source: UsageSource,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub account_label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageSource {
+    #[default]
+    Direct,
+    Cpa,
+}
+
+impl UsageSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Cpa => "cpa",
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +184,8 @@ pub enum ProviderErrorKind {
 #[derive(Serialize, Clone, Debug)]
 pub struct UsageProviderError {
     pub provider: IntegrationProvider,
+    #[serde(default)]
+    pub source: UsageSource,
     pub kind: ProviderErrorKind,
     pub message: String,
 }

@@ -7,7 +7,12 @@ export interface UsageBucket {
   utilization: number;
   resets_at: string | null;
   sort_order?: number;
+  source?: UsageSource;
+  account_id?: string | null;
+  account_label?: string | null;
 }
+
+export type UsageSource = "direct" | "cpa";
 
 // Mirrors `ProviderErrorKind` in src-tauri/src/models.rs. "network" means the
 // provider's API was unreachable (DNS / connect / timeout) and the poller is
@@ -31,6 +36,7 @@ export type ProviderErrorKind =
 
 export interface UsageProviderError {
   provider: IntegrationProvider;
+  source?: UsageSource;
   kind: ProviderErrorKind;
   message: string;
 }
