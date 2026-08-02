@@ -302,6 +302,7 @@ pub(crate) fn delete_connection(storage: &Storage) -> Result<(), CpaConnectError
 mod tests {
     use super::*;
 
+    // @lat: [[features#Features#Settings Window#CPA Connection Lifecycle#Ready account smoke selection]]
     #[test]
     fn chooses_ready_account_before_degraded_account() {
         let account = |auth_index: &str, status: &str, disabled: bool| CpaAuthFile {
@@ -353,6 +354,7 @@ mod tests {
         );
     }
 
+    // @lat: [[features#Features#Settings Window#CPA Connection Lifecycle#Typed safe connect failures]]
     #[test]
     fn connect_errors_have_distinct_safe_codes_and_messages() {
         let cases = [

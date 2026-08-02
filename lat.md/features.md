@@ -60,6 +60,8 @@ CPA window polling is smoke-gated, capped, staggered, and bounded independently 
 
 [[src-tauri/src/cpa/poll.rs#poll_account_snapshots]] maps the complete auth-file inventory before scheduling windows. Only persisted `true` provider smoke verdicts permit calls; the first 16 healthy eligible accounts by `auth_index` launch 250ms apart with at most three requests active.
 
+Each configured CPA phase logs `cpa_phase_ms` after native polling so its real-pool duration can be checked against the 3-minute cadence without delaying or obscuring direct-provider timing.
+
 #### Usable lifecycle scheduling
 
 The poll mapper canonicalizes CPA `active` and compatible `ready` credentials to the frontend's ready state and schedules only those usable accounts when their provider smoke gate is open.
@@ -79,6 +81,62 @@ Pools larger than 16 accounts schedule only the first 16 deterministic `auth_ind
 #### Unconfigured source null impact
 
 Without both saved connection settings, CPA contributes no usage fields, request path, phase timing, or secret-bearing cache key.
+
+### CPA Management Client Test Specs
+
+Management protocol tests pin the researched CPA response shapes, local endpoint boundary, configuration gate, and display-safe failures.
+
+#### Auth inventory fields
+
+The `/auth-files` fixture preserves required identity, provider, health, runtime-only, and nested Codex account fields.
+
+#### Auth inventory feature detection
+
+Malformed JSON or entries missing required inventory fields must fail as invalid or unsupported without guessing a compatible shape.
+
+#### API call envelope fields
+
+The `api-call` request and response fixtures preserve `authIndex`, method, headers, status code, and nested response body semantics.
+
+#### API call envelope rejection
+
+An envelope missing status, headers, or body must fail as an invalid response rather than yielding partial quota data.
+
+#### Loopback endpoint boundary
+
+Only explicit HTTP(S) loopback hosts pass URL validation; alternate loopback ranges, remote hosts, userinfo, and query-bearing URLs fail closed.
+
+#### Client configuration gate
+
+Client construction requires both an allowed loopback endpoint and a nonblank management key before any request path becomes reachable.
+
+#### Display-safe client errors
+
+Client error strings must omit account email, status detail, management credentials, and auth-index identity even when malformed data contains them.
+
+### CPA Quota Parser Test Specs
+
+Quota tests pin the verified upstream headers and normalize only complete Claude and Codex window responses into CPA-sourced buckets.
+
+#### Upstream request headers
+
+Claude and Codex requests use CPA token substitution plus each upstream's required beta, account, and user-agent headers.
+
+#### Claude windows fixture
+
+The researched Anthropic response maps known and additional windows to account-qualified CPA buckets with normalized resets.
+
+#### Claude malformed windows
+
+Missing or invalid Anthropic utilization fields produce an account-scoped failure instead of numeric quota data.
+
+#### Codex windows fixture
+
+The researched Codex response maps primary and secondary rate-limit windows to account-qualified CPA buckets and stable labels.
+
+#### Codex malformed windows
+
+Missing or invalid Codex rate-limit windows produce an account-scoped failure instead of partial numeric quota data.
 
 ## Widget Views
 
@@ -436,6 +494,14 @@ An exact bcrypt hash shape is rejected before any CPA request with safe recovery
 [[src-tauri/src/lib.rs#get_cpa_connection_status]] returns only the saved URL and configured state, never the management key. [[src-tauri/src/lib.rs#clear_cpa_connection]] runs the guarded manager purge, deletes both connection settings, every `usage.cpa.*` runtime row, raw CPA snapshots and `usage_hourly` keys under `cpa/%`, then clears the usage cache and advances its epoch so an older in-flight refresh cannot restore disconnected rows. Direct provider snapshots remain intact.
 
 Direct Claude and Codex integrations remain active when CPA is configured. The settings copy names the accepted v1 overlap explicitly: the same account can appear through both sources and may be counted twice.
+
+#### Ready account smoke selection
+
+Connection smoke checks prefer a ready, available account over a degraded account for each supported provider.
+
+#### Typed safe connect failures
+
+Invalid URL, unreachable, unauthorized, unsupported-version, and unexpected-response failures keep distinct user-safe codes and messages without credential names.
 
 ## Crash Reporting
 

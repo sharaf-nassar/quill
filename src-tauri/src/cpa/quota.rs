@@ -251,6 +251,7 @@ mod tests {
         }
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Upstream request headers]]
     #[test]
     fn builds_verified_token_substitution_headers() {
         let _claude = fetch_claude_usage;
@@ -266,6 +267,7 @@ mod tests {
         assert!(codex["User-Agent"].starts_with("codex_cli_rs/"));
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Claude windows fixture]]
     #[test]
     fn parses_research_anthropic_windows_fixture() {
         let fixture = response(json!({
@@ -299,6 +301,7 @@ mod tests {
         assert!(buckets[2].resets_at.is_some());
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Claude malformed windows]]
     #[test]
     fn rejects_malformed_anthropic_windows() {
         for body in [
@@ -316,6 +319,7 @@ mod tests {
         }
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Codex windows fixture]]
     #[test]
     fn parses_research_codex_rate_limit_fixture() {
         let fixture = response(json!({
@@ -350,6 +354,7 @@ mod tests {
         assert_eq!(buckets[1].label, "7 days");
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Quota Parser Test Specs#Codex malformed windows]]
     #[test]
     fn rejects_malformed_codex_rate_limits() {
         for body in [

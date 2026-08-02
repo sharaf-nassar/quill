@@ -364,6 +364,7 @@ fn find_account_id_in_claims(value: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#Auth inventory fields]]
     #[test]
     fn parses_research_auth_files_fixture() {
         let files = parse_auth_files(
@@ -406,6 +407,7 @@ mod tests {
         assert_eq!(files[1].chatgpt_account_id.as_deref(), Some("account-123"));
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#Auth inventory feature detection]]
     #[test]
     fn rejects_malformed_and_missing_auth_files_fields() {
         assert!(matches!(
@@ -424,6 +426,7 @@ mod tests {
         ));
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#API call envelope fields]]
     #[test]
     fn parses_research_api_call_envelope_fixture() {
         let headers = BTreeMap::from([("Authorization".to_string(), "Bearer $TOKEN$".to_string())]);
@@ -452,6 +455,7 @@ mod tests {
         assert!(response.header.contains_key("Content-Type"));
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#API call envelope rejection]]
     #[test]
     fn rejects_malformed_api_call_envelopes() {
         for fixture in [
@@ -466,6 +470,7 @@ mod tests {
         }
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#Loopback endpoint boundary]]
     #[test]
     fn validates_only_explicit_loopback_hosts() {
         for url in [
@@ -488,6 +493,7 @@ mod tests {
         }
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#Client configuration gate]]
     #[test]
     fn client_requires_loopback_url_and_management_key() {
         let _auth_files = CpaClient::auth_files;
@@ -537,6 +543,7 @@ mod tests {
         );
     }
 
+    // @lat: [[features#Features#Live Usage View#CPA Management Client Test Specs#Display-safe client errors]]
     #[test]
     fn display_errors_never_echo_response_identity_fields() {
         let fixture = r#"{
