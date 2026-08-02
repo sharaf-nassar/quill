@@ -1540,6 +1540,7 @@ pub struct ModelHistoryResponse {
     pub selected_model: Option<ModelIdentity>,
     pub bucket_seconds: i64,
     pub points: Vec<ModelHistoryPoint>,
+    pub building_index: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -1693,6 +1694,7 @@ pub struct ModelUsageOverviewResponse {
     pub represented_providers: Vec<String>,
     pub scope: ModelAnalyticsScope,
     pub backfill: ModelBackfillStatus,
+    pub building_index: bool,
     pub totals: ModelOverviewTotals,
     pub running_now: Vec<ModelRunningNow>,
     pub models: Vec<ModelOverviewRow>,

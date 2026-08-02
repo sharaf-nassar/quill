@@ -144,6 +144,7 @@ type ModelHistoryResponse = {
   provider: string | null;
   selectedModel: ModelIdentity | null;
   bucketSeconds: number;
+  buildingIndex?: boolean;
   points: Array<{
     bucketStart: string;
     bucketEnd: string;
@@ -153,6 +154,12 @@ type ModelHistoryResponse = {
   }>;
 };
 ```
+
+`buildingIndex` is true while the hourly model rollup is pending, running, or
+failed and history therefore preserves the established raw query. After
+completion it is false. Complete closed UTC hours use rollups only when one
+hour fits wholly inside one existing response bucket; boundary-crossing and
+current hours remain raw, preserving the fixed sliding bucket axis.
 
 Bucket widths are fixed by range: 300 seconds for `1h`, 3,600 for `24h`, 21,600
 for `7d`, and 86,400 for `30d`. Empty buckets are returned as zeros so chart axes

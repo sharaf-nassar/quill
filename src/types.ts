@@ -836,6 +836,7 @@ export interface ModelUsageOverviewResponse {
   representedProviders: string[];
   scope: ModelAnalyticsScope;
   backfill: ModelBackfillStatus;
+  buildingIndex?: boolean;
   totals: ModelUsageOverviewTotals;
   runningNow: ModelRunningNowEntry[];
   models: ModelUsageOverviewRow[];

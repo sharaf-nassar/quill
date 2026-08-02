@@ -3227,6 +3227,28 @@ fn model_overview_bucket_seconds(range: ModelRange) -> i64 {
     }
 }
 
+fn model_rollup_closed_bounds(range_start_ms: i64, range_end_ms: i64) -> (i64, i64) {
+    let first_full_hour = range_start_ms
+        .div_euclid(MODEL_ROLLUP_HOUR_MS)
+        .saturating_add(i64::from(
+            range_start_ms.rem_euclid(MODEL_ROLLUP_HOUR_MS) != 0,
+        ))
+        .saturating_mul(MODEL_ROLLUP_HOUR_MS);
+    let open_hour = range_end_ms
+        .div_euclid(MODEL_ROLLUP_HOUR_MS)
+        .saturating_mul(MODEL_ROLLUP_HOUR_MS);
+    (first_full_hour.min(open_hour), open_hour)
+}
+
+fn model_rollup_building_index(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT model_backfill_status != 'complete' FROM rollup_meta WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("Read model rollup backfill state: {error}"))
+}
+
 /// Derive the display project for one session: the final path component of the
 /// session's effective cwd, or `unknown` when no cwd was observed.
 fn model_overview_project(cwd: Option<&str>) -> String {
@@ -7492,6 +7514,9 @@ impl Storage {
             .map_err(|error| format!("Begin model overview read snapshot: {error}"))?;
 
         let backfill = read_model_backfill_status(&tx)?;
+        let building_index = model_rollup_building_index(&tx)?;
+        let (rollup_start_ms, rollup_end_ms) =
+            model_rollup_closed_bounds(range_start_ms, range_end_ms);
         let global_session_count = tx
             .query_row(
                 &format!(
@@ -7510,21 +7535,17 @@ impl Storage {
             )
             .map_err(|error| format!("Query global model overview session scope: {error}"))?;
 
-        // Materialize the scoped observation set ONCE instead of re-scanning
-        // `model_usage_observations` (join + suppression predicate + range +
-        // token re-sum) for every overview section. Each downstream aggregate
-        // reads this small in-memory temp table (see `open_model_analytics_reader`,
-        // which sets `temp_store = MEMORY`). Token amount, activity bucket
-        // index, and the day string are precomputed here so no section repeats
-        // that work. The provider filter is appended (not `?N IS NULL OR ...`)
-        // only when scoped, keeping the single base-table scan sargable.
+        // While the rollup is building, preserve the established raw path.
+        // Once complete, materialize aggregate-grain closed hours plus only the
+        // partial leading hour and current UTC hour from raw evidence.
         let provider_filter = if provider.is_some() {
-            " AND observation.provider = ?4"
+            " AND observation.provider = ?6"
         } else {
             ""
         };
-        let create_scoped_sql = format!(
-            "CREATE TEMP TABLE scoped_overview AS
+        let create_scoped_sql = if building_index {
+            format!(
+                "CREATE TEMP TABLE scoped_overview AS
              SELECT observation.provider AS provider,
                     observation.analytics_session_id AS analytics_session_id,
                     observation.derived_model_id AS derived_model_id,
@@ -7544,17 +7565,96 @@ impl Storage {
                      + COALESCE(observation.cache_creation_tokens, 0)
                      + COALESCE(observation.cache_read_tokens, 0)) AS token_amount,
                     (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
-                    date(observation.observed_at_ms / 1000, 'unixepoch') AS day_string
+                    date(observation.observed_at_ms / 1000, 'unixepoch') AS day_string,
+                    1 AS obs_count,
+                    CASE WHEN observation.observation_kind = 'turn' THEN 1 ELSE 0 END
+                        AS turn_count,
+                    observation.observed_at_ms AS last_observed_at_ms
              FROM model_usage_observations AS observation
              JOIN model_observation_sources AS source
                ON source.provider = observation.provider
               AND source.source_key = observation.source_key
              WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                AND observation.observed_at_ms >= ?1
-               AND observation.observed_at_ms < ?2{provider_filter}"
-        );
-        let mut create_params: Vec<&dyn rusqlite::ToSql> =
-            vec![&range_start_ms, &range_end_ms, &bucket_millis];
+               AND observation.observed_at_ms < ?2{}",
+                if provider.is_some() {
+                    " AND observation.provider = ?4"
+                } else {
+                    ""
+                }
+            )
+        } else {
+            format!(
+                "CREATE TEMP TABLE scoped_overview AS
+                 SELECT rollup.provider AS provider,
+                        rollup.analytics_session_id AS analytics_session_id,
+                        NULLIF(rollup.derived_model_id, '') AS derived_model_id,
+                        NULL AS observation_kind,
+                        source.is_sidechain AS is_sidechain,
+                        NULLIF(source.cwd, '') AS effective_cwd,
+                        rollup.first_observed_at_ms AS observed_at_ms,
+                        0 AS source_ordinal,
+                        '' AS source_record_key,
+                        rollup.source_key AS source_key,
+                        0 AS obs_id,
+                        rollup.input_tokens + rollup.output_tokens
+                            + rollup.cache_creation_tokens + rollup.cache_read_tokens
+                            AS token_amount,
+                        (rollup.hour_utc - ?1) / ?3 AS bucket_index,
+                        date(rollup.hour_utc / 1000, 'unixepoch') AS day_string,
+                        rollup.obs_count AS obs_count,
+                        rollup.turn_count AS turn_count,
+                        rollup.last_observed_at_ms AS last_observed_at_ms
+                 FROM model_usage_hourly AS rollup
+                 JOIN model_observation_sources AS source
+                   ON source.provider = rollup.provider
+                  AND source.source_key = rollup.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND rollup.hour_utc >= ?4
+                   AND rollup.hour_utc < ?5{provider_filter}
+                 UNION ALL
+                 SELECT observation.provider,
+                        observation.analytics_session_id,
+                        observation.derived_model_id,
+                        observation.observation_kind,
+                        source.is_sidechain,
+                        COALESCE(NULLIF(observation.cwd, ''), NULLIF(source.cwd, '')),
+                        observation.observed_at_ms,
+                        observation.source_ordinal,
+                        observation.source_record_key,
+                        observation.source_key,
+                        observation.id,
+                        COALESCE(observation.input_tokens, 0)
+                            + COALESCE(observation.output_tokens, 0)
+                            + COALESCE(observation.cache_creation_tokens, 0)
+                            + COALESCE(observation.cache_read_tokens, 0),
+                        (observation.observed_at_ms - ?1) / ?3,
+                        date(observation.observed_at_ms / 1000, 'unixepoch'),
+                        1,
+                        CASE WHEN observation.observation_kind = 'turn' THEN 1 ELSE 0 END,
+                        observation.observed_at_ms
+                 FROM model_usage_observations AS observation
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                   AND (observation.observed_at_ms < ?4
+                        OR observation.observed_at_ms >= ?5){provider_filter}"
+            )
+        };
+        let mut create_params: Vec<&dyn rusqlite::ToSql> = if building_index {
+            vec![&range_start_ms, &range_end_ms, &bucket_millis]
+        } else {
+            vec![
+                &range_start_ms,
+                &range_end_ms,
+                &bucket_millis,
+                &rollup_start_ms,
+                &rollup_end_ms,
+            ]
+        };
         if let Some(provider_value) = provider.as_ref() {
             create_params.push(provider_value);
         }
@@ -7589,9 +7689,8 @@ impl Storage {
                          ) AS scoped_sessions
                      ),
                      (
-                         SELECT COUNT(*)
+                         SELECT COALESCE(SUM(turn_count), 0)
                          FROM scoped_overview
-                         WHERE observation_kind = 'turn'
                      ),
                      COALESCE((
                          SELECT SUM(token_amount) FROM scoped_overview
@@ -7612,7 +7711,7 @@ impl Storage {
                          ) AS scoped_models
                      ),
                      (
-                         SELECT COUNT(*)
+                         SELECT COALESCE(SUM(obs_count), 0)
                          FROM scoped_overview
                          WHERE derived_model_id IS NOT NULL
                      )",
@@ -7630,8 +7729,8 @@ impl Storage {
             )
             .map_err(|error| format!("Query model overview totals: {error}"))?;
 
-        let mut represented_provider_statement = tx
-            .prepare_cached(&format!(
+        let represented_provider_sql = if building_index {
+            format!(
                 "SELECT observation.provider
                  FROM model_usage_observations AS observation
                  JOIN model_observation_sources AS source
@@ -7640,14 +7739,46 @@ impl Storage {
                  WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
+                   AND ?3 = ?3 AND ?4 = ?4
                  GROUP BY observation.provider COLLATE BINARY
-                 ORDER BY observation.provider COLLATE BINARY ASC",
-            ))
+                 ORDER BY observation.provider COLLATE BINARY ASC"
+            )
+        } else {
+            format!(
+                "SELECT represented.provider
+                 FROM (
+                     SELECT rollup.provider
+                     FROM model_usage_hourly AS rollup
+                     JOIN model_observation_sources AS source
+                       ON source.provider = rollup.provider
+                      AND source.source_key = rollup.source_key
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                       AND rollup.hour_utc >= ?3
+                       AND rollup.hour_utc < ?4
+                     UNION ALL
+                     SELECT observation.provider
+                     FROM model_usage_observations AS observation
+                     JOIN model_observation_sources AS source
+                       ON source.provider = observation.provider
+                      AND source.source_key = observation.source_key
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                       AND observation.observed_at_ms >= ?1
+                       AND observation.observed_at_ms < ?2
+                       AND (observation.observed_at_ms < ?3
+                            OR observation.observed_at_ms >= ?4)
+                 ) AS represented
+                 GROUP BY represented.provider COLLATE BINARY
+                 ORDER BY represented.provider COLLATE BINARY ASC"
+            )
+        };
+        let mut represented_provider_statement = tx
+            .prepare_cached(&represented_provider_sql)
             .map_err(|error| format!("Prepare represented overview providers query: {error}"))?;
         let represented_provider_rows = represented_provider_statement
-            .query_map(params![range_start_ms, range_end_ms], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![range_start_ms, range_end_ms, rollup_start_ms, rollup_end_ms],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|error| format!("Query represented overview providers: {error}"))?;
         let mut represented_providers = Vec::new();
         for row in represented_provider_rows {
@@ -7673,7 +7804,7 @@ impl Storage {
                                                  analytics_session_id COLLATE BINARY
                                     ORDER BY CASE WHEN effective_cwd IS NULL
                                                   THEN 1 ELSE 0 END,
-                                             observed_at_ms DESC,
+                                             last_observed_at_ms DESC,
                                              source_ordinal DESC,
                                              source_record_key COLLATE BINARY DESC,
                                              source_key COLLATE BINARY DESC,
@@ -7704,6 +7835,74 @@ impl Storage {
                 );
             }
         }
+        if !building_index {
+            let project_provider_filter = if provider.is_some() {
+                " AND observation.provider = ?3"
+            } else {
+                ""
+            };
+            let mut statement = tx
+                .prepare_cached(&format!(
+                    "WITH ranked AS (
+                         SELECT observation.provider,
+                                observation.analytics_session_id,
+                                COALESCE(
+                                    NULLIF(observation.cwd, ''),
+                                    NULLIF(source.cwd, '')
+                                ) AS effective_cwd,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY observation.provider COLLATE BINARY,
+                                                 observation.analytics_session_id COLLATE BINARY
+                                    ORDER BY CASE
+                                                 WHEN COALESCE(
+                                                     NULLIF(observation.cwd, ''),
+                                                     NULLIF(source.cwd, '')
+                                                 ) IS NULL
+                                                 THEN 1 ELSE 0
+                                             END,
+                                             observation.observed_at_ms DESC,
+                                             observation.source_ordinal DESC,
+                                             observation.source_record_key COLLATE BINARY DESC,
+                                             observation.source_key COLLATE BINARY DESC,
+                                             observation.id DESC
+                                ) AS cwd_rank
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2
+                           {project_provider_filter}
+                     )
+                     SELECT provider, analytics_session_id, effective_cwd
+                     FROM ranked
+                     WHERE cwd_rank = 1"
+                ))
+                .map_err(|error| format!("Prepare model overview raw project query: {error}"))?;
+            let mut project_params: Vec<&dyn rusqlite::ToSql> =
+                vec![&range_start_ms, &range_end_ms];
+            if let Some(provider_value) = provider.as_ref() {
+                project_params.push(provider_value);
+            }
+            let rows = statement
+                .query_map(project_params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("Query model overview raw projects: {error}"))?;
+            for row in rows {
+                let (session_provider, session_id, cwd) =
+                    row.map_err(|error| format!("Read model overview raw project row: {error}"))?;
+                session_projects.insert(
+                    (session_provider, session_id),
+                    model_overview_project(cwd.as_deref()),
+                );
+            }
+        }
 
         // Per-(session, model) attributed stats drive model reach, primary
         // attribution, combinations, and the project matrix.
@@ -7719,8 +7918,7 @@ impl Storage {
                     "SELECT provider,
                             analytics_session_id,
                             derived_model_id,
-                            SUM(CASE WHEN observation_kind = 'turn'
-                                     THEN 1 ELSE 0 END) AS attributed_turns,
+                            SUM(turn_count) AS attributed_turns,
                             SUM(token_amount) AS attributed_tokens
                      FROM scoped_overview
                      WHERE derived_model_id IS NOT NULL
@@ -7774,11 +7972,11 @@ impl Storage {
                     "SELECT provider,
                             derived_model_id,
                             COUNT(DISTINCT CASE
-                                WHEN observation_kind = 'turn'
+                                WHEN turn_count > 0
                                 THEN day_string
                             END) AS days_active,
                             MIN(observed_at_ms) AS first_seen_ms,
-                            MAX(observed_at_ms) AS last_seen_ms
+                            MAX(last_observed_at_ms) AS last_seen_ms
                      FROM scoped_overview
                      WHERE derived_model_id IS NOT NULL
                      GROUP BY provider COLLATE BINARY,
@@ -7813,23 +8011,105 @@ impl Storage {
         // Fixed-bucket distinct-session activity per model.
         let mut activity_buckets = HashMap::<(String, String), Vec<i64>>::new();
         {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT bucket_index,
-                            provider,
-                            derived_model_id,
-                            COUNT(DISTINCT analytics_session_id COLLATE BINARY)
-                                AS session_count
-                     FROM scoped_overview
-                     WHERE observation_kind = 'turn'
-                       AND derived_model_id IS NOT NULL
+            let activity_sql = if building_index {
+                "SELECT bucket_index,
+                        provider,
+                        derived_model_id,
+                        COUNT(DISTINCT analytics_session_id COLLATE BINARY)
+                            AS session_count
+                 FROM scoped_overview
+                 WHERE turn_count > 0
+                   AND derived_model_id IS NOT NULL
+                 GROUP BY bucket_index,
+                          provider COLLATE BINARY,
+                          derived_model_id COLLATE BINARY
+                 HAVING ?1 = ?1 AND ?2 = ?2 AND ?3 = ?3
+                    AND ?4 = ?4 AND ?5 = ?5 AND ?6 IS ?6"
+                    .to_string()
+            } else {
+                format!(
+                    "SELECT bucket_index, provider, derived_model_id,
+                            COUNT(*) AS session_count
+                     FROM (
+                         SELECT (rollup.hour_utc - ?1) / ?3 AS bucket_index,
+                                rollup.provider AS provider,
+                                rollup.derived_model_id AS derived_model_id,
+                                rollup.analytics_session_id AS analytics_session_id
+                         FROM model_usage_hourly AS rollup
+                         JOIN model_observation_sources AS source
+                           ON source.provider = rollup.provider
+                          AND source.source_key = rollup.source_key
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                           AND rollup.hour_utc >= ?4
+                           AND rollup.hour_utc < ?5
+                           AND rollup.turn_count > 0
+                           AND rollup.derived_model_id != ''
+                           AND (?6 IS NULL OR rollup.provider = ?6)
+                           AND (
+                               rollup.raw_pruned = 1
+                               OR (rollup.hour_utc - ?1) / ?3
+                                  = (rollup.hour_utc + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1) / ?3
+                           )
+                         UNION
+                         SELECT (observation.observed_at_ms - ?1) / ?3,
+                                observation.provider,
+                                observation.derived_model_id,
+                                observation.analytics_session_id
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2
+                           AND observation.observation_kind = 'turn'
+                           AND observation.derived_model_id IS NOT NULL
+                           AND (?6 IS NULL OR observation.provider = ?6)
+                           AND NOT (
+                               observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                                   * {MODEL_ROLLUP_HOUR_MS} >= ?4
+                               AND observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                                   * {MODEL_ROLLUP_HOUR_MS} < ?5
+                               AND (
+                                   observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                                       * {MODEL_ROLLUP_HOUR_MS} - ?1
+                               ) / ?3 = (
+                                   observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                                       * {MODEL_ROLLUP_HOUR_MS}
+                                   + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1
+                               ) / ?3
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1
+                               FROM model_usage_hourly AS authoritative
+                               WHERE authoritative.hour_utc =
+                                     observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                                         * {MODEL_ROLLUP_HOUR_MS}
+                                 AND authoritative.provider = observation.provider
+                                 AND authoritative.source_key = observation.source_key
+                                 AND authoritative.derived_model_id =
+                                     COALESCE(observation.derived_model_id, '')
+                                 AND authoritative.raw_pruned = 1
+                           )
+                     ) AS bucket_sessions
                      GROUP BY bucket_index,
                               provider COLLATE BINARY,
-                              derived_model_id COLLATE BINARY",
+                              derived_model_id COLLATE BINARY"
                 )
+            };
+            let mut statement = tx
+                .prepare_cached(&activity_sql)
                 .map_err(|error| format!("Prepare model overview activity query: {error}"))?;
+            let activity_params = params![
+                range_start_ms,
+                range_end_ms,
+                bucket_millis,
+                rollup_start_ms,
+                rollup_end_ms,
+                provider,
+            ];
             let rows = statement
-                .query_map([], |row| {
+                .query_map(activity_params, |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -7930,23 +8210,35 @@ impl Storage {
         }
         let mut running_by_provider = HashMap::<String, RunningNowRow>::new();
         {
+            let running_provider_filter = if provider.is_some() {
+                " AND observation.provider = ?3"
+            } else {
+                ""
+            };
             let mut statement = tx
-                .prepare_cached(
+                .prepare_cached(&format!(
                     "WITH turns AS (
-                         SELECT provider,
-                                derived_model_id AS model_id,
-                                observed_at_ms,
+                         SELECT observation.provider AS provider,
+                                observation.derived_model_id AS model_id,
+                                observation.observed_at_ms AS observed_at_ms,
                                 ROW_NUMBER() OVER (
-                                    PARTITION BY provider COLLATE BINARY
-                                    ORDER BY observed_at_ms DESC,
-                                             source_ordinal DESC,
-                                             source_record_key COLLATE BINARY DESC,
-                                             source_key COLLATE BINARY DESC,
-                                             obs_id DESC
+                                    PARTITION BY observation.provider COLLATE BINARY
+                                    ORDER BY observation.observed_at_ms DESC,
+                                             observation.source_ordinal DESC,
+                                             observation.source_record_key COLLATE BINARY DESC,
+                                             observation.source_key COLLATE BINARY DESC,
+                                             observation.id DESC
                                 ) AS rn
-                         FROM scoped_overview
-                         WHERE observation_kind = 'turn'
-                           AND derived_model_id IS NOT NULL
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2
+                           AND observation.observation_kind = 'turn'
+                           AND observation.derived_model_id IS NOT NULL
+                           {running_provider_filter}
                      ),
                      latest AS (
                          SELECT provider,
@@ -7997,11 +8289,16 @@ impl Storage {
                                       = latest.provider COLLATE BINARY
                                   AND prev_row.rn = first_diff.diff_rn
                             ) AS previous_model_id
-                     FROM latest",
-                )
+                     FROM latest"
+                ))
                 .map_err(|error| format!("Prepare model overview running query: {error}"))?;
+            let mut running_params: Vec<&dyn rusqlite::ToSql> =
+                vec![&range_start_ms, &range_end_ms];
+            if let Some(provider_value) = provider.as_ref() {
+                running_params.push(provider_value);
+            }
             let rows = statement
-                .query_map([], |row| {
+                .query_map(running_params.as_slice(), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -8305,6 +8602,7 @@ impl Storage {
                 scope_final,
             },
             backfill,
+            building_index,
             totals: ModelOverviewTotals {
                 sessions: totals_row.sessions,
                 projects: i64::try_from(session_projects.values().collect::<BTreeSet<_>>().len())
@@ -8415,38 +8713,18 @@ impl Storage {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|error| format!("Begin model history read snapshot: {error}"))?;
-        let mut statement = tx
-            .prepare_cached(&format!(
-                "SELECT
-                     (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
-                     SUM(
-                         CASE WHEN observation.derived_model_id IS NOT NULL THEN
-                             COALESCE(observation.input_tokens, 0)
-                             + COALESCE(observation.output_tokens, 0)
-                             + COALESCE(observation.cache_creation_tokens, 0)
-                             + COALESCE(observation.cache_read_tokens, 0)
-                         ELSE 0 END
-                     ) AS attributed_tokens,
-                     SUM(
-                         CASE WHEN observation.derived_model_id IS NULL THEN
-                             COALESCE(observation.input_tokens, 0)
-                             + COALESCE(observation.output_tokens, 0)
-                             + COALESCE(observation.cache_creation_tokens, 0)
-                             + COALESCE(observation.cache_read_tokens, 0)
-                         ELSE 0 END
-                     ) AS unattributed_tokens,
-                     SUM(
-                         CASE
-                             WHEN ?5 IS NOT NULL
-                              AND observation.provider COLLATE BINARY = ?5
-                              AND observation.derived_model_id COLLATE BINARY = ?6
-                             THEN COALESCE(observation.input_tokens, 0)
-                                  + COALESCE(observation.output_tokens, 0)
-                                  + COALESCE(observation.cache_creation_tokens, 0)
-                                  + COALESCE(observation.cache_read_tokens, 0)
-                             ELSE 0
-                         END
-                     ) AS selected_model_tokens
+        let building_index = model_rollup_building_index(&tx)?;
+        let (rollup_start_ms, rollup_end_ms) =
+            model_rollup_closed_bounds(range_start_ms, range_end_ms);
+        let history_source = if building_index {
+            format!(
+                "SELECT observation.observed_at_ms,
+                        observation.provider,
+                        observation.derived_model_id,
+                        COALESCE(observation.input_tokens, 0)
+                            + COALESCE(observation.output_tokens, 0)
+                            + COALESCE(observation.cache_creation_tokens, 0)
+                            + COALESCE(observation.cache_read_tokens, 0) AS token_amount
                  FROM model_usage_observations AS observation
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
@@ -8455,6 +8733,97 @@ impl Storage {
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
                    AND (?4 IS NULL OR observation.provider = ?4)
+                   AND ?7 = ?7 AND ?8 = ?8"
+            )
+        } else {
+            format!(
+                "SELECT rollup.hour_utc AS observed_at_ms,
+                        rollup.provider,
+                        NULLIF(rollup.derived_model_id, '') AS derived_model_id,
+                        rollup.input_tokens + rollup.output_tokens
+                            + rollup.cache_creation_tokens + rollup.cache_read_tokens
+                            AS token_amount
+                 FROM model_usage_hourly AS rollup
+                 JOIN model_observation_sources AS source
+                   ON source.provider = rollup.provider
+                  AND source.source_key = rollup.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND rollup.hour_utc >= ?7
+                   AND rollup.hour_utc < ?8
+                   AND (?4 IS NULL OR rollup.provider = ?4)
+                   AND (
+                       rollup.raw_pruned = 1
+                       OR (rollup.hour_utc - ?1) / ?3
+                          = (rollup.hour_utc + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1) / ?3
+                   )
+                 UNION ALL
+                 SELECT observation.observed_at_ms,
+                        observation.provider,
+                        observation.derived_model_id,
+                        COALESCE(observation.input_tokens, 0)
+                            + COALESCE(observation.output_tokens, 0)
+                            + COALESCE(observation.cache_creation_tokens, 0)
+                            + COALESCE(observation.cache_read_tokens, 0)
+                 FROM model_usage_observations AS observation
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+                   AND NOT (
+                       observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                           * {MODEL_ROLLUP_HOUR_MS} >= ?7
+                       AND observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                           * {MODEL_ROLLUP_HOUR_MS} < ?8
+                       AND (
+                           observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                               * {MODEL_ROLLUP_HOUR_MS} - ?1
+                       ) / ?3 = (
+                           observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                               * {MODEL_ROLLUP_HOUR_MS}
+                           + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1
+                       ) / ?3
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM model_usage_hourly AS authoritative
+                       WHERE authoritative.hour_utc =
+                             observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                                 * {MODEL_ROLLUP_HOUR_MS}
+                         AND authoritative.provider = observation.provider
+                         AND authoritative.source_key = observation.source_key
+                         AND authoritative.derived_model_id =
+                             COALESCE(observation.derived_model_id, '')
+                         AND authoritative.raw_pruned = 1
+                   )
+                   AND (?4 IS NULL OR observation.provider = ?4)"
+            )
+        };
+        let mut statement = tx
+            .prepare_cached(&format!(
+                "SELECT
+                     (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
+                     SUM(
+                         CASE WHEN observation.derived_model_id IS NOT NULL THEN
+                             observation.token_amount
+                         ELSE 0 END
+                     ) AS attributed_tokens,
+                     SUM(
+                         CASE WHEN observation.derived_model_id IS NULL THEN
+                             observation.token_amount
+                         ELSE 0 END
+                     ) AS unattributed_tokens,
+                     SUM(
+                         CASE
+                             WHEN ?5 IS NOT NULL
+                              AND observation.provider COLLATE BINARY = ?5
+                              AND observation.derived_model_id COLLATE BINARY = ?6
+                             THEN observation.token_amount
+                             ELSE 0
+                         END
+                     ) AS selected_model_tokens
+                 FROM ({history_source}) AS observation
                  GROUP BY bucket_index
                  ORDER BY bucket_index ASC",
             ))
@@ -8467,7 +8836,9 @@ impl Storage {
                     bucket_millis,
                     provider,
                     selected_provider,
-                    selected_model_id
+                    selected_model_id,
+                    rollup_start_ms,
+                    rollup_end_ms,
                 ],
                 |row| {
                     Ok(ModelHistoryAggregateRow {
@@ -8521,6 +8892,7 @@ impl Storage {
             selected_model: selected_model.cloned(),
             bucket_seconds,
             points,
+            building_index,
         })
     }
 
@@ -22943,6 +23315,350 @@ mod tests {
         assert_eq!(history.points[bucket3].unattributed_tokens, 0);
         // Only the pre-evidence codex delta stays unattributed.
         assert_eq!(history.points[bucket_pre].unattributed_tokens, 10);
+
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Hybrid Model Overview and History Parity]]
+    #[test]
+    #[serial]
+    fn hybrid_model_overview_and_history_match_raw_at_unaligned_boundaries() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let pinned_now = DateTime::parse_from_rfc3339("2026-07-20T12:37:23Z")
+            .expect("pinned time")
+            .with_timezone(&Utc);
+        let at = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .expect("seed timestamp")
+                .with_timezone(&Utc)
+        };
+
+        let claude = [
+            claude_overview_turn(
+                &at("2026-07-19T12:45:00Z"),
+                "sess-hybrid-a",
+                "model-a",
+                10,
+                "/work/alpha",
+            ),
+            claude_overview_turn(
+                &at("2026-07-19T13:10:00Z"),
+                "sess-hybrid-a",
+                "model-a",
+                20,
+                "/work/alpha",
+            ),
+            claude_overview_turn(
+                &at("2026-07-19T13:50:00Z"),
+                "sess-hybrid-a",
+                "model-b",
+                30,
+                "/work/alpha",
+            ),
+            claude_overview_turn(
+                &at("2026-07-20T11:30:00Z"),
+                "sess-hybrid-a",
+                "model-b",
+                40,
+                "/work/alpha",
+            ),
+            claude_overview_turn(
+                &at("2026-07-20T12:10:00Z"),
+                "sess-hybrid-a",
+                "model-a",
+                50,
+                "/work/alpha",
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "sk-hybrid-a", "sess-hybrid-a", &claude);
+
+        let unattributed = format!(
+            r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-hybrid-gap","cwd":"/work/beta","message":{{"usage":{{"input_tokens":0}}}}}}"#,
+            at("2026-07-19T18:05:00Z").to_rfc3339()
+        );
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "sk-hybrid-gap",
+            "sess-hybrid-gap",
+            &unattributed,
+        );
+
+        let suppressed = claude_overview_turn(
+            &at("2026-07-19T20:05:00Z"),
+            "sess-hybrid-suppressed",
+            "model-hidden",
+            999,
+            "/work/hidden",
+        );
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "sk-hybrid-suppressed",
+            "sess-hybrid-suppressed",
+            &suppressed,
+        );
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed', suppressed_sha256 = 'suppressed'
+                 WHERE provider = 'claude' AND source_key = 'sk-hybrid-suppressed'",
+                [],
+            )
+            .expect("suppress hybrid source");
+
+        let range_start_ms = (pinned_now - TimeDelta::hours(24)).timestamp_millis();
+        let range_end_ms = pinned_now.timestamp_millis();
+        let (rollup_start_ms, rollup_end_ms) =
+            model_rollup_closed_bounds(range_start_ms, range_end_ms);
+        let (raw_scope_rows, hybrid_raw_rows, hybrid_rollup_rows) = {
+            let conn = storage.conn.lock();
+            let raw_scope_rows = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*)
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2"
+                    ),
+                    params![range_start_ms, range_end_ms],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count raw overview scope");
+            let hybrid_raw_rows = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*)
+                         FROM model_usage_observations AS observation
+                         JOIN model_observation_sources AS source
+                           ON source.provider = observation.provider
+                          AND source.source_key = observation.source_key
+                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                           AND observation.observed_at_ms >= ?1
+                           AND observation.observed_at_ms < ?2
+                           AND (observation.observed_at_ms < ?3
+                                OR observation.observed_at_ms >= ?4)"
+                    ),
+                    params![range_start_ms, range_end_ms, rollup_start_ms, rollup_end_ms],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count hybrid raw boundary rows");
+            let hybrid_rollup_rows = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM model_usage_hourly AS rollup
+                     JOIN model_observation_sources AS source
+                       ON source.provider = rollup.provider
+                      AND source.source_key = rollup.source_key
+                     WHERE source.processing_status != 'suppressed'
+                       AND source.suppressed_sha256 IS NULL
+                       AND rollup.hour_utc >= ?1 AND rollup.hour_utc < ?2",
+                    params![rollup_start_ms, rollup_end_ms],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count hybrid rollup rows");
+            (raw_scope_rows, hybrid_raw_rows, hybrid_rollup_rows)
+        };
+        assert!(hybrid_rollup_rows > 0, "seed must exercise closed rollups");
+        assert!(
+            hybrid_raw_rows < raw_scope_rows,
+            "completed overview temp scope must retain only raw boundary rows"
+        );
+
+        let raw_overview = storage
+            .get_model_usage_overview_uncached(ModelRange::TwentyFourHours, None, pinned_now)
+            .expect("raw overview");
+        let selected = ModelIdentity {
+            provider: "claude".to_string(),
+            model_id: "model-a".to_string(),
+        };
+        let raw_history = storage
+            .get_model_history_uncached(
+                ModelRange::TwentyFourHours,
+                None,
+                Some(&selected),
+                pinned_now,
+            )
+            .expect("raw history");
+        let raw_week_overview = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("raw week overview");
+        let raw_week_history = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
+            .expect("raw week history");
+        assert!(raw_overview.building_index);
+        assert!(raw_history.building_index);
+
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete model rollup backfill");
+        let hybrid_overview = storage
+            .get_model_usage_overview_uncached(ModelRange::TwentyFourHours, None, pinned_now)
+            .expect("hybrid overview");
+        let hybrid_history = storage
+            .get_model_history_uncached(
+                ModelRange::TwentyFourHours,
+                None,
+                Some(&selected),
+                pinned_now,
+            )
+            .expect("hybrid history");
+        let hybrid_week_overview = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("hybrid week overview");
+        let hybrid_week_history = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
+            .expect("hybrid week history");
+        assert!(!hybrid_overview.building_index);
+        assert!(!hybrid_history.building_index);
+
+        let mut raw_overview_json = serde_json::to_value(&raw_overview).expect("raw overview json");
+        let mut hybrid_overview_json =
+            serde_json::to_value(&hybrid_overview).expect("hybrid overview json");
+        raw_overview_json
+            .as_object_mut()
+            .expect("raw overview object")
+            .remove("buildingIndex");
+        hybrid_overview_json
+            .as_object_mut()
+            .expect("hybrid overview object")
+            .remove("buildingIndex");
+        assert_eq!(hybrid_overview_json, raw_overview_json);
+
+        let mut raw_history_json = serde_json::to_value(&raw_history).expect("raw history json");
+        let mut hybrid_history_json =
+            serde_json::to_value(&hybrid_history).expect("hybrid history json");
+        raw_history_json
+            .as_object_mut()
+            .expect("raw history object")
+            .remove("buildingIndex");
+        hybrid_history_json
+            .as_object_mut()
+            .expect("hybrid history object")
+            .remove("buildingIndex");
+        assert_eq!(hybrid_history_json, raw_history_json);
+
+        let mut raw_week_overview_json =
+            serde_json::to_value(&raw_week_overview).expect("raw week overview json");
+        let mut hybrid_week_overview_json =
+            serde_json::to_value(&hybrid_week_overview).expect("hybrid week overview json");
+        raw_week_overview_json
+            .as_object_mut()
+            .expect("raw week overview object")
+            .remove("buildingIndex");
+        hybrid_week_overview_json
+            .as_object_mut()
+            .expect("hybrid week overview object")
+            .remove("buildingIndex");
+        assert_eq!(hybrid_week_overview_json, raw_week_overview_json);
+
+        let mut raw_week_history_json =
+            serde_json::to_value(&raw_week_history).expect("raw week history json");
+        let mut hybrid_week_history_json =
+            serde_json::to_value(&hybrid_week_history).expect("hybrid week history json");
+        raw_week_history_json
+            .as_object_mut()
+            .expect("raw week history object")
+            .remove("buildingIndex");
+        hybrid_week_history_json
+            .as_object_mut()
+            .expect("hybrid week history object")
+            .remove("buildingIndex");
+        assert_eq!(hybrid_week_history_json, raw_week_history_json);
+
+        let pruned_hour = at("2026-07-19T13:00:00Z").timestamp_millis();
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_usage_hourly
+                 SET raw_pruned = 1
+                 WHERE provider = 'claude' AND source_key = 'sk-hybrid-a'
+                   AND hour_utc = ?1",
+                [pruned_hour],
+            )
+            .expect("mark authoritative rollup hour");
+        let before_raw_delete = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("overview before authoritative raw delete");
+        let history_before_raw_delete = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
+            .expect("history before authoritative raw delete");
+        storage
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM model_usage_observations
+                 WHERE provider = 'claude' AND source_key = 'sk-hybrid-a'
+                   AND observed_at_ms >= ?1 AND observed_at_ms < ?2",
+                params![pruned_hour, pruned_hour + MODEL_ROLLUP_HOUR_MS],
+            )
+            .expect("delete raw evidence behind authoritative rollup");
+        let after_raw_delete = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("overview after authoritative raw delete");
+        let history_after_raw_delete = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
+            .expect("history after authoritative raw delete");
+        assert_eq!(
+            serde_json::to_value(after_raw_delete).expect("post-prune overview json"),
+            serde_json::to_value(before_raw_delete).expect("pre-prune overview json")
+        );
+        assert_eq!(
+            serde_json::to_value(history_after_raw_delete).expect("post-prune history json"),
+            serde_json::to_value(history_before_raw_delete).expect("pre-prune history json")
+        );
+
+        for status in ["pending", "running", "failed"] {
+            storage
+                .conn
+                .lock()
+                .execute(
+                    "UPDATE rollup_meta SET model_backfill_status = ?1 WHERE id = 1",
+                    [status],
+                )
+                .expect("set incomplete rollup state");
+            let response = storage
+                .get_model_history_uncached(
+                    ModelRange::TwentyFourHours,
+                    Some("claude"),
+                    Some(&selected),
+                    pinned_now,
+                )
+                .expect("raw fallback history");
+            assert!(response.building_index, "status {status}");
+        }
+
+        drop(storage);
+        clear_env();
+        let empty_dir = TempDir::new().expect("empty tempdir");
+        let empty_storage = init_storage_in(&empty_dir);
+        empty_storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete empty model rollup");
+        let empty = empty_storage
+            .get_model_usage_overview_uncached(ModelRange::TwentyFourHours, None, pinned_now)
+            .expect("completed empty overview");
+        assert!(!empty.building_index);
+        assert!(empty.models.is_empty());
 
         clear_env();
     }
