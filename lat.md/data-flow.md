@@ -286,6 +286,11 @@ The main window polls enabled providers for live rate limit status and stores th
 8d. When a Claude poll yields the `Credentials` kind (no local access token), the poller confirms the logout before warning. [[src-tauri/src/lib.rs#resolve_claude_logout_or_paused]] calls [[src-tauri/src/config.rs#claude_logged_in]], which spawns `claude auth status --json` UNCONFINED — a plain `tokio::process::Command` with the inherited environment and a ~15s timeout, NO Landlock/bwrap/sandbox-exec, NO prompt, NO `-p`, NO inference, and NO write to the credential store. Only `loggedIn: false` produces the red `Config` (logged-out) error; `loggedIn: true` or any inconclusive failure (binary missing, spawn error, timeout, parse failure) downgrades to `Paused` with cached rows and no warning. The verdict is cached for ~120s (`CLAUDE_AUTH_STATUS_CHECKED_AT_KEY` timestamp plus a `CLAUDE_AUTH_STATUS_LOGGED_IN_KEY` boolean) so the 3-minute poller spawns the CLI at most once per TTL; a successful live fetch clears the cache so a fresh login is recognized immediately.
 9. The widget renders one LIMITS row per enabled provider with a cell per rate-limit window; no view selects a single bucket for history any more
 10. `emit_usage_updates()` rebuilds the backend-owned indicator state, emits `indicator-updated`, and lets the tray listener update title text plus `Now`, `Resets`, and `Week` summary rows from the same payload
+
+CPA connection setup is a separate guarded mutation before its poll path becomes eligible. [[src-tauri/src/lib.rs#set_cpa_connection]] validates the loopback management endpoint and auth-file shape, performs one provider smoke call, then persists the connection and `usage.cpa.window_smoke.{claude,codex}` verdicts. The management key remains Rust-owned after submission and is omitted from every response.
+
+Disconnect reverses the source completely: [[src-tauri/src/integrations/manager.rs#clear_cpa_connection]] deletes connection/runtime settings plus CPA snapshots and hourly aggregates while holding `integration_mutation_guard`; the command then bumps the usage-cache epoch before rebuilding the next emitted snapshot.
+
 ## Indicator Preference Pipeline
 
 The status indicator has one backend-owned provider preference shared across the tray and the [[features#Settings Window]]'s Integrations tab.

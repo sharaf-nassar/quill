@@ -1397,7 +1397,7 @@ Storage and blocking-task failures stay in local logs. All five commands return 
 
 `delete_session_data` deletes token snapshots and all five transcript analytics tables for the selected `(provider, session_id)` pair, plus every model source owned by that provider-qualified analytics/root session. Model observation children are removed before retained source fingerprints become suppressed, preventing a retry from resurrecting unchanged deleted evidence. Project rename updates retained/live ownership and cwd-bearing analytics in the same transaction, then preserves that choice through `project_path_renames` on future replay.
 
-### Integration Commands (12)
+### Integration Commands (15)
 
 Commands for detecting providers and running install/uninstall flows, plus per-provider and global feature toggles.
 
@@ -1409,9 +1409,11 @@ The `confirm_enable_provider` command accepts an optional `api_key` parameter us
 
 `set_minimax_api_key` updates a stored MiniMax API key in place (no disable/re-enable round-trip) and emits `integrations-updated`.
 
+`set_cpa_connection`, `clear_cpa_connection`, and `get_cpa_connection_status` own the CPA service-source lifecycle. Connect accepts a loopback URL plus management key and returns typed smoke verdicts without returning or logging the key. Status exposes only URL/configured state. Clear removes both connection keys, every `usage.cpa.*` key, CPA raw/hourly rows, and invalidates the usage-cache epoch; all mutations run under the shared integration guard.
+
 `get_integration_features` returns the resolved `IntegrationFeatures` struct. `set_activity_tracking_enabled`, `set_context_telemetry_enabled`, and `set_brevity_enabled` each save their flag, reinstall every currently-enabled provider via [[src-tauri/src/integrations/manager.rs#apply_features_to_enabled_providers]] (which also re-syncs brevity blocks via `sync_brevity_blocks`), and emit `integration-features-updated`. The existing `set_context_preservation_enabled` follows the same path so all four feature toggles share one sync function.
 
-`get_provider_statuses`, `rescan_integrations`, `confirm_enable_provider`, `confirm_disable_provider`, `get_context_preservation_status`, `set_context_preservation_enabled`, `set_minimax_api_key`, `get_runtime_settings`, `set_runtime_settings`, `get_integration_features`, `set_activity_tracking_enabled`, `set_context_telemetry_enabled`, and `set_brevity_enabled`.
+`get_provider_statuses`, `rescan_integrations`, `confirm_enable_provider`, `confirm_disable_provider`, `get_context_preservation_status`, `set_context_preservation_enabled`, `set_minimax_api_key`, `set_cpa_connection`, `clear_cpa_connection`, `get_cpa_connection_status`, `get_runtime_settings`, `set_runtime_settings`, `get_integration_features`, `set_activity_tracking_enabled`, `set_context_telemetry_enabled`, and `set_brevity_enabled`.
 
 At startup, [[src-tauri/src/integrations/manager.rs]] verifies enabled, detected Claude and Codex providers against the stored context-preservation setting. Missing or stale Quill-managed hooks, MCP assets, templates, or unexpectedly present context assets trigger an idempotent reinstall of either the base-only or context-enabled asset set; repair failures leave the provider enabled but persist `last_error` and an error setup state.
 
@@ -1783,9 +1785,11 @@ Restart commands expose a shared provider-aware row model across Claude and Code
 
 [[src-tauri/src/lib.rs#get_release_notes]] proxies the public GitHub releases API for `sharaf-nassar/quill` via [[src-tauri/src/releases.rs#fetch_release_notes]], drops drafts and prereleases, and returns a normalized `ReleaseNote` list (tag, name, body, html url, published_at) that the [[frontend#Frontend#Components]] release-notes window paginates with Previous/Next. The command takes an optional `limit` (clamped to 1-100, default 30) so the frontend can request a small newest-first window without exposing GitHub pagination details. Unauthenticated requests are used because the repository is public; rate-limit and HTTP errors are surfaced as `Result::Err` strings rather than swallowed.
 
-### Integration Commands (9)
+### Integration Commands (12)
 
 Integration IPC exposes provider detection, manual rescan, provider enablement, the global context-preservation toggle, the global brevity toggle, and the in-place MiniMax API-key update.
+
+CPA adds a masked read command plus guarded connect/disconnect commands. The key is accepted only on connect and never returned; disconnect purges the complete settings and snapshot footprint before the usage-cache epoch advances.
 
 `get_provider_statuses`, `confirm_enable_provider`, `confirm_disable_provider`, and `get_context_preservation_status` expose provider state and the context-preservation setting. `set_context_preservation_enabled` installs or removes local context-preservation assets for currently enabled Claude and Codex providers without deleting historical context data.
 

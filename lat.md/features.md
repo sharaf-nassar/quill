@@ -312,7 +312,7 @@ Top-tabs navigation hosts five panels: General, Integrations, Context, Learning,
 | Tab | Panel | Settings |
 |-----|-------|----------|
 | General | [[src/components/settings/GeneralTab.tsx]] | Always-on-top toggle, an Advanced section with the current-config summary and "Reset to defaults" button covering runtime and learning settings, a "Help improve Quill" toggle that drives the [[features#Crash Reporting]] opt-out, and an About section described in [[features#Settings Window#Version and Release Notes]] |
-| Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form |
+| Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form, and the CPA connection lifecycle |
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
 | Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
 | Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
@@ -356,6 +356,16 @@ Always-on background tasks expose enable/interval toggles through a single `Runt
 The Integrations tab can update a stored MiniMax API key without disabling and re-enabling the integration.
 
 [[src-tauri/src/lib.rs#set_minimax_api_key]] delegates to [[src-tauri/src/integrations/manager.rs#set_minimax_api_key]] which trims the key, persists it via [[src-tauri/src/integrations/minimax.rs#save_api_key]], refreshes provider statuses, and emits `integrations-updated`. The frontend renders an inline `Save` / `Cancel` form; the dialog-based first-enable flow stays unchanged.
+
+### CPA Connection Lifecycle
+
+CPA is an opt-in cross-provider usage source configured from the Integrations tab without becoming a provider status row.
+
+The form defaults to `http://127.0.0.1:8317`, accepts only HTTP(S) loopback URLs, and sends the management key across Tauri only for an explicit connect attempt. [[src-tauri/src/integrations/cpa.rs#validate_connection]] checks `/v0/management/auth-files`, reports typed invalid-URL, unreachable, unauthorized, unsupported-version, and unexpected-response failures, then runs one Claude and Codex quota smoke check when each provider is present. A valid management connection persists `integration.cpa.base_url`, `integration.cpa.management_key`, and boolean `usage.cpa.window_smoke.{claude,codex}` gates; a failed provider smoke check keeps the connection but leaves that provider in health-only mode.
+
+[[src-tauri/src/lib.rs#get_cpa_connection_status]] returns only the saved URL and configured state, never the management key. [[src-tauri/src/lib.rs#clear_cpa_connection]] runs the guarded manager purge, deletes both connection settings, every `usage.cpa.*` runtime row, raw CPA snapshots and `usage_hourly` keys under `cpa/%`, then clears the usage cache and advances its epoch so an older in-flight refresh cannot restore disconnected rows. Direct provider snapshots remain intact.
+
+Direct Claude and Codex integrations remain active when CPA is configured. The settings copy names the accepted v1 overlap explicitly: the same account can appear through both sources and may be counted twice.
 
 ## Crash Reporting
 

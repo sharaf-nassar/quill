@@ -7,7 +7,6 @@ mod claude_setup;
 mod compress_prose;
 mod config;
 mod context_category;
-#[cfg(test)]
 mod cpa;
 mod crash_reporting;
 pub mod data_paths;
@@ -4500,6 +4499,47 @@ async fn set_minimax_api_key(
     Ok(status)
 }
 
+#[tauri::command]
+async fn set_cpa_connection(
+    base_url: String,
+    management_key: String,
+    app: tauri::AppHandle,
+) -> Result<integrations::cpa::CpaConnectResult, integrations::cpa::CpaConnectError> {
+    let validated = integrations::cpa::validate_connection(&base_url, &management_key).await?;
+    let result =
+        tokio::task::block_in_place(|| integrations::manager::set_cpa_connection(validated))?;
+
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after CPA connection update failed: {error}");
+    }
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn clear_cpa_connection(
+    app: tauri::AppHandle,
+) -> Result<(), integrations::cpa::CpaConnectError> {
+    tokio::task::block_in_place(integrations::manager::clear_cpa_connection)?;
+
+    // The epoch prevents a refresh that started before the purge from
+    // restoring CPA rows after disconnect. Clearing the in-memory entry makes
+    // the next emit rebuild from direct sources only.
+    clear_usage_cache().await;
+    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+        log::warn!("Usage refresh after CPA disconnect failed: {error}");
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_cpa_connection_status()
+-> Result<integrations::cpa::CpaConnectionStatus, integrations::cpa::CpaConnectError> {
+    integrations::manager::get_cpa_connection_status()
+}
+
 // --- Learning IPC authorization (feature 005 US2 T034 — H-4 / FR-011) ---
 //
 // See specs/005-learning-system-hardening/contracts/ipc-and-feedback.md
@@ -5679,6 +5719,9 @@ pub fn run() {
             confirm_disable_provider,
             set_brevity_enabled,
             set_minimax_api_key,
+            set_cpa_connection,
+            clear_cpa_connection,
+            get_cpa_connection_status,
             get_runtime_settings,
             set_runtime_settings,
             compact_database,

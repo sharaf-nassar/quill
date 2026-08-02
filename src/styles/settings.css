@@ -317,7 +317,8 @@
 .settings-input:focus,
 .settings-select:focus {
   outline: none;
-  border-color: rgba(52, 211, 153, 0.5);
+  border-color: rgba(96, 165, 250, 0.7);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.35);
 }
 
 .settings-input:disabled,
@@ -348,6 +349,13 @@
 .settings-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.settings-button:focus-visible,
+.settings-toggle:focus-visible,
+.settings-segment:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
 }
 
 .settings-button--primary {
@@ -584,6 +592,123 @@
 
 .settings-inline-form .settings-input {
   width: 180px;
+}
+
+/* ─── CLI Proxy API connection ─── */
+.cpa-settings {
+  margin: 0 4px 8px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  min-width: 0;
+}
+
+.cpa-settings-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.cpa-settings-header h3 {
+  margin: 0;
+  color: var(--readout-bright);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.cpa-connection-status {
+  color: rgba(255, 255, 255, 0.48);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.cpa-connection-status[data-state="connected"] {
+  color: var(--readout);
+}
+
+.cpa-connection-status[data-state="connecting"],
+.cpa-connection-status[data-state="disconnecting"] {
+  color: var(--signal-blue);
+}
+
+.cpa-connection-status[data-state="error"] {
+  color: var(--meter-red);
+}
+
+.cpa-settings-description,
+.cpa-settings-overlap,
+.cpa-settings-feedback {
+  margin: 7px 0 0;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.cpa-settings-form {
+  margin-top: 10px;
+}
+
+.cpa-settings-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+}
+
+.cpa-settings-field {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 4px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.cpa-settings-field .settings-input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  font-family: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.cpa-settings-field small {
+  color: rgba(255, 255, 255, 0.42);
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.cpa-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.cpa-settings-feedback {
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.72);
+}
+
+.cpa-settings-feedback--error {
+  color: var(--meter-red);
+}
+
+.cpa-settings-overlap {
+  color: rgba(255, 255, 255, 0.46);
+}
+
+@media (max-width: 620px) {
+  .cpa-settings-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 /* ─── Prose blocks (descriptive copy in tabs) ─── */

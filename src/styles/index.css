@@ -198,7 +198,7 @@ body {
   width: min(420px, 100%);
   background: var(--panel-raised);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 14px;
+  border-radius: 8px;
   box-shadow: 0 24px 40px rgba(0, 0, 0, 0.45);
   padding: 18px;
 }
@@ -267,7 +267,13 @@ body {
 }
 
 .confirm-dialog-input:focus {
-  border-color: rgba(99, 102, 241, 0.5);
+  border-color: rgba(96, 165, 250, 0.7);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.35);
+}
+
+.confirm-dialog-btn:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
 }
 
 .confirm-dialog-input::placeholder {

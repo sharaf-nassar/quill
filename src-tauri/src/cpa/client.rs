@@ -61,10 +61,20 @@ pub(crate) struct CpaAuthFile {
     pub chatgpt_account_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct CpaClient {
     base_url: Url,
     management_key: String,
+}
+
+impl fmt::Debug for CpaClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CpaClient")
+            .field("base_url", &self.base_url)
+            .field("management_key", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod cpa;
 pub(crate) mod deploy;
 pub mod manager;
 pub mod manifest;

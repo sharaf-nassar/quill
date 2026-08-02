@@ -305,6 +305,39 @@ export interface ProviderStatus {
   lastDetectionAttempts?: string[];
 }
 
+export interface CpaConnectionStatus {
+  baseUrl: string | null;
+  configured: boolean;
+}
+
+export type CpaSmokeState = "available" | "unavailable" | "not_present";
+
+export interface CpaSmokeVerdict {
+  state: CpaSmokeState;
+  message: string;
+}
+
+export interface CpaConnectResult {
+  connection: CpaConnectionStatus;
+  smoke: {
+    claude: CpaSmokeVerdict;
+    codex: CpaSmokeVerdict;
+  };
+}
+
+export type CpaConnectErrorCode =
+  | "invalid_url"
+  | "unreachable"
+  | "unauthorized"
+  | "unsupported_version"
+  | "unexpected_response"
+  | "storage";
+
+export interface CpaConnectError {
+  code: CpaConnectErrorCode;
+  message: string;
+}
+
 export interface ContextPreservationStatus {
   enabled: boolean;
   hasContextSavingsEvents: boolean;

@@ -9986,7 +9986,6 @@ impl Storage {
         Ok(buckets)
     }
 
-    #[allow(dead_code)] // Sequencing item 4 consumes the CPA cleanup path.
     pub fn delete_cpa_usage_snapshots(&self) -> Result<(), String> {
         let mut conn = self.conn.lock();
         let tx = conn
@@ -11662,6 +11661,16 @@ impl Storage {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
             .map_err(|e| format!("Setting delete error: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_settings_with_prefix(&self, prefix: &str) -> Result<(), String> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM settings WHERE key LIKE ?1",
+            params![format!("{prefix}%")],
+        )
+        .map_err(|e| format!("Settings prefix delete error: {e}"))?;
         Ok(())
     }
 
@@ -24034,6 +24043,15 @@ mod tests {
         reopened
             .delete_cpa_usage_snapshots()
             .expect("delete CPA usage snapshots");
+        reopened
+            .set_setting("usage.cpa.window_smoke.claude", "true")
+            .expect("seed CPA smoke setting");
+        reopened
+            .set_setting("usage.claude.last_attempt_at", "preserve")
+            .expect("seed direct usage setting");
+        reopened
+            .delete_settings_with_prefix("usage.cpa.")
+            .expect("delete CPA usage settings");
         {
             let conn = reopened.conn.lock();
             let cpa_snapshots: i64 = conn
@@ -24063,6 +24081,19 @@ mod tests {
             assert_eq!(cpa_hourly, 0);
             assert_eq!(direct_hourly, 1);
         }
+        assert_eq!(
+            reopened
+                .get_setting("usage.cpa.window_smoke.claude")
+                .expect("read deleted CPA smoke setting"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .get_setting("usage.claude.last_attempt_at")
+                .expect("read preserved direct usage setting")
+                .as_deref(),
+            Some("preserve")
+        );
 
         drop(reopened);
         clear_env();

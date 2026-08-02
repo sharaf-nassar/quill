@@ -2921,6 +2921,19 @@ const fixtures: Record<string, FixtureHandler> = {
   // misc no-ops
   set_indicator_primary_provider: () => null,
   set_minimax_api_key: () => null,
+  get_cpa_connection_status: () => ({ baseUrl: null, configured: false }),
+  set_cpa_connection: (args) => ({
+    connection: {
+      baseUrl:
+        typeof args?.baseUrl === "string" ? args.baseUrl : "http://127.0.0.1:8317",
+      configured: true,
+    },
+    smoke: {
+      claude: { state: "available", message: "Claude quota path verified." },
+      codex: { state: "available", message: "Codex quota path verified." },
+    },
+  }),
+  clear_cpa_connection: () => null,
   hide_window: () => null,
   quit_app: () => null,
 };

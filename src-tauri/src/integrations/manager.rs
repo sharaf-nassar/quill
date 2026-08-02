@@ -1,5 +1,8 @@
-use super::{claude, codex, integration_mutation_guard, minimax};
+use super::{claude, codex, cpa, integration_mutation_guard, minimax};
 use crate::brevity;
+use crate::integrations::cpa::{
+    CpaConnectError, CpaConnectResult, CpaConnectionStatus, ValidatedCpaConnection,
+};
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::{ContextPreservationStatus, IntegrationFeatures};
 use crate::storage::Storage;
@@ -186,6 +189,31 @@ pub fn set_minimax_api_key(app: &AppHandle, api_key: &str) -> Result<ProviderSta
     save_statuses(&storage, &statuses)?;
     emit_statuses(app, &statuses);
     Ok(status)
+}
+
+pub(crate) fn set_cpa_connection(
+    validated: ValidatedCpaConnection,
+) -> Result<CpaConnectResult, CpaConnectError> {
+    let _mutation_guard = integration_mutation_guard().map_err(|_| CpaConnectError::storage())?;
+    let storage = Storage::init().map_err(|_| CpaConnectError::storage())?;
+    cpa::save_connection(&storage, validated)
+}
+
+pub(crate) fn clear_cpa_connection() -> Result<(), CpaConnectError> {
+    let _mutation_guard = integration_mutation_guard().map_err(|_| CpaConnectError::storage())?;
+    let storage = Storage::init().map_err(|_| CpaConnectError::storage())?;
+    cpa::delete_connection(&storage)?;
+    storage
+        .delete_settings_with_prefix("usage.cpa.")
+        .map_err(|_| CpaConnectError::storage())?;
+    storage
+        .delete_cpa_usage_snapshots()
+        .map_err(|_| CpaConnectError::storage())
+}
+
+pub(crate) fn get_cpa_connection_status() -> Result<CpaConnectionStatus, CpaConnectError> {
+    let storage = Storage::init().map_err(|_| CpaConnectError::storage())?;
+    cpa::connection_status(&storage)
 }
 
 pub fn set_brevity_enabled(app: &AppHandle, enabled: bool) -> Result<IntegrationFeatures, String> {
