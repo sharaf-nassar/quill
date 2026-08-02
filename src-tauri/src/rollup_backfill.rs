@@ -60,6 +60,17 @@ pub(crate) trait RollupBackfillTarget {
 
     fn count_total_rows(&self, conn: &Connection) -> rusqlite::Result<u64>;
 
+    /// Prepare expensive source reads outside the immediate transaction and
+    /// ingest permit. Targets must revalidate prepared identity in
+    /// `fold_chunk` before applying it atomically with the bookmark.
+    fn prepare_chunk(
+        &mut self,
+        _conn: &Connection,
+        _state: RollupBackfillState,
+    ) -> rusqlite::Result<()> {
+        Ok(())
+    }
+
     fn fold_chunk(
         &mut self,
         tx: &Transaction<'_>,
@@ -321,6 +332,9 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
 
         progress.phase = RollupBackfillPhase::Folding;
         let previous = state;
+        target
+            .prepare_chunk(conn, previous)
+            .map_err(RollupBackfillError::FoldChunk)?;
         let deadline = Instant::now() + controls.chunk_duration();
         let chunk = with_ingest_write_permit(|| {
             let tx = conn

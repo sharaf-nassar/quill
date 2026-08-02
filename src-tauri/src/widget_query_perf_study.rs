@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{ModelRange, UsageBucket};
+use crate::rollup_backfill::RollupBackfillTerminal;
 use crate::storage::{Storage, with_pinned_query_now};
 
 /// One cold, app-cache-bypassed endpoint measurement.
@@ -110,6 +111,42 @@ fn latest_usage_buckets(corpus: &Path) -> Result<Vec<UsageBucket>, String> {
         buckets.extend(storage.get_latest_usage_buckets(provider)?);
     }
     Ok(buckets)
+}
+
+/// Backfill one worker-owned mutable corpus copy through the production target.
+pub fn backfill_runtime_rollup_copy(corpus: &Path) -> Result<(u64, u64), String> {
+    let metadata = corpus
+        .metadata()
+        .map_err(|error| format!("Read runtime backfill copy metadata: {error}"))?;
+    if metadata.permissions().readonly() {
+        return Err(format!(
+            "Runtime backfill copy must be writable: {}",
+            corpus.display()
+        ));
+    }
+    let storage = Storage::init_study_scratch(corpus)?;
+    let report = storage.run_runtime_rollup_backfill()?;
+    if report.terminal != RollupBackfillTerminal::Completed {
+        return Err(format!(
+            "Runtime corpus backfill did not complete: {:?}",
+            report.terminal
+        ));
+    }
+    Ok((report.progress.rows_done, report.progress.rows_total))
+}
+
+/// Measure only the 90-day runtime acceptance query on a prepared copy.
+pub fn measure_runtime_90d(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<WidgetQueryMeasurement, String> {
+    measure(
+        corpus,
+        pinned_end,
+        WINDOWS[2],
+        "get_llm_runtime_stats",
+        |storage| storage.get_llm_runtime_stats("90d", None),
+    )
 }
 
 /// Run the complete BEFORE query matrix against one immutable corpus.

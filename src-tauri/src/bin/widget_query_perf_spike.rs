@@ -18,11 +18,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use quill_lib::widget_query_perf_study::{WidgetQueryBenchmarkReport, run_widget_query_baseline};
+use quill_lib::widget_query_perf_study::{
+    WidgetQueryBenchmarkReport, backfill_runtime_rollup_copy, measure_runtime_90d,
+    run_widget_query_baseline,
+};
 use rusqlite::{Connection, OpenFlags, backup::Backup, backup::StepResult};
 
 fn usage() -> &'static str {
-    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
+    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
 }
 
 fn path_arg(value: Option<OsString>, name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -154,6 +157,36 @@ fn main() -> Result<(), Box<dyn Error>> {
             let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
             let report = run_widget_query_baseline(&corpus, pinned_end)?;
             print_markdown(&report);
+            Ok(())
+        }
+        "backfill-runtime" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let started = std::time::Instant::now();
+            let (rows_done, rows_total) = backfill_runtime_rollup_copy(&corpus)?;
+            println!("runtime_backfill.rows_done={rows_done}");
+            println!("runtime_backfill.rows_total={rows_total}");
+            println!(
+                "runtime_backfill.elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1_000.0
+            );
+            Ok(())
+        }
+        "measure-runtime" => {
+            let corpus = path_arg(args.next(), "CORPUS")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let measurement = measure_runtime_90d(&corpus, pinned_end)?;
+            println!("runtime_90d.elapsed_ms={:.3}", measurement.elapsed_ms);
+            println!("runtime_90d.output_bytes={}", measurement.output_bytes);
             Ok(())
         }
         _ => Err(format!("Unknown mode {mode:?}.\n{}", usage()).into()),

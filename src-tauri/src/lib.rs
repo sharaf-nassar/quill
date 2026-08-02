@@ -960,6 +960,22 @@ fn spawn_reserved_model_history_backfill(
     Ok(())
 }
 
+fn spawn_runtime_rollup_backfill() -> Result<(), String> {
+    let storage = get_storage()?;
+    tauri::async_runtime::spawn_blocking(move || match storage.run_runtime_rollup_backfill() {
+        Ok(report) => {
+            log::info!(
+                "Runtime rollup backfill finished: terminal={:?}, rows={}/{}",
+                report.terminal,
+                report.progress.rows_done,
+                report.progress.rows_total
+            );
+        }
+        Err(error) => log::error!("Runtime rollup backfill failed: {error}"),
+    });
+    Ok(())
+}
+
 async fn reconcile_queued_model_usage_sources(
     app_handle: tauri::AppHandle,
     queued: Vec<sessions::DiscoveredRetainedJsonlSource>,
@@ -5592,6 +5608,9 @@ pub fn run() {
             // Blocking inventory/parsing stays off the UI thread; shared root
             // permits serialize this pass with any early live notifications.
             spawn_startup_transcript_analytics_reconciliation(app.handle().clone());
+            if let Err(error) = spawn_runtime_rollup_backfill() {
+                log::error!("Could not schedule runtime rollup backfill: {error}");
+            }
             // Always-on incremental rescan so live coverage no longer depends
             // solely on the per-session notify hook. Feeds changed sources into
             // the same live-reconcile queue; spawned async to never block setup.

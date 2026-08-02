@@ -148,3 +148,29 @@ cargo test --release --lib runtime_hourly_ingest_fold_burst_p95_stays_within_bud
 | Replacement with runtime fold | 6,000 | 25 | 96.017 ms |
 
 Runtime fold overhead is **8.825%**, within the required maximum of 10%.
+
+## Runtime hybrid read
+
+The runtime rollup was backfilled on a worker-owned disposable copy whose
+pre-mutation SHA-256 matched the frozen source. Source preparation ran outside
+the ingest permit; each compact source commit used the shared transaction,
+checkpoint, and 250 ms deadline.
+
+```bash
+cargo run --release --bin widget_query_perf_spike -- backfill-runtime COPY
+cargo run --release --bin widget_query_perf_spike -- measure-runtime COPY 2026-08-02T19:27:43Z
+```
+
+| Measure | Result |
+| --- | ---: |
+| Source-keyed rows backfilled | 2,878,277 |
+| Backfill elapsed | 134,006.999 ms |
+| `get_llm_runtime_stats` cold @90d | 81.977 ms |
+| Output bytes | 252 |
+
+The final read is below the 200 ms budget. A rejected first tail plan used the
+global earliest open-turn timestamp and took 11,509.582 ms because it emitted
+1,556,010 raw rows. The final plan scans 5,129 active open states and performs
+one packed last-event seek per native chain through
+`idx_se_provider_chain_timestamp`; a direct diagnostic measured that row fetch
+at 52.816 ms before the production endpoint measurement.

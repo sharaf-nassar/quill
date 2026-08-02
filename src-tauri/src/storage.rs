@@ -26,6 +26,10 @@ use crate::retention::{
     parse_audit_record_setting, parse_watermark_setting, parse_window_days_setting,
     retention_insert_verdict, window_days_setting_value,
 };
+use crate::rollup_backfill::{
+    RollupBackfillChunk, RollupBackfillChunkBudget, RollupBackfillControls, RollupBackfillReport,
+    RollupBackfillState, RollupBackfillTarget, RollupBackfillTerminal, run_rollup_backfill,
+};
 use crate::transcript_analytics::TranscriptAnalyticsSnapshot;
 
 /// What the insert-time retention watermark did to one snapshot replacement.
@@ -1825,6 +1829,8 @@ const MODEL_SOURCE_STATE_COLUMNS: &str = "
 /// `?N` bindings.
 const ACTIVE_MODEL_SOURCE_PREDICATE: &str =
     "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
+const ACTIVE_RUNTIME_SOURCE_PREDICATE: &str =
+    "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
 
 struct RawStoredModelSource {
     source_key: String,
@@ -1902,6 +1908,42 @@ struct PreparedRuntimeHourlyRollup {
     runtime_millis: i64,
     first_turn_start_ms: i64,
     last_turn_end_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedRuntimeBackfillSource {
+    provider: String,
+    source_key: String,
+    session_id: String,
+    chain_id: String,
+    first_rowid: i64,
+    last_rowid: i64,
+    row_count: u64,
+    content_sha256: Option<String>,
+    seen_generation: i64,
+    rollups: Vec<PreparedRuntimeHourlyRollup>,
+    finalized_through_rowid: i64,
+    open_turn_started_ms: Option<i64>,
+}
+
+#[derive(Default)]
+struct RuntimeRollupBackfillTarget {
+    prepared: Option<PreparedRuntimeBackfillSource>,
+}
+
+#[derive(Debug)]
+struct RuntimeBackfillInvariant(String);
+
+impl std::fmt::Display for RuntimeBackfillInvariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RuntimeBackfillInvariant {}
+
+fn runtime_backfill_sql_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(RuntimeBackfillInvariant(message.into())))
 }
 
 struct CurrentModelSourceSuppression {
@@ -2430,6 +2472,22 @@ fn refold_runtime_source(
     tx: &rusqlite::Transaction<'_>,
     source: &crate::transcript_analytics::TranscriptAnalyticsSourceState,
 ) -> Result<(), String> {
+    refold_runtime_source_identity(
+        tx,
+        source.provider.as_str(),
+        &source.source_key,
+        &source.analytics_session_id,
+        &source.chain_id,
+    )
+}
+
+fn refold_runtime_source_identity(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_key: &str,
+    session_id: &str,
+    chain_id: &str,
+) -> Result<(), String> {
     let mut events = {
         let mut statement = tx
             .prepare(
@@ -2439,33 +2497,28 @@ fn refold_runtime_source(
             )
             .map_err(|error| format!("Prepare runtime source refold: {error}"))?;
         let rows = statement
-            .query_map(
-                params![source.provider.as_str(), source.source_key],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            )
+            .query_map(params![provider, source_key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
             .map_err(|error| format!("Query runtime source refold: {error}"))?;
         let mut events = Vec::new();
         for row in rows {
-            let (rowid, timestamp, kind, session_id, chain_id) =
+            let (rowid, timestamp, kind, event_session_id, event_chain_id) =
                 row.map_err(|error| format!("Read runtime source event: {error}"))?;
-            if session_id != source.analytics_session_id {
+            if event_session_id != session_id {
                 return Err(format!(
-                    "Runtime event session {session_id} does not match source session {}",
-                    source.analytics_session_id
+                    "Runtime event session {event_session_id} does not match source session {session_id}"
                 ));
             }
-            if chain_id != source.chain_id {
+            if event_chain_id != chain_id {
                 return Err(format!(
-                    "Runtime event chain {chain_id} does not match source chain {}",
-                    source.chain_id
+                    "Runtime event chain {event_chain_id} does not match source chain {chain_id}"
                 ));
             }
             let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
@@ -2491,14 +2544,14 @@ fn refold_runtime_source(
         .execute(
             "DELETE FROM runtime_hourly
              WHERE provider = ?1 AND source_key = ?2 AND raw_pruned = 0",
-            params![source.provider.as_str(), source.source_key],
+            params![provider, source_key],
         )
         .map_err(|error| format!("Delete replaced runtime rollup rows: {error}"))?;
     let deleted_state_rows = tx
         .execute(
             "DELETE FROM runtime_turn_state
              WHERE provider = ?1 AND source_key = ?2",
-            params![source.provider.as_str(), source.source_key],
+            params![provider, source_key],
         )
         .map_err(|error| format!("Delete replaced runtime turn state: {error}"))?;
 
@@ -2507,7 +2560,7 @@ fn refold_runtime_source(
     let mut open_turn_started_ms = None;
     if let Some(first) = events.first() {
         let mut turn_start_ms = first.timestamp_ms;
-        let mut turn_max_rowid = first.rowid;
+        let mut open_turn_min_rowid = first.rowid;
         let mut previous = first;
 
         for event in events.iter().skip(1) {
@@ -2520,7 +2573,7 @@ fn refold_runtime_source(
             };
 
             if continues_turn {
-                turn_max_rowid = turn_max_rowid.max(event.rowid);
+                open_turn_min_rowid = open_turn_min_rowid.min(event.rowid);
             } else {
                 let turn_end_ms = if is_tool_wait {
                     previous
@@ -2555,12 +2608,12 @@ fn refold_runtime_source(
                     rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
                     rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
                 }
-                finalized_through_rowid = finalized_through_rowid.max(turn_max_rowid);
                 turn_start_ms = event.timestamp_ms;
-                turn_max_rowid = event.rowid;
+                open_turn_min_rowid = event.rowid;
             }
             previous = event;
         }
+        finalized_through_rowid = open_turn_min_rowid.saturating_sub(1).max(0);
         open_turn_started_ms = Some(turn_start_ms);
     }
 
@@ -2586,9 +2639,9 @@ fn refold_runtime_source(
             folded_rollup_rows += statement
                 .execute(params![
                     rollup.hour_utc,
-                    source.provider.as_str(),
-                    source.source_key,
-                    source.analytics_session_id,
+                    provider,
+                    source_key,
+                    session_id,
                     rollup.turn_count,
                     rollup.runtime_millis as f64 / 1_000.0,
                     rollup.first_turn_start_ms,
@@ -2605,8 +2658,8 @@ fn refold_runtime_source(
                  open_turn_started_ms
              ) VALUES (?1, ?2, ?3, ?4)",
             params![
-                source.provider.as_str(),
-                source.source_key,
+                provider,
+                source_key,
                 finalized_through_rowid,
                 open_turn_started_ms,
             ],
@@ -2635,6 +2688,588 @@ fn refold_runtime_source(
     }
 
     Ok(())
+}
+
+impl RuntimeRollupBackfillTarget {
+    fn prepare_source_rollup(
+        conn: &Connection,
+        after_rowid: i64,
+    ) -> rusqlite::Result<Option<PreparedRuntimeBackfillSource>> {
+        let identity = conn
+            .query_row(
+                "WITH next_source AS (
+                     SELECT provider, source_key
+                     FROM session_events
+                     WHERE source_key IS NOT NULL AND rowid > ?1
+                     ORDER BY rowid
+                     LIMIT 1
+                 )
+                 SELECT event.provider, event.source_key,
+                        MIN(event.rowid), MAX(event.rowid), COUNT(*),
+                        MIN(event.session_id), MAX(event.session_id),
+                        MIN(event.chain_id), MAX(event.chain_id),
+                        source.content_sha256, source.seen_generation
+                 FROM next_source AS next
+                 JOIN session_events AS event
+                   ON event.provider = next.provider
+                  AND event.source_key = next.source_key
+                 JOIN transcript_analytics_sources AS source
+                   ON source.provider = event.provider
+                  AND source.source_key = event.source_key
+                 GROUP BY event.provider, event.source_key
+                ",
+                params![after_rowid],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            provider,
+            source_key,
+            first_rowid,
+            last_rowid,
+            row_count,
+            first_session_id,
+            last_session_id,
+            first_chain_id,
+            last_chain_id,
+            content_sha256,
+            seen_generation,
+        )) = identity
+        else {
+            return Ok(None);
+        };
+        if first_session_id != last_session_id || first_chain_id != last_chain_id {
+            return Err(runtime_backfill_sql_error(format!(
+                "Runtime source {provider}/{source_key} has mixed session or chain identity"
+            )));
+        }
+        let block_width = last_rowid
+            .checked_sub(first_rowid)
+            .and_then(|width| width.checked_add(1))
+            .and_then(|width| u64::try_from(width).ok());
+        if block_width != Some(row_count) {
+            return Err(runtime_backfill_sql_error(format!(
+                "Runtime source {provider}/{source_key} is not one contiguous rowid block"
+            )));
+        }
+
+        let mut statement = conn.prepare(
+            "SELECT rowid, timestamp, kind, session_id, chain_id
+             FROM session_events
+             WHERE provider = ?1 AND source_key = ?2
+             ORDER BY timestamp, rowid",
+        )?;
+        let rows = statement.query_map(params![provider, source_key], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (rowid, timestamp, kind, session_id, chain_id) = row?;
+            if session_id != first_session_id || chain_id != first_chain_id {
+                return Err(runtime_backfill_sql_error(format!(
+                    "Runtime source {provider}/{source_key} changed identity during preparation"
+                )));
+            }
+            let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
+                continue;
+            };
+            let timestamp_ms = timestamp.timestamp_millis();
+            if timestamp_ms < 0 {
+                return Err(runtime_backfill_sql_error(format!(
+                    "Runtime event row {rowid} timestamp predates the Unix epoch"
+                )));
+            }
+            events.push(PersistedRuntimeEvent {
+                rowid,
+                timestamp_ms,
+                kind,
+            });
+        }
+
+        let mut rollups = BTreeMap::<i64, PreparedRuntimeHourlyRollup>::new();
+        let mut finalized_through_rowid = 0_i64;
+        let mut open_turn_started_ms = None;
+        if let Some(first) = events.first() {
+            let mut turn_start_ms = first.timestamp_ms;
+            let mut open_turn_min_rowid = first.rowid;
+            let mut previous = first;
+            for event in events.iter().skip(1) {
+                let gap_ms = event.timestamp_ms.saturating_sub(previous.timestamp_ms);
+                let is_tool_wait =
+                    previous.kind == "asst_tool_use" && event.kind == "user_tool_result";
+                let continues_turn = if is_tool_wait {
+                    gap_ms <= RUNTIME_TOOL_WAIT_MAX_MS
+                } else {
+                    gap_ms <= RUNTIME_IDLE_THRESHOLD_MS
+                };
+                if continues_turn {
+                    open_turn_min_rowid = open_turn_min_rowid.min(event.rowid);
+                } else {
+                    let turn_end_ms = if is_tool_wait {
+                        previous
+                            .timestamp_ms
+                            .saturating_add(gap_ms.min(RUNTIME_TOOL_WAIT_MAX_MS))
+                    } else {
+                        previous.timestamp_ms
+                    };
+                    if turn_end_ms > turn_start_ms {
+                        let hour_utc =
+                            turn_start_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+                        let rollup = rollups.entry(hour_utc).or_insert_with(|| {
+                            PreparedRuntimeHourlyRollup {
+                                hour_utc,
+                                turn_count: 0,
+                                runtime_millis: 0,
+                                first_turn_start_ms: turn_start_ms,
+                                last_turn_end_ms: turn_end_ms,
+                            }
+                        });
+                        rollup.turn_count = rollup.turn_count.checked_add(1).ok_or_else(|| {
+                            runtime_backfill_sql_error("Runtime backfill turn count overflowed")
+                        })?;
+                        rollup.runtime_millis = rollup
+                            .runtime_millis
+                            .checked_add(turn_end_ms - turn_start_ms)
+                            .ok_or_else(|| {
+                                runtime_backfill_sql_error("Runtime backfill duration overflowed")
+                            })?;
+                        rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
+                        rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
+                    }
+                    turn_start_ms = event.timestamp_ms;
+                    open_turn_min_rowid = event.rowid;
+                }
+                previous = event;
+            }
+            finalized_through_rowid = open_turn_min_rowid.saturating_sub(1).max(0);
+            open_turn_started_ms = Some(turn_start_ms);
+        }
+
+        Ok(Some(PreparedRuntimeBackfillSource {
+            provider,
+            source_key,
+            session_id: first_session_id,
+            chain_id: first_chain_id,
+            first_rowid,
+            last_rowid,
+            row_count,
+            content_sha256,
+            seen_generation,
+            rollups: rollups.into_values().collect(),
+            finalized_through_rowid,
+            open_turn_started_ms,
+        }))
+    }
+}
+
+impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
+    fn name(&self) -> &'static str {
+        "runtime"
+    }
+
+    fn load_state(&self, conn: &Connection) -> rusqlite::Result<RollupBackfillState> {
+        let (status, bookmark) = conn.query_row(
+            "SELECT runtime_backfill_status, runtime_backfill_done_through_rowid
+             FROM rollup_meta WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        let done_through = if status == "complete" {
+            conn.query_row(
+                "SELECT MAX(rowid) FROM session_events WHERE source_key IS NOT NULL",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+        } else {
+            bookmark
+        };
+        let rows_done = match done_through {
+            Some(rowid) => conn.query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE source_key IS NOT NULL AND rowid <= ?1",
+                params![rowid],
+                |row| row.get::<_, u64>(0),
+            )?,
+            None => 0,
+        };
+        Ok(RollupBackfillState {
+            rows_done,
+            done_through,
+        })
+    }
+
+    fn count_total_rows(&self, conn: &Connection) -> rusqlite::Result<u64> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE source_key IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    fn prepare_chunk(
+        &mut self,
+        conn: &Connection,
+        state: RollupBackfillState,
+    ) -> rusqlite::Result<()> {
+        self.prepared = Self::prepare_source_rollup(conn, state.done_through.unwrap_or(0))?;
+        Ok(())
+    }
+
+    fn fold_chunk(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        state: RollupBackfillState,
+        budget: RollupBackfillChunkBudget,
+    ) -> rusqlite::Result<RollupBackfillChunk> {
+        let reset_changed = if state.done_through.is_none() {
+            let deleted_rollups =
+                tx.execute("DELETE FROM runtime_hourly WHERE raw_pruned = 0", [])?;
+            let deleted_states = tx.execute("DELETE FROM runtime_turn_state", [])?;
+            deleted_rollups > 0 || deleted_states > 0
+        } else {
+            false
+        };
+        let Some(prepared) = self.prepared.take() else {
+            if reset_changed {
+                tx.execute(
+                    "UPDATE rollup_meta
+                     SET rollup_generation = rollup_generation + 1
+                     WHERE id = 1",
+                    [],
+                )?;
+            }
+            return Ok(RollupBackfillChunk {
+                rows_processed: 0,
+                done_through: state.done_through,
+                completed: true,
+            });
+        };
+
+        let current = tx.query_row(
+            "SELECT MIN(event.rowid), MAX(event.rowid), COUNT(*),
+                    MIN(event.session_id), MAX(event.session_id),
+                    MIN(event.chain_id), MAX(event.chain_id),
+                    source.content_sha256, source.seen_generation
+             FROM session_events AS event
+             JOIN transcript_analytics_sources AS source
+               ON source.provider = event.provider
+              AND source.source_key = event.source_key
+             WHERE event.provider = ?1 AND event.source_key = ?2",
+            params![prepared.provider, prepared.source_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            },
+        )?;
+        let fingerprint_matches = current.0 == prepared.first_rowid
+            && current.1 == prepared.last_rowid
+            && current.2 == prepared.row_count
+            && current.3 == prepared.session_id
+            && current.4 == prepared.session_id
+            && current.5 == prepared.chain_id
+            && current.6 == prepared.chain_id
+            && current.7 == prepared.content_sha256
+            && current.8 == prepared.seen_generation;
+        if !fingerprint_matches {
+            return Err(runtime_backfill_sql_error(format!(
+                "Runtime source {}/{} changed after preparation",
+                prepared.provider, prepared.source_key
+            )));
+        }
+
+        tx.execute(
+            "DELETE FROM runtime_hourly
+             WHERE provider = ?1 AND source_key = ?2 AND raw_pruned = 0",
+            params![prepared.provider, prepared.source_key],
+        )?;
+        tx.execute(
+            "DELETE FROM runtime_turn_state
+             WHERE provider = ?1 AND source_key = ?2",
+            params![prepared.provider, prepared.source_key],
+        )?;
+        for rollup in &prepared.rollups {
+            tx.execute(
+                "INSERT INTO runtime_hourly (
+                     hour_utc, provider, source_key, session_id, turn_count,
+                     runtime_secs, first_turn_start_ms, last_turn_end_ms,
+                     raw_pruned
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+                 ON CONFLICT(hour_utc, provider, source_key) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     turn_count = excluded.turn_count,
+                     runtime_secs = excluded.runtime_secs,
+                     first_turn_start_ms = excluded.first_turn_start_ms,
+                     last_turn_end_ms = excluded.last_turn_end_ms
+                 WHERE runtime_hourly.raw_pruned = 0",
+                params![
+                    rollup.hour_utc,
+                    prepared.provider,
+                    prepared.source_key,
+                    prepared.session_id,
+                    rollup.turn_count,
+                    rollup.runtime_millis as f64 / 1_000.0,
+                    rollup.first_turn_start_ms,
+                    rollup.last_turn_end_ms,
+                ],
+            )?;
+            if budget.should_yield() {
+                return Err(runtime_backfill_sql_error(format!(
+                    "Runtime source {}/{} compact commit exceeded 250 ms",
+                    prepared.provider, prepared.source_key
+                )));
+            }
+        }
+        if let Some(open_turn_started_ms) = prepared.open_turn_started_ms {
+            tx.execute(
+                "INSERT INTO runtime_turn_state (
+                     provider, source_key, finalized_through_rowid,
+                     open_turn_started_ms
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    prepared.provider,
+                    prepared.source_key,
+                    prepared.finalized_through_rowid,
+                    open_turn_started_ms,
+                ],
+            )?;
+        }
+        let updated = tx.execute(
+            "UPDATE rollup_meta
+             SET rollup_generation = rollup_generation + 1
+             WHERE id = 1",
+            [],
+        )?;
+        if updated != 1 {
+            return Err(runtime_backfill_sql_error(
+                "Runtime rollup metadata singleton is missing",
+            ));
+        }
+        if budget.should_yield() {
+            return Err(runtime_backfill_sql_error(format!(
+                "Runtime source {}/{} compact commit exceeded 250 ms",
+                prepared.provider, prepared.source_key
+            )));
+        }
+        let completed = !tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM session_events
+                 WHERE source_key IS NOT NULL AND rowid > ?1
+             )",
+            params![prepared.last_rowid],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(RollupBackfillChunk {
+            rows_processed: prepared.row_count,
+            done_through: Some(prepared.last_rowid),
+            completed,
+        })
+    }
+
+    fn persist_chunk(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        state: RollupBackfillState,
+        completed: bool,
+    ) -> rusqlite::Result<()> {
+        let updated = tx.execute(
+            "UPDATE rollup_meta
+             SET runtime_backfill_status = ?1,
+                 runtime_backfill_done_through_rowid = ?2
+             WHERE id = 1",
+            params![
+                if completed { "complete" } else { "running" },
+                if completed { None } else { state.done_through },
+            ],
+        )?;
+        if updated != 1 {
+            return Err(runtime_backfill_sql_error(
+                "Runtime rollup metadata singleton is missing",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn completed_runtime_rollup_stats(
+    conn: &Connection,
+    from: DateTime<Utc>,
+    now: DateTime<Utc>,
+    parent_only: bool,
+) -> Result<Option<LlmRuntimeStats>, String> {
+    let complete = conn
+        .query_row(
+            "SELECT runtime_backfill_status = 'complete'
+             FROM rollup_meta WHERE id = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("Read runtime backfill status: {error}"))?;
+    if !complete {
+        return Ok(None);
+    }
+
+    let range_secs = (now - from).num_seconds() as f64;
+    let bucket_secs = range_secs / 7.0;
+    let from_epoch_ms = from.timestamp_millis() as f64;
+    let window_start_ms =
+        from.timestamp_millis().div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+    let mut total_runtime_secs = 0.0_f64;
+    let mut turn_count = 0_i64;
+    let mut sessions = HashSet::<(String, String)>::new();
+    let mut bucket_sums = [0.0_f64; 7];
+
+    let rollup_sql = format!(
+        "SELECT rollup.hour_utc, rollup.provider, rollup.session_id,
+                rollup.turn_count, rollup.runtime_secs
+         FROM runtime_hourly AS rollup
+         JOIN transcript_analytics_sources AS source
+           ON source.provider = rollup.provider
+          AND source.source_key = rollup.source_key
+         WHERE rollup.hour_utc >= ?1
+           AND {ACTIVE_RUNTIME_SOURCE_PREDICATE}{}",
+        if parent_only {
+            " AND source.is_sidechain = 0"
+        } else {
+            ""
+        }
+    );
+    {
+        let mut statement = conn
+            .prepare(&rollup_sql)
+            .map_err(|error| format!("Prepare runtime rollup query: {error}"))?;
+        let rows = statement
+            .query_map(params![window_start_ms], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, f64>(4)?,
+                ))
+            })
+            .map_err(|error| format!("Query runtime rollups: {error}"))?;
+        for row in rows {
+            let (hour_utc, provider, session_id, turns, runtime_secs) =
+                row.map_err(|error| format!("Read runtime rollup: {error}"))?;
+            total_runtime_secs += runtime_secs;
+            turn_count = turn_count
+                .checked_add(turns)
+                .ok_or_else(|| "Runtime rollup turn count overflowed".to_string())?;
+            sessions.insert((provider, session_id));
+            let bucket =
+                ((((hour_utc as f64 - from_epoch_ms) / 1_000.0) / bucket_secs).max(0.0)) as usize;
+            bucket_sums[bucket.min(6)] += runtime_secs;
+        }
+    }
+
+    let tail_sql = format!(
+        "SELECT state.open_turn_started_ms, source.provider,
+                source.analytics_session_id,
+                (
+                    SELECT event.timestamp || char(31) || event.kind
+                    FROM session_events AS event
+                         INDEXED BY idx_se_provider_chain_timestamp
+                    WHERE event.provider = source.provider
+                      AND event.chain_id = source.chain_id
+                      AND event.source_key = source.source_key
+                      AND event.rowid > state.finalized_through_rowid
+                    ORDER BY event.timestamp DESC, event.rowid DESC
+                    LIMIT 1
+                )
+         FROM runtime_turn_state AS state
+         JOIN transcript_analytics_sources AS source
+           ON source.provider = state.provider
+          AND source.source_key = state.source_key
+         WHERE state.open_turn_started_ms >= ?1
+           AND {ACTIVE_RUNTIME_SOURCE_PREDICATE}{}",
+        if parent_only {
+            " AND source.is_sidechain = 0"
+        } else {
+            ""
+        }
+    );
+    let mut statement = conn
+        .prepare(&tail_sql)
+        .map_err(|error| format!("Prepare runtime open-tail query: {error}"))?;
+    let rows = statement
+        .query_map(params![window_start_ms], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|error| format!("Query runtime open tail: {error}"))?;
+    for row in rows {
+        let (turn_start_ms, provider, session_id, packed_last_event) =
+            row.map_err(|error| format!("Read runtime open-tail row: {error}"))?;
+        let Some(packed_last_event) = packed_last_event else {
+            continue;
+        };
+        let Some((timestamp, kind)) = packed_last_event.split_once('\u{1f}') else {
+            return Err("Runtime open-tail row has an invalid packed event".to_string());
+        };
+        let timestamp = DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|error| format!("Parse runtime open-tail timestamp: {error}"))?;
+        let last_event_ms = timestamp.timestamp_millis();
+        let end_ms = if kind == "asst_tool_use" {
+            now.timestamp_millis()
+                .min(last_event_ms.saturating_add(RUNTIME_TOOL_WAIT_MAX_MS))
+        } else {
+            last_event_ms
+        };
+        let duration = end_ms.saturating_sub(turn_start_ms) as f64 / 1_000.0;
+        sessions.insert((provider, session_id));
+        if duration > 0.0 {
+            total_runtime_secs += duration;
+            turn_count += 1;
+            let bucket = ((((turn_start_ms as f64 - from_epoch_ms) / 1_000.0) / bucket_secs)
+                .max(0.0)) as usize;
+            bucket_sums[bucket.min(6)] += duration;
+        }
+    }
+    let avg_per_turn_secs = if turn_count > 0 {
+        total_runtime_secs / turn_count as f64
+    } else {
+        0.0
+    };
+    Ok(Some(LlmRuntimeStats {
+        total_runtime_secs,
+        turn_count,
+        session_count: sessions.len() as i64,
+        avg_per_turn_secs,
+        sparkline: bucket_sums.to_vec(),
+    }))
 }
 
 /// Delete every stale source owned by one completed root and its children.
@@ -6803,6 +7438,54 @@ impl Storage {
         }
 
         Ok(storage)
+    }
+
+    /// Run or resume the runtime rollup's first-install backfill.
+    ///
+    /// A dedicated writer connection lets the shared runner release the ingest
+    /// gate between chunks without retaining the primary connection mutex.
+    pub(crate) fn run_runtime_rollup_backfill(&self) -> Result<RollupBackfillReport, String> {
+        self.run_runtime_rollup_backfill_with_controls(&RollupBackfillControls::default())
+    }
+
+    fn run_runtime_rollup_backfill_with_controls(
+        &self,
+        controls: &RollupBackfillControls<'_>,
+    ) -> Result<RollupBackfillReport, String> {
+        let mut conn = Connection::open(&self.db_path)
+            .map_err(|error| format!("Open runtime backfill writer: {error}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Configure runtime backfill timeout: {error}"))?;
+        let mut target = RuntimeRollupBackfillTarget::default();
+        let result = run_rollup_backfill(&mut conn, &self.db_path, &mut target, controls);
+        match result {
+            Ok(report) => {
+                if matches!(report.terminal, RollupBackfillTerminal::Error(_)) {
+                    conn.execute(
+                        "UPDATE rollup_meta
+                         SET runtime_backfill_status = 'failed'
+                         WHERE id = 1",
+                        [],
+                    )
+                    .map_err(|error| format!("Mark runtime backfill failed: {error}"))?;
+                }
+                Ok(report)
+            }
+            Err(error) => {
+                conn.execute(
+                    "UPDATE rollup_meta
+                     SET runtime_backfill_status = 'failed'
+                     WHERE id = 1",
+                    [],
+                )
+                .map_err(|status_error| {
+                    format!(
+                        "Runtime backfill failed ({error}); marking it failed also failed: {status_error}"
+                    )
+                })?;
+                Err(format!("Runtime backfill failed: {error}"))
+            }
+        }
     }
 
     /// Open an independent read-only connection for the two Models overview
@@ -18372,6 +19055,10 @@ impl Storage {
         let from_str = from.to_rfc3339();
         let parent_only = matches!(scope, Some("parent_only"));
 
+        if let Some(stats) = completed_runtime_rollup_stats(&conn, from, now, parent_only)? {
+            return Ok(stats);
+        }
+
         let range_secs = range_to_duration(range).num_seconds() as f64;
         let bucket_secs = range_secs / 7.0;
         let from_epoch_ms = from.timestamp_millis() as f64;
@@ -18521,11 +19208,10 @@ impl Storage {
                         // threshold: end the current turn at prev_ms and
                         // begin a new one at the current row.
                         let clamped_end_ms = if is_tool_loop_gap {
-                            // STAT-4 / R-B: realize up to the ceiling so
-                            // the long wait still contributes its bounded
-                            // share, but never past `now` — we cannot
-                            // credit wall-clock time that has not elapsed.
-                            (prev_ms + TOOL_WAIT_MAX_SECS * 1000.0).min(now_ms)
+                            // Closed tool waits are a pure function of the two
+                            // persisted events. Only the trailing open tool
+                            // wait below depends on the pinned/current clock.
+                            prev_ms + TOOL_WAIT_MAX_SECS * 1000.0
                         } else {
                             prev_ms
                         };
@@ -18547,9 +19233,14 @@ impl Storage {
                 prev_kind = Some(kind);
             }
             if cur_provider.is_some() {
+                let open_end_ms = if prev_kind.as_deref() == Some("asst_tool_use") {
+                    (prev_ms + TOOL_WAIT_MAX_SECS * 1000.0).min(now_ms)
+                } else {
+                    prev_ms
+                };
                 flush_turn(
                     turn_start_ms,
-                    prev_ms,
+                    open_end_ms,
                     &mut total_runtime_secs,
                     &mut turn_count,
                     &mut bucket_sums,
@@ -26776,6 +27467,496 @@ mod tests {
             .expect("query runtime rollup rows")
             .collect::<Result<Vec<_>, _>>()
             .expect("collect runtime rollup rows")
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Backfill Empty Completion]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_completes_empty_database_immediately() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        let report = storage
+            .run_runtime_rollup_backfill()
+            .expect("empty runtime backfill");
+        assert_eq!(report.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(report.progress.rows_done, 0);
+        assert_eq!(report.progress.rows_total, 0);
+        let conn = storage.conn.lock();
+        assert_eq!(
+            conn.query_row(
+                "SELECT runtime_backfill_status,
+                        runtime_backfill_done_through_rowid
+                 FROM rollup_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .expect("read empty runtime backfill state"),
+            ("complete".to_string(), None)
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Backfill Chunk Resume]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_prepares_oversized_sources_and_resumes_exactly() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+        let user = crate::sessions::SessionEventKind::UserText;
+        let assistant = crate::sessions::SessionEventKind::AsstText;
+        let tool_use = crate::sessions::SessionEventKind::AsstToolUse;
+        let tool_result = crate::sessions::SessionEventKind::UserToolResult;
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-backfill",
+            source_key: "runtime-backfill-source",
+            session_id: "runtime-backfill-session",
+            generation: 1,
+            marker: "runtime-backfill",
+            rows: 0,
+        };
+        let events = vec![
+            (at(0), user),
+            (at(60), assistant),
+            (at(660), user),
+            (at(720), tool_use),
+            (at(7_920), tool_result),
+            (at(8_520), user),
+            (at(10_500), tool_use),
+            (at(35_700), tool_result),
+            (at(36_300), user),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed oversized runtime source");
+        let second_spec = TranscriptSourceSpec {
+            source_key: "runtime-backfill-source-2",
+            session_id: "runtime-backfill-session-2",
+            marker: "runtime-backfill-2",
+            ..spec
+        };
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&second_spec, &events))
+            .expect("seed second oversized runtime source");
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "INSERT INTO runtime_hourly (
+                     hour_utc, provider, source_key, session_id, turn_count,
+                     runtime_secs, first_turn_start_ms, last_turn_end_ms,
+                     raw_pruned
+                 ) VALUES (0, 'claude', ?1, ?2, 1, 5.0, 1, 5001, 1)",
+                params![spec.source_key, spec.session_id],
+            )
+            .expect("seed authoritative pruned runtime row");
+        }
+
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let controls = RollupBackfillControls {
+            chunk_rows: 3,
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        let mut previous_rows = 0_u64;
+        let mut chunk_millis = Vec::new();
+        loop {
+            let started = Instant::now();
+            let report = storage
+                .run_runtime_rollup_backfill_with_controls(&controls)
+                .expect("run bounded runtime backfill chunk");
+            chunk_millis.push(started.elapsed().as_secs_f64() * 1_000.0);
+            let delta = report.progress.rows_done - previous_rows;
+            assert_eq!(
+                delta,
+                events.len() as u64,
+                "one prepared source commits per chunk"
+            );
+            previous_rows = report.progress.rows_done;
+            if report.terminal == RollupBackfillTerminal::Completed {
+                break;
+            }
+            assert_eq!(report.terminal, RollupBackfillTerminal::Interrupted);
+        }
+        let max_chunk_ms = chunk_millis.into_iter().fold(0.0_f64, f64::max);
+        eprintln!("runtime_backfill.max_observed_chunk_ms={max_chunk_ms:.3}");
+        assert_eq!(previous_rows, (events.len() * 2) as u64);
+        assert_eq!(
+            runtime_rollup_rows(&storage, spec.source_key),
+            vec![
+                (0, 1, 5.0, 1, 5001),
+                (
+                    DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z")
+                        .expect("first hour")
+                        .timestamp_millis(),
+                    2,
+                    7_320.0,
+                    base.timestamp_millis(),
+                    base.timestamp_millis() + 7_920_000,
+                ),
+                (
+                    DateTime::parse_from_rfc3339("2026-07-30T13:00:00Z")
+                        .expect("tool hour")
+                        .timestamp_millis(),
+                    1,
+                    21_600.0,
+                    base.timestamp_millis() + 10_500_000,
+                    base.timestamp_millis() + 32_100_000,
+                ),
+            ]
+        );
+        let conn = storage.conn.lock();
+        assert_eq!(
+            conn.query_row(
+                "SELECT runtime_backfill_status FROM rollup_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read completed status"),
+            "complete"
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Backfill Live Replacement Handoff]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_absorbs_replacement_committed_between_chunks() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+        let user = crate::sessions::SessionEventKind::UserText;
+        let assistant = crate::sessions::SessionEventKind::AsstText;
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-handoff",
+            source_key: "runtime-handoff-source",
+            session_id: "runtime-handoff-session",
+            generation: 1,
+            marker: "runtime-handoff-v1",
+            rows: 0,
+        };
+        let original = vec![
+            (at(0), user),
+            (at(60), assistant),
+            (at(660), user),
+            (at(720), assistant),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &original))
+            .expect("seed original runtime source");
+        let second_spec = TranscriptSourceSpec {
+            source_key: "runtime-handoff-source-2",
+            session_id: "runtime-handoff-session-2",
+            marker: "runtime-handoff-second",
+            ..spec
+        };
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&second_spec, &original))
+            .expect("seed second runtime source");
+
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let controls = RollupBackfillControls {
+            chunk_rows: 2,
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        let first = storage
+            .run_runtime_rollup_backfill_with_controls(&controls)
+            .expect("interrupt initial runtime chunk");
+        assert_eq!(first.terminal, RollupBackfillTerminal::Interrupted);
+
+        let replacement_spec = TranscriptSourceSpec {
+            marker: "runtime-handoff-v2",
+            ..spec
+        };
+        let replacement = vec![(at(0), user), (at(20), assistant), (at(620), user)];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(
+                &replacement_spec,
+                &replacement,
+            ))
+            .expect("replace source while runtime backfill is running");
+        let expected = vec![(
+            DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z")
+                .expect("replacement hour")
+                .timestamp_millis(),
+            1,
+            20.0,
+            base.timestamp_millis(),
+            base.timestamp_millis() + 20_000,
+        )];
+        assert_eq!(runtime_rollup_rows(&storage, spec.source_key), expected);
+        storage
+            .run_runtime_rollup_backfill()
+            .expect("resume after live replacement");
+        assert_eq!(
+            runtime_rollup_rows(&storage, spec.source_key),
+            expected,
+            "resume must not double-fold a source already refolded by live ingest"
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Nonmonotonic Runtime Source Preparation]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_sorts_nonmonotonic_source_before_compact_commit() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-nonmonotonic",
+            source_key: "runtime-nonmonotonic-source",
+            session_id: "runtime-nonmonotonic-session",
+            generation: 1,
+            marker: "runtime-nonmonotonic",
+            rows: 0,
+        };
+        let events = vec![
+            (at(660), crate::sessions::SessionEventKind::UserText),
+            (at(0), crate::sessions::SessionEventKind::UserText),
+            (at(60), crate::sessions::SessionEventKind::AsstText),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed nonmonotonic source");
+        storage
+            .run_runtime_rollup_backfill()
+            .expect("backfill nonmonotonic source");
+        assert_eq!(
+            runtime_rollup_rows(&storage, spec.source_key),
+            vec![(
+                DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z")
+                    .expect("runtime hour")
+                    .timestamp_millis(),
+                1,
+                60.0,
+                base.timestamp_millis(),
+                base.timestamp_millis() + 60_000,
+            )]
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Prepared Runtime Source Revalidation]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_rejects_source_changed_after_preparation() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-revalidate",
+            source_key: "runtime-revalidate-source",
+            session_id: "runtime-revalidate-session",
+            generation: 1,
+            marker: "runtime-revalidate",
+            rows: 0,
+        };
+        let events = vec![
+            (at(0), crate::sessions::SessionEventKind::UserText),
+            (at(60), crate::sessions::SessionEventKind::AsstText),
+            (at(660), crate::sessions::SessionEventKind::UserText),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed source for revalidation");
+        let before = runtime_rollup_rows(&storage, spec.source_key);
+
+        let mut conn = Connection::open(&storage.db_path).expect("open backfill writer");
+        let mut target = RuntimeRollupBackfillTarget::default();
+        let state = target.load_state(&conn).expect("load pending state");
+        target
+            .prepare_chunk(&conn, state)
+            .expect("prepare runtime source");
+        conn.execute(
+            "UPDATE transcript_analytics_sources
+             SET content_sha256 = 'changed-after-prepare'
+             WHERE provider = 'claude' AND source_key = ?1",
+            params![spec.source_key],
+        )
+        .expect("mutate prepared fingerprint");
+        let tx = conn.transaction().expect("begin revalidation transaction");
+        let error = target
+            .fold_chunk(
+                &tx,
+                state,
+                RollupBackfillChunkBudget {
+                    max_rows: 3,
+                    deadline: Instant::now() + Duration::from_millis(250),
+                },
+            )
+            .expect_err("changed source must be rejected");
+        assert!(error.to_string().contains("changed after preparation"));
+        drop(tx);
+        assert_eq!(
+            runtime_rollup_rows(&storage, spec.source_key),
+            before,
+            "failed revalidation must roll back the reconciliation reset"
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Hybrid Runtime Read And Indexed Open Tail]]
+    #[test]
+    #[serial]
+    fn runtime_hybrid_matches_reference_and_tail_uses_timestamp_index() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let pinned_now = base + chrono::Duration::seconds(10_800);
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+        let user = crate::sessions::SessionEventKind::UserText;
+        let assistant = crate::sessions::SessionEventKind::AsstText;
+        let tool_use = crate::sessions::SessionEventKind::AsstToolUse;
+        let tool_result = crate::sessions::SessionEventKind::UserToolResult;
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-hybrid",
+            source_key: "runtime-hybrid-source",
+            session_id: "runtime-hybrid-session",
+            generation: 1,
+            marker: "runtime-hybrid",
+            rows: 0,
+        };
+        let events = vec![
+            (at(0), user),
+            (at(60), assistant),
+            (at(660), user),
+            (at(720), tool_use),
+            (at(7_920), tool_result),
+            (at(8_520), user),
+            (at(10_500), tool_use),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed hybrid runtime source");
+        let reference = with_pinned_query_now(pinned_now.with_timezone(&Utc), || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("raw runtime reference")
+        });
+        eprintln!("runtime_reference={reference:?}");
+        assert_eq!(reference.turn_count, 3);
+        assert!((reference.total_runtime_secs - 7_620.0).abs() < 1e-6);
+
+        storage
+            .run_runtime_rollup_backfill()
+            .expect("complete runtime backfill");
+        let hybrid = with_pinned_query_now(pinned_now.with_timezone(&Utc), || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("hybrid runtime stats")
+        });
+        assert!((hybrid.total_runtime_secs - reference.total_runtime_secs).abs() < 1e-6);
+        assert_eq!(hybrid.turn_count, reference.turn_count);
+        assert_eq!(hybrid.session_count, reference.session_count);
+        assert!((hybrid.avg_per_turn_secs - reference.avg_per_turn_secs).abs() < 1e-6);
+        assert_eq!(hybrid.sparkline, reference.sparkline);
+
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE transcript_analytics_sources
+                 SET processing_status = 'suppressed', suppressed_sha256 = 'hidden'
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![spec.source_key],
+            )
+            .expect("suppress runtime source");
+        }
+        let suppressed = with_pinned_query_now(pinned_now.with_timezone(&Utc), || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("suppressed runtime stats")
+        });
+        assert_eq!(suppressed.turn_count, 0);
+        assert_eq!(suppressed.session_count, 0);
+        assert_eq!(suppressed.total_runtime_secs, 0.0);
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE transcript_analytics_sources
+                 SET processing_status = 'ok', suppressed_sha256 = NULL
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![spec.source_key],
+            )
+            .expect("restore runtime source");
+        }
+
+        let conn = storage.conn.lock();
+        let tail_rows = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM session_events AS event
+                 JOIN runtime_turn_state AS state
+                   ON state.provider = event.provider
+                  AND state.source_key = event.source_key
+                 WHERE event.rowid > state.finalized_through_rowid",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count open-tail rows");
+        assert_eq!(tail_rows, 1);
+        let mut explain = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT state.open_turn_started_ms, source.provider,
+                        source.analytics_session_id,
+                        (
+                            SELECT event.timestamp || char(31) || event.kind
+                            FROM session_events AS event
+                                 INDEXED BY idx_se_provider_chain_timestamp
+                            WHERE event.provider = source.provider
+                              AND event.chain_id = source.chain_id
+                              AND event.source_key = source.source_key
+                              AND event.rowid > state.finalized_through_rowid
+                            ORDER BY event.timestamp DESC, event.rowid DESC
+                            LIMIT 1
+                        )
+                 FROM runtime_turn_state AS state
+                 JOIN transcript_analytics_sources AS source
+                   ON source.provider = state.provider
+                  AND source.source_key = state.source_key
+                 WHERE state.open_turn_started_ms >= ?1
+                   AND source.processing_status != 'suppressed'
+                   AND source.suppressed_sha256 IS NULL",
+            )
+            .expect("prepare open-tail explain");
+        let details = explain
+            .query_map(params![base.timestamp_millis()], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query open-tail explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect open-tail explain");
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("idx_se_provider_chain_timestamp")
+                    && detail.contains("provider=? AND chain_id=?")
+            }),
+            "open-tail plan must seek once per native chain: {details:?}"
+        );
+        eprintln!("runtime_tail.rows={tail_rows}");
+        eprintln!("runtime_tail.plan={details:?}");
+        clear_env();
     }
 
     // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Logical Turn Finalization And Source Refold]]

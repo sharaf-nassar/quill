@@ -17,3 +17,27 @@ The fixture covers 5-minute continuity, ordinary idle closure, tool waits below 
 Runtime finalization and folding must add no more than 10% p95 latency to representative burst-shaped session-event replacement batches.
 
 The ignored release benchmark times 25 replacements of one 6,000-event batch against the identical production transaction with only runtime folding disabled; parsing, setup, and warm-up remain outside timing.
+
+## Runtime Backfill Empty Completion
+
+An empty runtime source set must complete in one terminal shared-runner chunk and leave no misleading bookmark.
+
+## Runtime Backfill Chunk Resume
+
+A source larger than the row target must prepare outside the permit, commit compact state within the transaction deadline, resume by source-end bookmark, and preserve pruned authority exactly.
+
+## Runtime Backfill Live Replacement Handoff
+
+A source replaced between chunks must remain exact even when SQLite reuses rowids, with the resumed pass recognizing rather than duplicating the live refold.
+
+## Nonmonotonic Runtime Source Preparation
+
+Backfill must sort a source's persisted events before folding because its contiguous rowid block does not guarantee timestamp order.
+
+## Prepared Runtime Source Revalidation
+
+A source changed after off-permit preparation must fail revalidation and roll back every staged reconciliation write and bookmark change.
+
+## Hybrid Runtime Read And Indexed Open Tail
+
+Completed reads must match the time-invariant raw reference while scanning only each active source's open rows through the timestamp-leading runtime index.
