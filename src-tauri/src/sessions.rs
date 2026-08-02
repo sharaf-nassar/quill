@@ -350,14 +350,14 @@ pub(crate) fn enumerate_codex_retained_jsonl_source_root() -> ProviderSourceRoot
     )
 }
 
-/// Admit every retained transcript discovered during a Session Search scan to
-/// the independent model-source reconciliation queue.
+/// Admit every retained transcript to the independent model-source
+/// reconciliation queue.
 ///
-/// Enumeration and admission deliberately happen outside `IndexState` so an
-/// unchanged search mtime, empty search extraction, or later scan failure
-/// cannot suppress provider-qualified model evidence. The queue performs the
-/// blocking fingerprint/read work and preserves each source's owning root.
-fn enqueue_startup_model_source_reconciliation(app_handle: &tauri::AppHandle) {
+/// App startup and Session Search scans both use this boundary so a completed
+/// one-time backfill does not leave later retained files dependent on opening
+/// Search. Enumeration and admission happen outside `IndexState`; the queue
+/// performs blocking fingerprint/read work and preserves source identity.
+pub(crate) fn enqueue_startup_model_source_reconciliation(app_handle: &tauri::AppHandle) {
     for root in enumerate_retained_jsonl_source_roots() {
         if let ProviderRootEnumerationOutcome::Failed { diagnostic } = &root.outcome {
             log::warn!(

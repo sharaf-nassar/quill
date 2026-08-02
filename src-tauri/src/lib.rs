@@ -622,15 +622,27 @@ fn spawn_startup_transcript_analytics_reconciliation(app: tauri::AppHandle) {
     });
 }
 
+/// Re-admit retained model sources after runner state is available.
+///
+/// The durable backfill is intentionally one-shot. This independent startup
+/// inventory recovers sources retained after it completed without requiring
+/// the user to open Session Search, while the live queue keeps repeat
+/// discoveries source-key coalesced.
+fn spawn_startup_model_source_reconciliation(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        sessions::enqueue_startup_model_source_reconciliation(&app);
+    });
+}
+
 /// Periodically rescan both transcript roots and feed changed sources into the
-/// same live-reconcile queue the notify hook uses.
+/// same live-reconcile queues the notify hook uses.
 ///
 /// Live coverage no longer depends solely on the per-session notify hook: a
 /// session created after startup whose hook never fires (e.g. a long-running
 /// orchestrator mid-turn) is still ingested. Each tick enumerates candidates
 /// and enqueues only those whose mtime advanced past the previous tick's
-/// watermark; the queue's freshness classifier turns an unchanged source into a
-/// cheap stat-only no-op, so occasional over-enqueueing never re-parses a file.
+/// watermark. Both analytics queues retain their own source-key coalescing and
+/// freshness behavior, so occasional over-enqueueing stays cheap.
 fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         // Seed the watermark with startup time so the first tick does not redo
@@ -696,8 +708,11 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
                 }
             }
             for source in changed {
+                if let Err(error) = enqueue_model_usage_live_source(&app, source.clone()) {
+                    log::warn!("Transcript rescan failed to enqueue model source: {error}");
+                }
                 if let Err(error) = enqueue_transcript_analytics_live_source(&app, source) {
-                    log::warn!("Transcript rescan failed to enqueue source: {error}");
+                    log::warn!("Transcript rescan failed to enqueue analytics source: {error}");
                 }
             }
             log::info!(
@@ -5599,6 +5614,10 @@ pub fn run() {
                     log::error!("Could not resume interrupted model history backfill: {error}");
                 }
             }
+            // Re-admit the current retained inventory even when migration 28's
+            // one-time backfill is already complete. This is separate from
+            // Session Search startup and runs off the setup thread.
+            spawn_startup_model_source_reconciliation(app.handle().clone());
 
             // Initialize session search index first (shared with HTTP server)
             let session_index: Option<Arc<sessions::SessionIndex>> = {
