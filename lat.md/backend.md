@@ -1084,6 +1084,26 @@ Completed model reads use hourly rows for decomposable facets: represented provi
 
 Three facets need narrower handling because migration 37 omits their full grain. Activity/history use a rollup hour only when that whole UTC hour fits one existing response bucket; an hour crossing a sliding bucket boundary stays on a grouped raw query. Project labels overlay a focused latest-cwd raw query on source-cwd rollup fallback. Running-now uses indexed raw turn order because contiguous order and previous-model identity cannot be reconstructed from per-model hourly bounds. These exceptions do not rematerialize closed historical observations in the overview temp table.
 
+##### Chunked Rollup Backfill Framework
+
+[[src-tauri/src/rollup_backfill.rs#run_rollup_backfill]] safely drives target-specific model and runtime folds without owning either rollup's SQL or exposing a command surface.
+
+Each chunk receives a 250 ms ceiling and row limit, runs its fold plus durable bookmark update in one immediate transaction under the shared ingest permit, then releases the permit before `wal_checkpoint(TRUNCATE)`. A disk preflight precedes every chunk.
+
+Checkpoint busy/failure and unreadable or insufficient disk space stop as typed terminal errors. A committed bookmark remains resumable if its following checkpoint fails; unexpected target SQL and invariant failures bubble to the caller.
+
+###### Backfill Interrupt And Exact Resume
+
+An interruption after a committed chunk must resume strictly after its atomic bookmark, producing every source row exactly once without a duplicate or gap.
+
+###### Maintenance Lease Acquires Between Chunks
+
+A queued maintenance writer must acquire the fair ingest gate within one 250 ms chunk bound, and the backfill must remain yielded until that lease releases.
+
+###### Disk And Checkpoint Failures Stop Safely
+
+Disk refusal must advance no bookmark, while checkpoint busy or failure must stop with a typed terminal and preserve the already committed bookmark for exact resume.
+
 ##### Rollup Migration Test Specs
 
 Migration tests pin the additive schema boundary before fold and backfill behavior lands.

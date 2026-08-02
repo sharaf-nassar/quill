@@ -535,7 +535,7 @@ pub struct RetentionDeletePhaseReport {
 
 /// Free bytes on the filesystem holding `path`.
 #[cfg(unix)]
-fn available_disk_space(path: &Path) -> Result<u64, String> {
+pub(crate) fn available_disk_space(path: &Path) -> Result<u64, String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -560,7 +560,7 @@ fn available_disk_space(path: &Path) -> Result<u64, String> {
 }
 
 #[cfg(not(unix))]
-fn available_disk_space(_path: &Path) -> Result<u64, String> {
+pub(crate) fn available_disk_space(_path: &Path) -> Result<u64, String> {
     Err("The retention delete-phase preflight is unavailable on this platform".to_string())
 }
 

@@ -41,6 +41,8 @@ pub mod retention_fixture;
 /// Maintainer-only retention corpus protocol. This is intentionally a Cargo
 /// binary support module, not a Tauri, IPC, or supported-CLI surface.
 pub mod retention_study;
+/// Shared bounded runner for resumable hourly-rollup backfills.
+mod rollup_backfill;
 mod rule_watcher;
 mod server;
 pub(crate) mod sessions;
