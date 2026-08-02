@@ -202,6 +202,22 @@ not table-scan for the doomed set — the planner walks the partial unique index
 it, measured against a same-corpus control that cancels page-cache bias.
 Full numbers live in `specs/014-retention-pruning/retention-timing-spike.md`.
 
+### Widget query benchmark corpus
+
+[[src-tauri/src/bin/widget_query_perf_spike.rs]] freezes and measures the
+production-size corpus used for feature 020's reproducible widget-query A/B
+evidence.
+
+`freeze` reads a live WAL-backed database through SQLite's online backup API,
+refuses to overwrite an existing destination, validates the resulting snapshot,
+and makes it read-only. `measure` rejects writable corpora, opens a fresh
+read-only storage handle for every call to bypass app caches, and pins all 24h,
+30d, and 90d windows to one thread-local endpoint. It retains the real storage
+SQL and Rust post-processing while never running migrations, cleanup, or
+retention against the corpus. The database remains local and untracked; only
+its path, hash, endpoints, protocol, and timing table are committed in
+`specs/020-widget-query-perf/timing-measurement.md`.
+
 ### Database compaction
 
 [[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.

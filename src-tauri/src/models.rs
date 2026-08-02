@@ -1259,6 +1259,8 @@ pub enum ModelRange {
     SevenDays,
     #[serde(rename = "30d")]
     ThirtyDays,
+    #[serde(rename = "90d")]
+    NinetyDays,
 }
 
 impl ModelRange {
@@ -1269,6 +1271,7 @@ impl ModelRange {
             Self::TwentyFourHours => "24h",
             Self::SevenDays => "7d",
             Self::ThirtyDays => "30d",
+            Self::NinetyDays => "90d",
         }
     }
 }
@@ -1283,9 +1286,10 @@ impl TryFrom<&str> for ModelRange {
             "24h" => Ok(Self::TwentyFourHours),
             "7d" => Ok(Self::SevenDays),
             "30d" => Ok(Self::ThirtyDays),
+            "90d" => Ok(Self::NinetyDays),
             _ => Err(ModelAnalyticsError::new(
                 ModelAnalyticsErrorCode::InvalidRange,
-                "Range must be one of 1h, 6h, 24h, 7d, or 30d.",
+                "Range must be one of 1h, 6h, 24h, 7d, 30d, or 90d.",
             )),
         }
     }

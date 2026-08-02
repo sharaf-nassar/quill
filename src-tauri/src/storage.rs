@@ -1288,8 +1288,41 @@ fn range_to_duration(range: &str) -> TimeDelta {
         // resolves through the same helper instead of a private duration.
         "14d" => TimeDelta::days(14),
         "30d" => TimeDelta::days(30),
+        "90d" => TimeDelta::days(90),
         _ => TimeDelta::hours(24),
     }
+}
+
+thread_local! {
+    /// Maintainer-study clock override. Production never sets this value.
+    static PINNED_QUERY_NOW: std::cell::RefCell<Option<DateTime<Utc>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn query_now() -> DateTime<Utc> {
+    PINNED_QUERY_NOW
+        .with(|slot| *slot.borrow())
+        .unwrap_or_else(Utc::now)
+}
+
+/// Run one synchronous maintainer study with stable range endpoints.
+///
+/// The override is thread-local and restored even if `operation` unwinds, so
+/// production callers on other threads continue to use the wall clock.
+pub(crate) fn with_pinned_query_now<T>(now: DateTime<Utc>, operation: impl FnOnce() -> T) -> T {
+    struct RestorePinnedNow(Option<DateTime<Utc>>);
+
+    impl Drop for RestorePinnedNow {
+        fn drop(&mut self) {
+            PINNED_QUERY_NOW.with(|slot| {
+                slot.replace(self.0);
+            });
+        }
+    }
+
+    let previous = PINNED_QUERY_NOW.with(|slot| slot.replace(Some(now)));
+    let _restore = RestorePinnedNow(previous);
+    operation()
 }
 
 /// Inclusive lower bound of a range-scoped query as an RFC 3339 string.
@@ -1304,7 +1337,7 @@ fn range_from_timestamp(range: &str) -> String {
         return "1970-01-01T00:00:00Z".to_string();
     }
 
-    (Utc::now() - range_to_duration(range)).to_rfc3339()
+    (query_now() - range_to_duration(range)).to_rfc3339()
 }
 
 /// Bucket count used when a caller does not ask for one — the widget's
@@ -3020,6 +3053,7 @@ fn model_range_duration(range: ModelRange) -> TimeDelta {
         ModelRange::TwentyFourHours => TimeDelta::hours(24),
         ModelRange::SevenDays => TimeDelta::days(7),
         ModelRange::ThirtyDays => TimeDelta::days(30),
+        ModelRange::NinetyDays => TimeDelta::days(90),
     }
 }
 
@@ -3030,6 +3064,7 @@ fn model_history_bucket_seconds(range: ModelRange) -> i64 {
         ModelRange::TwentyFourHours => 60 * 60,
         ModelRange::SevenDays => 6 * 60 * 60,
         ModelRange::ThirtyDays => 24 * 60 * 60,
+        ModelRange::NinetyDays => 24 * 60 * 60,
     }
 }
 
@@ -3040,7 +3075,7 @@ fn model_overview_bucket_seconds(range: ModelRange) -> i64 {
         ModelRange::OneHour => 5 * 60,
         ModelRange::SixHours => 15 * 60,
         ModelRange::TwentyFourHours => 60 * 60,
-        ModelRange::SevenDays | ModelRange::ThirtyDays => 24 * 60 * 60,
+        ModelRange::SevenDays | ModelRange::ThirtyDays | ModelRange::NinetyDays => 24 * 60 * 60,
     }
 }
 
@@ -3938,6 +3973,35 @@ impl Storage {
     /// and deliberately omits production-only startup cleanup and archival.
     pub(crate) fn init_study_scratch(path: &Path) -> Result<Self, String> {
         Self::init_at(path.to_path_buf(), false)
+    }
+
+    /// Open a frozen performance corpus without running migrations, cleanup,
+    /// retention, or any other startup mutation.
+    pub(crate) fn init_widget_query_benchmark(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Open widget query benchmark corpus: {error}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Configure widget query benchmark timeout: {error}"))?;
+        conn.execute_batch(
+            "PRAGMA temp_store = MEMORY;
+             PRAGMA mmap_size = 268435456;
+             PRAGMA cache_size = -65536;
+             PRAGMA query_only = ON;",
+        )
+        .map_err(|error| format!("Configure widget query benchmark reader: {error}"))?;
+
+        Ok(Self {
+            conn: Mutex::new(conn),
+            db_path: path.to_path_buf(),
+            model_analytics_cache: Mutex::new(HashMap::new()),
+            model_usage_overview_cache: Mutex::new(HashMap::new()),
+            model_history_cache: Mutex::new(HashMap::new()),
+            bucket_stats_cache: Mutex::new(HashMap::new()),
+            context_savings_analytics_cache: Mutex::new(HashMap::new()),
+        })
     }
 
     fn init_at(path: PathBuf, production_startup: bool) -> Result<Self, String> {
@@ -6884,7 +6948,7 @@ impl Storage {
         range: ModelRange,
         provider: Option<&str>,
     ) -> Result<ModelAnalyticsResponse, String> {
-        let range_end = Utc::now();
+        let range_end = query_now();
         let probe_connection = self.open_model_analytics_reader()?;
         let key = CacheKey::new("get_model_analytics", range, provider, range_end);
         get_or_compute(
@@ -7226,7 +7290,7 @@ impl Storage {
         range: ModelRange,
         provider: Option<&str>,
     ) -> Result<ModelUsageOverviewResponse, String> {
-        let range_end = Utc::now();
+        let range_end = query_now();
         let probe_connection = self.open_model_analytics_reader()?;
         let key = CacheKey::new("get_model_usage_overview", range, provider, range_end);
         get_or_compute(
@@ -8139,7 +8203,7 @@ impl Storage {
         provider: Option<&str>,
         selected_model: Option<&ModelIdentity>,
     ) -> Result<ModelHistoryResponse, String> {
-        let range_end = Utc::now();
+        let range_end = query_now();
         let probe_connection = self.open_model_analytics_reader()?;
         let key = CacheKey::new("get_model_history", range, provider, range_end)
             .with_selected_model(selected_model);
@@ -9878,7 +9942,7 @@ impl Storage {
         days: i32,
     ) -> Result<BucketStats, String> {
         let days = days.clamp(1, 365);
-        let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
+        let from = (query_now() - TimeDelta::days(days as i64)).to_rfc3339();
 
         let mut stmt = conn
             .prepare_cached(
@@ -9935,7 +9999,7 @@ impl Storage {
         let conn = self.conn.lock();
         let request = serde_json::to_string(&(current_buckets, days))
             .map_err(|error| format!("Serialize bucket stats cache key: {error}"))?;
-        let key = CacheKey::for_request("get_all_bucket_stats", request, Utc::now());
+        let key = CacheKey::for_request("get_all_bucket_stats", request, query_now());
         get_or_compute(
             &self.bucket_stats_cache,
             key,
@@ -10168,7 +10232,7 @@ impl Storage {
         cwd: Option<&str>,
     ) -> Result<Vec<TokenDataPoint>, String> {
         let conn = self.conn.lock();
-        let now = Utc::now();
+        let now = query_now();
 
         // Skip hourly aggregates when filtering by session_id or cwd since
         // token_hourly doesn't store those fields
@@ -10179,6 +10243,7 @@ impl Storage {
             "24h" => (now - TimeDelta::hours(24), false),
             "7d" => (now - TimeDelta::days(7), false),
             "30d" => (now - TimeDelta::days(30), !needs_granular),
+            "90d" => (now - TimeDelta::days(90), !needs_granular),
             "all" => (now - TimeDelta::days(365), !needs_granular),
             _ => (now - TimeDelta::hours(24), false),
         };
@@ -10683,7 +10748,7 @@ impl Storage {
         let conn = self.conn.lock();
         let request = serde_json::to_string(&(range, limit))
             .map_err(|error| format!("Serialize context savings cache key: {error}"))?;
-        let key = CacheKey::for_request("get_context_savings_analytics", request, Utc::now());
+        let key = CacheKey::for_request("get_context_savings_analytics", request, query_now());
         get_or_compute(
             &self.context_savings_analytics_cache,
             key,
@@ -16722,7 +16787,7 @@ impl Storage {
 
     pub fn get_code_stats(&self, range: &str) -> Result<CodeStats, String> {
         let conn = self.conn.lock();
-        let from = (Utc::now() - range_to_duration(range)).to_rfc3339();
+        let from = (query_now() - range_to_duration(range)).to_rfc3339();
 
         let mut stmt = conn
             .prepare(
@@ -16848,7 +16913,7 @@ impl Storage {
         range: &str,
     ) -> Result<Vec<CodeStatsHistoryPoint>, String> {
         let conn = self.conn.lock();
-        let now = Utc::now();
+        let now = query_now();
         let from = now - range_to_duration(range);
         let from_str = from.to_rfc3339();
 
@@ -16858,6 +16923,7 @@ impl Storage {
             "24h" => 15 * 60,
             "7d" => 3600,
             "30d" => 86400,
+            "90d" => 86400,
             _ => 15 * 60,
         };
 
@@ -17404,7 +17470,7 @@ impl Storage {
         const TOOL_WAIT_MAX_SECS: f64 = 21_600.0; // 6 hours (R-B safety ceiling)
 
         let conn = self.conn.lock();
-        let now = Utc::now();
+        let now = query_now();
         let from = now - range_to_duration(range);
         let from_str = from.to_rfc3339();
         let parent_only = matches!(scope, Some("parent_only"));
@@ -17733,7 +17799,7 @@ fn calc_trend(
     provider: IntegrationProvider,
     bucket_key: &str,
 ) -> Result<String, String> {
-    let now = Utc::now();
+    let now = query_now();
     let one_hour_ago = (now - TimeDelta::hours(1)).to_rfc3339();
     let two_hours_ago = (now - TimeDelta::hours(2)).to_rfc3339();
 

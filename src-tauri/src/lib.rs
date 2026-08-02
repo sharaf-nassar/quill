@@ -48,6 +48,9 @@ mod storage;
 mod transcript_analytics;
 mod transcript_identity;
 mod tray_keepalive;
+/// Maintainer-only, read-only benchmark protocol for widget query performance.
+/// This is Cargo-binary support, not a Tauri, IPC, or supported-CLI surface.
+pub mod widget_query_perf_study;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
