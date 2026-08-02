@@ -238,12 +238,28 @@ const MODEL_ANALYTICS_CACHE_TABLES: [CacheTable; 3] = [
     CacheTable::RowId("model_backfill_state"),
 ];
 
-const MODEL_HISTORY_CACHE_TABLES: [CacheTable; 2] = [
+const ROLLUP_GENERATION_CACHE_TABLE: CacheTable = CacheTable::Column {
+    table: "rollup_meta",
+    high_water_column: "rollup_generation",
+};
+
+const MODEL_USAGE_OVERVIEW_CACHE_TABLES: [CacheTable; 4] = [
     CacheTable::Column {
         table: "model_usage_observations",
         high_water_column: "observed_at_ms",
     },
     CacheTable::RowId("model_observation_sources"),
+    CacheTable::RowId("model_backfill_state"),
+    ROLLUP_GENERATION_CACHE_TABLE,
+];
+
+const MODEL_HISTORY_CACHE_TABLES: [CacheTable; 3] = [
+    CacheTable::Column {
+        table: "model_usage_observations",
+        high_water_column: "observed_at_ms",
+    },
+    CacheTable::RowId("model_observation_sources"),
+    ROLLUP_GENERATION_CACHE_TABLE,
 ];
 
 #[allow(dead_code)]
@@ -7429,7 +7445,7 @@ impl Storage {
             &self.model_usage_overview_cache,
             key,
             &probe_connection,
-            &MODEL_ANALYTICS_CACHE_TABLES,
+            &MODEL_USAGE_OVERVIEW_CACHE_TABLES,
             || self.get_model_usage_overview_uncached(range, provider, range_end),
         )
     }
@@ -18409,6 +18425,143 @@ mod tests {
             1,
             "an absolute probe must observe a committed change from another connection"
         );
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Rollup Generation Cache Invalidation]]
+    #[test]
+    #[serial]
+    fn rollup_generation_invalidates_cache_after_upsert_only_write() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let reader = storage
+            .open_model_analytics_reader()
+            .expect("open cache probe reader");
+        let writer = Connection::open(&storage.db_path).expect("open independent rollup writer");
+
+        writer
+            .execute_batch(
+                "INSERT INTO model_usage_hourly (
+                     hour_utc, provider, derived_model_id, source_key,
+                     analytics_session_id, first_observed_at_ms,
+                     last_observed_at_ms
+                 ) VALUES (
+                     0, 'claude', 'claude-sonnet', 'source',
+                     'session', 1, 1
+                 );
+                 UPDATE rollup_meta
+                 SET rollup_generation = rollup_generation + 1
+                 WHERE id = 1;",
+            )
+            .expect("seed rollup row and generation");
+
+        let cache = Mutex::new(HashMap::new());
+        let key = CacheKey::new(
+            "rollup_generation_probe",
+            ModelRange::TwentyFourHours,
+            None,
+            query_now(),
+        );
+        let compute_count = std::cell::Cell::new(0_u32);
+        let compute = || {
+            compute_count.set(compute_count.get() + 1);
+            Ok(compute_count.get())
+        };
+
+        assert_eq!(
+            get_or_compute(
+                &cache,
+                key.clone(),
+                &reader,
+                &MODEL_USAGE_OVERVIEW_CACHE_TABLES,
+                compute,
+            ),
+            Ok(1)
+        );
+        assert_eq!(
+            get_or_compute(
+                &cache,
+                key.clone(),
+                &reader,
+                &MODEL_USAGE_OVERVIEW_CACHE_TABLES,
+                compute,
+            ),
+            Ok(1),
+            "unchanged generation must retain the cache entry"
+        );
+        assert_eq!(compute_count.get(), 1);
+
+        let raw_before: (i64, i64) = reader
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(observed_at_ms), 0)
+                 FROM model_usage_observations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read raw cache markers before UPSERT");
+        let rollup_before: (i64, i64) = reader
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0)
+                 FROM model_usage_hourly",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read rollup shape before UPSERT");
+
+        writer
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 INSERT INTO model_usage_hourly (
+                     hour_utc, provider, derived_model_id, source_key,
+                     analytics_session_id, obs_count, first_observed_at_ms,
+                     last_observed_at_ms
+                 ) VALUES (
+                     0, 'claude', 'claude-sonnet', 'source',
+                     'session', 1, 1, 1
+                 )
+                 ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
+                 DO UPDATE SET obs_count = model_usage_hourly.obs_count + 1;
+                 UPDATE rollup_meta
+                 SET rollup_generation = rollup_generation + 1
+                 WHERE id = 1;
+                 COMMIT;",
+            )
+            .expect("commit UPSERT-only rollup write");
+
+        let raw_after: (i64, i64) = reader
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(observed_at_ms), 0)
+                 FROM model_usage_observations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read raw cache markers after UPSERT");
+        let rollup_after: (i64, i64) = reader
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0)
+                 FROM model_usage_hourly",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read rollup shape after UPSERT");
+        assert_eq!(raw_after, raw_before, "raw MAX/count must stay unchanged");
+        assert_eq!(
+            rollup_after, rollup_before,
+            "UPSERT must not change rollup MAX(rowid)/count"
+        );
+
+        assert_eq!(
+            get_or_compute(
+                &cache,
+                key,
+                &reader,
+                &MODEL_USAGE_OVERVIEW_CACHE_TABLES,
+                compute,
+            ),
+            Ok(2),
+            "generation change must invalidate the cached payload"
+        );
+        assert_eq!(compute_count.get(), 2);
+        clear_env();
     }
 
     // This diagnostic makes the cache design decision reproducible without
