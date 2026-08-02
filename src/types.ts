@@ -347,6 +347,7 @@ export interface CpaConnectResult {
 
 export type CpaConnectErrorCode =
   | "invalid_url"
+  | "hashed_key"
   | "unreachable"
   | "unauthorized"
   | "unsupported_version"

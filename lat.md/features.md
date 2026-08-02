@@ -415,7 +415,15 @@ The Integrations tab can update a stored MiniMax API key without disabling and r
 
 CPA is an opt-in cross-provider usage source configured from the Integrations tab without becoming a provider status row.
 
-The form defaults to `http://127.0.0.1:8317`, accepts only HTTP(S) loopback URLs, and sends the management key across Tauri only for an explicit connect attempt. [[src-tauri/src/integrations/cpa.rs#validate_connection]] checks `/v0/management/auth-files`, reports typed invalid-URL, unreachable, unauthorized, unsupported-version, and unexpected-response failures, then runs one Claude and Codex quota smoke check when each provider is present. A valid management connection persists `integration.cpa.base_url`, `integration.cpa.management_key`, and boolean `usage.cpa.window_smoke.{claude,codex}` gates; a failed provider smoke check keeps the connection but leaves that provider in health-only mode.
+The form defaults to `http://127.0.0.1:8317`, accepts only HTTP(S) loopback URLs, and sends the management key across Tauri only for an explicit connect attempt. [[src-tauri/src/integrations/cpa.rs#validate_connection]] checks `/v0/management/auth-files`, reports typed invalid-URL, hashed-key, unreachable, unauthorized, unsupported-version, and unexpected-response failures, then runs one Claude and Codex quota smoke check when each provider is present. A valid management connection persists `integration.cpa.base_url`, `integration.cpa.management_key`, and boolean `usage.cpa.window_smoke.{claude,codex}` gates; a failed provider smoke check keeps the connection but leaves that provider in health-only mode.
+
+#### Exact plaintext key bytes
+
+Nonblank management keys retain every byte from Settings through validation, HTTP authentication, and local persistence because CPA hashes and verifies the exact plaintext rather than a trimmed form.
+
+#### One-way hash rejection
+
+An exact bcrypt hash shape is rejected before any CPA request with safe recovery copy because CPA replaces configured plaintext with a one-way hash that cannot authenticate as the original key.
 
 [[src-tauri/src/lib.rs#get_cpa_connection_status]] returns only the saved URL and configured state, never the management key. [[src-tauri/src/lib.rs#clear_cpa_connection]] runs the guarded manager purge, deletes both connection settings, every `usage.cpa.*` runtime row, raw CPA snapshots and `usage_hourly` keys under `cpa/%`, then clears the usage cache and advances its epoch so an older in-flight refresh cannot restore disconnected rows. Direct provider snapshots remain intact.
 

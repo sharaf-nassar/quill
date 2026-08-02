@@ -12,6 +12,7 @@ const API_CALL_PATH: &str = "v0/management/api-call";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CpaError {
     InvalidUrl,
+    HashedKey,
     Unreachable,
     Unauthorized,
     UnsupportedVersion,
@@ -26,6 +27,8 @@ impl fmt::Display for CpaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl => formatter.write_str("CPA URL must use HTTP or HTTPS on loopback."),
+            Self::HashedKey => formatter
+                .write_str("CPA's persisted bcrypt hash cannot be used as the management key."),
             Self::Unreachable => formatter.write_str("CPA management API is unreachable."),
             Self::Unauthorized => formatter.write_str("CPA management key was rejected."),
             Self::UnsupportedVersion => {
@@ -119,9 +122,11 @@ pub(crate) fn validate_loopback_url(base_url: &str) -> Result<Url, CpaError> {
 
 impl CpaClient {
     pub(crate) fn new(base_url: &str, management_key: &str) -> Result<Self, CpaError> {
-        let management_key = management_key.trim();
-        if management_key.is_empty() {
+        if management_key.trim().is_empty() {
             return Err(CpaError::Unauthorized);
+        }
+        if looks_like_bcrypt_hash(management_key) {
+            return Err(CpaError::HashedKey);
         }
 
         Ok(Self {
@@ -207,6 +212,17 @@ impl CpaClient {
         }
         Ok(envelope)
     }
+}
+
+fn looks_like_bcrypt_hash(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 60
+        && matches!(&bytes[..4], b"$2a$" | b"$2b$" | b"$2y$")
+        && bytes[4..6].iter().all(u8::is_ascii_digit)
+        && bytes[6] == b'$'
+        && bytes[7..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/'))
 }
 
 fn parse_auth_files(body: &str) -> Result<Vec<CpaAuthFile>, CpaError> {
@@ -485,6 +501,40 @@ mod tests {
             CpaClient::new("http://127.0.0.1:8317", "  "),
             Err(CpaError::Unauthorized)
         ));
+    }
+
+    // @lat: [[features#Settings Window#CPA Connection Lifecycle#Exact plaintext key bytes]]
+    #[test]
+    fn client_preserves_nonblank_management_key_bytes() {
+        let client = CpaClient::new("http://127.0.0.1:8317", "  exact key  ")
+            .expect("nonblank key should be accepted exactly");
+
+        assert_eq!(client.management_key, "  exact key  ");
+    }
+
+    // @lat: [[features#Settings Window#CPA Connection Lifecycle#One-way hash rejection]]
+    #[test]
+    fn client_rejects_exact_bcrypt_hash_shapes_without_echoing_them() {
+        let hashes = [
+            "$2a$10$01234567890123456789012345678901234567890123456789012",
+            "$2b$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0",
+            "$2y$04$.....................................................",
+        ];
+
+        for hash in hashes {
+            let error = CpaClient::new("http://127.0.0.1:8317", hash)
+                .expect_err("persisted hash must not be sent to CPA");
+            assert_eq!(error, CpaError::HashedKey);
+            assert!(!error.to_string().contains(hash));
+        }
+
+        assert!(
+            CpaClient::new(
+                "http://127.0.0.1:8317",
+                " $2b$12$abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0 "
+            )
+            .is_ok()
+        );
     }
 
     #[test]

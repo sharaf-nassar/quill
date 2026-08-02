@@ -83,6 +83,7 @@ pub struct CpaConnectResult {
 #[serde(rename_all = "snake_case")]
 pub enum CpaConnectErrorCode {
     InvalidUrl,
+    HashedKey,
     Unreachable,
     Unauthorized,
     UnsupportedVersion,
@@ -102,6 +103,9 @@ impl CpaConnectError {
         let message = match code {
             CpaConnectErrorCode::InvalidUrl => {
                 "Enter a loopback CPA URL using HTTP or HTTPS (127.0.0.1, localhost, or ::1)."
+            }
+            CpaConnectErrorCode::HashedKey => {
+                "CPA's config contains a one-way bcrypt hash. Enter the original plaintext management key; the saved hash cannot connect."
             }
             CpaConnectErrorCode::Unreachable => {
                 "CPA is unreachable at this URL. Start CPA and verify the port, then retry."
@@ -134,6 +138,7 @@ impl From<CpaError> for CpaConnectError {
     fn from(error: CpaError) -> Self {
         let code = match error {
             CpaError::InvalidUrl => CpaConnectErrorCode::InvalidUrl,
+            CpaError::HashedKey => CpaConnectErrorCode::HashedKey,
             CpaError::Unreachable => CpaConnectErrorCode::Unreachable,
             CpaError::Unauthorized => CpaConnectErrorCode::Unauthorized,
             CpaError::UnsupportedVersion => CpaConnectErrorCode::UnsupportedVersion,
@@ -157,7 +162,6 @@ pub(crate) async fn validate_connection(
 ) -> Result<ValidatedCpaConnection, CpaConnectError> {
     let parsed_url = validate_loopback_url(base_url).map_err(CpaConnectError::from)?;
     let normalized_url = parsed_url.as_str().trim_end_matches('/').to_string();
-    let management_key = management_key.trim();
     let client = CpaClient::new(&normalized_url, management_key).map_err(CpaConnectError::from)?;
     let auth_files = client.auth_files().await.map_err(CpaConnectError::from)?;
 
@@ -330,6 +334,7 @@ mod tests {
     fn connect_errors_have_distinct_safe_codes_and_messages() {
         let cases = [
             (CpaError::InvalidUrl, CpaConnectErrorCode::InvalidUrl),
+            (CpaError::HashedKey, CpaConnectErrorCode::HashedKey),
             (CpaError::Unreachable, CpaConnectErrorCode::Unreachable),
             (CpaError::Unauthorized, CpaConnectErrorCode::Unauthorized),
             (

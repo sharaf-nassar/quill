@@ -30,6 +30,7 @@ interface PendingProviderAction {
 const DEFAULT_CPA_URL = "http://127.0.0.1:8317";
 const CPA_ERROR_CODES = new Set<CpaConnectErrorCode>([
   "invalid_url",
+  "hashed_key",
   "unreachable",
   "unauthorized",
   "unsupported_version",
@@ -40,6 +41,8 @@ const CPA_ERROR_CODES = new Set<CpaConnectErrorCode>([
 const CPA_ERROR_MESSAGES: Record<CpaConnectErrorCode, string> = {
   invalid_url:
     "Enter a loopback CPA URL using HTTP or HTTPS (127.0.0.1, localhost, or ::1).",
+  hashed_key:
+    "CPA's config contains a one-way bcrypt hash. Enter the original plaintext management key; the saved hash cannot connect.",
   unreachable:
     "CPA is unreachable at this URL. Start CPA and verify the port, then retry.",
   unauthorized:
@@ -158,7 +161,7 @@ function CpaConnectionSettings() {
     try {
       const result = await invoke<CpaConnectResult>("set_cpa_connection", {
         baseUrl: baseUrl.trim(),
-        managementKey: managementKey.trim(),
+        managementKey,
       });
       setConfigured(true);
       setLifecycle("connected");
@@ -254,7 +257,8 @@ function CpaConnectionSettings() {
               spellCheck={false}
             />
             <small id={keyHintId}>
-              Stored locally. Quill never returns the saved key to this window.
+              Enter the original plaintext secret, not CPA's one-way $2… config
+              value. Stored locally; never returned to this window.
             </small>
           </label>
         </div>
