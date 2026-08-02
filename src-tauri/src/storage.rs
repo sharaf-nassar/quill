@@ -23561,6 +23561,10 @@ mod tests {
              CREATE INDEX idx_hook_invocations_identity_cwd
                  ON hook_invocations(hook_identity, cwd);
 
+             ALTER TABLE usage_snapshots DROP COLUMN source;
+             ALTER TABLE usage_snapshots DROP COLUMN account_label;
+             ALTER TABLE usage_snapshots DROP COLUMN account_id;
+
              DELETE FROM schema_version WHERE version > 29;",
         )
         .expect("rewind analytics schema to v29");
