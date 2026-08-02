@@ -22,3 +22,10 @@ that preference either way, your choice is preserved.
 Quill removes an unused legacy analytics archive when upgrading your local
 database. This change cannot be reversed: older Quill versions cannot open the
 upgraded database. Use Compact database after upgrading to reclaim disk space.
+
+**Faster analytics groundwork**
+
+Quill adds empty hourly rollup tables for faster Models and runtime analytics.
+This database-format upgrade is one-way: older Quill versions cannot open the
+upgraded database. Existing raw analytics remain intact, and the migration
+does not backfill or delete them.

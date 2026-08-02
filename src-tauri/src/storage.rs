@@ -98,7 +98,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 36;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 37;
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -6157,6 +6157,119 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 36: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 36 commit: {e}"))?;
+        }
+
+        // Migration 37 adds the empty hourly rollup surface used by model and
+        // runtime analytics. This is intentionally additive DDL only: raw
+        // evidence remains untouched, and the potentially expensive fold is
+        // performed later by the resumable background backfill. Recording v37
+        // is a one-way door because older builds refuse the newer schema via
+        // `SCHEMA_TOO_NEW`; additive tables keep all pre-upgrade data intact.
+        // @lat: [[backend#Database#Schema#Hourly Analytics Rollups]]
+        if current_version < 37 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 37 transaction: {e}"))?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS model_usage_hourly (
+                     hour_utc                      INTEGER NOT NULL,
+                     provider                      TEXT NOT NULL,
+                     derived_model_id               TEXT NOT NULL,
+                     source_key                     TEXT NOT NULL,
+                     analytics_session_id           TEXT NOT NULL,
+                     obs_count                      INTEGER NOT NULL DEFAULT 0,
+                     turn_count                     INTEGER NOT NULL DEFAULT 0,
+                     token_count                    INTEGER NOT NULL DEFAULT 0,
+                     sidechain_count                INTEGER NOT NULL DEFAULT 0,
+                     input_tokens                   INTEGER NOT NULL DEFAULT 0,
+                     input_tokens_present           INTEGER NOT NULL DEFAULT 0,
+                     output_tokens                  INTEGER NOT NULL DEFAULT 0,
+                     output_tokens_present          INTEGER NOT NULL DEFAULT 0,
+                     cache_creation_tokens          INTEGER NOT NULL DEFAULT 0,
+                     cache_creation_tokens_present  INTEGER NOT NULL DEFAULT 0,
+                     cache_read_tokens              INTEGER NOT NULL DEFAULT 0,
+                     cache_read_tokens_present      INTEGER NOT NULL DEFAULT 0,
+                     first_observed_at_ms            INTEGER NOT NULL,
+                     last_observed_at_ms             INTEGER NOT NULL,
+                     raw_pruned                     INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(hour_utc, provider, derived_model_id, source_key),
+                     CHECK(hour_utc >= 0),
+                     CHECK(obs_count >= 0),
+                     CHECK(turn_count >= 0),
+                     CHECK(token_count >= 0),
+                     CHECK(sidechain_count >= 0),
+                     CHECK(input_tokens >= 0),
+                     CHECK(input_tokens_present >= 0),
+                     CHECK(output_tokens >= 0),
+                     CHECK(output_tokens_present >= 0),
+                     CHECK(cache_creation_tokens >= 0),
+                     CHECK(cache_creation_tokens_present >= 0),
+                     CHECK(cache_read_tokens >= 0),
+                     CHECK(cache_read_tokens_present >= 0),
+                     CHECK(first_observed_at_ms >= 0),
+                     CHECK(last_observed_at_ms >= first_observed_at_ms),
+                     CHECK(raw_pruned IN (0, 1))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_model_usage_hourly_source
+                     ON model_usage_hourly(provider, source_key);
+
+                 CREATE TABLE IF NOT EXISTS runtime_hourly (
+                     hour_utc             INTEGER NOT NULL,
+                     provider             TEXT NOT NULL,
+                     source_key           TEXT NOT NULL,
+                     session_id           TEXT NOT NULL,
+                     turn_count           INTEGER NOT NULL DEFAULT 0,
+                     runtime_secs         REAL NOT NULL DEFAULT 0,
+                     first_turn_start_ms  INTEGER NOT NULL,
+                     last_turn_end_ms     INTEGER NOT NULL,
+                     raw_pruned           INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(hour_utc, provider, source_key),
+                     CHECK(hour_utc >= 0),
+                     CHECK(turn_count >= 0),
+                     CHECK(runtime_secs >= 0),
+                     CHECK(first_turn_start_ms >= 0),
+                     CHECK(last_turn_end_ms >= first_turn_start_ms),
+                     CHECK(raw_pruned IN (0, 1))
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_runtime_hourly_source
+                     ON runtime_hourly(provider, source_key);
+
+                 CREATE TABLE IF NOT EXISTS runtime_turn_state (
+                     provider                    TEXT NOT NULL,
+                     source_key                  TEXT NOT NULL,
+                     finalized_through_rowid     INTEGER NOT NULL DEFAULT 0,
+                     open_turn_started_ms        INTEGER,
+                     PRIMARY KEY(provider, source_key),
+                     CHECK(finalized_through_rowid >= 0),
+                     CHECK(open_turn_started_ms IS NULL
+                           OR open_turn_started_ms >= 0)
+                 );
+
+                 CREATE TABLE IF NOT EXISTS rollup_meta (
+                     id                                  INTEGER PRIMARY KEY
+                                                         CHECK(id = 1),
+                     rollup_generation                   INTEGER NOT NULL DEFAULT 0,
+                     model_backfill_status               TEXT NOT NULL DEFAULT 'pending',
+                     model_backfill_done_through_ms      INTEGER,
+                     runtime_backfill_status             TEXT NOT NULL DEFAULT 'pending',
+                     runtime_backfill_done_through_rowid INTEGER,
+                     CHECK(rollup_generation >= 0),
+                     CHECK(model_backfill_status IN
+                           ('pending', 'running', 'complete', 'failed')),
+                     CHECK(model_backfill_done_through_ms IS NULL
+                           OR model_backfill_done_through_ms >= 0),
+                     CHECK(runtime_backfill_status IN
+                           ('pending', 'running', 'complete', 'failed')),
+                     CHECK(runtime_backfill_done_through_rowid IS NULL
+                           OR runtime_backfill_done_through_rowid >= 0)
+                 );
+                 INSERT OR IGNORE INTO rollup_meta (id) VALUES (1);",
+            )
+            .map_err(|e| format!("Migration 37 (hourly analytics rollups): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (37)", [])
+                .map_err(|e| format!("Failed to record migration 37: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 37 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -24099,6 +24212,223 @@ mod tests {
             Some("preserve")
         );
 
+        drop(reopened);
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups#Rollup Migration Test Specs#Migration 37 Additive Schema]]
+    #[test]
+    #[serial]
+    fn migration_37_adds_empty_rollup_schema_and_reopens() {
+        clear_env();
+
+        let assert_rollup_schema = |conn: &Connection| {
+            for table in [
+                "model_usage_hourly",
+                "runtime_hourly",
+                "runtime_turn_state",
+                "rollup_meta",
+            ] {
+                assert!(
+                    table_exists(conn, table),
+                    "missing migration 37 table {table}"
+                );
+            }
+            for (table, columns) in [
+                (
+                    "model_usage_hourly",
+                    &[
+                        "hour_utc",
+                        "provider",
+                        "derived_model_id",
+                        "source_key",
+                        "analytics_session_id",
+                        "obs_count",
+                        "turn_count",
+                        "token_count",
+                        "sidechain_count",
+                        "input_tokens",
+                        "input_tokens_present",
+                        "output_tokens",
+                        "output_tokens_present",
+                        "cache_creation_tokens",
+                        "cache_creation_tokens_present",
+                        "cache_read_tokens",
+                        "cache_read_tokens_present",
+                        "first_observed_at_ms",
+                        "last_observed_at_ms",
+                        "raw_pruned",
+                    ][..],
+                ),
+                (
+                    "runtime_hourly",
+                    &[
+                        "hour_utc",
+                        "provider",
+                        "source_key",
+                        "session_id",
+                        "turn_count",
+                        "runtime_secs",
+                        "first_turn_start_ms",
+                        "last_turn_end_ms",
+                        "raw_pruned",
+                    ][..],
+                ),
+                (
+                    "runtime_turn_state",
+                    &[
+                        "provider",
+                        "source_key",
+                        "finalized_through_rowid",
+                        "open_turn_started_ms",
+                    ][..],
+                ),
+                (
+                    "rollup_meta",
+                    &[
+                        "id",
+                        "rollup_generation",
+                        "model_backfill_status",
+                        "model_backfill_done_through_ms",
+                        "runtime_backfill_status",
+                        "runtime_backfill_done_through_rowid",
+                    ][..],
+                ),
+            ] {
+                for column in columns {
+                    assert!(
+                        table_has_column(conn, table, column),
+                        "{table}.{column} missing after migration 37"
+                    );
+                }
+            }
+            assert!(index_present(conn, "idx_model_usage_hourly_source"));
+            assert!(index_present(conn, "idx_runtime_hourly_source"));
+
+            let meta: (i64, String, Option<i64>, String, Option<i64>) = conn
+                .query_row(
+                    "SELECT rollup_generation,
+                            model_backfill_status,
+                            model_backfill_done_through_ms,
+                            runtime_backfill_status,
+                            runtime_backfill_done_through_rowid
+                     FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .expect("read rollup metadata singleton");
+            assert_eq!(
+                meta,
+                (0, "pending".into(), None, "pending".into(), None),
+                "migration initializes bookmarks without doing backfill work"
+            );
+        };
+
+        // Fresh databases apply migration 37 and receive the empty schema.
+        let fresh_dir = TempDir::new().expect("fresh tempdir");
+        let fresh = init_storage_in(&fresh_dir);
+        {
+            let conn = fresh.conn.lock();
+            assert_rollup_schema(&conn);
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_hourly"),
+                0
+            );
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM runtime_hourly"),
+                0
+            );
+        }
+        drop(fresh);
+        clear_env();
+
+        // Build a v36 database with raw evidence, then remove only v37's
+        // additive surface. Reopening must recreate the schema without folding
+        // either raw table in the migration transaction.
+        let existing_dir = TempDir::new().expect("existing tempdir");
+        let existing = init_storage_in(&existing_dir);
+        {
+            let conn = existing.conn.lock();
+            conn.execute_batch(
+                "INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, is_sidechain,
+                     observed_at_ms, input_tokens, model_evidence,
+                     token_evidence, derived_model_id
+                 ) VALUES (
+                     'claude', 'source-v36', 'record-v36', 0,
+                     'token', 'session-v36', 'session-v36', 'session-v36', 0,
+                     1760000000000, 42, 'explicit', 'direct', 'claude-opus'
+                 );
+                 INSERT INTO session_events (
+                     provider, source_key, event_key, session_id, chain_id,
+                     is_sidechain, timestamp, kind
+                 ) VALUES (
+                     'claude', 'source-v36', 'event-v36', 'session-v36',
+                     'session-v36', 0, '2025-10-09T08:53:20Z', 'asst_text'
+                 );
+                 DROP TABLE model_usage_hourly;
+                 DROP TABLE runtime_hourly;
+                 DROP TABLE runtime_turn_state;
+                 DROP TABLE rollup_meta;
+                 DELETE FROM schema_version WHERE version = 37;",
+            )
+            .expect("prepare v36 rollup fixture");
+        }
+        drop(existing);
+
+        let migrated = init_storage_in(&existing_dir);
+        {
+            let conn = migrated.conn.lock();
+            assert_rollup_schema(&conn);
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
+                1
+            );
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM session_events"),
+                1
+            );
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_hourly"),
+                0
+            );
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM runtime_hourly"),
+                0
+            );
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 37"
+                ),
+                1
+            );
+        }
+        drop(migrated);
+
+        // A normal restart skips migration 37 and leaves one version record.
+        let reopened = init_storage_in(&existing_dir);
+        {
+            let conn = reopened.conn.lock();
+            assert_rollup_schema(&conn);
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 37"
+                ),
+                1
+            );
+        }
         drop(reopened);
         clear_env();
     }
