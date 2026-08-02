@@ -23,6 +23,11 @@ Quill removes an unused legacy analytics archive when upgrading your local
 database. This change cannot be reversed: older Quill versions cannot open the
 upgraded database. Use Compact database after upgrading to reclaim disk space.
 
+If `usage.db.pre-model-wipe.bak` exists beside your current database, it is an
+optional, user-controlled backup. Quill does not delete it automatically. You
+may delete it to reclaim disk space only after confirming the current database
+works and you no longer need the backup.
+
 **Faster analytics groundwork**
 
 Quill adds empty hourly rollup tables for faster Models and runtime analytics.

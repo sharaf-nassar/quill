@@ -727,11 +727,13 @@ no epic, `bd search` empty) — nothing to refine or close. The separate
 rollouts on disk mostly never enumerated for ingest; true throughput
 understated ~100×) is already filed and referenced by this plan only as
 a sizing-validation dependency (Data Model, Risks); disposition:
-**not-in-scope** — this feature does not fix it. Two follow-up beads to
-file at create-beads: (1) per the spec review, the 2.5 GB
-`usage.db.pre-model-wipe.bak` user-communication item (owner assignment
-only; no automated deletion — spec Non-Goal); (2) re-run the rollup
-sizing/consistency validation after quill-xnb is fixed — the
+**not-in-scope** — this feature does not fix it. The first follow-up is
+resolved: Sharaf Nassar, project maintainer, owns communication about the
+2.5 GB `usage.db.pre-model-wipe.bak`. The release notes tell users that the
+backup is optional and user-controlled, and to delete it only after confirming
+the current database works and the backup is no longer needed. Quill will not
+delete it automatically (spec Non-Goal). One follow-up bead remains to re-run
+the rollup sizing/consistency validation after quill-xnb is fixed — the
 revalidation promised in Data Model and Risks needs an owner.
 
 ## Target Epic
