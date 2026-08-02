@@ -7,6 +7,8 @@ mod claude_setup;
 mod compress_prose;
 mod config;
 mod context_category;
+#[cfg(test)]
+mod cpa;
 mod crash_reporting;
 pub mod data_paths;
 mod eval_harness;
