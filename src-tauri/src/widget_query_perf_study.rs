@@ -14,7 +14,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::integrations::IntegrationProvider;
-use crate::models::{ModelRange, UsageBucket};
+use crate::models::{LlmRuntimeStats, ModelRange, UsageBucket};
 use crate::rollup_backfill::{
     RollupBackfillControls, RollupBackfillProgress, RollupBackfillTerminal, RollupChunkControl,
 };
@@ -129,6 +129,88 @@ pub struct ModelRollupDerivedCorpusReport {
     pub fixture_bytes_before_backfill: u64,
     pub consistency: ModelRollupConsistencyCorpusReport,
 }
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeParityWindowReport {
+    pub window: &'static str,
+    pub scope: &'static str,
+    pub total_runtime_secs: f64,
+    pub turn_count: i64,
+    pub session_count: i64,
+    pub avg_per_turn_secs: f64,
+    pub sparkline: Vec<f64>,
+    pub normalized_bytes: usize,
+    pub normalized_sha256: String,
+    pub exact: bool,
+    pub repeated_stable: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeParityDerivedCorpusReport {
+    pub source_path: String,
+    pub source_bytes: u64,
+    pub source_read_only: bool,
+    pub range_start: String,
+    pub copied_start: String,
+    pub range_end: String,
+    pub copied_sources: u64,
+    pub copied_events: u64,
+    pub available_bytes_before: u64,
+    pub required_bytes: u64,
+    pub fixture_bytes_before_backfill: u64,
+    pub backfill_rows_done: u64,
+    pub backfill_rows_total: u64,
+    pub backfill_chunks: u64,
+    pub backfill_elapsed_ms: f64,
+    pub runtime_rollup_rows: u64,
+    pub runtime_state_rows: u64,
+    pub quick_check: String,
+    pub equality: Vec<RuntimeParityWindowReport>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeReferenceEvent {
+    timestamp_ms: i64,
+    kind: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeReferenceSource {
+    provider: String,
+    source_key: String,
+    closed_session_id: String,
+    open_session_id: String,
+    chain_id: String,
+    is_sidechain: bool,
+    events: Vec<RuntimeReferenceEvent>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeReferenceTurn {
+    start_ms: i64,
+    end_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeReferenceOpenTurn {
+    start_ms: i64,
+    last_event_ms: i64,
+    last_kind: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct CanonicalRuntimeStats {
+    total_runtime_micros: i64,
+    turn_count: i64,
+    session_count: i64,
+    avg_per_turn_micros: i64,
+    sparkline_micros: Vec<i64>,
+}
+
+const RUNTIME_REFERENCE_IDLE_MS: i64 = 5 * 60 * 1_000;
+const RUNTIME_REFERENCE_TOOL_WAIT_MS: i64 = 6 * 60 * 60 * 1_000;
+const RUNTIME_REFERENCE_HOUR_MS: i64 = 60 * 60 * 1_000;
+const RUNTIME_PARITY_EPSILON_SECS: f64 = 0.000_001;
 
 #[derive(Debug)]
 struct ModelRollupCorpusOutput {
@@ -366,6 +448,299 @@ fn exact_output_digest(
     }
     let bytes = serde_json::to_vec(raw)
         .map_err(|error| format!("Serialize {window} {output} equality digest: {error}"))?;
+    Ok((bytes.len(), format!("{:x}", Sha256::digest(&bytes))))
+}
+
+fn runtime_gap_continues(previous_kind: &str, next_kind: &str, gap_ms: i64) -> bool {
+    if previous_kind == "asst_tool_use" && next_kind == "user_tool_result" {
+        gap_ms <= RUNTIME_REFERENCE_TOOL_WAIT_MS
+    } else {
+        gap_ms <= RUNTIME_REFERENCE_IDLE_MS
+    }
+}
+
+fn fold_runtime_reference_source(
+    source: &RuntimeReferenceSource,
+) -> (Vec<RuntimeReferenceTurn>, Option<RuntimeReferenceOpenTurn>) {
+    let Some(first) = source.events.first() else {
+        return (Vec::new(), None);
+    };
+    let mut turns = Vec::new();
+    let mut turn_start_ms = first.timestamp_ms;
+    let mut previous = first;
+    for event in source.events.iter().skip(1) {
+        let gap_ms = event.timestamp_ms.saturating_sub(previous.timestamp_ms);
+        if !runtime_gap_continues(&previous.kind, &event.kind, gap_ms) {
+            let end_ms = if previous.kind == "asst_tool_use" && event.kind == "user_tool_result" {
+                previous
+                    .timestamp_ms
+                    .saturating_add(gap_ms.min(RUNTIME_REFERENCE_TOOL_WAIT_MS))
+            } else {
+                previous.timestamp_ms
+            };
+            if end_ms > turn_start_ms {
+                turns.push(RuntimeReferenceTurn {
+                    start_ms: turn_start_ms,
+                    end_ms,
+                });
+            }
+            turn_start_ms = event.timestamp_ms;
+        }
+        previous = event;
+    }
+    let open = Some(RuntimeReferenceOpenTurn {
+        start_ms: turn_start_ms,
+        last_event_ms: previous.timestamp_ms,
+        last_kind: previous.kind.clone(),
+    });
+    (turns, open)
+}
+
+fn independent_runtime_reference(
+    sources: &[RuntimeReferenceSource],
+    duration: TimeDelta,
+    pinned_now: DateTime<Utc>,
+    parent_only: bool,
+) -> LlmRuntimeStats {
+    let from = pinned_now - duration;
+    let from_ms = from.timestamp_millis();
+    let window_start_hour =
+        from_ms.div_euclid(RUNTIME_REFERENCE_HOUR_MS) * RUNTIME_REFERENCE_HOUR_MS;
+    let bucket_secs = duration.num_seconds() as f64 / 7.0;
+    let mut total_runtime_secs = 0.0_f64;
+    let mut turn_count = 0_i64;
+    let mut sessions = std::collections::HashSet::<(String, String)>::new();
+    let mut sparkline = vec![0.0_f64; 7];
+
+    for source in sources {
+        if parent_only && source.is_sidechain {
+            continue;
+        }
+        let (closed, open) = fold_runtime_reference_source(source);
+        let mut closed_hours = std::collections::BTreeMap::<i64, (i64, i64)>::new();
+        for turn in closed {
+            let hour =
+                turn.start_ms.div_euclid(RUNTIME_REFERENCE_HOUR_MS) * RUNTIME_REFERENCE_HOUR_MS;
+            if hour < window_start_hour {
+                continue;
+            }
+            let duration_ms = turn.end_ms.saturating_sub(turn.start_ms);
+            let entry = closed_hours.entry(hour).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(duration_ms);
+            entry.1 = entry.1.saturating_add(1);
+        }
+        for (hour, (duration_ms, turns)) in closed_hours {
+            let duration_secs = duration_ms as f64 / 1_000.0;
+            total_runtime_secs += duration_secs;
+            turn_count += turns;
+            sessions.insert((source.provider.clone(), source.closed_session_id.clone()));
+            let bucket = ((((hour - from_ms) as f64 / 1_000.0) / bucket_secs).max(0.0)) as usize;
+            sparkline[bucket.min(6)] += duration_secs;
+        }
+
+        let Some(open) = open.filter(|turn| turn.start_ms >= window_start_hour) else {
+            continue;
+        };
+        sessions.insert((source.provider.clone(), source.open_session_id.clone()));
+        let end_ms = if open.last_kind == "asst_tool_use" {
+            pinned_now.timestamp_millis().min(
+                open.last_event_ms
+                    .saturating_add(RUNTIME_REFERENCE_TOOL_WAIT_MS),
+            )
+        } else {
+            open.last_event_ms
+        };
+        let duration_ms = end_ms.saturating_sub(open.start_ms);
+        if duration_ms > 0 {
+            let duration_secs = duration_ms as f64 / 1_000.0;
+            total_runtime_secs += duration_secs;
+            turn_count += 1;
+            let bucket =
+                (((open.start_ms - from_ms) as f64 / 1_000.0) / bucket_secs).max(0.0) as usize;
+            sparkline[bucket.min(6)] += duration_secs;
+        }
+    }
+
+    LlmRuntimeStats {
+        total_runtime_secs,
+        turn_count,
+        session_count: sessions.len() as i64,
+        avg_per_turn_secs: if turn_count > 0 {
+            total_runtime_secs / turn_count as f64
+        } else {
+            0.0
+        },
+        sparkline,
+    }
+}
+
+fn load_runtime_reference_sources(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<RuntimeReferenceSource>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT event.rowid, event.provider, event.source_key,
+                    event.session_id, event.chain_id, event.timestamp, event.kind,
+                    source.analytics_session_id, source.chain_id, source.is_sidechain
+             FROM session_events AS event
+             JOIN transcript_analytics_sources AS source
+               ON source.provider = event.provider
+              AND source.source_key = event.source_key
+             WHERE event.source_key IS NOT NULL
+               AND source.processing_status != 'suppressed'
+               AND source.suppressed_sha256 IS NULL
+             ORDER BY event.provider, event.source_key, event.timestamp, event.rowid",
+        )
+        .map_err(|error| format!("Prepare independent runtime source read: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+            ))
+        })
+        .map_err(|error| format!("Query independent runtime sources: {error}"))?;
+
+    let mut sources = Vec::<RuntimeReferenceSource>::new();
+    for row in rows {
+        let (
+            rowid,
+            provider,
+            source_key,
+            session_id,
+            chain_id,
+            timestamp,
+            kind,
+            analytics_session_id,
+            registry_chain_id,
+            is_sidechain,
+        ) = row.map_err(|error| format!("Read independent runtime event: {error}"))?;
+        let Some(analytics_session_id) = analytics_session_id else {
+            return Err(format!(
+                "Runtime reference source {provider}/{source_key} lacks analytics_session_id"
+            ));
+        };
+        if registry_chain_id.as_deref() != Some(chain_id.as_str()) {
+            return Err(format!(
+                "Runtime reference source {provider}/{source_key} registry chain differs from event chain"
+            ));
+        }
+        let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
+            continue;
+        };
+        let timestamp_ms = timestamp.timestamp_millis();
+        if timestamp_ms < 0 {
+            return Err(format!(
+                "Runtime reference event {provider}/{source_key}/{rowid} predates Unix epoch"
+            ));
+        }
+        if sources
+            .last()
+            .is_none_or(|source| source.provider != provider || source.source_key != source_key)
+        {
+            sources.push(RuntimeReferenceSource {
+                provider: provider.clone(),
+                source_key: source_key.clone(),
+                closed_session_id: session_id.clone(),
+                open_session_id: analytics_session_id.clone(),
+                chain_id: chain_id.clone(),
+                is_sidechain: is_sidechain != 0,
+                events: Vec::new(),
+            });
+        }
+        let source = sources.last_mut().expect("source was inserted above");
+        if source.closed_session_id != session_id
+            || source.open_session_id != analytics_session_id
+            || source.chain_id != chain_id
+            || source.is_sidechain != (is_sidechain != 0)
+        {
+            return Err(format!(
+                "Runtime reference source {provider}/{source_key} has mixed identity"
+            ));
+        }
+        source
+            .events
+            .push(RuntimeReferenceEvent { timestamp_ms, kind });
+    }
+    Ok(sources)
+}
+
+fn normalized_runtime_micros(value: f64, field: &str) -> Result<i64, String> {
+    if !value.is_finite() {
+        return Err(format!("Runtime parity {field} is not finite"));
+    }
+    let micros = value * 1_000_000.0;
+    if micros < i64::MIN as f64 || micros > i64::MAX as f64 {
+        return Err(format!("Runtime parity {field} exceeds i64 microseconds"));
+    }
+    Ok(micros.round() as i64)
+}
+
+fn canonical_runtime_stats(stats: &LlmRuntimeStats) -> Result<CanonicalRuntimeStats, String> {
+    Ok(CanonicalRuntimeStats {
+        total_runtime_micros: normalized_runtime_micros(
+            stats.total_runtime_secs,
+            "total_runtime_secs",
+        )?,
+        turn_count: stats.turn_count,
+        session_count: stats.session_count,
+        avg_per_turn_micros: normalized_runtime_micros(
+            stats.avg_per_turn_secs,
+            "avg_per_turn_secs",
+        )?,
+        sparkline_micros: stats
+            .sparkline
+            .iter()
+            .enumerate()
+            .map(|(index, value)| normalized_runtime_micros(*value, &format!("sparkline[{index}]")))
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn require_runtime_parity(
+    reference: &LlmRuntimeStats,
+    production: &LlmRuntimeStats,
+    window: &str,
+    scope: &str,
+) -> Result<(usize, String), String> {
+    if reference.turn_count != production.turn_count
+        || reference.session_count != production.session_count
+        || reference.sparkline.len() != production.sparkline.len()
+    {
+        return Err(format!(
+            "Runtime parity count/shape mismatch at {window}/{scope}: reference={reference:?}, production={production:?}"
+        ));
+    }
+    let close = |left: f64, right: f64| (left - right).abs() <= RUNTIME_PARITY_EPSILON_SECS;
+    if !close(reference.total_runtime_secs, production.total_runtime_secs)
+        || !close(reference.avg_per_turn_secs, production.avg_per_turn_secs)
+        || reference
+            .sparkline
+            .iter()
+            .zip(&production.sparkline)
+            .any(|(left, right)| !close(*left, *right))
+    {
+        return Err(format!(
+            "Runtime parity numeric mismatch at {window}/{scope}: reference={reference:?}, production={production:?}"
+        ));
+    }
+    let reference = canonical_runtime_stats(reference)?;
+    let production = canonical_runtime_stats(production)?;
+    if reference != production {
+        return Err(format!(
+            "Runtime parity normalized mismatch at {window}/{scope}: reference={reference:?}, production={production:?}"
+        ));
+    }
+    let bytes = serde_json::to_vec(&reference)
+        .map_err(|error| format!("Serialize runtime parity digest at {window}/{scope}: {error}"))?;
     Ok((bytes.len(), format!("{:x}", Sha256::digest(&bytes))))
 }
 
@@ -927,6 +1302,365 @@ pub fn verify_model_rollup_from_frozen(
     })
 }
 
+fn runtime_copy_boundary(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    source_key: &str,
+    copied_start_ms: i64,
+    range_end: &str,
+) -> Result<Option<(String, i64)>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT rowid, timestamp, kind
+             FROM frozen.session_events
+             WHERE provider = ?1 AND source_key = ?2 AND timestamp < ?3
+             ORDER BY timestamp, rowid",
+        )
+        .map_err(|error| format!("Prepare runtime boundary scan: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![provider, source_key, range_end], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Query runtime boundary scan: {error}"))?;
+    let mut turn_start: Option<(String, i64)> = None;
+    let mut previous: Option<(i64, String)> = None;
+    for row in rows {
+        let (rowid, timestamp, kind) =
+            row.map_err(|error| format!("Read runtime boundary event: {error}"))?;
+        let Ok(parsed) = DateTime::parse_from_rfc3339(&timestamp) else {
+            continue;
+        };
+        let timestamp_ms = parsed.timestamp_millis();
+        if timestamp_ms < 0 {
+            return Err(format!(
+                "Runtime boundary event {provider}/{source_key}/{rowid} predates Unix epoch"
+            ));
+        }
+        if let Some((previous_ms, previous_kind)) = &previous {
+            let gap_ms = timestamp_ms.saturating_sub(*previous_ms);
+            if !runtime_gap_continues(previous_kind, &kind, gap_ms) {
+                turn_start = Some((timestamp.clone(), rowid));
+            }
+        } else {
+            turn_start = Some((timestamp.clone(), rowid));
+        }
+        previous = Some((timestamp_ms, kind));
+        if timestamp_ms >= copied_start_ms {
+            return Ok(turn_start);
+        }
+    }
+    Ok(None)
+}
+
+/// Derive a bounded runtime fixture and compare an independent raw reference
+/// with the unchanged production backfill and completed hybrid reader.
+// @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Frozen Corpus Independent Runtime Parity]]
+pub fn verify_runtime_parity_from_frozen(
+    source: &Path,
+    fixture: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<RuntimeParityDerivedCorpusReport, String> {
+    let source = source
+        .canonicalize()
+        .map_err(|error| format!("Resolve frozen runtime corpus: {error}"))?;
+    let source_metadata = source
+        .metadata()
+        .map_err(|error| format!("Read frozen runtime corpus metadata: {error}"))?;
+    if !source_metadata.is_file() || !source_metadata.permissions().readonly() {
+        return Err(format!(
+            "Frozen runtime corpus must be a read-only file: {}",
+            source.display()
+        ));
+    }
+    if fixture.exists() {
+        return Err(format!(
+            "Refusing to overwrite derived runtime fixture: {}",
+            fixture.display()
+        ));
+    }
+    let fixture_parent = fixture
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "Derived runtime fixture must have a parent directory".to_string())?;
+
+    let range_start = pinned_end - TimeDelta::days(90);
+    let copied_start_ms = range_start
+        .timestamp_millis()
+        .div_euclid(RUNTIME_REFERENCE_HOUR_MS)
+        * RUNTIME_REFERENCE_HOUR_MS;
+    let copied_start = DateTime::<Utc>::from_timestamp_millis(copied_start_ms)
+        .ok_or_else(|| "Derived runtime copied start is not representable".to_string())?;
+    let copied_start_text = copied_start.to_rfc3339();
+    let range_end_text = pinned_end.to_rfc3339();
+
+    let storage = Storage::init_study_scratch(fixture)?;
+    drop(storage);
+    let mut conn = rusqlite::Connection::open(fixture)
+        .map_err(|error| format!("Open derived runtime fixture: {error}"))?;
+    let source_path = source
+        .to_str()
+        .ok_or_else(|| "Frozen runtime corpus path is not UTF-8".to_string())?;
+    if source_path.contains(['?', '#']) {
+        return Err("Frozen runtime corpus path cannot contain URI query delimiters".to_string());
+    }
+    let source_uri = format!("file:{source_path}?mode=ro&immutable=1");
+    conn.execute("ATTACH DATABASE ?1 AS frozen", [&source_uri])
+        .map_err(|error| format!("Attach immutable runtime corpus: {error}"))?;
+    for table in ["transcript_analytics_sources", "session_events"] {
+        let main_columns = attached_table_columns(&conn, "main", table)?;
+        let frozen_columns = attached_table_columns(&conn, "frozen", table)?;
+        if main_columns != frozen_columns {
+            return Err(format!(
+                "Derived runtime fixture schema differs for {table}: main={main_columns:?}, frozen={frozen_columns:?}"
+            ));
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE TEMP TABLE runtime_fixture_sources (
+             provider        TEXT NOT NULL,
+             source_key      TEXT NOT NULL,
+             start_timestamp TEXT NOT NULL,
+             start_rowid     INTEGER NOT NULL,
+             PRIMARY KEY(provider, source_key)
+         ) WITHOUT ROWID;",
+    )
+    .map_err(|error| format!("Create runtime fixture source frontier: {error}"))?;
+    let source_keys = {
+        let mut statement = conn
+            .prepare(
+                "SELECT source.provider, source.source_key
+                 FROM frozen.transcript_analytics_sources AS source
+                 WHERE source.processing_status != 'suppressed'
+                   AND source.suppressed_sha256 IS NULL
+                   AND source.analytics_session_id IS NOT NULL
+                   AND source.chain_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM frozen.session_events AS event
+                       WHERE event.provider = source.provider
+                         AND event.source_key = source.source_key
+                         AND event.timestamp >= ?1 AND event.timestamp < ?2
+                   )
+                 ORDER BY source.provider, source.source_key",
+            )
+            .map_err(|error| format!("Prepare runtime fixture source scan: {error}"))?;
+        statement
+            .query_map(
+                rusqlite::params![copied_start_text, range_end_text],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| format!("Query runtime fixture sources: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read runtime fixture sources: {error}"))?
+    };
+    for (provider, source_key) in &source_keys {
+        let Some((start_timestamp, start_rowid)) = runtime_copy_boundary(
+            &conn,
+            provider,
+            source_key,
+            copied_start_ms,
+            &range_end_text,
+        )?
+        else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO runtime_fixture_sources (
+                 provider, source_key, start_timestamp, start_rowid
+             ) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![provider, source_key, start_timestamp, start_rowid],
+        )
+        .map_err(|error| format!("Record runtime fixture source frontier: {error}"))?;
+    }
+    let copied_sources = conn
+        .query_row("SELECT COUNT(*) FROM runtime_fixture_sources", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .map_err(|error| format!("Count runtime fixture sources: {error}"))?;
+    let copied_events = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM frozen.session_events AS event
+             JOIN runtime_fixture_sources AS selected
+               ON selected.provider = event.provider
+              AND selected.source_key = event.source_key
+             WHERE event.timestamp < ?1
+               AND (event.timestamp > selected.start_timestamp
+                    OR (event.timestamp = selected.start_timestamp
+                        AND event.rowid >= selected.start_rowid))",
+            [&range_end_text],
+            |row| row.get::<_, u64>(0),
+        )
+        .map_err(|error| format!("Count derived runtime events: {error}"))?;
+    let available_bytes = crate::retention_engine::available_disk_space(fixture_parent)?;
+    let required_bytes = copied_events
+        .saturating_mul(512)
+        .saturating_add(copied_sources.saturating_mul(4_096))
+        .saturating_mul(2);
+    if available_bytes < required_bytes {
+        return Err(format!(
+            "Derived runtime fixture needs an estimated {required_bytes} free bytes; found {available_bytes}"
+        ));
+    }
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Begin derived runtime fixture extraction: {error}"))?;
+    let inserted_sources = tx
+        .execute(
+            "INSERT INTO main.transcript_analytics_sources
+             SELECT source.*
+             FROM frozen.transcript_analytics_sources AS source
+             JOIN runtime_fixture_sources AS selected
+               ON selected.provider = source.provider
+              AND selected.source_key = source.source_key",
+            [],
+        )
+        .map_err(|error| format!("Copy derived runtime source registry: {error}"))?;
+    let inserted_events = tx
+        .execute(
+            "INSERT INTO main.session_events
+             SELECT event.*
+             FROM frozen.session_events AS event
+             JOIN runtime_fixture_sources AS selected
+               ON selected.provider = event.provider
+              AND selected.source_key = event.source_key
+             WHERE event.timestamp < ?1
+               AND (event.timestamp > selected.start_timestamp
+                    OR (event.timestamp = selected.start_timestamp
+                        AND event.rowid >= selected.start_rowid))
+             ORDER BY event.provider, event.source_key, event.timestamp, event.rowid",
+            [&range_end_text],
+        )
+        .map_err(|error| format!("Copy derived runtime events: {error}"))?;
+    if inserted_sources as u64 != copied_sources || inserted_events as u64 != copied_events {
+        return Err(format!(
+            "Derived runtime copy counts changed: sources {inserted_sources}/{copied_sources}, events {inserted_events}/{copied_events}"
+        ));
+    }
+    tx.commit()
+        .map_err(|error| format!("Commit derived runtime fixture extraction: {error}"))?;
+    conn.execute_batch("DETACH DATABASE frozen; PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("Finalize derived runtime fixture extraction: {error}"))?;
+    drop(conn);
+
+    let fixture_bytes_before_backfill = fixture
+        .metadata()
+        .map_err(|error| format!("Read derived runtime fixture metadata: {error}"))?
+        .len();
+    let storage = Storage::init_study_scratch(fixture)?;
+    let reference_sources = {
+        let conn = rusqlite::Connection::open_with_flags(
+            fixture,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Open independent runtime reference reader: {error}"))?;
+        load_runtime_reference_sources(&conn)?
+    };
+
+    let chunks = std::cell::Cell::new(0_u64);
+    let progress = |_: &RollupBackfillProgress| chunks.set(chunks.get() + 1);
+    let controls = RollupBackfillControls {
+        progress: Some(&progress),
+        ..RollupBackfillControls::default()
+    };
+    let backfill_started = Instant::now();
+    let backfill = storage.run_runtime_rollup_backfill_with_controls(&controls)?;
+    let backfill_elapsed_ms = backfill_started.elapsed().as_secs_f64() * 1_000.0;
+    if backfill.terminal != RollupBackfillTerminal::Completed {
+        return Err(format!(
+            "Derived runtime backfill did not complete: {:?}",
+            backfill.terminal
+        ));
+    }
+
+    let mut equality = Vec::with_capacity(WINDOWS.len() * 2);
+    for window in WINDOWS {
+        for (scope, parent_only) in [("all", false), ("parent_only", true)] {
+            let reference = independent_runtime_reference(
+                &reference_sources,
+                window.duration,
+                pinned_end,
+                parent_only,
+            );
+            let production = with_pinned_query_now(pinned_end, || {
+                storage.get_llm_runtime_stats(window.label, parent_only.then_some("parent_only"))
+            })?;
+            let repeated = with_pinned_query_now(pinned_end, || {
+                storage.get_llm_runtime_stats(window.label, parent_only.then_some("parent_only"))
+            })?;
+            let (normalized_bytes, normalized_sha256) =
+                require_runtime_parity(&reference, &production, window.label, scope)?;
+            if canonical_runtime_stats(&production)? != canonical_runtime_stats(&repeated)? {
+                return Err(format!(
+                    "Completed runtime output changed across repeated reads at {}/{scope}",
+                    window.label
+                ));
+            }
+            equality.push(RuntimeParityWindowReport {
+                window: window.label,
+                scope,
+                total_runtime_secs: production.total_runtime_secs,
+                turn_count: production.turn_count,
+                session_count: production.session_count,
+                avg_per_turn_secs: production.avg_per_turn_secs,
+                sparkline: production.sparkline,
+                normalized_bytes,
+                normalized_sha256,
+                exact: true,
+                repeated_stable: true,
+            });
+        }
+    }
+
+    let conn = rusqlite::Connection::open(fixture)
+        .map_err(|error| format!("Open derived runtime fixture for validation: {error}"))?;
+    let quick_check = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Validate derived runtime fixture: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Derived runtime fixture quick_check failed: {quick_check}"
+        ));
+    }
+    let runtime_rollup_rows = conn
+        .query_row("SELECT COUNT(*) FROM runtime_hourly", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .map_err(|error| format!("Count derived runtime rollups: {error}"))?;
+    let runtime_state_rows = conn
+        .query_row("SELECT COUNT(*) FROM runtime_turn_state", [], |row| {
+            row.get::<_, u64>(0)
+        })
+        .map_err(|error| format!("Count derived runtime states: {error}"))?;
+
+    Ok(RuntimeParityDerivedCorpusReport {
+        source_path: source.display().to_string(),
+        source_bytes: source_metadata.len(),
+        source_read_only: source_metadata.permissions().readonly(),
+        range_start: range_start.to_rfc3339(),
+        copied_start: copied_start.to_rfc3339(),
+        range_end: pinned_end.to_rfc3339(),
+        copied_sources,
+        copied_events,
+        available_bytes_before: available_bytes,
+        required_bytes,
+        fixture_bytes_before_backfill,
+        backfill_rows_done: backfill.progress.rows_done,
+        backfill_rows_total: backfill.progress.rows_total,
+        backfill_chunks: chunks.get(),
+        backfill_elapsed_ms,
+        runtime_rollup_rows,
+        runtime_state_rows,
+        quick_check,
+        equality,
+    })
+}
+
 /// Measure only the 90-day runtime acceptance query on a prepared copy.
 pub fn measure_runtime_90d(
     corpus: &Path,
@@ -1126,4 +1860,174 @@ pub fn run_widget_query_baseline(
         measurements,
         view_fanouts,
     })
+}
+
+#[cfg(test)]
+mod runtime_reference_tests {
+    use rusqlite::params;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn seed_source(
+        conn: &rusqlite::Connection,
+        provider: &str,
+        source_key: &str,
+        session_id: &str,
+        chain_id: &str,
+        is_sidechain: bool,
+        events: &[(DateTime<Utc>, &str)],
+    ) {
+        conn.execute(
+            "INSERT INTO transcript_analytics_sources (
+                 provider, source_key, source_root_key, source_path,
+                 source_session_id, analytics_session_id, chain_id,
+                 is_sidechain, content_sha256, seen_generation,
+                 processing_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8, 1, 'ok')",
+            params![
+                provider,
+                source_key,
+                format!("root-{source_key}"),
+                format!("/runtime-reference/{source_key}.jsonl"),
+                session_id,
+                chain_id,
+                i64::from(is_sidechain),
+                format!("sha-{source_key}"),
+            ],
+        )
+        .expect("insert runtime reference source");
+        for (ordinal, (timestamp, kind)) in events.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_events (
+                     provider, source_key, event_key, session_id, chain_id,
+                     is_sidechain, timestamp, kind
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    provider,
+                    source_key,
+                    format!("{source_key}-{ordinal}"),
+                    session_id,
+                    chain_id,
+                    i64::from(is_sidechain),
+                    timestamp.to_rfc3339(),
+                    kind,
+                ],
+            )
+            .expect("insert runtime reference event");
+        }
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Independent Runtime Reference Edge Semantics]]
+    #[test]
+    #[serial]
+    fn independent_runtime_reference_covers_edges_and_matches_hybrid() {
+        let directory = TempDir::new().expect("runtime parity tempdir");
+        let fixture = directory.path().join("runtime-parity.sqlite3");
+        let storage = Storage::init_study_scratch(&fixture).expect("initialize runtime fixture");
+        let conn = rusqlite::Connection::open(storage.database_path())
+            .expect("open runtime fixture writer");
+        let base = DateTime::parse_from_rfc3339("2026-08-02T08:00:00Z")
+            .expect("parse runtime base")
+            .with_timezone(&Utc);
+        let at = |seconds: i64| base + TimeDelta::seconds(seconds);
+        seed_source(
+            &conn,
+            "claude",
+            "parent-source",
+            "shared-session",
+            "parent-chain",
+            false,
+            &[
+                (at(0), "user_text"),
+                (at(60), "asst_text"),
+                (at(660), "user_text"),
+                (at(720), "asst_tool_use"),
+                (at(7_920), "user_tool_result"),
+                (at(8_520), "user_text"),
+                (at(10_500), "asst_tool_use"),
+                (at(35_700), "user_tool_result"),
+                (at(37_500), "asst_tool_use"),
+            ],
+        );
+        seed_source(
+            &conn,
+            "claude",
+            "side-source",
+            "shared-session",
+            "side-chain",
+            true,
+            &[
+                (at(100), "user_text"),
+                (at(220), "asst_text"),
+                (at(1_000), "user_text"),
+            ],
+        );
+        seed_source(
+            &conn,
+            "codex",
+            "codex-source",
+            "shared-session",
+            "codex-chain",
+            false,
+            &[
+                (at(200), "user_text"),
+                (at(260), "asst_text"),
+                (at(1_000), "user_text"),
+            ],
+        );
+        let boundary = DateTime::parse_from_rfc3339("2026-08-01T19:10:00Z")
+            .expect("parse boundary base")
+            .with_timezone(&Utc);
+        seed_source(
+            &conn,
+            "claude",
+            "boundary-source",
+            "boundary-session",
+            "boundary-chain",
+            false,
+            &[
+                (boundary, "user_text"),
+                (boundary + TimeDelta::minutes(5), "asst_text"),
+                (boundary + TimeDelta::minutes(10), "asst_text"),
+                (boundary + TimeDelta::minutes(50), "user_text"),
+            ],
+        );
+        drop(conn);
+
+        let reference_conn = rusqlite::Connection::open_with_flags(
+            storage.database_path(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open independent reference reader");
+        let sources = load_runtime_reference_sources(&reference_conn)
+            .expect("load independent reference sources");
+        drop(reference_conn);
+        let pinned_now = DateTime::parse_from_rfc3339("2026-08-02T19:27:43Z")
+            .expect("parse pinned runtime endpoint")
+            .with_timezone(&Utc);
+        let all = independent_runtime_reference(&sources, TimeDelta::hours(24), pinned_now, false);
+        assert_eq!(all.total_runtime_secs, 33_463.0);
+        assert_eq!(all.turn_count, 7);
+        assert_eq!(all.session_count, 3);
+        assert_eq!(all.sparkline.iter().sum::<f64>(), 33_463.0);
+        let parent =
+            independent_runtime_reference(&sources, TimeDelta::hours(24), pinned_now, true);
+        assert_eq!(parent.total_runtime_secs, 33_343.0);
+        assert_eq!(parent.turn_count, 6);
+        assert_eq!(parent.session_count, 3);
+
+        let backfill = storage
+            .run_runtime_rollup_backfill()
+            .expect("run production runtime backfill");
+        assert_eq!(backfill.terminal, RollupBackfillTerminal::Completed);
+        for (scope, reference) in [(None, all), (Some("parent_only"), parent)] {
+            let production =
+                with_pinned_query_now(pinned_now, || storage.get_llm_runtime_stats("24h", scope))
+                    .expect("read production hybrid runtime");
+            require_runtime_parity(&reference, &production, "24h", scope.unwrap_or("all"))
+                .expect("independent reference must match production hybrid");
+        }
+    }
 }

@@ -250,6 +250,56 @@ one packed last-event seek per native chain through
 `idx_se_provider_chain_timestamp`; a direct diagnostic measured that row fetch
 at 52.816 ms before the production endpoint measurement.
 
+## Independent runtime parity
+
+The parity verifier implements logical-turn walking and output shaping without
+calling production fold or shape helpers. It independently pins native-chain
+identity, five-minute idle closure, the six-hour tool-loop ceiling, start-hour
+attribution, provider-qualified sessions, parent-only filtering, and trailing
+tool-use realization against the fixed endpoint.
+
+It attaches the frozen source immutable/read-only, creates a fresh schema, and
+copies only active events needed by the 90-day window. For each source it also
+copies the exact logical-turn prefix crossing the floored boundary, preventing
+a truncated fixture from inventing a new turn start.
+
+```bash
+cargo run --release --bin widget_query_perf_spike -- verify-runtime-parity-derived SOURCE FIXTURE 2026-08-02T19:27:43Z
+```
+
+| Measure | Result |
+| --- | ---: |
+| Fixture sources | 5,130 |
+| Fixture events | 2,339,428 |
+| Fixture bytes before backfill | 3,005,239,296 |
+| Estimated required / available bytes | 2,437,599,232 / 651,293,700,096 |
+| Backfill rows | 2,339,428 / 2,339,428 |
+| Backfill chunks | 5,130 |
+| Backfill elapsed | 101,237.202 ms |
+| Runtime rollup / open-state rows | 2,148 / 5,130 |
+| `PRAGMA quick_check` | `ok` |
+
+Every integer field matches exactly. Runtime totals, averages, and all seven
+sparkline buckets first match within the established `1e-6`-second tolerance,
+then match after conversion to integer microseconds for the recorded digest.
+Each completed production read also matched an immediate repeated read.
+
+| Window | Scope | Runtime seconds | Turns | Sessions | Normalized SHA-256 |
+| --- | --- | ---: | ---: | ---: | --- |
+| 24h | all | 273,033.051 | 402 | 31 | `1917cbc863e27049e976ac6b3fcf846924babf805b326462bd2903c4fda7c8c1` |
+| 24h | parent only | 143,496.212 | 117 | 31 | `51a47edc5e448d464a234d933ea5a58144f92464c44c5934f2f7c69f91d4c548` |
+| 30d | all | 4,951,227.057 | 7,262 | 540 | `4fe8abb113a20ff263e3f9a40eb7b7904b17b0d0e3c12bd2b052e42f7f37020d` |
+| 30d | parent only | 2,357,889.470 | 1,901 | 540 | `f880296c7cbaef2b4c60cf850c6d063380341b79093ef476ae0831cb519c5d93` |
+| 90d | all | 5,572,381.772 | 8,114 | 924 | `3bc9c85a74f10044f60aebebc1d29d838fa120c130de6f14531fdc59cd31d137` |
+| 90d | parent only | 2,960,171.796 | 2,686 | 924 | `f2ba4bdc8a4f090aa423fd10006ce0c8f93c4afcbe6e2fa1c0d4883719a9501a` |
+
+Before and after the run, the frozen source remained 13,525,123,072 bytes,
+mode `0444`, with unchanged inode, mtime, and canonical SHA-256
+`c86553ab3b0f22e23511dfc43a1f1b9dc9af35ad57f6ae63fcb3de75a673d04e`.
+Its zero-byte WAL and 32,768-byte SHM retained identical metadata. The only
+temporary file was the validated 3,010,273,280-byte fixture; it and its
+`mktemp` directory were removed after `quick_check=ok` and parity completion.
+
 ## Post-A/B interim re-measurement
 
 The gate used one disposable copy for both authoritative rollups and every

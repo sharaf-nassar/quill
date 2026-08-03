@@ -21,12 +21,12 @@ use chrono::{DateTime, Utc};
 use quill_lib::widget_query_perf_study::{
     WidgetQueryBenchmarkReport, backfill_model_rollup_copy, backfill_runtime_rollup_copy,
     measure_runtime_90d, measure_session_breakdown_30d, run_widget_query_baseline,
-    verify_model_rollup_copy, verify_model_rollup_from_frozen,
+    verify_model_rollup_copy, verify_model_rollup_from_frozen, verify_runtime_parity_from_frozen,
 };
 use rusqlite::{Connection, OpenFlags, ToSql, backup::Backup, backup::StepResult, params};
 
 fn usage() -> &'static str {
-    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
+    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike verify-runtime-parity-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
 }
 
 fn path_arg(value: Option<OsString>, name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -486,6 +486,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
             let report = verify_model_rollup_from_frozen(&source, &fixture, pinned_end)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        "verify-runtime-parity-derived" => {
+            let source = path_arg(args.next(), "SOURCE")?;
+            let fixture = path_arg(args.next(), "FIXTURE")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let report = verify_runtime_parity_from_frozen(&source, &fixture, pinned_end)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }

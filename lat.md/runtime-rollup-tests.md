@@ -45,3 +45,15 @@ A source changed after off-permit preparation must fail revalidation and roll ba
 ## Hybrid Runtime Read And Indexed Open Tail
 
 Completed reads must match the time-invariant raw reference while scanning only each active source's open rows through the timestamp-leading runtime index.
+
+## Independent Runtime Reference Edge Semantics
+
+An independent raw-event walker must pin turn identity, thresholds, start-hour attribution, open-tail realization, provider-qualified sessions, scope filtering, and every returned aggregate before matching the production hybrid path.
+
+The synthetic fixture covers ordinary idle, tool waits below and above six hours, an open tool wait pinned to now, overlapping parent/sub-agent chains, equal session ids across providers, and a turn starting in the partial boundary hour.
+
+## Frozen Corpus Independent Runtime Parity
+
+A bounded derived fixture must match the independent reference at 24 hours, 30 days, and 90 days for all-source and parent-only scope without mutating or copying the full frozen database.
+
+The verifier copies active 90-day events plus exact pre-boundary logical-turn context, runs unchanged production runtime backfill, compares all fields with microsecond normalization, and requires repeated completed reads to remain identical.
