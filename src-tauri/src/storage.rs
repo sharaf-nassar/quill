@@ -1915,6 +1915,87 @@ struct PreparedRuntimeHourlyRollup {
 }
 
 #[derive(Clone, Debug)]
+struct PreparedRuntimeFold {
+    rollups: Vec<PreparedRuntimeHourlyRollup>,
+    finalized_through_rowid: i64,
+    open_turn_started_ms: Option<i64>,
+}
+
+fn fold_persisted_runtime_events(
+    events: &[PersistedRuntimeEvent],
+    context: &str,
+) -> Result<PreparedRuntimeFold, String> {
+    let mut rollups = BTreeMap::<i64, PreparedRuntimeHourlyRollup>::new();
+    let mut finalized_through_rowid = 0_i64;
+    let mut open_turn_started_ms = None;
+    if let Some(first) = events.first() {
+        let mut turn_start_ms = first.timestamp_ms;
+        let mut open_turn_min_rowid = first.rowid;
+        let mut previous = first;
+
+        for event in events.iter().skip(1) {
+            let gap_ms = event.timestamp_ms.saturating_sub(previous.timestamp_ms);
+            let is_tool_wait = previous.kind == "asst_tool_use" && event.kind == "user_tool_result";
+            let continues_turn = if is_tool_wait {
+                gap_ms <= RUNTIME_TOOL_WAIT_MAX_MS
+            } else {
+                gap_ms <= RUNTIME_IDLE_THRESHOLD_MS
+            };
+
+            if continues_turn {
+                open_turn_min_rowid = open_turn_min_rowid.min(event.rowid);
+            } else {
+                let turn_end_ms = if is_tool_wait {
+                    previous
+                        .timestamp_ms
+                        .saturating_add(gap_ms.min(RUNTIME_TOOL_WAIT_MAX_MS))
+                } else {
+                    previous.timestamp_ms
+                };
+                if turn_end_ms > turn_start_ms {
+                    let hour_utc =
+                        turn_start_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+                    let rollup =
+                        rollups
+                            .entry(hour_utc)
+                            .or_insert_with(|| PreparedRuntimeHourlyRollup {
+                                hour_utc,
+                                turn_count: 0,
+                                runtime_millis: 0,
+                                first_turn_start_ms: turn_start_ms,
+                                last_turn_end_ms: turn_end_ms,
+                            });
+                    rollup.turn_count = rollup.turn_count.checked_add(1).ok_or_else(|| {
+                        format!("{context} runtime hourly turn count exceeds SQLite INTEGER range")
+                    })?;
+                    rollup.runtime_millis = rollup
+                        .runtime_millis
+                        .checked_add(turn_end_ms - turn_start_ms)
+                        .ok_or_else(|| {
+                            format!(
+                                "{context} runtime hourly duration exceeds SQLite INTEGER range"
+                            )
+                        })?;
+                    rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
+                    rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
+                }
+                turn_start_ms = event.timestamp_ms;
+                open_turn_min_rowid = event.rowid;
+            }
+            previous = event;
+        }
+        finalized_through_rowid = open_turn_min_rowid.saturating_sub(1).max(0);
+        open_turn_started_ms = Some(turn_start_ms);
+    }
+
+    Ok(PreparedRuntimeFold {
+        rollups: rollups.into_values().collect(),
+        finalized_through_rowid,
+        open_turn_started_ms,
+    })
+}
+
+#[derive(Clone, Debug)]
 struct PreparedRuntimeBackfillSource {
     provider: String,
     source_key: String,
@@ -2501,7 +2582,7 @@ fn refold_runtime_source(
     )
 }
 
-fn refold_runtime_source_identity(
+pub(crate) fn refold_runtime_source_identity(
     tx: &rusqlite::Transaction<'_>,
     provider: &str,
     source_key: &str,
@@ -2575,70 +2656,10 @@ fn refold_runtime_source_identity(
         )
         .map_err(|error| format!("Delete replaced runtime turn state: {error}"))?;
 
-    let mut rollups = BTreeMap::<i64, PreparedRuntimeHourlyRollup>::new();
-    let mut finalized_through_rowid = 0_i64;
-    let mut open_turn_started_ms = None;
-    if let Some(first) = events.first() {
-        let mut turn_start_ms = first.timestamp_ms;
-        let mut open_turn_min_rowid = first.rowid;
-        let mut previous = first;
-
-        for event in events.iter().skip(1) {
-            let gap_ms = event.timestamp_ms.saturating_sub(previous.timestamp_ms);
-            let is_tool_wait = previous.kind == "asst_tool_use" && event.kind == "user_tool_result";
-            let continues_turn = if is_tool_wait {
-                gap_ms <= RUNTIME_TOOL_WAIT_MAX_MS
-            } else {
-                gap_ms <= RUNTIME_IDLE_THRESHOLD_MS
-            };
-
-            if continues_turn {
-                open_turn_min_rowid = open_turn_min_rowid.min(event.rowid);
-            } else {
-                let turn_end_ms = if is_tool_wait {
-                    previous
-                        .timestamp_ms
-                        .saturating_add(gap_ms.min(RUNTIME_TOOL_WAIT_MAX_MS))
-                } else {
-                    previous.timestamp_ms
-                };
-                if turn_end_ms > turn_start_ms {
-                    let hour_utc =
-                        turn_start_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
-                    let rollup =
-                        rollups
-                            .entry(hour_utc)
-                            .or_insert_with(|| PreparedRuntimeHourlyRollup {
-                                hour_utc,
-                                turn_count: 0,
-                                runtime_millis: 0,
-                                first_turn_start_ms: turn_start_ms,
-                                last_turn_end_ms: turn_end_ms,
-                            });
-                    rollup.turn_count = rollup.turn_count.checked_add(1).ok_or_else(|| {
-                        "Runtime hourly rollup turn count exceeds SQLite INTEGER range".to_string()
-                    })?;
-                    rollup.runtime_millis = rollup
-                        .runtime_millis
-                        .checked_add(turn_end_ms - turn_start_ms)
-                        .ok_or_else(|| {
-                            "Runtime hourly rollup duration exceeds SQLite INTEGER range"
-                                .to_string()
-                        })?;
-                    rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
-                    rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
-                }
-                turn_start_ms = event.timestamp_ms;
-                open_turn_min_rowid = event.rowid;
-            }
-            previous = event;
-        }
-        finalized_through_rowid = open_turn_min_rowid.saturating_sub(1).max(0);
-        open_turn_started_ms = Some(turn_start_ms);
-    }
+    let fold = fold_persisted_runtime_events(&events, "Runtime source refold")?;
 
     let mut folded_rollup_rows = 0_usize;
-    if !rollups.is_empty() {
+    if !fold.rollups.is_empty() {
         let mut statement = tx
             .prepare_cached(
                 "INSERT INTO runtime_hourly (
@@ -2655,7 +2676,7 @@ fn refold_runtime_source_identity(
                  WHERE runtime_hourly.raw_pruned = 0",
             )
             .map_err(|error| format!("Prepare runtime hourly refold: {error}"))?;
-        for rollup in rollups.values() {
+        for rollup in &fold.rollups {
             folded_rollup_rows += statement
                 .execute(params![
                     rollup.hour_utc,
@@ -2671,7 +2692,7 @@ fn refold_runtime_source_identity(
         }
     }
 
-    let inserted_state_rows = if let Some(open_turn_started_ms) = open_turn_started_ms {
+    let inserted_state_rows = if let Some(open_turn_started_ms) = fold.open_turn_started_ms {
         tx.execute(
             "INSERT INTO runtime_turn_state (
                  provider, source_key, finalized_through_rowid,
@@ -2680,7 +2701,7 @@ fn refold_runtime_source_identity(
             params![
                 provider,
                 source_key,
-                finalized_through_rowid,
+                fold.finalized_through_rowid,
                 open_turn_started_ms,
             ],
         )
@@ -2708,6 +2729,298 @@ fn refold_runtime_source_identity(
     }
 
     Ok(())
+}
+
+// @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups]]
+pub(crate) fn verify_runtime_rollup_source_coverage(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_key: &str,
+) -> Result<i64, String> {
+    let (session_id, chain_id) = tx
+        .query_row(
+            "SELECT analytics_session_id, chain_id
+             FROM transcript_analytics_sources
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider, source_key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|error| format!("Read runtime retention source identity: {error}"))?;
+    let mut events = {
+        let mut statement = tx
+            .prepare(
+                "SELECT rowid, timestamp, kind, session_id, chain_id
+                 FROM session_events
+                 WHERE provider = ?1 AND source_key = ?2
+                 ORDER BY timestamp, rowid",
+            )
+            .map_err(|error| format!("Prepare runtime retention coverage: {error}"))?;
+        let rows = statement
+            .query_map(params![provider, source_key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| format!("Query runtime retention coverage: {error}"))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (rowid, timestamp, kind, event_session_id, event_chain_id) =
+                row.map_err(|error| format!("Read runtime retention event: {error}"))?;
+            if event_session_id != session_id || event_chain_id != chain_id {
+                return Err(format!(
+                    "Runtime retention source {provider}/{source_key} has mixed session or chain identity"
+                ));
+            }
+            let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
+                continue;
+            };
+            let timestamp_ms = timestamp.timestamp_millis();
+            if timestamp_ms < 0 {
+                return Err(format!(
+                    "Runtime retention event row {rowid} predates the Unix epoch"
+                ));
+            }
+            events.push(PersistedRuntimeEvent {
+                rowid,
+                timestamp_ms,
+                kind,
+            });
+        }
+        events
+    };
+    events.sort_unstable_by_key(|event| (event.timestamp_ms, event.rowid));
+    let fold = fold_persisted_runtime_events(&events, "Runtime retention coverage")?;
+
+    let mut authoritative_hours = HashSet::new();
+    let mut actual = BTreeMap::new();
+    {
+        let mut statement = tx
+            .prepare(
+                "SELECT hour_utc, session_id, turn_count, runtime_secs,
+                        first_turn_start_ms, last_turn_end_ms, raw_pruned
+                 FROM runtime_hourly
+                 WHERE provider = ?1 AND source_key = ?2",
+            )
+            .map_err(|error| format!("Prepare runtime retention rollup read: {error}"))?;
+        let rows = statement
+            .query_map(params![provider, source_key], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|error| format!("Query runtime retention rollups: {error}"))?;
+        for row in rows {
+            let (hour, row_session_id, turns, seconds, first, last, raw_pruned) =
+                row.map_err(|error| format!("Read runtime retention rollup: {error}"))?;
+            if row_session_id != session_id {
+                return Err(format!(
+                    "Runtime retention rollup {provider}/{source_key}/{hour} has the wrong session identity"
+                ));
+            }
+            if raw_pruned == 1 {
+                authoritative_hours.insert(hour);
+            } else {
+                actual.insert(
+                    hour,
+                    (turns, (seconds * 1_000.0).round() as i64, first, last),
+                );
+            }
+        }
+    }
+    let expected = fold
+        .rollups
+        .iter()
+        .filter(|rollup| !authoritative_hours.contains(&rollup.hour_utc))
+        .map(|rollup| {
+            (
+                rollup.hour_utc,
+                (
+                    rollup.turn_count,
+                    rollup.runtime_millis,
+                    rollup.first_turn_start_ms,
+                    rollup.last_turn_end_ms,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if actual != expected {
+        return Err(format!(
+            "Runtime rollup coverage does not match raw refold for {provider}/{source_key}: actual={actual:?}, expected={expected:?}"
+        ));
+    }
+
+    let state = tx
+        .query_row(
+            "SELECT finalized_through_rowid, open_turn_started_ms
+             FROM runtime_turn_state
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider, source_key],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Read runtime retention bookmark: {error}"))?;
+    let Some((finalized_through_rowid, open_turn_started_ms)) = state else {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        return Err(format!(
+            "Runtime rollup coverage is missing the bookmark for {provider}/{source_key}"
+        ));
+    };
+    if finalized_through_rowid < fold.finalized_through_rowid
+        || open_turn_started_ms != fold.open_turn_started_ms
+    {
+        return Err(format!(
+            "Runtime rollup bookmark does not cover the raw refold for {provider}/{source_key}"
+        ));
+    }
+    Ok(finalized_through_rowid)
+}
+
+pub(crate) fn seal_runtime_open_turn_for_retention(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_key: &str,
+    cutoff_ms: i64,
+) -> Result<usize, String> {
+    let state = tx
+        .query_row(
+            "SELECT state.finalized_through_rowid, state.open_turn_started_ms,
+                    source.analytics_session_id
+             FROM runtime_turn_state AS state
+             JOIN transcript_analytics_sources AS source
+               ON source.provider = state.provider
+              AND source.source_key = state.source_key
+             WHERE state.provider = ?1 AND state.source_key = ?2",
+            params![provider, source_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Read runtime retention open state: {error}"))?;
+    let Some((finalized_through_rowid, Some(open_turn_started_ms), session_id)) = state else {
+        return Ok(0);
+    };
+    let mut open_events = {
+        let mut statement = tx
+            .prepare(
+                "SELECT rowid, timestamp, kind
+                 FROM session_events
+                 WHERE provider = ?1 AND source_key = ?2
+                   AND rowid > ?3
+                 ORDER BY timestamp, rowid",
+            )
+            .map_err(|error| format!("Prepare runtime retention open tail: {error}"))?;
+        let rows = statement
+            .query_map(
+                params![provider, source_key, finalized_through_rowid],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("Query runtime retention open tail: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read runtime retention open tail: {error}"))?
+    };
+    if open_events.is_empty() {
+        return Err(format!(
+            "Runtime retention open state for {provider}/{source_key} has no raw events"
+        ));
+    }
+    let mut last_event_ms = 0_i64;
+    for (_, timestamp, _) in &open_events {
+        if !crate::retention::is_conforming_timestamp(timestamp) {
+            return Ok(0);
+        }
+        let timestamp_ms = DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|error| format!("Parse runtime retention open timestamp: {error}"))?
+            .timestamp_millis();
+        if timestamp_ms >= cutoff_ms {
+            return Ok(0);
+        }
+        last_event_ms = timestamp_ms;
+    }
+    let (_, _, last_kind) = open_events
+        .last()
+        .expect("non-empty runtime retention open tail");
+    let turn_end_ms = if last_kind == "asst_tool_use" {
+        last_event_ms.saturating_add(RUNTIME_TOOL_WAIT_MAX_MS)
+    } else {
+        last_event_ms
+    };
+    if turn_end_ms > cutoff_ms {
+        return Ok(0);
+    }
+    let mut changed = 0_usize;
+    if turn_end_ms > open_turn_started_ms {
+        let hour_utc = open_turn_started_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+        changed = changed.saturating_add(
+            tx.execute(
+                "INSERT INTO runtime_hourly (
+                     hour_utc, provider, source_key, session_id, turn_count,
+                     runtime_secs, first_turn_start_ms, last_turn_end_ms,
+                     raw_pruned
+                 ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, 0)
+                 ON CONFLICT(hour_utc, provider, source_key) DO UPDATE SET
+                     session_id = excluded.session_id,
+                     turn_count = runtime_hourly.turn_count + 1,
+                     runtime_secs = runtime_hourly.runtime_secs + excluded.runtime_secs,
+                     first_turn_start_ms = MIN(
+                         runtime_hourly.first_turn_start_ms,
+                         excluded.first_turn_start_ms
+                     ),
+                     last_turn_end_ms = MAX(
+                         runtime_hourly.last_turn_end_ms,
+                         excluded.last_turn_end_ms
+                     )",
+                params![
+                    hour_utc,
+                    provider,
+                    source_key,
+                    session_id,
+                    (turn_end_ms - open_turn_started_ms) as f64 / 1_000.0,
+                    open_turn_started_ms,
+                    turn_end_ms,
+                ],
+            )
+            .map_err(|error| format!("Seal runtime retention open turn: {error}"))?,
+        );
+    }
+    let max_open_rowid = open_events
+        .drain(..)
+        .map(|(rowid, _, _)| rowid)
+        .max()
+        .unwrap_or(finalized_through_rowid);
+    changed = changed.saturating_add(
+        tx.execute(
+            "UPDATE runtime_turn_state
+             SET finalized_through_rowid = MAX(finalized_through_rowid, ?3),
+                 open_turn_started_ms = NULL
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider, source_key, max_open_rowid],
+        )
+        .map_err(|error| format!("Seal runtime retention open state: {error}"))?,
+    );
+    Ok(changed)
 }
 
 impl ModelRollupBackfillTarget {
@@ -3106,64 +3419,8 @@ impl RuntimeRollupBackfillTarget {
             });
         }
 
-        let mut rollups = BTreeMap::<i64, PreparedRuntimeHourlyRollup>::new();
-        let mut finalized_through_rowid = 0_i64;
-        let mut open_turn_started_ms = None;
-        if let Some(first) = events.first() {
-            let mut turn_start_ms = first.timestamp_ms;
-            let mut open_turn_min_rowid = first.rowid;
-            let mut previous = first;
-            for event in events.iter().skip(1) {
-                let gap_ms = event.timestamp_ms.saturating_sub(previous.timestamp_ms);
-                let is_tool_wait =
-                    previous.kind == "asst_tool_use" && event.kind == "user_tool_result";
-                let continues_turn = if is_tool_wait {
-                    gap_ms <= RUNTIME_TOOL_WAIT_MAX_MS
-                } else {
-                    gap_ms <= RUNTIME_IDLE_THRESHOLD_MS
-                };
-                if continues_turn {
-                    open_turn_min_rowid = open_turn_min_rowid.min(event.rowid);
-                } else {
-                    let turn_end_ms = if is_tool_wait {
-                        previous
-                            .timestamp_ms
-                            .saturating_add(gap_ms.min(RUNTIME_TOOL_WAIT_MAX_MS))
-                    } else {
-                        previous.timestamp_ms
-                    };
-                    if turn_end_ms > turn_start_ms {
-                        let hour_utc =
-                            turn_start_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
-                        let rollup = rollups.entry(hour_utc).or_insert_with(|| {
-                            PreparedRuntimeHourlyRollup {
-                                hour_utc,
-                                turn_count: 0,
-                                runtime_millis: 0,
-                                first_turn_start_ms: turn_start_ms,
-                                last_turn_end_ms: turn_end_ms,
-                            }
-                        });
-                        rollup.turn_count = rollup.turn_count.checked_add(1).ok_or_else(|| {
-                            runtime_backfill_sql_error("Runtime backfill turn count overflowed")
-                        })?;
-                        rollup.runtime_millis = rollup
-                            .runtime_millis
-                            .checked_add(turn_end_ms - turn_start_ms)
-                            .ok_or_else(|| {
-                                runtime_backfill_sql_error("Runtime backfill duration overflowed")
-                            })?;
-                        rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
-                        rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
-                    }
-                    turn_start_ms = event.timestamp_ms;
-                    open_turn_min_rowid = event.rowid;
-                }
-                previous = event;
-            }
-            finalized_through_rowid = open_turn_min_rowid.saturating_sub(1).max(0);
-            open_turn_started_ms = Some(turn_start_ms);
-        }
+        let fold = fold_persisted_runtime_events(&events, "Runtime backfill")
+            .map_err(runtime_backfill_sql_error)?;
 
         Ok(Some(PreparedRuntimeBackfillSource {
             provider,
@@ -3175,9 +3432,9 @@ impl RuntimeRollupBackfillTarget {
             row_count,
             content_sha256,
             seen_generation,
-            rollups: rollups.into_values().collect(),
-            finalized_through_rowid,
-            open_turn_started_ms,
+            rollups: fold.rollups,
+            finalized_through_rowid: fold.finalized_through_rowid,
+            open_turn_started_ms: fold.open_turn_started_ms,
         }))
     }
 }
@@ -3579,12 +3836,97 @@ fn completed_runtime_rollup_stats(
 /// so source pruning must preserve child-first ordering explicitly.
 /// Accepting an existing transaction keeps both deletes in the caller's
 /// atomic pruning operation.
+fn bump_rollup_generation_in_transaction(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    let updated = tx
+        .execute(
+            "UPDATE rollup_meta
+             SET rollup_generation = rollup_generation + 1
+             WHERE id = 1",
+            [],
+        )
+        .map_err(|error| format!("Bump hourly rollup generation: {error}"))?;
+    if updated != 1 {
+        return Err("Hourly rollup metadata singleton is missing".to_string());
+    }
+    Ok(())
+}
+
+fn delete_model_rollups_for_sources_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    sources: &[(String, String)],
+) -> Result<usize, String> {
+    let mut deleted = 0_usize;
+    let mut statement = tx
+        .prepare_cached(
+            "DELETE FROM model_usage_hourly
+             WHERE provider = ?1 AND source_key = ?2",
+        )
+        .map_err(|error| format!("Prepare model rollup source delete: {error}"))?;
+    for (provider, source_key) in sources {
+        deleted = deleted.saturating_add(
+            statement
+                .execute(params![provider, source_key])
+                .map_err(|error| format!("Delete model rollup source rows: {error}"))?,
+        );
+    }
+    drop(statement);
+    if deleted > 0 {
+        bump_rollup_generation_in_transaction(tx)?;
+    }
+    Ok(deleted)
+}
+
+fn delete_runtime_rollups_for_sources_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    sources: &[(String, String)],
+) -> Result<usize, String> {
+    let mut deleted = 0_usize;
+    for table in ["runtime_hourly", "runtime_turn_state"] {
+        let mut statement = tx
+            .prepare_cached(&format!(
+                "DELETE FROM {table} WHERE provider = ?1 AND source_key = ?2"
+            ))
+            .map_err(|error| format!("Prepare {table} source delete: {error}"))?;
+        for (provider, source_key) in sources {
+            deleted = deleted.saturating_add(
+                statement
+                    .execute(params![provider, source_key])
+                    .map_err(|error| format!("Delete {table} source rows: {error}"))?,
+            );
+        }
+    }
+    if deleted > 0 {
+        bump_rollup_generation_in_transaction(tx)?;
+    }
+    Ok(deleted)
+}
+
 fn delete_model_observation_sources_for_root_in_transaction(
     tx: &rusqlite::Transaction<'_>,
     provider: &str,
     source_root_key: &str,
     generation: i64,
 ) -> Result<usize, String> {
+    let stale_sources = {
+        let mut statement = tx
+            .prepare(
+                "SELECT provider, source_key
+                 FROM model_observation_sources
+                 WHERE provider = ?1
+                   AND source_root_key = ?2
+                   AND seen_generation < ?3
+                 ORDER BY source_key",
+            )
+            .map_err(|error| format!("Prepare completed-root model source keys: {error}"))?;
+        let rows = statement
+            .query_map(params![provider, source_root_key, generation], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| format!("Query completed-root model source keys: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read completed-root model source keys: {error}"))?
+    };
+    delete_model_rollups_for_sources_in_transaction(tx, &stale_sources)?;
     tx.execute(
         "DELETE FROM model_usage_observations
          WHERE provider = ?1
@@ -3677,6 +4019,7 @@ fn suppress_project_model_sources_in_transaction(
 
     let mut observations_deleted = 0_usize;
     let mut sources_suppressed = 0_usize;
+    delete_model_rollups_for_sources_in_transaction(tx, &matching_sources)?;
     {
         let mut delete_observations = tx
             .prepare_cached(
@@ -3743,6 +4086,9 @@ fn suppress_transcript_analytics_sources_in_transaction(
     suppressed_at_ms: i64,
 ) -> Result<usize, String> {
     let mut deleted = 0_usize;
+    deleted = deleted.saturating_add(delete_runtime_rollups_for_sources_in_transaction(
+        tx, sources,
+    )?);
     for table in TRANSCRIPT_ANALYTICS_TABLES {
         let mut statement = tx
             .prepare_cached(&format!(
@@ -4915,6 +5261,11 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Read transcript prune key: {e}"))?;
         drop(stmt);
+        let rollup_sources = keys
+            .iter()
+            .map(|key| (proof.provider.as_str().to_string(), key.clone()))
+            .collect::<Vec<_>>();
+        delete_runtime_rollups_for_sources_in_transaction(&tx, &rollup_sources)?;
         for key in &keys {
             for table in [
                 "session_events",
@@ -11520,7 +11871,8 @@ impl Storage {
                         last_observed_at_ms = MAX(
                             model_usage_hourly.last_observed_at_ms,
                             excluded.last_observed_at_ms
-                        )",
+                        )
+                     WHERE model_usage_hourly.raw_pruned = 0",
                 )
                 .map_err(|error| format!("Prepare model hourly rollup UPSERT: {error}"))?;
             for rollup in &model_hourly_rollups {
@@ -14058,6 +14410,24 @@ impl Storage {
         // token-hourly rollup. Delete children explicitly, then leave the
         // retained source fingerprint suppressed so unchanged history cannot
         // reappear during retry.
+        let model_sources = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider, source_key
+                     FROM model_observation_sources
+                     WHERE hostname = ?1
+                     ORDER BY provider, source_key",
+                )
+                .map_err(|e| format!("Prepare host model source keys: {e}"))?;
+            let rows = statement
+                .query_map(params![hostname], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("Query host model source keys: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read host model source keys: {e}"))?
+        };
+        delete_model_rollups_for_sources_in_transaction(&tx, &model_sources)?;
         let model_observation_count = tx
             .execute(
                 "DELETE FROM model_usage_observations
@@ -14166,6 +14536,24 @@ impl Storage {
         // A visible session is the resolved analytics/root session. Matching
         // that identity removes every parent and subagent source without
         // conflating equal native IDs reported by different providers.
+        let model_sources = {
+            let mut statement = tx
+                .prepare_cached(
+                    "SELECT provider, source_key
+                     FROM model_observation_sources
+                     WHERE provider = ?1 AND analytics_session_id = ?2
+                     ORDER BY source_key",
+                )
+                .map_err(|e| format!("Prepare session model source keys: {e}"))?;
+            let rows = statement
+                .query_map(params![provider.as_str(), session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| format!("Query session model source keys: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Read session model source keys: {e}"))?
+        };
+        delete_model_rollups_for_sources_in_transaction(&tx, &model_sources)?;
         let model_observation_count = tx
             .execute(
                 "DELETE FROM model_usage_observations
@@ -28926,6 +29314,474 @@ mod tests {
                 base_ms + 620_000
             );
         }
+        clear_env();
+    }
+
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Source Delete And Authoritative Re-ingest]]
+    #[test]
+    #[serial]
+    fn model_rollup_preserves_pruned_authority_on_reingest_and_source_delete() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:01:00Z","sessionId":"authority-session","message":{"model":"model-a","usage":{"input_tokens":3}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:10:00Z","sessionId":"authority-session","message":{"model":"model-a","usage":{"output_tokens":5}}}"#,
+        ]
+        .join("\n");
+        let (source, observations, fingerprint) =
+            prepare_claude_model_source(&dir, "authority-source", "authority-session", &jsonl);
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("seed authoritative model source");
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE model_usage_hourly
+                 SET raw_pruned = 1
+                 WHERE provider = 'claude' AND source_key = 'authority-source'",
+                [],
+            )
+            .expect("mark authoritative model rollup");
+        }
+        storage
+            .set_setting(RETENTION_WATERMARK_KEY, "2026-07-30T10:05:00.000Z")
+            .expect("set model retention watermark");
+
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("reingest partially retained source");
+        {
+            let conn = storage.conn.lock();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT obs_count, input_tokens, output_tokens, raw_pruned
+                     FROM model_usage_hourly
+                     WHERE provider = 'claude' AND source_key = 'authority-source'",
+                    [],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?
+                    )),
+                )
+                .expect("read authoritative rollup after reingest"),
+                (2, 3, 5, 1),
+                "retained raw must not be added into an authoritative bucket"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM model_usage_observations
+                     WHERE provider = 'claude' AND source_key = 'authority-source'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count retained model raw"),
+                1
+            );
+        }
+
+        storage
+            .delete_session_data(IntegrationProvider::Claude, "authority-session")
+            .expect("delete authoritative model session");
+        let conn = storage.conn.lock();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_usage_hourly
+                 WHERE provider = 'claude' AND source_key = 'authority-source'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count deleted model rollups"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_usage_observations
+                 WHERE provider = 'claude' AND source_key = 'authority-source'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count deleted model raw"),
+            0
+        );
+        drop(conn);
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Source Delete Invalidation]]
+    #[test]
+    #[serial]
+    fn runtime_source_delete_removes_rollup_state_and_retention_aggregate() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "delete-root",
+            source_key: "delete-runtime-source",
+            session_id: "delete-runtime-session",
+            generation: 1,
+            marker: "delete-runtime",
+            rows: 0,
+        };
+        let events = vec![
+            (
+                "2026-07-30T10:00:00Z".to_string(),
+                crate::sessions::SessionEventKind::UserText,
+            ),
+            (
+                "2026-07-30T10:01:00Z".to_string(),
+                crate::sessions::SessionEventKind::AsstText,
+            ),
+            (
+                "2026-07-30T10:11:00Z".to_string(),
+                crate::sessions::SessionEventKind::UserText,
+            ),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed deleted runtime source");
+        storage
+            .conn
+            .lock()
+            .execute(
+                "INSERT INTO retention_daily_aggregates (
+                     provider, source_key, session_id, day, agent_id, file_path,
+                     tool_action_count, session_event_count, code_change_count,
+                     lines_added, lines_removed
+                 ) VALUES ('claude', ?1, ?2, '2026-07-30', '', '', 0, 2, 0, 0, 0)",
+                params![spec.source_key, spec.session_id],
+            )
+            .expect("seed runtime retention aggregate");
+
+        storage
+            .delete_session_data(IntegrationProvider::Claude, spec.session_id)
+            .expect("delete runtime session");
+        let conn = storage.conn.lock();
+        for table in [
+            "session_events",
+            "runtime_hourly",
+            "runtime_turn_state",
+            "retention_daily_aggregates",
+        ] {
+            assert_eq!(
+                conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                         WHERE provider = 'claude' AND source_key = ?1"
+                    ),
+                    params![spec.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or_else(|error| panic!("count {table} after source delete: {error}")),
+                0,
+                "{table} retained deleted source state"
+            );
+        }
+        drop(conn);
+        clear_env();
+    }
+
+    // @lat: [[rollup-retention-tests#Rollup Retention Test Specs#Missing Coverage Refusal]]
+    #[test]
+    #[serial]
+    fn retention_refuses_model_prune_without_exact_rollup_coverage() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let jsonl = r#"{"type":"assistant","timestamp":"2026-01-15T10:01:00Z","sessionId":"refusal-session","message":{"model":"model-a","usage":{"input_tokens":3}}}"#;
+        let (source, observations, fingerprint) =
+            prepare_claude_model_source(&dir, "refusal-source", "refusal-session", jsonl);
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("seed refusal model source");
+        storage
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM model_usage_hourly
+                 WHERE provider = 'claude' AND source_key = 'refusal-source'",
+                [],
+            )
+            .expect("remove model rollup coverage");
+        let request = crate::retention_engine::RetentionDeleteRequest {
+            cutoff: "2026-01-16T00:00:00.000Z".to_string(),
+            window_days: 30,
+            bytes_before: std::fs::metadata(storage.database_path())
+                .expect("stat refusal database")
+                .len(),
+            ran_at: DateTime::parse_from_rfc3339("2026-01-16T00:00:00Z")
+                .expect("parse refusal run time")
+                .with_timezone(&Utc),
+        };
+        let error = crate::retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &crate::retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect_err("missing model rollup must refuse prune");
+        assert!(matches!(
+            error,
+            crate::retention_engine::RetentionDeleteError::RollupCoverage {
+                table: "model_usage_observations",
+                ..
+            }
+        ));
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM model_usage_observations
+                     WHERE provider = 'claude' AND source_key = 'refusal-source'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count raw after refused prune"),
+            1
+        );
+        assert_eq!(
+            storage
+                .read_retention_watermark()
+                .expect("read watermark after refusal"),
+            None
+        );
+        clear_env();
+    }
+
+    // @lat: [[rollup-retention-tests#Rollup Retention Test Specs#Missing Runtime Coverage Refusal]]
+    #[test]
+    #[serial]
+    fn retention_refuses_runtime_prune_without_exact_rollup_coverage() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "runtime-refusal-root",
+            source_key: "runtime-refusal-source",
+            session_id: "runtime-refusal-session",
+            generation: 1,
+            marker: "runtime-refusal",
+            rows: 0,
+        };
+        let events = vec![
+            (
+                "2026-01-15T10:00:00.000Z".to_string(),
+                crate::sessions::SessionEventKind::UserText,
+            ),
+            (
+                "2026-01-15T10:01:00.000Z".to_string(),
+                crate::sessions::SessionEventKind::AsstText,
+            ),
+            (
+                "2026-01-15T10:11:00.000Z".to_string(),
+                crate::sessions::SessionEventKind::UserText,
+            ),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed runtime refusal source");
+        storage
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM runtime_hourly
+                 WHERE provider = 'claude' AND source_key = ?1",
+                params![spec.source_key],
+            )
+            .expect("remove runtime rollup coverage");
+        let request = crate::retention_engine::RetentionDeleteRequest {
+            cutoff: "2026-01-15T10:05:00.000Z".to_string(),
+            window_days: 30,
+            bytes_before: std::fs::metadata(storage.database_path())
+                .expect("stat runtime refusal database")
+                .len(),
+            ran_at: DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+                .expect("parse runtime refusal run time")
+                .with_timezone(&Utc),
+        };
+        let error = crate::retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &crate::retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect_err("missing runtime rollup must refuse prune");
+        assert!(matches!(
+            error,
+            crate::retention_engine::RetentionDeleteError::RollupCoverage {
+                table: "session_events",
+                ..
+            }
+        ));
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE provider = 'claude' AND source_key = ?1",
+                    params![spec.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count events after refused runtime prune"),
+            3
+        );
+        assert_eq!(
+            storage
+                .read_retention_watermark()
+                .expect("read watermark after runtime refusal"),
+            None
+        );
+        clear_env();
+    }
+
+    // @lat: [[rollup-retention-tests#Rollup Retention Test Specs#Fold Then Prune Authority]]
+    #[test]
+    #[serial]
+    fn retention_promotes_both_rollups_and_clamps_runtime_bookmark() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let model_jsonl = r#"{"type":"assistant","timestamp":"2026-01-15T10:01:00Z","sessionId":"prune-model-session","message":{"model":"model-a","usage":{"input_tokens":3}}}"#;
+        let (model_source, observations, fingerprint) = prepare_claude_model_source(
+            &dir,
+            "prune-model-source",
+            "prune-model-session",
+            model_jsonl,
+        );
+        storage
+            .replace_model_source(&model_source, &observations, &fingerprint)
+            .expect("seed pruned model source");
+
+        let runtime_spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "prune-runtime-root",
+            source_key: "prune-runtime-source",
+            session_id: "prune-runtime-session",
+            generation: 1,
+            marker: "prune-runtime",
+            rows: 0,
+        };
+        let runtime_events = vec![
+            (
+                "2026-01-15T10:00:00.000Z".to_string(),
+                crate::sessions::SessionEventKind::UserText,
+            ),
+            (
+                "2026-01-15T10:01:00.000Z".to_string(),
+                crate::sessions::SessionEventKind::AsstText,
+            ),
+            (
+                "2026-01-15T10:11:00.000Z".to_string(),
+                crate::sessions::SessionEventKind::UserText,
+            ),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(
+                &runtime_spec,
+                &runtime_events,
+            ))
+            .expect("seed pruned runtime source");
+        let deleted_runtime_horizon = storage
+            .conn
+            .lock()
+            .query_row(
+                "SELECT MAX(rowid) FROM session_events
+                 WHERE provider = 'claude' AND source_key = ?1
+                   AND timestamp < '2026-01-15T10:11:00.000Z'",
+                params![runtime_spec.source_key],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read runtime prune horizon");
+        let model_raw_count = storage
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM model_usage_observations
+                 WHERE provider = 'claude' AND source_key = 'prune-model-source'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count model prune rows");
+        let request = crate::retention_engine::RetentionDeleteRequest {
+            cutoff: "2026-01-15T10:05:00.000Z".to_string(),
+            window_days: 30,
+            bytes_before: std::fs::metadata(storage.database_path())
+                .expect("stat prune database")
+                .len(),
+            ran_at: DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+                .expect("parse prune run time")
+                .with_timezone(&Utc),
+        };
+        let report = crate::retention_engine::run_retention_delete_phase(
+            &storage,
+            &request,
+            &crate::retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect("run rollup-aware retention");
+        assert_eq!(report.deleted.model_usage_observations, model_raw_count);
+        assert_eq!(report.deleted.session_events, 2);
+        {
+            let conn = storage.conn.lock();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT raw_pruned FROM model_usage_hourly
+                     WHERE provider = 'claude' AND source_key = 'prune-model-source'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read pruned model authority"),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT raw_pruned FROM runtime_hourly
+                     WHERE provider = 'claude' AND source_key = ?1",
+                    params![runtime_spec.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read pruned runtime authority"),
+                1
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT finalized_through_rowid FROM runtime_turn_state
+                     WHERE provider = 'claude' AND source_key = ?1",
+                    params![runtime_spec.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read clamped runtime bookmark")
+                    >= deleted_runtime_horizon
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COALESCE(SUM(session_event_count), 0)
+                     FROM retention_daily_aggregates
+                     WHERE provider = 'claude' AND source_key = ?1",
+                    params![runtime_spec.source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read retained event aggregate"),
+                2
+            );
+            conn.execute(
+                "UPDATE rollup_meta SET runtime_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete runtime rollup for read");
+        }
+        let stats = with_pinned_query_now(
+            DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
+                .expect("parse pinned runtime now")
+                .with_timezone(&Utc),
+            || storage.get_llm_runtime_stats("30d", None),
+        )
+        .expect("read pruned runtime stats");
+        assert_eq!(stats.turn_count, 1);
+        assert_eq!(stats.total_runtime_secs, 60.0);
         clear_env();
     }
 

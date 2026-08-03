@@ -69,7 +69,9 @@ use serde_json::{Map, Value, json};
 use crate::retention::{
     RetentionAuditRecord, RetentionRunStatus, RetentionTableCounts, is_conforming_timestamp,
 };
-use crate::storage::Storage;
+use crate::storage::{
+    Storage, seal_runtime_open_turn_for_retention, verify_runtime_rollup_source_coverage,
+};
 
 /// Rows deleted per chunk transaction.
 ///
@@ -226,6 +228,9 @@ pub enum RetentionDeleteError {
     Connection { reason: String },
     /// A statement failed on the maintenance connection.
     Sqlite(rusqlite::Error),
+    /// Raw detail is not fully represented by the hourly authority that
+    /// would survive its deletion.
+    RollupCoverage { table: &'static str, reason: String },
     /// The watermark advance failed, so the run refuses to delete anything —
     /// deleting without a durable watermark re-opens the resurrection path the
     /// watermark exists to close.
@@ -249,6 +254,9 @@ impl std::fmt::Display for RetentionDeleteError {
             }
             RetentionDeleteError::Sqlite(error) => {
                 write!(f, "Retention maintenance statement failed: {error}")
+            }
+            RetentionDeleteError::RollupCoverage { table, reason } => {
+                write!(f, "Retention refused to prune {table}: {reason}")
             }
             RetentionDeleteError::WatermarkAdvance { reason } => {
                 write!(
@@ -582,6 +590,49 @@ fn doomed_scan_sql(target: RetentionTarget) -> String {
              SELECT rowid AS rid FROM {} WHERE observed_at_ms < ?1",
             target.doomed_table(),
             target.table()
+        ),
+        RetentionTarget::SessionEvents => format!(
+            "CREATE TEMP TABLE {} AS
+             SELECT event.rowid AS rid
+             FROM session_events AS event
+             LEFT JOIN runtime_turn_state AS state
+               ON state.provider = event.provider
+              AND state.source_key = event.source_key
+             WHERE event.source_key IS NOT NULL
+               AND (
+                   state.source_key IS NULL
+                   OR event.rowid <= state.finalized_through_rowid
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM session_events AS tail
+                       WHERE tail.provider = event.provider
+                         AND tail.source_key = event.source_key
+                         AND tail.rowid > state.finalized_through_rowid
+                         AND (
+                             length(tail.timestamp) != 24
+                             OR tail.timestamp NOT LIKE '%Z'
+                             OR tail.timestamp >= ?1
+                             OR (
+                                 tail.kind = 'asst_tool_use'
+                                 AND tail.rowid = (
+                                     SELECT latest.rowid
+                                     FROM session_events AS latest
+                                     WHERE latest.provider = event.provider
+                                       AND latest.source_key = event.source_key
+                                       AND latest.rowid > state.finalized_through_rowid
+                                     ORDER BY latest.timestamp DESC, latest.rowid DESC
+                                     LIMIT 1
+                                 )
+                                 AND julianday(tail.timestamp, '+6 hours')
+                                     > julianday(?1)
+                             )
+                         )
+                   )
+               )
+               AND length(event.timestamp) = 24
+               AND event.timestamp LIKE '%Z'
+               AND event.timestamp < ?1",
+            target.doomed_table()
         ),
         _ => format!(
             "CREATE TEMP TABLE {} AS
@@ -1115,8 +1166,239 @@ impl DrainState {
     }
 
     fn total_deleted(&self) -> i64 {
-        self.deleted.tool_actions + self.deleted.session_events
+        self.deleted.tool_actions
+            + self.deleted.session_events
+            + self.deleted.model_usage_observations
     }
+}
+
+fn prepare_model_rollup_prune(
+    tx: &rusqlite::Transaction<'_>,
+    doomed_table: &str,
+    boundary: i64,
+    mark: bool,
+) -> Result<usize, RetentionDeleteError> {
+    tx.execute_batch("DROP TABLE IF EXISTS temp.retention_model_rollup_expected;")?;
+    tx.execute(
+        &format!(
+            "CREATE TEMP TABLE retention_model_rollup_expected AS
+             WITH affected AS (
+                 SELECT DISTINCT
+                        (observation.observed_at_ms / 3600000) * 3600000 AS hour_utc,
+                        observation.provider,
+                        COALESCE(observation.derived_model_id, '') AS derived_model_id,
+                        observation.source_key
+                 FROM model_usage_observations AS observation
+                 WHERE observation.rowid <= ?1
+                   AND observation.rowid IN (SELECT rid FROM {doomed_table})
+             )
+             SELECT (observation.observed_at_ms / 3600000) * 3600000 AS hour_utc,
+                    observation.provider,
+                    COALESCE(observation.derived_model_id, '') AS derived_model_id,
+                    observation.source_key,
+                    MIN(observation.analytics_session_id) AS analytics_session_id,
+                    COUNT(*) AS obs_count,
+                    SUM(observation.observation_kind = 'turn') AS turn_count,
+                    SUM(observation.observation_kind = 'token') AS token_count,
+                    SUM(observation.is_sidechain) AS sidechain_count,
+                    SUM(COALESCE(observation.input_tokens, 0)) AS input_tokens,
+                    COUNT(observation.input_tokens) AS input_tokens_present,
+                    SUM(COALESCE(observation.output_tokens, 0)) AS output_tokens,
+                    COUNT(observation.output_tokens) AS output_tokens_present,
+                    SUM(COALESCE(observation.cache_creation_tokens, 0))
+                        AS cache_creation_tokens,
+                    COUNT(observation.cache_creation_tokens)
+                        AS cache_creation_tokens_present,
+                    SUM(COALESCE(observation.cache_read_tokens, 0))
+                        AS cache_read_tokens,
+                    COUNT(observation.cache_read_tokens) AS cache_read_tokens_present,
+                    MIN(observation.observed_at_ms) AS first_observed_at_ms,
+                    MAX(observation.observed_at_ms) AS last_observed_at_ms
+             FROM model_usage_observations AS observation
+             JOIN affected
+               ON affected.hour_utc =
+                    (observation.observed_at_ms / 3600000) * 3600000
+              AND affected.provider = observation.provider
+              AND affected.derived_model_id =
+                    COALESCE(observation.derived_model_id, '')
+              AND affected.source_key = observation.source_key
+             GROUP BY 1, 2, 3, 4"
+        ),
+        params![boundary],
+    )?;
+
+    let uncovered: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM retention_model_rollup_expected AS expected
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM model_usage_hourly AS rollup
+             WHERE rollup.hour_utc = expected.hour_utc
+               AND rollup.provider = expected.provider
+               AND rollup.derived_model_id = expected.derived_model_id
+               AND rollup.source_key = expected.source_key
+               AND (
+                   rollup.raw_pruned = 1
+                   OR (
+                       rollup.analytics_session_id = expected.analytics_session_id
+                       AND rollup.obs_count = expected.obs_count
+                       AND rollup.turn_count = expected.turn_count
+                       AND rollup.token_count = expected.token_count
+                       AND rollup.sidechain_count = expected.sidechain_count
+                       AND rollup.input_tokens = expected.input_tokens
+                       AND rollup.input_tokens_present = expected.input_tokens_present
+                       AND rollup.output_tokens = expected.output_tokens
+                       AND rollup.output_tokens_present = expected.output_tokens_present
+                       AND rollup.cache_creation_tokens = expected.cache_creation_tokens
+                       AND rollup.cache_creation_tokens_present =
+                           expected.cache_creation_tokens_present
+                       AND rollup.cache_read_tokens = expected.cache_read_tokens
+                       AND rollup.cache_read_tokens_present =
+                           expected.cache_read_tokens_present
+                       AND rollup.first_observed_at_ms = expected.first_observed_at_ms
+                       AND rollup.last_observed_at_ms = expected.last_observed_at_ms
+                   )
+               )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if uncovered != 0 {
+        return Err(RetentionDeleteError::RollupCoverage {
+            table: "model_usage_observations",
+            reason: format!("{uncovered} affected hourly group(s) do not match model_usage_hourly"),
+        });
+    }
+    if !mark {
+        return Ok(0);
+    }
+
+    tx.execute(
+        "UPDATE model_usage_hourly AS rollup
+         SET raw_pruned = 1
+         WHERE raw_pruned = 0
+           AND EXISTS (
+               SELECT 1
+               FROM retention_model_rollup_expected AS expected
+               WHERE expected.hour_utc = rollup.hour_utc
+                 AND expected.provider = rollup.provider
+                 AND expected.derived_model_id = rollup.derived_model_id
+                 AND expected.source_key = rollup.source_key
+           )",
+        [],
+    )
+    .map_err(Into::into)
+}
+
+fn prepare_runtime_rollup_prune(
+    tx: &rusqlite::Transaction<'_>,
+    doomed_table: &str,
+    boundary: i64,
+    cutoff_ms: i64,
+    mark: bool,
+) -> Result<usize, RetentionDeleteError> {
+    let sources = {
+        let mut statement = tx.prepare(&format!(
+            "SELECT DISTINCT event.provider, event.source_key
+             FROM session_events AS event
+             WHERE event.rowid <= ?1
+               AND event.rowid IN (SELECT rid FROM {doomed_table})
+             ORDER BY event.provider, event.source_key"
+        ))?;
+        let rows = statement.query_map(params![boundary], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if !mark {
+        for (provider, source_key) in &sources {
+            verify_runtime_rollup_source_coverage(tx, provider, source_key).map_err(|reason| {
+                RetentionDeleteError::RollupCoverage {
+                    table: "session_events",
+                    reason,
+                }
+            })?;
+        }
+        return Ok(0);
+    }
+
+    let mut sealed = 0_usize;
+    for (provider, source_key) in &sources {
+        sealed = sealed.saturating_add(
+            seal_runtime_open_turn_for_retention(tx, provider, source_key, cutoff_ms).map_err(
+                |reason| RetentionDeleteError::RollupCoverage {
+                    table: "session_events",
+                    reason,
+                },
+            )?,
+        );
+    }
+
+    let marked = tx.execute(
+        &format!(
+            "UPDATE runtime_hourly AS rollup
+             SET raw_pruned = 1
+             WHERE raw_pruned = 0
+               AND rollup.first_turn_start_ms < ?2
+               AND EXISTS (
+                   SELECT 1
+                   FROM session_events AS event
+                   WHERE event.provider = rollup.provider
+                     AND event.source_key = rollup.source_key
+                     AND event.rowid <= ?1
+                     AND event.rowid IN (SELECT rid FROM {doomed_table})
+               )"
+        ),
+        params![boundary, cutoff_ms],
+    )?;
+    let clamped = tx.execute(
+        &format!(
+            "UPDATE runtime_turn_state AS state
+             SET finalized_through_rowid = MAX(
+                 finalized_through_rowid,
+                 (
+                     SELECT COALESCE(MAX(event.rowid), finalized_through_rowid)
+                     FROM session_events AS event
+                     WHERE event.provider = state.provider
+                       AND event.source_key = state.source_key
+                       AND event.rowid <= ?1
+                       AND event.rowid IN (SELECT rid FROM {doomed_table})
+                 )
+             )
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM session_events AS event
+                 WHERE event.provider = state.provider
+                   AND event.source_key = state.source_key
+                   AND event.rowid <= ?1
+                   AND event.rowid IN (SELECT rid FROM {doomed_table})
+             )"
+        ),
+        params![boundary],
+    )?;
+    Ok(sealed.saturating_add(marked).saturating_add(clamped))
+}
+
+fn validate_rollup_prune_coverage(
+    conn: &mut Connection,
+    cutoff_ms: i64,
+) -> Result<(), RetentionDeleteError> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    prepare_runtime_rollup_prune(
+        &tx,
+        RetentionTarget::SessionEvents.doomed_table(),
+        i64::MAX,
+        cutoff_ms,
+        false,
+    )?;
+    prepare_model_rollup_prune(
+        &tx,
+        RetentionTarget::ModelUsageObservations.doomed_table(),
+        i64::MAX,
+        false,
+    )?;
+    tx.rollback()?;
+    Ok(())
 }
 
 /// Drain one target table in chunks bounded by a single scalar rowid.
@@ -1134,6 +1416,7 @@ fn drain_target(
     conn: &mut Connection,
     db_path: &Path,
     target: RetentionTarget,
+    cutoff_ms: i64,
     total_doomed: i64,
     budget: RetentionDeleteBudget,
     controls: &RetentionDeleteControls<'_>,
@@ -1250,6 +1533,29 @@ fn drain_target(
             tx.rollback()?;
             return Ok((state, DrainOutcome::Completed));
         };
+        let rollup_rows_changed = match target {
+            RetentionTarget::ToolActions => 0,
+            RetentionTarget::SessionEvents => {
+                prepare_runtime_rollup_prune(&tx, target.doomed_table(), boundary, cutoff_ms, true)?
+            }
+            RetentionTarget::ModelUsageObservations => {
+                prepare_model_rollup_prune(&tx, target.doomed_table(), boundary, true)?
+            }
+        };
+        if rollup_rows_changed > 0 {
+            let updated = tx.execute(
+                "UPDATE rollup_meta
+                 SET rollup_generation = rollup_generation + 1
+                 WHERE id = 1",
+                [],
+            )?;
+            if updated != 1 {
+                return Err(RetentionDeleteError::RollupCoverage {
+                    table: target.table(),
+                    reason: "rollup metadata singleton is missing".to_string(),
+                });
+            }
+        }
         if let Some(target_aggregate_sql) = &target_aggregate_sql {
             tx.execute(target_aggregate_sql, params![boundary])?;
         }
@@ -1321,6 +1627,11 @@ pub fn run_retention_delete_phase(
     let db_path = storage.database_path().to_path_buf();
     let mut conn = open_maintenance_connection(&db_path)?;
     let scan = scan_doomed_rows(&conn, &request.cutoff, controls)?;
+    let cutoff_ms = DateTime::parse_from_rfc3339(&request.cutoff)
+        .map_err(|_| RetentionDeleteError::MalformedCutoff {
+            cutoff: request.cutoff.clone(),
+        })?
+        .timestamp_millis();
 
     if let Some(reason) = scan.skip_reason() {
         return finish(
@@ -1381,6 +1692,7 @@ pub fn run_retention_delete_phase(
             );
         }
     };
+    validate_rollup_prune_coverage(&mut conn, cutoff_ms)?;
 
     let mut watermark_advanced = false;
     let outcome = {
@@ -1407,6 +1719,7 @@ pub fn run_retention_delete_phase(
                 &mut conn,
                 &db_path,
                 target,
+                cutoff_ms,
                 scan.total_doomed(),
                 budget,
                 controls,
@@ -1570,8 +1883,9 @@ mod tests {
     /// in both target tables. The fixture never lands a row on a boundary, so
     /// without this the strict `<` predicate is untested at its own edge.
     fn plant_boundary_rows(fixture: &RetentionFixture, cutoff: &str) {
-        let conn = fixture.open_connection().expect("open fixture connection");
-        conn.execute(
+        let mut conn = fixture.open_connection().expect("open fixture connection");
+        let tx = conn.transaction().expect("begin boundary insert");
+        tx.execute(
             "INSERT INTO tool_actions
                  (provider, source_key, action_key, message_id, session_id, chain_id,
                   tool_name, category, summary, timestamp)
@@ -1581,7 +1895,7 @@ mod tests {
             params![cutoff],
         )
         .expect("plant tool_actions boundary row");
-        conn.execute(
+        tx.execute(
             "INSERT INTO session_events
                  (provider, source_key, event_key, session_id, chain_id, timestamp, kind)
              VALUES ('claude', 'retention-fixture/source-0000.jsonl', 'se-boundary',
@@ -1589,6 +1903,16 @@ mod tests {
             params![cutoff],
         )
         .expect("plant session_events boundary row");
+        crate::storage::refold_runtime_source_identity(
+            &tx,
+            "claude",
+            "retention-fixture/source-0000.jsonl",
+            "session-0000",
+            "chain-0000",
+        )
+        .expect("refold boundary runtime source");
+        tx.commit()
+            .expect("commit boundary rows and runtime refold");
     }
 
     fn boundary_rows_present(fixture: &RetentionFixture) -> (i64, i64) {

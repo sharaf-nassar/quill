@@ -12,6 +12,10 @@ Persisted event gaps must produce stable closed turns and exact source replaceme
 
 The fixture covers 5-minute continuity, ordinary idle closure, tool waits below and above 6 hours, start-hour attribution, the finalized bookmark, the open turn, exact re-ingest, and rollback after a late registry failure.
 
+## Runtime Source Delete Invalidation
+
+Explicit source deletion must atomically remove runtime raw events, hourly authority, open-turn state, and retained daily counters so no deleted source can remain visible.
+
 ## Runtime Fold Burst Budget
 
 Runtime finalization and folding must add no more than 10% p95 latency to representative burst-shaped session-event replacement batches.

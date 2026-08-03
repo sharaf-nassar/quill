@@ -22,6 +22,10 @@ A source ingested into an hour older than the committed bookmark must stay exact
 
 A source replaced between chunks must remain equal to the current raw group-by across already-bookmarked and future hours.
 
+## Source Delete And Authoritative Re-ingest
+
+Re-ingest must never add retained raw into an authoritative pruned bucket, and explicit source deletion must remove both raw evidence and every hourly authority for that source.
+
 ## Maintenance Admission Refusal
 
 Rebuild admission must refuse both an active maintenance writer and a writer already queued behind the current backfill reader.

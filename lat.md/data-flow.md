@@ -70,9 +70,13 @@ pages into freed bytes without letting an ingest write land between the halves.
    [[src-tauri/src/retention_engine.rs#write_retention_archive]] atomically
    publishes a JSONL sidecar containing every preview-counted row before any
    delete, including the non-conforming rows the database keeps.
-5. The engine preflights free disk after the optional archive, advances
-   `retention.watermark` before the first chunk commits, and deletes in chunks
-   with WAL checkpoints, periodic free-space checks, and progress per chunk.
+5. The engine preflights free disk after the optional archive, then proves every
+   affected model group and finalized runtime source equals its hourly refold.
+   Missing coverage refuses before `retention.watermark` moves. Each chunk marks
+   covered rollups `raw_pruned=1`, clamps runtime state past deleted rowids,
+   writes transcript daily counters, and deletes raw in one transaction. The
+   partial runtime turns stay raw, while a fully doomed turn is sealed into the
+   hourly authority first. Runtime stats never merge daily counters.
 6. The maintenance connection is closed, then
    [[src-tauri/src/storage.rs#Storage#vacuum_database]] runs under the same
    lease and emits `Compacting database`. Its preflight is independent of the
@@ -146,7 +150,7 @@ When an ancestor changes a retained descendant's resolved analytics root, prepar
 
 The first model-rollup pass and manual rebuild share [[src-tauri/src/rollup_backfill.rs#run_rollup_backfill]]. A committed bookmark names the last complete UTC hour; each next transaction replaces current raw-backed groups across a half-open hour range, preserves pruned authority, and yields before its WAL checkpoint. Existing raw reads remain active until `model_backfill_status` commits `complete`.
 
-Deletion keeps each removed source fingerprint as durable suppression. Reconciliation skips unchanged suppressed content; only one successful atomic replacement of changed content clears suppression and restores observations. All aggregate, history, paging, and chain queries exclude suppressed ownership, so attribution coverage and empty-state scope follow the same lifecycle.
+Deletion keeps each removed source fingerprint as durable suppression and removes that source's raw-backed and pruned hourly rows in the same transaction. Reconciliation skips unchanged suppressed content; only one successful atomic replacement of changed content clears suppression and restores observations. Re-ingest refolds unpruned groups but never updates an authoritative `raw_pruned=1` conflict. All aggregate, history, paging, and chain queries join active source ownership at read time, so suppression and restored visibility follow one lifecycle without rewriting rollups.
 
 The [[src-tauri/src/storage.rs#Storage#get_model_analytics|aggregate]], [[src-tauri/src/storage.rs#Storage#get_model_history|history]], overview, and [[src-tauri/src/storage.rs#Storage#get_model_sessions|paged-session]] reads use separate read-only deferred transactions rather than the primary connection mutex. Once rollup backfill completes, overview and history read complete closed UTC hours from `model_usage_hourly`, joined to active sources at read time, and use raw evidence for leading partial/current hours or documented facet exceptions. Incomplete states preserve the raw path and expose `buildingIndex`. They can read WAL snapshots concurrently with each other and committed reconciliation batches without changing per-response snapshot semantics, so the Sessions drill-down no longer stalls behind ingestion writes.
 

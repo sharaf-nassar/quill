@@ -54,6 +54,7 @@ use crate::storage::Storage;
 /// Provider every fixture row is attributed to. One provider keeps the
 /// per-month counts trivially assertable; retention is provider-agnostic.
 pub const FIXTURE_PROVIDER: &str = "claude";
+const NONCONFORMING_RUNTIME_SOURCE: &str = "retention-fixture/nonconforming-runtime-source.jsonl";
 
 /// Width of one synthetic "month" bucket, in days. Fixed rather than calendar
 /// months so bucket boundaries are exact multiples of a duration.
@@ -600,6 +601,24 @@ fn write_corpus(
     for table in RetentionTable::ALL {
         write_table(&tx, plan, table)?;
     }
+    for index in 0..plan.sources() {
+        crate::storage::refold_runtime_source_identity(
+            &tx,
+            FIXTURE_PROVIDER,
+            &source_key(index),
+            &format!("session-{index:04}"),
+            &format!("chain-{index:04}"),
+        )
+        .map_err(RetentionFixtureError::StorageInit)?;
+    }
+    crate::storage::refold_runtime_source_identity(
+        &tx,
+        FIXTURE_PROVIDER,
+        NONCONFORMING_RUNTIME_SOURCE,
+        "nonconforming-runtime-session",
+        "nonconforming-runtime-chain",
+    )
+    .map_err(RetentionFixtureError::StorageInit)?;
     tx.commit()?;
     Ok(())
 }
@@ -629,6 +648,14 @@ fn write_sources(
             format!("chain-{index:04}"),
         ])?;
     }
+    stmt.execute(params![
+        FIXTURE_PROVIDER,
+        NONCONFORMING_RUNTIME_SOURCE,
+        "retention-fixture",
+        "/retention-fixture/nonconforming-runtime-source.jsonl",
+        "nonconforming-runtime-session",
+        "nonconforming-runtime-chain",
+    ])?;
     Ok(())
 }
 
@@ -638,6 +665,27 @@ fn write_table(
     table: RetentionTable,
 ) -> Result<(), RetentionFixtureError> {
     let mut stmt = tx.prepare(insert_sql(table))?;
+    if table == RetentionTable::SessionEvents {
+        let mut seeds = Vec::new();
+        for bucket in plan.buckets() {
+            for kind in RetentionRowKind::ALL {
+                let rows = bucket.rows(table, kind);
+                let slot = slot_for(table, kind);
+                for row in 0..rows {
+                    seeds.push(seed_for(plan, bucket, table, kind, slot, row));
+                }
+            }
+        }
+        seeds.sort_by_key(|seed| {
+            DateTime::parse_from_rfc3339(&seed.timestamp)
+                .map(|timestamp| timestamp.timestamp_millis())
+                .unwrap_or(i64::MAX)
+        });
+        for seed in &seeds {
+            bind_row(&mut stmt, seed)?;
+        }
+        return Ok(());
+    }
     for bucket in plan.buckets() {
         for kind in RetentionRowKind::ALL {
             let rows = bucket.rows(table, kind);
@@ -685,6 +733,17 @@ fn seed_for(
             key,
         },
         _ => {
+            if table == RetentionTable::SessionEvents
+                && kind == RetentionRowKind::OwnedNonConforming
+            {
+                return RowSeed {
+                    timestamp,
+                    source_key: Some(NONCONFORMING_RUNTIME_SOURCE.to_string()),
+                    session_id: "nonconforming-runtime-session".to_string(),
+                    chain_id: "nonconforming-runtime-chain".to_string(),
+                    key,
+                };
+            }
             let source_index = ((u64::from(bucket.index) + row) % u64::from(plan.sources())) as u32;
             RowSeed {
                 timestamp,

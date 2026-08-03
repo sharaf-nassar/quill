@@ -815,12 +815,18 @@ is index-dominated — `PRAGMA wal_checkpoint(TRUNCATE)` after each commit bound
 WAL by one chunk rather than by the run, measured at zero post-checkpoint bytes
 at every swept chunk size.
 
-Before each chunk deletes detail rows, [[src-tauri/src/retention_engine.rs#drain_target]]
-upserts their daily counters into [[backend#Database#Schema#Retention aggregates]]
-inside the same SQLite transaction. A committed prune therefore leaves a compact
-session/code-stat view; a failed chunk leaves both raw detail and its aggregate
-unchanged. Live rows remain outside this path because the doomed scan excludes
-`source_key IS NULL`.
+Before the watermark moves, the engine verifies that every affected model group
+and finalized runtime source equals its hourly refold. Missing or divergent
+coverage refuses the whole prune. Before each chunk deletes detail rows,
+[[src-tauri/src/retention_engine.rs#drain_target]] promotes covered hourly rows
+to `raw_pruned=1`, clamps the runtime bookmark, and upserts transcript daily
+counters into [[backend#Database#Schema#Retention aggregates]] inside the same
+SQLite transaction. A committed prune therefore leaves hourly authority plus a
+compact session/code-stat view; runtime reads consume only the hourly side, so
+daily event counters cannot double-count runtime. A failed chunk leaves raw,
+rollups, bookmark, and daily aggregate unchanged. Live rows and a partial or
+unrealized trailing runtime turn remain outside the doomed set; a fully doomed
+turn is sealed into `runtime_hourly` first.
 
 #### Preflight, and what it is not
 
@@ -1085,7 +1091,9 @@ Migration 37 creates source-keyed rollup storage for bounded model and runtime r
 - **runtime_turn_state** — One row per provider/source finalization bookmark, with the highest finalized raw rowid and the remaining open logical turn's start. Open turns are not folded into `runtime_hourly`.
 - **rollup_meta** — Singleton generation plus independent model/runtime backfill status and resumable bookmarks.
 
-Both hourly tables lead their unique key with `hour_utc` for bounded range reads and carry a `(provider, source_key)` index for exact source invalidation. Model replacement deletes that source's prior `raw_pruned=0` rows before refolding and preserves NULL-aware token evidence. Transcript replacement likewise deletes only unpruned runtime rows plus state, refolds from the newly persisted source events, and advances `rollup_generation` once iff rollup or state changed. Both folds share the raw replacement transaction, so a later registry failure rolls back raw rows, rollup, state, and generation together. Migration 37 itself initializes only the metadata singleton; it performs no raw-table fold or backfill. Recording v37 is a one-way door because older builds refuse it through `SCHEMA_TOO_NEW`, but the additive DDL preserves every pre-upgrade row.
+Both hourly tables lead their unique key with `hour_utc` for bounded range reads and carry a `(provider, source_key)` index for exact source invalidation. Model replacement deletes that source's prior `raw_pruned=0` rows before refolding and preserves NULL-aware token evidence; a conflict with `raw_pruned=1` is never updated because that whole bucket is already authoritative. Transcript replacement likewise deletes only unpruned runtime rows plus state and refolds from newly persisted events. Explicit project, host, session, and completed-root deletion removes every matching hourly row and runtime state beside raw detail; suppression alone remains a read-time source join. Each mutation shares one raw transaction, so a later failure rolls raw, rollup, state, source metadata, and generation back together. Migration 37 itself initializes only the metadata singleton; it performs no raw-table fold or backfill. Recording v37 is a one-way door because older builds refuse it through `SCHEMA_TOO_NEW`, but the additive DDL preserves every pre-upgrade row.
+
+Retention prevalidates every doomed model group against its full raw group-by and every doomed runtime source against the deterministic refold before advancing the watermark. A mismatch refuses the run without deletion. Each delete chunk promotes covered hourly rows to `raw_pruned=1` in the same transaction as raw deletion. Runtime selects finalized events at or below the persisted bookmark. A trailing turn stays raw unless every event is doomed and any tool wait is fully realized before the cutoff; only then is it sealed into hourly authority. The bookmark clamps past removed rowids. Runtime stats never merge `retention_daily_aggregates`; those daily event counters remain available only to transcript/code views.
 
 Completed model reads use hourly rows for decomposable facets: represented providers; scoped sessions/evidence; turn, token, and distinct-model totals; per-session/model reach, turns, tokens, primary model, combinations, and pairs; active days and first/last evidence; delegation totals; and history sums. Every row joins active `model_observation_sources` during the read, so suppression is immediate, and the empty model sentinel returns to NULL attribution before aggregation.
 
