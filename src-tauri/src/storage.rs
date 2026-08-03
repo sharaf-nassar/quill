@@ -3677,12 +3677,31 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
     }
 }
 
-fn completed_runtime_rollup_stats(
+struct RuntimeRollupStatsRow {
+    hour_utc: i64,
+    provider: String,
+    session_id: String,
+    turn_count: i64,
+    runtime_secs: f64,
+}
+
+struct RuntimeOpenTailStatsRow {
+    turn_start_ms: i64,
+    provider: String,
+    session_id: String,
+    packed_last_event: Option<String>,
+}
+
+struct CompletedRuntimeRollupRows {
+    rollups: Vec<RuntimeRollupStatsRow>,
+    open_tails: Vec<RuntimeOpenTailStatsRow>,
+}
+
+fn read_completed_runtime_rollup_rows(
     conn: &Connection,
-    from: DateTime<Utc>,
-    now: DateTime<Utc>,
+    window_start_ms: i64,
     parent_only: bool,
-) -> Result<Option<LlmRuntimeStats>, String> {
+) -> Result<Option<CompletedRuntimeRollupRows>, String> {
     let complete = conn
         .query_row(
             "SELECT runtime_backfill_status = 'complete'
@@ -3694,16 +3713,6 @@ fn completed_runtime_rollup_stats(
     if !complete {
         return Ok(None);
     }
-
-    let range_secs = (now - from).num_seconds() as f64;
-    let bucket_secs = range_secs / 7.0;
-    let from_epoch_ms = from.timestamp_millis() as f64;
-    let window_start_ms =
-        from.timestamp_millis().div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
-    let mut total_runtime_secs = 0.0_f64;
-    let mut turn_count = 0_i64;
-    let mut sessions = HashSet::<(String, String)>::new();
-    let mut bucket_sums = [0.0_f64; 7];
 
     let rollup_sql = format!(
         "SELECT rollup.hour_utc, rollup.provider, rollup.session_id,
@@ -3720,34 +3729,24 @@ fn completed_runtime_rollup_stats(
             ""
         }
     );
-    {
+    let rollups = {
         let mut statement = conn
             .prepare(&rollup_sql)
             .map_err(|error| format!("Prepare runtime rollup query: {error}"))?;
         let rows = statement
             .query_map(params![window_start_ms], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, f64>(4)?,
-                ))
+                Ok(RuntimeRollupStatsRow {
+                    hour_utc: row.get(0)?,
+                    provider: row.get(1)?,
+                    session_id: row.get(2)?,
+                    turn_count: row.get(3)?,
+                    runtime_secs: row.get(4)?,
+                })
             })
             .map_err(|error| format!("Query runtime rollups: {error}"))?;
-        for row in rows {
-            let (hour_utc, provider, session_id, turns, runtime_secs) =
-                row.map_err(|error| format!("Read runtime rollup: {error}"))?;
-            total_runtime_secs += runtime_secs;
-            turn_count = turn_count
-                .checked_add(turns)
-                .ok_or_else(|| "Runtime rollup turn count overflowed".to_string())?;
-            sessions.insert((provider, session_id));
-            let bucket =
-                ((((hour_utc as f64 - from_epoch_ms) / 1_000.0) / bucket_secs).max(0.0)) as usize;
-            bucket_sums[bucket.min(6)] += runtime_secs;
-        }
-    }
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read runtime rollup: {error}"))?
+    };
 
     let tail_sql = format!(
         "SELECT state.open_turn_started_ms, source.provider,
@@ -3775,23 +3774,56 @@ fn completed_runtime_rollup_stats(
             ""
         }
     );
-    let mut statement = conn
-        .prepare(&tail_sql)
-        .map_err(|error| format!("Prepare runtime open-tail query: {error}"))?;
-    let rows = statement
-        .query_map(params![window_start_ms], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })
-        .map_err(|error| format!("Query runtime open tail: {error}"))?;
-    for row in rows {
-        let (turn_start_ms, provider, session_id, packed_last_event) =
-            row.map_err(|error| format!("Read runtime open-tail row: {error}"))?;
-        let Some(packed_last_event) = packed_last_event else {
+    let open_tails = {
+        let mut statement = conn
+            .prepare(&tail_sql)
+            .map_err(|error| format!("Prepare runtime open-tail query: {error}"))?;
+        let rows = statement
+            .query_map(params![window_start_ms], |row| {
+                Ok(RuntimeOpenTailStatsRow {
+                    turn_start_ms: row.get(0)?,
+                    provider: row.get(1)?,
+                    session_id: row.get(2)?,
+                    packed_last_event: row.get(3)?,
+                })
+            })
+            .map_err(|error| format!("Query runtime open tail: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read runtime open-tail row: {error}"))?
+    };
+
+    Ok(Some(CompletedRuntimeRollupRows {
+        rollups,
+        open_tails,
+    }))
+}
+
+fn shape_completed_runtime_rollup_stats(
+    rows: CompletedRuntimeRollupRows,
+    from: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<LlmRuntimeStats, String> {
+    let range_secs = (now - from).num_seconds() as f64;
+    let bucket_secs = range_secs / 7.0;
+    let from_epoch_ms = from.timestamp_millis() as f64;
+    let mut total_runtime_secs = 0.0_f64;
+    let mut turn_count = 0_i64;
+    let mut sessions = HashSet::<(String, String)>::new();
+    let mut bucket_sums = [0.0_f64; 7];
+
+    for row in rows.rollups {
+        total_runtime_secs += row.runtime_secs;
+        turn_count = turn_count
+            .checked_add(row.turn_count)
+            .ok_or_else(|| "Runtime rollup turn count overflowed".to_string())?;
+        sessions.insert((row.provider, row.session_id));
+        let bucket =
+            ((((row.hour_utc as f64 - from_epoch_ms) / 1_000.0) / bucket_secs).max(0.0)) as usize;
+        bucket_sums[bucket.min(6)] += row.runtime_secs;
+    }
+
+    for row in rows.open_tails {
+        let Some(packed_last_event) = row.packed_last_event else {
             continue;
         };
         let Some((timestamp, kind)) = packed_last_event.split_once('\u{1f}') else {
@@ -3806,12 +3838,12 @@ fn completed_runtime_rollup_stats(
         } else {
             last_event_ms
         };
-        let duration = end_ms.saturating_sub(turn_start_ms) as f64 / 1_000.0;
-        sessions.insert((provider, session_id));
+        let duration = end_ms.saturating_sub(row.turn_start_ms) as f64 / 1_000.0;
+        sessions.insert((row.provider, row.session_id));
         if duration > 0.0 {
             total_runtime_secs += duration;
             turn_count += 1;
-            let bucket = ((((turn_start_ms as f64 - from_epoch_ms) / 1_000.0) / bucket_secs)
+            let bucket = ((((row.turn_start_ms as f64 - from_epoch_ms) / 1_000.0) / bucket_secs)
                 .max(0.0)) as usize;
             bucket_sums[bucket.min(6)] += duration;
         }
@@ -3821,13 +3853,13 @@ fn completed_runtime_rollup_stats(
     } else {
         0.0
     };
-    Ok(Some(LlmRuntimeStats {
+    Ok(LlmRuntimeStats {
         total_runtime_secs,
         turn_count,
         session_count: sessions.len() as i64,
         avg_per_turn_secs,
         sparkline: bucket_sums.to_vec(),
-    }))
+    })
 }
 
 /// Delete every stale source owned by one completed root and its children.
@@ -8285,30 +8317,32 @@ impl Storage {
         Ok(total)
     }
 
-    /// Open an independent read-only connection for the two Models overview
-    /// queries that the frontend issues together. Their deferred transactions
-    /// still provide one snapshot per response, while WAL can now serve both
-    /// readers without serializing them behind the primary connection mutex.
-    fn open_model_analytics_reader(&self) -> Result<Connection, String> {
+    /// Open one independent, short-lived reader for a view query.
+    ///
+    /// Omitting `SQLITE_OPEN_URI` keeps the resolved database path literal,
+    /// including paths containing URI metacharacters. Read-only open flags
+    /// protect the main database while still allowing in-memory temp tables.
+    /// Multi-statement callers own one deferred transaction so a response
+    /// observes one WAL snapshot without using the writer connection mutex.
+    // @lat: [[backend#Database#View Query Reader Connections]]
+    fn open_view_reader(&self) -> Result<Connection, String> {
         let conn = Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|error| format!("Open model analytics read connection: {error}"))?;
+        .map_err(|error| format!("Open view read connection: {error}"))?;
         conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|error| format!("Configure model analytics read timeout: {error}"))?;
-        // Keep transient work (the overview's scoped temp table, sort spills)
-        // resident in memory and let the reader map/cache more of the database
-        // so repeated aggregate scans are not served cold. The connection is
-        // already opened `SQLITE_OPEN_READ_ONLY`, which is what protects the
-        // main database from writes; `query_only` is intentionally not set
-        // because it also blocks the in-memory temp table the overview builds.
+            .map_err(|error| format!("Configure view read timeout: {error}"))?;
+        // Keep transient work (including the Models overview's scoped temp
+        // table and sort spills) resident in memory and let each reader map a
+        // bounded database window. `query_only` is intentionally not set
+        // because it also blocks the in-memory temp table.
         conn.execute_batch(
             "PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 268435456;
              PRAGMA cache_size = -65536;",
         )
-        .map_err(|error| format!("Configure model analytics reader pragmas: {error}"))?;
+        .map_err(|error| format!("Configure view reader pragmas: {error}"))?;
         Ok(conn)
     }
 
@@ -8848,7 +8882,7 @@ impl Storage {
         provider: Option<&str>,
     ) -> Result<ModelAnalyticsResponse, String> {
         let range_end = query_now();
-        let probe_connection = self.open_model_analytics_reader()?;
+        let probe_connection = self.open_view_reader()?;
         let key = CacheKey::new("get_model_analytics", range, provider, range_end);
         get_or_compute(
             &self.model_analytics_cache,
@@ -8869,7 +8903,7 @@ impl Storage {
         let range_start_ms = (range_end - model_range_duration(range)).timestamp_millis();
         let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
 
-        let mut conn = self.open_model_analytics_reader()?;
+        let mut conn = self.open_view_reader()?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|error| format!("Begin model analytics read snapshot: {error}"))?;
@@ -9190,7 +9224,7 @@ impl Storage {
         provider: Option<&str>,
     ) -> Result<ModelUsageOverviewResponse, String> {
         let range_end = query_now();
-        let probe_connection = self.open_model_analytics_reader()?;
+        let probe_connection = self.open_view_reader()?;
         let key = CacheKey::new("get_model_usage_overview", range, provider, range_end);
         get_or_compute(
             &self.model_usage_overview_cache,
@@ -9237,7 +9271,7 @@ impl Storage {
             )?);
         }
 
-        let mut conn = self.open_model_analytics_reader()?;
+        let mut conn = self.open_view_reader()?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|error| format!("Begin model overview read snapshot: {error}"))?;
@@ -10379,7 +10413,7 @@ impl Storage {
         selected_model: Option<&ModelIdentity>,
     ) -> Result<ModelHistoryResponse, String> {
         let range_end = query_now();
-        let probe_connection = self.open_model_analytics_reader()?;
+        let probe_connection = self.open_view_reader()?;
         let key = CacheKey::new("get_model_history", range, provider, range_end)
             .with_selected_model(selected_model);
         get_or_compute(
@@ -10438,7 +10472,7 @@ impl Storage {
 
         let selected_provider = selected_model.map(|identity| identity.provider.as_str());
         let selected_model_id = selected_model.map(|identity| identity.model_id.as_str());
-        let mut conn = self.open_model_analytics_reader()?;
+        let mut conn = self.open_view_reader()?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|error| format!("Begin model history read snapshot: {error}"))?;
@@ -10682,7 +10716,7 @@ impl Storage {
             // ingestion writes holding the primary connection mutex. WAL still
             // gives this deferred transaction a consistent snapshot, and the
             // cursor/revision guard below preserves stale-page rejection.
-            let mut conn = self.open_model_analytics_reader()?;
+            let mut conn = self.open_view_reader()?;
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
                 .map_err(|error| format!("Begin model sessions read snapshot: {error}"))?;
@@ -12374,26 +12408,32 @@ impl Storage {
         current_buckets: &[UsageBucket],
         days: i32,
     ) -> Result<Vec<BucketStats>, String> {
-        let conn = self.conn.lock();
         let request = serde_json::to_string(&(current_buckets, days))
             .map_err(|error| format!("Serialize bucket stats cache key: {error}"))?;
         let key = CacheKey::for_request("get_all_bucket_stats", request, query_now());
-        get_or_compute(
+        let mut conn = self.open_view_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin bucket stats read snapshot: {error}"))?;
+        let result = get_or_compute(
             &self.bucket_stats_cache,
             key,
-            &conn,
+            &tx,
             &[CacheTable::RowId("usage_snapshots")],
             || {
                 let mut results = Vec::new();
                 for bucket in current_buckets {
                     let mut stats =
-                        Self::get_usage_stats_with_conn(&conn, bucket.provider, &bucket.key, days)?;
+                        Self::get_usage_stats_with_conn(&tx, bucket.provider, &bucket.key, days)?;
                     stats.current = bucket.utilization;
                     results.push(stats);
                 }
                 Ok(results)
             },
-        )
+        )?;
+        tx.commit()
+            .map_err(|error| format!("Commit bucket stats read snapshot: {error}"))?;
+        Ok(result)
     }
 
     pub fn get_latest_usage_buckets(
@@ -12609,7 +12649,10 @@ impl Storage {
         session_id: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<Vec<TokenDataPoint>, String> {
-        let conn = self.conn.lock();
+        let mut conn = self.open_view_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin token history read snapshot: {error}"))?;
         let now = query_now();
 
         // Skip hourly aggregates when filtering by session_id or cwd since
@@ -12673,7 +12716,7 @@ impl Storage {
                     ),
                 };
 
-            let mut stmt = conn
+            let mut stmt = tx
                 .prepare(&hourly_sql)
                 .map_err(|e| format!("Prepare error: {e}"))?;
 
@@ -12730,7 +12773,7 @@ impl Storage {
         }
         snap_sql.push_str(" ORDER BY timestamp ASC");
 
-        let mut stmt2 = conn
+        let mut stmt2 = tx
             .prepare(&snap_sql)
             .map_err(|e| format!("Prepare error: {e}"))?;
 
@@ -12757,6 +12800,10 @@ impl Storage {
         for row in snap_rows {
             points.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
+        drop(stmt2);
+        tx.commit()
+            .map_err(|error| format!("Commit token history read snapshot: {error}"))?;
+        drop(conn);
 
         let max_points = match range {
             "1h" => 60,
@@ -13124,17 +13171,23 @@ impl Storage {
         range: &str,
         limit: Option<i64>,
     ) -> Result<ContextSavingsAnalytics, String> {
-        let conn = self.conn.lock();
         let request = serde_json::to_string(&(range, limit))
             .map_err(|error| format!("Serialize context savings cache key: {error}"))?;
         let key = CacheKey::for_request("get_context_savings_analytics", request, query_now());
-        get_or_compute(
+        let mut conn = self.open_view_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin context savings read snapshot: {error}"))?;
+        let result = get_or_compute(
             &self.context_savings_analytics_cache,
             key,
-            &conn,
+            &tx,
             &[CacheTable::RowId("context_savings_events")],
-            || Self::get_context_savings_analytics_with_conn(&conn, range, limit),
-        )
+            || Self::get_context_savings_analytics_with_conn(&tx, range, limit),
+        )?;
+        tx.commit()
+            .map_err(|error| format!("Commit context savings read snapshot: {error}"))?;
+        Ok(result)
     }
 
     fn get_context_savings_analytics_with_conn(
@@ -13396,7 +13449,7 @@ impl Storage {
     }
 
     pub fn get_host_breakdown(&self, range: &str) -> Result<Vec<HostBreakdown>, String> {
-        let conn = self.conn.lock();
+        let conn = self.open_view_reader()?;
         let from = range_from_timestamp(range);
 
         let mut stmt = conn
@@ -13433,7 +13486,7 @@ impl Storage {
     }
 
     pub fn get_project_breakdown(&self, range: &str) -> Result<Vec<ProjectBreakdown>, String> {
-        let conn = self.conn.lock();
+        let conn = self.open_view_reader()?;
         let from = range_from_timestamp(range);
 
         let mut stmt = conn
@@ -13470,6 +13523,8 @@ impl Storage {
         for row in rows {
             raw.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
+        drop(stmt);
+        drop(conn);
 
         // Merge subdirectories into their parent project root.
         // If /a/b is a prefix of /a/b/c, fold /a/b/c into /a/b.
@@ -13488,7 +13543,7 @@ impl Storage {
         }
 
         let limit = limit.unwrap_or(100).clamp(1, 500);
-        let conn = self.conn.lock();
+        let conn = self.open_view_reader()?;
         let from = range_from_timestamp(range);
 
         let mut sql = String::from(
@@ -13561,7 +13616,7 @@ impl Storage {
         }
 
         let limit = limit.unwrap_or(100).clamp(1, 500);
-        let conn = self.conn.lock();
+        let conn = self.open_view_reader()?;
         let from = range_from_timestamp(range);
 
         // For each `hook_identity` group, surface the most recently
@@ -13784,7 +13839,7 @@ impl Storage {
         limit: Option<i32>,
     ) -> Result<Vec<SessionBreakdown>, String> {
         let limit = limit.unwrap_or(10).clamp(1, 500);
-        let conn = self.conn.lock();
+        let conn = self.open_view_reader()?;
         let from = range_from_timestamp(range);
 
         // Sub-agent rollup (Wave 2). Each output row is keyed by
@@ -19201,91 +19256,124 @@ impl Storage {
     }
 
     pub fn get_code_stats(&self, range: &str) -> Result<CodeStats, String> {
-        let conn = self.conn.lock();
         let from = (query_now() - range_to_duration(range)).to_rfc3339();
+        struct RawCodeStatsRow {
+            tool_name: String,
+            file_path: Option<String>,
+            full_input: String,
+            session_id: String,
+            stored_added: Option<i64>,
+            stored_removed: Option<i64>,
+        }
+        struct RetainedCodeStatsRow {
+            session_id: String,
+            file_path: String,
+            added: i64,
+            removed: i64,
+        }
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT tool_name, file_path, full_input, session_id,
-				        lines_added, lines_removed
-				 FROM tool_actions
-				 WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL",
-            )
-            .map_err(|e| format!("Prepare error: {e}"))?;
+        let (raw_rows, retained_rows) = {
+            let mut conn = self.open_view_reader()?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("Begin code stats read snapshot: {error}"))?;
+
+            let raw_rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT tool_name, file_path, full_input, session_id,
+				                lines_added, lines_removed
+				         FROM tool_actions
+				         WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL",
+                    )
+                    .map_err(|e| format!("Prepare error: {e}"))?;
+                let rows = stmt
+                    .query_map([&from], |row| {
+                        Ok(RawCodeStatsRow {
+                            tool_name: row.get(0)?,
+                            file_path: row.get(1)?,
+                            full_input: row.get(2)?,
+                            session_id: row.get(3)?,
+                            stored_added: row.get(4)?,
+                            stored_removed: row.get(5)?,
+                        })
+                    })
+                    .map_err(|e| format!("Query error: {e}"))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Row error: {e}"))?
+            };
+
+            // Raw rows carry payload for legacy parsing; pruned rows retain
+            // their already-computed counters in daily aggregates.
+            let retained_rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT session_id, file_path, lines_added, lines_removed
+                         FROM retention_daily_aggregates
+                         WHERE day >= substr(?1, 1, 10) AND code_change_count > 0",
+                    )
+                    .map_err(|e| format!("Prepare retention code stats: {e}"))?;
+                let rows = stmt
+                    .query_map([&from], |row| {
+                        Ok(RetainedCodeStatsRow {
+                            session_id: row.get(0)?,
+                            file_path: row.get(1)?,
+                            added: row.get(2)?,
+                            removed: row.get(3)?,
+                        })
+                    })
+                    .map_err(|e| format!("Query retention code stats: {e}"))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Retention code stats row: {e}"))?
+            };
+
+            tx.commit()
+                .map_err(|error| format!("Commit code stats read snapshot: {error}"))?;
+            (raw_rows, retained_rows)
+        };
 
         let mut total_added: i64 = 0;
         let mut total_removed: i64 = 0;
         let mut sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut lang_lines: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
 
-        let rows = stmt
-            .query_map([&from], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                ))
-            })
-            .map_err(|e| format!("Query error: {e}"))?;
-
-        for row in rows {
-            let (tool_name, file_path, full_input, session_id, stored_added, stored_removed) =
-                row.map_err(|e| format!("Row error: {e}"))?;
-
+        for row in raw_rows {
             // Prefer the stored (untruncated) counts; fall back to re-parsing
             // `full_input` for legacy rows written before migration 33.
-            let resolved = match (stored_added, stored_removed) {
-                (Some(a), Some(r)) => Some((a, r, file_path.clone().unwrap_or_default())),
-                _ => parse_code_change(&tool_name, &full_input).map(|(a, r, parsed_path)| {
-                    let path = if parsed_path.is_empty() {
-                        file_path.clone().unwrap_or_default()
-                    } else {
-                        parsed_path
-                    };
-                    (a, r, path)
-                }),
+            let resolved = match (row.stored_added, row.stored_removed) {
+                (Some(a), Some(r)) => Some((a, r, row.file_path.clone().unwrap_or_default())),
+                _ => {
+                    parse_code_change(&row.tool_name, &row.full_input).map(|(a, r, parsed_path)| {
+                        let path = if parsed_path.is_empty() {
+                            row.file_path.clone().unwrap_or_default()
+                        } else {
+                            parsed_path
+                        };
+                        (a, r, path)
+                    })
+                }
             };
 
             if let Some((added, removed, path)) = resolved {
                 total_added += added;
                 total_removed += removed;
-                sessions.insert(session_id);
+                sessions.insert(row.session_id);
 
                 let lang = ext_to_language(&path);
                 *lang_lines.entry(lang).or_insert(0) += added + removed;
             }
         }
 
-        // Raw rows carry payload for legacy parsing; pruned rows retain their
-        // already-computed counters in daily aggregates.  Merge both views so
-        // a range spanning the retention boundary remains additive.
-        let mut aggregate_stmt = conn
-            .prepare(
-                "SELECT session_id, file_path, lines_added, lines_removed
-                 FROM retention_daily_aggregates
-                 WHERE day >= substr(?1, 1, 10) AND code_change_count > 0",
-            )
-            .map_err(|e| format!("Prepare retention code stats: {e}"))?;
-        let aggregate_rows = aggregate_stmt
-            .query_map([&from], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })
-            .map_err(|e| format!("Query retention code stats: {e}"))?;
-        for row in aggregate_rows {
-            let (session_id, file_path, added, removed) =
-                row.map_err(|e| format!("Retention code stats row: {e}"))?;
-            total_added += added;
-            total_removed += removed;
-            sessions.insert(session_id);
-            *lang_lines.entry(ext_to_language(&file_path)).or_insert(0) += added + removed;
+        // Merge both snapshots so a range spanning the retention boundary
+        // remains additive. All parsing and shaping runs after the reader
+        // transaction has closed.
+        for row in retained_rows {
+            total_added += row.added;
+            total_removed += row.removed;
+            sessions.insert(row.session_id);
+            *lang_lines
+                .entry(ext_to_language(&row.file_path))
+                .or_insert(0) += row.added + row.removed;
         }
 
         let session_count = sessions.len() as i64;
@@ -19327,7 +19415,6 @@ impl Storage {
         &self,
         range: &str,
     ) -> Result<Vec<CodeStatsHistoryPoint>, String> {
-        let conn = self.conn.lock();
         let now = query_now();
         let from = now - range_to_duration(range);
         let from_str = from.to_rfc3339();
@@ -19346,14 +19433,75 @@ impl Storage {
             _ => 15 * 60,
         };
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT tool_name, full_input, timestamp, lines_added, lines_removed
-				 FROM tool_actions
-				 WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL
-				 ORDER BY timestamp ASC",
-            )
-            .map_err(|e| format!("Prepare error: {e}"))?;
+        struct RawStoredCodeChange {
+            tool_name: String,
+            full_input: String,
+            timestamp: String,
+            stored_added: Option<i64>,
+            stored_removed: Option<i64>,
+        }
+        struct RetainedStoredCodeChange {
+            day: String,
+            added: i64,
+            removed: i64,
+        }
+
+        let (raw_rows, retained_rows) = {
+            let mut conn = self.open_view_reader()?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("Begin code history read snapshot: {error}"))?;
+
+            let raw_rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT tool_name, full_input, timestamp, lines_added, lines_removed
+				         FROM tool_actions
+				         WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL
+				         ORDER BY timestamp ASC",
+                    )
+                    .map_err(|e| format!("Prepare error: {e}"))?;
+                let rows = stmt
+                    .query_map([&from_str], |row| {
+                        Ok(RawStoredCodeChange {
+                            tool_name: row.get(0)?,
+                            full_input: row.get(1)?,
+                            timestamp: row.get(2)?,
+                            stored_added: row.get(3)?,
+                            stored_removed: row.get(4)?,
+                        })
+                    })
+                    .map_err(|e| format!("Query error: {e}"))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Row error: {e}"))?
+            };
+
+            let retained_rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT day, lines_added, lines_removed
+                         FROM retention_daily_aggregates
+                         WHERE day >= substr(?1, 1, 10) AND code_change_count > 0
+                         ORDER BY day ASC",
+                    )
+                    .map_err(|e| format!("Prepare retention code history: {e}"))?;
+                let rows = stmt
+                    .query_map([&from_str], |row| {
+                        Ok(RetainedStoredCodeChange {
+                            day: row.get(0)?,
+                            added: row.get(1)?,
+                            removed: row.get(2)?,
+                        })
+                    })
+                    .map_err(|e| format!("Query retention code history: {e}"))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Retention code history row: {e}"))?
+            };
+
+            tx.commit()
+                .map_err(|error| format!("Commit code history read snapshot: {error}"))?;
+            (raw_rows, retained_rows)
+        };
 
         struct RawChange {
             added: i64,
@@ -19362,57 +19510,27 @@ impl Storage {
         }
         let mut changes: Vec<RawChange> = Vec::new();
 
-        let rows = stmt
-            .query_map([&from_str], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })
-            .map_err(|e| format!("Query error: {e}"))?;
-
-        for row in rows {
-            let (tool_name, full_input, timestamp, stored_added, stored_removed) =
-                row.map_err(|e| format!("Row error: {e}"))?;
-
+        for row in raw_rows {
             // Prefer stored counts; re-parse `full_input` only for legacy rows.
-            let counts = match (stored_added, stored_removed) {
+            let counts = match (row.stored_added, row.stored_removed) {
                 (Some(a), Some(r)) => Some((a, r)),
-                _ => parse_code_change(&tool_name, &full_input).map(|(a, r, _)| (a, r)),
+                _ => parse_code_change(&row.tool_name, &row.full_input).map(|(a, r, _)| (a, r)),
             };
 
             if let Some((added, removed)) = counts
-                && let Ok(ts) = timestamp.parse::<DateTime<Utc>>()
+                && let Ok(ts) = row.timestamp.parse::<DateTime<Utc>>()
             {
                 changes.push(RawChange { added, removed, ts });
             }
         }
 
-        let mut aggregate_stmt = conn
-            .prepare(
-                "SELECT day, lines_added, lines_removed
-                 FROM retention_daily_aggregates
-                 WHERE day >= substr(?1, 1, 10) AND code_change_count > 0
-                 ORDER BY day ASC",
-            )
-            .map_err(|e| format!("Prepare retention code history: {e}"))?;
-        let aggregate_rows = aggregate_stmt
-            .query_map([&from_str], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
-            .map_err(|e| format!("Query retention code history: {e}"))?;
-        for row in aggregate_rows {
-            let (day, added, removed) =
-                row.map_err(|e| format!("Retention code history row: {e}"))?;
-            if let Ok(ts) = format!("{day}T00:00:00Z").parse::<DateTime<Utc>>() {
-                changes.push(RawChange { added, removed, ts });
+        for row in retained_rows {
+            if let Ok(ts) = format!("{}T00:00:00Z", row.day).parse::<DateTime<Utc>>() {
+                changes.push(RawChange {
+                    added: row.added,
+                    removed: row.removed,
+                    ts,
+                });
             }
         }
 
@@ -19888,15 +20006,84 @@ impl Storage {
         const IDLE_THRESHOLD_SECS: f64 = 300.0; // 5 minutes (R-B)
         const TOOL_WAIT_MAX_SECS: f64 = 21_600.0; // 6 hours (R-B safety ceiling)
 
-        let conn = self.conn.lock();
         let now = query_now();
         let from = now - range_to_duration(range);
         let from_str = from.to_rfc3339();
         let parent_only = matches!(scope, Some("parent_only"));
+        let window_start_ms =
+            from.timestamp_millis().div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
 
-        if let Some(stats) = completed_runtime_rollup_stats(&conn, from, now, parent_only)? {
-            return Ok(stats);
+        struct RuntimeEventRow {
+            timestamp: String,
+            kind: String,
+            provider: String,
+            session_id: String,
+            chain_id: String,
         }
+        enum RuntimeQueryRows {
+            Rollup(CompletedRuntimeRollupRows),
+            Events(Vec<RuntimeEventRow>),
+        }
+
+        let query_rows = {
+            let mut conn = self.open_view_reader()?;
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|error| format!("Begin runtime stats read snapshot: {error}"))?;
+            let result = if let Some(rows) =
+                read_completed_runtime_rollup_rows(&tx, window_start_ms, parent_only)?
+            {
+                RuntimeQueryRows::Rollup(rows)
+            } else {
+                // STAT-2: parent_only adds `is_sidechain = 0` to the WHERE.
+                // Order matches the native chain key so the walker can process
+                // each (provider, chain_id) timeline contiguously.
+                //
+                // `INDEXED BY idx_se_timestamp_chain` (migration 32) pins the
+                // bounded plan. The leading timestamp makes this a covering
+                // range seek even before SQLite has planner statistics.
+                let sql = if parent_only {
+                    "SELECT timestamp, kind, provider, session_id, chain_id
+                     FROM session_events INDEXED BY idx_se_timestamp_chain
+                     WHERE timestamp >= ?1 AND is_sidechain = 0
+                     ORDER BY provider, chain_id, timestamp, rowid"
+                } else {
+                    "SELECT timestamp, kind, provider, session_id, chain_id
+                     FROM session_events INDEXED BY idx_se_timestamp_chain
+                     WHERE timestamp >= ?1
+                     ORDER BY provider, chain_id, timestamp, rowid"
+                };
+                let events = {
+                    let mut stmt = tx
+                        .prepare_cached(sql)
+                        .map_err(|e| format!("Prepare runtime query: {e}"))?;
+                    let rows = stmt
+                        .query_map(params![from_str], |row| {
+                            Ok(RuntimeEventRow {
+                                timestamp: row.get(0)?,
+                                kind: row.get(1)?,
+                                provider: row.get(2)?,
+                                session_id: row.get(3)?,
+                                chain_id: row.get(4)?,
+                            })
+                        })
+                        .map_err(|e| format!("Runtime query error: {e}"))?;
+                    // Preserve the established tolerance for malformed rows.
+                    rows.flatten().collect()
+                };
+                RuntimeQueryRows::Events(events)
+            };
+            tx.commit()
+                .map_err(|error| format!("Commit runtime stats read snapshot: {error}"))?;
+            result
+        };
+
+        let events = match query_rows {
+            RuntimeQueryRows::Rollup(rows) => {
+                return shape_completed_runtime_rollup_stats(rows, from, now);
+            }
+            RuntimeQueryRows::Events(events) => events,
+        };
 
         let range_secs = range_to_duration(range).num_seconds() as f64;
         let bucket_secs = range_secs / 7.0;
@@ -19948,145 +20135,96 @@ impl Storage {
             }
         };
 
-        {
-            // STAT-2: parent_only adds `is_sidechain = 0` to the WHERE.
-            // Order matches the native chain key so the walker can process
-            // each (provider, chain_id) timeline contiguously.
-            //
-            // `INDEXED BY idx_se_timestamp_chain` (migration 32) pins the
-            // bounded plan. Left free, SQLite prefers migration 31's
-            // `(provider, chain_id, timestamp)` index purely because it
-            // satisfies the ORDER BY — but `timestamp` is third there, so the
-            // range filter cannot seek and the tick scans the whole corpus
-            // plus one rowid lookup per row. Quill never runs `ANALYZE`, so
-            // there is no `sqlite_stat1` for the planner to reconsider with;
-            // the choice is fixed regardless of how large the table grows.
-            // The pinned index leads with `timestamp` and carries every
-            // column this query reads, so the scan is a covering range seek
-            // and the only added cost is sorting the matched window — far
-            // cheaper than an unbounded scan with random heap fetches, and it
-            // shrinks with the requested range instead of staying constant.
-            // Migration 32 always creates the index and
-            // `ensure_startup_indexes` re-creates it on every open, so the
-            // directive cannot fail to resolve.
-            let sql = if parent_only {
-                "SELECT timestamp, kind, provider, session_id, chain_id
-                 FROM session_events INDEXED BY idx_se_timestamp_chain
-                 WHERE timestamp >= ?1 AND is_sidechain = 0
-                 ORDER BY provider, chain_id, timestamp, rowid"
-            } else {
-                "SELECT timestamp, kind, provider, session_id, chain_id
-                 FROM session_events INDEXED BY idx_se_timestamp_chain
-                 WHERE timestamp >= ?1
-                 ORDER BY provider, chain_id, timestamp, rowid"
+        for row in events {
+            let ts = match DateTime::parse_from_rfc3339(&row.timestamp) {
+                Ok(t) => t,
+                Err(_) => continue,
             };
-            let mut stmt = conn
-                .prepare_cached(sql)
-                .map_err(|e| format!("Prepare runtime query: {e}"))?;
-            let rows = stmt
-                .query_map(params![from_str], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                })
-                .map_err(|e| format!("Runtime query error: {e}"))?;
+            let ms = ts.timestamp_millis() as f64;
+            // STAT-3: chain identity is (provider, chain_id).
+            // Compare slices first to avoid allocating a composite key
+            // on every row; the borrow ends before we move the owned
+            // strings into the trackers below.
+            let chain_changed = cur_provider.as_deref() != Some(row.provider.as_str())
+                || cur_chain_id.as_deref() != Some(row.chain_id.as_str());
 
-            for row in rows.flatten() {
-                let (ts_str, kind, provider, session_id, chain_id) = row;
-                let ts = match DateTime::parse_from_rfc3339(&ts_str) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                let ms = ts.timestamp_millis() as f64;
-                // STAT-3: chain identity is (provider, chain_id).
-                // Compare slices first to avoid allocating a composite key
-                // on every row; the borrow ends before we move the owned
-                // strings into the trackers below.
-                let chain_changed = cur_provider.as_deref() != Some(provider.as_str())
-                    || cur_chain_id.as_deref() != Some(chain_id.as_str());
-
-                if chain_changed {
-                    if cur_provider.is_some() {
-                        flush_turn(
-                            turn_start_ms,
-                            prev_ms,
-                            &mut total_runtime_secs,
-                            &mut turn_count,
-                            &mut bucket_sums,
-                            from_epoch_ms,
-                            bucket_secs,
-                        );
-                    }
-                    // STAT-6: session_count is keyed on the
-                    // provider-qualified resolved root, so a parent and its
-                    // sub-agents count as one session while equal ids from
-                    // different providers remain separate.
-                    sessions.insert((provider.clone(), session_id));
-                    cur_provider = Some(provider);
-                    cur_chain_id = Some(chain_id);
-                    turn_start_ms = ms;
-                } else {
-                    // STAT-4: classify the gap from the previous event.
-                    let gap = (ms - prev_ms) / 1000.0;
-                    let is_tool_loop_gap = matches!(prev_kind.as_deref(), Some("asst_tool_use"))
-                        && kind == "user_tool_result";
-                    let counts_as_active = if is_tool_loop_gap {
-                        // Tool-loop gaps count up to the safety ceiling.
-                        gap <= TOOL_WAIT_MAX_SECS
-                    } else {
-                        // Non-tool-loop gaps count only when <= idle threshold.
-                        gap <= IDLE_THRESHOLD_SECS
-                    };
-
-                    if !counts_as_active {
-                        // User-idle (or tool-loop over ceiling) gap exceeds
-                        // threshold: end the current turn at prev_ms and
-                        // begin a new one at the current row.
-                        let clamped_end_ms = if is_tool_loop_gap {
-                            // Closed tool waits are a pure function of the two
-                            // persisted events. Only the trailing open tool
-                            // wait below depends on the pinned/current clock.
-                            prev_ms + TOOL_WAIT_MAX_SECS * 1000.0
-                        } else {
-                            prev_ms
-                        };
-                        flush_turn(
-                            turn_start_ms,
-                            clamped_end_ms,
-                            &mut total_runtime_secs,
-                            &mut turn_count,
-                            &mut bucket_sums,
-                            from_epoch_ms,
-                            bucket_secs,
-                        );
-                        turn_start_ms = ms;
-                    }
-                    // else: the gap counts; current turn continues with
-                    // turn_start_ms unchanged.
+            if chain_changed {
+                if cur_provider.is_some() {
+                    flush_turn(
+                        turn_start_ms,
+                        prev_ms,
+                        &mut total_runtime_secs,
+                        &mut turn_count,
+                        &mut bucket_sums,
+                        from_epoch_ms,
+                        bucket_secs,
+                    );
                 }
-                prev_ms = ms;
-                prev_kind = Some(kind);
-            }
-            if cur_provider.is_some() {
-                let open_end_ms = if prev_kind.as_deref() == Some("asst_tool_use") {
-                    (prev_ms + TOOL_WAIT_MAX_SECS * 1000.0).min(now_ms)
+                // STAT-6: session_count is keyed on the
+                // provider-qualified resolved root, so a parent and its
+                // sub-agents count as one session while equal ids from
+                // different providers remain separate.
+                sessions.insert((row.provider.clone(), row.session_id));
+                cur_provider = Some(row.provider);
+                cur_chain_id = Some(row.chain_id);
+                turn_start_ms = ms;
+            } else {
+                // STAT-4: classify the gap from the previous event.
+                let gap = (ms - prev_ms) / 1000.0;
+                let is_tool_loop_gap = matches!(prev_kind.as_deref(), Some("asst_tool_use"))
+                    && row.kind == "user_tool_result";
+                let counts_as_active = if is_tool_loop_gap {
+                    // Tool-loop gaps count up to the safety ceiling.
+                    gap <= TOOL_WAIT_MAX_SECS
                 } else {
-                    prev_ms
+                    // Non-tool-loop gaps count only when <= idle threshold.
+                    gap <= IDLE_THRESHOLD_SECS
                 };
-                flush_turn(
-                    turn_start_ms,
-                    open_end_ms,
-                    &mut total_runtime_secs,
-                    &mut turn_count,
-                    &mut bucket_sums,
-                    from_epoch_ms,
-                    bucket_secs,
-                );
+
+                if !counts_as_active {
+                    // User-idle (or tool-loop over ceiling) gap exceeds
+                    // threshold: end the current turn at prev_ms and
+                    // begin a new one at the current row.
+                    let clamped_end_ms = if is_tool_loop_gap {
+                        // Closed tool waits are a pure function of the two
+                        // persisted events. Only the trailing open tool
+                        // wait below depends on the pinned/current clock.
+                        prev_ms + TOOL_WAIT_MAX_SECS * 1000.0
+                    } else {
+                        prev_ms
+                    };
+                    flush_turn(
+                        turn_start_ms,
+                        clamped_end_ms,
+                        &mut total_runtime_secs,
+                        &mut turn_count,
+                        &mut bucket_sums,
+                        from_epoch_ms,
+                        bucket_secs,
+                    );
+                    turn_start_ms = ms;
+                }
+                // else: the gap counts; current turn continues with
+                // turn_start_ms unchanged.
             }
+            prev_ms = ms;
+            prev_kind = Some(row.kind);
+        }
+        if cur_provider.is_some() {
+            let open_end_ms = if prev_kind.as_deref() == Some("asst_tool_use") {
+                (prev_ms + TOOL_WAIT_MAX_SECS * 1000.0).min(now_ms)
+            } else {
+                prev_ms
+            };
+            flush_turn(
+                turn_start_ms,
+                open_end_ms,
+                &mut total_runtime_secs,
+                &mut turn_count,
+                &mut bucket_sums,
+                from_epoch_ms,
+                bucket_secs,
+            );
         }
 
         // STAT-7: avg = total / count, 0 when empty window.
@@ -20603,9 +20741,7 @@ mod tests {
     fn rollup_generation_invalidates_cache_after_upsert_only_write() {
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let reader = storage
-            .open_model_analytics_reader()
-            .expect("open cache probe reader");
+        let reader = storage.open_view_reader().expect("open cache probe reader");
         let writer = Connection::open(&storage.db_path).expect("open independent rollup writer");
 
         writer

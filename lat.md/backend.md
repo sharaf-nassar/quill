@@ -940,6 +940,16 @@ bytes unchanged — the "rows removed, bytes not yet reclaimed" outcome.
 scan's doomed set and present in full after the run, which is the delete-side
 half of the live-rows invariant.
 
+### View Query Reader Connections
+
+Widget analytics reads use independent, disposable SQLite connections so read IPC does not serialize on the ingest writer mutex.
+
+[[src-tauri/src/storage.rs#Storage#open_view_reader]] opens the resolved database path with `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`, intentionally omitting URI interpretation, and retains the established 5-second busy timeout plus WAL-compatible transient-memory pragmas. Each reader closes after one response so WAL checkpoints and compaction are not starved.
+
+The migrated view slice is [[src-tauri/src/storage.rs#Storage#get_all_bucket_stats]], [[src-tauri/src/storage.rs#Storage#get_context_savings_analytics]], [[src-tauri/src/storage.rs#Storage#get_token_history]], [[src-tauri/src/storage.rs#Storage#get_host_breakdown]], [[src-tauri/src/storage.rs#Storage#get_project_breakdown]], [[src-tauri/src/storage.rs#Storage#get_skill_breakdown]], [[src-tauri/src/storage.rs#Storage#get_hook_breakdown]], [[src-tauri/src/storage.rs#Storage#get_session_breakdown]], [[src-tauri/src/storage.rs#Storage#get_code_stats]], [[src-tauri/src/storage.rs#Storage#get_code_stats_history]], and [[src-tauri/src/storage.rs#Storage#get_llm_runtime_stats]]. Models aggregate, overview, history, and session reads use the same helper.
+
+Multi-statement reads run in deferred transactions, giving one response a stable WAL snapshot while ingest commits concurrently. Cache probes and cache misses share that snapshot. SQL rows are fully materialized before parsing, project merging, downsampling, runtime turn walking, or history bucketing begins, shortening reader lifetime as well as removing writer-mutex contention.
+
 ### Schema
 
 The database schema is versioned through migration 37 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, retention aggregates, and metadata tables.
@@ -1001,7 +1011,7 @@ Attributed coverage uses one token-bearing observation population: rows with der
 
 [[src-tauri/src/storage.rs#Storage#get_model_history]] reads one matching snapshot into fixed, zero-filled UTC buckets: 5 minutes for 1 hour, 1 hour for 24 hours, 6 hours for 7 days, and 1 day for 30 days. It keeps attributed, unattributed, and optional provider-qualified selected-model series separate while excluding suppressed sources; like every other aggregate, series attribution keys on `derived_model_id`.
 
-The aggregate, history, overview, and paged-session commands each open a short-lived read-only connection through [[src-tauri/src/storage.rs#Storage#open_model_analytics_reader]] and start their deferred transaction there, so none waits on the primary storage mutex or serializes behind ingestion writes; WAL still governs database-level writer/readers safely. That reader opens `SQLITE_OPEN_READ_ONLY` — the main-database write guard — and sets `temp_store=MEMORY`, a `mmap_size`, and a larger `cache_size` so the overview's in-memory scratch table stays off disk; it no longer sets `PRAGMA query_only`, which is incompatible with that temp table and redundant with the read-only open flag. The frontend's Models page now issues only the overview command; aggregate and history remain served for compatibility and tests.
+The aggregate, history, overview, and paged-session commands each open a short-lived read-only connection through [[src-tauri/src/storage.rs#Storage#open_view_reader]] and start their deferred transaction there, so none waits on the primary storage mutex or serializes behind ingestion writes; WAL still governs database-level writer/readers safely. That reader opens `SQLITE_OPEN_READ_ONLY` — the main-database write guard — and sets `temp_store=MEMORY`, a `mmap_size`, and a larger `cache_size` so the overview's in-memory scratch table stays off disk; it does not set `PRAGMA query_only`, which is incompatible with that temp table and redundant with the read-only open flag. The frontend's Models page now issues only the overview command; aggregate and history remain served for compatibility and tests.
 
 ##### Analytics Cache Primitive
 
