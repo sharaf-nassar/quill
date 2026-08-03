@@ -463,6 +463,55 @@ mtime, and canonical SHA-256
 Its existing zero-byte WAL and 32,768-byte SHM also retained identical mode,
 inode, mtime, and size; neither sidecar was removed or rewritten.
 
+### Slice E code-stats payload projection
+
+The slice-E reader change preserves the independent-reader snapshot boundary
+while replacing unconditional `full_input` projection with:
+
+```sql
+CASE WHEN lines_added IS NULL OR lines_removed IS NULL
+     THEN full_input
+END AS legacy_full_input
+```
+
+Both code-stat queries retain `full_input IS NOT NULL` eligibility. Rust uses
+persisted counts directly when both are present and invokes the existing
+tolerant parser only when the conditional payload is non-NULL. Retained daily
+rows and history bucketing are unchanged.
+
+The release harness ran against the frozen corpus with pinned end
+`2026-08-02T19:27:43Z`. Each query uses a fresh read-only `Storage`; its paired
+cold/warm calls must serialize to exactly equal JSON before timing is accepted.
+OS page cache remains uncontrolled. The first full matrix pass measured:
+
+| Query | Window | Cold | Warm | Output bytes |
+| --- | --- | ---: | ---: | ---: |
+| `get_code_stats` | 24h | 2.443 ms | 2.002 ms | 773 |
+| `get_code_stats_history` | 24h | 2.058 ms | 1.999 ms | 9,181 |
+| `get_code_stats` | 30d | 57.415 ms | 54.036 ms | 1,069 |
+| `get_code_stats_history` | 30d | 52.782 ms | 53.920 ms | 3,091 |
+| `get_code_stats` | 90d | 77.453 ms | 86.673 ms | 1,073 |
+| `get_code_stats_history` | 90d | 73.094 ms | 71.004 ms | 9,002 |
+
+Three full passes supplied six 30-day history samples (each pass's cold and
+controlled warm call): `52.782`, `53.920`, `78.366`, `88.407`, `55.859`, and
+`59.876` ms. Nearest-rank p95 is **88.407 ms**, 29.5% of the 300 ms budget.
+Every pass returned 3,091 bytes, matching the prior frozen-corpus record.
+
+`EXPLAIN QUERY PLAN` reports
+`SEARCH tool_actions USING INDEX idx_tool_actions_category_timestamp
+(category=? AND timestamp>?)`. The 30-day window contains 15,408 eligible
+rows: 15,407 with both persisted counters and one legacy row. Projection checks
+found zero persisted rows with a materialized payload and the one legacy payload
+equal to its stored `full_input`.
+
+Before and after measurement, the source remained 13,525,123,072 bytes, mode
+`0444`, inode `21943763`, mtime `1785698785`, ctime `1785698835`, and SHA-256
+`c86553ab3b0f22e23511dfc43a1f1b9dc9af35ad57f6ae63fcb3de75a673d04e`.
+The `-shm` sidecar stayed 32,768 bytes, mode `0444`, inode `21943767`, with
+mtime/ctime `1785699012.9498673700`; `-wal` stayed zero bytes, mode `0444`,
+inode `21943766`, with mtime/ctime `1785699012.9481790910`.
+
 ## Frontend cache and refresh query-window evidence
 
 The slice-D Node mock uses a controllable clock around the production module

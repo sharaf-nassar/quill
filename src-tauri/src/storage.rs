@@ -19366,7 +19366,7 @@ impl Storage {
         struct RawCodeStatsRow {
             tool_name: String,
             file_path: Option<String>,
-            full_input: String,
+            legacy_full_input: Option<String>,
             session_id: String,
             stored_added: Option<i64>,
             stored_removed: Option<i64>,
@@ -19387,7 +19387,11 @@ impl Storage {
             let raw_rows = {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT tool_name, file_path, full_input, session_id,
+                        "SELECT tool_name, file_path,
+                                CASE WHEN lines_added IS NULL OR lines_removed IS NULL
+                                     THEN full_input
+                                END AS legacy_full_input,
+                                session_id,
 				                lines_added, lines_removed
 				         FROM tool_actions
 				         WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL",
@@ -19398,7 +19402,7 @@ impl Storage {
                         Ok(RawCodeStatsRow {
                             tool_name: row.get(0)?,
                             file_path: row.get(1)?,
-                            full_input: row.get(2)?,
+                            legacy_full_input: row.get(2)?,
                             session_id: row.get(3)?,
                             stored_added: row.get(4)?,
                             stored_removed: row.get(5)?,
@@ -19448,8 +19452,8 @@ impl Storage {
             // `full_input` for legacy rows written before migration 33.
             let resolved = match (row.stored_added, row.stored_removed) {
                 (Some(a), Some(r)) => Some((a, r, row.file_path.clone().unwrap_or_default())),
-                _ => {
-                    parse_code_change(&row.tool_name, &row.full_input).map(|(a, r, parsed_path)| {
+                _ => row.legacy_full_input.as_deref().and_then(|full_input| {
+                    parse_code_change(&row.tool_name, full_input).map(|(a, r, parsed_path)| {
                         let path = if parsed_path.is_empty() {
                             row.file_path.clone().unwrap_or_default()
                         } else {
@@ -19457,7 +19461,7 @@ impl Storage {
                         };
                         (a, r, path)
                     })
-                }
+                }),
             };
 
             if let Some((added, removed, path)) = resolved {
@@ -19541,7 +19545,7 @@ impl Storage {
 
         struct RawStoredCodeChange {
             tool_name: String,
-            full_input: String,
+            legacy_full_input: Option<String>,
             timestamp: String,
             stored_added: Option<i64>,
             stored_removed: Option<i64>,
@@ -19561,7 +19565,11 @@ impl Storage {
             let raw_rows = {
                 let mut stmt = tx
                     .prepare(
-                        "SELECT tool_name, full_input, timestamp, lines_added, lines_removed
+                        "SELECT tool_name,
+                                CASE WHEN lines_added IS NULL OR lines_removed IS NULL
+                                     THEN full_input
+                                END AS legacy_full_input,
+                                timestamp, lines_added, lines_removed
 				         FROM tool_actions
 				         WHERE category = 'code_change' AND timestamp >= ?1 AND full_input IS NOT NULL
 				         ORDER BY timestamp ASC",
@@ -19571,7 +19579,7 @@ impl Storage {
                     .query_map([&from_str], |row| {
                         Ok(RawStoredCodeChange {
                             tool_name: row.get(0)?,
-                            full_input: row.get(1)?,
+                            legacy_full_input: row.get(1)?,
                             timestamp: row.get(2)?,
                             stored_added: row.get(3)?,
                             stored_removed: row.get(4)?,
@@ -19620,7 +19628,11 @@ impl Storage {
             // Prefer stored counts; re-parse `full_input` only for legacy rows.
             let counts = match (row.stored_added, row.stored_removed) {
                 (Some(a), Some(r)) => Some((a, r)),
-                _ => parse_code_change(&row.tool_name, &row.full_input).map(|(a, r, _)| (a, r)),
+                _ => row
+                    .legacy_full_input
+                    .as_deref()
+                    .and_then(|full_input| parse_code_change(&row.tool_name, full_input))
+                    .map(|(a, r, _)| (a, r)),
             };
 
             if let Some((added, removed)) = counts

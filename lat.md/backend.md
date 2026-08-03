@@ -952,6 +952,13 @@ Multi-statement reads run in deferred transactions, giving one response a stable
 
 [[view-reader-tests#View Reader Contention Tests]] pins the five-second slow-reader acceptance boundary under fast view queries and concurrent ingest.
 
+Code-stat readers keep that close-before-shaping boundary while avoiding payload
+allocation for migrated rows: SQL conditionally projects `full_input` only when
+either stored line counter is NULL. On the frozen feature-020 corpus, the 30-day
+history path measured 88.407 ms p95 across six release-harness samples against
+its 300 ms budget; the protocol and integrity record live in
+`specs/020-widget-query-perf/timing-measurement.md`.
+
 ### Schema
 
 The database schema is versioned through migration 37 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, retention aggregates, and metadata tables.
@@ -1174,7 +1181,7 @@ a search hit therefore survives the deletion of the rows behind its code stats,
 which is precisely the degradation
 [[frontend#Frontend#Components#Retention Degradation]] exists to state.
 
-- **tool_actions** — Tool invocation details behind `get_code_stats`, `get_batch_session_code_stats` and sub-agent discovery (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input; the code-stats queries prefer those columns and re-parse `full_input` only for legacy rows. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
+- **tool_actions** — Tool invocation details behind `get_code_stats`, `get_batch_session_code_stats` and sub-agent discovery (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input. The code-stats queries select those persisted counters directly and conditionally project `full_input` only when either counter is NULL; these legacy rows keep the tolerant parser while migrated rows never materialize the payload. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
 
 #### Retention aggregates
