@@ -33,7 +33,6 @@
 
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { areaPath, scalePoints, seriesMax, smoothPath, type VizPoint } from "../viz";
 import { useCachedInvoke } from "../../../hooks/useCachedInvoke";
 import { useCodeStats } from "../../../hooks/useCodeStats";
@@ -57,7 +56,6 @@ const BAR_HEIGHT = 56;
 const AREA_TOP_PAD = 7;
 /** Half the gap between the zero line and the tallest bar, in either direction. */
 const BAR_PAD = 4;
-const REFRESH_DEBOUNCE_MS = 1000;
 const REFRESH_INTERVAL_MS = 60_000;
 
 /** Added and removed lines are categories, so they take metric hues, not severity. */
@@ -292,24 +290,22 @@ function useWidgetTokenHistory(range: RangeType) {
     [range],
   );
   const { state, refresh } = useCachedInvoke({
-    identity: `widget-token-history:${range}`,
+    command: "get_token_history",
+    args: {
+      range,
+      provider: null,
+      hostname: null,
+      sessionId: null,
+      cwd: null,
+    },
     request,
     normalizeError: String,
+    invalidationEvents: ["tokens-updated"],
   });
 
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const schedule = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(refresh, REFRESH_DEBOUNCE_MS);
-    };
-    const unlisten = listen("tokens-updated", schedule);
     const interval = setInterval(refresh, REFRESH_INTERVAL_MS);
-    return () => {
-      if (timer) clearTimeout(timer);
-      clearInterval(interval);
-      unlisten.then((stop) => stop());
-    };
+    return () => clearInterval(interval);
   }, [refresh]);
 
   return {

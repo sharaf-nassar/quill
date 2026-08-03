@@ -5,7 +5,6 @@
 
 import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import type {
   ActivitySeriesResponse,
   ProviderTokenSeriesResponse,
@@ -16,7 +15,6 @@ import { useCachedInvoke } from "./useCachedInvoke";
 /** Points the widget draws per series; mirrors the Rust default grid. */
 export const WIDGET_SERIES_BUCKETS = 8;
 
-const REFRESH_DEBOUNCE_MS = 1000;
 const REFRESH_INTERVAL_MS = 60_000;
 
 export interface WidgetSeriesResult<T> {
@@ -32,18 +30,8 @@ export interface WidgetSeriesResult<T> {
  */
 function useSnapshotRefresh(refresh: () => void): void {
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const schedule = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(refresh, REFRESH_DEBOUNCE_MS);
-    };
-    const unlisten = listen("tokens-updated", schedule);
     const interval = setInterval(refresh, REFRESH_INTERVAL_MS);
-    return () => {
-      if (timer) clearTimeout(timer);
-      clearInterval(interval);
-      unlisten.then((stop) => stop());
-    };
+    return () => clearInterval(interval);
   }, [refresh]);
 }
 
@@ -67,9 +55,11 @@ export function useProviderTokenSeries(
     [range, buckets],
   );
   const { state, refresh } = useCachedInvoke({
-    identity: `provider-token-series:${range}:${buckets}`,
+    command: "get_provider_token_series",
+    args: { range, buckets },
     request,
     normalizeError: String,
+    invalidationEvents: ["tokens-updated"],
   });
   useSnapshotRefresh(refresh);
 
@@ -97,9 +87,11 @@ export function useActivitySeries(
     [range, buckets],
   );
   const { state, refresh } = useCachedInvoke({
-    identity: `activity-series:${range}:${buckets}`,
+    command: "get_activity_series",
+    args: { range, buckets },
     request,
     normalizeError: String,
+    invalidationEvents: ["tokens-updated"],
   });
   useSnapshotRefresh(refresh);
 

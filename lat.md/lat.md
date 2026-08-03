@@ -8,3 +8,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[infrastructure]] — CI/CD pipeline, release process, build config, code quality, scripts
 - [[runtime-rollup-tests]] — Runtime finalization, replacement, and ingest-budget test specs
 - [[model-rollup-tests]] — Model backfill resume, authority, handoff, and maintenance test specs
+- [[frontend-cache-tests]] — Frontend invoke cache, refresh cadence, and lifecycle test specs

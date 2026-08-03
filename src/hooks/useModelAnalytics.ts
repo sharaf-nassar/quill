@@ -1,15 +1,12 @@
 import {
 	useCallback,
 	useEffect,
-	useEffectEvent,
 	useRef,
 	useState,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import type {
 	ModelAnalyticsError,
-	ModelAnalyticsUpdatedEvent,
 	ModelBackfillState,
 	ModelBackfillStatus,
 	ModelRange,
@@ -18,7 +15,6 @@ import type {
 import { normalizeModelAnalyticsError } from "./modelAnalyticsErrors";
 import { useCachedInvoke } from "./useCachedInvoke";
 
-const EVENT_COALESCE_MS = 1_000;
 const FALLBACK_POLL_MS = 60_000;
 
 export interface ModelAnalyticsRequestState<T> {
@@ -156,13 +152,13 @@ export function useModelAnalytics(
 	provider: string | null,
 	active: boolean,
 ): UseModelAnalyticsResult {
-	const overviewIdentity = JSON.stringify([range, provider]);
 	const pendingRefreshWhileHiddenRef = useRef(false);
 	const [backfillStatus, setBackfillStatus] =
 		useState<ModelBackfillStatus | null>(null);
 	const [isBackfillRetrying, setIsBackfillRetrying] = useState(false);
 	const [backfillRetryError, setBackfillRetryError] =
 		useState<ModelAnalyticsError | null>(null);
+	const [refreshGeneration, setRefreshGeneration] = useState(0);
 	const backfillRetryGenerationRef = useRef(0);
 	const backfillRetryInFlightRef = useRef(false);
 
@@ -172,6 +168,7 @@ export function useModelAnalytics(
 	const acceptOverviewData = useCallback(
 		(response: ModelUsageOverviewResponse) => {
 			acceptBackfillStatus(response.backfill);
+			setRefreshGeneration((generation) => generation + 1);
 		},
 		[acceptBackfillStatus],
 	);
@@ -189,13 +186,15 @@ export function useModelAnalytics(
 	}, []);
 
 	const overviewRequest = useCachedInvoke({
-		identity: overviewIdentity,
+		command: "get_model_usage_overview",
+		args: { range, provider },
 		request: requestOverview,
 		normalizeError: normalizeModelAnalyticsError,
 		onAcceptedData: acceptOverviewData,
 		onError: logOverviewError,
+		invalidationEvents: ["model-analytics-updated"],
 	});
-	const [refreshGeneration, setRefreshGeneration] = useState(0);
+	const refreshOverview = overviewRequest.refresh;
 
 	const retryBackfill = useCallback(() => {
 		if (backfillRetryInFlightRef.current) return;
@@ -238,90 +237,39 @@ export function useModelAnalytics(
 		[],
 	);
 
-	const refreshFromExternalSignal = useEffectEvent(() => {
-		setRefreshGeneration((generation) => generation + 1);
-		overviewRequest.refresh();
-	});
-
-	// External signals (ingest events, poll) only refresh when the panel is
-	// observable — the Models tab is active and the document is visible. While
-	// hidden the signal is remembered and replayed once on the next activation,
-	// so a background tab never storms the backend or fans out to detail hooks.
-	const maybeRefreshFromSignal = useEffectEvent(() => {
-		if (active && document.visibilityState !== "hidden") {
-			refreshFromExternalSignal();
-		} else {
-			pendingRefreshWhileHiddenRef.current = true;
-		}
-	});
-
-	const flushPendingIfObservable = useEffectEvent(() => {
-		if (!active || document.visibilityState === "hidden") return;
-		if (!pendingRefreshWhileHiddenRef.current) return;
-		pendingRefreshWhileHiddenRef.current = false;
-		refreshFromExternalSignal();
-	});
-
 	useEffect(() => {
-		flushPendingIfObservable();
-	}, [active]);
-
-	useEffect(() => {
-		let disposed = false;
-		let unlisten: (() => void) | null = null;
-		let eventTimer: ReturnType<typeof setTimeout> | null = null;
-
-		void listen<ModelAnalyticsUpdatedEvent>(
-			"model-analytics-updated",
-			(event) => {
-				if (disposed || eventTimer !== null) return;
-				// Backfill emits one event per committed source; no-op commits carry
-				// dataChanged=false. Ignore them so idle ingest cannot storm refetches.
-				if (event.payload.dataChanged === false) return;
-
-				// The first data-changing event owns the deadline. Later events join
-				// this window without clearing or extending its timer.
-				eventTimer = setTimeout(() => {
-					eventTimer = null;
-					if (!disposed) maybeRefreshFromSignal();
-				}, EVENT_COALESCE_MS);
-			},
-		)
-			.then((stopListening) => {
-				if (disposed) {
-					stopListening();
-				} else {
-					unlisten = stopListening;
-					// Reconcile once after subscription becomes active. This closes the
-					// gap where a commit event can land between initial fetch and the
-					// asynchronous Tauri listener registration. If the listener already
-					// captured an event, its fixed-window timer owns that refresh.
-					if (eventTimer === null) maybeRefreshFromSignal();
-				}
-			})
-			.catch((error: unknown) => {
-				if (!disposed) {
-					console.error("Model analytics event listener failed:", error);
-				}
-			});
-
-		const pollTimer = setInterval(() => {
-			if (!disposed) maybeRefreshFromSignal();
-		}, FALLBACK_POLL_MS);
-
-		const handleVisibilityChange = () => {
-			if (!disposed) flushPendingIfObservable();
+		const refreshIfObservable = () => {
+			if (active && document.visibilityState !== "hidden") {
+				pendingRefreshWhileHiddenRef.current = false;
+				refreshOverview();
+			} else {
+				pendingRefreshWhileHiddenRef.current = true;
+			}
 		};
+		const flushPendingIfObservable = () => {
+			if (
+				!pendingRefreshWhileHiddenRef.current ||
+				!active ||
+				document.visibilityState === "hidden"
+			) {
+				return;
+			}
+			pendingRefreshWhileHiddenRef.current = false;
+			refreshOverview();
+		};
+
+		flushPendingIfObservable();
+		const pollTimer = setInterval(refreshIfObservable, FALLBACK_POLL_MS);
 		document.addEventListener("visibilitychange", handleVisibilityChange);
+		function handleVisibilityChange() {
+			flushPendingIfObservable();
+		}
 
 		return () => {
-			disposed = true;
-			if (eventTimer !== null) clearTimeout(eventTimer);
 			clearInterval(pollTimer);
 			document.removeEventListener("visibilitychange", handleVisibilityChange);
-			unlisten?.();
 		};
-	}, []);
+	}, [active, refreshOverview]);
 
 	return {
 		overview: overviewRequest.state,

@@ -380,3 +380,22 @@ BEFORE fan-out total exists and none is reconstructed from unrelated rows.
 These decisions size C/D/E but do not waive slice A's failed cold budgets. The
 residual model-query follow-up remains the release gate before feature 020 can
 claim its S1 acceptance target.
+
+## Frontend cache and refresh query-window evidence
+
+The slice-D Node mock uses a controllable clock around the production module
+store. It mounts two command-and-range keys, emits an invalidation every second,
+then removes one subscriber while the next shared fan-out is pending.
+
+```text
+npm run test:cached-invoke
+[query-window] [{"atMs":0,"command":"get_token_stats","args":{"range":"6h"}},{"atMs":0,"command":"get_project_breakdown","args":{"range":"6h"}},{"atMs":5000,"command":"get_token_stats","args":{"range":"6h"}},{"atMs":5000,"command":"get_project_breakdown","args":{"range":"6h"}},{"atMs":10000,"command":"get_token_stats","args":{"range":"6h"}},{"atMs":10000,"command":"get_project_breakdown","args":{"range":"6h"}},{"atMs":15000,"command":"get_project_breakdown","args":{"range":"6h"}}]
+```
+
+Both mounted commands run at 0, 5,000, and 10,000 ms: one complete fan-out per
+fixed window and no interval below 5,000 ms despite continuous events. After
+the token-stats subscriber leaves, the shared timer remains live and refreshes
+only the project key at 15,000 ms. Companion assertions verify a fresh remount
+issues zero requests, stale unmounted entries revalidate in the background,
+changed ranges isolate keys, concurrent subscribers coalesce, rejected work
+does not poison the cache, and Strict Mode cleanup releases listeners/timers.

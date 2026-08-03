@@ -337,7 +337,7 @@ Controls for restarting Claude Code instances from the dedicated Restart window.
 
 ## Custom Hooks
 
-All data hooks use Tauri `invoke()` for request-response and `listen()` for push event refresh. Most refresh on a 60-second interval and debounce event-triggered refreshes by 1 second.
+Widget data hooks use Tauri `invoke()` through a process-lifetime cache. One widget-level listener set invalidates entries on push events and batches mounted refresh work on a fixed five-second floor; most hooks retain a 60-second fallback poll.
 
 ### Integration Hook
 
@@ -402,15 +402,27 @@ The hooks the deleted analytics pane owned — `useAnalyticsData`, `useTokenData
 [[src/hooks/useCachedInvoke.ts#useCachedInvoke]] is the shared cache primitive
 for `useModelAnalytics`, `useWidgetSeries`, `useWeeklyTrends`, `useCodeStats`,
 `useCodeInsights`, `useLlmRuntimeStats`, `useContextSavingsStats`, and
-`useBreakdownData`. Each hook keeps identity-scoped accepted data, starts its
-first request immediately, and debounces later refreshes by 200 ms. A
-generation guard discards stale responses, a same-identity in-flight request
-coalesces refreshes, and equal JSON results retain their prior object identity.
-This gives every hook stale-while-revalidate rendering without duplicating
-request-lifecycle code — which is what lets a view switch back to a range it
-already visited without a skeleton.
+`useBreakdownData`. [[src/hooks/cachedInvokeStore.ts#CachedInvokeStore]] keys
+entries by logical command plus stable serialized arguments, retains accepted
+data for 45 seconds, shares identical in-flight requests, and never promotes a
+rejection to cached data. Fresh remounts read the module entry with zero IPC;
+stale entries still render while a background revalidation waits for the
+shared cadence. Explicit Retry bypasses that delay, while equal responses keep
+their prior object identity. See [[frontend-cache-tests#Frontend Invoke Cache Tests]].
 
-Data hooks subscribe to backend push events instead of relying only on the 60-second polling fallback. `useLlmRuntimeStats` and `useBreakdownData` refresh on `sessions-index-updated`; `useCodeStats` and `useCodeInsights` also subscribe to `transcript-analytics-updated`, because after migration 30 `tool_actions` is written exclusively by source-owned reconciliation and `sessions-index-updated` no longer covers it. `useCodeInsights` additionally listens to `tokens-updated` because it combines code and token history. The widget series hooks in [[src/hooks/useWidgetSeries.ts]] share one refresh path — both read `token_snapshots`, so both debounce on `tokens-updated` and poll on the same 60-second interval, and neither can end up a refresh behind the other.
+[[src/hooks/useCachedInvokeEvents.ts#useCachedInvokeEvents]] owns the widget's
+push listeners so inactive-view entries are invalidated even with no React
+subscriber. Only mounted keys join one non-extending fan-out window, whose
+minimum interval is 5,000 ms; continuous events produce periodic refreshes
+instead of starving a trailing debounce. Hidden windows mark entries stale
+without querying and refresh mounted stale entries when visible again. Async
+listener registration and module timers clean up under Strict Mode, while
+settled data survives the unmount. Listener promise settlement never
+invalidates entries; only an emitted event does. `tokens-updated`,
+`sessions-index-updated`, `transcript-analytics-updated`,
+`context-savings-updated`, `hooks-observed-updated`, and data-changing
+`model-analytics-updated` events each invalidate only hooks that declared that
+dependency.
 
 `useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 
@@ -423,7 +435,7 @@ Hooks follow a consistent async state pattern: `useState` for data/loading/error
 
 `useModelAnalytics` keeps usage-overview and backfill retry state independent so a failed refresh cannot replace the last successfully loaded same-scope overview.
 
-[[src/hooks/useModelAnalytics.ts#useModelAnalytics]] takes `(range, provider, active)`, fetches the single `get_model_usage_overview` snapshot per scope, and exposes separate initial-loading, refresh-loading, structured-error, and Retry state. [[src/hooks/useCachedInvoke.ts#useCachedInvoke]] owns its identity-keyed cache, first-call-immediate/later-call-200ms debounce, stale-response generation guard, same-identity deferred refresh dedupe, and byte-identical reference reuse. Revisiting a range/provider scope therefore renders cached data while it revalidates without a skeleton. Backfill status persists across scope changes from accepted snapshots and the structured retry response; generation, lifecycle, inventory, and monotonic progress outrank wall-clock timestamps so clock rollback cannot hide completion. Its own guarded Retry never clears recovered overview data. External refreshes are gated: the `model-analytics-updated` listener ignores events whose payload reports `dataChanged === false`, and event-driven refresh and the 60-second poll pause while the panel is inactive or the document is hidden, replaying a single missed signal once on re-activation. One Strict Mode-safe listener still starts a fixed one-second deadline at the first observable event and reconciles once when its asynchronous registration becomes active to close the initial fetch/subscription gap unless a captured event already owns that refresh; a disposed registration only unsubscribes. Model selection is client-side and never refetches the overview; the widget's [[lat.md/frontend#Frontend#Components#Widget View Region#Models View]] has no inspect panel, so one overview snapshot serves the whole view and there are no detail hooks to fan a refresh generation out to.
+[[src/hooks/useModelAnalytics.ts#useModelAnalytics]] takes `(range, provider, active)`, fetches one `get_model_usage_overview` snapshot per scope, and exposes separate initial-loading, refresh-loading, structured-error, and Retry state. Its command-and-args cache preserves the last accepted overview across view switches and keeps stale data beside refresh errors. Backfill status persists across scope changes from accepted snapshots and the structured retry response; generation, lifecycle, inventory, and monotonic progress outrank wall-clock timestamps so clock rollback cannot hide completion. The guarded Retry remains immediate and never clears recovered overview data. Central event invalidation ignores `model-analytics-updated` events with `dataChanged === false`; data-changing events join the widget's shared five-second fan-out window, while the 60-second fallback poll pauses when the panel or document is hidden and replays once when observable. Model selection is client-side and never refetches the overview; the widget's [[lat.md/frontend#Frontend#Components#Widget View Region#Models View]] has no inspect panel, so one overview snapshot serves the whole view.
 
 ### Context
 

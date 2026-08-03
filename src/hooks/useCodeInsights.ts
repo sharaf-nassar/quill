@@ -1,6 +1,5 @@
-import { useState, useEffect, useCallback } from "react";
+import { useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { useCachedInvoke } from "./useCachedInvoke";
 import type {
 	RangeType,
@@ -32,7 +31,6 @@ interface CodeInsightsResult {
 }
 
 const SPARKLINE_BUCKETS = 7;
-const REFRESH_DEBOUNCE_MS = 1000;
 
 function getRangeMs(range: RangeType): number {
 	switch (range) {
@@ -151,7 +149,6 @@ export function useCodeInsights(
 	range: RangeType,
 	currentRuntime: LlmRuntimeStatsResult,
 ): CodeInsightsResult {
-	const [result, setResult] = useState<CodeInsightsResult>(EMPTY_RESULT);
 	const {
 		loading: runtimeLoading,
 		totalRuntimeSecs,
@@ -159,11 +156,9 @@ export function useCodeInsights(
 	} = currentRuntime;
 
 	const fetchData = useCallback(async () => {
-		if (runtimeLoading) return;
-		try {
-			const historyRange = comparisonRange(range);
-			const [tokenHistory, codeHistory, comparisonRuntime] =
-				await Promise.all([
+		const historyRange = comparisonRange(range);
+		const [tokenHistory, codeHistory, comparisonRuntime] =
+			await Promise.all([
 					invoke<TokenDataPoint[]>("get_token_history", {
 						range: historyRange,
 						hostname: null,
@@ -181,41 +176,37 @@ export function useCodeInsights(
 						: invoke<LlmRuntimeStats>("get_llm_runtime_stats", {
 								range: historyRange,
 							}),
-				]);
+			]);
 
-			if (tokenHistory.length === 0 || codeHistory.length === 0) {
-				setResult({
-					...EMPTY_RESULT,
-					loading: false,
-				});
-				return;
-			}
+		if (tokenHistory.length === 0 || codeHistory.length === 0) {
+			return { ...EMPTY_RESULT, loading: false };
+		}
 
-			const now = Date.now();
-			const rangeMs = getRangeMs(range);
-			const currentStart = now - rangeMs;
-			const prevStart = currentStart - rangeMs;
+		const now = Date.now();
+		const rangeMs = getRangeMs(range);
+		const currentStart = now - rangeMs;
+		const prevStart = currentStart - rangeMs;
 
-			let currentTokens = 0;
-			let prevTokens = 0;
-			for (const point of tokenHistory) {
-				const ts = new Date(point.timestamp).getTime();
-				if (ts >= currentStart) currentTokens += point.total_tokens;
-				else if (ts >= prevStart) prevTokens += point.total_tokens;
-			}
+		let currentTokens = 0;
+		let prevTokens = 0;
+		for (const point of tokenHistory) {
+			const ts = new Date(point.timestamp).getTime();
+			if (ts >= currentStart) currentTokens += point.total_tokens;
+			else if (ts >= prevStart) prevTokens += point.total_tokens;
+		}
 
-			let currentLoc = 0;
-			let prevLoc = 0;
-			for (const point of codeHistory) {
-				const ts = new Date(point.timestamp).getTime();
-				if (ts >= currentStart) currentLoc += point.total_changed;
-				else if (ts >= prevStart) prevLoc += point.total_changed;
-			}
+		let currentLoc = 0;
+		let prevLoc = 0;
+		for (const point of codeHistory) {
+			const ts = new Date(point.timestamp).getTime();
+			if (ts >= currentStart) currentLoc += point.total_changed;
+			else if (ts >= prevStart) prevLoc += point.total_changed;
+		}
 
-			const bucketMs = rangeMs / SPARKLINE_BUCKETS;
-			const efficiencySparkline: SparklinePoint[] = [];
-			const velocitySparkline: SparklinePoint[] = [];
-			for (let i = 0; i < SPARKLINE_BUCKETS; i++) {
+		const bucketMs = rangeMs / SPARKLINE_BUCKETS;
+		const efficiencySparkline: SparklinePoint[] = [];
+		const velocitySparkline: SparklinePoint[] = [];
+		for (let i = 0; i < SPARKLINE_BUCKETS; i++) {
 				const bucketStart = currentStart + i * bucketMs;
 				const bucketEnd = bucketStart + bucketMs;
 				let bucketTokens = 0;
@@ -239,28 +230,28 @@ export function useCodeInsights(
 				velocitySparkline.push({
 					value: bucketHours > 0 ? Math.round(bucketLoc / bucketHours) : 0,
 				});
-			}
+		}
 
-			const compMs = getRangeMs(historyRange);
-			const compStart = now - compMs;
-			const compRuntime = comparisonRuntime ?? {
-				sparkline: runtimeSparkline.map(({ value }) => value),
-			};
-			const currentActiveSecs = totalRuntimeSecs ?? 0;
-			const prevActiveSecs = activeSecsInWindow(
-				compRuntime.sparkline,
-				compStart,
-				compMs,
-				prevStart,
-				currentStart,
-			);
+		const compMs = getRangeMs(historyRange);
+		const compStart = now - compMs;
+		const compRuntime = comparisonRuntime ?? {
+			sparkline: runtimeSparkline.map(({ value }) => value),
+		};
+		const currentActiveSecs = totalRuntimeSecs ?? 0;
+		const prevActiveSecs = activeSecsInWindow(
+			compRuntime.sparkline,
+			compStart,
+			compMs,
+			prevStart,
+			currentStart,
+		);
 
-			const tokensPerLoc = computeEfficiency(currentTokens, currentLoc);
-			const prevEfficiency = computeEfficiency(prevTokens, prevLoc);
-			const locPerHour = computeVelocity(currentLoc, currentActiveSecs, rangeMs);
-			const prevVelocity = computeVelocity(prevLoc, prevActiveSecs, rangeMs);
+		const tokensPerLoc = computeEfficiency(currentTokens, currentLoc);
+		const prevEfficiency = computeEfficiency(prevTokens, prevLoc);
+		const locPerHour = computeVelocity(currentLoc, currentActiveSecs, rangeMs);
+		const prevVelocity = computeVelocity(prevLoc, prevActiveSecs, rangeMs);
 
-			setResult({
+		return {
 				efficiency: {
 					tokensPerLoc,
 					trend: computeTrend(tokensPerLoc, prevEfficiency, false),
@@ -272,45 +263,31 @@ export function useCodeInsights(
 					sparkline: velocitySparkline,
 				},
 				loading: false,
-			});
-		} catch (e) {
-			console.error("Code insights fetch error:", e);
-			setResult({
-				...EMPTY_RESULT,
-				loading: false,
-			});
-		}
-	}, [range, runtimeLoading, runtimeSparkline, totalRuntimeSecs]);
+			};
+	}, [range, runtimeSparkline, totalRuntimeSecs]);
 
-	useCachedInvoke({ identity: `code-insights:${range}`, request: fetchData, normalizeError: String });
-
-	useEffect(() => {
-		let mounted = true;
-		let timer: ReturnType<typeof setTimeout> | null = null;
-		const scheduleRefresh = () => {
-			if (!mounted) return;
-			if (timer) clearTimeout(timer);
-			timer = setTimeout(fetchData, REFRESH_DEBOUNCE_MS);
-		};
-		const unlistenPromises = [
-			listen("tokens-updated", scheduleRefresh),
-			listen("sessions-index-updated", scheduleRefresh),
-			listen("transcript-analytics-updated", scheduleRefresh),
-		];
-
-		return () => {
-			mounted = false;
-			if (timer) clearTimeout(timer);
-			for (const unlistenPromise of unlistenPromises) {
-				unlistenPromise.then((fn) => fn());
-			}
-		};
-	}, [fetchData]);
+	const { state, refresh } = useCachedInvoke({
+		command: "widget_code_insights",
+		args: {
+			range,
+			totalRuntimeSecs,
+			runtimeSparkline: runtimeSparkline.map(({ value }) => value),
+		},
+		request: fetchData,
+		normalizeError: String,
+		onError: (error) => console.error("Code insights fetch error:", error),
+		enabled: !runtimeLoading,
+		invalidationEvents: [
+			"tokens-updated",
+			"sessions-index-updated",
+			"transcript-analytics-updated",
+		],
+	});
 
 	useEffect(() => {
-		const interval = setInterval(fetchData, 60_000);
+		const interval = setInterval(refresh, 60_000);
 		return () => clearInterval(interval);
-	}, [fetchData]);
+	}, [refresh]);
 
-	return result;
+	return state.data ?? { ...EMPTY_RESULT, loading: state.initialLoading };
 }

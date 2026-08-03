@@ -11,6 +11,7 @@
 
 import { useState, type ReactNode } from "react";
 import type { RangeType } from "../../types";
+import { useCachedInvokeEvents } from "../../hooks/useCachedInvokeEvents";
 import ViewSwitcher, { type ViewOption, type WidgetView } from "./ViewSwitcher";
 import ChartsView from "./views/ChartsView";
 import ContextView from "./views/ContextView";
@@ -78,6 +79,7 @@ const VIEWS: readonly ViewDefinition[] = [
 ];
 
 function ViewRegion() {
+  useCachedInvokeEvents();
   const [view, setView] = useState<WidgetView>("usage");
   const [range, setRange] = useState<RangeType>(DEFAULT_RANGE);
 

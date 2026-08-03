@@ -22,7 +22,6 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { AreaChart, Sparkline, type VizSeries } from "../viz";
 import { selectInsightLine } from "./insightLine";
 import { useActivitySeries, useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
@@ -51,7 +50,6 @@ import type {
 } from "../../../types";
 
 const CHART_HEIGHT = 118;
-const REFRESH_DEBOUNCE_MS = 1000;
 const REFRESH_INTERVAL_MS = 60_000;
 /** Rows the breakdown shows before it would start dominating the widget. */
 const BREAKDOWN_LIMIT = 5;
@@ -273,24 +271,22 @@ function useWidgetTokenStats(range: RangeType) {
     [range],
   );
   const { state, refresh } = useCachedInvoke({
-    identity: `widget-token-stats:${range}`,
+    command: "get_token_stats",
+    args: {
+      range,
+      provider: null,
+      hostname: null,
+      sessionId: null,
+      cwd: null,
+    },
     request,
     normalizeError: String,
+    invalidationEvents: ["tokens-updated"],
   });
 
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const schedule = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(refresh, REFRESH_DEBOUNCE_MS);
-    };
-    const unlisten = listen("tokens-updated", schedule);
     const interval = setInterval(refresh, REFRESH_INTERVAL_MS);
-    return () => {
-      if (timer) clearTimeout(timer);
-      clearInterval(interval);
-      unlisten.then((stop) => stop());
-    };
+    return () => clearInterval(interval);
   }, [refresh]);
 
   return { stats: state.data, loading: state.initialLoading };

@@ -21,7 +21,6 @@
 
 import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { useCachedInvoke } from "./useCachedInvoke";
 import { activeSecsInWindow, computeVelocity } from "./useCodeInsights";
 import { retentionSpanFor, type RetentionSpan } from "../utils/retention";
@@ -36,7 +35,6 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 const HISTORY_MS = 30 * 24 * 60 * 60 * 1000;
 /** The widest fixed range, so one fetch covers both compared weeks. */
 const HISTORY_RANGE = "30d";
-const REFRESH_DEBOUNCE_MS = 1000;
 const REFRESH_INTERVAL_MS = 60_000;
 /**
  * Percent moves below this read as noise rather than as a trend. Matches the
@@ -243,27 +241,16 @@ async function loadWeeklyTrends(cutoff: string | null): Promise<WeeklyTrends> {
 export function useWeeklyTrends(cutoff: string | null): WeeklyTrendsResult {
   const request = useCallback(() => loadWeeklyTrends(cutoff), [cutoff]);
   const { state, refresh } = useCachedInvoke({
-    identity: `weekly-trends:${cutoff ?? "none"}`,
+    command: "widget_weekly_trends",
+    args: { cutoff },
     request,
     normalizeError: String,
+    invalidationEvents: ["tokens-updated", "transcript-analytics-updated"],
   });
 
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const schedule = () => {
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(refresh, REFRESH_DEBOUNCE_MS);
-    };
-    const unlistens = [
-      listen("tokens-updated", schedule),
-      listen("transcript-analytics-updated", schedule),
-    ];
     const interval = setInterval(refresh, REFRESH_INTERVAL_MS);
-    return () => {
-      if (timer) clearTimeout(timer);
-      clearInterval(interval);
-      for (const unlisten of unlistens) unlisten.then((stop) => stop());
-    };
+    return () => clearInterval(interval);
   }, [refresh]);
 
   return {
