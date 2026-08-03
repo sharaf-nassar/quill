@@ -12,3 +12,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[frontend-cache-tests]] — Frontend invoke cache, refresh cadence, and lifecycle test specs
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
+- [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs

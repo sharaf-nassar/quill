@@ -28828,6 +28828,66 @@ mod tests {
         );
     }
 
+    fn rollup_test_wal_path(database_path: &Path) -> PathBuf {
+        let mut wal_path = database_path.as_os_str().to_os_string();
+        wal_path.push("-wal");
+        PathBuf::from(wal_path)
+    }
+
+    fn rollup_test_wal_bytes(wal_path: &Path) -> u64 {
+        std::fs::metadata(wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+
+    fn truncate_rollup_test_wal(storage: &Storage) {
+        let checkpoint = storage
+            .conn
+            .lock()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("truncate fixture WAL before contention");
+        assert_eq!(checkpoint.0, 0, "fixture WAL checkpoint must not be busy");
+        assert_eq!(
+            rollup_test_wal_bytes(&rollup_test_wal_path(storage.database_path())),
+            0,
+            "TRUNCATE checkpoint must start the contention run at zero WAL bytes"
+        );
+    }
+
+    fn assert_rollup_wal_bound(
+        target: &str,
+        before_checkpoint: &[u64],
+        after_checkpoint: &[u64],
+        bound_bytes: u64,
+    ) {
+        assert!(
+            before_checkpoint.len() >= 2,
+            "{target} fixture must exercise multiple chunks"
+        );
+        assert_eq!(
+            before_checkpoint.len(),
+            after_checkpoint.len(),
+            "every {target} chunk must reach its checkpoint"
+        );
+        assert!(
+            before_checkpoint
+                .iter()
+                .all(|wal_bytes| *wal_bytes <= bound_bytes),
+            "{target} WAL exceeded {bound_bytes} bytes before checkpoint: \
+             {before_checkpoint:?}"
+        );
+        assert!(
+            after_checkpoint.iter().all(|wal_bytes| *wal_bytes == 0),
+            "{target} TRUNCATE checkpoint left WAL bytes: {after_checkpoint:?}"
+        );
+    }
+
     // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Empty Completion And Committed Progress]]
     #[test]
     #[serial]
@@ -29229,6 +29289,261 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[rollup-concurrency-tests#Rollup Backfill Concurrency Test Specs#Model Quiesce Ingest And WAL Bound]]
+    #[test]
+    #[serial]
+    fn model_backfill_resumes_after_quiesce_with_exact_ingest_and_bounded_wal() {
+        const CHUNK_ROWS: u64 = 128;
+        const ROWS_PER_HOUR: usize = 129;
+        const MAINTENANCE_HOLD: Duration = Duration::from_millis(300);
+
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(init_storage_in(&dir));
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z")
+            .expect("model contention base")
+            .with_timezone(&Utc);
+        let initial = (0..ROWS_PER_HOUR * 2)
+            .map(|index| {
+                let timestamp = base
+                    + TimeDelta::hours((index / ROWS_PER_HOUR) as i64)
+                    + TimeDelta::seconds((index % ROWS_PER_HOUR) as i64);
+                claude_overview_turn(
+                    &timestamp,
+                    "model-contention-session",
+                    "model-contention",
+                    1,
+                    "/work/model-contention",
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "model-contention-source",
+            "model-contention-session",
+            &initial,
+        );
+        assert_eq!(
+            storage
+                .reset_model_rollup_backfill()
+                .expect("reset model contention backfill"),
+            (ROWS_PER_HOUR * 2) as u64
+        );
+
+        let live = claude_overview_turn(
+            &(base - TimeDelta::hours(1)),
+            "model-live-session",
+            "model-live",
+            7,
+            "/work/model-live",
+        );
+        let (live_source, live_observations, live_fingerprint) =
+            prepare_claude_model_source(&dir, "model-live-source", "model-live-session", &live);
+        let live_observation_count = live_observations.len();
+        truncate_rollup_test_wal(&storage);
+
+        let wal_path = rollup_test_wal_path(storage.database_path());
+        let wal_before_checkpoint = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let wal_after_checkpoint = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let (first_chunk_tx, first_chunk_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let (backfill_attempt_tx, backfill_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let (backfill_acquired_tx, backfill_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let (backfill_proceed_tx, backfill_proceed_rx) = std::sync::mpsc::sync_channel(0);
+        let backfill_storage = std::sync::Arc::clone(&storage);
+        let before_samples = std::sync::Arc::clone(&wal_before_checkpoint);
+        let after_samples = std::sync::Arc::clone(&wal_after_checkpoint);
+        let backfill_wal_path = wal_path.clone();
+        let backfill = std::thread::spawn(move || {
+            let before_permit_calls = std::cell::Cell::new(0_usize);
+            let before_permit = || {
+                let call = before_permit_calls.get() + 1;
+                before_permit_calls.set(call);
+                if call == 2 {
+                    backfill_attempt_tx
+                        .send(())
+                        .expect("signal model backfill waiting for permit");
+                }
+            };
+            let after_permit_calls = std::cell::Cell::new(0_usize);
+            let after_permit = || {
+                let call = after_permit_calls.get() + 1;
+                after_permit_calls.set(call);
+                if call == 2 {
+                    backfill_acquired_tx
+                        .send(())
+                        .expect("signal model backfill acquired permit");
+                    backfill_proceed_rx
+                        .recv()
+                        .expect("release model backfill after live ingest");
+                }
+            };
+            let before_checkpoint_path = backfill_wal_path.clone();
+            let before_checkpoint = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+                before_samples
+                    .lock()
+                    .push(rollup_test_wal_bytes(&before_checkpoint_path));
+            };
+            let after_checkpoint_path = backfill_wal_path.clone();
+            let progress = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+                after_samples
+                    .lock()
+                    .push(rollup_test_wal_bytes(&after_checkpoint_path));
+            };
+            let after_chunk_calls = std::cell::Cell::new(0_usize);
+            let after_chunk = |progress: &crate::rollup_backfill::RollupBackfillProgress| {
+                let call = after_chunk_calls.get() + 1;
+                after_chunk_calls.set(call);
+                if call == 1 {
+                    first_chunk_tx
+                        .send((progress.rows_done, progress.done_through))
+                        .expect("publish committed model prefix");
+                    resume_rx
+                        .recv()
+                        .expect("resume model backfill into maintenance window");
+                }
+                crate::rollup_backfill::RollupChunkControl::Continue
+            };
+            let controls = RollupBackfillControls {
+                chunk_rows: CHUNK_ROWS,
+                before_chunk_permit: Some(&before_permit),
+                after_chunk_permit: Some(&after_permit),
+                before_checkpoint: Some(&before_checkpoint),
+                progress: Some(&progress),
+                after_chunk: Some(&after_chunk),
+                ..RollupBackfillControls::default()
+            };
+            backfill_storage.run_model_rollup_backfill_with_controls(&controls)
+        });
+
+        let (prefix_rows_done, prefix_bookmark) = first_chunk_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("model backfill commits its first chunk");
+        assert_eq!(prefix_rows_done, ROWS_PER_HOUR as u64);
+        let committed_prefix = unpruned_model_hourly_rows(&storage);
+        assert_eq!(committed_prefix.len(), 1);
+        assert_eq!(committed_prefix[0].obs_count, ROWS_PER_HOUR as i64);
+
+        let maintenance = crate::begin_ingest_quiesce();
+        let (ingest_attempt_tx, ingest_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let (ingest_acquired_tx, ingest_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let ingest_storage = std::sync::Arc::clone(&storage);
+        let ingest = std::thread::spawn(move || {
+            ingest_attempt_tx
+                .send(())
+                .expect("signal model live ingest permit attempt");
+            crate::with_ingest_write_permit(|| {
+                ingest_acquired_tx
+                    .send(())
+                    .expect("signal model live ingest permit acquisition");
+                ingest_storage
+                    .replace_model_source(&live_source, &live_observations, &live_fingerprint)
+                    .map(|_| ())
+            })
+        });
+        resume_tx.send(()).expect("resume model backfill");
+        ingest_attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("model live ingest reaches the held gate");
+        backfill_attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("model backfill reaches the held gate");
+        std::thread::sleep(MAINTENANCE_HOLD);
+        assert_eq!(
+            ingest_acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "maintenance must defer model live ingest"
+        );
+        assert_eq!(
+            backfill_acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "maintenance must keep model backfill between chunks"
+        );
+        assert_eq!(
+            unpruned_model_hourly_rows(&storage),
+            committed_prefix,
+            "maintenance must preserve the committed model prefix"
+        );
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT model_backfill_done_through_ms FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .expect("read held model bookmark"),
+            prefix_bookmark
+        );
+
+        drop(maintenance);
+        backfill_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("model backfill acquires after maintenance");
+        ingest_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("model live ingest acquires after maintenance");
+        ingest
+            .join()
+            .expect("model live ingest thread joins")
+            .expect("model live ingest commits");
+        backfill_proceed_tx
+            .send(())
+            .expect("continue model backfill after ingest commit");
+        let report = backfill
+            .join()
+            .expect("model backfill thread joins")
+            .expect("model backfill completes after quiesce");
+        assert_eq!(report.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(
+            raw_model_hourly_rows(&storage),
+            unpruned_model_hourly_rows(&storage),
+            "resumed model backfill must neither lose nor double live ingest"
+        );
+        let (live_raw, live_rolled) = storage
+            .conn
+            .lock()
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM model_usage_observations
+                      WHERE source_key = 'model-live-source'),
+                     (SELECT COALESCE(SUM(obs_count), 0) FROM model_usage_hourly
+                      WHERE source_key = 'model-live-source' AND raw_pruned = 0)",
+                [],
+                |row| Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?)),
+            )
+            .expect("read persisted model live evidence");
+        assert_eq!(
+            (live_raw, live_rolled),
+            (live_observation_count, live_observation_count)
+        );
+
+        let wal_bound_rows = ROWS_PER_HOUR as u64 + live_observation_count as u64;
+        let wal_bound_bytes = wal_bound_rows
+            .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_WAL_BYTES_PER_ROW)
+            .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_SPACE_MULTIPLIER);
+        let before_checkpoint = wal_before_checkpoint.lock().clone();
+        let after_checkpoint = wal_after_checkpoint.lock().clone();
+        assert_rollup_wal_bound(
+            "model",
+            &before_checkpoint,
+            &after_checkpoint,
+            wal_bound_bytes,
+        );
+        assert!(rollup_test_wal_bytes(&wal_path) <= wal_bound_bytes);
+        eprintln!(
+            "model_family2.wal_bound_bytes={wal_bound_bytes} before={before_checkpoint:?} \
+             after={after_checkpoint:?} rows_done={}",
+            report.progress.rows_done
+        );
+
+        drop(storage);
+        clear_env();
+    }
+
     fn runtime_snapshot(
         spec: &TranscriptSourceSpec<'_>,
         events: &[(String, crate::sessions::SessionEventKind)],
@@ -29519,6 +29834,275 @@ mod tests {
             expected,
             "resume must not double-fold a source already refolded by live ingest"
         );
+        clear_env();
+    }
+
+    // @lat: [[rollup-concurrency-tests#Rollup Backfill Concurrency Test Specs#Runtime Quiesce Ingest And WAL Bound]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_resumes_after_quiesce_with_exact_ingest_and_bounded_wal() {
+        const CHUNK_ROWS: u64 = 128;
+        const MAINTENANCE_HOLD: Duration = Duration::from_millis(300);
+
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(init_storage_in(&dir));
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |seconds: i64| (base + TimeDelta::seconds(seconds)).to_rfc3339();
+        let user = crate::sessions::SessionEventKind::UserText;
+        let assistant = crate::sessions::SessionEventKind::AsstText;
+        let original = vec![
+            (at(0), user),
+            (at(60), assistant),
+            (at(660), user),
+            (at(720), assistant),
+        ];
+        let first_spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-contention",
+            source_key: "runtime-contention-source-1",
+            session_id: "runtime-contention-session-1",
+            generation: 1,
+            marker: "runtime-contention-v1",
+            rows: 0,
+        };
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&first_spec, &original))
+            .expect("seed first runtime contention source");
+        let second_spec = TranscriptSourceSpec {
+            source_key: "runtime-contention-source-2",
+            session_id: "runtime-contention-session-2",
+            marker: "runtime-contention-second",
+            ..first_spec
+        };
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&second_spec, &original))
+            .expect("seed second runtime contention source");
+        let expected_initial_first = runtime_rollup_rows(&storage, first_spec.source_key);
+        let expected_second = runtime_rollup_rows(&storage, second_spec.source_key);
+        assert!(!expected_initial_first.is_empty());
+        assert!(!expected_second.is_empty());
+        assert_eq!(
+            storage
+                .reset_runtime_rollup_backfill()
+                .expect("reset runtime contention backfill"),
+            (original.len() * 2) as u64
+        );
+
+        let replacement_spec = TranscriptSourceSpec {
+            marker: "runtime-contention-v2",
+            ..first_spec
+        };
+        let replacement_events = vec![(at(0), user), (at(20), assistant), (at(620), user)];
+        let replacement = runtime_snapshot(&replacement_spec, &replacement_events);
+        let expected_replacement = vec![(
+            DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z")
+                .expect("runtime replacement hour")
+                .timestamp_millis(),
+            1,
+            20.0,
+            base.timestamp_millis(),
+            base.timestamp_millis() + 20_000,
+        )];
+        truncate_rollup_test_wal(&storage);
+
+        let wal_path = rollup_test_wal_path(storage.database_path());
+        let wal_before_checkpoint = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let wal_after_checkpoint = std::sync::Arc::new(Mutex::new(Vec::<u64>::new()));
+        let (first_chunk_tx, first_chunk_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let (backfill_attempt_tx, backfill_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let (backfill_acquired_tx, backfill_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let (backfill_proceed_tx, backfill_proceed_rx) = std::sync::mpsc::sync_channel(0);
+        let backfill_storage = std::sync::Arc::clone(&storage);
+        let before_samples = std::sync::Arc::clone(&wal_before_checkpoint);
+        let after_samples = std::sync::Arc::clone(&wal_after_checkpoint);
+        let backfill_wal_path = wal_path.clone();
+        let backfill = std::thread::spawn(move || {
+            let before_permit_calls = std::cell::Cell::new(0_usize);
+            let before_permit = || {
+                let call = before_permit_calls.get() + 1;
+                before_permit_calls.set(call);
+                if call == 2 {
+                    backfill_attempt_tx
+                        .send(())
+                        .expect("signal runtime backfill waiting for permit");
+                }
+            };
+            let after_permit_calls = std::cell::Cell::new(0_usize);
+            let after_permit = || {
+                let call = after_permit_calls.get() + 1;
+                after_permit_calls.set(call);
+                if call == 2 {
+                    backfill_acquired_tx
+                        .send(())
+                        .expect("signal runtime backfill acquired permit");
+                    backfill_proceed_rx
+                        .recv()
+                        .expect("release runtime backfill after live ingest");
+                }
+            };
+            let before_checkpoint_path = backfill_wal_path.clone();
+            let before_checkpoint = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+                before_samples
+                    .lock()
+                    .push(rollup_test_wal_bytes(&before_checkpoint_path));
+            };
+            let after_checkpoint_path = backfill_wal_path.clone();
+            let progress = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+                after_samples
+                    .lock()
+                    .push(rollup_test_wal_bytes(&after_checkpoint_path));
+            };
+            let after_chunk_calls = std::cell::Cell::new(0_usize);
+            let after_chunk = |progress: &crate::rollup_backfill::RollupBackfillProgress| {
+                let call = after_chunk_calls.get() + 1;
+                after_chunk_calls.set(call);
+                if call == 1 {
+                    first_chunk_tx
+                        .send((progress.rows_done, progress.done_through))
+                        .expect("publish committed runtime prefix");
+                    resume_rx
+                        .recv()
+                        .expect("resume runtime backfill into maintenance window");
+                }
+                crate::rollup_backfill::RollupChunkControl::Continue
+            };
+            let controls = RollupBackfillControls {
+                chunk_rows: CHUNK_ROWS,
+                before_chunk_permit: Some(&before_permit),
+                after_chunk_permit: Some(&after_permit),
+                before_checkpoint: Some(&before_checkpoint),
+                progress: Some(&progress),
+                after_chunk: Some(&after_chunk),
+                ..RollupBackfillControls::default()
+            };
+            backfill_storage.run_runtime_rollup_backfill_with_controls(&controls)
+        });
+
+        let (prefix_rows_done, prefix_bookmark) = first_chunk_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime backfill commits its first chunk");
+        assert_eq!(prefix_rows_done, original.len() as u64);
+        assert_eq!(
+            runtime_rollup_rows(&storage, first_spec.source_key),
+            expected_initial_first
+        );
+
+        let maintenance = crate::begin_ingest_quiesce();
+        let (ingest_attempt_tx, ingest_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let (ingest_acquired_tx, ingest_acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let ingest_storage = std::sync::Arc::clone(&storage);
+        let ingest = std::thread::spawn(move || {
+            ingest_attempt_tx
+                .send(())
+                .expect("signal runtime live ingest permit attempt");
+            crate::with_ingest_write_permit(|| {
+                ingest_acquired_tx
+                    .send(())
+                    .expect("signal runtime live ingest permit acquisition");
+                ingest_storage
+                    .replace_transcript_analytics_snapshot(&replacement)
+                    .map(|_| ())
+            })
+        });
+        resume_tx.send(()).expect("resume runtime backfill");
+        ingest_attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime live ingest reaches the held gate");
+        backfill_attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime backfill reaches the held gate");
+        std::thread::sleep(MAINTENANCE_HOLD);
+        assert_eq!(
+            ingest_acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "maintenance must defer runtime live ingest"
+        );
+        assert_eq!(
+            backfill_acquired_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty),
+            "maintenance must keep runtime backfill between chunks"
+        );
+        assert_eq!(
+            runtime_rollup_rows(&storage, first_spec.source_key),
+            expected_initial_first,
+            "maintenance must preserve the committed runtime prefix"
+        );
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .query_row(
+                    "SELECT runtime_backfill_done_through_rowid FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .expect("read held runtime bookmark"),
+            prefix_bookmark
+        );
+
+        drop(maintenance);
+        backfill_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime backfill acquires after maintenance");
+        ingest_acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime live ingest acquires after maintenance");
+        ingest
+            .join()
+            .expect("runtime live ingest thread joins")
+            .expect("runtime live ingest commits");
+        backfill_proceed_tx
+            .send(())
+            .expect("continue runtime backfill after ingest commit");
+        let report = backfill
+            .join()
+            .expect("runtime backfill thread joins")
+            .expect("runtime backfill completes after quiesce");
+        assert_eq!(report.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(
+            runtime_rollup_rows(&storage, first_spec.source_key),
+            expected_replacement,
+            "runtime resume must not lose or double the replacement"
+        );
+        assert_eq!(
+            runtime_rollup_rows(&storage, second_spec.source_key),
+            expected_second,
+            "runtime resume must retain the untouched source exactly once"
+        );
+        let live_raw = storage
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE source_key = 'runtime-contention-source-1'",
+                [],
+                |row| row.get::<_, usize>(0),
+            )
+            .expect("count persisted runtime replacement rows");
+        assert_eq!(live_raw, replacement_events.len());
+
+        let wal_bound_rows = CHUNK_ROWS + replacement_events.len() as u64;
+        let wal_bound_bytes = wal_bound_rows
+            .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_WAL_BYTES_PER_ROW)
+            .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_SPACE_MULTIPLIER);
+        let before_checkpoint = wal_before_checkpoint.lock().clone();
+        let after_checkpoint = wal_after_checkpoint.lock().clone();
+        assert_rollup_wal_bound(
+            "runtime",
+            &before_checkpoint,
+            &after_checkpoint,
+            wal_bound_bytes,
+        );
+        assert!(rollup_test_wal_bytes(&wal_path) <= wal_bound_bytes);
+        eprintln!(
+            "runtime_family2.wal_bound_bytes={wal_bound_bytes} before={before_checkpoint:?} \
+             after={after_checkpoint:?} rows_done={}",
+            report.progress.rows_done
+        );
+
+        drop(storage);
         clear_env();
     }
 

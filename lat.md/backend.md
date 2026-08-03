@@ -1115,7 +1115,7 @@ Three facets need narrower handling because migration 37 omits their full grain.
 
 [[src-tauri/src/rollup_backfill.rs#run_rollup_backfill]] safely drives target-specific model and runtime folds without owning either rollup's SQL or exposing a command surface.
 
-Each chunk receives a 250 ms ceiling and row limit, runs its fold plus durable bookmark update in one immediate transaction under the shared ingest permit, then releases the permit before `wal_checkpoint(TRUNCATE)`. A disk preflight precedes every chunk.
+Each chunk receives a 250 ms ceiling and row limit, runs its fold plus durable bookmark update in one immediate transaction under the shared ingest permit, then releases the permit before `wal_checkpoint(TRUNCATE)`. The transaction deadline starts only after that permit is acquired, so a maintenance lease never consumes the fold budget. A disk preflight precedes every chunk.
 
 Checkpoint busy/failure and unreadable or insufficient disk space stop as typed terminal errors. A committed bookmark remains resumable if its following checkpoint fails; unexpected target SQL and invariant failures bubble to the caller and emit a generic failure detail instead of claiming a checkpoint fault.
 
@@ -1124,6 +1124,8 @@ The runtime target prepares one source-keyed `session_events` block at a time ou
 The model target selects a row-budgeted half-open UTC-hour range before admission, then re-reads current raw evidence inside the permit transaction. It replaces only that range's `raw_pruned=0` groups and atomically stores the inclusive end-of-hour bookmark; live replacement refolds old hours directly, so rows arriving behind the bookmark remain exact. Empty databases commit `complete` immediately.
 
 [[src-tauri/src/lib.rs#spawn_model_rollup_backfill]] schedules incomplete model state after startup. [[src-tauri/src/lib.rs#rebuild_model_rollup]] reserves one target run, refuses active or queued maintenance without waiting, clears only raw-backed rows and bookmark state, then uses the same runner. Per-run progress and finished events are emitted only after their lifecycle transaction commits; run ids prevent delayed events from an older rebuild replacing current UI state.
+
+[[rollup-concurrency-tests#Rollup Backfill Concurrency Test Specs]] exercises concrete model and runtime targets across maintenance deferral, live ingest, exact resume, and real WAL truncation boundaries.
 
 ###### Backfill Interrupt And Exact Resume
 

@@ -217,6 +217,8 @@ pub(crate) type RollupCheckpoint<'a> =
     &'a dyn Fn(&Connection) -> Result<RollupCheckpointResult, String>;
 pub(crate) type RollupProgressSink<'a> = &'a dyn Fn(&RollupBackfillProgress);
 pub(crate) type RollupChunkHook<'a> = &'a dyn Fn(&RollupBackfillProgress) -> RollupChunkControl;
+#[cfg(test)]
+pub(crate) type RollupPermitHook<'a> = &'a dyn Fn();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RollupChunkControl {
@@ -233,6 +235,12 @@ pub(crate) struct RollupBackfillControls<'a> {
     pub(crate) checkpoint: Option<RollupCheckpoint<'a>>,
     pub(crate) progress: Option<RollupProgressSink<'a>>,
     pub(crate) after_chunk: Option<RollupChunkHook<'a>>,
+    #[cfg(test)]
+    pub(crate) before_chunk_permit: Option<RollupPermitHook<'a>>,
+    #[cfg(test)]
+    pub(crate) after_chunk_permit: Option<RollupPermitHook<'a>>,
+    #[cfg(test)]
+    pub(crate) before_checkpoint: Option<RollupProgressSink<'a>>,
 }
 
 impl Default for RollupBackfillControls<'_> {
@@ -246,6 +254,12 @@ impl Default for RollupBackfillControls<'_> {
             checkpoint: None,
             progress: None,
             after_chunk: None,
+            #[cfg(test)]
+            before_chunk_permit: None,
+            #[cfg(test)]
+            after_chunk_permit: None,
+            #[cfg(test)]
+            before_checkpoint: None,
         }
     }
 }
@@ -339,8 +353,18 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
         target
             .prepare_chunk(conn, previous, controls.chunk_rows)
             .map_err(RollupBackfillError::FoldChunk)?;
-        let deadline = Instant::now() + controls.chunk_duration();
+        #[cfg(test)]
+        if let Some(hook) = controls.before_chunk_permit {
+            hook();
+        }
         let chunk = with_ingest_write_permit(|| {
+            #[cfg(test)]
+            if let Some(hook) = controls.after_chunk_permit {
+                hook();
+            }
+            // Waiting behind maintenance is not chunk work. Start the target's
+            // transaction budget only after the shared ingest permit lands.
+            let deadline = Instant::now() + controls.chunk_duration();
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(RollupBackfillError::BeginChunk)?;
@@ -374,6 +398,10 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
         progress.phase = RollupBackfillPhase::Checkpointing;
         progress.rows_done = state.rows_done;
         progress.done_through = state.done_through;
+        #[cfg(test)]
+        if let Some(hook) = controls.before_checkpoint {
+            hook(&progress);
+        }
         match controls.checkpoint(conn) {
             Ok(RollupCheckpointResult::Complete) => {}
             Ok(RollupCheckpointResult::Busy {
