@@ -159,11 +159,12 @@ fn parse_buckets(data: &serde_json::Value) -> Vec<UsageBucket> {
 /// Per-model weekly limits from the structured `limits` array. The usage API
 /// moved these out of the flat `seven_day_<model>` keys (now `null`) into
 /// `limits[]`, where each `weekly_scoped` entry carries a `percent` plus a
-/// `scope.model.display_name` (e.g. `"Fable"`). This is the only place the
-/// Fable 5 weekly bucket is surfaced. The `session` and `weekly_all` limits are
-/// skipped because the flat `five_hour` / `seven_day` keys already produce those
-/// buckets (and drive the tray indicator windows).
-fn parse_scoped_weekly_limits(
+/// `scope.model.display_name` (e.g. `"Fable"`). The direct and CPA Claude
+/// parsers share this normalization so both sources surface the same scoped
+/// model windows. The `session` and `weekly_all` limits are skipped because the
+/// flat `five_hour` / `seven_day` keys already produce those buckets (and drive
+/// the tray indicator windows).
+pub(crate) fn parse_scoped_weekly_limits(
     data: &serde_json::Value,
     existing_labels: &HashSet<String>,
 ) -> Vec<UsageBucket> {

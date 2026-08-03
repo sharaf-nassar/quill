@@ -50,9 +50,9 @@
       "name": "Limit Cell",
       "kind": "custom",
       "refersTo": "signature",
-      "description": "The signature component: rounded percent, 8px window label, and a 4px severity track on the flat plane. No box, no border — the cell is a region of the surface.",
-      "html": "<div class='ds-cell'><span class='ds-cell-pct'>68%</span><span class='ds-cell-window'>5H</span><div class='ds-cell-bar' role='progressbar' aria-valuenow='68' aria-valuemin='0' aria-valuemax='100'><i class='ds-cell-fill ds-cell-fill--amber' style='width:68%'></i></div></div>",
-      "css": ".ds-cell{display:flex;flex-direction:column;gap:4px;min-width:52px;font-family:Geist,-apple-system,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums;} .ds-cell-pct{font-size:11px;font-weight:600;line-height:1;color:#c9d1d9;} .ds-cell-pct--stale{color:#6e7681;} .ds-cell-window{font-size:8px;font-weight:500;color:#6e7681;white-space:nowrap;} .ds-cell-bar{position:relative;height:4px;border-radius:999px;background:rgba(255,255,255,0.08);overflow:hidden;} .ds-cell-fill{display:block;height:100%;border-radius:999px;transition:width 0.3s ease;} .ds-cell-fill--green{background:#34d399;} .ds-cell-fill--amber{background:#fbbf24;} .ds-cell-fill--red{background:#f87171;} .ds-cell-fill--stale{background:#6e7681;} @media (prefers-reduced-motion: reduce){.ds-cell-fill{transition:none;}}"
+      "description": "The signature component: 8px metric-category window label at inline-start, rounded percent geometrically centered over a separate 4px severity track on the flat plane. No box, no border — the cell is a region of the surface.",
+      "html": "<div class='ds-cell'><div class='ds-cell-top'><span class='ds-cell-window ds-cell-window--five-hour'>5H</span><span class='ds-cell-pct'>68%</span></div><div class='ds-cell-bar' role='progressbar' aria-valuenow='68' aria-valuemin='0' aria-valuemax='100'><i class='ds-cell-fill ds-cell-fill--amber' style='width:68%'></i></div></div>",
+      "css": ".ds-cell{display:flex;flex-direction:column;gap:4px;min-width:52px;font-family:Geist,-apple-system,'Segoe UI',sans-serif;font-variant-numeric:tabular-nums;} .ds-cell-top{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:baseline;min-width:0;} .ds-cell-pct{grid-column:2;grid-row:1;justify-self:center;font-size:11px;font-weight:600;line-height:1;color:#c9d1d9;white-space:nowrap;} .ds-cell-pct--stale{color:#6e7681;} .ds-cell-window{grid-column:1;grid-row:1;justify-self:start;font-size:8px;font-weight:500;color:#6e7681;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;} .ds-cell-window--five-hour{color:#22d3ee;} .ds-cell-bar{position:relative;height:4px;border-radius:999px;background:rgba(255,255,255,0.08);overflow:hidden;} .ds-cell-fill{display:block;height:100%;border-radius:999px;transition:width 0.3s ease;} .ds-cell-fill--green{background:#34d399;} .ds-cell-fill--amber{background:#fbbf24;} .ds-cell-fill--red{background:#f87171;} .ds-cell-fill--stale{background:#6e7681;} @media (prefers-reduced-motion: reduce){.ds-cell-fill{transition:none;}}"
     },
     {
       "name": "Toggle Strip",
@@ -132,8 +132,8 @@
     ],
     "rules": [
       { "name": "The Severity Code Rule", "body": "Green, amber, and red are reserved for threshold state. They never decorate, brand, or indicate category, and they never mark a failed or degraded read — that is slate. A delta takes green or red only when its meaning is known to be good or bad; unknown goodness stays neutral.", "section": "colors" },
-      { "name": "The Reserved-Status Rule", "body": "Provider identity and metric identity never overlap the severity meter in either direction. Where a diverging pair is a category rather than a threshold (added versus removed lines), it is drawn from the metric ramp, never from green/red.", "section": "colors" },
-      { "name": "The Cyan Dual-Role Rule", "body": "Signal Cyan #22d3ee is Quill's brand accent and the runtime/throughput metric hue. Both roles are Quill speaking about itself, which is why cyan is never assigned to a provider family. Cyan is not an interactive accent: selection and focus remain Signal Blue.", "section": "colors" },
+      { "name": "The Reserved-Status Rule", "body": "Provider, metric, and limit-window identity never use severity tokens. Where a diverging pair is a category rather than a threshold, it is drawn from the metric ramp, never from green/red.", "section": "colors" },
+      { "name": "The Cyan Category Rule", "body": "Signal Cyan #22d3ee is Quill's brand accent and Runtime metric hue; the 5-hour limit label reuses the Runtime category token. Cyan is never a provider or severity hue and is not interactive: selection and focus remain Signal Blue.", "section": "colors" },
       { "name": "The Model-Shade Rule", "body": "A model is a shade of its provider's family ramp, assigned by in-scope rank; rank seven and beyond folds to neutral. Identity always renders swatch plus raw id, and the same model keeps the same shade on every surface of a view.", "section": "colors" },
       { "name": "The Dimming Ladder Rule", "body": "Hierarchy is built by brightness, not hue. Step down Text Hi to Text to Label to Faint. Reach for a new color only when it carries new meaning.", "section": "colors" },
       { "name": "The No-Decorative-Gradient Rule", "body": "Gradients are permitted in exactly one place: the vertical fade under a chart area, where it is the series' own value-encoding surface. No gradient backgrounds, buttons, borders, headers, or text.", "section": "colors" },
@@ -147,7 +147,8 @@
       "Do build on one flat surface and separate bands with a hairline and space.",
       "Do reserve green / amber / red for threshold state on the 50% / 80% thresholds, and render degraded or failed reads in slate.",
       "Do give every provider exactly one fixed family hue (Claude orange, Codex blue, MiniMax violet, Agent orchid) and shade models within their provider family by in-scope rank.",
-      "Do keep metric hues on sparkline strokes, endpoints, and swatches only — values stay Text Hi.",
+      "Do distinguish 5-hour, 7-day, and Fable limit labels with Runtime light blue, Projects teal, and Tokens-per-LOC purple while retaining raw text and position as non-color cues.",
+      "Do keep metric-readout hues on sparkline strokes, endpoints, and swatches only — values stay Text Hi. Named limit-window labels are the sole text exception.",
       "Do set font-variant-numeric: tabular-nums on every live or compared number, and keep type at 8px or above.",
       "Do make values bright and labels dim; build hierarchy with brightness and weight, not new hues.",
       "Do keep motion functional and fast and honor prefers-reduced-motion.",

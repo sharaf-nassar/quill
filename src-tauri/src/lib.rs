@@ -99,6 +99,8 @@ static MODEL_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static RUNTIME_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static ROLLUP_BACKFILL_RUN_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
+static RUNTIME_SETTINGS_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
+const RUNTIME_SETTINGS_BUSY_ERROR: &str = "Runtime settings transition already in progress";
 // Holds the tray's "Always on Top" CheckMenuItem so the Settings window can
 // keep the tray checkmark and the window state in sync after a toggle.
 static TRAY_ON_TOP_ITEM: OnceLock<CheckMenuItem<tauri::Wry>> = OnceLock::new();
@@ -4097,6 +4099,127 @@ fn load_runtime_settings(storage: &Storage) -> RuntimeSettings {
     }
 }
 
+fn bool_setting_value(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+fn persist_runtime_settings(storage: &Storage, settings: &RuntimeSettings) -> Result<(), String> {
+    let live_interval = settings.live_usage_interval_seconds.to_string();
+    storage.set_settings_atomically(&[
+        (
+            LIVE_USAGE_ENABLED_KEY,
+            bool_setting_value(settings.live_usage_enabled),
+        ),
+        (LIVE_USAGE_INTERVAL_KEY, live_interval.as_str()),
+        (
+            RULE_WATCHER_ENABLED_KEY,
+            bool_setting_value(settings.rule_watcher_enabled),
+        ),
+        (
+            ALWAYS_ON_TOP_KEY,
+            bool_setting_value(settings.always_on_top),
+        ),
+        (
+            CRASH_REPORTING_ENABLED_KEY,
+            bool_setting_value(settings.crash_reporting_enabled),
+        ),
+    ])
+}
+
+fn format_runtime_settings_failure(primary: String, rollback_errors: Vec<String>) -> String {
+    if rollback_errors.is_empty() {
+        primary
+    } else {
+        format!("{primary}; rollback errors: {}", rollback_errors.join("; "))
+    }
+}
+
+fn apply_runtime_settings(
+    app: &tauri::AppHandle,
+    storage: &Storage,
+    mut settings: RuntimeSettings,
+    tray_item: Option<&CheckMenuItem<tauri::Wry>>,
+) -> Result<RuntimeSettings, String> {
+    let _transition_guard = RUNTIME_SETTINGS_TRANSITION_LOCK
+        .try_lock()
+        .ok_or_else(|| RUNTIME_SETTINGS_BUSY_ERROR.to_string())?;
+    let previous = load_runtime_settings(storage);
+    settings.live_usage_interval_seconds = settings
+        .live_usage_interval_seconds
+        .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
+
+    let window = app.get_webview_window("main");
+    let native_changed = previous.always_on_top != settings.always_on_top;
+    let crash_reporting_changed =
+        previous.crash_reporting_enabled != settings.crash_reporting_enabled;
+    let mut native_applied = false;
+    let mut persisted = false;
+    let mut crash_reporting_applied = false;
+    let transition = (|| -> Result<(), String> {
+        if native_changed {
+            let window = window.as_ref().ok_or_else(|| {
+                format!(
+                    "Apply native always-on-top state {}: main window unavailable",
+                    settings.always_on_top
+                )
+            })?;
+            window
+                .set_always_on_top(settings.always_on_top)
+                .map_err(|error| {
+                    format!(
+                        "Apply native always-on-top state {}: {error}",
+                        settings.always_on_top
+                    )
+                })?;
+            native_applied = true;
+        }
+        persist_runtime_settings(storage, &settings)
+            .map_err(|error| format!("Persist runtime settings: {error}"))?;
+        persisted = true;
+        if let Some(item) = tray_item {
+            item.set_checked(settings.always_on_top)
+                .map_err(|error| format!("Synchronize Always on Top tray checkmark: {error}"))?;
+        }
+        if crash_reporting_changed {
+            crash_reporting::set_enabled(settings.crash_reporting_enabled);
+            crash_reporting_applied = true;
+        }
+        app.emit("runtime-settings-updated", &settings)
+            .map_err(|error| format!("Emit runtime-settings-updated: {error}"))?;
+        Ok(())
+    })();
+
+    if let Err(primary) = transition {
+        let mut rollback_errors = Vec::new();
+        if native_applied
+            && let Some(window) = window.as_ref()
+            && let Err(error) = window.set_always_on_top(previous.always_on_top)
+        {
+            rollback_errors.push(format!(
+                "restore native always-on-top to {}: {error}",
+                previous.always_on_top
+            ));
+        }
+        if persisted && let Err(error) = persist_runtime_settings(storage, &previous) {
+            rollback_errors.push(format!("restore persisted runtime settings: {error}"));
+        }
+        if crash_reporting_applied {
+            crash_reporting::set_enabled(previous.crash_reporting_enabled);
+        }
+        if let Some(item) = tray_item
+            && let Err(error) = item.set_checked(previous.always_on_top)
+        {
+            rollback_errors.push(format!(
+                "restore Always on Top tray checkmark to {}: {error}",
+                previous.always_on_top
+            ));
+        }
+        return Err(format_runtime_settings_failure(primary, rollback_errors));
+    }
+
+    Ok(settings)
+}
+
 #[tauri::command]
 async fn get_runtime_settings() -> Result<RuntimeSettings, String> {
     let storage = get_storage()?;
@@ -4109,63 +4232,7 @@ async fn set_runtime_settings(
     app: tauri::AppHandle,
 ) -> Result<RuntimeSettings, String> {
     let storage = get_storage()?;
-    let previous = load_runtime_settings(storage);
-    let live_interval = settings
-        .live_usage_interval_seconds
-        .clamp(LIVE_USAGE_INTERVAL_MIN_SECS, LIVE_USAGE_INTERVAL_MAX_SECS);
-    storage.set_setting(
-        LIVE_USAGE_ENABLED_KEY,
-        if settings.live_usage_enabled {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
-    storage.set_setting(LIVE_USAGE_INTERVAL_KEY, &live_interval.to_string())?;
-    storage.set_setting(
-        RULE_WATCHER_ENABLED_KEY,
-        if settings.rule_watcher_enabled {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
-    storage.set_setting(
-        ALWAYS_ON_TOP_KEY,
-        if settings.always_on_top {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
-    storage.set_setting(
-        CRASH_REPORTING_ENABLED_KEY,
-        if settings.crash_reporting_enabled {
-            "true"
-        } else {
-            "false"
-        },
-    )?;
-
-    if previous.always_on_top != settings.always_on_top
-        && let Some(window) = app.get_webview_window("main")
-        && let Err(error) = window.set_always_on_top(settings.always_on_top)
-    {
-        // The preference is still recorded; the compositor simply refused to
-        // honour it (Wayland has no always-on-top protocol). Log it rather
-        // than let the widget claim a state the window does not have.
-        log::warn!("Failed to apply always-on-top: {error}");
-    }
-    if let Some(item) = TRAY_ON_TOP_ITEM.get() {
-        let _ = item.set_checked(settings.always_on_top);
-    }
-    if previous.crash_reporting_enabled != settings.crash_reporting_enabled {
-        crash_reporting::set_enabled(settings.crash_reporting_enabled);
-    }
-
-    let resolved = load_runtime_settings(storage);
-    let _ = app.emit("runtime-settings-updated", &resolved);
-    Ok(resolved)
+    apply_runtime_settings(&app, storage, settings, TRAY_ON_TOP_ITEM.get())
 }
 
 /// Completion path every retention run ends on: drop the analytics payloads
@@ -6219,29 +6286,57 @@ pub fn run() {
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "show" => show_main_window(app),
                     "on_top" => {
-                        if let Some(w) = app.get_webview_window("main")
-                            && let Ok(current) = w.is_always_on_top()
-                        {
-                            let new_state = !current;
-                            if let Err(error) = w.set_always_on_top(new_state) {
-                                log::warn!("Failed to apply always-on-top: {error}");
+                        let Some(storage) = STORAGE.get() else {
+                            let mut message =
+                                "Always on Top tray transition failed: storage unavailable"
+                                    .to_string();
+                            if let Err(error) = on_top.set_checked(on_top_enabled) {
+                                message.push_str(&format!(
+                                    "; rollback errors: restore Always on Top tray checkmark to {on_top_enabled}: {error}"
+                                ));
                             }
-                            if let Some(storage) = STORAGE.get() {
-                                if let Err(error) = storage.set_setting(
-                                    ALWAYS_ON_TOP_KEY,
-                                    if new_state { "true" } else { "false" },
-                                ) {
-                                    log::warn!("Failed to persist always-on-top: {error}");
+                            log::error!("{message}");
+                            return;
+                        };
+                        let desired = match on_top.is_checked() {
+                            Ok(desired) => desired,
+                            Err(error) => {
+                                let previous = load_runtime_settings(storage);
+                                let mut rollback_errors = Vec::new();
+                                if let Err(rollback_error) =
+                                    on_top.set_checked(previous.always_on_top)
+                                {
+                                    rollback_errors.push(format!(
+                                        "restore Always on Top tray checkmark to {}: {rollback_error}",
+                                        previous.always_on_top
+                                    ));
                                 }
-                                // The widget titlebar and the Settings toggle
-                                // both mirror this one setting, so the tray
-                                // must broadcast the change like any other
-                                // writer of the runtime settings.
-                                let _ = app.emit(
-                                    "runtime-settings-updated",
-                                    load_runtime_settings(storage),
+                                log::error!(
+                                    "Always on Top tray transition failed: {}",
+                                    format_runtime_settings_failure(
+                                        format!("Read toggled tray check state: {error}"),
+                                        rollback_errors,
+                                    )
                                 );
+                                return;
                             }
+                        };
+                        let mut settings = load_runtime_settings(storage);
+                        settings.always_on_top = desired;
+                        if let Err(error) =
+                            apply_runtime_settings(app, storage, settings, Some(&on_top))
+                        {
+                            let committed = load_runtime_settings(storage).always_on_top;
+                            let error = match on_top.set_checked(committed) {
+                                Ok(()) => error,
+                                Err(rollback_error) => format_runtime_settings_failure(
+                                    error,
+                                    vec![format!(
+                                        "restore Always on Top tray checkmark to committed state {committed}: {rollback_error}"
+                                    )],
+                                ),
+                            };
+                            log::error!("Always on Top tray transition failed: {error}");
                         }
                     }
                     "check_update" => {

@@ -15105,6 +15105,24 @@ impl Storage {
         Ok(())
     }
 
+    /// Persist a related group of settings in one SQLite transaction.
+    pub fn set_settings_atomically(&self, settings: &[(&str, &str)]) -> Result<(), String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin settings transaction: {error}"))?;
+        for (key, value) in settings {
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .map_err(|error| format!("Write setting {key}: {error}"))?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Commit settings transaction: {error}"))?;
+        Ok(())
+    }
+
     pub fn delete_setting(&self, key: &str) -> Result<(), String> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM settings WHERE key = ?1", params![key])

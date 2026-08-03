@@ -106,10 +106,10 @@
   .psw.codex{background:var(--codex)}
   .pname{font-size:9.5px;font-weight:600;letter-spacing:.08em;color:var(--label);width:44px;flex:0 0 44px}
   .bkt{display:flex;flex-direction:column;gap:4px;width:60px}
-  .bkt .top{display:flex;justify-content:space-between;align-items:baseline;gap:6px}
-  .bkt .pc{font-size:11px;font-weight:600;color:var(--text);line-height:1}
+  .bkt .top{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:baseline;min-width:0}
+  .bkt .pc{grid-column:2;grid-row:1;justify-self:center;font-size:11px;font-weight:600;color:var(--text);line-height:1;white-space:nowrap}
   .bkt .pc.a{color:var(--amber)}
-  .bkt .bl{font-size:8px;font-weight:500;letter-spacing:.04em;color:var(--faint)}
+  .bkt .bl{grid-column:1;grid-row:1;justify-self:start;font-size:8px;font-weight:500;letter-spacing:.04em;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .bar{height:4px;border-radius:99px;background:rgba(255,255,255,.08);position:relative;overflow:hidden}
   .bar i{position:absolute;top:0;bottom:0;left:0;border-radius:99px;background:#8b949e}
   .bar i.a{background:var(--amber)}
@@ -294,15 +294,15 @@
         <span class="t">Limits</span>
         <div class="lrow">
           <span class="psw claude"></span><span class="pname">CLAUDE</span>
-          <span class="bkt"><span class="top"><span class="pc a">62%</span><span class="bl">5H</span></span><span class="bar"><i class="a" style="width:62%"></i></span></span>
-          <span class="bkt"><span class="top"><span class="pc">31%</span><span class="bl">7D</span></span><span class="bar"><i style="width:31%"></i></span></span>
-          <span class="bkt"><span class="top"><span class="pc">18%</span><span class="bl">FABLE</span></span><span class="bar"><i style="width:18%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="bl">5H</span><span class="pc a">62%</span></span><span class="bar"><i class="a" style="width:62%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="bl">7D</span><span class="pc">31%</span></span><span class="bar"><i style="width:31%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="bl">FABLE</span><span class="pc">18%</span></span><span class="bar"><i style="width:18%"></i></span></span>
           <span class="lreset a">3h 54m</span>
         </div>
         <div class="lrow">
           <span class="psw codex"></span><span class="pname">CODEX</span>
-          <span class="bkt"><span class="top"><span class="pc">44%</span><span class="bl">7D</span></span><span class="bar"><i style="width:44%"></i></span></span>
-          <span class="bkt"><span class="top"><span class="pc">7%</span><span class="bl">SPARK</span></span><span class="bar"><i style="width:7%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="bl">7D</span><span class="pc">44%</span></span><span class="bar"><i style="width:44%"></i></span></span>
+          <span class="bkt"><span class="top"><span class="bl">SPARK</span><span class="pc">7%</span></span><span class="bar"><i style="width:7%"></i></span></span>
           <span class="lreset">6d 22h</span>
         </div>
       </div>

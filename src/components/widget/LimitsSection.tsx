@@ -24,6 +24,7 @@ type Severity = "nominal" | "caution" | "critical" | "stale";
 type RowState = "ready" | "pending" | "setup" | "unavailable";
 type CpaProvider = Extract<IntegrationProvider, "claude" | "codex">;
 type AccountState = "ready" | "disabled" | "unavailable" | "cooling";
+type LimitWindowKind = "five-hour" | "seven-day" | "fable";
 
 const TICK_MS = 10_000;
 const MAX_VISIBLE_ACCOUNTS = 6;
@@ -70,11 +71,29 @@ interface CpaLimitsRow extends LimitsRow {
 
 interface CpaResetReadout {
   key: string;
-  shortLabel: "5H" | "7D";
   fullLabel: string;
   remainingMs: number | null;
   resetText: string;
   severity: Severity;
+}
+
+function limitWindowKind(key: string): LimitWindowKind | null {
+  if (key === "weekly_scoped_fable") return "fable";
+  if (
+    key === "five_hour" ||
+    /(?:^|_)300m$/.test(key) ||
+    /(?:^|_)5h$/.test(key)
+  ) {
+    return "five-hour";
+  }
+  if (
+    key === "seven_day" ||
+    /(?:^|_)10080m$/.test(key) ||
+    /_(?:week|weekly)$/.test(key)
+  ) {
+    return "seven-day";
+  }
+  return null;
 }
 
 function isPrimaryMinimaxBucket(bucket: UsageBucket): boolean {
@@ -264,34 +283,38 @@ function rowTiming(cells: LimitCell[]): Pick<
   };
 }
 
-function canonicalResetLabel(key: string): "5H" | "7D" | null {
-  if (key === "five_hour" || key === "codex_300m") return "5H";
-  if (key === "seven_day" || key === "codex_10080m") return "7D";
-  return null;
+function isCanonicalResetWindow(key: string): boolean {
+  return (
+    key === "five_hour" ||
+    key === "codex_300m" ||
+    key === "seven_day" ||
+    key === "codex_10080m"
+  );
 }
 
 function cpaResetReadouts(cells: LimitCell[]): CpaResetReadout[] {
-  return cells.flatMap((cell) => {
-    const shortLabel = canonicalResetLabel(cell.key);
-    if (shortLabel === null) return [];
+  return cells.map((cell) => {
     const remainingMs = cell?.remainingMs ?? null;
     const live = remainingMs !== null && remainingMs > 0;
-    return [
-      {
-        key: cell.key,
-        shortLabel,
-        fullLabel: cell.fullLabel,
-        remainingMs,
-        resetText:
-          remainingMs === null
-            ? "—"
-            : live
-              ? formatCountdown(remainingMs)
-              : "now",
-        severity: live ? cell.severity : "stale",
-      },
-    ];
+    return {
+      key: cell.key,
+      fullLabel: cell.fullLabel,
+      remainingMs,
+      resetText:
+        remainingMs === null
+          ? "—"
+          : live
+            ? formatCountdown(remainingMs)
+            : "now",
+      severity: live ? cell.severity : "stale",
+    };
   });
+}
+
+function cpaAggregateResetReadouts(cells: LimitCell[]): CpaResetReadout[] {
+  return cpaResetReadouts(
+    cells.filter((cell) => isCanonicalResetWindow(cell.key)),
+  );
 }
 
 function accessibleCountdown(remainingMs: number): string {
@@ -495,11 +518,15 @@ function WindowCells({
             key={cell.key}
           >
             <div className="wg-limits-bucket-top">
+              <span
+                className="wg-limits-window"
+                data-window-kind={limitWindowKind(cell.key) ?? undefined}
+                title={cell.fullLabel}
+              >
+                {cell.shortLabel}
+              </span>
               <span className="wg-limits-pct" data-severity={cell.severity}>
                 {cell.percent === null ? "—" : `${cell.percent}%`}
-              </span>
-              <span className="wg-limits-window" title={cell.fullLabel}>
-                {cell.shortLabel}
               </span>
             </div>
             {cell.percent === null ? (
@@ -626,7 +653,7 @@ function CpaRow({
     row.healthy === null || row.total === null
       ? `${name} CPA health count unavailable`
       : `${row.healthy} healthy of ${row.total} ${name} CPA accounts`;
-  const resetReadouts = cpaResetReadouts(row.cells);
+  const resetReadouts = cpaAggregateResetReadouts(row.cells);
 
   return (
     <div
@@ -703,6 +730,7 @@ function CpaRow({
               <WindowCells
                 cells={account.cells}
                 ownerLabel={`${name} account ${account.label}`}
+                resetReadouts={cpaResetReadouts(account.cells)}
               />
             </div>
           ))}

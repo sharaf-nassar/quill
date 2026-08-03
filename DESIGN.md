@@ -217,9 +217,9 @@ over-alerting and under-informing: dense, quiet, semantic.
 ## 2. Colors
 
 One flat plane needs fewer surfaces and stricter hues. The palette is a
-surface pair, a hairline ladder, a brightness-only text ladder, and three
-closed sets of meaningful color: severity, provider identity, and metric
-identity.
+surface pair, a hairline ladder, a brightness-only text ladder, and four
+closed sets of meaningful color: severity, provider identity, metric identity,
+and limit-window identity.
 
 ### Surfaces
 - **Surface** (`#14181f`): the plane. The widget shell, every band, every row.
@@ -274,11 +274,24 @@ alone — and the same model keeps the same shade on every surface of a view.
 
 ### Metric Identity
 Six fixed hues that name the six readouts, plus three that name the context
-categories. They are permitted on **sparkline strokes, their endpoint dots,
-label swatches, and split-bar segments only.** Values stay Text Hi.
+categories. Within metric readouts, they are permitted on **sparkline strokes,
+their endpoint dots, label swatches, and split-bar segments only.** Values stay
+Text Hi. Limit-window labels may reuse metric hues as category identifiers under
+the rule below.
 - Runtime `#22d3ee` · Tokens-per-LOC `#a78bfa` · LOC-per-hour `#f472b6` ·
   Sessions `#818cf8` · Projects `#2dd4bf` · Net lines `#a3e635`.
 - Context: preserved `#22d3ee` · retrieved `#60a5fa` · routing `#a78bfa`.
+
+### Limit Window Identity
+Rate-limit labels reuse three established metric-category hues so adjacent
+windows scan as distinct categories without borrowing the severity meter.
+- **5-hour** uses Runtime light blue `#22d3ee` (`--metric-runtime`).
+- **7-day** uses Projects teal `#2dd4bf` (`--metric-projects`).
+- **Fable** uses Tokens-per-LOC purple `#a78bfa`
+  (`--metric-tok-per-loc`).
+
+The color is confined to the raw text label; label wording and cell position
+remain the primary cues, and every other dynamic window stays neutral.
 
 ### Named Rules
 
@@ -289,18 +302,17 @@ green or red only when its *meaning* is known to be good or bad (a falling
 tokens-per-LOC is an improvement and reads green); a delta whose goodness is
 unknown stays neutral. If a green thing is not "healthy," it is a bug.
 
-**The Reserved-Status Rule.** Provider identity and metric identity never
-overlap the severity meter, in either direction. A provider or metric hue
-rendering as green or amber is forbidden — the exact drift this system was
-built to kill. Where a diverging pair is genuinely a category rather than a
-threshold (added versus removed lines), it is drawn from the metric ramp
-(`--metric-net-lines` up, `--metric-loc-per-hr` down), never from green/red.
+**The Reserved-Status Rule.** Provider, metric, and limit-window identity never
+use the severity tokens, in either direction. Where a diverging pair is
+genuinely a category rather than a threshold (added versus removed lines), it
+is drawn from the metric ramp (`--metric-net-lines` up,
+`--metric-loc-per-hr` down), never from green/red.
 
-**The Cyan Dual-Role Rule.** Signal Cyan `#22d3ee` is Quill's own brand accent
-— the titlebar glyph, the update invitation, the marketing tie — *and* the
-runtime/throughput metric hue. Both roles are Quill speaking about itself, so
-they cannot be confused with a provider or a severity; that is exactly why cyan
-is never assigned to a provider family. Cyan is not an interactive accent:
+**The Cyan Category Rule.** Signal Cyan `#22d3ee` is Quill's own brand accent —
+the titlebar glyph, the update invitation, the marketing tie — and the Runtime
+metric hue. The 5-hour limit label explicitly reuses the Runtime category token.
+These roles cannot be confused with a provider or severity; that is exactly why
+cyan is never assigned to a provider family. Cyan is not an interactive accent:
 selection and focus remain Signal Blue.
 
 **The Dimming Ladder Rule.** Hierarchy is built by brightness, not hue. Step
@@ -434,10 +446,10 @@ precisely why it is cyan and not amber.
 
 ### Signature Component — The Limit Cell
 The clearest expression of the North Star. Per rate-limit window: a compact
-header places the rounded percent (12px on provider summaries, 11px on account
-rows, tabular) at left and its 8px window label geometrically centered over the
-track. Below it, a 4px `pill`-radius track on an 8% white ground has a discrete
-`green | amber | red` class chosen by the 50/80 thresholds. The fill
+header places its 8px window label at inline-start and the rounded percent (12px
+on provider summaries, 11px on account rows, tabular) geometrically centered
+over the track. Below it, a 4px `pill`-radius track on an 8% white ground has a
+discrete `green | amber | red` class chosen by the 50/80 thresholds. The fill
 transitions width at 0.3s ease — meter ballistics, calm rather than twitchy.
 The track is a real `role="progressbar"` with `aria-valuenow/min/max` and the
 untruncated window label as its accessible name. A bucket whose reset has
@@ -449,9 +461,11 @@ competing with the utilization plane above.
 
 Cells divide the available meter region evenly. Direct cells hold a 60px
 legibility floor; CPA cells hold 88px so utilization, window, and reset remain
-associated before dynamic extras reflow. Provider and disclosed account rows
-repeat the same 70px identity column and meter grid, making their values scan
-vertically from the 320px floor through a full-screen drag.
+associated before dynamic extras reflow. CPA cells wrap as equal flex lines:
+multi-cell lines share the width and any lone wrapped cell fills its line.
+Provider and disclosed account rows repeat the same 70px identity column and
+meter layout, making their values scan vertically from the 320px floor through
+a full-screen drag.
 
 ### Charts
 - Drawn by an internal SVG kit, not a charting library. Primitives are
@@ -517,8 +531,12 @@ redesign pass moves it onto the flat plane. Until then:
 - **Do** give every provider exactly one fixed family hue (Claude orange,
   Codex blue, MiniMax violet, Agent orchid) and shade models within their
   provider's family by in-scope rank.
-- **Do** keep metric hues on sparkline strokes, endpoints, and swatches only —
-  values stay Text Hi.
+- **Do** distinguish 5-hour, 7-day, and Fable limit labels with Runtime light
+  blue, Projects teal, and Tokens-per-LOC purple while keeping their raw text
+  and position as non-color cues.
+- **Do** keep metric-readout hues on sparkline strokes, endpoints, and swatches
+  only — values stay Text Hi. The named limit-window label reuse is the sole
+  text exception.
 - **Do** set `font-variant-numeric: tabular-nums` on every live or compared
   number, and keep type at 8px or above.
 - **Do** make values bright and labels dim; build hierarchy with brightness and

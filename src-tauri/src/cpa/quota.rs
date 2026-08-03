@@ -16,8 +16,8 @@ const CLAUDE_WINDOWS: &[(&str, &str, u32)] = &[
     ("seven_day_opus", "Opus", 1),
     ("seven_day_cowork", "Code", 1),
     ("seven_day_oauth_apps", "OAuth", 1),
-    ("iguana_necktie", "Fable 5", 1),
 ];
+const LEGACY_FABLE_WINDOW: (&str, &str, u32) = ("iguana_necktie", "Fable 5", 1);
 
 pub(crate) async fn fetch_claude_usage(
     client: &CpaClient,
@@ -98,6 +98,41 @@ fn parse_claude_usage(
             account_id: Some(auth_index.to_owned()),
             account_label: None,
         });
+    }
+
+    let existing_labels = buckets.iter().map(|bucket| bucket.label.clone()).collect();
+    for mut bucket in crate::fetcher::parse_scoped_weekly_limits(&payload, &existing_labels) {
+        bucket.key = account_bucket_key(auth_index, &bucket.key);
+        bucket.source = UsageSource::Cpa;
+        bucket.account_id = Some(auth_index.to_owned());
+        buckets.push(bucket);
+    }
+
+    // Older Anthropic responses exposed Fable under a codenamed flat key.
+    // Normalize that fallback onto the structured key so mixed-version CPA
+    // accounts still collapse into one pool window.
+    if !buckets
+        .iter()
+        .any(|bucket| bucket.key.ends_with("/weekly_scoped_fable"))
+    {
+        let (window_key, label, sort_order) = LEGACY_FABLE_WINDOW;
+        if let Some(window) = object.get(window_key)
+            && !window.is_null()
+        {
+            let utilization = required_utilization(window, "utilization", auth_index)?;
+            let resets_at = parse_reset_value(window.get("resets_at"), auth_index)?;
+            buckets.push(UsageBucket {
+                provider: IntegrationProvider::Claude,
+                key: account_bucket_key(auth_index, "weekly_scoped_fable"),
+                label: label.to_string(),
+                utilization,
+                resets_at,
+                sort_order,
+                source: UsageSource::Cpa,
+                account_id: Some(auth_index.to_owned()),
+                account_label: None,
+            });
+        }
     }
 
     if buckets.is_empty() {

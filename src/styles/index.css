@@ -1220,9 +1220,9 @@ body {
 }
 
 .wg-limits-pct {
-  grid-column: 1;
+  grid-column: 2;
   grid-row: 1;
-  justify-self: start;
+  justify-self: center;
   font-size: 11px;
   font-weight: 600;
   line-height: 1;
@@ -1244,9 +1244,9 @@ body {
 }
 
 .wg-limits-window {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 1;
-  justify-self: center;
+  justify-self: start;
   font-size: 8px;
   font-weight: 500;
   letter-spacing: 0.04em;
@@ -1254,6 +1254,18 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.wg-limits-window[data-window-kind="five-hour"] {
+  color: var(--metric-runtime);
+}
+
+.wg-limits-window[data-window-kind="seven-day"] {
+  color: var(--metric-projects);
+}
+
+.wg-limits-window[data-window-kind="fable"] {
+  color: var(--metric-tok-per-loc);
 }
 
 .wg-limits-cell-reset {
@@ -1364,8 +1376,9 @@ body {
 }
 
 .wg-limits-row[data-source="cpa"] .wg-limits-cells {
-  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
-  column-gap: var(--space-sm);
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--space-md);
   row-gap: var(--space-sm);
 }
 
@@ -1496,9 +1509,18 @@ body {
 }
 
 .wg-cpa-account-row .wg-limits-cells {
-  grid-template-columns: repeat(auto-fit, minmax(88px, 1fr));
-  column-gap: var(--space-sm);
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: var(--space-md);
   row-gap: var(--space-sm);
+}
+
+.wg-limits-row[data-source="cpa"]
+  .wg-limits-cells
+  > .wg-limits-bucket,
+.wg-cpa-account-row .wg-limits-cells > .wg-limits-bucket {
+  flex: 1 1 88px;
+  min-width: min(88px, 100%);
 }
 
 .wg-cpa-more,
@@ -1518,6 +1540,11 @@ body {
   .wg-limits {
     padding-right: var(--space-xl);
     padding-left: var(--space-xl);
+  }
+
+  .wg-limits-row[data-source="cpa"] .wg-limits-cells,
+  .wg-cpa-account-row .wg-limits-cells {
+    column-gap: var(--space-sm);
   }
 
   .wg-cpa-identity {
