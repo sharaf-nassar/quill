@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{ModelRange, UsageBucket};
@@ -79,6 +80,46 @@ pub struct ModelRollupBackfillCorpusReport {
     pub missing_or_mismatched_rollup_rows: u64,
     pub extra_rollup_rows: u64,
     pub committed_status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelRollupCorpusEquality {
+    pub window: &'static str,
+    pub overview_bytes: usize,
+    pub overview_sha256: String,
+    pub history_bytes: usize,
+    pub history_sha256: String,
+    pub exact: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelRollupConsistencyCorpusReport {
+    pub pinned_end: String,
+    pub quick_check: String,
+    pub backfill: ModelRollupBackfillCorpusReport,
+    pub equality: Vec<ModelRollupCorpusEquality>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelRollupDerivedCorpusReport {
+    pub source_path: String,
+    pub source_bytes: u64,
+    pub source_read_only: bool,
+    pub range_start: String,
+    pub range_end: String,
+    pub copied_sources: u64,
+    pub copied_observations: u64,
+    pub available_bytes_before: u64,
+    pub required_bytes: u64,
+    pub fixture_bytes_before_backfill: u64,
+    pub consistency: ModelRollupConsistencyCorpusReport,
+}
+
+#[derive(Debug)]
+struct ModelRollupCorpusOutput {
+    window: &'static str,
+    overview: serde_json::Value,
+    history: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -173,6 +214,61 @@ fn add_output<T: Serialize>(
         .map_err(|error| format!("Serialize {query} fan-out output: {error}"))?
         .len();
     Ok(())
+}
+
+fn normalized_model_rollup_output<T: Serialize>(
+    value: &T,
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::to_value(value)
+        .map_err(|error| format!("Serialize {label} consistency output: {error}"))?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("{label} consistency output was not an object"))?
+        .remove("buildingIndex");
+    Ok(value)
+}
+
+fn collect_model_rollup_outputs(
+    storage: &Storage,
+    pinned_end: DateTime<Utc>,
+) -> Result<Vec<ModelRollupCorpusOutput>, String> {
+    with_pinned_query_now(pinned_end, || {
+        WINDOWS
+            .iter()
+            .map(|window| {
+                let overview = storage.get_model_usage_overview(window.model_range, None)?;
+                let history = storage.get_model_history(window.model_range, None, None)?;
+                Ok(ModelRollupCorpusOutput {
+                    window: window.label,
+                    overview: normalized_model_rollup_output(
+                        &overview,
+                        &format!("{} overview", window.label),
+                    )?,
+                    history: normalized_model_rollup_output(
+                        &history,
+                        &format!("{} history", window.label),
+                    )?,
+                })
+            })
+            .collect()
+    })
+}
+
+fn exact_output_digest(
+    raw: &serde_json::Value,
+    hybrid: &serde_json::Value,
+    window: &str,
+    output: &str,
+) -> Result<(usize, String), String> {
+    if raw != hybrid {
+        return Err(format!(
+            "Frozen corpus {window} {output} differs between raw and hybrid reads"
+        ));
+    }
+    let bytes = serde_json::to_vec(raw)
+        .map_err(|error| format!("Serialize {window} {output} equality digest: {error}"))?;
+    Ok((bytes.len(), format!("{:x}", Sha256::digest(&bytes))))
 }
 
 fn usage_view_fanout(storage: &Storage) -> Result<usize, String> {
@@ -503,6 +599,233 @@ pub fn backfill_model_rollup_copy(
         missing_or_mismatched_rollup_rows,
         extra_rollup_rows,
         committed_status,
+    })
+}
+
+/// Rebuild one writable corpus copy, then compare production hybrid reads to
+/// the pre-rebuild raw path at one pinned endpoint.
+pub fn verify_model_rollup_copy(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<ModelRollupConsistencyCorpusReport, String> {
+    let metadata = corpus
+        .metadata()
+        .map_err(|error| format!("Read model consistency copy metadata: {error}"))?;
+    if metadata.permissions().readonly() {
+        return Err(format!(
+            "Model consistency copy must be writable: {}",
+            corpus.display()
+        ));
+    }
+
+    let storage = Storage::init_study_scratch(corpus)?;
+    let inspection = rusqlite::Connection::open(corpus)
+        .map_err(|error| format!("Open model consistency inspection: {error}"))?;
+    let quick_check = inspection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Quick-check model consistency copy: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Model consistency copy quick_check failed: {quick_check}"
+        ));
+    }
+    let authoritative_rows = inspection
+        .query_row(
+            "SELECT COUNT(*) FROM model_usage_hourly WHERE raw_pruned = 1",
+            [],
+            |row| row.get::<_, u64>(0),
+        )
+        .map_err(|error| format!("Count authoritative model corpus rows: {error}"))?;
+    drop(inspection);
+    if authoritative_rows != 0 {
+        return Err(format!(
+            "Frozen corpus raw equality requires zero authoritative rows; found {authoritative_rows}"
+        ));
+    }
+
+    storage.reset_model_rollup_backfill()?;
+    let raw = collect_model_rollup_outputs(&storage, pinned_end)?;
+    drop(storage);
+
+    let backfill = backfill_model_rollup_copy(corpus)?;
+    if backfill.missing_or_mismatched_rollup_rows != 0 || backfill.extra_rollup_rows != 0 {
+        return Err(format!(
+            "Frozen corpus rollup rows differ from raw refold: missing_or_mismatched={}, extra={}",
+            backfill.missing_or_mismatched_rollup_rows, backfill.extra_rollup_rows
+        ));
+    }
+
+    let storage = Storage::init_study_scratch(corpus)?;
+    let hybrid = collect_model_rollup_outputs(&storage, pinned_end)?;
+    if raw.len() != hybrid.len() {
+        return Err("Frozen corpus raw and hybrid window counts differ".to_string());
+    }
+    let mut equality = Vec::with_capacity(raw.len());
+    for (raw, hybrid) in raw.iter().zip(&hybrid) {
+        if raw.window != hybrid.window {
+            return Err(format!(
+                "Frozen corpus raw window {} paired with hybrid window {}",
+                raw.window, hybrid.window
+            ));
+        }
+        let (overview_bytes, overview_sha256) =
+            exact_output_digest(&raw.overview, &hybrid.overview, raw.window, "overview")?;
+        let (history_bytes, history_sha256) =
+            exact_output_digest(&raw.history, &hybrid.history, raw.window, "history")?;
+        equality.push(ModelRollupCorpusEquality {
+            window: raw.window,
+            overview_bytes,
+            overview_sha256,
+            history_bytes,
+            history_sha256,
+            exact: true,
+        });
+    }
+
+    Ok(ModelRollupConsistencyCorpusReport {
+        pinned_end: pinned_end.to_rfc3339(),
+        quick_check,
+        backfill,
+        equality,
+    })
+}
+
+fn attached_table_columns(
+    conn: &rusqlite::Connection,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, String> {
+    let sql = format!("PRAGMA {schema}.table_info('{table}')");
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Prepare {schema}.{table} layout read: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Query {schema}.{table} layout: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Read {schema}.{table} layout: {error}"))?;
+    Ok(columns)
+}
+
+/// Derive one bounded writable fixture from an immutable corpus attachment,
+/// then exercise the production backfill and hybrid readers on that fixture.
+// @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Frozen Corpus Raw Hybrid Equality]]
+pub fn verify_model_rollup_from_frozen(
+    source: &Path,
+    fixture: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<ModelRollupDerivedCorpusReport, String> {
+    let source = source
+        .canonicalize()
+        .map_err(|error| format!("Resolve frozen model corpus: {error}"))?;
+    let source_metadata = source
+        .metadata()
+        .map_err(|error| format!("Read frozen model corpus metadata: {error}"))?;
+    if !source_metadata.is_file() || !source_metadata.permissions().readonly() {
+        return Err(format!(
+            "Frozen model corpus must be a read-only file: {}",
+            source.display()
+        ));
+    }
+    if fixture.exists() {
+        return Err(format!(
+            "Refusing to overwrite derived model fixture: {}",
+            fixture.display()
+        ));
+    }
+    let fixture_parent = fixture
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "Derived model fixture must have a parent directory".to_string())?;
+    let available_bytes = crate::retention_engine::available_disk_space(fixture_parent)?;
+    let required_bytes = source_metadata.len();
+    if available_bytes < required_bytes {
+        return Err(format!(
+            "Derived model fixture needs at least {required_bytes} free bytes; found {available_bytes}"
+        ));
+    }
+
+    let range_start = pinned_end - TimeDelta::days(90);
+    let range_start_ms = range_start.timestamp_millis();
+    let range_end_ms = pinned_end.timestamp_millis();
+    let storage = Storage::init_study_scratch(fixture)?;
+    drop(storage);
+
+    let mut conn = rusqlite::Connection::open(fixture)
+        .map_err(|error| format!("Open derived model fixture: {error}"))?;
+    let source_path = source
+        .to_str()
+        .ok_or_else(|| "Frozen model corpus path is not UTF-8".to_string())?;
+    if source_path.contains(['?', '#']) {
+        return Err("Frozen model corpus path cannot contain URI query delimiters".to_string());
+    }
+    let source_uri = format!("file:{source_path}?mode=ro&immutable=1");
+    conn.execute("ATTACH DATABASE ?1 AS frozen", [&source_uri])
+        .map_err(|error| format!("Attach immutable model corpus: {error}"))?;
+    for table in ["model_observation_sources", "model_usage_observations"] {
+        let main_columns = attached_table_columns(&conn, "main", table)?;
+        let frozen_columns = attached_table_columns(&conn, "frozen", table)?;
+        if main_columns != frozen_columns {
+            return Err(format!(
+                "Derived fixture schema differs for {table}: main={main_columns:?}, frozen={frozen_columns:?}"
+            ));
+        }
+    }
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Begin derived model fixture extraction: {error}"))?;
+    let copied_sources = tx
+        .execute(
+            "INSERT INTO main.model_observation_sources
+             SELECT source.*
+             FROM frozen.model_observation_sources AS source
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM frozen.model_usage_observations AS observation
+                 WHERE observation.provider = source.provider
+                   AND observation.source_key = source.source_key
+                   AND observation.observed_at_ms >= ?1
+                   AND observation.observed_at_ms < ?2
+             )",
+            rusqlite::params![range_start_ms, range_end_ms],
+        )
+        .map_err(|error| format!("Copy derived model source registry: {error}"))?;
+    let copied_observations = tx
+        .execute(
+            "INSERT INTO main.model_usage_observations
+             SELECT observation.*
+             FROM frozen.model_usage_observations AS observation
+             WHERE observation.observed_at_ms >= ?1
+               AND observation.observed_at_ms < ?2",
+            rusqlite::params![range_start_ms, range_end_ms],
+        )
+        .map_err(|error| format!("Copy derived model observations: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("Commit derived model fixture extraction: {error}"))?;
+    conn.execute_batch("DETACH DATABASE frozen; PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|error| format!("Finalize derived model fixture extraction: {error}"))?;
+    drop(conn);
+
+    let fixture_bytes_before_backfill = fixture
+        .metadata()
+        .map_err(|error| format!("Read derived model fixture metadata: {error}"))?
+        .len();
+    let consistency = verify_model_rollup_copy(fixture, pinned_end)?;
+    Ok(ModelRollupDerivedCorpusReport {
+        source_path: source.display().to_string(),
+        source_bytes: source_metadata.len(),
+        source_read_only: source_metadata.permissions().readonly(),
+        range_start: range_start.to_rfc3339(),
+        range_end: pinned_end.to_rfc3339(),
+        copied_sources: u64::try_from(copied_sources)
+            .map_err(|_| "Copied model source count exceeds u64".to_string())?,
+        copied_observations: u64::try_from(copied_observations)
+            .map_err(|_| "Copied model observation count exceeds u64".to_string())?,
+        available_bytes_before: available_bytes,
+        required_bytes,
+        fixture_bytes_before_backfill,
+        consistency,
     })
 }
 

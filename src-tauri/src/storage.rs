@@ -25583,6 +25583,108 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Live Suppression Read Time Invalidation]]
+    #[test]
+    #[serial]
+    fn completed_model_rollup_reads_apply_suppression_without_rewriting_buckets() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let pinned_now = DateTime::parse_from_rfc3339("2026-07-30T12:37:23Z")
+            .expect("pinned time")
+            .with_timezone(&Utc);
+        let jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:01:00Z","sessionId":"suppression-session","message":{"model":"model-a","usage":{"output_tokens":7}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-30T10:02:00Z","sessionId":"suppression-session","message":{"model":"model-a","usage":{"input_tokens":0}}}"#,
+        ]
+        .join("\n");
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "suppression-source",
+            "suppression-session",
+            &jsonl,
+        );
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete model rollup");
+
+        let baseline = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("read active hybrid overview");
+        let baseline_history = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, None, pinned_now)
+            .expect("read active hybrid history");
+        let rollups_before = unpruned_model_hourly_rows(&storage);
+        assert_eq!(baseline.totals.total_tokens, 7);
+        assert_eq!(rollups_before.len(), 1);
+        assert_eq!(rollups_before[0].input_tokens_present, 1);
+        assert_eq!(rollups_before[0].output_tokens_present, 1);
+
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'suppressed', suppressed_sha256 = 'suppressed'
+                 WHERE provider = 'claude' AND source_key = 'suppression-source'",
+                [],
+            )
+            .expect("suppress model source");
+        let suppressed = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("read suppressed hybrid overview");
+        let suppressed_history = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, None, pinned_now)
+            .expect("read suppressed hybrid history");
+        assert_eq!(suppressed.totals.total_tokens, 0);
+        assert!(suppressed.models.is_empty());
+        assert_eq!(
+            suppressed_history
+                .points
+                .iter()
+                .map(|point| point.attributed_tokens + point.unattributed_tokens)
+                .sum::<i64>(),
+            0
+        );
+        assert_eq!(
+            unpruned_model_hourly_rows(&storage),
+            rollups_before,
+            "suppression is a read-time ownership filter"
+        );
+
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_observation_sources
+                 SET processing_status = 'ok', suppressed_sha256 = NULL
+                 WHERE provider = 'claude' AND source_key = 'suppression-source'",
+                [],
+            )
+            .expect("restore model source visibility");
+        let restored = storage
+            .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
+            .expect("read restored hybrid overview");
+        let restored_history = storage
+            .get_model_history_uncached(ModelRange::SevenDays, None, None, pinned_now)
+            .expect("read restored hybrid history");
+        assert_eq!(
+            serde_json::to_value(restored).expect("restored overview json"),
+            serde_json::to_value(baseline).expect("baseline overview json")
+        );
+        assert_eq!(
+            serde_json::to_value(restored_history).expect("restored history json"),
+            serde_json::to_value(baseline_history).expect("baseline history json")
+        );
+        clear_env();
+    }
+
     fn claude_overview_turn(
         timestamp: &DateTime<Utc>,
         session_id: &str,
@@ -28447,6 +28549,122 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Backfill Transaction Abort And Exact Resume]]
+    #[test]
+    #[serial]
+    fn model_rollup_backfill_rolls_back_fold_when_bookmark_persist_aborts() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let at = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .expect("timestamp")
+                .with_timezone(&Utc)
+        };
+        let jsonl = [
+            claude_overview_turn(
+                &at("2026-07-30T10:05:00Z"),
+                "abort-session",
+                "model-a",
+                10,
+                "/work/abort",
+            ),
+            claude_overview_turn(
+                &at("2026-07-30T12:05:00Z"),
+                "abort-session",
+                "model-b",
+                20,
+                "/work/abort",
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "abort-source", "abort-session", &jsonl);
+        storage
+            .reset_model_rollup_backfill()
+            .expect("reset model rollup before crash test");
+
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let first_controls = RollupBackfillControls {
+            chunk_rows: 1,
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        let first = storage
+            .run_model_rollup_backfill_with_controls(&first_controls)
+            .expect("commit first model chunk");
+        assert_eq!(first.terminal, RollupBackfillTerminal::Interrupted);
+        let committed_rows = unpruned_model_hourly_rows(&storage);
+        let committed_bookmark = first.progress.done_through;
+        assert_eq!(committed_rows.len(), 1);
+
+        storage
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER abort_model_backfill_bookmark
+                 BEFORE UPDATE OF model_backfill_done_through_ms ON rollup_meta
+                 WHEN NEW.model_backfill_status = 'complete'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced bookmark persistence failure');
+                 END;",
+            )
+            .expect("install bookmark abort trigger");
+        let failing_controls = RollupBackfillControls {
+            chunk_rows: 1,
+            ..RollupBackfillControls::default()
+        };
+        let error = storage
+            .run_model_rollup_backfill_with_controls(&failing_controls)
+            .expect_err("bookmark failure must abort the second chunk");
+        assert!(
+            error.contains("Persist rollup backfill bookmark"),
+            "{error}"
+        );
+        {
+            let conn = storage.conn.lock();
+            assert_eq!(
+                read_model_hourly_rollup_rows(
+                    &conn,
+                    "SELECT hour_utc, provider, derived_model_id, source_key,
+                            analytics_session_id, obs_count, turn_count, token_count,
+                            sidechain_count, input_tokens, input_tokens_present,
+                            output_tokens, output_tokens_present, cache_creation_tokens,
+                            cache_creation_tokens_present, cache_read_tokens,
+                            cache_read_tokens_present, first_observed_at_ms,
+                            last_observed_at_ms, raw_pruned
+                     FROM model_usage_hourly WHERE raw_pruned = 0
+                     ORDER BY 1, 2, 3, 4, 5",
+                ),
+                committed_rows,
+                "aborted fold must not outlive its bookmark"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT model_backfill_done_through_ms, model_backfill_status
+                     FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+                )
+                .expect("read failed model backfill state"),
+                (committed_bookmark, "failed".to_string())
+            );
+            conn.execute_batch("DROP TRIGGER abort_model_backfill_bookmark;")
+                .expect("drop bookmark abort trigger");
+        }
+
+        let resumed = storage
+            .run_model_rollup_backfill_with_controls(&RollupBackfillControls::default())
+            .expect("resume after rolled-back model chunk");
+        assert_eq!(resumed.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(
+            raw_model_hourly_rows(&storage),
+            unpruned_model_hourly_rows(&storage)
+        );
+        clear_env();
+    }
+
     // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Late Old-Hour Ingest Handoff]]
     #[test]
     #[serial]
@@ -29773,6 +29991,52 @@ mod tests {
             )
             .expect("complete runtime rollup for read");
         }
+        let model_authority = {
+            let conn = storage.conn.lock();
+            read_model_hourly_rollup_rows(
+                &conn,
+                "SELECT hour_utc, provider, derived_model_id, source_key,
+                        analytics_session_id, obs_count, turn_count, token_count,
+                        sidechain_count, input_tokens, input_tokens_present,
+                        output_tokens, output_tokens_present, cache_creation_tokens,
+                        cache_creation_tokens_present, cache_read_tokens,
+                        cache_read_tokens_present, first_observed_at_ms,
+                        last_observed_at_ms, raw_pruned
+                 FROM model_usage_hourly
+                 WHERE provider = 'claude'
+                   AND source_key = 'prune-model-source'
+                 ORDER BY 1, 2, 3, 4, 5",
+            )
+        };
+        assert_eq!(model_authority.len(), 1);
+        storage
+            .reset_model_rollup_backfill()
+            .expect("reset model rebuild after prune");
+        let model_rebuild = storage
+            .run_model_rollup_backfill_with_controls(&RollupBackfillControls::default())
+            .expect("rebuild model rollup after prune");
+        assert_eq!(model_rebuild.terminal, RollupBackfillTerminal::Completed);
+        let model_authority_after_rebuild = {
+            let conn = storage.conn.lock();
+            read_model_hourly_rollup_rows(
+                &conn,
+                "SELECT hour_utc, provider, derived_model_id, source_key,
+                        analytics_session_id, obs_count, turn_count, token_count,
+                        sidechain_count, input_tokens, input_tokens_present,
+                        output_tokens, output_tokens_present, cache_creation_tokens,
+                        cache_creation_tokens_present, cache_read_tokens,
+                        cache_read_tokens_present, first_observed_at_ms,
+                        last_observed_at_ms, raw_pruned
+                 FROM model_usage_hourly
+                 WHERE provider = 'claude'
+                   AND source_key = 'prune-model-source'
+                 ORDER BY 1, 2, 3, 4, 5",
+            )
+        };
+        assert_eq!(
+            model_authority_after_rebuild, model_authority,
+            "rebuild must preserve authority with no raw rows to refold"
+        );
         let stats = with_pinned_query_now(
             DateTime::parse_from_rfc3339("2026-01-15T11:00:00Z")
                 .expect("parse pinned runtime now")

@@ -167,6 +167,43 @@ proves a queued maintenance writer acquires within the shared 250 ms chunk
 bound. The empty-database regression completed zero-of-zero in one committed
 terminal chunk in 28.684 ms, below its one-second small-database ceiling.
 
+## Model rollup consistency
+
+The Family 1 equality leg attaches the frozen source immutable/read-only,
+extracts only its pinned 90-day model rows and matching registry sources into
+a disposable database, then runs production backfill and requires exact
+normalized equality at all three acceptance windows:
+
+```bash
+cargo run --release --bin widget_query_perf_spike -- verify-model-rollup-derived SOURCE FIXTURE 2026-08-02T19:27:43Z
+```
+
+| Measure | Result |
+| --- | ---: |
+| Fixture sources | 4,392 |
+| Fixture observations | 4,100,262 |
+| Fixture bytes before backfill | 5,991,608,320 |
+| `PRAGMA quick_check` | `ok` |
+| First committed chunk | 5,124 rows |
+| Resume bookmark | 1,778,205,599,999 ms |
+| Final terminal / status | Completed / complete |
+| Chunks | 172 |
+| End-to-end backfill | 14,554.554 ms |
+| Raw-to-rollup missing or mismatched groups | 0 |
+| Extra unpruned groups | 0 |
+| `raw_pruned=1` rows before / after | 0 / 0 |
+
+| Window | Overview bytes | Overview SHA-256 | History bytes | History SHA-256 | Exact |
+| --- | ---: | --- | ---: | --- | --- |
+| 24h | 5,131 | `1291275007a478751980859e9f20d6dfcd2d23876efc9692261a86d338a06c69` | 3,963 | `049126eccc9019ed37e157f53ea00d88f59eb3f8f76ee5a863ca786e33c5cda1` | yes |
+| 30d | 12,670 | `fb50579fa9c6f866bb9b1c3311d9cb86d790a91ecd60792557be763a7c8c679d` | 5,129 | `d2b0463451f9e1f098a8ed0a7a5e99d0ef8330d374a217032c2880d42416fe8c` | yes |
+| 90d | 17,040 | `ded5f5ff9020dc308015c16159f4456fefcef514a550b786628b3fe787b3afd9` | 14,749 | `ef4e4d7a789a027912bcf94ce5babc192aac97c48b2d57d5b74a16529acca662` | yes |
+
+The source remained 13,525,123,072 bytes, mode `0444`, and SHA-256
+`c86553ab3b0f22e23511dfc43a1f1b9dc9af35ad57f6ae63fcb3de75a673d04e`.
+Its read-only zero-byte WAL and 32,768-byte SHM retained their baseline modes
+and mtimes. The validated 5.99 GB derived fixture was deleted after the run.
+
 ## Runtime ingest fold overhead
 
 The runtime-rollup benchmark compares production transcript replacement with

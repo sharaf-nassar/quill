@@ -16,4 +16,4 @@ Retention must reject a runtime prune before moving its watermark or deleting ev
 
 ## Fold Then Prune Authority
 
-One committed prune must promote exact model and runtime rows, delete only covered runtime events, clamp the bookmark, and keep runtime reads independent of daily event counters.
+One committed prune must promote exact model and runtime rows, preserve model authority through rebuild, clamp runtime state, and keep runtime reads independent of daily event counters.
