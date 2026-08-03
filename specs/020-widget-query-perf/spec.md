@@ -486,7 +486,8 @@ lines; ~745 rows/MB; bursts to ~866k rows/day from as few as 77 files,
 quiet-day floor 5-10k/day). Per-token_count fidelity is the intentional
 "replayable evidence" contract (lat.md/data-flow.md:131-155) — the rollup
 layer, not a parser change, is the right compression point. **Size the
-rollup for burst days up to ~1M rows/day, not the 135k/day average.**
+rollup for the corrected 1.48M-row peak day, not the 135k/day pre-fix
+average; retain the 5k rollup-row/day envelope.**
 CPA modules write neither `model_usage_observations` nor
 `usage_snapshots` — no schema collision. SEPARATE BUG found (own bead,
 outside this feature): post-2026-07-28 source-admission regression —
@@ -501,13 +502,13 @@ clarification Q7's "live ingest events still force a refresh").
 replacing next-larger-preset; the prior-period fetch is the one
 enumerated, justified over-range query.
 
-Post-fix revalidation confirms exact raw/hybrid consistency for the canonical
-4.10M-observation corpus, but it also confirms that snapshot still has the
-pre-fix quiet admission shape after 2026-07-28. It therefore cannot close the
-corrected-volume sizing question. `quill-45m.27` owns a post-reconciliation
-snapshot and rerun. Current physical evidence also replaces the estimated
-350-byte rollup row with 1,021 bytes including both indexes; see
-`timing-measurement.md`.
+Final post-fix validation uses a new corpus frozen after complete retained-file
+and registry fingerprint parity. Its bounded 6.35M observations fold to 9,092
+rows, and two independent fixtures match exact raw/hybrid results at every
+acceptance window. The measured rollup footprint is 1,031 bytes per row,
+putting the conservative 1.8M-row annual envelope at 1.856 GB; see
+`timing-measurement.md`. The original corpus remains the immutable BEFORE and
+post-A/B timing baseline.
 
 **Q7: Test authorization?**
 A: **Authorized** (constitution 7): rollup-consistency tests,

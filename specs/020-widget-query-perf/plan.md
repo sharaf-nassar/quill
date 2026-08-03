@@ -3,9 +3,10 @@
 Implementation plan for the clarified spec (all 7 Clarifications binding).
 Slice cut per Q5: A = model rollup (S1), B = runtime stats (S2) first and
 independent; C = readers (S3), D = refresh honesty (S4), E = query cleanups
-(S5) beaded now but gated on a post-A/B re-measurement. All acceptance is
-measured on the frozen 13.5 GB corpus per Q3. This plan supersedes two
-recorded 013 decisions (cited in Architecture Approach).
+(S5) beaded now but gated on a post-A/B re-measurement. BEFORE and post-A/B
+timing stay pinned to the frozen 13.5 GB corpus per Q3; corrected-volume
+sizing uses the later 16.7 GB corpus. This plan supersedes two recorded 013
+decisions (cited in Architecture Approach).
 
 ## Architecture Approach
 
@@ -287,19 +288,19 @@ migration-34 precedent: schema step stays fast, never blocks startup).
 - Indexes: the unique key (hour-leading — serves all range reads) plus
   `(provider, source_key)` for invalidation deletes. Both covering for
   their access paths.
-- **Size at the 1M rows/day burst envelope (Q6a: size for bursts, not
-  the 135k/day average):** rollup rows/day = active sources × active
-  hours × models/hour. Burst evidence: 866k raw rows/day from as few as
-  77 files; envelope 200 sources × 12 h × 2 models ≈ **≤5k rollup
-  rows/day** vs 1M raw — ≥200:1 compression (raw is ~745 rows/MB).
-  Post-`quill-xnb` revalidation of the canonical bounded corpus folds
-  4.10M observations into 7,288 rows and 7.44 MB versus 5.98 GB for the
-  raw table plus indexes (804:1 physical compression). Actual rollup
-  footprint is ~1,021 B/row including both indexes, not the prior 350 B
-  estimate; 1.8M constant-burst annual rows therefore project to
-  ~1.84 GB, not ~650 MB. The snapshot still exhibits the old post-07-28
-  quiet-source shape, so `quill-45m.27` owns a fully reconciled corpus,
-  corrected-volume rerun, and final annual budget.
+- **Size at the corrected burst envelope (Q6a: size for bursts, not an
+  understated daily average):** rollup rows/day = active sources × active
+  hours × models/hour. The reconciled corpus peaks at 1,476,108 combined raw
+  observations on 2026-07-29 across 394 provider-qualified sources and 548
+  source-hours, but folds to only 572 rows. The existing **≤5k rollup
+  rows/day** envelope therefore remains 8.74× above observed density.
+  Its bounded fixture folds 6.35M observations into 9,092 rows and 9.38 MB
+  versus 9.27 GB for the raw table plus indexes (989:1 physical compression).
+  Actual rollup footprint is ~1,031 B/row including both indexes, not the
+  prior 350 B estimate; 1.8M constant-burst annual rows therefore project to
+  1.856 GB (1.729 GiB), not ~650 MB. This supersedes the original corpus's
+  pre-fix quiet-source estimate of ~1.84 GB with completed reconciliation
+  evidence.
   The existing 7 indexes / 3.6 GB on `model_usage_observations` are kept
   as-is; post-rollup index cleanup is an explicit follow-up outside this
   feature (per the spec Non-Goal).
@@ -557,12 +558,13 @@ window) to make S4's "no query exceeds R except range×2" checkable.
   oversize rejection :3055-3077 unchanged). If exceeded: fold moves to a
   post-commit same-connection follow-up transaction with the current
   hour always served raw (hybrid read already tolerates this).
-- **Corrected-volume validation needs a later corpus.** The canonical
-  snapshot still has the pre-fix post-07-28 quiet-source shape despite
-  containing `quill-xnb`'s first admissions. Current-volume consistency
-  and physical sizing are measured, but `quill-45m.27` must repeat them
-  after full retained-source reconciliation. The ≤1M-row/day envelope
-  remains the provisional bound until that evidence lands.
+- **Corrected-volume validation — resolved.** The 2026-08-03 corpus was frozen
+  only after two stable retained-file inventories bracketed a complete
+  read-only registry snapshot with zero missing or fingerprint-mismatched
+  sources. Two independently derived fixtures then matched every normalized
+  24h/30d/90d digest. Corrected daily raw volume exceeds the provisional 1M
+  bound, but its peak folds to 572 rows, leaving the 5k/day rollup envelope
+  conservative and the final annual storage budget at 1.856 GB.
 - **Backfill UX on slow disks.** The 20s stall machine is exactly where
   backfill is slowest. Mitigation: raw path + "building index" note
   keeps Models functional (degraded but honest) during the one-time

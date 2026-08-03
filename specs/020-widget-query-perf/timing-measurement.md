@@ -1,7 +1,7 @@
 # Widget query timing measurement
 
 This acceptance record freezes the BEFORE query costs and corpus identity, then
-records the interim post-A/B gate used to size slices C/D/E.
+records the post-A/B gate and corrected-volume rollup sizing evidence.
 
 ## Frozen corpus
 
@@ -244,8 +244,8 @@ reconciliation at or after `2026-08-02T18:00:00Z`; the latest is
 `2026-08-02T19:15:00.704Z`. The fix commit is timestamped
 `2026-08-02T19:17:46Z`, ten minutes before corpus capture. This corpus therefore
 does not prove the fully corrected retained-source volume promised by the
-post-`quill-xnb` acceptance task. Follow-up `quill-45m.27` owns a snapshot after
-reconciliation completion and the corrected-volume sizing rerun.
+post-`quill-xnb` acceptance task. The completed rerun below freezes a distinct
+snapshot after reconciliation completion.
 
 The existing burst envelope remains conservative for observed row counts. The
 90-day Codex peak is 865,263 observations from 73 sources on 2026-07-27, which
@@ -261,9 +261,8 @@ The bounded fixture gains 7,430,144 bytes after backfill. Raw b-trees consume
 1,459.55 bytes per observation; the rollup consumes 1,021.19 bytes per row
 (381.61 table + 639.58 indexes), while 562.60:1 row compression produces
 804.11:1 physical compression. At this measured occupancy, 1.8 million annual
-rollup rows project to 1.84 GB, not the plan's former ~650 MB. Follow-up
-`quill-45m.27` carries this corrected annual-budget input into the true-volume
-rerun.
+rollup rows project to 1.84 GB, not the plan's former ~650 MB. The
+corrected-volume rerun below carries that input into the final budget.
 
 Two independently derived fixtures produced the same backfill structure:
 
@@ -304,6 +303,120 @@ The 32,768-byte SHM stayed mode `0444`, inode `21943767`, with mtime/ctime
 `21943766`, with mtime/ctime `1785699012.9481790910`. Both validated
 5,999,038,464-byte fixture databases and their dedicated temp directory were
 deleted after the stable-digest rerun; no fixture sidecars remained at cleanup.
+
+### Corrected-volume corpus and final sizing rerun
+
+The follow-up corpus was frozen only after the production reconciliation path
+proved current retained inventory parity. At
+`2026-08-03T06:28:00.031Z`, two identical metadata-only inventories bracketed
+one read-only registry snapshot: all 7,181 current sources were admitted, none
+had a size/mtime/status mismatch, and durable backfill state was complete with
+both roots resolved and no failures. The registry contained 460 additional
+historical paths whose files had since been removed; live reconciliation does
+not prune them.
+
+The release `freeze` command immediately copied the WAL-consistent live
+database to this new stable, untracked path without replacing the original
+BEFORE corpus:
+
+`/home/mamba/.local/share/com.quilltoolkit.app/benchmark-corpora/widget-query-perf/usage-2026-08-03.db`
+
+| Property | Corrected corpus |
+| --- | --- |
+| Captured | `2026-08-03T06:28:00.031Z` |
+| Bytes | `16,738,598,912` |
+| SHA-256 | `782a4d5553f9271b13684d86870c4000dcbcded81c25f7f99b4e3d22e3dfdacc` |
+| Permissions | `0444` |
+| SQLite | `3.45.1` |
+| Schema version | `37` |
+| Pages | `4,086,572 × 4,096` bytes |
+| Freelist | `0` pages |
+| Validation | `PRAGMA quick_check = ok` |
+| Sidecars after close | WAL absent; SHM absent |
+
+The original `usage-2026-08-02.db` remains the immutable BEFORE and post-A/B
+timing baseline. It retained its 13,525,123,072-byte size, mode `0444`, inode,
+timestamps, sidecars, and canonical SHA-256 throughout this rerun. Results in
+this subsection use only the corrected corpus and the later pinned endpoint.
+
+The corrected corpus has 217,361 Claude and 6,236,478 Codex observations. Its
+Codex volume at or after `2026-07-28T00:00:00Z` is 2,551,330 observations
+across 894 sources, versus 336,842 across 153 in the original corpus. That is
+2,214,488 more observations and 741 more sources: 7.57× and 5.84× the old
+totals, respectively. The post-fix daily Codex density is:
+
+| UTC day | Observations | Sources | Source-hours | Rollup rows | Obs/rollup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-07-28 | 793,785 | 257 | 380 | 407 | 1,950.33 |
+| 2026-07-29 | 1,465,412 | 234 | 347 | 371 | 3,949.90 |
+| 2026-07-30 | 87,525 | 43 | 85 | 89 | 983.43 |
+| 2026-07-31 | 133,890 | 87 | 148 | 161 | 831.61 |
+| 2026-08-01 | 11,683 | 43 | 60 | 66 | 177.02 |
+| 2026-08-02 | 44,261 | 186 | 282 | 300 | 147.54 |
+| 2026-08-03 partial | 14,774 | 74 | 112 | 121 | 122.10 |
+
+The same bounded derivation and production interrupted/resumed backfill ran
+twice from scratch:
+
+```bash
+cargo run --release --bin widget_query_perf_spike -- verify-model-rollup-derived SOURCE FIXTURE 2026-08-03T06:28:00.031Z
+```
+
+| Measure | Fixture A | Fixture B |
+| --- | ---: | ---: |
+| Sources / observations | 5,737 / 6,352,310 | 5,737 / 6,352,310 |
+| Bytes before backfill | 9,281,732,608 | 9,281,732,608 |
+| First chunk / resume bookmark | 5,194 / 1,778,209,199,999 ms | 5,194 / 1,778,209,199,999 ms |
+| Chunks | 219 | 219 |
+| Backfill elapsed | 20,373.805 ms | 18,532.347 ms |
+| Max progress interval | 748.524 ms | 722.642 ms |
+| Max WAL after checkpoint / finish | 0 / 0 bytes | 0 / 0 bytes |
+| Missing-or-mismatched / extra rows | 0 / 0 | 0 / 0 |
+| Terminal / committed status | Completed / complete | Completed / complete |
+
+Both fixtures returned `PRAGMA quick_check = ok`, preserved zero
+`raw_pruned=1` rows, and produced the same exact normalized raw/hybrid results:
+
+| Window | Overview bytes | Overview SHA-256 | History bytes | History SHA-256 | Exact |
+| --- | ---: | --- | ---: | --- | --- |
+| 24h | 5,416 | `caa665c2c73d31bb2fd69ad372875a1030f9a7ac8602f75aa76bed5fd6609ca9` | 4,228 | `c371b22c4e11d95117216552cb837047457ffe0b040a8e25bd2e9a2efc10c0b4` | yes |
+| 30d | 12,921 | `d502ce428a0e206487d7fa26dff26f77f4f96872bbd008341f88d69aa063e51f` | 5,419 | `df8efd2a8487e1587d6b3870745e7fe7adf23526fbdeaa94e44b5f05b9ca6bfa` | yes |
+| 90d | 17,510 | `edeeefbd5b2536876e8c6e0d49cfbade6e43689498399cd58b17e4e2da590b83` | 15,523 | `09caa09af9c2c8815bccb81e43d1c60a52b293483b69f9cd55f0671e14c4173e` | yes |
+
+The bounded provider/source-hour density is:
+
+| Provider | Observations | Sources | Source-hours | Rollup rows | Obs/rollup | p50 | p95 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Claude | 217,361 | 2,762 | 4,000 | 4,014 | 54.15 | 35 | 177 | 545 |
+| Codex | 6,134,949 | 2,975 | 4,806 | 5,078 | 1,208.14 | 73 | 10,719 | 18,083 |
+| Total | 6,352,310 | 5,737 | 8,806 | 9,092 | 698.67 | — | — | 18,083 |
+
+Claude averages 1.0035 models per source-hour, with p50/p95 both one.
+Codex averages 1.0566, with p50 one and p95 two. Raw identity count is also
+6,352,310, so the provider/source/record uniqueness contract has no
+duplicates.
+
+Physical occupancy changed only slightly despite the corrected observation
+volume:
+
+| B-tree set | Table bytes | Index bytes | Total bytes |
+| --- | ---: | ---: | ---: |
+| Raw observations | 3,741,335,552 | 5,531,234,304 | 9,272,569,856 |
+| Model hourly rollup | 3,485,696 | 5,890,048 | 9,375,744 |
+
+The fixture gained 9,363,456 file bytes after backfill. Raw B-trees consume
+1,459.72 bytes per observation; the rollup consumes 1,031.21 bytes per row.
+The measured 698.67:1 row compression yields 989.00:1 physical compression.
+At this occupancy, the plan's conservative 1.8 million annual rollup rows
+require 1.856 GB (1.729 GiB). The corrected peak day has 1,476,108 combined
+observations but only 572 combined rollup rows, so the 5,000-row/day rollup
+envelope remains 8.74× above observed density.
+
+At each verifier finish the WAL was present at zero bytes and the SHM existed
+only while its final connection was open. After both read-only validation
+handles closed, the fixture sidecars were absent. The two validated fixture
+databases and their dedicated temporary directory were then deleted; the two
+immutable corpora retained no open handles.
 
 ## Runtime ingest fold overhead
 

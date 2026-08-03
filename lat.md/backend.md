@@ -205,8 +205,8 @@ Full numbers live in `specs/014-retention-pruning/retention-timing-spike.md`.
 ### Widget query benchmark corpus
 
 [[src-tauri/src/bin/widget_query_perf_spike.rs]] freezes and measures the
-production-size corpus used for feature 020's reproducible widget-query A/B
-evidence.
+production-size corpora used for feature 020's reproducible widget-query A/B
+and corrected-volume sizing evidence.
 
 `freeze` reads a live WAL-backed database through SQLite's online backup API,
 refuses to overwrite an existing destination, validates the resulting snapshot,
@@ -219,6 +219,16 @@ post-processing while never running migrations, cleanup, or retention against
 the corpus. The database remains local and untracked; only its path, hash,
 endpoints, protocol, and timing table are committed in
 `specs/020-widget-query-perf/timing-measurement.md`.
+
+The original `usage-2026-08-02.db` remains the immutable BEFORE and post-A/B
+timing baseline. Corrected-volume acceptance uses a distinct
+`usage-2026-08-03.db`: two stable retained-file inventories bracket one
+read-only registry snapshot, and freeze starts only when durable reconciliation
+is complete with zero missing or fingerprint-mismatched current sources. Two
+independently derived 90-day fixtures must then match normalized raw and hybrid
+overview/history results before cleanup. That corpus measures 1,031 bytes per
+model rollup row including indexes, making the conservative 1.8-million-row
+annual envelope 1.856 GB rather than the original 350-byte estimate's ~650 MB.
 
 `diagnose-model` is the read-only residual-work audit for the same pinned
 corpus. It reports rollup lifecycle and authority counts, raw/rollup
