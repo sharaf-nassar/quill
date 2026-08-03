@@ -1111,6 +1111,18 @@ Completed model-rollup reads must equal the established raw computation across o
 
 The seeded comparison pins an unaligned endpoint, covers closed and open hours, missing and explicit-zero evidence, suppression, selected-model history, and pending/running/failed versus completed-empty `buildingIndex` states.
 
+##### Bounded Completed Model Raw Seeks
+
+Completed rollup reads must seek only exact raw boundary intervals and scoped sessions instead of scanning the full observation window.
+
+SQLite 3.45 plan checks require history/activity residual ranges, project prefix/tie lookups, and paged running-turn reads to use bounded indexes without raw scans or temporary ordering.
+
+##### Running Model Pagination Parity
+
+Paged running-model reads must preserve the complete turn order across page boundaries and cannot stop until each represented provider finds a predecessor or exhausts its range.
+
+More than 1,024 same-prefix turns put decisive ordinal and binary-key ties on the second SQL page, while an interleaved provider with one model verifies exhaustion, oldest `runningSinceAt`, and a NULL predecessor.
+
 #### Hourly Analytics Rollups
 
 Migration 37 creates source-keyed rollup storage for bounded model and runtime reads while preserving raw evidence.
@@ -1126,7 +1138,7 @@ Retention prevalidates every doomed model group against its full raw group-by an
 
 Completed model reads use hourly rows for decomposable facets: represented providers; scoped sessions/evidence; turn, token, and distinct-model totals; per-session/model reach, turns, tokens, primary model, combinations, and pairs; active days and first/last evidence; delegation totals; and history sums. Every row joins active `model_observation_sources` during the read, so suppression is immediate, and the empty model sentinel returns to NULL attribution before aggregation.
 
-Three facets need narrower handling because migration 37 omits their full grain. Activity/history use a rollup hour only when that whole UTC hour fits one existing response bucket; an hour crossing a sliding bucket boundary stays on a grouped raw query. Project labels overlay a focused latest-cwd raw query on source-cwd rollup fallback. Running-now uses indexed raw turn order because contiguous order and previous-model identity cannot be reconstructed from per-model hourly bounds. These exceptions do not rematerialize closed historical observations in the overview temp table.
+Three facets need narrower handling because migration 37 omits their full grain. Activity/history use a rollup hour only when that whole UTC hour fits one existing response bucket; explicit half-open raw intervals seek only bucket-crossing hours. Completed overview scope and provider discovery express leading and trailing raw edges as separate bounded `UNION ALL` branches, never one full-window range with an `OR` edge filter. Project labels seek descending time/ordinal prefixes per scoped chain, fetch exact-prefix cwd ties without SQL sorting, and compare full binary suffixes in Rust while retaining source-cwd fallback and older-prefix continuation. Active source cwd and any pruned-authority keys are materialized once per read. Running-now pages the observed-time index, retains complete timestamp/provider groups across pages, applies the remaining order in Rust, and stops after each represented provider finds its first differing model or the range is exhausted. These exceptions do not rematerialize closed historical observations in the overview temp table.
 
 ##### Chunked Rollup Backfill Framework
 

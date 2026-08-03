@@ -18,7 +18,7 @@ use crate::models::{LlmRuntimeStats, ModelRange, UsageBucket};
 use crate::rollup_backfill::{
     RollupBackfillControls, RollupBackfillProgress, RollupBackfillTerminal, RollupChunkControl,
 };
-use crate::storage::{Storage, with_pinned_query_now};
+use crate::storage::{Storage, with_model_overview_stage_timings, with_pinned_query_now};
 
 /// One cold, app-cache-bypassed endpoint measurement.
 #[derive(Debug, Serialize)]
@@ -30,6 +30,34 @@ pub struct WidgetQueryMeasurement {
     pub elapsed_ms: f64,
     pub warm_elapsed_ms: f64,
     pub output_bytes: usize,
+    pub output_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WidgetQueryOutputHash {
+    pub query: &'static str,
+    pub window: &'static str,
+    pub output_bytes: usize,
+    pub output_sha256: String,
+}
+
+/// One opt-in internal stage from a cold model-overview call.
+#[derive(Debug, Serialize)]
+pub struct ModelOverviewStageMeasurement {
+    pub stage: &'static str,
+    pub elapsed_ms: f64,
+}
+
+/// Cold endpoint total plus internal production-stage attribution.
+#[derive(Debug, Serialize)]
+pub struct ModelOverviewProfile {
+    pub window: &'static str,
+    pub start: String,
+    pub end: String,
+    pub elapsed_ms: f64,
+    pub output_bytes: usize,
+    pub output_sha256: String,
+    pub stages: Vec<ModelOverviewStageMeasurement>,
 }
 
 /// One complete view's backend request set, measured without frontend work.
@@ -270,25 +298,27 @@ fn measure<T: Serialize>(
     operation: impl Fn(&Storage) -> Result<T, String>,
 ) -> Result<WidgetQueryMeasurement, String> {
     let storage = Storage::init_widget_query_benchmark(corpus)?;
-    let (elapsed_ms, warm_elapsed_ms, output_bytes) = with_pinned_query_now(pinned_end, || {
-        let started = Instant::now();
-        let value = operation(&storage)?;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let output = serde_json::to_vec(&value)
-            .map_err(|error| format!("Serialize {query} benchmark output: {error}"))?;
+    let (elapsed_ms, warm_elapsed_ms, output_bytes, output_sha256) =
+        with_pinned_query_now(pinned_end, || {
+            let started = Instant::now();
+            let value = operation(&storage)?;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let output = serde_json::to_vec(&value)
+                .map_err(|error| format!("Serialize {query} benchmark output: {error}"))?;
 
-        let warm_started = Instant::now();
-        let warm_value = operation(&storage)?;
-        let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
-        let warm_output = serde_json::to_vec(&warm_value)
-            .map_err(|error| format!("Serialize warm {query} benchmark output: {error}"))?;
-        if output != warm_output {
-            return Err(format!(
-                "Cold and warm {query} benchmark outputs differ at pinned endpoint"
-            ));
-        }
-        Ok::<_, String>((elapsed_ms, warm_elapsed_ms, output.len()))
-    })?;
+            let warm_started = Instant::now();
+            let warm_value = operation(&storage)?;
+            let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
+            let warm_output = serde_json::to_vec(&warm_value)
+                .map_err(|error| format!("Serialize warm {query} benchmark output: {error}"))?;
+            if output != warm_output {
+                return Err(format!(
+                    "Cold and warm {query} benchmark outputs differ at pinned endpoint"
+                ));
+            }
+            let output_sha256 = hex::encode(Sha256::digest(&output));
+            Ok::<_, String>((elapsed_ms, warm_elapsed_ms, output.len(), output_sha256))
+        })?;
 
     Ok(WidgetQueryMeasurement {
         query,
@@ -298,6 +328,7 @@ fn measure<T: Serialize>(
         elapsed_ms,
         warm_elapsed_ms,
         output_bytes,
+        output_sha256,
     })
 }
 
@@ -382,6 +413,115 @@ pub fn measure_session_breakdown_30d(
         output_bytes,
         query_plan,
     })
+}
+
+/// Measure completed-rollup model reads at their acceptance windows.
+pub fn measure_model_rollup_queries(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<Vec<WidgetQueryMeasurement>, String> {
+    let mut measurements = Vec::with_capacity(4);
+    for window in WINDOWS.into_iter().skip(1) {
+        measurements.push(measure(
+            corpus,
+            pinned_end,
+            window,
+            "get_model_usage_overview",
+            |storage| storage.get_model_usage_overview(window.model_range, None),
+        )?);
+        measurements.push(measure(
+            corpus,
+            pinned_end,
+            window,
+            "get_model_history",
+            |storage| storage.get_model_history(window.model_range, None, None),
+        )?);
+    }
+    Ok(measurements)
+}
+
+/// Attribute one cold model-overview call without changing production output.
+pub fn profile_model_overview_queries(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<Vec<ModelOverviewProfile>, String> {
+    let mut profiles = Vec::with_capacity(2);
+    for window in WINDOWS.into_iter().skip(1) {
+        let storage = Storage::init_widget_query_benchmark(corpus)?;
+        let (elapsed_ms, output, stages) = with_pinned_query_now(pinned_end, || {
+            let started = Instant::now();
+            let (value, stages) = with_model_overview_stage_timings(|| {
+                storage.get_model_usage_overview(window.model_range, None)
+            });
+            let value = value?;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let output = serde_json::to_vec(&value)
+                .map_err(|error| format!("Serialize profiled model overview output: {error}"))?;
+            Ok::<_, String>((elapsed_ms, output, stages))
+        })?;
+        profiles.push(ModelOverviewProfile {
+            window: window.label,
+            start: (pinned_end - window.duration).to_rfc3339(),
+            end: pinned_end.to_rfc3339(),
+            elapsed_ms,
+            output_bytes: output.len(),
+            output_sha256: hex::encode(Sha256::digest(&output)),
+            stages: stages
+                .into_iter()
+                .map(|stage| ModelOverviewStageMeasurement {
+                    stage: stage.stage,
+                    elapsed_ms: stage.elapsed_ms,
+                })
+                .collect(),
+        });
+    }
+    Ok(profiles)
+}
+
+fn hash_output<T: Serialize>(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    window: Window,
+    query: &'static str,
+    operation: impl Fn(&Storage) -> Result<T, String>,
+) -> Result<WidgetQueryOutputHash, String> {
+    let storage = Storage::init_widget_query_benchmark(corpus)?;
+    let output = with_pinned_query_now(pinned_end, || {
+        let value = operation(&storage)?;
+        serde_json::to_vec(&value)
+            .map_err(|error| format!("Serialize {query} parity output: {error}"))
+    })?;
+    Ok(WidgetQueryOutputHash {
+        query,
+        window: window.label,
+        output_bytes: output.len(),
+        output_sha256: hex::encode(Sha256::digest(&output)),
+    })
+}
+
+/// Hash completed-rollup model responses without app-cache warm samples.
+pub fn hash_model_rollup_queries(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<Vec<WidgetQueryOutputHash>, String> {
+    let mut hashes = Vec::with_capacity(4);
+    for window in WINDOWS.into_iter().skip(1) {
+        hashes.push(hash_output(
+            corpus,
+            pinned_end,
+            window,
+            "get_model_usage_overview",
+            |storage| storage.get_model_usage_overview(window.model_range, None),
+        )?);
+        hashes.push(hash_output(
+            corpus,
+            pinned_end,
+            window,
+            "get_model_history",
+            |storage| storage.get_model_history(window.model_range, None, None),
+        )?);
+    }
+    Ok(hashes)
 }
 
 fn add_output<T: Serialize>(

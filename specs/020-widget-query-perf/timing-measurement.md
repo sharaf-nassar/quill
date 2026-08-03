@@ -820,3 +820,124 @@ a hidden duplicate. Sessions and Skills retain one secondary project request
 because the exact Projects readout remains visible; Skills explicitly sends
 `allTime: false` with the selected range. Stable serialization still coalesces
 equivalent argument order, while `6h` and internal `12h` remain isolated keys.
+## Residual model-query follow-up attempt
+
+The follow-up used the same worker-owned model-backfilled copy, pinned endpoint,
+release profile, and app-cache-empty `Storage` protocol. SQLite was 3.45.0.
+Before query changes, SHA-256 hashes captured the exact serialized 30d/90d
+overview and history responses. A hash-only pass after the final design matched
+all four byte lengths and hashes before the final timed pass.
+
+The implemented design replaced the all-range representative-project rank with
+one bounded `idx_model_observations_chain_time` candidate seek per active scoped
+chain, then applied the complete cross-chain timestamp, ordinal, binary text,
+and row-id order in Rust. History and activity derive explicit half-open raw
+intervals for bucket-crossing hours. Active sources and any `raw_pruned=1`
+authority keys are materialized once as keyed temporary tables, so each raw
+branch performs a bounded observed-time seek without repeated durable-table
+authority probes.
+
+| Query | Window | Final cold | Output bytes | SHA-256 | Gate |
+| --- | --- | ---: | ---: | --- | --- |
+| `get_model_usage_overview` | 30d | 4,155.851 ms | 12,761 | `ec00856281427f5f619a49ef19ba9f4da599301c64a8a8f8b1f5c6657d4ef601` | fail |
+| `get_model_history` | 30d | 270.428 ms | 5,151 | `72c50ada905adb8aa26a46e095a4e85a5404f73308b381436f9d1652a4d33efe` | pass |
+| `get_model_usage_overview` | 90d | 3,794.482 ms | 17,131 | `c9e291097a69fb5d18ce0d06a7ef15225fd2cd7ae3d440ced3627f7b746a0ee5` | fail |
+| `get_model_history` | 90d | 296.463 ms | 14,771 | `d20200a035a7f988459a4616daa4165ad26c88ab87cc2708a3f2ea2055c36933` | pass |
+
+History therefore clears the 500 ms gate with exact parity, but overview does
+not. The final overview is roughly five times faster than the 19.6–19.7 second
+post-A/B result, yet remains 7.6–8.3 times over budget. This attempt is not an
+acceptance pass and the residual overview release gate stays open.
+
+## Residual model-query final retry
+
+The final retry preserved the first attempt's history/activity interval and
+temporary-authority work. Before changing project selection, a focused SQLite
+3.45 diagnostic materialized the production-equivalent overview scope and
+consumed every packed per-chain candidate. The 30d stage returned 3,501 chain
+rows and 3,485 candidates (1,188,656 packed bytes) in 52.632 ms; the 90d stage
+returned 4,392 candidates (1,495,109 packed bytes) in 61.635 ms. Both plans
+range-seek `idx_model_observations_chain_time`, but report
+`USE TEMP B-TREE FOR RIGHT PART OF ORDER BY`.
+
+That measurement showed the project candidate stage was not the remaining
+3.8-4.2 second cost. Inspection found completed overview still ranked every
+in-range attributed raw turn to compute the latest contiguous provider run.
+The final correction removed both residual SQL sorts: project selection now
+uses prepared descending time/ordinal prefix seeks plus unsorted exact-prefix
+tie reads, and running-now pages the observed-time index. Rust retains a whole
+timestamp/provider prefix across pages, applies the exact ordinal, BINARY
+record/source, and row-id suffix, and stops only when each represented provider
+finds a different predecessor or exhausts the range. SQLite 3.45 plan tests
+require bounded index searches with no raw observation scan or temporary
+ordering for all three reads.
+
+The parity pass ran once before timing and matched the first attempt's four
+serialized byte lengths and hashes exactly. The final timed pass then ran once
+against the same model-backfilled disposable copy, pinned to
+`2026-08-02T19:27:43Z`; OS page cache remained uncontrolled.
+
+| Query | Window | Final retry cold | Warm | Output bytes | SHA-256 | Gate |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| `get_model_usage_overview` | 30d | 889.941 ms | 1.144 ms | 12,761 | `ec00856281427f5f619a49ef19ba9f4da599301c64a8a8f8b1f5c6657d4ef601` | fail |
+| `get_model_history` | 30d | 278.429 ms | 1.118 ms | 5,151 | `72c50ada905adb8aa26a46e095a4e85a5404f73308b381436f9d1652a4d33efe` | pass |
+| `get_model_usage_overview` | 90d | 896.938 ms | 1.147 ms | 17,131 | `c9e291097a69fb5d18ce0d06a7ef15225fd2cd7ae3d440ced3627f7b746a0ee5` | fail |
+| `get_model_history` | 90d | 280.014 ms | 1.098 ms | 14,771 | `d20200a035a7f988459a4616daa4165ad26c88ab87cc2708a3f2ea2055c36933` | pass |
+
+The final correction cuts overview to about 0.9 seconds with exact parity, but
+both acceptance windows remain roughly 1.8 times above the 500 ms ceiling.
+Under the one-retry measurement discipline, no further design or timing
+variant was attempted. The task remains failed and the dirty retry worktree is
+preserved for diagnosis.
+
+## Instrumented completed-path acceptance retry
+
+An opt-in stage collector was added before another query variant. It records
+overview stage boundaries only when the performance harness enables it, so the
+normal application path does not read the clock. Direct profiling first showed
+that the immutable corpus had pending model backfill metadata and zero model
+rollup rows; its raw fallback took more than 41 seconds and was not the target
+completed path. This proved a writable disposable copy was required.
+
+An authorized SQLite online backup produced a byte-identical copy with
+`quick_check=ok`. The unchanged model backfill processed 4,201,401 rows in 190
+chunks, produced 9,734 hourly rows, completed with `raw_pruned=0`, and left no
+consistency mismatch. The first completed-path profile disproved prepared
+project-chain round trips as the residual cause:
+
+| Stage | 30d before | 30d after | 90d before | 90d after |
+| --- | ---: | ---: | ---: | ---: |
+| Complete overview | 884.766 ms | 293.223 ms | 879.325 ms | 285.573 ms |
+| Scoped materialization | 340.678 ms | 15.215 ms | 308.310 ms | 18.121 ms |
+| Represented providers | 314.215 ms | 7.663 ms | 316.307 ms | 10.328 ms |
+| Project candidates | 48.372 ms | 61.875 ms | 59.088 ms | 58.287 ms |
+| Activity | 82.632 ms | 106.928 ms | 92.736 ms | 93.378 ms |
+| Running-now | 29.159 ms | 33.697 ms | 28.898 ms | 30.971 ms |
+
+Both dominant SQL branches bounded the outer observation window but selected
+the raw rollup edges with `(ts < rollup_start OR ts >= rollup_end)`. SQLite
+therefore walked the full in-window raw range before rejecting closed hours.
+The correction splits each leading and trailing edge into its own half-open
+`UNION ALL` branch and pins all four branches to
+`idx_model_observations_observed_provider`.
+
+Corpus query plans confirm two-sided observed-time index searches. The 30d
+leading/trailing edges contain 160/47 rows and the 90d edges contain 23/47
+rows. No branch scans model observations or creates a temporary ordering. The
+post-change hybrid parity test also passes with `raw_pruned=1` authority.
+
+The final one-shot measurements used the same completed copy and pinned
+endpoint `2026-08-02T19:27:43Z`. Every cold query clears 500 ms and exactly
+matches the established serialized response:
+
+| Query | Window | Cold | Warm | Output bytes | SHA-256 | Gate |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| `get_model_usage_overview` | 30d | 297.203 ms | 1.065 ms | 12,761 | `ec00856281427f5f619a49ef19ba9f4da599301c64a8a8f8b1f5c6657d4ef601` | pass |
+| `get_model_history` | 30d | 255.077 ms | 1.029 ms | 5,151 | `72c50ada905adb8aa26a46e095a4e85a5404f73308b381436f9d1652a4d33efe` | pass |
+| `get_model_usage_overview` | 90d | 270.769 ms | 1.025 ms | 17,131 | `c9e291097a69fb5d18ce0d06a7ef15225fd2cd7ae3d440ced3627f7b746a0ee5` | pass |
+| `get_model_history` | 90d | 288.437 ms | 1.047 ms | 14,771 | `d20200a035a7f988459a4616daa4165ad26c88ab87cc2708a3f2ea2055c36933` | pass |
+
+The source corpus retained its canonical SHA-256, 13,525,123,072-byte size,
+read-only mode, and unchanged WAL/SHM metadata. The disposable copy passed a
+final `quick_check`, reported completed generation 190 and `raw_pruned=0`, had
+no open handles, and was removed with its WAL, SHM, and temporary directory.

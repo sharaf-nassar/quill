@@ -1321,6 +1321,83 @@ thread_local! {
     /// Maintainer-study clock override. Production never sets this value.
     static PINNED_QUERY_NOW: std::cell::RefCell<Option<DateTime<Utc>>> =
         const { std::cell::RefCell::new(None) };
+
+    /// Opt-in maintainer-study collector for one model-overview call.
+    /// Production leaves this `None`; each mark then performs only one TLS
+    /// option check and never reads the clock.
+    static MODEL_OVERVIEW_STAGE_COLLECTOR:
+        std::cell::RefCell<Option<ModelOverviewStageCollector>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ModelOverviewStageTiming {
+    pub(crate) stage: &'static str,
+    pub(crate) elapsed_ms: f64,
+}
+
+struct ModelOverviewStageCollector {
+    last_mark: Instant,
+    timings: Vec<ModelOverviewStageTiming>,
+}
+
+fn mark_model_overview_stage(stage: &'static str) {
+    MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(collector) = slot.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        collector.timings.push(ModelOverviewStageTiming {
+            stage,
+            elapsed_ms: now.duration_since(collector.last_mark).as_secs_f64() * 1_000.0,
+        });
+        collector.last_mark = now;
+    });
+}
+
+/// Collect internal model-overview stages for one synchronous maintainer run.
+///
+/// The collector is thread-local and restored across nesting or unwinding, so
+/// production callers and concurrent threads retain the disabled fast path.
+pub(crate) fn with_model_overview_stage_timings<T>(
+    operation: impl FnOnce() -> T,
+) -> (T, Vec<ModelOverviewStageTiming>) {
+    struct RestoreCollector {
+        previous: Option<ModelOverviewStageCollector>,
+        active: bool,
+    }
+
+    impl Drop for RestoreCollector {
+        fn drop(&mut self) {
+            if self.active {
+                MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
+                    slot.replace(self.previous.take());
+                });
+            }
+        }
+    }
+
+    let previous = MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
+        slot.replace(Some(ModelOverviewStageCollector {
+            last_mark: Instant::now(),
+            timings: Vec::new(),
+        }))
+    });
+    let mut restore = RestoreCollector {
+        previous,
+        active: true,
+    };
+    let result = operation();
+    let collector = MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
+        let collector = slot.replace(restore.previous.take());
+        restore.active = false;
+        collector
+    });
+    (
+        result,
+        collector.map_or_else(Vec::new, |collector| collector.timings),
+    )
 }
 
 fn query_now() -> DateTime<Utc> {
@@ -4782,6 +4859,346 @@ fn model_rollup_closed_bounds(range_start_ms: i64, range_end_ms: i64) -> (i64, i
         .div_euclid(MODEL_ROLLUP_HOUR_MS)
         .saturating_mul(MODEL_ROLLUP_HOUR_MS);
     (first_full_hour.min(open_hour), open_hour)
+}
+
+/// Raw half-open intervals needed when an hourly model rollup cannot represent
+/// an exact response bucket. Adjacent intervals are merged so short buckets
+/// retain the established raw path without issuing redundant index seeks.
+fn model_rollup_residual_ranges(
+    range_start_ms: i64,
+    range_end_ms: i64,
+    bucket_millis: i64,
+    rollup_start_ms: i64,
+    rollup_end_ms: i64,
+) -> Result<Vec<(i64, i64)>, String> {
+    if bucket_millis <= 0 || range_start_ms > range_end_ms {
+        return Err("Invalid model rollup residual range".to_string());
+    }
+
+    fn push_range(ranges: &mut Vec<(i64, i64)>, start_ms: i64, end_ms: i64) {
+        if start_ms >= end_ms {
+            return;
+        }
+        if let Some((_, previous_end_ms)) = ranges.last_mut()
+            && start_ms <= *previous_end_ms
+        {
+            *previous_end_ms = (*previous_end_ms).max(end_ms);
+            return;
+        }
+        ranges.push((start_ms, end_ms));
+    }
+
+    let mut ranges = Vec::new();
+    push_range(
+        &mut ranges,
+        range_start_ms,
+        rollup_start_ms.min(range_end_ms),
+    );
+
+    let mut hour_start_ms = rollup_start_ms;
+    while hour_start_ms < rollup_end_ms {
+        let hour_end_ms = hour_start_ms
+            .checked_add(MODEL_ROLLUP_HOUR_MS)
+            .ok_or_else(|| "Model rollup residual hour overflow".to_string())?;
+        let start_bucket = (hour_start_ms - range_start_ms) / bucket_millis;
+        let end_bucket = (hour_end_ms - 1 - range_start_ms) / bucket_millis;
+        if start_bucket != end_bucket {
+            push_range(&mut ranges, hour_start_ms, hour_end_ms);
+        }
+        hour_start_ms = hour_end_ms;
+    }
+
+    push_range(&mut ranges, rollup_end_ms.max(range_start_ms), range_end_ms);
+    Ok(ranges)
+}
+
+fn model_rollup_has_pruned_authority(
+    conn: &Connection,
+    range_start_ms: i64,
+    range_end_ms: i64,
+) -> Result<bool, String> {
+    let first_hour_ms = range_start_ms
+        .div_euclid(MODEL_ROLLUP_HOUR_MS)
+        .saturating_mul(MODEL_ROLLUP_HOUR_MS);
+    let end_hour_ms = range_end_ms
+        .div_euclid(MODEL_ROLLUP_HOUR_MS)
+        .saturating_add(i64::from(
+            range_end_ms.rem_euclid(MODEL_ROLLUP_HOUR_MS) != 0,
+        ))
+        .saturating_mul(MODEL_ROLLUP_HOUR_MS);
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM model_usage_hourly
+             WHERE hour_utc >= ?1 AND hour_utc < ?2
+               AND raw_pruned = 1
+         )",
+        params![first_hour_ms, end_hour_ms],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("Query model rollup pruned authority: {error}"))
+}
+
+fn materialize_model_read_authority(
+    conn: &Connection,
+    range_start_ms: i64,
+    range_end_ms: i64,
+    has_pruned_authority: bool,
+) -> Result<(), String> {
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE active_model_read_sources (
+             provider TEXT NOT NULL,
+             source_key TEXT NOT NULL,
+             cwd TEXT,
+             PRIMARY KEY(provider, source_key)
+         ) WITHOUT ROWID;
+         INSERT INTO active_model_read_sources(provider, source_key, cwd)
+         SELECT source.provider, source.source_key, source.cwd
+         FROM model_observation_sources AS source
+         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE};"
+    ))
+    .map_err(|error| format!("Materialize active model read sources: {error}"))?;
+    if has_pruned_authority {
+        let first_hour_ms = range_start_ms
+            .div_euclid(MODEL_ROLLUP_HOUR_MS)
+            .saturating_mul(MODEL_ROLLUP_HOUR_MS);
+        let end_hour_ms = range_end_ms
+            .div_euclid(MODEL_ROLLUP_HOUR_MS)
+            .saturating_add(i64::from(
+                range_end_ms.rem_euclid(MODEL_ROLLUP_HOUR_MS) != 0,
+            ))
+            .saturating_mul(MODEL_ROLLUP_HOUR_MS);
+        conn.execute_batch(
+            "CREATE TEMP TABLE authoritative_model_read_groups (
+                 hour_utc INTEGER NOT NULL,
+                 provider TEXT NOT NULL,
+                 source_key TEXT NOT NULL,
+                 derived_model_id TEXT NOT NULL,
+                 PRIMARY KEY(hour_utc, provider, source_key, derived_model_id)
+             ) WITHOUT ROWID;",
+        )
+        .and_then(|_| {
+            conn.execute(
+                "INSERT INTO authoritative_model_read_groups (
+                     hour_utc, provider, source_key, derived_model_id
+                 )
+                 SELECT hour_utc, provider, source_key, derived_model_id
+                 FROM model_usage_hourly
+                 WHERE raw_pruned = 1
+                   AND hour_utc >= ?1 AND hour_utc < ?2",
+                params![first_hour_ms, end_hour_ms],
+            )
+        })
+        .map_err(|error| format!("Materialize pruned model read authority: {error}"))?;
+    }
+    Ok(())
+}
+
+fn model_raw_residual_branch_sql(
+    projection: &str,
+    start_parameter: usize,
+    end_parameter: usize,
+    provider_parameter: usize,
+    exclude_authoritative: bool,
+) -> String {
+    let mut sql = format!(
+        "SELECT {projection}
+         FROM model_usage_observations AS observation
+              INDEXED BY idx_model_observations_observed_provider
+         JOIN active_model_read_sources AS source
+           ON source.provider = observation.provider
+          AND source.source_key = observation.source_key
+         WHERE observation.observed_at_ms >= ?{start_parameter}
+           AND observation.observed_at_ms < ?{end_parameter}
+           AND (?{provider_parameter} IS NULL
+                OR observation.provider = ?{provider_parameter})"
+    );
+    if exclude_authoritative {
+        sql.push_str(&format!(
+            "
+           AND NOT EXISTS (
+               SELECT 1
+               FROM authoritative_model_read_groups AS authoritative
+               WHERE authoritative.hour_utc =
+                     observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
+                         * {MODEL_ROLLUP_HOUR_MS}
+                 AND authoritative.provider = observation.provider
+                 AND authoritative.source_key = observation.source_key
+                 AND authoritative.derived_model_id =
+                     COALESCE(observation.derived_model_id, '')
+           )"
+        ));
+    }
+    sql
+}
+
+fn completed_model_scoped_chains_sql() -> String {
+    format!(
+        "WITH scoped_sessions AS (
+             SELECT provider, analytics_session_id
+             FROM scoped_overview
+             GROUP BY provider COLLATE BINARY,
+                      analytics_session_id COLLATE BINARY
+         ), scoped_chains AS (
+             SELECT source.provider,
+                    source.analytics_session_id,
+                    source.chain_id
+             FROM model_observation_sources AS source
+                  INDEXED BY idx_model_sources_session
+             JOIN scoped_sessions AS scoped
+               ON scoped.provider = source.provider
+              AND scoped.analytics_session_id = source.analytics_session_id
+             WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+               AND source.chain_id IS NOT NULL
+             GROUP BY source.provider COLLATE BINARY,
+                      source.analytics_session_id COLLATE BINARY,
+                      source.chain_id COLLATE BINARY
+         )
+         SELECT scoped.provider, scoped.analytics_session_id, scoped.chain_id
+         FROM scoped_chains AS scoped"
+    )
+}
+
+fn completed_model_project_prefix_sql() -> &'static str {
+    "SELECT observation.observed_at_ms, observation.source_ordinal
+     FROM model_usage_observations AS observation
+          INDEXED BY idx_model_observations_chain_time
+     WHERE observation.provider = ?1
+       AND observation.analytics_session_id = ?2
+       AND observation.chain_id = ?3
+       AND observation.observed_at_ms >= ?4
+       AND observation.observed_at_ms < ?5
+       AND (
+           ?6 IS NULL
+           OR observation.observed_at_ms < ?6
+           OR (
+               observation.observed_at_ms = ?6
+               AND observation.source_ordinal < ?7
+           )
+       )
+     ORDER BY observation.observed_at_ms DESC,
+              observation.source_ordinal DESC
+     LIMIT 1"
+}
+
+fn completed_model_project_ties_sql() -> &'static str {
+    "SELECT COALESCE(NULLIF(observation.cwd, ''), NULLIF(owner.cwd, '')),
+            observation.source_record_key,
+            observation.source_key,
+            observation.id
+     FROM model_usage_observations AS observation
+          INDEXED BY idx_model_observations_chain_time
+     JOIN active_model_read_sources AS owner
+       ON owner.provider = observation.provider
+      AND owner.source_key = observation.source_key
+     WHERE observation.provider = ?1
+       AND observation.analytics_session_id = ?2
+       AND observation.chain_id = ?3
+       AND observation.observed_at_ms = ?4
+       AND observation.source_ordinal = ?5
+       AND COALESCE(NULLIF(observation.cwd, ''), NULLIF(owner.cwd, ''))
+           IS NOT NULL"
+}
+
+fn completed_model_running_turns_sql(provider_filtered: bool) -> String {
+    format!(
+        "SELECT observation.provider,
+                observation.derived_model_id,
+                observation.observed_at_ms,
+                observation.source_ordinal,
+                observation.source_record_key,
+                observation.source_key,
+                observation.id
+         FROM model_usage_observations AS observation
+              INDEXED BY idx_model_observations_observed_provider
+         JOIN active_model_read_sources AS source
+           ON source.provider = observation.provider
+          AND source.source_key = observation.source_key
+         WHERE observation.observed_at_ms >= ?1
+           AND observation.observed_at_ms < ?2
+           AND observation.observation_kind = 'turn'
+           AND observation.derived_model_id IS NOT NULL
+           {}
+           AND (
+               ?4 IS NULL
+               OR observation.observed_at_ms < ?4
+               OR (
+                   observation.observed_at_ms = ?4
+                   AND observation.provider COLLATE BINARY < ?5
+               )
+               OR (
+                   observation.observed_at_ms = ?4
+                   AND observation.provider COLLATE BINARY = ?5
+                   AND observation.id < ?6
+               )
+           )
+         ORDER BY observation.observed_at_ms DESC,
+                  observation.provider COLLATE BINARY DESC,
+                  observation.id DESC
+         LIMIT ?7",
+        if provider_filtered {
+            "AND observation.provider = ?3"
+        } else {
+            "AND ?3 IS NULL"
+        }
+    )
+}
+
+struct CompletedModelRunningTurn {
+    provider: String,
+    model_id: String,
+    observed_at_ms: i64,
+    source_ordinal: i64,
+    source_record_key: String,
+    source_key: String,
+    id: i64,
+}
+
+struct CompletedModelRunningState {
+    model_id: String,
+    last_seen_ms: i64,
+    running_since_ms: i64,
+    previous_model_id: Option<String>,
+    complete: bool,
+}
+
+fn apply_completed_model_running_prefix(
+    turns: &mut Vec<CompletedModelRunningTurn>,
+    states: &mut HashMap<String, CompletedModelRunningState>,
+) {
+    turns.sort_unstable_by(|left, right| {
+        right
+            .source_ordinal
+            .cmp(&left.source_ordinal)
+            .then_with(|| right.source_record_key.cmp(&left.source_record_key))
+            .then_with(|| right.source_key.cmp(&left.source_key))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    for turn in turns.drain(..) {
+        match states.entry(turn.provider) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(CompletedModelRunningState {
+                    model_id: turn.model_id,
+                    last_seen_ms: turn.observed_at_ms,
+                    running_since_ms: turn.observed_at_ms,
+                    previous_model_id: None,
+                    complete: false,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if state.complete {
+                    continue;
+                }
+                if turn.model_id == state.model_id {
+                    state.running_since_ms = turn.observed_at_ms;
+                } else {
+                    state.previous_model_id = Some(turn.model_id);
+                    state.complete = true;
+                }
+            }
+        }
+    }
 }
 
 fn model_rollup_building_index(conn: &Connection) -> Result<bool, String> {
@@ -9061,6 +9478,7 @@ impl Storage {
             .prepare_cached(&format!(
                 "SELECT observation.provider
                  FROM model_usage_observations AS observation
+                      INDEXED BY idx_model_observations_observed_provider
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
                   AND source.source_key = observation.source_key
@@ -9275,6 +9693,7 @@ impl Storage {
         provider: Option<&str>,
         range_end: DateTime<Utc>,
     ) -> Result<ModelUsageOverviewResponse, String> {
+        mark_model_overview_stage("cache_probe");
         let range_end_ms = range_end.timestamp_millis();
         let range_millis = model_range_duration(range).num_milliseconds();
         let range_start_ms = range_end_ms
@@ -9304,6 +9723,7 @@ impl Storage {
                 "bucket_start",
             )?);
         }
+        mark_model_overview_stage("range_axis");
 
         let mut conn = self.open_view_reader()?;
         let tx = conn
@@ -9314,6 +9734,20 @@ impl Storage {
         let building_index = model_rollup_building_index(&tx)?;
         let (rollup_start_ms, rollup_end_ms) =
             model_rollup_closed_bounds(range_start_ms, range_end_ms);
+        let residual_ranges = if building_index {
+            Vec::new()
+        } else {
+            model_rollup_residual_ranges(
+                range_start_ms,
+                range_end_ms,
+                bucket_millis,
+                rollup_start_ms,
+                rollup_end_ms,
+            )?
+        };
+        let has_pruned_authority = !building_index
+            && model_rollup_has_pruned_authority(&tx, range_start_ms, range_end_ms)?;
+        materialize_model_read_authority(&tx, range_start_ms, range_end_ms, has_pruned_authority)?;
         let global_session_count = tx
             .query_row(
                 &format!(
@@ -9331,6 +9765,7 @@ impl Storage {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| format!("Query global model overview session scope: {error}"))?;
+        mark_model_overview_stage("snapshot_authority");
 
         // While the rollup is building, preserve the established raw path.
         // Once complete, materialize aggregate-grain closed hours plus only the
@@ -9431,14 +9866,42 @@ impl Storage {
                         CASE WHEN observation.observation_kind = 'turn' THEN 1 ELSE 0 END,
                         observation.observed_at_ms
                  FROM model_usage_observations AS observation
+                      INDEXED BY idx_model_observations_observed_provider
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
                   AND source.source_key = observation.source_key
                  WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                    AND observation.observed_at_ms >= ?1
-                   AND observation.observed_at_ms < ?2
-                   AND (observation.observed_at_ms < ?4
-                        OR observation.observed_at_ms >= ?5){provider_filter}"
+                   AND observation.observed_at_ms < ?4{provider_filter}
+                 UNION ALL
+                 SELECT observation.provider,
+                        observation.analytics_session_id,
+                        observation.derived_model_id,
+                        observation.observation_kind,
+                        source.is_sidechain,
+                        COALESCE(NULLIF(observation.cwd, ''), NULLIF(source.cwd, '')),
+                        observation.observed_at_ms,
+                        observation.source_ordinal,
+                        observation.source_record_key,
+                        observation.source_key,
+                        observation.id,
+                        COALESCE(observation.input_tokens, 0)
+                            + COALESCE(observation.output_tokens, 0)
+                            + COALESCE(observation.cache_creation_tokens, 0)
+                            + COALESCE(observation.cache_read_tokens, 0),
+                        (observation.observed_at_ms - ?1) / ?3,
+                        date(observation.observed_at_ms / 1000, 'unixepoch'),
+                        1,
+                        CASE WHEN observation.observation_kind = 'turn' THEN 1 ELSE 0 END,
+                        observation.observed_at_ms
+                 FROM model_usage_observations AS observation
+                      INDEXED BY idx_model_observations_observed_provider
+                 JOIN model_observation_sources AS source
+                   ON source.provider = observation.provider
+                  AND source.source_key = observation.source_key
+                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   AND observation.observed_at_ms >= ?5
+                   AND observation.observed_at_ms < ?2{provider_filter}"
             )
         };
         let mut create_params: Vec<&dyn rusqlite::ToSql> = if building_index {
@@ -9457,6 +9920,7 @@ impl Storage {
         }
         tx.execute(&create_scoped_sql, create_params.as_slice())
             .map_err(|error| format!("Materialize model overview scoped rows: {error}"))?;
+        mark_model_overview_stage("scoped_materialization");
         tx.execute_batch(
             "CREATE INDEX temp.scoped_overview_provider_session
                  ON scoped_overview(provider, analytics_session_id);
@@ -9464,6 +9928,7 @@ impl Storage {
                  ON scoped_overview(provider, derived_model_id);",
         )
         .map_err(|error| format!("Index model overview scoped rows: {error}"))?;
+        mark_model_overview_stage("scoped_indexes");
 
         struct OverviewTotalsRow {
             sessions: i64,
@@ -9525,6 +9990,7 @@ impl Storage {
                 },
             )
             .map_err(|error| format!("Query model overview totals: {error}"))?;
+        mark_model_overview_stage("totals");
 
         let represented_provider_sql = if building_index {
             format!(
@@ -9555,14 +10021,23 @@ impl Storage {
                      UNION ALL
                      SELECT observation.provider
                      FROM model_usage_observations AS observation
+                          INDEXED BY idx_model_observations_observed_provider
                      JOIN model_observation_sources AS source
                        ON source.provider = observation.provider
                       AND source.source_key = observation.source_key
                      WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                        AND observation.observed_at_ms >= ?1
+                       AND observation.observed_at_ms < ?3
+                     UNION ALL
+                     SELECT observation.provider
+                     FROM model_usage_observations AS observation
+                          INDEXED BY idx_model_observations_observed_provider
+                     JOIN model_observation_sources AS source
+                       ON source.provider = observation.provider
+                      AND source.source_key = observation.source_key
+                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                       AND observation.observed_at_ms >= ?4
                        AND observation.observed_at_ms < ?2
-                       AND (observation.observed_at_ms < ?3
-                            OR observation.observed_at_ms >= ?4)
                  ) AS represented
                  GROUP BY represented.provider COLLATE BINARY
                  ORDER BY represented.provider COLLATE BINARY ASC"
@@ -9584,6 +10059,7 @@ impl Storage {
             );
         }
         drop(represented_provider_statement);
+        mark_model_overview_stage("represented_providers");
 
         // Per-session representative project: the latest non-null effective
         // cwd inside the range, matching the `get_model_sessions` convention
@@ -9632,74 +10108,130 @@ impl Storage {
                 );
             }
         }
+        mark_model_overview_stage("project_rollup_fallback");
         if !building_index {
-            let project_provider_filter = if provider.is_some() {
-                " AND observation.provider = ?3"
-            } else {
-                ""
+            type ProjectCandidate = (String, i64, i64, String, String, i64);
+            let mut raw_candidates = BTreeMap::<(String, String), ProjectCandidate>::new();
+            let scoped_chains = {
+                let mut statement = tx
+                    .prepare_cached(&completed_model_scoped_chains_sql())
+                    .map_err(|error| {
+                        format!("Prepare model overview scoped chains query: {error}")
+                    })?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|error| format!("Query model overview scoped chains: {error}"))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("Read model overview scoped chain: {error}"))?
             };
-            let mut statement = tx
-                .prepare_cached(&format!(
-                    "WITH ranked AS (
-                         SELECT observation.provider,
-                                observation.analytics_session_id,
-                                COALESCE(
-                                    NULLIF(observation.cwd, ''),
-                                    NULLIF(source.cwd, '')
-                                ) AS effective_cwd,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY observation.provider COLLATE BINARY,
-                                                 observation.analytics_session_id COLLATE BINARY
-                                    ORDER BY CASE
-                                                 WHEN COALESCE(
-                                                     NULLIF(observation.cwd, ''),
-                                                     NULLIF(source.cwd, '')
-                                                 ) IS NULL
-                                                 THEN 1 ELSE 0
-                                             END,
-                                             observation.observed_at_ms DESC,
-                                             observation.source_ordinal DESC,
-                                             observation.source_record_key COLLATE BINARY DESC,
-                                             observation.source_key COLLATE BINARY DESC,
-                                             observation.id DESC
-                                ) AS cwd_rank
-                         FROM model_usage_observations AS observation
-                         JOIN model_observation_sources AS source
-                           ON source.provider = observation.provider
-                          AND source.source_key = observation.source_key
-                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                           AND observation.observed_at_ms >= ?1
-                           AND observation.observed_at_ms < ?2
-                           {project_provider_filter}
-                     )
-                     SELECT provider, analytics_session_id, effective_cwd
-                     FROM ranked
-                     WHERE cwd_rank = 1"
-                ))
-                .map_err(|error| format!("Prepare model overview raw project query: {error}"))?;
-            let mut project_params: Vec<&dyn rusqlite::ToSql> =
-                vec![&range_start_ms, &range_end_ms];
-            if let Some(provider_value) = provider.as_ref() {
-                project_params.push(provider_value);
+            let mut prefix_statement = tx
+                .prepare_cached(completed_model_project_prefix_sql())
+                .map_err(|error| format!("Prepare model overview project prefix query: {error}"))?;
+            let mut ties_statement = tx
+                .prepare_cached(completed_model_project_ties_sql())
+                .map_err(|error| format!("Prepare model overview project ties query: {error}"))?;
+            for (session_provider, session_id, chain_id) in scoped_chains {
+                let mut before_prefix = None::<(i64, i64)>;
+                let candidate = loop {
+                    let before_observed_at = before_prefix.map(|prefix| prefix.0);
+                    let before_ordinal = before_prefix.map(|prefix| prefix.1);
+                    let prefix = prefix_statement
+                        .query_row(
+                            params![
+                                session_provider,
+                                session_id,
+                                chain_id,
+                                range_start_ms,
+                                range_end_ms,
+                                before_observed_at,
+                                before_ordinal,
+                            ],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .optional()
+                        .map_err(|error| format!("Query model overview project prefix: {error}"))?;
+                    let Some((observed_at_ms, source_ordinal)) = prefix else {
+                        break None;
+                    };
+                    let rows = ties_statement
+                        .query_map(
+                            params![
+                                session_provider,
+                                session_id,
+                                chain_id,
+                                observed_at_ms,
+                                source_ordinal,
+                            ],
+                            |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                ))
+                            },
+                        )
+                        .map_err(|error| {
+                            format!("Query model overview project prefix ties: {error}")
+                        })?;
+                    let mut best_tie = None::<(String, String, String, i64)>;
+                    for row in rows {
+                        let tie = row.map_err(|error| {
+                            format!("Read model overview project prefix tie: {error}")
+                        })?;
+                        if best_tie.as_ref().is_none_or(|best| {
+                            (tie.1.as_str(), tie.2.as_str(), tie.3)
+                                > (best.1.as_str(), best.2.as_str(), best.3)
+                        }) {
+                            best_tie = Some(tie);
+                        }
+                    }
+                    if let Some((cwd, source_record_key, source_key, id)) = best_tie {
+                        break Some((
+                            cwd,
+                            observed_at_ms,
+                            source_ordinal,
+                            source_record_key,
+                            source_key,
+                            id,
+                        ));
+                    }
+                    before_prefix = Some((observed_at_ms, source_ordinal));
+                };
+                let Some(candidate) = candidate else {
+                    continue;
+                };
+                let key = (session_provider, session_id);
+                let replace = raw_candidates.get(&key).is_none_or(|current| {
+                    (
+                        candidate.1,
+                        candidate.2,
+                        candidate.3.as_str(),
+                        candidate.4.as_str(),
+                        candidate.5,
+                    ) > (
+                        current.1,
+                        current.2,
+                        current.3.as_str(),
+                        current.4.as_str(),
+                        current.5,
+                    )
+                });
+                if replace {
+                    raw_candidates.insert(key, candidate);
+                }
             }
-            let rows = statement
-                .query_map(project_params.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })
-                .map_err(|error| format!("Query model overview raw projects: {error}"))?;
-            for row in rows {
-                let (session_provider, session_id, cwd) =
-                    row.map_err(|error| format!("Read model overview raw project row: {error}"))?;
-                session_projects.insert(
-                    (session_provider, session_id),
-                    model_overview_project(cwd.as_deref()),
-                );
+            for (key, candidate) in raw_candidates {
+                session_projects.insert(key, model_overview_project(Some(&candidate.0)));
             }
         }
+        mark_model_overview_stage("project_raw_candidates");
 
         // Per-(session, model) attributed stats drive model reach, primary
         // attribution, combinations, and the project matrix.
@@ -9756,6 +10288,8 @@ impl Storage {
             }
         }
 
+        mark_model_overview_stage("session_models");
+
         // Per-model activity days and first/last attributed evidence.
         struct ModelMetaRow {
             days_active: i64,
@@ -9805,9 +10339,19 @@ impl Storage {
             }
         }
 
+        mark_model_overview_stage("model_meta");
+
         // Fixed-bucket distinct-session activity per model.
         let mut activity_buckets = HashMap::<(String, String), Vec<i64>>::new();
         {
+            let mut activity_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+                Box::new(range_start_ms),
+                Box::new(range_end_ms),
+                Box::new(bucket_millis),
+                Box::new(rollup_start_ms),
+                Box::new(rollup_end_ms),
+                Box::new(provider.map(str::to_owned)),
+            ];
             let activity_sql = if building_index {
                 "SELECT bucket_index,
                         provider,
@@ -9824,7 +10368,7 @@ impl Storage {
                     AND ?4 = ?4 AND ?5 = ?5 AND ?6 IS ?6"
                     .to_string()
             } else {
-                format!(
+                let mut sql = format!(
                     "SELECT bucket_index, provider, derived_model_id,
                             COUNT(*) AS session_count
                      FROM (
@@ -9833,11 +10377,10 @@ impl Storage {
                                 rollup.derived_model_id AS derived_model_id,
                                 rollup.analytics_session_id AS analytics_session_id
                          FROM model_usage_hourly AS rollup
-                         JOIN model_observation_sources AS source
+                         JOIN active_model_read_sources AS source
                            ON source.provider = rollup.provider
                           AND source.source_key = rollup.source_key
-                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                           AND rollup.hour_utc >= ?4
+                         WHERE rollup.hour_utc >= ?4
                            AND rollup.hour_utc < ?5
                            AND rollup.turn_count > 0
                            AND rollup.derived_model_id != ''
@@ -9846,67 +10389,43 @@ impl Storage {
                                rollup.raw_pruned = 1
                                OR (rollup.hour_utc - ?1) / ?3
                                   = (rollup.hour_utc + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1) / ?3
-                           )
-                         UNION
-                         SELECT (observation.observed_at_ms - ?1) / ?3,
-                                observation.provider,
-                                observation.derived_model_id,
-                                observation.analytics_session_id
-                         FROM model_usage_observations AS observation
-                         JOIN model_observation_sources AS source
-                           ON source.provider = observation.provider
-                          AND source.source_key = observation.source_key
-                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                           AND observation.observed_at_ms >= ?1
-                           AND observation.observed_at_ms < ?2
-                           AND observation.observation_kind = 'turn'
-                           AND observation.derived_model_id IS NOT NULL
-                           AND (?6 IS NULL OR observation.provider = ?6)
-                           AND NOT (
-                               observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                                   * {MODEL_ROLLUP_HOUR_MS} >= ?4
-                               AND observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                                   * {MODEL_ROLLUP_HOUR_MS} < ?5
-                               AND (
-                                   observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                                       * {MODEL_ROLLUP_HOUR_MS} - ?1
-                               ) / ?3 = (
-                                   observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                                       * {MODEL_ROLLUP_HOUR_MS}
-                                   + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1
-                               ) / ?3
-                           )
-                           AND NOT EXISTS (
-                               SELECT 1
-                               FROM model_usage_hourly AS authoritative
-                               WHERE authoritative.hour_utc =
-                                     observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                                         * {MODEL_ROLLUP_HOUR_MS}
-                                 AND authoritative.provider = observation.provider
-                                 AND authoritative.source_key = observation.source_key
-                                 AND authoritative.derived_model_id =
-                                     COALESCE(observation.derived_model_id, '')
-                                 AND authoritative.raw_pruned = 1
-                           )
+                           )"
+                );
+                for &(raw_start_ms, raw_end_ms) in &residual_ranges {
+                    let start_parameter = activity_params.len() + 1;
+                    let end_parameter = start_parameter + 1;
+                    activity_params.push(Box::new(raw_start_ms));
+                    activity_params.push(Box::new(raw_end_ms));
+                    sql.push_str(" UNION ");
+                    sql.push_str(&model_raw_residual_branch_sql(
+                        "(observation.observed_at_ms - ?1) / ?3,
+                         observation.provider,
+                         observation.derived_model_id,
+                         observation.analytics_session_id",
+                        start_parameter,
+                        end_parameter,
+                        6,
+                        has_pruned_authority,
+                    ));
+                    sql.push_str(
+                        " AND observation.observation_kind = 'turn'
+                           AND observation.derived_model_id IS NOT NULL",
+                    );
+                }
+                sql.push_str(
+                    "
                      ) AS bucket_sessions
                      GROUP BY bucket_index,
                               provider COLLATE BINARY,
-                              derived_model_id COLLATE BINARY"
-                )
+                              derived_model_id COLLATE BINARY",
+                );
+                sql
             };
             let mut statement = tx
                 .prepare_cached(&activity_sql)
                 .map_err(|error| format!("Prepare model overview activity query: {error}"))?;
-            let activity_params = params![
-                range_start_ms,
-                range_end_ms,
-                bucket_millis,
-                rollup_start_ms,
-                rollup_end_ms,
-                provider,
-            ];
             let rows = statement
-                .query_map(activity_params, |row| {
+                .query_map(rusqlite::params_from_iter(activity_params.iter()), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -9931,6 +10450,8 @@ impl Storage {
                 series[bucket_index] = session_count;
             }
         }
+
+        mark_model_overview_stage("activity");
 
         // Attributed tokens split by owning-source sidechain flag.
         let mut parent_tokens = 0_i64;
@@ -9991,134 +10512,104 @@ impl Storage {
             }
         }
 
-        // Latest contiguous attributed-model run per provider. One window pass
-        // over the scoped temp table replaces the previous per-provider
-        // statement re-execution loop. `turns` ranks each provider's attributed
-        // turns newest-first on the same total order the old loop walked; the
-        // leading contiguous run is every row before `first_diff` (the highest-
-        // ranked turn whose model differs from rank 1). `running_since` is the
-        // earliest timestamp still inside that run, and `previous_model_id` is
-        // the model at the break — matching the old walk exactly.
-        struct RunningNowRow {
-            model_id: String,
-            last_seen_ms: i64,
-            running_since_ms: i64,
-            previous_model_id: Option<String>,
-        }
-        let mut running_by_provider = HashMap::<String, RunningNowRow>::new();
-        {
-            let running_provider_filter = if provider.is_some() {
-                " AND observation.provider = ?3"
-            } else {
-                ""
-            };
+        mark_model_overview_stage("delegation");
+
+        // Latest contiguous attributed-model run per provider. Stream bounded
+        // pages in the observed-time index order and stop once every represented
+        // provider reaches its first differing model. Rows tied on the indexed
+        // `(observed_at_ms, provider)` prefix are ordered in Rust by the exact
+        // ordinal, binary source keys, and row-id suffix.
+        let target_running_providers = represented_providers
+            .iter()
+            .filter(|provider_name| provider.is_none_or(|filter| filter == *provider_name))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut running_by_provider = HashMap::<String, CompletedModelRunningState>::new();
+        if !target_running_providers.is_empty() {
+            const RUNNING_TURN_PAGE_SIZE: i64 = 1_024;
+            let selected_provider = provider.map(str::to_owned);
             let mut statement = tx
-                .prepare_cached(&format!(
-                    "WITH turns AS (
-                         SELECT observation.provider AS provider,
-                                observation.derived_model_id AS model_id,
-                                observation.observed_at_ms AS observed_at_ms,
-                                ROW_NUMBER() OVER (
-                                    PARTITION BY observation.provider COLLATE BINARY
-                                    ORDER BY observation.observed_at_ms DESC,
-                                             observation.source_ordinal DESC,
-                                             observation.source_record_key COLLATE BINARY DESC,
-                                             observation.source_key COLLATE BINARY DESC,
-                                             observation.id DESC
-                                ) AS rn
-                         FROM model_usage_observations AS observation
-                         JOIN model_observation_sources AS source
-                           ON source.provider = observation.provider
-                          AND source.source_key = observation.source_key
-                         WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                           AND observation.observed_at_ms >= ?1
-                           AND observation.observed_at_ms < ?2
-                           AND observation.observation_kind = 'turn'
-                           AND observation.derived_model_id IS NOT NULL
-                           {running_provider_filter}
-                     ),
-                     latest AS (
-                         SELECT provider,
-                                model_id AS latest_model,
-                                observed_at_ms AS last_seen_ms
-                         FROM turns
-                         WHERE rn = 1
-                     ),
-                     first_diff AS (
-                         SELECT turns.provider, MIN(turns.rn) AS diff_rn
-                         FROM turns
-                         JOIN latest
-                           ON latest.provider = turns.provider
-                         WHERE turns.model_id COLLATE BINARY
-                               != latest.latest_model COLLATE BINARY
-                         GROUP BY turns.provider COLLATE BINARY
-                     )
-                     SELECT latest.provider,
-                            latest.latest_model,
-                            latest.last_seen_ms,
-                            (
-                                SELECT run_row.observed_at_ms
-                                FROM turns AS run_row
-                                WHERE run_row.provider COLLATE BINARY
-                                      = latest.provider COLLATE BINARY
-                                  AND run_row.rn = COALESCE(
-                                        (
-                                            SELECT first_diff.diff_rn - 1
-                                            FROM first_diff
-                                            WHERE first_diff.provider COLLATE BINARY
-                                                  = latest.provider COLLATE BINARY
-                                        ),
-                                        (
-                                            SELECT MAX(max_row.rn)
-                                            FROM turns AS max_row
-                                            WHERE max_row.provider COLLATE BINARY
-                                                  = latest.provider COLLATE BINARY
-                                        )
-                                    )
-                            ) AS running_since_ms,
-                            (
-                                SELECT prev_row.model_id
-                                FROM turns AS prev_row
-                                JOIN first_diff
-                                  ON first_diff.provider COLLATE BINARY
-                                     = prev_row.provider COLLATE BINARY
-                                WHERE prev_row.provider COLLATE BINARY
-                                      = latest.provider COLLATE BINARY
-                                  AND prev_row.rn = first_diff.diff_rn
-                            ) AS previous_model_id
-                     FROM latest"
-                ))
-                .map_err(|error| format!("Prepare model overview running query: {error}"))?;
-            let mut running_params: Vec<&dyn rusqlite::ToSql> =
-                vec![&range_start_ms, &range_end_ms];
-            if let Some(provider_value) = provider.as_ref() {
-                running_params.push(provider_value);
-            }
-            let rows = statement
-                .query_map(running_params.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                    ))
-                })
-                .map_err(|error| format!("Query model overview running turns: {error}"))?;
-            for row in rows {
-                let (row_provider, model_id, last_seen_ms, running_since_ms, previous_model_id) =
-                    row.map_err(|error| format!("Read model overview running row: {error}"))?;
-                running_by_provider.insert(
-                    row_provider,
-                    RunningNowRow {
-                        model_id,
-                        last_seen_ms,
-                        running_since_ms,
-                        previous_model_id,
-                    },
-                );
+                .prepare_cached(&completed_model_running_turns_sql(provider.is_some()))
+                .map_err(|error| format!("Prepare model overview running turns: {error}"))?;
+            let mut cursor = None::<(i64, String, i64)>;
+            let mut pending_prefix = None::<(i64, String)>;
+            let mut pending_turns = Vec::<CompletedModelRunningTurn>::new();
+            'pages: loop {
+                let cursor_observed_at = cursor.as_ref().map(|value| value.0);
+                let cursor_provider = cursor.as_ref().map(|value| value.1.as_str());
+                let cursor_id = cursor.as_ref().map(|value| value.2);
+                let mut rows = statement
+                    .query(params![
+                        range_start_ms,
+                        range_end_ms,
+                        selected_provider,
+                        cursor_observed_at,
+                        cursor_provider,
+                        cursor_id,
+                        RUNNING_TURN_PAGE_SIZE,
+                    ])
+                    .map_err(|error| format!("Query model overview running turns: {error}"))?;
+                let mut page_rows = 0_i64;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|error| format!("Read model overview running turn: {error}"))?
+                {
+                    let turn = CompletedModelRunningTurn {
+                        provider: row.get(0).map_err(|error| {
+                            format!("Read model overview running provider: {error}")
+                        })?,
+                        model_id: row.get(1).map_err(|error| {
+                            format!("Read model overview running model: {error}")
+                        })?,
+                        observed_at_ms: row.get(2).map_err(|error| {
+                            format!("Read model overview running timestamp: {error}")
+                        })?,
+                        source_ordinal: row.get(3).map_err(|error| {
+                            format!("Read model overview running ordinal: {error}")
+                        })?,
+                        source_record_key: row.get(4).map_err(|error| {
+                            format!("Read model overview running record key: {error}")
+                        })?,
+                        source_key: row.get(5).map_err(|error| {
+                            format!("Read model overview running source key: {error}")
+                        })?,
+                        id: row.get(6).map_err(|error| {
+                            format!("Read model overview running row id: {error}")
+                        })?,
+                    };
+                    let prefix = (turn.observed_at_ms, turn.provider.clone());
+                    if pending_prefix
+                        .as_ref()
+                        .is_some_and(|pending| pending != &prefix)
+                    {
+                        apply_completed_model_running_prefix(
+                            &mut pending_turns,
+                            &mut running_by_provider,
+                        );
+                        if target_running_providers.iter().all(|provider_name| {
+                            running_by_provider
+                                .get(provider_name)
+                                .is_some_and(|state| state.complete)
+                        }) {
+                            break 'pages;
+                        }
+                    }
+                    pending_prefix = Some(prefix);
+                    cursor = Some((turn.observed_at_ms, turn.provider.clone(), turn.id));
+                    pending_turns.push(turn);
+                    page_rows += 1;
+                }
+                if page_rows < RUNNING_TURN_PAGE_SIZE {
+                    apply_completed_model_running_prefix(
+                        &mut pending_turns,
+                        &mut running_by_provider,
+                    );
+                    break;
+                }
             }
         }
+        mark_model_overview_stage("running_query");
+
         // Emit in represented-provider order, honoring the provider filter, so
         // the response ordering matches the previous loop over the sorted list.
         let mut running_now = Vec::new();
@@ -10145,6 +10636,7 @@ impl Storage {
 
         tx.commit()
             .map_err(|error| format!("Commit model overview read snapshot: {error}"))?;
+        mark_model_overview_stage("snapshot_commit");
 
         // Fold per-(session, model) stats into model reach, primary counts,
         // combinations, and the project matrix.
@@ -10386,7 +10878,7 @@ impl Storage {
             && backfill.failed_sources == 0
             && backfill.remaining_sources == 0;
 
-        Ok(ModelUsageOverviewResponse {
+        let response = ModelUsageOverviewResponse {
             generated_at,
             range,
             provider: provider.map(str::to_owned),
@@ -10431,7 +10923,9 @@ impl Storage {
                 top_pairs,
             },
             delegation,
-        })
+        };
+        mark_model_overview_stage("response_fold");
+        Ok(response)
     }
 
     /// Aggregate retained model evidence into a fixed, zero-filled UTC axis.
@@ -10513,6 +11007,37 @@ impl Storage {
         let building_index = model_rollup_building_index(&tx)?;
         let (rollup_start_ms, rollup_end_ms) =
             model_rollup_closed_bounds(range_start_ms, range_end_ms);
+        let residual_ranges = if building_index {
+            Vec::new()
+        } else {
+            model_rollup_residual_ranges(
+                range_start_ms,
+                range_end_ms,
+                bucket_millis,
+                rollup_start_ms,
+                rollup_end_ms,
+            )?
+        };
+        let has_pruned_authority = !building_index
+            && model_rollup_has_pruned_authority(&tx, range_start_ms, range_end_ms)?;
+        if !building_index {
+            materialize_model_read_authority(
+                &tx,
+                range_start_ms,
+                range_end_ms,
+                has_pruned_authority,
+            )?;
+        }
+        let mut history_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
+            Box::new(range_start_ms),
+            Box::new(range_end_ms),
+            Box::new(bucket_millis),
+            Box::new(provider.map(str::to_owned)),
+            Box::new(selected_provider.map(str::to_owned)),
+            Box::new(selected_model_id.map(str::to_owned)),
+            Box::new(rollup_start_ms),
+            Box::new(rollup_end_ms),
+        ];
         let history_source = if building_index {
             format!(
                 "SELECT observation.observed_at_ms,
@@ -10533,7 +11058,7 @@ impl Storage {
                    AND ?7 = ?7 AND ?8 = ?8"
             )
         } else {
-            format!(
+            let mut sql = format!(
                 "SELECT rollup.hour_utc AS observed_at_ms,
                         rollup.provider,
                         NULLIF(rollup.derived_model_id, '') AS derived_model_id,
@@ -10541,61 +11066,39 @@ impl Storage {
                             + rollup.cache_creation_tokens + rollup.cache_read_tokens
                             AS token_amount
                  FROM model_usage_hourly AS rollup
-                 JOIN model_observation_sources AS source
+                 JOIN active_model_read_sources AS source
                    ON source.provider = rollup.provider
                   AND source.source_key = rollup.source_key
-                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                   AND rollup.hour_utc >= ?7
+                 WHERE rollup.hour_utc >= ?7
                    AND rollup.hour_utc < ?8
                    AND (?4 IS NULL OR rollup.provider = ?4)
                    AND (
                        rollup.raw_pruned = 1
                        OR (rollup.hour_utc - ?1) / ?3
                           = (rollup.hour_utc + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1) / ?3
-                   )
-                 UNION ALL
-                 SELECT observation.observed_at_ms,
-                        observation.provider,
-                        observation.derived_model_id,
-                        COALESCE(observation.input_tokens, 0)
-                            + COALESCE(observation.output_tokens, 0)
-                            + COALESCE(observation.cache_creation_tokens, 0)
-                            + COALESCE(observation.cache_read_tokens, 0)
-                 FROM model_usage_observations AS observation
-                 JOIN model_observation_sources AS source
-                   ON source.provider = observation.provider
-                  AND source.source_key = observation.source_key
-                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                   AND observation.observed_at_ms >= ?1
-                   AND observation.observed_at_ms < ?2
-                   AND NOT (
-                       observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                           * {MODEL_ROLLUP_HOUR_MS} >= ?7
-                       AND observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                           * {MODEL_ROLLUP_HOUR_MS} < ?8
-                       AND (
-                           observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                               * {MODEL_ROLLUP_HOUR_MS} - ?1
-                       ) / ?3 = (
-                           observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                               * {MODEL_ROLLUP_HOUR_MS}
-                           + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1
-                       ) / ?3
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM model_usage_hourly AS authoritative
-                       WHERE authoritative.hour_utc =
-                             observation.observed_at_ms / {MODEL_ROLLUP_HOUR_MS}
-                                 * {MODEL_ROLLUP_HOUR_MS}
-                         AND authoritative.provider = observation.provider
-                         AND authoritative.source_key = observation.source_key
-                         AND authoritative.derived_model_id =
-                             COALESCE(observation.derived_model_id, '')
-                         AND authoritative.raw_pruned = 1
-                   )
-                   AND (?4 IS NULL OR observation.provider = ?4)"
-            )
+                   )"
+            );
+            for &(raw_start_ms, raw_end_ms) in &residual_ranges {
+                let start_parameter = history_params.len() + 1;
+                let end_parameter = start_parameter + 1;
+                history_params.push(Box::new(raw_start_ms));
+                history_params.push(Box::new(raw_end_ms));
+                sql.push_str(" UNION ALL ");
+                sql.push_str(&model_raw_residual_branch_sql(
+                    "observation.observed_at_ms,
+                     observation.provider,
+                     observation.derived_model_id,
+                     COALESCE(observation.input_tokens, 0)
+                         + COALESCE(observation.output_tokens, 0)
+                         + COALESCE(observation.cache_creation_tokens, 0)
+                         + COALESCE(observation.cache_read_tokens, 0)",
+                    start_parameter,
+                    end_parameter,
+                    4,
+                    has_pruned_authority,
+                ));
+            }
+            sql
         };
         let mut statement = tx
             .prepare_cached(&format!(
@@ -10626,26 +11129,14 @@ impl Storage {
             ))
             .map_err(|error| format!("Prepare model history query: {error}"))?;
         let rows = statement
-            .query_map(
-                params![
-                    range_start_ms,
-                    range_end_ms,
-                    bucket_millis,
-                    provider,
-                    selected_provider,
-                    selected_model_id,
-                    rollup_start_ms,
-                    rollup_end_ms,
-                ],
-                |row| {
-                    Ok(ModelHistoryAggregateRow {
-                        bucket_index: row.get(0)?,
-                        attributed_tokens: row.get(1)?,
-                        unattributed_tokens: row.get(2)?,
-                        selected_model_tokens: row.get(3)?,
-                    })
-                },
-            )
+            .query_map(rusqlite::params_from_iter(history_params.iter()), |row| {
+                Ok(ModelHistoryAggregateRow {
+                    bucket_index: row.get(0)?,
+                    attributed_tokens: row.get(1)?,
+                    unattributed_tokens: row.get(2)?,
+                    selected_model_tokens: row.get(3)?,
+                })
+            })
             .map_err(|error| format!("Query model history: {error}"))?;
 
         for aggregate_row in rows {
@@ -25666,6 +26157,175 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Bounded Completed Model Raw Seeks]]
+    #[test]
+    #[serial]
+    fn completed_model_residual_reads_use_bounded_index_seeks() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let conn = storage.conn.lock();
+        assert_eq!(rusqlite::version(), "3.45.0");
+
+        conn.execute_batch(
+            "CREATE TEMP TABLE scoped_overview (
+                 provider TEXT NOT NULL,
+                 analytics_session_id TEXT NOT NULL
+             );
+             CREATE INDEX temp.scoped_overview_provider_session
+                 ON scoped_overview(provider, analytics_session_id);",
+        )
+        .expect("create scoped overview plan fixture");
+        materialize_model_read_authority(&conn, 0, 1, true)
+            .expect("materialize active plan sources");
+
+        let mut project_prefix_explain = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                completed_model_project_prefix_sql()
+            ))
+            .expect("prepare project prefix explain");
+        let project_prefix_details = project_prefix_explain
+            .query_map(
+                params![
+                    "claude",
+                    "session",
+                    "chain",
+                    0_i64,
+                    1_i64,
+                    Option::<i64>::None,
+                    Option::<i64>::None,
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("query project prefix explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect project prefix explain");
+        assert!(
+            project_prefix_details.iter().any(|detail| {
+                detail.contains("SEARCH observation USING")
+                    && detail.contains("idx_model_observations_chain_time")
+                    && detail.contains("provider=? AND analytics_session_id=? AND chain_id=?")
+                    && detail.contains("observed_at_ms>? AND observed_at_ms<?")
+            }),
+            "project prefix must seek each scoped chain's bounded raw range: {project_prefix_details:?}"
+        );
+        assert!(
+            project_prefix_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN observation")
+                    && !detail.contains("TEMP B-TREE")),
+            "project prefix must avoid raw scans and temporary ordering: {project_prefix_details:?}"
+        );
+
+        let mut project_ties_explain = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                completed_model_project_ties_sql()
+            ))
+            .expect("prepare project ties explain");
+        let project_ties_details = project_ties_explain
+            .query_map(params!["claude", "session", "chain", 0_i64, 0_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query project ties explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect project ties explain");
+        assert!(
+            project_ties_details.iter().any(|detail| {
+                detail.contains("SEARCH observation USING")
+                    && detail.contains("idx_model_observations_chain_time")
+                    && detail.contains("provider=? AND analytics_session_id=? AND chain_id=?")
+                    && detail.contains("observed_at_ms=? AND source_ordinal=?")
+            }),
+            "project ties must seek one exact chain prefix: {project_ties_details:?}"
+        );
+        assert!(
+            project_ties_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN observation")
+                    && !detail.contains("TEMP B-TREE")),
+            "project ties must avoid raw scans and temporary ordering: {project_ties_details:?}"
+        );
+
+        let running_sql = completed_model_running_turns_sql(false);
+        let mut running_explain = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {running_sql}"))
+            .expect("prepare running turns explain");
+        let running_details = running_explain
+            .query_map(
+                params![
+                    0_i64,
+                    1_i64,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    1_024_i64,
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("query running turns explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect running turns explain");
+        assert!(
+            running_details.iter().any(|detail| {
+                detail.contains("SEARCH observation USING")
+                    && detail.contains("idx_model_observations_observed_provider")
+                    && detail.contains("observed_at_ms>? AND observed_at_ms<?")
+            }),
+            "running turns must use a bounded observed-time seek: {running_details:?}"
+        );
+        assert!(
+            running_details
+                .iter()
+                .all(|detail| !detail.contains("SCAN observation")
+                    && !detail.contains("TEMP B-TREE")),
+            "running turns must avoid raw scans and temporary ordering: {running_details:?}"
+        );
+
+        let raw_sql = model_raw_residual_branch_sql("observation.id", 1, 2, 3, true);
+        let mut raw_explain = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {raw_sql}"))
+            .expect("prepare residual branch explain");
+        let raw_details = raw_explain
+            .query_map(params![0_i64, 1_i64, Option::<String>::None], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("query residual branch explain")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect residual branch explain");
+        assert!(
+            raw_details.iter().any(|detail| {
+                detail.contains("SEARCH observation USING INDEX")
+                    && detail.contains("idx_model_observations_observed_provider")
+                    && detail.contains("observed_at_ms>? AND observed_at_ms<?")
+            }),
+            "residual branch must use a bounded observed-time seek: {raw_details:?}"
+        );
+
+        let range_end_ms = DateTime::parse_from_rfc3339("2026-08-02T19:27:43Z")
+            .expect("pinned end")
+            .timestamp_millis();
+        for (days, expected_ranges) in [(30, 31), (90, 91)] {
+            let range_start_ms = range_end_ms - TimeDelta::days(days).num_milliseconds();
+            let (rollup_start_ms, rollup_end_ms) =
+                model_rollup_closed_bounds(range_start_ms, range_end_ms);
+            let ranges = model_rollup_residual_ranges(
+                range_start_ms,
+                range_end_ms,
+                TimeDelta::days(1).num_milliseconds(),
+                rollup_start_ms,
+                rollup_end_ms,
+            )
+            .expect("daily residual ranges");
+            assert_eq!(ranges.len(), expected_ranges);
+            assert!(ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+            assert!(ranges.iter().all(|(start, end)| start < end));
+        }
+        clear_env();
+    }
+
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Hybrid Model Overview and History Parity]]
     #[test]
     #[serial]
@@ -25721,6 +26381,120 @@ mod tests {
         ]
         .join("\n");
         seed_claude_model_source(&storage, &dir, "sk-hybrid-a", "sess-hybrid-a", &claude);
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE model_observation_sources
+                 SET cwd = '/work/fallback-latest'
+                 WHERE provider = 'claude' AND source_key = 'sk-hybrid-a'",
+                [],
+            )
+            .expect("set source cwd fallback");
+            conn.execute(
+                "UPDATE model_usage_observations
+                 SET cwd = NULL
+                 WHERE provider = 'claude' AND source_key = 'sk-hybrid-a'
+                   AND observed_at_ms = ?1",
+                [at("2026-07-20T12:10:00Z").timestamp_millis()],
+            )
+            .expect("clear latest observation cwd");
+        }
+
+        let null_prefix = [
+            claude_overview_turn(
+                &at("2026-07-20T12:00:00Z"),
+                "sess-hybrid-null-prefix",
+                "model-a",
+                1,
+                "/work/older-prefix",
+            ),
+            claude_overview_turn(
+                &at("2026-07-20T12:20:00Z"),
+                "sess-hybrid-null-prefix",
+                "model-a",
+                1,
+                "/work/latest-null",
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "sk-hybrid-null-prefix",
+            "sess-hybrid-null-prefix",
+            &null_prefix,
+        );
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "UPDATE model_observation_sources
+                 SET cwd = NULL
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-hybrid-null-prefix'",
+                [],
+            )
+            .expect("clear null-prefix source cwd");
+            conn.execute(
+                "UPDATE model_usage_observations
+                 SET cwd = NULL
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-hybrid-null-prefix'
+                   AND observed_at_ms = ?1",
+                [at("2026-07-20T12:20:00Z").timestamp_millis()],
+            )
+            .expect("clear newest prefix cwd");
+        }
+
+        let tie_at = at("2026-07-20T12:15:00Z");
+        for (source_key, cwd) in [
+            ("sk-hybrid-tie-a", "/work/tie-a"),
+            ("sk-hybrid-tie-z", "/work/tie-z"),
+        ] {
+            seed_claude_model_source(
+                &storage,
+                &dir,
+                source_key,
+                "sess-hybrid-tie",
+                &claude_overview_turn(&tie_at, "sess-hybrid-tie", "model-a", 1, cwd),
+            );
+        }
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_usage_observations
+                 SET source_record_key = 'same-record'
+                 WHERE provider = 'claude'
+                   AND analytics_session_id = 'sess-hybrid-tie'",
+                [],
+            )
+            .expect("align project tie record keys");
+
+        let pruned_project = claude_overview_turn(
+            &at("2026-07-19T14:05:00Z"),
+            "sess-hybrid-pruned-project",
+            "model-a",
+            5,
+            "/work/pruned-fallback",
+        );
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "sk-hybrid-pruned-project",
+            "sess-hybrid-pruned-project",
+            &pruned_project,
+        );
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_observation_sources
+                 SET cwd = '/work/pruned-fallback'
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-hybrid-pruned-project'",
+                [],
+            )
+            .expect("set authoritative project source cwd fallback");
 
         let unattributed = format!(
             r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-hybrid-gap","cwd":"/work/beta","message":{{"usage":{{"input_tokens":0}}}}}}"#,
@@ -25823,6 +26597,27 @@ mod tests {
         let raw_overview = storage
             .get_model_usage_overview_uncached(ModelRange::TwentyFourHours, None, pinned_now)
             .expect("raw overview");
+        assert!(
+            raw_overview
+                .project_matrix
+                .iter()
+                .any(|row| row.project == "fallback-latest"),
+            "latest NULL observation cwd must use its source cwd before an earlier explicit cwd"
+        );
+        assert!(
+            raw_overview
+                .project_matrix
+                .iter()
+                .any(|row| row.project == "older-prefix"),
+            "a newest prefix without effective cwd must fall back to an older prefix"
+        );
+        assert!(
+            raw_overview
+                .project_matrix
+                .iter()
+                .any(|row| row.project == "tie-z"),
+            "project ties must use binary source-key order after matching time, ordinal, and record"
+        );
         let selected = ModelIdentity {
             provider: "claude".to_string(),
             model_id: "model-a".to_string(),
@@ -25927,6 +26722,7 @@ mod tests {
         assert_eq!(hybrid_week_history_json, raw_week_history_json);
 
         let pruned_hour = at("2026-07-19T13:00:00Z").timestamp_millis();
+        let pruned_project_hour = at("2026-07-19T14:00:00Z").timestamp_millis();
         storage
             .conn
             .lock()
@@ -25938,6 +26734,18 @@ mod tests {
                 [pruned_hour],
             )
             .expect("mark authoritative rollup hour");
+        storage
+            .conn
+            .lock()
+            .execute(
+                "UPDATE model_usage_hourly
+                 SET raw_pruned = 1
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-hybrid-pruned-project'
+                   AND hour_utc = ?1",
+                [pruned_project_hour],
+            )
+            .expect("mark authoritative project fallback hour");
         let before_raw_delete = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("overview before authoritative raw delete");
@@ -25954,12 +26762,33 @@ mod tests {
                 params![pruned_hour, pruned_hour + MODEL_ROLLUP_HOUR_MS],
             )
             .expect("delete raw evidence behind authoritative rollup");
+        storage
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM model_usage_observations
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-hybrid-pruned-project'
+                   AND observed_at_ms >= ?1 AND observed_at_ms < ?2",
+                params![
+                    pruned_project_hour,
+                    pruned_project_hour + MODEL_ROLLUP_HOUR_MS
+                ],
+            )
+            .expect("delete raw project evidence behind authoritative rollup");
         let after_raw_delete = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("overview after authoritative raw delete");
         let history_after_raw_delete = storage
             .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
             .expect("history after authoritative raw delete");
+        assert!(
+            after_raw_delete
+                .project_matrix
+                .iter()
+                .any(|row| row.project == "pruned-fallback"),
+            "raw-pruned project must retain the rollup/source cwd fallback"
+        );
         assert_eq!(
             serde_json::to_value(after_raw_delete).expect("post-prune overview json"),
             serde_json::to_value(before_raw_delete).expect("pre-prune overview json")
@@ -26109,6 +26938,159 @@ mod tests {
             serde_json::to_value(restored_history).expect("restored history json"),
             serde_json::to_value(baseline_history).expect("baseline history json")
         );
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Running Model Pagination Parity]]
+    #[test]
+    #[serial]
+    fn running_model_pagination_preserves_full_ties_and_exhaustion() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let pinned_now = DateTime::parse_from_rfc3339("2026-07-20T12:37:23Z")
+            .expect("pinned time")
+            .with_timezone(&Utc);
+        let tied_at = DateTime::parse_from_rfc3339("2026-07-20T12:30:00Z")
+            .expect("tied timestamp")
+            .timestamp_millis();
+
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "sk-running-page",
+            "sess-running-page",
+            &claude_overview_turn(
+                &DateTime::from_timestamp_millis(tied_at).expect("tied instant"),
+                "sess-running-page",
+                "seed-model",
+                1,
+                "/work/page",
+            ),
+        );
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "DELETE FROM model_usage_observations
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-running-page'",
+                [],
+            )
+            .expect("clear parsed pagination seed");
+            conn.execute(
+                "WITH digits(value) AS (
+                     VALUES (0), (1), (2), (3), (4),
+                            (5), (6), (7), (8), (9)
+                 ), numbered(value) AS (
+                     SELECT ones.value
+                            + tens.value * 10
+                            + hundreds.value * 100
+                            + thousands.value * 1000
+                            + 1
+                     FROM digits AS ones
+                     CROSS JOIN digits AS tens
+                     CROSS JOIN digits AS hundreds
+                     CROSS JOIN digits AS thousands
+                 )
+                 INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, parent_chain_id,
+                     agent_id, turn_id, raw_model_id, derived_model_id,
+                     cwd, hostname, is_sidechain, observed_at_ms,
+                     input_tokens, output_tokens, cache_creation_tokens,
+                     cache_read_tokens, model_evidence, token_evidence
+                 )
+                 SELECT 'claude',
+                        'sk-running-page',
+                        printf('record-%04d', value),
+                        CASE value
+                            WHEN 1 THEN 3000
+                            WHEN 2 THEN 2999
+                            ELSE value
+                        END,
+                        'turn',
+                        'sess-running-page',
+                        'sess-running-page',
+                        'sess-running-page',
+                        NULL,
+                        NULL,
+                        printf('turn-%04d', value),
+                        CASE value
+                            WHEN 1 THEN 'final-model'
+                            WHEN 2 THEN 'previous-model'
+                            ELSE 'noise-model'
+                        END,
+                        CASE value
+                            WHEN 1 THEN 'final-model'
+                            WHEN 2 THEN 'previous-model'
+                            ELSE 'noise-model'
+                        END,
+                        '/work/page',
+                        'host-a',
+                        0,
+                        ?1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        'explicit',
+                        'direct'
+                 FROM numbered
+                 WHERE value <= 1026
+                 ORDER BY value ASC",
+                [tied_at],
+            )
+            .expect("seed pagination-spanning tied turns");
+            conn.execute(
+                "UPDATE model_observation_sources
+                 SET observation_count = 1026,
+                     first_activity_at_ms = ?1,
+                     last_activity_at_ms = ?1
+                 WHERE provider = 'claude'
+                   AND source_key = 'sk-running-page'",
+                [tied_at],
+            )
+            .expect("update pagination source bounds");
+        }
+
+        let codex_jsonl = [
+            r#"{"type":"session_meta","timestamp":"2026-07-20T12:05:00Z","payload":{"id":"sess-running-codex"}}"#.to_string(),
+            r#"{"type":"turn_context","timestamp":"2026-07-20T12:10:00Z","payload":{"model":"codex-steady"}}"#.to_string(),
+            r#"{"type":"turn_context","timestamp":"2026-07-20T12:32:00Z","payload":{"model":"codex-steady"}}"#.to_string(),
+        ]
+        .join("\n");
+        seed_codex_model_source(
+            &storage,
+            &dir,
+            "sk-running-codex",
+            "sess-running-codex",
+            &codex_jsonl,
+        );
+
+        let overview = storage
+            .get_model_usage_overview_uncached(ModelRange::OneHour, None, pinned_now)
+            .expect("paginated running overview");
+        let claude = overview
+            .running_now
+            .iter()
+            .find(|row| row.provider == "claude")
+            .expect("claude running row");
+        assert_eq!(claude.model_id, "final-model");
+        assert_eq!(claude.previous_model_id.as_deref(), Some("previous-model"));
+        assert_eq!(claude.last_seen_at, "2026-07-20T12:30:00+00:00");
+        assert_eq!(claude.running_since_at, "2026-07-20T12:30:00+00:00");
+
+        let codex = overview
+            .running_now
+            .iter()
+            .find(|row| row.provider == "codex")
+            .expect("codex running row");
+        assert_eq!(codex.model_id, "codex-steady");
+        assert_eq!(codex.previous_model_id, None);
+        assert_eq!(codex.last_seen_at, "2026-07-20T12:32:00+00:00");
+        assert_eq!(codex.running_since_at, "2026-07-20T12:10:00+00:00");
+
         clear_env();
     }
 

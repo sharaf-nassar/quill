@@ -20,13 +20,14 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use quill_lib::widget_query_perf_study::{
     WidgetQueryBenchmarkReport, backfill_model_rollup_copy, backfill_runtime_rollup_copy,
-    measure_runtime_90d, measure_session_breakdown_30d, run_widget_query_baseline,
+    hash_model_rollup_queries, measure_model_rollup_queries, measure_runtime_90d,
+    measure_session_breakdown_30d, profile_model_overview_queries, run_widget_query_baseline,
     verify_model_rollup_copy, verify_model_rollup_from_frozen, verify_runtime_parity_from_frozen,
 };
 use rusqlite::{Connection, OpenFlags, ToSql, backup::Backup, backup::StepResult, params};
 
 fn usage() -> &'static str {
-    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike verify-runtime-parity-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
+    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike verify-runtime-parity-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike diagnose-project CORPUS PINNED_END_RFC3339 DAYS\n  widget_query_perf_spike hash-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike profile-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
 }
 
 fn path_arg(value: Option<OsString>, name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -116,18 +117,19 @@ fn print_markdown(report: &WidgetQueryBenchmarkReport) {
     println!("- Pinned end: `{}`", report.pinned_end);
     println!("- OS page cache: {}", report.os_page_cache);
     println!();
-    println!("| Query | Window | Start | End | Cold | Warm | Output bytes |");
-    println!("| --- | --- | --- | --- | ---: | ---: | ---: |");
+    println!("| Query | Window | Start | End | Cold | Warm | Output bytes | SHA-256 |");
+    println!("| --- | --- | --- | --- | ---: | ---: | ---: | --- |");
     for measurement in &report.measurements {
         println!(
-            "| `{}` | {} | `{}` | `{}` | {:.3} ms | {:.3} ms | {} |",
+            "| `{}` | {} | `{}` | `{}` | {:.3} ms | {:.3} ms | {} | `{}` |",
             measurement.query,
             measurement.window,
             measurement.start,
             measurement.end,
             measurement.elapsed_ms,
             measurement.warm_elapsed_ms,
-            measurement.output_bytes
+            measurement.output_bytes,
+            measurement.output_sha256
         );
     }
     println!();
@@ -174,6 +176,186 @@ fn print_query_plan(
     Ok(())
 }
 
+fn completed_project_candidates_sql() -> String {
+    let active_predicate =
+        "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
+    format!(
+        "WITH scoped_sessions AS (
+             SELECT provider, analytics_session_id
+             FROM scoped_overview
+             GROUP BY provider COLLATE BINARY,
+                      analytics_session_id COLLATE BINARY
+         ), scoped_chains AS (
+             SELECT source.provider,
+                    source.analytics_session_id,
+                    source.chain_id
+             FROM model_observation_sources AS source
+                  INDEXED BY idx_model_sources_session
+             JOIN scoped_sessions AS scoped
+               ON scoped.provider = source.provider
+              AND scoped.analytics_session_id = source.analytics_session_id
+             WHERE {active_predicate}
+               AND source.chain_id IS NOT NULL
+             GROUP BY source.provider COLLATE BINARY,
+                      source.analytics_session_id COLLATE BINARY,
+                      source.chain_id COLLATE BINARY
+         )
+         SELECT scoped.provider, scoped.analytics_session_id, scoped.chain_id,
+                (
+                    SELECT json_array(
+                               COALESCE(
+                                   NULLIF(observation.cwd, ''),
+                                   NULLIF(owner.cwd, '')
+                               ),
+                               observation.observed_at_ms,
+                               observation.source_ordinal,
+                               observation.source_record_key,
+                               observation.source_key,
+                               observation.id
+                           )
+                    FROM model_usage_observations AS observation
+                         INDEXED BY idx_model_observations_chain_time
+                    JOIN model_observation_sources AS owner
+                      ON owner.provider = observation.provider
+                     AND owner.source_key = observation.source_key
+                    WHERE owner.processing_status != 'suppressed'
+                      AND owner.suppressed_sha256 IS NULL
+                      AND observation.provider = scoped.provider
+                      AND observation.analytics_session_id =
+                          scoped.analytics_session_id
+                      AND observation.chain_id = scoped.chain_id
+                      AND observation.observed_at_ms >= ?1
+                      AND observation.observed_at_ms < ?2
+                      AND COALESCE(
+                              NULLIF(observation.cwd, ''),
+                              NULLIF(owner.cwd, '')
+                          ) IS NOT NULL
+                    ORDER BY observation.observed_at_ms DESC,
+                             observation.source_ordinal DESC,
+                             observation.source_record_key COLLATE BINARY DESC,
+                             observation.source_key COLLATE BINARY DESC,
+                             observation.id DESC
+                    LIMIT 1
+                ) AS packed_candidate
+         FROM scoped_chains AS scoped"
+    )
+}
+
+fn diagnose_completed_project_stage(
+    connection: &Connection,
+    range_label: &str,
+    range_start_ms: i64,
+    range_end_ms: i64,
+) -> Result<(), Box<dyn Error>> {
+    let hour_ms = 3_600_000_i64;
+    let rollup_start_ms = range_start_ms
+        .div_euclid(hour_ms)
+        .saturating_add(i64::from(range_start_ms.rem_euclid(hour_ms) != 0))
+        .saturating_mul(hour_ms);
+    let rollup_end_ms = range_end_ms.div_euclid(hour_ms).saturating_mul(hour_ms);
+    let active_predicate =
+        "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
+    connection.execute_batch("DROP TABLE IF EXISTS scoped_overview;")?;
+    connection.execute(
+        &format!(
+            "CREATE TEMP TABLE scoped_overview AS
+             SELECT rollup.provider, rollup.analytics_session_id
+             FROM model_usage_hourly AS rollup
+             JOIN model_observation_sources AS source
+               ON source.provider = rollup.provider
+              AND source.source_key = rollup.source_key
+             WHERE {active_predicate}
+               AND rollup.hour_utc >= ?3
+               AND rollup.hour_utc < ?4
+             UNION ALL
+             SELECT observation.provider, observation.analytics_session_id
+             FROM model_usage_observations AS observation
+             JOIN model_observation_sources AS source
+               ON source.provider = observation.provider
+              AND source.source_key = observation.source_key
+             WHERE {active_predicate}
+               AND observation.observed_at_ms >= ?1
+               AND observation.observed_at_ms < ?2
+               AND (observation.observed_at_ms < ?3
+                    OR observation.observed_at_ms >= ?4)"
+        ),
+        params![range_start_ms, range_end_ms, rollup_start_ms, rollup_end_ms],
+    )?;
+    connection.execute_batch(
+        "CREATE INDEX temp.scoped_overview_provider_session
+             ON scoped_overview(provider, analytics_session_id);",
+    )?;
+
+    let project_sql = completed_project_candidates_sql();
+    print_query_plan(
+        connection,
+        &format!("overview.completed_project_stage_{range_label}"),
+        &project_sql,
+        &[&range_start_ms, &range_end_ms],
+    )?;
+    let started = std::time::Instant::now();
+    let mut statement = connection.prepare(&project_sql)?;
+    let rows = statement.query_map(params![range_start_ms, range_end_ms], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut chain_rows = 0_i64;
+    let mut candidate_rows = 0_i64;
+    let mut packed_bytes = 0_usize;
+    for row in rows {
+        let (_, _, _, candidate) = row?;
+        chain_rows += 1;
+        if let Some(candidate) = candidate {
+            candidate_rows += 1;
+            packed_bytes += candidate.len();
+        }
+    }
+    println!("overview.completed_project_stage_{range_label}.chains={chain_rows}");
+    println!("overview.completed_project_stage_{range_label}.candidates={candidate_rows}");
+    println!("overview.completed_project_stage_{range_label}.packed_bytes={packed_bytes}");
+    println!(
+        "overview.completed_project_stage_{range_label}.elapsed_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1_000.0
+    );
+    Ok(())
+}
+
+fn diagnose_completed_project_stage_cold(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    days: i64,
+) -> Result<(), Box<dyn Error>> {
+    if !matches!(days, 30 | 90) {
+        return Err("Project diagnostic DAYS must be 30 or 90".into());
+    }
+    let canonical = corpus.canonicalize()?;
+    let metadata = canonical.metadata()?;
+    if !metadata.permissions().readonly() {
+        return Err(format!(
+            "Project diagnostic corpus must be read-only: {}",
+            canonical.display()
+        )
+        .into());
+    }
+    let connection = Connection::open_with_flags(
+        &canonical,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.execute_batch("PRAGMA temp_store = MEMORY;")?;
+    let range_end_ms = pinned_end.timestamp_millis();
+    let range_start_ms = range_end_ms - chrono::TimeDelta::days(days).num_milliseconds();
+    diagnose_completed_project_stage(
+        &connection,
+        &format!("{days}d"),
+        range_start_ms,
+        range_end_ms,
+    )
+}
+
 fn diagnose_model_residuals(
     corpus: &Path,
     pinned_end: DateTime<Utc>,
@@ -191,7 +373,7 @@ fn diagnose_model_residuals(
         &canonical,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    connection.execute_batch("PRAGMA query_only = ON;")?;
+    connection.execute_batch("PRAGMA temp_store = MEMORY;")?;
 
     let range_end_ms = pinned_end.timestamp_millis();
     let range_start_30d_ms = range_end_ms - chrono::TimeDelta::days(30).num_milliseconds();
@@ -249,6 +431,52 @@ fn diagnose_model_residuals(
         )?;
         println!("raw.active_rows_{label}={rows}");
     }
+
+    let source_cwd_counts: (i64, i64, i64, i64) = connection.query_row(
+        &format!(
+            "SELECT COUNT(*),
+                    SUM(NULLIF(source.cwd, '') IS NOT NULL),
+                    COUNT(DISTINCT source.provider || char(31)
+                                           || source.analytics_session_id),
+                    COUNT(DISTINCT CASE WHEN NULLIF(source.cwd, '') IS NOT NULL
+                                        THEN source.provider || char(31)
+                                             || source.analytics_session_id END)
+             FROM model_observation_sources AS source
+             WHERE {active_predicate}"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    println!("project.active_sources={}", source_cwd_counts.0);
+    println!("project.sources_with_cwd={}", source_cwd_counts.1);
+    println!("project.active_sessions={}", source_cwd_counts.2);
+    println!("project.sessions_with_source_cwd={}", source_cwd_counts.3);
+
+    let observation_cwd_counts: (i64, i64) = connection.query_row(
+        &format!(
+            "SELECT COUNT(*),
+                    COUNT(DISTINCT observation.provider || char(31)
+                                            || observation.analytics_session_id)
+             FROM model_usage_observations AS observation
+             JOIN model_observation_sources AS source
+               ON source.provider = observation.provider
+              AND source.source_key = observation.source_key
+             WHERE {active_predicate}
+               AND observation.observed_at_ms >= ?1
+               AND observation.observed_at_ms < ?2
+               AND NULLIF(observation.cwd, '') IS NOT NULL"
+        ),
+        params![range_start_30d_ms, range_end_ms],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    println!(
+        "project.observations_with_cwd_30d={}",
+        observation_cwd_counts.0
+    );
+    println!(
+        "project.sessions_with_observation_cwd_30d={}",
+        observation_cwd_counts.1
+    );
 
     let rollup_rows_30d: i64 = connection.query_row(
         "SELECT COUNT(*) FROM model_usage_hourly
@@ -379,6 +607,8 @@ fn diagnose_model_residuals(
         |row| row.get(0),
     )?;
     println!("history.raw_residual_stage.rows={history_raw_rows}");
+    diagnose_completed_project_stage(&connection, "30d", range_start_30d_ms, range_end_ms)?;
+    diagnose_completed_project_stage(&connection, "90d", range_start_90d_ms, range_end_ms)?;
     Ok(())
 }
 
@@ -516,6 +746,78 @@ fn main() -> Result<(), Box<dyn Error>> {
             let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
             diagnose_model_residuals(&corpus, pinned_end)
         }
+        "diagnose-project" => {
+            let corpus = path_arg(args.next(), "CORPUS")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            let days = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing DAYS.\n{}", usage()))?
+                .parse::<i64>()?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            diagnose_completed_project_stage_cold(&corpus, pinned_end, days)
+        }
+        "hash-model" => {
+            let corpus = path_arg(args.next(), "CORPUS")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            for output in hash_model_rollup_queries(&corpus, pinned_end)? {
+                println!(
+                    "query={} window={} output_bytes={} output_sha256={}",
+                    output.query, output.window, output.output_bytes, output.output_sha256
+                );
+            }
+            Ok(())
+        }
+        "measure-model" => {
+            let corpus = path_arg(args.next(), "CORPUS")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            for measurement in measure_model_rollup_queries(&corpus, pinned_end)? {
+                println!(
+                    "query={} window={} cold_ms={:.3} warm_ms={:.3} output_bytes={} output_sha256={}",
+                    measurement.query,
+                    measurement.window,
+                    measurement.elapsed_ms,
+                    measurement.warm_elapsed_ms,
+                    measurement.output_bytes,
+                    measurement.output_sha256
+                );
+            }
+            Ok(())
+        }
+        "profile-model" => {
+            let corpus = path_arg(args.next(), "CORPUS")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let profiles = profile_model_overview_queries(&corpus, pinned_end)?;
+            println!("{}", serde_json::to_string_pretty(&profiles)?);
+            Ok(())
+        }
         "measure-runtime" => {
             let corpus = path_arg(args.next(), "CORPUS")?;
             let pinned_end = args
@@ -533,6 +835,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 measurement.warm_elapsed_ms
             );
             println!("runtime_90d.output_bytes={}", measurement.output_bytes);
+            println!("runtime_90d.output_sha256={}", measurement.output_sha256);
             Ok(())
         }
         _ => Err(format!("Unknown mode {mode:?}.\n{}", usage()).into()),
