@@ -194,7 +194,7 @@ Coverage is attributed tokens divided by all token-bearing model observations; c
 
 Each accepted raw ID appears exactly as observed after surrounding-whitespace trimming and is qualified by provider; no model catalog, family parsing, alias, friendly name, or `unknown` row participates. Provider identity uses the fixed Claude orange, Codex blue, and MiniMax violet code, and each model renders as a rank-assigned shade of its provider's family ramp — the same shade in both bands, never a hue derived from the ID itself.
 
-Committed model events coalesce from the first event into one fixed one-second refresh, with a 60-second fallback poll; the overview snapshot refreshes as one unit. See [[data-flow#Model Observation Reconciliation]] and [[frontend#Frontend#Components#Widget View Region#Models View]].
+Data-changing model events invalidate the overview's process-cache key and join the widget's shared five-second-or-longer mounted refresh fan-out. A 60-second fallback poll uses the same path, and one accepted overview refreshes both bands. See [[data-flow#Model Observation Reconciliation]] and [[frontend#Frontend#Components#Widget View Region#Models View]].
 
 ### Context View
 
@@ -441,7 +441,7 @@ Top-tabs navigation hosts five panels: General, Integrations, Context, Learning,
 | Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with MiniMax API key prompt), in-place MiniMax API-key edit form, and the CPA connection lifecycle |
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |
 | Learning | [[src/components/settings/LearningTab.tsx]] | Learning trigger mode, periodic enable, periodic interval, min observations, min confidence, plus the Rule Watcher master toggle |
-| Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
+| Performance | [[src/components/settings/PerformanceTab.tsx]] | Live-usage refresh enable + interval (60–600s), model-index rebuild and committed progress from [[frontend#Frontend#Components#Model Rollup Maintenance]], manual database compaction, and the manual retention prune control described in [[frontend#Frontend#Components#Retention Control]] |
 
 ### Version and Release Notes
 

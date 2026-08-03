@@ -89,7 +89,7 @@ pending for the entire quiesce window, then execute after the guard releases.
 
 [[src-tauri/src/storage.rs]] manages a SQLite database with WAL mode and 5-second busy timeout. The largest backend module.
 
-Most operations use one mutex-protected primary connection. The paired Models aggregate and history reads instead open independent read-only, query-only connections with the same timeout, allowing WAL concurrency while each response retains its own deferred snapshot.
+Writes and maintenance use one mutex-protected primary connection. Widget analytics reads instead open disposable read-only connections with the same timeout, allowing WAL concurrency while each multi-statement response retains one deferred snapshot; [[backend#Backend#Database#View Query Reader Connections]] inventories the migrated commands.
 
 ### Location
 

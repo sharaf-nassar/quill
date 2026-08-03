@@ -44,7 +44,7 @@ A source changed after off-permit preparation must fail revalidation and roll ba
 
 ## Hybrid Runtime Read And Indexed Open Tail
 
-Completed reads must match the time-invariant raw reference while scanning only each active source's open rows through the timestamp-leading runtime index.
+Completed reads must match the time-invariant raw reference while seeking each active source's open tail through the provider-and-chain-leading timestamp index.
 
 ## Independent Runtime Reference Edge Semantics
 
