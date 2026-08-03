@@ -244,8 +244,52 @@ checks free disk space and runs [[src-tauri/src/storage.rs#Storage#vacuum_databa
 on a dedicated SQLite connection. Its result reports the before/after database
 footprint on success, or a reason with unchanged size when preflight or VACUUM
 cannot proceed. It emits `compact-database-progress` for the disk-space and
-VACUUM phases, then emits `compact-database-finished` with the structured
-result after the maintenance lease is released.
+VACUUM phases, then emits `compact-database-finished` with the structured result
+after all successful maintenance and the ingest-quiesce lease are complete.
+
+#### Bounded Query Planner Analysis
+
+Successful manual compaction refreshes SQLite planner statistics without adding startup work or changing retention semantics.
+
+After VACUUM, [[src-tauri/src/storage.rs#Storage#run_bounded_database_analysis]]
+opens a dedicated writer, applies `PRAGMA analysis_limit=1000`, runs `ANALYZE`
+inside one immediate transaction, requires `sqlite_stat1`, refreshes the
+long-lived writer's planner state, then performs a TRUNCATE checkpoint before
+the compaction lease can release. Any SQL,
+verification, or checkpoint fault propagates with its operation named.
+
+The long-lived writer reloads `sqlite_stat1` and flushes cached prepared
+statements before the final checkpoint. View readers are already disposable
+and load the new statistics on open. Result caches remain valid because planner
+statistics cannot change query semantics. Skipped preflight/VACUUM paths and
+retention-triggered compaction do not run ANALYZE.
+
+The maintainer-only [[src-tauri/src/widget_query_perf_study.rs#audit_widget_query_plans]]
+captures expanded SQL from real feature-020 production readers, derives stable
+literal-normalized identities, and replays the exact statements for before and
+after `EXPLAIN QUERY PLAN`. It fails closed on statement-set, occurrence,
+SCAN/SEARCH/index/temp-order, material timing, or output-size drift.
+
+The maintainer binary can persist large full and focused reports through a
+create-only, flushed, synced Rust file handle before returning a fail verdict.
+The merged frozen-corpus gate covers 250 pending/raw and 16,086 completed SQL
+statements over the same 42 timed paths. Each state changed 10 plans with zero
+conservative plan regressions.
+
+Model history's pending raw fallback checks durable active-source ownership
+with a correlated primary-key `EXISTS` lookup; it does not create source or
+authority temp tables. Completed history instead joins the per-call temp
+active-source table and excludes keys in the per-call temp pruned-authority
+table from split indexed residual seeks. Provider-series, session-candidate,
+and represented-provider aggregations retain their audited grouping or range
+indexes.
+
+Fail-closed full runs retained two pending and four completed one-shot timing
+flags. Exact canonical 8+8 statless/analyzed alternation cleared all six under
+the unchanged 5 ms plus 25% threshold, with identical outputs and zero focused
+plan regressions. Bounded analysis retains 121 pending or 123 completed
+`sqlite_stat1` rows, reloads planner state, checkpoints 0/0, and passes
+`quick_check`.
 
 #### Database Compaction Test Specs
 
@@ -1030,6 +1074,13 @@ Attributed coverage uses one token-bearing observation population: rows with der
 
 [[src-tauri/src/storage.rs#Storage#get_model_history]] reads one matching snapshot into fixed, zero-filled UTC buckets: 5 minutes for 1 hour, 1 hour for 24 hours, 6 hours for 7 days, and 1 day for 30 days. It keeps attributed, unattributed, and optional provider-qualified selected-model series separate while excluding suppressed sources; like every other aggregate, series attribution keys on `derived_model_id`.
 
+While rollup construction is incomplete, history checks active source
+ownership with a correlated primary-key `EXISTS` lookup because it projects no
+source columns. This preserves suppression semantics while keeping statless
+and analyzed raw-fallback plans identical. Completed history instead joins its
+per-read active-source table and excludes materialized pruned authority from
+split, indexed raw residual seeks.
+
 The aggregate, history, overview, and paged-session commands each open a short-lived read-only connection through [[src-tauri/src/storage.rs#Storage#open_view_reader]] and start their deferred transaction there, so none waits on the primary storage mutex or serializes behind ingestion writes; WAL still governs database-level writer/readers safely. That reader opens `SQLITE_OPEN_READ_ONLY` — the main-database write guard — and sets `temp_store=MEMORY`, a `mmap_size`, and a larger `cache_size` so the overview's in-memory scratch table stays off disk; it does not set `PRAGMA query_only`, which is incompatible with that temp table and redundant with the read-only open flag. The frontend's Models page now issues only the overview command; aggregate and history remain served for compatibility and tests.
 
 ##### Analytics Cache Primitive
@@ -1457,7 +1508,7 @@ Tables for tracking active LLM session time, per-turn response latency, and cach
 - **session_events** — Runtime events carry `(provider, source_key, event_key, session_id, chain_id, parent_chain_id)` plus agent, timestamp, kind, UUID, and sidechain attribution. Migration 30 deduplicates owned rows by `(provider, source_key, event_key)` and source-less rows by `(provider, session_id, event_key)` through separate partial unique indexes.
 - **response_times** (legacy for runtime card; still consumed by Sessions breakdown and sub-agent tree) — Per-turn latency carries the same source/root/chain lineage. Owned identity is `(provider, source_key, chain_id, timestamp)`; source-less identity substitutes `session_id` for `source_key`.
 
-Migration 32 adds `idx_se_timestamp_chain(timestamp, provider, chain_id, is_sidechain, kind, session_id)`. The incomplete-backfill raw fallback pins this covering range index because Quill never runs `ANALYZE`; [[src-tauri/src/storage.rs#ensure_startup_indexes]] recreates it on every open. Completed hybrid reads instead drive from the small per-source state table and perform one correlated last-event seek through migration 31's `idx_se_provider_chain_timestamp(provider, chain_id, timestamp)`. This avoids materializing 1.5M open-turn rows on the frozen corpus while retaining the per-source finalized-rowid guard.
+Migration 32 adds `idx_se_timestamp_chain(timestamp, provider, chain_id, is_sidechain, kind, session_id)`. The incomplete-backfill raw fallback pins this covering range index so its plan stays safe before optional manual maintenance has created `sqlite_stat1`; [[src-tauri/src/storage.rs#ensure_startup_indexes]] recreates it on every open. Completed hybrid reads instead drive from the small per-source state table and perform one correlated last-event seek through migration 31's `idx_se_provider_chain_timestamp(provider, chain_id, timestamp)`. This avoids materializing 1.5M open-turn rows on the frozen corpus while retaining the per-source finalized-rowid guard.
 
 `get_llm_runtime_stats(range, scope)` uses raw `session_events` while runtime backfill is pending, running, or failed. Once complete, finalized turns come from `runtime_hourly`; only rows after each active source's `runtime_turn_state.finalized_through_rowid` are read through `idx_se_timestamp_chain`. Closed turns are attributed by start UTC hour and never depend on wall time. A trailing `asst_tool_use` realizes through `min(now, tool_use + 6h)`; ordinary open turns end at their last event. Distinct sessions stay provider-qualified, suppressed sources are filtered at read time, and `parent_only` uses source lineage.
 

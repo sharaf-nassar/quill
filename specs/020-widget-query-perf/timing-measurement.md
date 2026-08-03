@@ -673,10 +673,11 @@ BEFORE fan-out total exists and none is reconstructed from unrelated rows.
   render ceiling, but they do not cover render cost or repeated ingest-driven
   fan-outs. The duplicate Usage history call is present, module-cache survival
   is still unproven, and ≥5s coalescing/range honesty are normative behavior.
-- **Slice E — SHRINK.** Keep the targeted `full_input` removal and bounded
-  session-subquery cleanup, but defer app-wide bounded `ANALYZE` and its plan
-  blast radius. The two hard E endpoints already pass at 59.368 ms and
-  42.849 ms; current evidence does not justify changing planner statistics.
+- **Slice E — GO, audited scope.** Keep the targeted `full_input` removal and
+  bounded session-subquery cleanup, and run bounded `ANALYZE` after successful
+  manual compaction. The complete production-SQL audit in
+  [[Bounded ANALYZE audit]] found no material timing or plan regression after
+  stabilizing the three unproven index choices and model-history source lookup.
 
 These decisions size C/D/E but do not waive slice A's failed cold budgets. The
 residual model-query follow-up remains the release gate before feature 020 can
@@ -941,3 +942,30 @@ The source corpus retained its canonical SHA-256, 13,525,123,072-byte size,
 read-only mode, and unchanged WAL/SHM metadata. The disposable copy passed a
 final `quick_check`, reported completed generation 190 and `raw_pruned=0`, had
 no open handles, and was removed with its WAL, SHM, and temporary directory.
+
+## Bounded ANALYZE audit
+
+The user-directed item-21 reevaluation passes its fail-closed no-regression
+gate. Full methodology and plan evidence live in
+`specs/020-widget-query-perf/analyze-plan-audit.md`.
+
+Fresh online-backup audits covered both rollup states. Pending/raw replayed 250
+statements; completed replayed 16,086 because completed overview performs
+bounded per-session candidate seeks. Both covered 42 timed paths, changed 10
+plans without a conservative regression, retained 121/123 `sqlite_stat1` rows,
+checkpointed 0/0, and returned `quick_check=ok`.
+
+Fail-closed one-shot timing found two pending and four completed flags. Exact
+canonical 8+8 alternation on each original state cleared all six without
+weakening the 5 ms plus 25% threshold. Pending medians were 76.331/76.568 ms
+for 24h bucket stats and 319.082/301.936 ms for 90d hooks. Completed medians
+were 205.253/197.567 ms for Context, 82.785/93.009 ms for 24h buckets,
+31.685/37.237 ms for 24h model overview, and 108.564/111.085 ms for 30d
+buckets. Every path kept identical output bytes and SHA-256 across all 16
+samples; focused plans had zero regressions.
+
+Final analyzed model reads retained canonical 30d/90d overview/history hashes
+and measured 281.996–307.778 ms cold, all below 500 ms. Immutable source,
+zero-byte WAL, and 32,768-byte SHM retained their modes, inodes, mtimes, sizes,
+and SHA-256. Bounded app-wide ANALYZE remains enabled only after successful
+manual compaction.

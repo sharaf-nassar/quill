@@ -15,25 +15,80 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use chrono::{DateTime, Utc};
 use quill_lib::widget_query_perf_study::{
-    WidgetQueryBenchmarkReport, backfill_model_rollup_copy, backfill_runtime_rollup_copy,
-    hash_model_rollup_queries, measure_model_rollup_queries, measure_runtime_90d,
-    measure_session_breakdown_30d, profile_model_overview_queries, run_widget_query_baseline,
-    verify_model_rollup_copy, verify_model_rollup_from_frozen, verify_runtime_parity_from_frozen,
+    WidgetQueryBenchmarkReport, audit_flagged_paths_ab, audit_model_history_24h_ab,
+    audit_pending_flagged_paths_ab, audit_widget_query_plans, backfill_model_rollup_copy,
+    backfill_runtime_rollup_copy, clear_query_planner_stats_for_audit, hash_model_rollup_queries,
+    measure_model_rollup_queries, measure_runtime_90d, measure_session_breakdown_30d,
+    profile_model_overview_queries, run_widget_query_baseline, verify_model_rollup_copy,
+    verify_model_rollup_from_frozen, verify_runtime_parity_from_frozen,
 };
 use rusqlite::{Connection, OpenFlags, ToSql, backup::Backup, backup::StepResult, params};
+use serde::Serialize;
 
 fn usage() -> &'static str {
-    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike verify-runtime-parity-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike diagnose-project CORPUS PINNED_END_RFC3339 DAYS\n  widget_query_perf_spike hash-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike profile-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
+    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike prepare-analyze-audit COPY\n  widget_query_perf_spike secure-analyze-audit COPY\n  widget_query_perf_spike audit-analyze COPY PINNED_END_RFC3339 [REPORT]\n  widget_query_perf_spike audit-model-history-ab COPY PINNED_END_RFC3339 [SAMPLES] [REPORT]\n  widget_query_perf_spike audit-flagged-paths-ab COPY PINNED_END_RFC3339 [SAMPLES] [REPORT]\n  widget_query_perf_spike audit-pending-paths-ab COPY PINNED_END_RFC3339 [SAMPLES] [REPORT]\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike verify-runtime-parity-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike diagnose-project CORPUS PINNED_END_RFC3339 DAYS\n  widget_query_perf_spike hash-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike profile-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
 }
 
 fn path_arg(value: Option<OsString>, name: &str) -> Result<PathBuf, Box<dyn Error>> {
     value
         .map(PathBuf::from)
         .ok_or_else(|| format!("Missing {name}.\n{}", usage()).into())
+}
+
+fn emit_json_report<T: Serialize>(
+    report: &T,
+    report_path: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(report_path) = report_path else {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    };
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(report_path)?;
+    let mut writer = BufWriter::new(&file);
+    serde_json::to_writer_pretty(&mut writer, report)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    drop(writer);
+    file.sync_all()?;
+    println!("report={}", report_path.display());
+    Ok(())
+}
+
+fn secure_analyze_audit_files(corpus: &Path) -> Result<(), Box<dyn Error>> {
+    let mut paths = vec![corpus.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = corpus.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&sidecar)?
+            .sync_all()?;
+        paths.push(sidecar);
+    }
+    for path in paths {
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        #[cfg(not(unix))]
+        {
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&path, permissions)?;
+        }
+    }
+    Ok(())
 }
 
 fn freeze_snapshot(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
@@ -626,6 +681,138 @@ fn main() -> Result<(), Box<dyn Error>> {
                 return Err(format!("Unexpected argument.\n{}", usage()).into());
             }
             freeze_snapshot(&source, &destination)
+        }
+        "prepare-analyze-audit" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            clear_query_planner_stats_for_audit(&corpus)?;
+            secure_analyze_audit_files(&corpus)?;
+            println!("prepared={}", corpus.display());
+            Ok(())
+        }
+        "secure-analyze-audit" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            secure_analyze_audit_files(&corpus)?;
+            println!("secured={}", corpus.display());
+            Ok(())
+        }
+        "audit-analyze" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            let report_path = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let report = audit_widget_query_plans(&corpus, pinned_end)?;
+            emit_json_report(&report, report_path.as_deref())?;
+            if report.verdict != "pass" {
+                return Err(format!(
+                    "Bounded ANALYZE audit failed: plan_regressions={}, timing_regressions={}",
+                    report.plan_regressions, report.timing_regressions
+                )
+                .into());
+            }
+            Ok(())
+        }
+        "audit-model-history-ab" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            let samples = args
+                .next()
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| "SAMPLES must be valid UTF-8".to_string())?
+                        .parse::<usize>()
+                        .map_err(|error| format!("Invalid SAMPLES: {error}"))
+                })
+                .transpose()?
+                .unwrap_or(8);
+            let report_path = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let report = audit_model_history_24h_ab(&corpus, pinned_end, samples)?;
+            emit_json_report(&report, report_path.as_deref())?;
+            if report.verdict != "pass" {
+                return Err(format!(
+                    "Focused model-history A/B failed: median_delta_ms={:.3}, median_ratio={:.3}",
+                    report.median_delta_ms, report.median_ratio
+                )
+                .into());
+            }
+            Ok(())
+        }
+        "audit-flagged-paths-ab" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            let samples = args
+                .next()
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| "SAMPLES must be valid UTF-8".to_string())?
+                        .parse::<usize>()
+                        .map_err(|error| format!("Invalid SAMPLES: {error}"))
+                })
+                .transpose()?
+                .unwrap_or(8);
+            let report_path = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let report = audit_flagged_paths_ab(&corpus, pinned_end, samples)?;
+            emit_json_report(&report, report_path.as_deref())?;
+            if report.verdict != "pass" {
+                return Err("Focused flagged-path A/B failed".into());
+            }
+            Ok(())
+        }
+        "audit-pending-paths-ab" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            let samples = args
+                .next()
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| "SAMPLES must be valid UTF-8".to_string())?
+                        .parse::<usize>()
+                        .map_err(|error| format!("Invalid SAMPLES: {error}"))
+                })
+                .transpose()?
+                .unwrap_or(8);
+            let report_path = args.next().map(PathBuf::from);
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let report = audit_pending_flagged_paths_ab(&corpus, pinned_end, samples)?;
+            emit_json_report(&report, report_path.as_deref())?;
+            if report.verdict != "pass" {
+                return Err("Focused pending-path A/B failed".into());
+            }
+            Ok(())
         }
         "measure" => {
             let corpus = path_arg(args.next(), "CORPUS")?;

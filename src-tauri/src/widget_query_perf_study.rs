@@ -5,6 +5,7 @@
 //! post-processing paths. A thread-local clock pins every range to one exact
 //! endpoint. The frozen corpus is never migrated, cleaned up, or written.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -18,10 +19,14 @@ use crate::models::{LlmRuntimeStats, ModelRange, UsageBucket};
 use crate::rollup_backfill::{
     RollupBackfillControls, RollupBackfillProgress, RollupBackfillTerminal, RollupChunkControl,
 };
-use crate::storage::{Storage, with_model_overview_stage_timings, with_pinned_query_now};
+use crate::storage::{
+    DatabaseAnalysisResult, Storage, WidgetQueryTraceStatement, begin_widget_query_trace,
+    finish_widget_query_trace, set_widget_query_trace_path, with_model_overview_stage_timings,
+    with_pinned_query_now,
+};
 
 /// One cold, app-cache-bypassed endpoint measurement.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WidgetQueryMeasurement {
     pub query: &'static str,
     pub window: &'static str,
@@ -61,7 +66,7 @@ pub struct ModelOverviewProfile {
 }
 
 /// One complete view's backend request set, measured without frontend work.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WidgetViewFanoutMeasurement {
     pub view: &'static str,
     pub window: &'static str,
@@ -72,7 +77,7 @@ pub struct WidgetViewFanoutMeasurement {
 }
 
 /// Reproducible metadata and all baseline measurements from one corpus pass.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct WidgetQueryBenchmarkReport {
     pub corpus_path: String,
     pub corpus_bytes: u64,
@@ -86,6 +91,128 @@ pub struct WidgetQueryBenchmarkReport {
     pub os_page_cache: &'static str,
     pub measurements: Vec<WidgetQueryMeasurement>,
     pub view_fanouts: Vec<WidgetViewFanoutMeasurement>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueryPlannerStatsSnapshot {
+    pub exists: bool,
+    pub rows: i64,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WidgetQueryPlanAuditEntry {
+    pub path: String,
+    pub connection_id: u64,
+    pub sequence: usize,
+    pub sql_shape_sha256: String,
+    pub sql_shape: String,
+    pub before_expanded_sha256: String,
+    pub after_expanded_sha256: String,
+    pub before_plan: Vec<String>,
+    pub after_plan: Vec<String>,
+    pub plan_changed: bool,
+    pub regression_reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WidgetQueryTimingComparison {
+    pub path: String,
+    pub before_cold_ms: f64,
+    pub after_cold_ms: f64,
+    pub before_warm_ms: f64,
+    pub after_warm_ms: f64,
+    pub cold_delta_ms: f64,
+    pub cold_ratio: f64,
+    pub material_regression: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WidgetQueryPlanAuditReport {
+    pub corpus_path: String,
+    pub corpus_bytes_before: u64,
+    pub corpus_bytes_after: u64,
+    pub pinned_end: String,
+    pub sqlite_version: String,
+    pub before_stats: QueryPlannerStatsSnapshot,
+    pub analysis: DatabaseAnalysisResult,
+    pub after_stats: QueryPlannerStatsSnapshot,
+    pub audited_sql_statements: usize,
+    pub changed_plans: usize,
+    pub plan_regressions: usize,
+    pub timing_regressions: usize,
+    pub plans: Vec<WidgetQueryPlanAuditEntry>,
+    pub timings: Vec<WidgetQueryTimingComparison>,
+    pub before_benchmark: WidgetQueryBenchmarkReport,
+    pub after_benchmark: WidgetQueryBenchmarkReport,
+    pub quick_check: String,
+    pub verdict: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelHistoryAbSample {
+    pub state: &'static str,
+    pub ordinal: usize,
+    pub cold_ms: f64,
+    pub warm_ms: f64,
+    pub output_bytes: usize,
+    pub output_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelHistoryAbReport {
+    pub corpus_path: String,
+    pub pinned_end: String,
+    pub samples_per_state: usize,
+    pub initial_stats: QueryPlannerStatsSnapshot,
+    pub statless_samples: Vec<ModelHistoryAbSample>,
+    pub analyzed_samples: Vec<ModelHistoryAbSample>,
+    pub statless_median_cold_ms: f64,
+    pub analyzed_median_cold_ms: f64,
+    pub median_delta_ms: f64,
+    pub median_ratio: f64,
+    pub material_regression: bool,
+    pub plan_comparison: Vec<WidgetQueryPlanAuditEntry>,
+    pub final_analysis: DatabaseAnalysisResult,
+    pub final_stats: QueryPlannerStatsSnapshot,
+    pub quick_check: String,
+    pub verdict: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FlaggedPathAbSample {
+    pub state: &'static str,
+    pub ordinal: usize,
+    pub cold_ms: f64,
+    pub warm_ms: f64,
+    pub output_bytes: usize,
+    pub output_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FlaggedPathAbComparison {
+    pub path: String,
+    pub statless_samples: Vec<FlaggedPathAbSample>,
+    pub analyzed_samples: Vec<FlaggedPathAbSample>,
+    pub statless_median_cold_ms: f64,
+    pub analyzed_median_cold_ms: f64,
+    pub median_delta_ms: f64,
+    pub median_ratio: f64,
+    pub material_regression: bool,
+    pub plan_comparison: Vec<WidgetQueryPlanAuditEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FlaggedPathsAbReport {
+    pub corpus_path: String,
+    pub pinned_end: String,
+    pub samples_per_state: usize,
+    pub initial_stats: QueryPlannerStatsSnapshot,
+    pub comparisons: Vec<FlaggedPathAbComparison>,
+    pub final_analysis: DatabaseAnalysisResult,
+    pub final_stats: QueryPlannerStatsSnapshot,
+    pub quick_check: String,
+    pub verdict: &'static str,
 }
 
 /// Focused repeated measurement for the 30-day session-breakdown budget.
@@ -300,12 +427,14 @@ fn measure<T: Serialize>(
     let storage = Storage::init_widget_query_benchmark(corpus)?;
     let (elapsed_ms, warm_elapsed_ms, output_bytes, output_sha256) =
         with_pinned_query_now(pinned_end, || {
+            set_widget_query_trace_path(format!("query/{}/{query}/cold", window.label));
             let started = Instant::now();
             let value = operation(&storage)?;
             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
             let output = serde_json::to_vec(&value)
                 .map_err(|error| format!("Serialize {query} benchmark output: {error}"))?;
 
+            set_widget_query_trace_path(format!("query/{}/{query}/warm", window.label));
             let warm_started = Instant::now();
             let warm_value = operation(&storage)?;
             let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
@@ -1000,10 +1129,12 @@ fn measure_view_fanout(
     let storage = Storage::init_widget_query_benchmark(corpus)?;
     let (cold_elapsed_ms, warm_elapsed_ms, output_bytes) =
         with_pinned_query_now(pinned_end, || {
+            set_widget_query_trace_path(format!("fanout/{view}/cold"));
             let started = Instant::now();
             let cold_output_bytes = operation(&storage)?;
             let cold_elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
 
+            set_widget_query_trace_path(format!("fanout/{view}/warm"));
             let warm_started = Instant::now();
             let warm_output_bytes = operation(&storage)?;
             let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
@@ -1824,11 +1955,1054 @@ pub fn measure_runtime_90d(
     )
 }
 
+fn planner_stats_snapshot(corpus: &Path) -> Result<QueryPlannerStatsSnapshot, String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        corpus,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Open query-plan audit statistics reader: {error}"))?;
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'sqlite_stat1'
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("Inspect query-plan audit sqlite_stat1: {error}"))?
+        == 1;
+    if !exists {
+        return Ok(QueryPlannerStatsSnapshot {
+            exists: false,
+            rows: 0,
+            sha256: None,
+        });
+    }
+
+    let mut statement = connection
+        .prepare("SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx, stat")
+        .map_err(|error| format!("Prepare query-plan audit statistics snapshot: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Read query-plan audit statistics snapshot: {error}"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| format!("Materialize query-plan audit statistics: {error}"))?;
+    let encoded = serde_json::to_vec(&rows)
+        .map_err(|error| format!("Serialize query-plan audit statistics: {error}"))?;
+    let row_count = i64::try_from(rows.len())
+        .map_err(|_| "sqlite_stat1 row count exceeds SQLite INTEGER range".to_string())?;
+    Ok(QueryPlannerStatsSnapshot {
+        exists: true,
+        rows: row_count,
+        sha256: Some(format!("{:x}", Sha256::digest(encoded))),
+    })
+}
+
+fn capture_widget_query_matrix(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<(WidgetQueryBenchmarkReport, Vec<WidgetQueryTraceStatement>), String> {
+    begin_widget_query_trace()?;
+    let benchmark = run_widget_query_baseline_inner(corpus, pinned_end, false);
+    let trace = finish_widget_query_trace();
+    match (benchmark, trace) {
+        (Ok(benchmark), Ok(trace)) => Ok((benchmark, trace)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(benchmark), Err(trace)) => Err(format!(
+            "Widget query audit failed ({benchmark}); trace cleanup also failed ({trace})"
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct CapturedQueryPlan {
+    path: String,
+    connection_id: u64,
+    sequence: usize,
+    sql_shape_sha256: String,
+    sql_shape: String,
+    expanded_sha256: String,
+    plan: Vec<String>,
+}
+
+fn leading_sql_keyword(sql: &str) -> String {
+    sql.trim_start()
+        .split_once(char::is_whitespace)
+        .map_or_else(
+            || sql.trim().to_string(),
+            |(keyword, _)| keyword.to_string(),
+        )
+        .to_ascii_uppercase()
+}
+
+fn normalized_sql_shape(sql: &str) -> String {
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(sql.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let character = chars[index];
+        if character == '\'' {
+            normalized.push('?');
+            index += 1;
+            while index < chars.len() {
+                if chars[index] == '\'' {
+                    if index + 1 < chars.len() && chars[index + 1] == '\'' {
+                        index += 2;
+                        continue;
+                    }
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+            continue;
+        }
+        let previous_is_identifier =
+            index > 0 && (chars[index - 1].is_ascii_alphanumeric() || chars[index - 1] == '_');
+        if character.is_ascii_digit() && !previous_is_identifier {
+            normalized.push('?');
+            index += 1;
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric()
+                    || matches!(chars[index], '.' | '_' | '+' | '-'))
+            {
+                index += 1;
+            }
+            continue;
+        }
+        normalized.push(character);
+        index += 1;
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn statement_has_query_plan(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "SELECT" | "WITH" | "CREATE" | "INSERT" | "UPDATE" | "DELETE"
+    )
+}
+
+fn statement_changes_replay_state(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "BEGIN"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "CREATE"
+            | "DROP"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+    )
+}
+
+fn explain_production_trace(
+    corpus: &Path,
+    trace: Vec<WidgetQueryTraceStatement>,
+) -> Result<Vec<CapturedQueryPlan>, String> {
+    let mut groups = BTreeMap::<(String, u64), Vec<String>>::new();
+    for statement in trace {
+        if statement.path.ends_with("/cold") {
+            groups
+                .entry((statement.path, statement.connection_id))
+                .or_default()
+                .push(statement.sql);
+        }
+    }
+
+    let mut captured = Vec::new();
+    for ((path, connection_id), statements) in groups {
+        let connection = rusqlite::Connection::open_with_flags(
+            corpus,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Open query-plan replay connection for {path}: {error}"))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("Configure query-plan replay timeout for {path}: {error}"))?;
+        connection
+            .execute_batch(
+                "PRAGMA temp_store = MEMORY;
+                 PRAGMA mmap_size = 268435456;
+                 PRAGMA cache_size = -65536;",
+            )
+            .map_err(|error| {
+                format!("Configure query-plan replay connection for {path}: {error}")
+            })?;
+
+        for (sequence, sql) in statements.into_iter().enumerate() {
+            let keyword = leading_sql_keyword(&sql);
+            if statement_has_query_plan(&keyword) {
+                let mut statement = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .map_err(|error| {
+                        format!(
+                            "Prepare traced query plan for {path} connection {connection_id} statement {sequence}: {error}"
+                        )
+                    })?;
+                let plan = statement
+                    .query_map([], |row| row.get::<_, String>(3))
+                    .map_err(|error| {
+                        format!(
+                            "Execute traced query plan for {path} connection {connection_id} statement {sequence}: {error}"
+                        )
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(|error| {
+                        format!(
+                            "Read traced query plan for {path} connection {connection_id} statement {sequence}: {error}"
+                        )
+                    })?;
+                if !plan.is_empty() {
+                    let sql_shape = normalized_sql_shape(&sql);
+                    captured.push(CapturedQueryPlan {
+                        path: path.clone(),
+                        connection_id,
+                        sequence,
+                        sql_shape_sha256: format!("{:x}", Sha256::digest(sql_shape.as_bytes())),
+                        sql_shape,
+                        expanded_sha256: format!("{:x}", Sha256::digest(sql.as_bytes())),
+                        plan,
+                    });
+                }
+            }
+            if statement_changes_replay_state(&keyword) {
+                connection.execute_batch(&sql).map_err(|error| {
+                    format!(
+                        "Replay traced state for {path} connection {connection_id} statement {sequence}: {error}"
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(captured)
+}
+
+fn plan_index_names(plan: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    for detail in plan {
+        for marker in ["USING COVERING INDEX ", "USING INDEX "] {
+            let Some((_, suffix)) = detail.split_once(marker) else {
+                continue;
+            };
+            let name = suffix
+                .split(|character: char| character.is_whitespace() || character == '(')
+                .next()
+                .unwrap_or_default();
+            if !name.is_empty() && !names.iter().any(|candidate| candidate == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn plan_regression_reasons(before: &[String], after: &[String]) -> Vec<String> {
+    let count = |plan: &[String], marker: &str| {
+        plan.iter().filter(|detail| detail.contains(marker)).count()
+    };
+    let mut reasons = Vec::new();
+    let before_scans = count(before, "SCAN ");
+    let after_scans = count(after, "SCAN ");
+    if after_scans > before_scans {
+        reasons.push(format!(
+            "SCAN count increased from {before_scans} to {after_scans}"
+        ));
+    }
+    let before_searches = count(before, "SEARCH ");
+    let after_searches = count(after, "SEARCH ");
+    if after_searches < before_searches {
+        reasons.push(format!(
+            "SEARCH count decreased from {before_searches} to {after_searches}"
+        ));
+    }
+    let before_temp_order = count(before, "USE TEMP B-TREE");
+    let after_temp_order = count(after, "USE TEMP B-TREE");
+    if after_temp_order > before_temp_order {
+        reasons.push(format!(
+            "temporary ordering structures increased from {before_temp_order} to {after_temp_order}"
+        ));
+    }
+    let after_text = after.join("\n");
+    for index in plan_index_names(before) {
+        if !after_text.contains(&index) {
+            reasons.push(format!("planner stopped using index {index}"));
+        }
+    }
+    reasons
+}
+
+fn compare_captured_plans(
+    before: Vec<CapturedQueryPlan>,
+    after: Vec<CapturedQueryPlan>,
+) -> Result<Vec<WidgetQueryPlanAuditEntry>, String> {
+    let group = |plans: Vec<CapturedQueryPlan>| {
+        let mut grouped = BTreeMap::<(String, String), Vec<CapturedQueryPlan>>::new();
+        for plan in plans {
+            grouped
+                .entry((plan.path.clone(), plan.sql_shape_sha256.clone()))
+                .or_default()
+                .push(plan);
+        }
+        grouped
+    };
+    let before = group(before);
+    let mut after = group(after);
+    if before.keys().ne(after.keys()) {
+        let before_keys = before.keys().cloned().collect::<Vec<_>>();
+        let after_keys = after.keys().cloned().collect::<Vec<_>>();
+        return Err(format!(
+            "Traced production SQL set changed after ANALYZE: before={before_keys:?}, after={after_keys:?}"
+        ));
+    }
+
+    let mut compared = Vec::new();
+    for (key, before_group) in before {
+        let after_group = after
+            .remove(&key)
+            .expect("matching key set was checked above");
+        if before_group.len() != after_group.len() {
+            return Err(format!(
+                "Traced production SQL occurrence count changed after ANALYZE for {}/{}: before={}, after={}",
+                key.0,
+                key.1,
+                before_group.len(),
+                after_group.len()
+            ));
+        }
+        for (before, after) in before_group.into_iter().zip(after_group) {
+            if before.sql_shape != after.sql_shape {
+                return Err(format!(
+                    "Traced production SQL shape digest collision at {}/{}",
+                    before.path, before.sql_shape_sha256
+                ));
+            }
+            let regression_reasons = plan_regression_reasons(&before.plan, &after.plan);
+            compared.push(WidgetQueryPlanAuditEntry {
+                path: before.path,
+                connection_id: before.connection_id,
+                sequence: before.sequence,
+                sql_shape_sha256: before.sql_shape_sha256,
+                sql_shape: before.sql_shape,
+                before_expanded_sha256: before.expanded_sha256,
+                after_expanded_sha256: after.expanded_sha256,
+                plan_changed: before.plan != after.plan,
+                before_plan: before.plan,
+                after_plan: after.plan,
+                regression_reasons,
+            });
+        }
+    }
+    Ok(compared)
+}
+
+fn timing_comparisons(
+    before: &WidgetQueryBenchmarkReport,
+    after: &WidgetQueryBenchmarkReport,
+) -> Result<Vec<WidgetQueryTimingComparison>, String> {
+    let mut before_rows = BTreeMap::<String, (f64, f64, usize)>::new();
+    for measurement in &before.measurements {
+        before_rows.insert(
+            format!("query/{}/{}", measurement.window, measurement.query),
+            (
+                measurement.elapsed_ms,
+                measurement.warm_elapsed_ms,
+                measurement.output_bytes,
+            ),
+        );
+    }
+    for measurement in &before.view_fanouts {
+        before_rows.insert(
+            format!("fanout/{}", measurement.view),
+            (
+                measurement.cold_elapsed_ms,
+                measurement.warm_elapsed_ms,
+                measurement.output_bytes,
+            ),
+        );
+    }
+
+    let mut after_rows = BTreeMap::<String, (f64, f64, usize)>::new();
+    for measurement in &after.measurements {
+        after_rows.insert(
+            format!("query/{}/{}", measurement.window, measurement.query),
+            (
+                measurement.elapsed_ms,
+                measurement.warm_elapsed_ms,
+                measurement.output_bytes,
+            ),
+        );
+    }
+    for measurement in &after.view_fanouts {
+        after_rows.insert(
+            format!("fanout/{}", measurement.view),
+            (
+                measurement.cold_elapsed_ms,
+                measurement.warm_elapsed_ms,
+                measurement.output_bytes,
+            ),
+        );
+    }
+    if before_rows.keys().ne(after_rows.keys()) {
+        return Err("Timed production path set changed after ANALYZE".to_string());
+    }
+
+    before_rows
+        .into_iter()
+        .map(|(path, (before_cold_ms, before_warm_ms, before_bytes))| {
+            let (after_cold_ms, after_warm_ms, after_bytes) = after_rows[&path];
+            if before_bytes != after_bytes {
+                return Err(format!(
+                    "Serialized output size changed after ANALYZE for {path}: before={before_bytes}, after={after_bytes}"
+                ));
+            }
+            let cold_delta_ms = after_cold_ms - before_cold_ms;
+            let cold_ratio = if before_cold_ms > 0.0 {
+                after_cold_ms / before_cold_ms
+            } else if after_cold_ms == 0.0 {
+                1.0
+            } else {
+                f64::INFINITY
+            };
+            // Ignore sub-5 ms scheduler noise; above that floor, a 25% cold
+            // slowdown is material enough to block a planner-statistics change.
+            let material_regression = cold_delta_ms > 5.0 && cold_ratio > 1.25;
+            Ok(WidgetQueryTimingComparison {
+                path,
+                before_cold_ms,
+                after_cold_ms,
+                before_warm_ms,
+                after_warm_ms,
+                cold_delta_ms,
+                cold_ratio,
+                material_regression,
+            })
+        })
+        .collect()
+}
+
+/// Audit bounded ANALYZE against every production SQL statement exercised by
+/// the feature-020 endpoint and view-fanout matrix.
+// @lat: [[backend#Database#Database compaction#Bounded Query Planner Analysis]]
+pub fn audit_widget_query_plans(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+) -> Result<WidgetQueryPlanAuditReport, String> {
+    let canonical = corpus
+        .canonicalize()
+        .map_err(|error| format!("Resolve writable query-plan audit copy: {error}"))?;
+    let before_metadata = canonical
+        .metadata()
+        .map_err(|error| format!("Read writable query-plan audit copy metadata: {error}"))?;
+    if !before_metadata.is_file() {
+        return Err(format!(
+            "Query-plan audit copy is not a file: {}",
+            canonical.display()
+        ));
+    }
+    if before_metadata.permissions().readonly() {
+        return Err(format!(
+            "Query-plan audit requires a disposable writable copy: {}",
+            canonical.display()
+        ));
+    }
+
+    let before_stats = planner_stats_snapshot(&canonical)?;
+    if before_stats.rows != 0 {
+        return Err(format!(
+            "Query-plan audit copy already contains {} sqlite_stat1 rows",
+            before_stats.rows
+        ));
+    }
+    let (before_benchmark, before_trace) = capture_widget_query_matrix(&canonical, pinned_end)?;
+    let before_plans = explain_production_trace(&canonical, before_trace)?;
+
+    let analysis_storage = Storage::init_widget_query_maintenance_audit(&canonical)?;
+    let analysis = analysis_storage.run_bounded_database_analysis()?;
+    drop(analysis_storage);
+    let after_stats = planner_stats_snapshot(&canonical)?;
+    if !after_stats.exists || after_stats.rows <= 0 {
+        return Err(format!(
+            "Bounded ANALYZE did not populate sqlite_stat1: exists={}, rows={}",
+            after_stats.exists, after_stats.rows
+        ));
+    }
+
+    let (after_benchmark, after_trace) = capture_widget_query_matrix(&canonical, pinned_end)?;
+    let after_plans = explain_production_trace(&canonical, after_trace)?;
+    let plans = compare_captured_plans(before_plans, after_plans)?;
+    let timings = timing_comparisons(&before_benchmark, &after_benchmark)?;
+    let changed_plans = plans.iter().filter(|entry| entry.plan_changed).count();
+    let plan_regressions = plans
+        .iter()
+        .filter(|entry| !entry.regression_reasons.is_empty())
+        .count();
+    let timing_regressions = timings
+        .iter()
+        .filter(|timing| timing.material_regression)
+        .count();
+
+    let validation = rusqlite::Connection::open_with_flags(
+        &canonical,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Open analyzed audit copy for validation: {error}"))?;
+    let quick_check = validation
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Validate analyzed query-plan audit copy: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Analyzed query-plan audit copy quick_check failed: {quick_check}"
+        ));
+    }
+    let after_metadata = canonical
+        .metadata()
+        .map_err(|error| format!("Read analyzed query-plan audit copy metadata: {error}"))?;
+    let verdict = if plan_regressions == 0 && timing_regressions == 0 {
+        "pass"
+    } else {
+        "fail"
+    };
+
+    Ok(WidgetQueryPlanAuditReport {
+        corpus_path: canonical.display().to_string(),
+        corpus_bytes_before: before_metadata.len(),
+        corpus_bytes_after: after_metadata.len(),
+        pinned_end: pinned_end.to_rfc3339(),
+        sqlite_version: rusqlite::version().to_string(),
+        before_stats,
+        analysis,
+        after_stats,
+        audited_sql_statements: plans.len(),
+        changed_plans,
+        plan_regressions,
+        timing_regressions,
+        plans,
+        timings,
+        before_benchmark,
+        after_benchmark,
+        quick_check,
+        verdict,
+    })
+}
+
+/// Remove planner statistics from a disposable audit copy, reload statless
+/// planner state, and truncate its WAL.
+pub fn clear_query_planner_stats_for_audit(corpus: &Path) -> Result<(), String> {
+    let mut connection = rusqlite::Connection::open_with_flags(
+        corpus,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Open focused A/B statistics writer: {error}"))?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| format!("Configure focused A/B statistics timeout: {error}"))?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| format!("Begin focused A/B statistics clear: {error}"))?;
+    tx.execute("DELETE FROM sqlite_stat1", [])
+        .map_err(|error| format!("Clear focused A/B sqlite_stat1 rows: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("Commit focused A/B statistics clear: {error}"))?;
+    connection
+        .execute_batch("ANALYZE sqlite_schema;")
+        .map_err(|error| format!("Reload statless focused A/B planner state: {error}"))?;
+    let (busy, log_frames, checkpointed_frames) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Checkpoint focused A/B statistics clear: {error}"))?;
+    if busy != 0 || log_frames != checkpointed_frames {
+        return Err(format!(
+            "Focused A/B statless checkpoint incomplete: busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}"
+        ));
+    }
+    let remaining = connection
+        .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|error| format!("Verify focused A/B statless planner state: {error}"))?;
+    if remaining != 0 {
+        return Err(format!(
+            "Focused A/B statistics clear left {remaining} sqlite_stat1 rows"
+        ));
+    }
+    Ok(())
+}
+
+fn measure_model_history_ab_sample(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    state: &'static str,
+    ordinal: usize,
+) -> Result<(ModelHistoryAbSample, Vec<WidgetQueryTraceStatement>), String> {
+    begin_widget_query_trace()?;
+    let measurement = (|| -> Result<ModelHistoryAbSample, String> {
+        let storage = Storage::init_widget_query_benchmark(corpus)?;
+        with_pinned_query_now(pinned_end, || {
+            set_widget_query_trace_path("focused/model_history_24h/cold");
+            let cold_started = Instant::now();
+            let cold = storage.get_model_history(ModelRange::TwentyFourHours, None, None)?;
+            let cold_ms = cold_started.elapsed().as_secs_f64() * 1_000.0;
+            let cold = serde_json::to_vec(&cold)
+                .map_err(|error| format!("Serialize focused cold model history: {error}"))?;
+
+            set_widget_query_trace_path("focused/model_history_24h/warm");
+            let warm_started = Instant::now();
+            let warm = storage.get_model_history(ModelRange::TwentyFourHours, None, None)?;
+            let warm_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
+            let warm = serde_json::to_vec(&warm)
+                .map_err(|error| format!("Serialize focused warm model history: {error}"))?;
+            if cold != warm {
+                return Err(format!(
+                    "Focused {state} model-history cold and warm outputs differ"
+                ));
+            }
+            Ok(ModelHistoryAbSample {
+                state,
+                ordinal,
+                cold_ms,
+                warm_ms,
+                output_bytes: cold.len(),
+                output_sha256: format!("{:x}", Sha256::digest(&cold)),
+            })
+        })
+    })();
+    let trace = finish_widget_query_trace();
+    match (measurement, trace) {
+        (Ok(measurement), Ok(trace)) => Ok((measurement, trace)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(measurement), Err(trace)) => Err(format!(
+            "Focused model-history A/B failed ({measurement}); trace cleanup also failed ({trace})"
+        )),
+    }
+}
+
+fn median(values: impl IntoIterator<Item = f64>) -> Result<f64, String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err("Cannot compute median of an empty sample set".to_string());
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Ok(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+/// Recheck a flagged model-history timing with repeated statless/analyzed
+/// pairs on the same disposable copy.
+pub fn audit_model_history_24h_ab(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    samples_per_state: usize,
+) -> Result<ModelHistoryAbReport, String> {
+    let samples_per_state = samples_per_state.clamp(2, 20);
+    let canonical = corpus
+        .canonicalize()
+        .map_err(|error| format!("Resolve focused model-history A/B copy: {error}"))?;
+    let initial_stats = planner_stats_snapshot(&canonical)?;
+    if !initial_stats.exists || initial_stats.rows <= 0 {
+        return Err("Focused model-history A/B requires the analyzed audit copy".to_string());
+    }
+
+    let mut statless_samples = Vec::with_capacity(samples_per_state);
+    let mut analyzed_samples = Vec::with_capacity(samples_per_state);
+    let mut statless_plan = None;
+    let mut analyzed_plan = None;
+    let mut final_analysis = None;
+    for ordinal in 0..samples_per_state {
+        clear_query_planner_stats_for_audit(&canonical)?;
+        let (statless, trace) =
+            measure_model_history_ab_sample(&canonical, pinned_end, "statless", ordinal)?;
+        if statless_plan.is_none() {
+            statless_plan = Some(explain_production_trace(&canonical, trace)?);
+        }
+        statless_samples.push(statless);
+
+        let storage = Storage::init_widget_query_maintenance_audit(&canonical)?;
+        final_analysis = Some(storage.run_bounded_database_analysis()?);
+        drop(storage);
+        let (analyzed, trace) =
+            measure_model_history_ab_sample(&canonical, pinned_end, "analyzed", ordinal)?;
+        if analyzed_plan.is_none() {
+            analyzed_plan = Some(explain_production_trace(&canonical, trace)?);
+        }
+        analyzed_samples.push(analyzed);
+    }
+
+    let mut output_hashes = statless_samples
+        .iter()
+        .chain(&analyzed_samples)
+        .map(|sample| (sample.output_bytes, sample.output_sha256.as_str()));
+    let Some(expected_output) = output_hashes.next() else {
+        return Err("Focused model-history A/B produced no samples".to_string());
+    };
+    if output_hashes.any(|output| output != expected_output) {
+        return Err("Focused model-history A/B output hashes differ".to_string());
+    }
+
+    let statless_median_cold_ms = median(statless_samples.iter().map(|sample| sample.cold_ms))?;
+    let analyzed_median_cold_ms = median(analyzed_samples.iter().map(|sample| sample.cold_ms))?;
+    let median_delta_ms = analyzed_median_cold_ms - statless_median_cold_ms;
+    let median_ratio = analyzed_median_cold_ms / statless_median_cold_ms;
+    let material_regression = median_delta_ms > 5.0 && median_ratio > 1.25;
+    let plan_comparison = compare_captured_plans(
+        statless_plan.expect("first statless sample records a plan"),
+        analyzed_plan.expect("first analyzed sample records a plan"),
+    )?;
+    let plan_regression = plan_comparison
+        .iter()
+        .any(|entry| !entry.regression_reasons.is_empty());
+    let final_stats = planner_stats_snapshot(&canonical)?;
+    if !final_stats.exists || final_stats.rows <= 0 {
+        return Err("Focused model-history A/B did not restore sqlite_stat1".to_string());
+    }
+    let validation = rusqlite::Connection::open_with_flags(
+        &canonical,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Open focused model-history A/B validation: {error}"))?;
+    let quick_check = validation
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Validate focused model-history A/B copy: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Focused model-history A/B quick_check failed: {quick_check}"
+        ));
+    }
+    let verdict = if material_regression || plan_regression {
+        "fail"
+    } else {
+        "pass"
+    };
+    Ok(ModelHistoryAbReport {
+        corpus_path: canonical.display().to_string(),
+        pinned_end: pinned_end.to_rfc3339(),
+        samples_per_state,
+        initial_stats,
+        statless_samples,
+        analyzed_samples,
+        statless_median_cold_ms,
+        analyzed_median_cold_ms,
+        median_delta_ms,
+        median_ratio,
+        material_regression,
+        plan_comparison,
+        final_analysis: final_analysis.expect("sample count is clamped above zero"),
+        final_stats,
+        quick_check,
+        verdict,
+    })
+}
+
+const FLAGGED_ANALYZE_PATHS: [&str; 4] = [
+    "fanout/Context",
+    "query/24h/get_all_bucket_stats",
+    "query/24h/get_model_usage_overview",
+    "query/30d/get_all_bucket_stats",
+];
+const PENDING_FLAGGED_ANALYZE_PATHS: [&str; 2] = [
+    "query/24h/get_all_bucket_stats",
+    "query/90d/get_hook_breakdown",
+];
+
+fn timed_serialized_output<T: Serialize>(
+    path: &str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<(f64, Vec<u8>), String> {
+    let started = Instant::now();
+    let value = operation()?;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let output = serde_json::to_vec(&value)
+        .map_err(|error| format!("Serialize flagged ANALYZE path {path}: {error}"))?;
+    Ok((elapsed_ms, output))
+}
+
+fn timed_flagged_audit_path(
+    storage: &Storage,
+    path: &str,
+    current_buckets: &[UsageBucket],
+) -> Result<(f64, Vec<u8>), String> {
+    match path {
+        "fanout/Context" => timed_serialized_output(path, || {
+            storage.get_context_savings_analytics("30d", Some(40))
+        }),
+        "query/24h/get_all_bucket_stats" => {
+            timed_serialized_output(path, || storage.get_all_bucket_stats(current_buckets, 1))
+        }
+        "query/24h/get_model_usage_overview" => timed_serialized_output(path, || {
+            storage.get_model_usage_overview(ModelRange::TwentyFourHours, None)
+        }),
+        "query/30d/get_all_bucket_stats" => {
+            timed_serialized_output(path, || storage.get_all_bucket_stats(current_buckets, 30))
+        }
+        "query/90d/get_hook_breakdown" => timed_serialized_output(path, || {
+            storage.get_hook_breakdown("90d", None, false, Some(100))
+        }),
+        unexpected => Err(format!("Unsupported flagged ANALYZE path: {unexpected}")),
+    }
+}
+
+fn measure_flagged_audit_path_sample(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    path: &str,
+    current_buckets: &[UsageBucket],
+    state: &'static str,
+    ordinal: usize,
+) -> Result<(FlaggedPathAbSample, Vec<WidgetQueryTraceStatement>), String> {
+    begin_widget_query_trace()?;
+    let measurement = (|| -> Result<FlaggedPathAbSample, String> {
+        let storage = Storage::init_widget_query_benchmark(corpus)?;
+        with_pinned_query_now(pinned_end, || {
+            set_widget_query_trace_path(format!("{path}/cold"));
+            let (cold_ms, cold) = timed_flagged_audit_path(&storage, path, current_buckets)?;
+
+            set_widget_query_trace_path(format!("{path}/warm"));
+            let (warm_ms, warm) = timed_flagged_audit_path(&storage, path, current_buckets)?;
+            if cold != warm {
+                return Err(format!(
+                    "Flagged {state} path {path} cold and warm outputs differ"
+                ));
+            }
+            Ok(FlaggedPathAbSample {
+                state,
+                ordinal,
+                cold_ms,
+                warm_ms,
+                output_bytes: cold.len(),
+                output_sha256: format!("{:x}", Sha256::digest(&cold)),
+            })
+        })
+    })();
+    let trace = finish_widget_query_trace();
+    match (measurement, trace) {
+        (Ok(measurement), Ok(trace)) => Ok((measurement, trace)),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(measurement), Err(trace)) => Err(format!(
+            "Flagged path A/B failed ({measurement}); trace cleanup also failed ({trace})"
+        )),
+    }
+}
+
+#[derive(Default)]
+struct FlaggedPathAbAccumulator {
+    statless_samples: Vec<FlaggedPathAbSample>,
+    analyzed_samples: Vec<FlaggedPathAbSample>,
+    statless_plan: Option<Vec<CapturedQueryPlan>>,
+    analyzed_plan: Option<Vec<CapturedQueryPlan>>,
+}
+
+fn audit_paths_ab(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    samples_per_state: usize,
+    paths: &[&str],
+) -> Result<FlaggedPathsAbReport, String> {
+    let samples_per_state = samples_per_state.clamp(2, 20);
+    let canonical = corpus
+        .canonicalize()
+        .map_err(|error| format!("Resolve flagged path A/B copy: {error}"))?;
+    let initial_stats = planner_stats_snapshot(&canonical)?;
+    if !initial_stats.exists || initial_stats.rows <= 0 {
+        return Err("Flagged path A/B requires the analyzed audit copy".to_string());
+    }
+    let current_buckets = latest_usage_buckets(&canonical)?;
+    let mut accumulators = BTreeMap::<String, FlaggedPathAbAccumulator>::new();
+    for &path in paths {
+        accumulators.insert(path.to_string(), FlaggedPathAbAccumulator::default());
+    }
+
+    let mut final_analysis = None;
+    for ordinal in 0..samples_per_state {
+        for &path in paths {
+            clear_query_planner_stats_for_audit(&canonical)?;
+            let (statless, trace) = measure_flagged_audit_path_sample(
+                &canonical,
+                pinned_end,
+                path,
+                &current_buckets,
+                "statless",
+                ordinal,
+            )?;
+            let accumulator = accumulators
+                .get_mut(path)
+                .expect("all flagged paths have accumulators");
+            if accumulator.statless_plan.is_none() {
+                accumulator.statless_plan = Some(explain_production_trace(&canonical, trace)?);
+            }
+            accumulator.statless_samples.push(statless);
+
+            let storage = Storage::init_widget_query_maintenance_audit(&canonical)?;
+            final_analysis = Some(storage.run_bounded_database_analysis()?);
+            drop(storage);
+            let (analyzed, trace) = measure_flagged_audit_path_sample(
+                &canonical,
+                pinned_end,
+                path,
+                &current_buckets,
+                "analyzed",
+                ordinal,
+            )?;
+            let accumulator = accumulators
+                .get_mut(path)
+                .expect("all flagged paths have accumulators");
+            if accumulator.analyzed_plan.is_none() {
+                accumulator.analyzed_plan = Some(explain_production_trace(&canonical, trace)?);
+            }
+            accumulator.analyzed_samples.push(analyzed);
+        }
+    }
+
+    let mut comparisons = Vec::with_capacity(paths.len());
+    for &path in paths {
+        let accumulator = accumulators
+            .remove(path)
+            .expect("all flagged paths have completed accumulators");
+        let mut outputs = accumulator
+            .statless_samples
+            .iter()
+            .chain(&accumulator.analyzed_samples)
+            .map(|sample| (sample.output_bytes, sample.output_sha256.as_str()));
+        let Some(expected_output) = outputs.next() else {
+            return Err(format!("Flagged path A/B produced no samples for {path}"));
+        };
+        if outputs.any(|output| output != expected_output) {
+            return Err(format!("Flagged path A/B output hashes differ for {path}"));
+        }
+        let statless_median_cold_ms = median(
+            accumulator
+                .statless_samples
+                .iter()
+                .map(|sample| sample.cold_ms),
+        )?;
+        let analyzed_median_cold_ms = median(
+            accumulator
+                .analyzed_samples
+                .iter()
+                .map(|sample| sample.cold_ms),
+        )?;
+        let median_delta_ms = analyzed_median_cold_ms - statless_median_cold_ms;
+        let median_ratio = analyzed_median_cold_ms / statless_median_cold_ms;
+        let material_regression = median_delta_ms > 5.0 && median_ratio > 1.25;
+        let plan_comparison = compare_captured_plans(
+            accumulator
+                .statless_plan
+                .expect("first statless sample records a plan"),
+            accumulator
+                .analyzed_plan
+                .expect("first analyzed sample records a plan"),
+        )?;
+        comparisons.push(FlaggedPathAbComparison {
+            path: path.to_string(),
+            statless_samples: accumulator.statless_samples,
+            analyzed_samples: accumulator.analyzed_samples,
+            statless_median_cold_ms,
+            analyzed_median_cold_ms,
+            median_delta_ms,
+            median_ratio,
+            material_regression,
+            plan_comparison,
+        });
+    }
+
+    let final_stats = planner_stats_snapshot(&canonical)?;
+    if !final_stats.exists || final_stats.rows <= 0 {
+        return Err("Flagged path A/B did not restore sqlite_stat1".to_string());
+    }
+    let validation = rusqlite::Connection::open_with_flags(
+        &canonical,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("Open flagged path A/B validation: {error}"))?;
+    let quick_check = validation
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Validate flagged path A/B copy: {error}"))?;
+    if quick_check != "ok" {
+        return Err(format!(
+            "Flagged path A/B quick_check failed: {quick_check}"
+        ));
+    }
+    let failed = comparisons.iter().any(|comparison| {
+        comparison.material_regression
+            || comparison
+                .plan_comparison
+                .iter()
+                .any(|plan| !plan.regression_reasons.is_empty())
+    });
+    Ok(FlaggedPathsAbReport {
+        corpus_path: canonical.display().to_string(),
+        pinned_end: pinned_end.to_rfc3339(),
+        samples_per_state,
+        initial_stats,
+        comparisons,
+        final_analysis: final_analysis.expect("sample count is clamped above zero"),
+        final_stats,
+        quick_check,
+        verdict: if failed { "fail" } else { "pass" },
+    })
+}
+
+/// Recheck every timing row flagged by the completed-state full audit through
+/// exact-path alternating statless/analyzed pairs.
+pub fn audit_flagged_paths_ab(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    samples_per_state: usize,
+) -> Result<FlaggedPathsAbReport, String> {
+    audit_paths_ab(
+        corpus,
+        pinned_end,
+        samples_per_state,
+        &FLAGGED_ANALYZE_PATHS,
+    )
+}
+
+/// Recheck both pending-state timing flags without running completed-state
+/// queries between each statless/analyzed pair.
+pub fn audit_pending_flagged_paths_ab(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    samples_per_state: usize,
+) -> Result<FlaggedPathsAbReport, String> {
+    audit_paths_ab(
+        corpus,
+        pinned_end,
+        samples_per_state,
+        &PENDING_FLAGGED_ANALYZE_PATHS,
+    )
+}
+
 /// Run the complete BEFORE query matrix against one immutable corpus.
 // @lat: [[backend#Database#Widget query benchmark corpus]]
 pub fn run_widget_query_baseline(
     corpus: &Path,
     pinned_end: DateTime<Utc>,
+) -> Result<WidgetQueryBenchmarkReport, String> {
+    run_widget_query_baseline_inner(corpus, pinned_end, true)
+}
+
+fn run_widget_query_baseline_inner(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    require_read_only: bool,
 ) -> Result<WidgetQueryBenchmarkReport, String> {
     let canonical = corpus
         .canonicalize()
@@ -1842,7 +3016,7 @@ pub fn run_widget_query_baseline(
             canonical.display()
         ));
     }
-    if !metadata.permissions().readonly() {
+    if require_read_only && !metadata.permissions().readonly() {
         return Err(format!(
             "Widget query benchmark corpus must be read-only: {}",
             canonical.display()

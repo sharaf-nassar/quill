@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
@@ -103,6 +104,88 @@ use crate::models::{
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
 pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 37;
+
+/// Approximate rows examined per index by the manual maintenance ANALYZE.
+pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
+
+#[derive(Clone, Debug)]
+pub(crate) struct WidgetQueryTraceStatement {
+    pub(crate) path: String,
+    pub(crate) connection_id: u64,
+    pub(crate) sql: String,
+}
+
+#[derive(Default)]
+struct WidgetQueryTraceState {
+    path: String,
+    connection_id: u64,
+    statements: Vec<WidgetQueryTraceStatement>,
+}
+
+thread_local! {
+    static WIDGET_QUERY_TRACE: RefCell<Option<WidgetQueryTraceState>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn begin_widget_query_trace() -> Result<(), String> {
+    WIDGET_QUERY_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        if trace.is_some() {
+            return Err("Widget query SQL trace is already active on this thread".to_string());
+        }
+        *trace = Some(WidgetQueryTraceState::default());
+        Ok(())
+    })
+}
+
+pub(crate) fn set_widget_query_trace_path(path: impl Into<String>) {
+    WIDGET_QUERY_TRACE.with(|trace| {
+        if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.path = path.into();
+        }
+    });
+}
+
+pub(crate) fn finish_widget_query_trace() -> Result<Vec<WidgetQueryTraceStatement>, String> {
+    WIDGET_QUERY_TRACE.with(|trace| {
+        trace
+            .borrow_mut()
+            .take()
+            .map(|trace| trace.statements)
+            .ok_or_else(|| "Widget query SQL trace is not active on this thread".to_string())
+    })
+}
+
+fn widget_query_trace_is_active() -> bool {
+    WIDGET_QUERY_TRACE.with(|trace| trace.borrow().is_some())
+}
+
+fn record_widget_query_statement(sql: &str) {
+    WIDGET_QUERY_TRACE.with(|trace| {
+        let mut trace = trace.borrow_mut();
+        let Some(trace) = trace.as_mut() else {
+            return;
+        };
+        if trace.path.is_empty() {
+            return;
+        }
+        trace.statements.push(WidgetQueryTraceStatement {
+            path: trace.path.clone(),
+            connection_id: trace.connection_id,
+            sql: sql.to_string(),
+        });
+    });
+}
+
+fn attach_widget_query_trace(conn: &mut Connection) {
+    if widget_query_trace_is_active() {
+        WIDGET_QUERY_TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.connection_id = trace.connection_id.saturating_add(1);
+            }
+        });
+        conn.trace(Some(record_widget_query_statement));
+    }
+}
 
 const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
@@ -1900,9 +1983,10 @@ const MODEL_SOURCE_STATE_COLUMNS: &str = "
 
 /// Read-path filter selecting active (non-suppressed) model-source ownership.
 /// Deletion keeps each removed fingerprint as durable suppression, so every
-/// aggregate, history, paging, and chain query joins
+/// aggregate, history, paging, and chain query checks
 /// `model_observation_sources` (aliased `source`) and applies this predicate;
-/// omitting it at any read site would leak suppressed evidence back into
+/// callers may join when they project source columns or use `EXISTS` when they
+/// only need membership. Omitting it would leak suppressed evidence back into
 /// results. This single definition mirrors the write-side suppression
 /// invariant composed by [`suppress_model_sources_update_sql`]. It is a
 /// compile-time constant with no runtime values, so interpolating it via
@@ -5375,6 +5459,17 @@ pub(crate) struct DatabaseCompactionResult {
     pub(crate) bytes_after: u64,
 }
 
+/// Evidence returned by the bounded planner-statistics maintenance step.
+#[derive(Debug, serde::Serialize)]
+pub struct DatabaseAnalysisResult {
+    pub analysis_limit: i64,
+    pub elapsed_ms: f64,
+    pub total_elapsed_ms: f64,
+    pub sqlite_stat1_rows: i64,
+    pub checkpoint_log_frames: i64,
+    pub checkpointed_frames: i64,
+}
+
 fn skipped_database_compaction(
     bytes_before: u64,
     reason: impl Into<String>,
@@ -6158,7 +6253,7 @@ impl Storage {
     /// Open a frozen performance corpus without running migrations, cleanup,
     /// retention, or any other startup mutation.
     pub(crate) fn init_widget_query_benchmark(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -6172,7 +6267,29 @@ impl Storage {
              PRAGMA query_only = ON;",
         )
         .map_err(|error| format!("Configure widget query benchmark reader: {error}"))?;
+        attach_widget_query_trace(&mut conn);
 
+        Ok(Self {
+            conn: Mutex::new(conn),
+            db_path: path.to_path_buf(),
+            model_analytics_cache: Mutex::new(HashMap::new()),
+            model_usage_overview_cache: Mutex::new(HashMap::new()),
+            model_history_cache: Mutex::new(HashMap::new()),
+            bucket_stats_cache: Mutex::new(HashMap::new()),
+            context_savings_analytics_cache: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Open a disposable writable corpus copy for the feature-020 ANALYZE
+    /// audit without running migrations, cleanup, or startup maintenance.
+    pub(crate) fn init_widget_query_maintenance_audit(path: &Path) -> Result<Self, String> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Open writable widget query audit copy: {error}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Configure writable widget query audit timeout: {error}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -8743,7 +8860,7 @@ impl Storage {
     /// observes one WAL snapshot without using the writer connection mutex.
     // @lat: [[backend#Database#View Query Reader Connections]]
     fn open_view_reader(&self) -> Result<Connection, String> {
-        let conn = Connection::open_with_flags(
+        let mut conn = Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -8760,6 +8877,7 @@ impl Storage {
              PRAGMA cache_size = -65536;",
         )
         .map_err(|error| format!("Configure view reader pragmas: {error}"))?;
+        attach_widget_query_trace(&mut conn);
         Ok(conn)
     }
 
@@ -8866,6 +8984,114 @@ impl Storage {
                 format!("Could not inspect compacted database: {error}"),
             ),
         }
+    }
+
+    /// Refresh planner statistics after a successful manual compaction.
+    ///
+    /// The caller owns the blocking ingest-quiesce lease. Statistics are
+    /// collected on a dedicated connection with an approximate per-index row
+    /// limit, committed atomically, and checkpointed before the lease is
+    /// released. Existing result caches remain valid because ANALYZE cannot
+    /// change query results; only the writer connection's prepared plans need
+    /// to be expired and reloaded.
+    // @lat: [[backend#Database#Database compaction#Bounded Query Planner Analysis]]
+    pub(crate) fn run_bounded_database_analysis(&self) -> Result<DatabaseAnalysisResult, String> {
+        let maintenance_started = Instant::now();
+        let mut connection = Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| format!("Open dedicated database connection for ANALYZE: {error}"))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Configure ANALYZE timeout: {error}"))?;
+
+        let applied_limit = connection
+            .query_row(
+                &format!("PRAGMA analysis_limit = {DATABASE_ANALYSIS_LIMIT}"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Set bounded ANALYZE row limit: {error}"))?;
+        if applied_limit != DATABASE_ANALYSIS_LIMIT {
+            return Err(format!(
+                "SQLite applied ANALYZE row limit {applied_limit}, expected {DATABASE_ANALYSIS_LIMIT}"
+            ));
+        }
+
+        let started = Instant::now();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Begin bounded ANALYZE transaction: {error}"))?;
+        tx.execute_batch("ANALYZE;")
+            .map_err(|error| format!("Collect bounded database statistics: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Commit bounded database statistics: {error}"))?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+        let stat1_exists = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'sqlite_stat1'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("Verify sqlite_stat1 after ANALYZE: {error}"))?;
+        if stat1_exists != 1 {
+            return Err("Bounded ANALYZE completed without creating sqlite_stat1".to_string());
+        }
+        let sqlite_stat1_rows = connection
+            .query_row("SELECT COUNT(*) FROM sqlite_stat1", [], |row| row.get(0))
+            .map_err(|error| format!("Count sqlite_stat1 rows after ANALYZE: {error}"))?;
+
+        let writer_reload = (|| -> Result<(), String> {
+            let writer = self.conn.lock();
+            writer
+                .execute_batch("ANALYZE sqlite_schema;")
+                .map_err(|error| format!("Reload writer query-planner statistics: {error}"))?;
+            writer.flush_prepared_statement_cache();
+            Ok(())
+        })();
+
+        let checkpoint = connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| format!("Checkpoint bounded ANALYZE transaction: {error}"))
+            .and_then(
+                |(checkpoint_busy, checkpoint_log_frames, checkpointed_frames)| {
+                    if checkpoint_busy != 0 || checkpointed_frames != checkpoint_log_frames {
+                        Err(format!(
+                            "Bounded ANALYZE checkpoint incomplete: busy={checkpoint_busy}, log_frames={checkpoint_log_frames}, checkpointed_frames={checkpointed_frames}"
+                        ))
+                    } else {
+                        Ok((checkpoint_log_frames, checkpointed_frames))
+                    }
+                },
+            );
+        let (checkpoint_log_frames, checkpointed_frames) = match (writer_reload, checkpoint) {
+            (Ok(()), Ok(checkpoint)) => checkpoint,
+            (Err(reload), Ok(_)) => return Err(reload),
+            (Ok(()), Err(checkpoint)) => return Err(checkpoint),
+            (Err(reload), Err(checkpoint)) => {
+                return Err(format!("{reload}; additionally, {checkpoint}"));
+            }
+        };
+
+        Ok(DatabaseAnalysisResult {
+            analysis_limit: applied_limit,
+            elapsed_ms,
+            total_elapsed_ms: maintenance_started.elapsed().as_secs_f64() * 1_000.0,
+            sqlite_stat1_rows,
+            checkpoint_log_frames,
+            checkpointed_frames,
+        })
     }
 
     /// Read the migration-28 singleton without changing backfill state.
@@ -9992,10 +10218,14 @@ impl Storage {
             .map_err(|error| format!("Query model overview totals: {error}"))?;
         mark_model_overview_stage("totals");
 
+        // This time-range grouping is deliberately pinned: bounded ANALYZE
+        // otherwise substitutes the derived-model skip-scan even though this
+        // query neither filters nor groups on derived model identity.
         let represented_provider_sql = if building_index {
             format!(
                 "SELECT observation.provider
                  FROM model_usage_observations AS observation
+                      INDEXED BY idx_model_observations_observed_provider
                  JOIN model_observation_sources AS source
                    ON source.provider = observation.provider
                   AND source.source_key = observation.source_key
@@ -11048,10 +11278,13 @@ impl Storage {
                             + COALESCE(observation.cache_creation_tokens, 0)
                             + COALESCE(observation.cache_read_tokens, 0) AS token_amount
                  FROM model_usage_observations AS observation
-                 JOIN model_observation_sources AS source
-                   ON source.provider = observation.provider
-                  AND source.source_key = observation.source_key
-                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
+                 WHERE EXISTS (
+                       SELECT 1
+                       FROM model_observation_sources AS source
+                       WHERE source.provider = observation.provider
+                         AND source.source_key = observation.source_key
+                         AND {ACTIVE_MODEL_SOURCE_PREDICATE}
+                   )
                    AND observation.observed_at_ms >= ?1
                    AND observation.observed_at_ms < ?2
                    AND (?4 IS NULL OR observation.provider = ?4)
@@ -13437,6 +13670,9 @@ impl Storage {
         let conn = self.conn.lock();
         let window = token_series_window(&conn, range, buckets)?;
 
+        // Keep the provider-leading grouping index in both planner states.
+        // Bounded ANALYZE otherwise substitutes a timestamp skip-scan whose
+        // cost was not proven across this aggregation's supported windows.
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT provider,
@@ -13444,7 +13680,7 @@ impl Storage {
                         COALESCE(SUM(input_tokens + output_tokens
                                      + cache_creation_input_tokens
                                      + cache_read_input_tokens), 0)
-                 FROM token_snapshots
+                 FROM token_snapshots INDEXED BY idx_token_snap_provider_session_sidechain
                  WHERE timestamp >= ?1
                  GROUP BY 1, 2"
             ))
@@ -14395,6 +14631,9 @@ impl Storage {
         // retained aggregate uses its overlapping first UTC day because its
         // daily grain cannot represent the partial boundary day without
         // under-counting a retained sub-agent.
+        // Grouping is provider/session-led for every supported filter shape.
+        // Pin that access path so planner statistics cannot substitute the
+        // unrelated provider/timestamp skip-scan audited on the frozen corpus.
         let mut sql = String::from(
             "WITH tok AS MATERIALIZED (
                  SELECT provider, session_id, hostname,
@@ -14404,7 +14643,7 @@ impl Storage {
                         MIN(timestamp) AS first_seen,
                         MAX(timestamp) AS last_active_tok,
                         MAX(CASE WHEN is_sidechain = 1 THEN 1 ELSE 0 END) AS has_subagents
-                 FROM token_snapshots
+                 FROM token_snapshots INDEXED BY idx_token_snap_provider_session_sidechain
                  WHERE timestamp >= ?1
             ",
         );

@@ -41,10 +41,13 @@ then compacts inside the same lease.
    room for a safe rebuild.
 4. On success, [[src-tauri/src/storage.rs#Storage#vacuum_database]] opens its
    dedicated SQLite connection, emits the compaction phase, and runs VACUUM.
-5. Releasing the guard permits pending internal writes to continue; the
+5. A successful VACUUM runs [[backend#Database#Database compaction#Bounded Query Planner Analysis]]
+   under the same lease, checkpoints its statistics write, and refreshes the
+   long-lived writer's prepared planner state. A skipped VACUUM never analyzes.
+6. Releasing the guard permits pending internal writes to continue; the
    command then emits `compact-database-finished` with either the completed
    before/after footprint or the safe skip reason.
-6. The settings surface renders progress and the terminal result inline;
+7. The settings surface renders progress and the terminal result inline;
    external hook clients retry their rejected ingest instead of losing it.
 
 ### Retention Pruning Path

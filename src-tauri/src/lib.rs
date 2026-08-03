@@ -4386,7 +4386,16 @@ async fn compact_database(
         let result = match storage.preflight_database_compaction() {
             Ok(bytes_before) => {
                 emit_database_compaction_progress(&maintenance_app, "Compacting database", 65);
-                storage.vacuum_database(bytes_before)
+                let result = storage.vacuum_database(bytes_before);
+                if result.status == "completed" {
+                    emit_database_compaction_progress(
+                        &maintenance_app,
+                        "Optimizing query plans",
+                        85,
+                    );
+                    storage.run_bounded_database_analysis()?;
+                }
+                result
             }
             Err(skipped) => skipped,
         };
