@@ -205,6 +205,106 @@ The source remained 13,525,123,072 bytes, mode `0444`, and SHA-256
 Its read-only zero-byte WAL and 32,768-byte SHM retained their baseline modes
 and mtimes. The validated 5.99 GB derived fixture was deleted after the run.
 
+### Post-source-admission sizing and consistency rerun
+
+This rerun followed `quill-xnb` commit `689ae74`, which independently re-admits
+retained model inventory at startup and feeds periodic rescans into both
+analytics queues. It used the same immutable source, pinned endpoint, bounded
+90-day extraction, production interrupted/resumed backfill, raw-refold check,
+and raw/hybrid query legs as the Family 1 run above.
+
+The immutable source still contains exactly the prior run's 4,100,262 bounded
+observations and 4,392 sources. Provider and rollup density are:
+
+| Provider | Observations | Sources | Source-hours | Rollup rows | Obs/rollup | p50 | p95 | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Claude | 179,411 | 2,150 | 3,261 | 3,272 | 54.83 | 34 | 183 | 545 |
+| Codex | 3,920,851 | 2,242 | 3,826 | 4,016 | 976.31 | 65 | 7,242 | 15,845 |
+| Total | 4,100,262 | 4,392 | 7,087 | 7,288 | 562.60 | — | — | 15,845 |
+
+The raw identity count is also 4,100,262, so the unique
+`(provider, source_key, source_record_key)` contract has no duplicates. One
+rollup source-hour carries 1.003 models on average for Claude and 1.050 for
+Codex; each provider's p50 and p95 are both one model per source-hour.
+
+The measured Codex post-`2026-07-28T00:00:00Z` volume is 336,842 observations
+across 153 sources. Its daily admission shape remains:
+
+| UTC day | Observations | Sources | Rollup rows | Obs/rollup |
+| --- | ---: | ---: | ---: | ---: |
+| 2026-07-28 | 321,392 | 114 | 227 | 1,415.82 |
+| 2026-07-29 | 5,840 | 22 | 83 | 70.36 |
+| 2026-07-30 | 1,472 | 10 | 29 | 50.76 |
+| 2026-07-31 | 2,865 | 8 | 41 | 69.88 |
+| 2026-08-01 | 1,092 | 3 | 13 | 84.00 |
+| 2026-08-02 partial | 4,181 | 12 | 45 | 92.91 |
+
+Only five Codex registry sources, carrying 974 observations, have a successful
+reconciliation at or after `2026-08-02T18:00:00Z`; the latest is
+`2026-08-02T19:15:00.704Z`. The fix commit is timestamped
+`2026-08-02T19:17:46Z`, ten minutes before corpus capture. This corpus therefore
+does not prove the fully corrected retained-source volume promised by the
+post-`quill-xnb` acceptance task. Follow-up `quill-45m.27` owns a snapshot after
+reconciliation completion and the corrected-volume sizing rerun.
+
+The existing burst envelope remains conservative for observed row counts. The
+90-day Codex peak is 865,263 observations from 73 sources on 2026-07-27, which
+folds to 129 rows (6,707.47 observations per rollup row). Physical sizing,
+however, invalidates the plan's 350-byte estimate:
+
+| B-tree set | Table bytes | Index bytes | Total bytes |
+| --- | ---: | ---: | ---: |
+| Raw observations | 2,414,886,912 | 3,569,659,904 | 5,984,546,816 |
+| Model hourly rollup | 2,781,184 | 4,661,248 | 7,442,432 |
+
+The bounded fixture gains 7,430,144 bytes after backfill. Raw b-trees consume
+1,459.55 bytes per observation; the rollup consumes 1,021.19 bytes per row
+(381.61 table + 639.58 indexes), while 562.60:1 row compression produces
+804.11:1 physical compression. At this measured occupancy, 1.8 million annual
+rollup rows project to 1.84 GB, not the plan's former ~650 MB. Follow-up
+`quill-45m.27` carries this corrected annual-budget input into the true-volume
+rerun.
+
+Two independently derived fixtures produced the same backfill structure:
+
+| Measure | Fixture A | Fixture B |
+| --- | ---: | ---: |
+| Sources / observations | 4,392 / 4,100,262 | 4,392 / 4,100,262 |
+| First chunk / resume bookmark | 5,124 / 1,778,205,599,999 ms | 5,124 / 1,778,205,599,999 ms |
+| Chunks | 172 | 172 |
+| Backfill elapsed | 12,477.102 ms | 12,481.933 ms |
+| Max progress interval | 337.900 ms | 341.039 ms |
+| Max WAL after checkpoint / finish | 0 / 0 bytes | 0 / 0 bytes |
+| Missing-or-mismatched / extra rows | 0 / 0 | 0 / 0 |
+| Terminal / committed status | Completed / complete | Completed / complete |
+
+Both returned `PRAGMA quick_check = ok` and preserved zero `raw_pruned=1`
+rows. Progress intervals include boundary selection, preflight, the permit-held
+transaction, and checkpoint work; they are not transaction-hold measurements.
+
+The first comparison exposed a verifier-only reproducibility defect. Fresh
+scratch databases differed solely at canonical JSON path
+`/backfill/updatedAt` because migration 28 stamps `model_backfill_state` at
+fixture creation. Aligning only that database value made every overview digest
+equal. The study normalizer now removes only this lifecycle timestamp in
+addition to `buildingIndex`; semantic fields remain covered. With the two
+fixtures' distinct original timestamps restored, both independently produced:
+
+| Window | Overview bytes | Overview SHA-256 | History bytes | History SHA-256 | Exact |
+| --- | ---: | --- | ---: | --- | --- |
+| 24h | 5,087 | `40615ee37d93f5d9b9bee0ae3da327fa1ba67748f20a3beb246b67ba9dd3081d` | 3,963 | `049126eccc9019ed37e157f53ea00d88f59eb3f8f76ee5a863ca786e33c5cda1` | yes |
+| 30d | 12,626 | `4a50ffec366608c025d60fc6c30b28bfe729afc6e662ac41f2555f0360698533` | 5,129 | `d2b0463451f9e1f098a8ed0a7a5e99d0ef8330d374a217032c2880d42416fe8c` | yes |
+| 90d | 16,996 | `bf9d6d001fde3aa03b0f6c6f4e5367703a07e9c1a78f954bc54d3a13eb285bad` | 14,749 | `ef4e4d7a789a027912bcf94ce5babc192aac97c48b2d57d5b74a16529acca662` | yes |
+
+The source remained 13,525,123,072 bytes, mode `0444`, inode `21943763`,
+mtime `1785698785`, ctime `1785698835`, and canonical SHA-256
+`c86553ab3b0f22e23511dfc43a1f1b9dc9af35ad57f6ae63fcb3de75a673d04e`.
+The 32,768-byte SHM stayed mode `0444`, inode `21943767`, with mtime/ctime
+`1785699012.9498673700`; the zero-byte WAL stayed mode `0444`, inode
+`21943766`, with mtime/ctime `1785699012.9481790910`. Both validated
+5,999,038,464-byte fixture databases and their dedicated temp directory were
+deleted after the stable-digest rerun; no fixture sidecars remained at cleanup.
+
 ## Runtime ingest fold overhead
 
 The runtime-rollup benchmark compares production transcript replacement with

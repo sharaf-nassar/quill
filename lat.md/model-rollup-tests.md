@@ -38,6 +38,10 @@ Suppression flips must hide and restore completed overview and history results i
 
 A bounded 90d fixture derived from an immutable corpus must produce byte-exact normalized overview and history outputs for 24h, 30d, and 90d raw versus hybrid reads.
 
+Normalization excludes only `buildingIndex` and the fixture-created
+`backfill.updatedAt` lifecycle timestamp. Independent fixtures must emit stable
+digests so every semantic field remains covered across reruns.
+
 ## Maintenance Admission Refusal
 
 Rebuild admission must refuse both an active maintenance writer and a writer already queued behind the current backfill reader.

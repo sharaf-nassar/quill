@@ -292,14 +292,14 @@ migration-34 precedent: schema step stays fast, never blocks startup).
   hours × models/hour. Burst evidence: 866k raw rows/day from as few as
   77 files; envelope 200 sources × 12 h × 2 models ≈ **≤5k rollup
   rows/day** vs 1M raw — ≥200:1 compression (raw is ~745 rows/MB).
-  At ~350 B/row including index overhead: worst-case constant-burst year
-  ≈ 1.8M rows ≈ ~650 MB/yr; realistic (mixed quiet/burst) tens of MB —
-  versus today's 2.5 GB table + 3.6 GB indexes. Backfill of the existing
-  4.2M rows yields ~50-150k rollup rows (~20-50 MB). **Sizing caveat:**
-  the 5-10k/day quiet floor is a false floor from the quill-xnb
-  source-admission regression (throughput understated ~100×); the burst
-  envelope above already covers the corrected rate, and the sizing test
-  re-validates once xnb is fixed (dependency noted, fix not in scope).
+  Post-`quill-xnb` revalidation of the canonical bounded corpus folds
+  4.10M observations into 7,288 rows and 7.44 MB versus 5.98 GB for the
+  raw table plus indexes (804:1 physical compression). Actual rollup
+  footprint is ~1,021 B/row including both indexes, not the prior 350 B
+  estimate; 1.8M constant-burst annual rows therefore project to
+  ~1.84 GB, not ~650 MB. The snapshot still exhibits the old post-07-28
+  quiet-source shape, so `quill-45m.27` owns a fully reconciled corpus,
+  corrected-volume rerun, and final annual budget.
   The existing 7 indexes / 3.6 GB on `model_usage_observations` are kept
   as-is; post-rollup index cleanup is an explicit follow-up outside this
   feature (per the spec Non-Goal).
@@ -557,13 +557,12 @@ window) to make S4's "no query exceeds R except range×2" checkable.
   oversize rejection :3055-3077 unchanged). If exceeded: fold moves to a
   post-commit same-connection follow-up transaction with the current
   hour always served raw (hybrid read already tolerates this).
-- **Sizing validated against understated throughput.** The quiet-day
-  floor (5-10k/day) is a false floor from the quill-xnb source-admission
-  regression (post-07-28 rollouts not enumerated; true throughput
-  understated ~100×). The burst envelope (≤1M rows/day) already bounds
-  the corrected rate; the sizing/consistency tests re-run when xnb is
-  fixed. This plan depends on xnb only for sizing validation and does
-  NOT take on fixing it.
+- **Corrected-volume validation needs a later corpus.** The canonical
+  snapshot still has the pre-fix post-07-28 quiet-source shape despite
+  containing `quill-xnb`'s first admissions. Current-volume consistency
+  and physical sizing are measured, but `quill-45m.27` must repeat them
+  after full retained-source reconciliation. The ≤1M-row/day envelope
+  remains the provisional bound until that evidence lands.
 - **Backfill UX on slow disks.** The 20s stall machine is exactly where
   backfill is slowest. Mitigation: raw path + "building index" note
   keeps Models functional (degraded but honest) during the one-time

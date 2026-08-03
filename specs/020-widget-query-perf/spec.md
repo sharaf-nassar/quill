@@ -501,6 +501,14 @@ clarification Q7's "live ingest events still force a refresh").
 replacing next-larger-preset; the prior-period fetch is the one
 enumerated, justified over-range query.
 
+Post-fix revalidation confirms exact raw/hybrid consistency for the canonical
+4.10M-observation corpus, but it also confirms that snapshot still has the
+pre-fix quiet admission shape after 2026-07-28. It therefore cannot close the
+corrected-volume sizing question. `quill-45m.27` owns a post-reconciliation
+snapshot and rerun. Current physical evidence also replaces the estimated
+350-byte rollup row with 1,021 bytes including both indexes; see
+`timing-measurement.md`.
+
 **Q7: Test authorization?**
 A: **Authorized** (constitution 7): rollup-consistency tests,
 backfill/quiesce concurrency tests, and the 5s-injection contention

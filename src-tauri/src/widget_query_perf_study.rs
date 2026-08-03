@@ -402,10 +402,19 @@ fn normalized_model_rollup_output<T: Serialize>(
 ) -> Result<serde_json::Value, String> {
     let mut value = serde_json::to_value(value)
         .map_err(|error| format!("Serialize {label} consistency output: {error}"))?;
-    value
+    let object = value
         .as_object_mut()
-        .ok_or_else(|| format!("{label} consistency output was not an object"))?
-        .remove("buildingIndex");
+        .ok_or_else(|| format!("{label} consistency output was not an object"))?;
+    object.remove("buildingIndex");
+    // Fresh derived fixtures stamp their migration-28 singleton at creation.
+    // That lifecycle timestamp is unrelated to query semantics and otherwise
+    // makes cross-fixture overview digests differ despite exact raw/hybrid data.
+    if let Some(backfill) = object
+        .get_mut("backfill")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        backfill.remove("updatedAt");
+    }
     Ok(value)
 }
 
