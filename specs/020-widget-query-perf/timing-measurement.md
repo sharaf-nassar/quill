@@ -1,7 +1,9 @@
 # Widget query timing measurement
 
 This acceptance record freezes the BEFORE query costs and corpus identity, then
-records the post-A/B gate and corrected-volume rollup sizing evidence.
+records the final feature-020 query, contention, cache, and planner gates. Later
+sections retain diagnostic attempts as history; this final verdict supersedes
+their interim failures and deferred decisions.
 
 ## Frozen corpus
 
@@ -64,6 +66,103 @@ The matrix covers the rollup candidates, runtime path, slice-E cleanups,
 range-changing Trends query, five initial breakdown commands, and both 013
 cached-only endpoints. `Output bytes` validates each call returned a
 serializable result rather than failing silently.
+
+## Final acceptance verdict
+
+**Query and contention verdict: PASS. Frontend render-timing verdict: NOT
+MEASURED.** Every budgeted production query clears its cold target, the
+user-visible warm path issues no new request, and the 5-second injected-reader
+test clears its 100 ms p95 target with concurrent ingest. Usage, Charts, and
+Context backend fan-outs are recorded separately from actual render work; no
+artifact in this feature measures Tauri IPC, React reconciliation, layout, or
+paint, so the three 1,200 ms render gates remain unproven rather than being
+inferred from backend totals.
+
+This is the authoritative release decision for this file. The post-A/B and
+residual-query sections below document how the final design was reached; rows
+marked failed, pending, deferred, or inconclusive in those historical sections
+do not describe the integrated result.
+
+### Final before/after query matrix
+
+The table covers every query in the frozen 13-path matrix at all three pinned
+windows. BEFORE is the original one-shot cold measurement. Final is the latest
+app-cache-empty production-path evidence suitable for that query's required
+state. Model rows use a completed model rollup; runtime rows use a completed
+runtime rollup. General paths use the final bounded-ANALYZE audit, while focused
+8+8 medians replace flagged one-shot values for bucket stats, 90-day hooks, and
+30-day Context. Slice-E code rows use their dedicated final projection run.
+
+| Query | 24h BEFORE -> final | 30d BEFORE -> final | 90d BEFORE -> final | Final gate |
+| --- | ---: | ---: | ---: | --- |
+| `get_model_usage_overview` | 250.355 -> 37.237 ms | 71,959.774 -> 307.778 ms | 44,401.936 -> 296.495 ms | pass: 30d/90d <=500 ms |
+| `get_model_history` | 12.499 -> 26.617 ms | 6,138.933 -> 281.996 ms | 6,268.581 -> 299.793 ms | pass: 30d/90d <=500 ms |
+| `get_token_history` | 1.438 -> 1.085 ms | 9.976 -> 2.442 ms | 3.291 -> 3.399 ms | reference |
+| `get_llm_runtime_stats` | 277.845 -> 4.222 ms | 9,948.795 -> 47.329 ms | 3,856.366 -> 81.977 ms | pass: 90d <=200 ms |
+| `get_code_stats` | 42.702 -> 2.443 ms | 2,471.927 -> 57.415 ms | 584.547 -> 77.453 ms | reference |
+| `get_code_stats_history` | 2.157 -> 2.058 ms | 60.758 -> 52.782 ms | 89.693 -> 73.094 ms | pass: 30d <=300 ms |
+| `get_host_breakdown` | 11.400 -> 1.519 ms | 1.222 -> 2.093 ms | 1.253 -> 2.258 ms | reference |
+| `get_project_breakdown` | 6.347 -> 1.645 ms | 3.443 -> 4.364 ms | 4.222 -> 4.700 ms | reference |
+| `get_session_breakdown` | 46.790 -> 19.061 ms | 883.987 -> 93.100 ms | 47.091 -> 89.411 ms | pass: 30d <=300 ms |
+| `get_skill_breakdown` | 0.700 -> 1.118 ms | 15.879 -> 2.465 ms | 39.214 -> 5.034 ms | reference |
+| `get_hook_breakdown` | 218.681 -> 29.930 ms | 2,550.247 -> 262.094 ms | 312.579 -> 301.936 ms | reference |
+| `get_all_bucket_stats` | 169.491 -> 93.009 ms | 164.779 -> 111.085 ms | 157.313 -> 100.965 ms | reference |
+| `get_context_savings_analytics` | 41.218 -> 15.003 ms | 500.936 -> 197.567 ms | 574.557 -> 368.764 ms | reference |
+
+The apparent small regressions on fast reference rows are millisecond-scale
+one-shot variation, not budget failures. The ANALYZE audit applied the stricter
+combined regression rule: slower by both more than 5 ms and more than 25%.
+Every initial flag cleared exact-path 8+8 alternation with canonical output and
+zero plan regressions.
+
+### Final cross-cutting gates
+
+| Measure | Budget | Final evidence | Gate |
+| --- | ---: | --- | --- |
+| Model overview cold @30d / 90d | <=500 ms | 307.778 / 296.495 ms | pass |
+| Model history cold @30d / 90d | <=500 ms | 281.996 / 299.793 ms | pass |
+| Runtime cold @90d | <=200 ms | 81.977 ms | pass |
+| Session breakdown @30d | <=300 ms | 10-sample p95 141.554 ms | pass |
+| Code stats history @30d | <=300 ms | 6-sample p95 88.407 ms | pass |
+| Fast class under 5s injection | <=100 ms p95 | 100 samples/query: host 1.782 ms, project 1.887 ms | pass |
+| Warm view switch/remount | no slower than current warm | fresh remount issues zero IPC/backend requests | pass |
+| Usage backend fan-out @30d | render budget <=1,200 ms | 559.261 ms backend only | backend below ceiling; render unproven |
+| Charts backend fan-out @30d | render budget <=1,200 ms | 134.433 ms backend only | backend below ceiling; render unproven |
+| Context backend fan-out @30d | render budget <=1,200 ms | exact 8+8 analyzed median 197.567 ms backend only | backend below ceiling; render unproven |
+| Model ingest fold overhead | <=10% p95 | +5.316% | pass |
+| Runtime ingest fold overhead | <=10% p95 | +8.825% | pass |
+| Bounded ANALYZE regression | no conservative plan/timing regression | pending 250 / completed 16,086 statements; 42 paths each; 10 changed plans each; zero plan regressions | pass |
+
+The focused contention run used the existing
+`five_second_view_snapshot_allows_fast_queries_and_ingest` test. It held a
+stable WAL reader snapshot for 5.000164 seconds, sampled host and project 100
+times each, committed 49 concurrent writes, found all 50 rows persisted, and
+reported zero query, ingest, lock, or busy errors. Nearest-rank p95 is the 95th
+ordered sample, with no interpolation.
+
+### Final methodology and evidence selection
+
+- Corpus, endpoint, window bounds, release profile, fresh-reader cold boundary,
+  and uncontrolled OS-page-cache caveat are the frozen protocol above. The
+  immutable source retained its canonical SHA-256, 13,525,123,072-byte size,
+  read-only mode, and WAL/SHM identity throughout final corpus work.
+- Query output identity is required before timing is accepted. Final completed
+  30d/90d model overview/history retained the four canonical hashes recorded in
+  the completed-path table below. The ANALYZE audit likewise required identical
+  bytes and SHA-256 across every focused 8+8 comparison.
+- Attempt-3 durable reports covered pending/raw and completed-model states
+  separately. Pending replayed 250 statements over 42 paths; completed replayed
+  16,086 over the same 42 paths. Each changed 10 plans with zero conservative
+  plan regressions. The completed corpus did not represent a completed runtime
+  rollup, so runtime acceptance uses its dedicated completed-runtime evidence
+  instead of the audit's raw fallback timing.
+- Backend fan-out is elapsed Rust/SQLite work on one shared `Storage`. It is not
+  render time. No fan-out value is relabeled or arithmetically reconstructed as
+  IPC, React, layout, paint, or end-to-end render evidence.
+- The process-lifetime command-and-argument cache is the warm regression guard:
+  a fresh remount returns cached data without issuing a request. Immediate
+  same-handle repeats elsewhere in this record diagnose backend cache behavior;
+  they are not substituted for the user-visible warm-view decision.
 
 ## BEFORE results
 
@@ -513,7 +612,10 @@ Its zero-byte WAL and 32,768-byte SHM retained identical metadata. The only
 temporary file was the validated 3,010,273,280-byte fixture; it and its
 `mktemp` directory were removed after `quick_check=ok` and parity completion.
 
-## Post-A/B interim re-measurement
+## Historical post-A/B interim re-measurement
+
+This section is preserved as diagnostic evidence and is superseded by the
+final acceptance verdict above.
 
 The gate used one disposable copy for both authoritative rollups and every
 measurement. Before mutation, source and copy were each 13,525,123,072 bytes
@@ -646,7 +748,11 @@ Tauri IPC, React, layout, or paint instrumentation, so it cannot claim the
 The BEFORE harness did not execute exact view fan-outs, so no same-corpus
 BEFORE fan-out total exists and none is reconstructed from unrelated rows.
 
-### Interim budget gate
+### Superseded interim budget gate
+
+This was the gate before slices C/D/E, the completed model-edge correction,
+and the bounded-ANALYZE audit landed. Its failures and pending rows are not the
+final decision.
 
 | Measure | Budget | Post-A/B evidence | Gate |
 | --- | ---: | ---: | --- |
@@ -663,7 +769,7 @@ BEFORE fan-out total exists and none is reconstructed from unrelated rows.
 | Fast class under 5s injection | ≤100 ms p95 | slice-C test not implemented | pending |
 | Warm regression | no slower | model overview 1.089 ms vs 013's coarse 1 ms; context 0.078 ms vs 238 ms on older corpus | model inconclusive; context pass |
 
-### Slice decisions
+### Historical slice decisions
 
 - **Slice C — GO, full enumerated scope.** Reader isolation remains required
   for the ≤100 ms contention contract, and cold bucket/context/hook reads still
@@ -679,9 +785,9 @@ BEFORE fan-out total exists and none is reconstructed from unrelated rows.
   [[Bounded ANALYZE audit]] found no material timing or plan regression after
   stabilizing the three unproven index choices and model-history source lookup.
 
-These decisions size C/D/E but do not waive slice A's failed cold budgets. The
-residual model-query follow-up remains the release gate before feature 020 can
-claim its S1 acceptance target.
+These decisions sized the then-pending C/D/E work. Slice A's failed cold budget
+was subsequently cleared by the instrumented completed-path correction and the
+final merged pending/completed audit.
 
 ## Session breakdown candidate pruning
 
@@ -821,7 +927,9 @@ a hidden duplicate. Sessions and Skills retain one secondary project request
 because the exact Projects readout remains visible; Skills explicitly sends
 `allTime: false` with the selected range. Stable serialization still coalesces
 equivalent argument order, while `6h` and internal `12h` remain isolated keys.
-## Residual model-query follow-up attempt
+## Historical residual model-query follow-up attempt
+
+This failed attempt is superseded by the completed-path acceptance retry below.
 
 The follow-up used the same worker-owned model-backfilled copy, pinned endpoint,
 release profile, and app-cache-empty `Storage` protocol. SQLite was 3.45.0.
@@ -850,7 +958,10 @@ not. The final overview is roughly five times faster than the 19.6–19.7 second
 post-A/B result, yet remains 7.6–8.3 times over budget. This attempt is not an
 acceptance pass and the residual overview release gate stays open.
 
-## Residual model-query final retry
+## Historical residual model-query final retry
+
+This second failed attempt is superseded by the completed-path acceptance retry
+below.
 
 The final retry preserved the first attempt's history/activity interval and
 temporary-authority work. Before changing project selection, a focused SQLite
@@ -885,11 +996,10 @@ against the same model-backfilled disposable copy, pinned to
 | `get_model_usage_overview` | 90d | 896.938 ms | 1.147 ms | 17,131 | `c9e291097a69fb5d18ce0d06a7ef15225fd2cd7ae3d440ced3627f7b746a0ee5` | fail |
 | `get_model_history` | 90d | 280.014 ms | 1.098 ms | 14,771 | `d20200a035a7f988459a4616daa4165ad26c88ab87cc2708a3f2ea2055c36933` | pass |
 
-The final correction cuts overview to about 0.9 seconds with exact parity, but
-both acceptance windows remain roughly 1.8 times above the 500 ms ceiling.
-Under the one-retry measurement discipline, no further design or timing
-variant was attempted. The task remains failed and the dirty retry worktree is
-preserved for diagnosis.
+This historical correction cut overview to about 0.9 seconds with exact parity,
+but both acceptance windows remained roughly 1.8 times above the 500 ms
+ceiling. The later instrumented completed-path correction found and bounded the
+remaining raw-edge work; the final task verdict is therefore not this failure.
 
 ## Instrumented completed-path acceptance retry
 
