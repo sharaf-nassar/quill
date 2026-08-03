@@ -27,6 +27,7 @@ import { selectInsightLine } from "./insightLine";
 import { useActivitySeries, useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
 import { useBreakdownData } from "../../../hooks/useBreakdownData";
 import { useCachedInvoke } from "../../../hooks/useCachedInvoke";
+import { shouldLoadSecondaryProjects } from "../../../hooks/widgetQueryPlan";
 import { useCodeInsights } from "../../../hooks/useCodeInsights";
 import { useCodeStats } from "../../../hooks/useCodeStats";
 import { useContextSavingsStats } from "../../../hooks/useContextSavingsStats";
@@ -77,9 +78,6 @@ const MODES: ReadonlyArray<{ id: BreakdownMode; label: string }> = [
 const HOOK_ASYMMETRY_HELP =
   "Claude hooks are tracked per script. Codex hooks are tracked per event " +
   "because Codex doesn't log per-script hook executions.";
-
-/** Skills are counted over all history here, matching the analytics surface. */
-const SKILL_ALL_TIME = true;
 
 function rangeMs(range: RangeType): number {
   switch (range) {
@@ -432,11 +430,15 @@ function UsageView({ range }: UsageViewProps) {
   const code = useCodeStats(range);
   const savings = useContextSavingsStats(range);
   const retention = useRetentionCutoff();
-  const breakdown = useBreakdownData(mode, range, { skillAllTime: SKILL_ALL_TIME });
+  const breakdown = useBreakdownData(mode, range);
   // Projects is a readout metric as well as a breakdown mode, so its count is
-  // read unconditionally; the breakdown hook above owns whatever mode the user
-  // has selected.
-  const projects = useBreakdownData("projects", range);
+  // read separately only while another breakdown is selected. In Projects
+  // mode the selected request supplies both regions, avoiding two subscribers
+  // and two loading/error paths for the same command and arguments.
+  const secondaryProjects = useBreakdownData("projects", range, {
+    enabled: shouldLoadSecondaryProjects(mode),
+  });
+  const projects = mode === "projects" ? breakdown : secondaryProjects;
 
   // Recency labels are relative, so they age on their own clock rather than
   // waiting for the next data refresh.

@@ -1300,12 +1300,16 @@ fn parse_rule_frontmatter(content: &str) -> (Option<String>, bool, String) {
 fn range_to_duration(range: &str) -> TimeDelta {
     match range {
         "1h" => TimeDelta::hours(1),
+        // Internal comparison windows used by widget code insights. They are
+        // deliberately enumerated instead of accepting arbitrary range text.
+        "2h" => TimeDelta::hours(2),
         "6h" => TimeDelta::hours(6),
+        "12h" => TimeDelta::hours(12),
         "24h" => TimeDelta::hours(24),
+        "2d" => TimeDelta::days(2),
         "7d" => TimeDelta::days(7),
-        // Internal lookback for the insights session selector; not part of
-        // the user-facing range toggle vocabulary, but named here so it
-        // resolves through the same helper instead of a private duration.
+        // Internal comparison window shared by weekly trends and the 7d code
+        // insight delta; not part of the user-facing range vocabulary.
         "14d" => TimeDelta::days(14),
         "30d" => TimeDelta::days(30),
         "90d" => TimeDelta::days(90),
@@ -1349,9 +1353,9 @@ pub(crate) fn with_pinned_query_now<T>(now: DateTime<Utc>, operation: impl FnOnc
 ///
 /// Single scoping helper shared by every range-parameterized read path —
 /// token stats, the five breakdowns, and context savings — so the range
-/// vocabulary (`1h`, `6h`, `24h`, `7d`, `30d`, `all`) is honored
-/// identically everywhere instead of one command quietly answering a 24h
-/// window for a 1H/6H request.
+/// vocabulary (`1h`, `6h`, `24h`, `7d`, `30d`, `all`) and the narrowly
+/// enumerated internal comparison ranges (`2h`, `12h`, `2d`, `14d`) are
+/// honored identically instead of one command quietly answering 24h.
 fn range_from_timestamp(range: &str) -> String {
     if range == "all" {
         return "1970-01-01T00:00:00Z".to_string();
@@ -12259,15 +12263,13 @@ impl Storage {
         // Skip hourly aggregates when filtering by session_id or cwd since
         // token_hourly doesn't store those fields
         let needs_granular = session_id.is_some() || cwd.is_some();
-        let (from, use_hourly) = match range {
-            "1h" => (now - TimeDelta::hours(1), false),
-            "6h" => (now - TimeDelta::hours(6), false),
-            "24h" => (now - TimeDelta::hours(24), false),
-            "7d" => (now - TimeDelta::days(7), false),
-            "30d" => (now - TimeDelta::days(30), !needs_granular),
-            "90d" => (now - TimeDelta::days(90), !needs_granular),
-            "all" => (now - TimeDelta::days(365), !needs_granular),
-            _ => (now - TimeDelta::hours(24), false),
+        let (from, use_hourly) = if range == "all" {
+            (now - TimeDelta::days(365), !needs_granular)
+        } else {
+            (
+                now - range_to_duration(range),
+                matches!(range, "30d" | "90d") && !needs_granular,
+            )
         };
 
         let from_str = from.to_rfc3339();
@@ -12409,6 +12411,9 @@ impl Storage {
             "6h" => 360,
             "7d" => 672,
             "30d" | "all" => 720,
+            // Keep comparison rows intact so downsampling cannot fold one
+            // side of the current/prior boundary into the other.
+            "2h" | "12h" | "2d" | "14d" => usize::MAX,
             _ => 1440,
         };
 
@@ -18941,9 +18946,13 @@ impl Storage {
 
         let bucket_secs: i64 = match range {
             "1h" => 60,
+            "2h" => 60,
             "6h" => 5 * 60,
+            "12h" => 10 * 60,
             "24h" => 15 * 60,
+            "2d" => 30 * 60,
             "7d" => 3600,
+            "14d" => 2 * 3600,
             "30d" => 86400,
             "90d" => 86400,
             _ => 15 * 60,
@@ -19931,6 +19940,25 @@ mod tests {
             // a deleted temp directory.
             std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
             std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+        }
+    }
+
+    // @lat: [[widget-range-tests#Widget Range Query Tests#Internal Comparison Ranges Are Exact]]
+    #[test]
+    fn internal_comparison_ranges_are_exact_doubles() {
+        let pinned_now = DateTime::parse_from_rfc3339("2026-08-02T12:00:00Z").expect("pinned now");
+        for (displayed, comparison) in [("1h", "2h"), ("6h", "12h"), ("24h", "2d"), ("7d", "14d")] {
+            assert_eq!(
+                range_to_duration(comparison),
+                range_to_duration(displayed) * 2,
+            );
+            let from = with_pinned_query_now(pinned_now.with_timezone(&Utc), || {
+                range_from_timestamp(comparison)
+            });
+            assert_eq!(
+                DateTime::parse_from_rfc3339(&from).expect("comparison lower bound"),
+                pinned_now - range_to_duration(comparison),
+            );
         }
     }
 

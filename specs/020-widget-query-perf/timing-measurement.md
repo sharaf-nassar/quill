@@ -399,3 +399,30 @@ only the project key at 15,000 ms. Companion assertions verify a fresh remount
 issues zero requests, stale unmounted entries revalidate in the background,
 changed ranges isolate keys, concurrent subscribers coalesce, rejected work
 does not poison the cache, and Strict Mode cleanup releases listeners/timers.
+
+### Range-scoped frontend query evidence
+
+The same Node suite executes the production pure query planner for all four
+displayed widget ranges. Every Code Insights request is the one permitted
+two-period comparison; Trends issues one 14-day request per source and no
+extra 7-day runtime request. Skills and the visible Projects readout stay at
+the selected 6-hour range.
+
+```text
+[range-query-window] [{"view":"usage","hook":"useCodeInsights","displayedRange":"1h","command":"get_token_history","requestedRange":"2h","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"1h","command":"get_code_stats_history","requestedRange":"2h","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"1h","command":"get_llm_runtime_stats","requestedRange":"2h","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"6h","command":"get_token_history","requestedRange":"12h","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"6h","command":"get_code_stats_history","requestedRange":"12h","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"6h","command":"get_llm_runtime_stats","requestedRange":"12h","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"24h","command":"get_token_history","requestedRange":"2d","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"24h","command":"get_code_stats_history","requestedRange":"2d","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"24h","command":"get_llm_runtime_stats","requestedRange":"2d","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"7d","command":"get_token_history","requestedRange":"14d","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"7d","command":"get_code_stats_history","requestedRange":"14d","window":"comparison"},{"view":"usage","hook":"useCodeInsights","displayedRange":"7d","command":"get_llm_runtime_stats","requestedRange":"14d","window":"comparison"},{"view":"trends","hook":"useWeeklyTrends","displayedRange":"7d","command":"get_token_history","requestedRange":"14d","window":"comparison"},{"view":"trends","hook":"useWeeklyTrends","displayedRange":"7d","command":"get_code_stats_history","requestedRange":"14d","window":"comparison"},{"view":"trends","hook":"useWeeklyTrends","displayedRange":"7d","command":"get_llm_runtime_stats","requestedRange":"14d","window":"comparison"},{"view":"usage","hook":"useBreakdownData","displayedRange":"6h","command":"get_skill_breakdown","requestedRange":"6h","window":"current"},{"view":"usage","hook":"useBreakdownData","displayedRange":"6h","command":"get_project_breakdown","requestedRange":"6h","window":"current"}]
+```
+
+The assertion converts every logged range to milliseconds: a request beyond
+the displayed window must be marked `comparison` and equal exactly `2 × R`;
+all others must be at or below `R`. The mode-transition log records the lazy
+secondary breakdown behavior:
+
+```text
+[breakdown-query-transition] [{"mode":"sessions","queries":[{"command":"get_session_breakdown","args":{"range":"6h","hostname":null,"limit":200}},{"command":"get_project_breakdown","args":{"range":"6h"}}]},{"mode":"projects","queries":[{"command":"get_project_breakdown","args":{"range":"6h"}}]},{"mode":"skills","queries":[{"command":"get_skill_breakdown","args":{"range":"6h","provider":null,"allTime":false,"limit":100}},{"command":"get_project_breakdown","args":{"range":"6h"}}]}]
+```
+
+Projects mode has one project command-and-args key, not a selected request plus
+a hidden duplicate. Sessions and Skills retain one secondary project request
+because the exact Projects readout remains visible; Skills explicitly sends
+`allTime: false` with the selected range. Stable serialization still coalesces
+equivalent argument order, while `6h` and internal `12h` remain isolated keys.

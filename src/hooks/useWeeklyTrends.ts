@@ -13,16 +13,18 @@
 // hour definition the Usage readout prints (constitution #1: one source, one
 // story).
 //
-// One approximation is inherited deliberately. `get_llm_runtime_stats` only
-// accepts the fixed ranges, so it can measure "the last 7 days" exactly but
-// never "the 7 days before that"; the prior week's active seconds are recovered
-// by prorating the 30-day runtime sparkline, exactly as `useCodeInsights` does
-// for its own comparison window.
+// Runtime for both weeks is recovered from the exact 14-day comparison
+// sparkline, matching `useCodeInsights` without a second current-week query.
 
 import { useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCachedInvoke } from "./useCachedInvoke";
 import { activeSecsInWindow, computeVelocity } from "./useCodeInsights";
+import {
+  queryRangeMs,
+  WEEKLY_TRENDS_HISTORY_RANGE,
+  weeklyTrendQueries,
+} from "./widgetQueryPlan";
 import { retentionSpanFor, type RetentionSpan } from "../utils/retention";
 import type {
   CodeStatsHistoryPoint,
@@ -32,9 +34,7 @@ import type {
 } from "../types";
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const HISTORY_MS = 30 * 24 * 60 * 60 * 1000;
-/** The widest fixed range, so one fetch covers both compared weeks. */
-const HISTORY_RANGE = "30d";
+const HISTORY_MS = queryRangeMs(WEEKLY_TRENDS_HISTORY_RANGE);
 const REFRESH_INTERVAL_MS = 60_000;
 /**
  * Percent moves below this read as noise rather than as a trend. Matches the
@@ -127,21 +127,11 @@ function hitRate(cacheRead: number, servedInput: number): number | null {
 }
 
 async function loadWeeklyTrends(cutoff: string | null): Promise<WeeklyTrends> {
-  const [tokenHistory, codeHistory, historyRuntime, weekRuntime] = await Promise.all([
-    invoke<TokenDataPoint[]>("get_token_history", {
-      range: HISTORY_RANGE,
-      provider: null,
-      hostname: null,
-      sessionId: null,
-      cwd: null,
-    }),
-    invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", {
-      range: HISTORY_RANGE,
-    }),
-    invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range: HISTORY_RANGE }),
-    // The current week's active seconds are measured, not prorated: this is the
-    // same read the Usage view's runtime readout makes at 7D.
-    invoke<LlmRuntimeStats>("get_llm_runtime_stats", { range: "7d" }),
+  const [tokenQuery, codeQuery, runtimeQuery] = weeklyTrendQueries();
+  const [tokenHistory, codeHistory, historyRuntime] = await Promise.all([
+    invoke<TokenDataPoint[]>(tokenQuery.command, tokenQuery.args),
+    invoke<CodeStatsHistoryPoint[]>(codeQuery.command, codeQuery.args),
+    invoke<LlmRuntimeStats>(runtimeQuery.command, runtimeQuery.args),
   ]);
 
   const now = Date.now();
@@ -190,6 +180,13 @@ async function loadWeeklyTrends(cutoff: string | null): Promise<WeeklyTrends> {
     previousStart,
     currentStart,
   );
+  const currentActiveSecs = activeSecsInWindow(
+    historyRuntime.sparkline,
+    now - HISTORY_MS,
+    HISTORY_MS,
+    currentStart,
+    now,
+  );
 
   const end = new Date(now).toISOString();
   const currentStartIso = new Date(currentStart).toISOString();
@@ -205,7 +202,7 @@ async function loadWeeklyTrends(cutoff: string | null): Promise<WeeklyTrends> {
   const currentVelocity =
     velocitySpans.current === "pruned"
       ? null
-      : weekVelocity(currentLoc, weekRuntime.total_runtime_secs);
+      : weekVelocity(currentLoc, currentActiveSecs);
   const previousVelocity =
     velocitySpans.previous === "pruned"
       ? null

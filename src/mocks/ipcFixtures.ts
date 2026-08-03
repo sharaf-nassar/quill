@@ -76,9 +76,13 @@ const sqliteUtc = (msAgo: number) =>
 
 const RANGE_DURATION_MS: Record<string, number> = {
   "1h": H,
+  "2h": 2 * H,
   "6h": 6 * H,
+  "12h": 12 * H,
   "24h": D,
+  "2d": 2 * D,
   "7d": 7 * D,
+  "14d": 14 * D,
   "30d": 30 * D,
 };
 
@@ -237,9 +241,12 @@ const usageStats: BucketStats[] = usageData.buckets.map((b) => ({
 /** Point spacing per range; hour-granular ranges get sub-hour buckets. */
 const TOKEN_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> = {
   "1h": { count: 12, stepMs: 5 * M },
+  "2h": { count: 25, stepMs: 5 * M },
   "6h": { count: 24, stepMs: 15 * M },
-  // A month of daily points — the window the widget's week-over-week Trends
-  // rows read, and the comparison window `useCodeInsights` already fetched.
+  "12h": { count: 49, stepMs: 15 * M },
+  "2d": { count: 49, stepMs: H },
+  // Fifteen inclusive daily boundaries cover both complete compared weeks.
+  "14d": { count: 15, stepMs: D },
   "30d": { count: 30, stepMs: D },
 };
 const DEFAULT_TOKEN_HISTORY = { count: 48, stepMs: H };
@@ -301,7 +308,11 @@ const codeStats: CodeStats = {
 /** The widget's readout grid asks for 8 buckets; hour ranges shrink the step. */
 const CODE_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> = {
   "1h": { count: 8, stepMs: 7.5 * M },
+  "2h": { count: 17, stepMs: 7.5 * M },
   "6h": { count: 8, stepMs: 45 * M },
+  "12h": { count: 17, stepMs: 45 * M },
+  "2d": { count: 17, stepMs: 3 * H },
+  "14d": { count: 15, stepMs: D },
 };
 const DEFAULT_CODE_HISTORY = { count: 14, stepMs: D };
 

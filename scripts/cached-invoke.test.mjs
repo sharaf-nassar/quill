@@ -7,6 +7,14 @@ import {
 	cleanupInvokeListeners,
 	registerInvokeEventListeners,
 } from "../src/hooks/cachedInvokeStore.ts";
+import {
+	breakdownQuery,
+	codeInsightsHistoryQueries,
+	queryRangeMs,
+	usageBreakdownQueries,
+	weeklyTrendQueries,
+	WIDGET_DISPLAY_RANGES,
+} from "../src/hooks/widgetQueryPlan.ts";
 
 class FakeClock {
 	nowMs = 0;
@@ -228,9 +236,125 @@ test("stable argument keys coalesce object order but isolate changed ranges", as
 		command: "get_token_history",
 		args: { provider: null, range: "24h" },
 	});
+	const comparisonA = cachedInvokeKey({
+		command: "get_token_history",
+		args: { range: "12h", provider: null },
+	});
+	const comparisonB = cachedInvokeKey({
+		command: "get_token_history",
+		args: { provider: null, range: "12h" },
+	});
 
 	assert.equal(sixHourA, sixHourB);
 	assert.notEqual(sixHourA, day);
+	assert.equal(comparisonA, comparisonB);
+	assert.notEqual(sixHourA, comparisonA);
+});
+
+// @lat: [[widget-range-tests#Widget Range Query Tests#Displayed Windows Bound Every Query]]
+test("widget query plans request only the displayed range or its exact prior period", () => {
+	const queryLog = [];
+	for (const displayedRange of WIDGET_DISPLAY_RANGES) {
+		for (const query of codeInsightsHistoryQueries(displayedRange)) {
+			queryLog.push({
+				view: "usage",
+				hook: "useCodeInsights",
+				displayedRange,
+				command: query.command,
+				requestedRange: query.requestedRange,
+				window: query.window,
+			});
+		}
+	}
+	for (const query of weeklyTrendQueries()) {
+		queryLog.push({
+			view: "trends",
+			hook: "useWeeklyTrends",
+			displayedRange: "7d",
+			command: query.command,
+			requestedRange: query.requestedRange,
+			window: query.window,
+		});
+	}
+	for (const query of usageBreakdownQueries("skills", "6h")) {
+		queryLog.push({
+			view: "usage",
+			hook: "useBreakdownData",
+			displayedRange: "6h",
+			command: query.command,
+			requestedRange: query.requestedRange,
+			window: "current",
+		});
+	}
+
+	for (const query of queryLog) {
+		const displayedMs = queryRangeMs(query.displayedRange);
+		const requestedMs = queryRangeMs(query.requestedRange);
+		if (requestedMs > displayedMs) {
+			assert.equal(query.window, "comparison");
+			assert.equal(requestedMs, displayedMs * 2);
+		} else {
+			assert.ok(requestedMs <= displayedMs);
+		}
+	}
+
+	assert.deepEqual(
+		codeInsightsHistoryQueries("6h").map(({ command, args }) => ({ command, args })),
+		[
+			{
+				command: "get_token_history",
+				args: { range: "12h", hostname: null, sessionId: null, cwd: null },
+			},
+			{ command: "get_code_stats_history", args: { range: "12h" } },
+			{ command: "get_llm_runtime_stats", args: { range: "12h" } },
+		],
+	);
+	assert.deepEqual(
+		weeklyTrendQueries().map(({ command, args }) => ({ command, args })),
+		[
+			{
+				command: "get_token_history",
+				args: {
+					range: "14d",
+					provider: null,
+					hostname: null,
+					sessionId: null,
+					cwd: null,
+				},
+			},
+			{ command: "get_code_stats_history", args: { range: "14d" } },
+			{ command: "get_llm_runtime_stats", args: { range: "14d" } },
+		],
+	);
+	assert.equal(breakdownQuery("skills", "6h").args.allTime, false);
+	console.info(`[range-query-window] ${JSON.stringify(queryLog)}`);
+});
+
+// @lat: [[widget-range-tests#Widget Range Query Tests#Breakdown Transitions Issue Unique Reads]]
+test("breakdown transitions keep one project request and range-scope skills", () => {
+	const transitionLog = ["sessions", "projects", "skills"].map((mode) => {
+		const queries = usageBreakdownQueries(mode, "6h");
+		const keys = queries.map(({ command, args }) => cachedInvokeKey({ command, args }));
+		assert.equal(new Set(keys).size, keys.length);
+		assert.equal(
+			queries.filter(({ command }) => command === "get_project_breakdown").length,
+			1,
+		);
+		return {
+			mode,
+			queries: queries.map(({ command, args }) => ({ command, args })),
+		};
+	});
+
+	assert.deepEqual(transitionLog[1], {
+		mode: "projects",
+		queries: [{ command: "get_project_breakdown", args: { range: "6h" } }],
+	});
+	assert.deepEqual(transitionLog[2].queries[0], {
+		command: "get_skill_breakdown",
+		args: { range: "6h", provider: null, allTime: false, limit: 100 },
+	});
+	console.info(`[breakdown-query-transition] ${JSON.stringify(transitionLog)}`);
 });
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Errors retry without poisoning cache]]

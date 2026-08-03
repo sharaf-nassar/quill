@@ -1,6 +1,11 @@
 import { useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCachedInvoke } from "./useCachedInvoke";
+import {
+	codeInsightsComparisonRange,
+	codeInsightsHistoryQueries,
+	queryRangeMs,
+} from "./widgetQueryPlan";
 import type {
 	RangeType,
 	TokenDataPoint,
@@ -31,36 +36,6 @@ interface CodeInsightsResult {
 }
 
 const SPARKLINE_BUCKETS = 7;
-
-function getRangeMs(range: RangeType): number {
-	switch (range) {
-		case "1h":
-			return 60 * 60 * 1000;
-		case "6h":
-			return 6 * 60 * 60 * 1000;
-		case "24h":
-			return 24 * 60 * 60 * 1000;
-		case "7d":
-			return 7 * 24 * 60 * 60 * 1000;
-		case "30d":
-			return 30 * 24 * 60 * 60 * 1000;
-	}
-}
-
-function comparisonRange(range: RangeType): RangeType {
-	switch (range) {
-		case "1h":
-			return "6h";
-		case "6h":
-			return "24h";
-		case "24h":
-			return "7d";
-		case "7d":
-			return "30d";
-		case "30d":
-			return "30d";
-	}
-}
 
 function computeEfficiency(tokens: number, loc: number): number | null {
 	if (loc === 0) return null;
@@ -156,26 +131,19 @@ export function useCodeInsights(
 	} = currentRuntime;
 
 	const fetchData = useCallback(async () => {
-		const historyRange = comparisonRange(range);
+		const historyRange = codeInsightsComparisonRange(range);
+		const [tokenQuery, codeQuery, runtimeQuery] =
+			codeInsightsHistoryQueries(range);
 		const [tokenHistory, codeHistory, comparisonRuntime] =
 			await Promise.all([
-					invoke<TokenDataPoint[]>("get_token_history", {
-						range: historyRange,
-						hostname: null,
-						sessionId: null,
-						cwd: null,
-					}),
-					invoke<CodeStatsHistoryPoint[]>("get_code_stats_history", {
-						range: historyRange,
-					}),
+					invoke<TokenDataPoint[]>(tokenQuery.command, tokenQuery.args),
+					invoke<CodeStatsHistoryPoint[]>(codeQuery.command, codeQuery.args),
 					// Comparison-range runtime supplies the prior window's active
 					// seconds via proration. The current window comes from the shared
 					// LLM Runtime hook, so this never duplicates that IPC request.
 					historyRange === range
 						? Promise.resolve<LlmRuntimeStats | null>(null)
-						: invoke<LlmRuntimeStats>("get_llm_runtime_stats", {
-								range: historyRange,
-							}),
+						: invoke<LlmRuntimeStats>(runtimeQuery.command, runtimeQuery.args),
 			]);
 
 		if (tokenHistory.length === 0 || codeHistory.length === 0) {
@@ -183,7 +151,7 @@ export function useCodeInsights(
 		}
 
 		const now = Date.now();
-		const rangeMs = getRangeMs(range);
+		const rangeMs = queryRangeMs(range);
 		const currentStart = now - rangeMs;
 		const prevStart = currentStart - rangeMs;
 
@@ -232,7 +200,7 @@ export function useCodeInsights(
 				});
 		}
 
-		const compMs = getRangeMs(historyRange);
+		const compMs = queryRangeMs(historyRange);
 		const compStart = now - compMs;
 		const compRuntime = comparisonRuntime ?? {
 			sparkline: runtimeSparkline.map(({ value }) => value),

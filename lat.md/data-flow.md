@@ -10,7 +10,7 @@ Hook scripts capture token usage from Claude Code and Codex sessions and report 
 2. Provider hook script (`report-tokens.sh`) extracts tokens and POSTs to `POST /api/v1/tokens` with Bearer auth
 3. [[src-tauri/src/server.rs]] validates, rate-limits, and inserts into `token_snapshots` table
 4. Server emits `tokens-updated` Tauri event
-5. Frontend hooks (`useWidgetSeries`, `useCodeInsights`, `useWeeklyTrends`) receive the event and refresh via IPC, debounced through `useCachedInvoke`
+5. Frontend hooks (`useWidgetSeries`, `useCodeInsights`, `useWeeklyTrends`) receive the event and refresh via IPC through the shared five-second-or-longer `useCachedInvoke` fan-out; insight comparisons read exactly two selected periods and weekly trends read exactly 14 days
 6. Hourly cleanup task aggregates snapshots into `token_hourly` by provider/host for historical queries
 
 Each provider script searches newest-first with a binary reverse reader using fixed 64 KiB chunks. Memory stays bounded by one chunk plus the current logical record; invalid UTF-8, invalid JSON, non-object records, and malformed provider payloads are skipped so an older valid usage sample can still report. Every consumed token leaf must be a non-boolean integer from 0 through 100,000,000. Codex prefers a valid `last_token_usage`, falls back to valid `total_token_usage` in the same record, then continues to older records.

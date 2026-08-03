@@ -1,11 +1,14 @@
-import { useCallback, useMemo } from "react";
+import { useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useCachedInvoke } from "./useCachedInvoke";
+import {
+  breakdownQuery,
+  type BreakdownQueryOptions,
+} from "./widgetQueryPlan";
 import type {
   BreakdownMode,
   HookBreakdown,
   HostBreakdown,
-  IntegrationProvider,
   ProjectBreakdown,
   RangeType,
   SessionBreakdown,
@@ -19,66 +22,31 @@ type BreakdownRow =
   | SkillBreakdown
   | HookBreakdown;
 interface BreakdownOptions {
-  skillAllTime?: boolean;
-  skillProvider?: IntegrationProvider | null;
+  enabled?: boolean;
+  skillAllTime?: BreakdownQueryOptions["skillAllTime"];
+  skillProvider?: BreakdownQueryOptions["skillProvider"];
   // Feature 009: same All/Codex/Claude + ALL TIME pattern as skills,
   // but tracked independently so the user's last Skills filter doesn't
   // leak into the Hooks breakdown and vice versa.
   hookAllTime?: boolean;
-  hookProvider?: IntegrationProvider | null;
+  hookProvider?: BreakdownQueryOptions["hookProvider"];
 }
 
-const SESSION_BREAKDOWN_LIMIT = 200;
-const SKILL_BREAKDOWN_LIMIT = 100;
-const HOOK_BREAKDOWN_LIMIT = 100;
-
 export function useBreakdownData(mode: BreakdownMode, range: RangeType, options: BreakdownOptions = {}) {
-  const skillAllTime = options.skillAllTime ?? false;
-  const skillProvider = options.skillProvider ?? null;
-  const hookAllTime = options.hookAllTime ?? false;
-  const hookProvider = options.hookProvider ?? null;
-  const command =
-    mode === "hosts"
-      ? "get_host_breakdown"
-      : mode === "projects"
-        ? "get_project_breakdown"
-        : mode === "skills"
-          ? "get_skill_breakdown"
-          : mode === "hooks"
-            ? "get_hook_breakdown"
-            : "get_session_breakdown";
-  const args = useMemo(
-    () =>
-      mode === "skills"
-        ? {
-            range,
-            provider: skillProvider,
-            allTime: skillAllTime,
-            limit: SKILL_BREAKDOWN_LIMIT,
-          }
-        : mode === "hooks"
-          ? {
-              range,
-              provider: hookProvider,
-              allTime: hookAllTime,
-              limit: HOOK_BREAKDOWN_LIMIT,
-            }
-          : mode === "sessions"
-            ? { range, hostname: null, limit: SESSION_BREAKDOWN_LIMIT }
-            : { range },
-    [hookAllTime, hookProvider, mode, range, skillAllTime, skillProvider],
-  );
+  const enabled = options.enabled ?? true;
+  const { command, args: commandArgs } = breakdownQuery(mode, range, options);
 
   const fetchData = useCallback(async () => {
-    return invoke<BreakdownRow[]>(command, args);
-  }, [args, command]);
+    return invoke<BreakdownRow[]>(command, commandArgs);
+  }, [command, commandArgs]);
 
   const { state, refresh } = useCachedInvoke({
     command,
-    args,
+    args: commandArgs,
     request: fetchData,
     normalizeError: String,
     onError: (error) => console.error("Breakdown data fetch error:", error),
+    enabled,
     invalidationEvents: [
       "tokens-updated",
       "sessions-index-updated",
