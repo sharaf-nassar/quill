@@ -211,12 +211,19 @@ evidence.
 `freeze` reads a live WAL-backed database through SQLite's online backup API,
 refuses to overwrite an existing destination, validates the resulting snapshot,
 and makes it read-only. `measure` rejects writable corpora, opens a fresh
-read-only storage handle for every call to bypass app caches, and pins all 24h,
-30d, and 90d windows to one thread-local endpoint. It retains the real storage
-SQL and Rust post-processing while never running migrations, cleanup, or
-retention against the corpus. The database remains local and untracked; only
-its path, hash, endpoints, protocol, and timing table are committed in
+read-only storage handle per query or view fan-out, and pins all 24h, 30d, and
+90d windows to one thread-local endpoint. Each operation runs cold and then
+immediately warm; view totals cover backend work only and explicitly exclude
+IPC and frontend rendering. It retains the real storage SQL and Rust
+post-processing while never running migrations, cleanup, or retention against
+the corpus. The database remains local and untracked; only its path, hash,
+endpoints, protocol, and timing table are committed in
 `specs/020-widget-query-perf/timing-measurement.md`.
+
+`diagnose-model` is the read-only residual-work audit for the same pinned
+corpus. It reports rollup lifecycle and authority counts, raw/rollup
+cardinalities, and SQLite query plans for the overview project-ranking and
+history boundary-hour stages without changing the database.
 
 ### Database compaction
 

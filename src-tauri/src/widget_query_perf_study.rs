@@ -27,6 +27,18 @@ pub struct WidgetQueryMeasurement {
     pub start: String,
     pub end: String,
     pub elapsed_ms: f64,
+    pub warm_elapsed_ms: f64,
+    pub output_bytes: usize,
+}
+
+/// One complete view's backend request set, measured without frontend work.
+#[derive(Debug, Serialize)]
+pub struct WidgetViewFanoutMeasurement {
+    pub view: &'static str,
+    pub window: &'static str,
+    pub calls: &'static str,
+    pub cold_elapsed_ms: f64,
+    pub warm_elapsed_ms: f64,
     pub output_bytes: usize,
 }
 
@@ -44,6 +56,7 @@ pub struct WidgetQueryBenchmarkReport {
     pub pinned_end: String,
     pub os_page_cache: &'static str,
     pub measurements: Vec<WidgetQueryMeasurement>,
+    pub view_fanouts: Vec<WidgetViewFanoutMeasurement>,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,17 +129,27 @@ fn measure<T: Serialize>(
     pinned_end: DateTime<Utc>,
     window: Window,
     query: &'static str,
-    operation: impl FnOnce(&Storage) -> Result<T, String>,
+    operation: impl Fn(&Storage) -> Result<T, String>,
 ) -> Result<WidgetQueryMeasurement, String> {
     let storage = Storage::init_widget_query_benchmark(corpus)?;
-    let (elapsed_ms, output_bytes) = with_pinned_query_now(pinned_end, || {
+    let (elapsed_ms, warm_elapsed_ms, output_bytes) = with_pinned_query_now(pinned_end, || {
         let started = Instant::now();
         let value = operation(&storage)?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        let output_bytes = serde_json::to_vec(&value)
-            .map_err(|error| format!("Serialize {query} benchmark output: {error}"))?
-            .len();
-        Ok::<_, String>((elapsed_ms, output_bytes))
+        let output = serde_json::to_vec(&value)
+            .map_err(|error| format!("Serialize {query} benchmark output: {error}"))?;
+
+        let warm_started = Instant::now();
+        let warm_value = operation(&storage)?;
+        let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
+        let warm_output = serde_json::to_vec(&warm_value)
+            .map_err(|error| format!("Serialize warm {query} benchmark output: {error}"))?;
+        if output != warm_output {
+            return Err(format!(
+                "Cold and warm {query} benchmark outputs differ at pinned endpoint"
+            ));
+        }
+        Ok::<_, String>((elapsed_ms, warm_elapsed_ms, output.len()))
     })?;
 
     Ok(WidgetQueryMeasurement {
@@ -135,6 +158,151 @@ fn measure<T: Serialize>(
         start: (pinned_end - window.duration).to_rfc3339(),
         end: pinned_end.to_rfc3339(),
         elapsed_ms,
+        warm_elapsed_ms,
+        output_bytes,
+    })
+}
+
+fn add_output<T: Serialize>(
+    total: &mut usize,
+    query: &str,
+    result: Result<T, String>,
+) -> Result<(), String> {
+    let value = result?;
+    *total += serde_json::to_vec(&value)
+        .map_err(|error| format!("Serialize {query} fan-out output: {error}"))?
+        .len();
+    Ok(())
+}
+
+fn usage_view_fanout(storage: &Storage) -> Result<usize, String> {
+    let mut bytes = 0;
+    add_output(
+        &mut bytes,
+        "get_provider_token_series",
+        storage.get_provider_token_series("30d", Some(8)),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_activity_series",
+        storage.get_activity_series("30d", Some(8)),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_token_stats",
+        storage.get_token_stats("30d", None, None, None, None),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_llm_runtime_stats",
+        storage.get_llm_runtime_stats("30d", None),
+    )?;
+    add_output(&mut bytes, "get_code_stats", storage.get_code_stats("30d"))?;
+    add_output(
+        &mut bytes,
+        "get_code_stats_history (code stats)",
+        storage.get_code_stats_history("30d"),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_context_savings_analytics",
+        storage.get_context_savings_analytics("30d", Some(40)),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_retention_policy",
+        storage.get_retention_policy(),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_session_breakdown",
+        storage.get_session_breakdown("30d", None, None, Some(200)),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_project_breakdown",
+        storage.get_project_breakdown("30d"),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_token_history",
+        storage.get_token_history("30d", None, None, None, None),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_code_stats_history (insights)",
+        storage.get_code_stats_history("30d"),
+    )?;
+    Ok(bytes)
+}
+
+fn charts_view_fanout(storage: &Storage) -> Result<usize, String> {
+    let mut bytes = 0;
+    add_output(
+        &mut bytes,
+        "get_provider_token_series",
+        storage.get_provider_token_series("30d", Some(8)),
+    )?;
+    add_output(&mut bytes, "get_code_stats", storage.get_code_stats("30d"))?;
+    add_output(
+        &mut bytes,
+        "get_code_stats_history",
+        storage.get_code_stats_history("30d"),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_token_history",
+        storage.get_token_history("30d", None, None, None, None),
+    )?;
+    add_output(
+        &mut bytes,
+        "get_retention_policy",
+        storage.get_retention_policy(),
+    )?;
+    Ok(bytes)
+}
+
+fn context_view_fanout(storage: &Storage) -> Result<usize, String> {
+    let mut bytes = 0;
+    add_output(
+        &mut bytes,
+        "get_context_savings_analytics",
+        storage.get_context_savings_analytics("30d", Some(40)),
+    )?;
+    Ok(bytes)
+}
+
+fn measure_view_fanout(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    view: &'static str,
+    calls: &'static str,
+    operation: impl Fn(&Storage) -> Result<usize, String>,
+) -> Result<WidgetViewFanoutMeasurement, String> {
+    let storage = Storage::init_widget_query_benchmark(corpus)?;
+    let (cold_elapsed_ms, warm_elapsed_ms, output_bytes) =
+        with_pinned_query_now(pinned_end, || {
+            let started = Instant::now();
+            let cold_output_bytes = operation(&storage)?;
+            let cold_elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+            let warm_started = Instant::now();
+            let warm_output_bytes = operation(&storage)?;
+            let warm_elapsed_ms = warm_started.elapsed().as_secs_f64() * 1_000.0;
+            if cold_output_bytes != warm_output_bytes {
+                return Err(format!(
+                    "Cold and warm {view} fan-out output sizes differ at pinned endpoint"
+                ));
+            }
+            Ok::<_, String>((cold_elapsed_ms, warm_elapsed_ms, cold_output_bytes))
+        })?;
+
+    Ok(WidgetViewFanoutMeasurement {
+        view,
+        window: "30d",
+        calls,
+        cold_elapsed_ms,
+        warm_elapsed_ms,
         output_bytes,
     })
 }
@@ -499,6 +667,30 @@ pub fn run_widget_query_baseline(
         )?);
     }
 
+    let view_fanouts = vec![
+        measure_view_fanout(
+            &canonical,
+            pinned_end,
+            "Usage",
+            "provider series -> activity series -> token stats -> runtime -> code stats -> code history (code card) -> context savings -> retention policy -> session breakdown -> project breakdown -> token history -> code history (insights after runtime)",
+            usage_view_fanout,
+        )?,
+        measure_view_fanout(
+            &canonical,
+            pinned_end,
+            "Charts",
+            "provider series -> code stats -> code history -> token history -> retention policy",
+            charts_view_fanout,
+        )?,
+        measure_view_fanout(
+            &canonical,
+            pinned_end,
+            "Context",
+            "context savings",
+            context_view_fanout,
+        )?,
+    ];
+
     Ok(WidgetQueryBenchmarkReport {
         corpus_path: canonical.display().to_string(),
         corpus_bytes: metadata.len(),
@@ -511,5 +703,6 @@ pub fn run_widget_query_baseline(
         pinned_end: pinned_end.to_rfc3339(),
         os_page_cache: "uncontrolled; cold means first in-process call with app caches bypassed",
         measurements,
+        view_fanouts,
     })
 }
