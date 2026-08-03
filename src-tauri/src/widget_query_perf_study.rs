@@ -60,6 +60,21 @@ pub struct WidgetQueryBenchmarkReport {
     pub view_fanouts: Vec<WidgetViewFanoutMeasurement>,
 }
 
+/// Focused repeated measurement for the 30-day session-breakdown budget.
+#[derive(Debug, Serialize)]
+pub struct SessionBreakdownBenchmarkReport {
+    pub corpus_path: String,
+    pub corpus_bytes: u64,
+    pub corpus_read_only: bool,
+    pub pinned_end: String,
+    pub range_start: String,
+    pub samples_ms: Vec<f64>,
+    pub p95_ms: f64,
+    pub max_ms: f64,
+    pub output_bytes: usize,
+    pub query_plan: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ModelRollupBackfillCorpusReport {
     pub rows_done: u64,
@@ -201,6 +216,89 @@ fn measure<T: Serialize>(
         elapsed_ms,
         warm_elapsed_ms,
         output_bytes,
+    })
+}
+
+/// Measure only `get_session_breakdown` repeatedly on fresh read-only handles.
+///
+/// This keeps the slice-E acceptance run independent from the much slower
+/// full query matrix while preserving the same pinned-clock and cache-bypass
+/// rules. Every sample must serialize identically.
+pub fn measure_session_breakdown_30d(
+    corpus: &Path,
+    pinned_end: DateTime<Utc>,
+    sample_count: usize,
+) -> Result<SessionBreakdownBenchmarkReport, String> {
+    let sample_count = sample_count.clamp(1, 100);
+    let canonical = corpus
+        .canonicalize()
+        .map_err(|error| format!("Resolve session breakdown corpus: {error}"))?;
+    let metadata = canonical
+        .metadata()
+        .map_err(|error| format!("Read session breakdown corpus metadata: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Session breakdown corpus is not a file: {}",
+            canonical.display()
+        ));
+    }
+    if !metadata.permissions().readonly() {
+        return Err(format!(
+            "Session breakdown corpus must be read-only: {}",
+            canonical.display()
+        ));
+    }
+
+    let plan_storage = Storage::init_widget_query_benchmark(&canonical)?;
+    let query_plan = with_pinned_query_now(pinned_end, || {
+        plan_storage.explain_session_breakdown_query("30d", None, None, Some(200))
+    })?;
+    drop(plan_storage);
+
+    let mut samples_ms = Vec::with_capacity(sample_count);
+    let mut canonical_output: Option<Vec<u8>> = None;
+    for _ in 0..sample_count {
+        let storage = Storage::init_widget_query_benchmark(&canonical)?;
+        let (elapsed_ms, output) = with_pinned_query_now(pinned_end, || {
+            let started = Instant::now();
+            let value = storage.get_session_breakdown("30d", None, None, Some(200))?;
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let output = serde_json::to_vec(&value)
+                .map_err(|error| format!("Serialize focused session breakdown output: {error}"))?;
+            Ok::<_, String>((elapsed_ms, output))
+        })?;
+        if let Some(expected) = &canonical_output {
+            if expected != &output {
+                return Err(
+                    "Focused session breakdown outputs differ at the pinned endpoint".to_string(),
+                );
+            }
+        } else {
+            canonical_output = Some(output);
+        }
+        samples_ms.push(elapsed_ms);
+    }
+
+    let mut ordered = samples_ms.clone();
+    ordered.sort_by(f64::total_cmp);
+    let p95_index = ((ordered.len() as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(ordered.len() - 1);
+    let p95_ms = ordered[p95_index];
+    let max_ms = *ordered.last().expect("sample count is clamped above zero");
+    let output_bytes = canonical_output.map_or(0, |output| output.len());
+
+    Ok(SessionBreakdownBenchmarkReport {
+        corpus_path: canonical.display().to_string(),
+        corpus_bytes: metadata.len(),
+        corpus_read_only: metadata.permissions().readonly(),
+        pinned_end: pinned_end.to_rfc3339(),
+        range_start: (pinned_end - TimeDelta::days(30)).to_rfc3339(),
+        samples_ms,
+        p95_ms,
+        max_ms,
+        output_bytes,
+        query_plan,
     })
 }
 

@@ -20,13 +20,13 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use quill_lib::widget_query_perf_study::{
     WidgetQueryBenchmarkReport, backfill_model_rollup_copy, backfill_runtime_rollup_copy,
-    measure_runtime_90d, run_widget_query_baseline, verify_model_rollup_copy,
-    verify_model_rollup_from_frozen,
+    measure_runtime_90d, measure_session_breakdown_30d, run_widget_query_baseline,
+    verify_model_rollup_copy, verify_model_rollup_from_frozen,
 };
 use rusqlite::{Connection, OpenFlags, ToSql, backup::Backup, backup::StepResult, params};
 
 fn usage() -> &'static str {
-    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
+    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike verify-model-rollup COPY PINNED_END_RFC3339\n  widget_query_perf_spike verify-model-rollup-derived SOURCE FIXTURE PINNED_END_RFC3339\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike diagnose-model CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure-session-breakdown CORPUS PINNED_END_RFC3339 [SAMPLES]\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
 }
 
 fn path_arg(value: Option<OsString>, name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -409,6 +409,31 @@ fn main() -> Result<(), Box<dyn Error>> {
             let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
             let report = run_widget_query_baseline(&corpus, pinned_end)?;
             print_markdown(&report);
+            Ok(())
+        }
+        "measure-session-breakdown" => {
+            let corpus = path_arg(args.next(), "CORPUS")?;
+            let pinned_end = args
+                .next()
+                .and_then(|value| value.into_string().ok())
+                .ok_or_else(|| format!("Missing PINNED_END_RFC3339.\n{}", usage()))?;
+            let sample_count = args
+                .next()
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| "SAMPLES must be valid UTF-8".to_string())?
+                        .parse::<usize>()
+                        .map_err(|error| format!("Invalid SAMPLES: {error}"))
+                })
+                .transpose()?
+                .unwrap_or(10);
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let pinned_end = DateTime::parse_from_rfc3339(&pinned_end)?.with_timezone(&Utc);
+            let report = measure_session_breakdown_30d(&corpus, pinned_end, sample_count)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         "backfill-runtime" => {

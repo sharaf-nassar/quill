@@ -294,15 +294,14 @@ survive below the watermark, so all copy says "may be incomplete".
 
 `SessionBreakdown.subagent_count` is an accepted, documented limitation rather than a bug to fix here: it can outlive the tree it summarises, so the Sessions breakdown renders it marked instead of exact.
 
-The count unions `token_snapshots ∪ response_times ∪ tool_actions` and retention
-prunes only the last of the three, so for a session older than the watermark it
-is computed over mixed horizons and can disagree with its own drilldown — the
-badge says `+2`, the expanded tree says nothing. The treatment is to dagger the
-badge, explain the mixed horizon in its title, and replace the tree's "No
-sub-agents" empty state with "Sub-agent detail pruned (before <date>)" so the
-contradiction is named rather than left for the user to discover. `has_subagents`
-degrades the same way. The real fix is rollup aggregates, which are a deferred
-follow-up.
+The count unions range-bounded `token_snapshots ∪ response_times ∪ tool_actions`
+with overlapping `retention_daily_aggregates`. Retention prunes only raw tool
+actions, and the retained table has daily rather than exact-timestamp grain, so
+the partial first day remains a mixed horizon and can disagree with its own
+drilldown. The treatment is to dagger the badge, explain the mixed horizon in
+its title, and replace the tree's "No sub-agents" empty state with "Sub-agent
+detail pruned (before <date>)" so the contradiction is named rather than left
+for the user to discover. `has_subagents` degrades the same way.
 
 The same shape appears in session search from the other direction: the
 full-text index is never pruned, so a hit survives after the SQL rows behind its

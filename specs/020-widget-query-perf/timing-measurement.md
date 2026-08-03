@@ -49,6 +49,7 @@ logical CPUs and 125 GiB RAM.
 ```bash
 cargo run --release --bin widget_query_perf_spike -- freeze SOURCE DEST
 cargo run --release --bin widget_query_perf_spike -- measure CORPUS 2026-08-02T19:27:43Z
+cargo run --release --bin widget_query_perf_spike -- measure-session-breakdown CORPUS 2026-08-02T19:27:43Z 10
 ```
 
 Pinned half-open windows:
@@ -417,6 +418,50 @@ BEFORE fan-out total exists and none is reconstructed from unrelated rows.
 These decisions size C/D/E but do not waive slice A's failed cold budgets. The
 residual model-query follow-up remains the release gate before feature 020 can
 claim its S1 acceptance target.
+
+## Session breakdown candidate pruning
+
+The slice-E session cleanup ran separately from the full matrix so repeated
+samples did not pay the unrelated residual model-query cost. Each sample used
+a fresh read-only `Storage`, the pinned 30-day endpoint, production SQL, and an
+app-cache-empty handle. OS page cache remained uncontrolled.
+
+Source inspection of the legacy SQL showed one range-grouped `tok` CTE feeding
+unbounded correlated response-count, latest-activity, latest-project, and
+four-table distinct-agent subqueries. SQLite therefore enriched every token
+session before the final `ORDER BY ... LIMIT 200`; the frozen BEFORE run cost
+883.987 ms and returned 61,698 bytes.
+
+The final plan materializes range-, provider-, and hostname-scoped token groups
+and an indexed, range-bounded response maximum, then materializes 200 ranked
+candidates before enrichment. Its EQP orders `rankable` while building
+`candidates`, scans only `candidates` afterward, and places the response count,
+project lookup, and distinct-agent UNION beneath that scan. Raw probes carry
+the exact timestamp lower bound. The retained-agent probe uses the overlapping
+UTC day because `retention_daily_aggregates` has daily grain.
+
+```text
+MATERIALIZE candidates
+  MATERIALIZE rankable
+    MATERIALIZE tok
+    CORRELATED SCALAR SUBQUERY: SEARCH response_times
+  USE TEMP B-TREE FOR ORDER BY
+SCAN candidates
+  CORRELATED SCALAR SUBQUERY: SEARCH response_times
+  CORRELATED SCALAR SUBQUERY: SEARCH token_snapshots
+  CORRELATED SCALAR SUBQUERY: bounded four-table agent UNION
+```
+
+| Samples | Min | Median | p95 | Max | Output bytes | Budget |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 118.001 ms | 123.797 ms | 141.554 ms | 141.554 ms | 61,698 | ≤300 ms |
+
+All ten serialized outputs were byte-identical. Before and after measurement,
+the source remained 13,525,123,072 bytes, mode `0444`, with unchanged inode,
+mtime, and canonical SHA-256
+`c86553ab3b0f22e23511dfc43a1f1b9dc9af35ad57f6ae63fcb3de75a673d04e`.
+Its existing zero-byte WAL and 32,768-byte SHM also retained identical mode,
+inode, mtime, and size; neither sidecar was removed or rewritten.
 
 ## Frontend cache and refresh query-window evidence
 

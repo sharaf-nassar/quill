@@ -13865,17 +13865,16 @@ impl Storage {
         Ok(results)
     }
 
-    pub fn get_session_breakdown(
-        &self,
-        range: &str,
+    /// Build the production session-breakdown query and its owned parameters.
+    ///
+    /// Keeping SQL construction separate lets the maintainer benchmark record
+    /// the exact production EQP instead of maintaining a diagnostic copy.
+    fn session_breakdown_query(
+        from: String,
         hostname: Option<&str>,
         provider: Option<IntegrationProvider>,
-        limit: Option<i32>,
-    ) -> Result<Vec<SessionBreakdown>, String> {
-        let limit = limit.unwrap_or(10).clamp(1, 500);
-        let conn = self.open_view_reader()?;
-        let from = range_from_timestamp(range);
-
+        limit: i32,
+    ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
         // Sub-agent rollup (Wave 2). Each output row is keyed by
         // `(provider, session_id, hostname)` — the same natural key as
         // `token_snapshots`. A session that appears on multiple hostnames
@@ -13894,15 +13893,19 @@ impl Storage {
         // * `has_subagents` reads token_snapshots (only sub-agent-aware
         //   table that survived the Wave 1 reingest reset). Cheapest
         //   reliable signal.
-        // * `subagent_count` is COUNT(DISTINCT agent_id) over the UNION of
-        //   all three sub-agent-aware tables — any one of them may carry
-        //   the agent first depending on extraction ordering.
+        // * `subagent_count` is COUNT(DISTINCT agent_id) over the three raw
+        //   sub-agent-aware tables plus retained daily evidence — any source
+        //   may carry the agent first depending on extraction and pruning.
         //
-        // The `(provider, session_id, is_sidechain)` index added in
-        // migration 20 means each subquery is an index scan over the
-        // relevant slice, not a full-table scan.
+        // Rank only the cheap, range-scoped token groups plus each group's
+        // indexed response-time maximum. Materializing that top-N frontier
+        // lets LIMIT prune the turn/project/sub-agent enrichment below.
+        // Raw enrichment stays inside the requested timestamp range. The
+        // retained aggregate uses its overlapping first UTC day because its
+        // daily grain cannot represent the partial boundary day without
+        // under-counting a retained sub-agent.
         let mut sql = String::from(
-            "WITH tok AS (
+            "WITH tok AS MATERIALIZED (
                  SELECT provider, session_id, hostname,
                         SUM(input_tokens + output_tokens
                             + cache_creation_input_tokens
@@ -13912,65 +13915,101 @@ impl Storage {
                         MAX(CASE WHEN is_sidechain = 1 THEN 1 ELSE 0 END) AS has_subagents
                  FROM token_snapshots
                  WHERE timestamp >= ?1
-                 GROUP BY provider, session_id, hostname
-             )
-             SELECT
-                 tok.provider,
-                 tok.session_id,
-                 tok.hostname,
-                 tok.total_tokens,
-                 COALESCE((SELECT COUNT(*) FROM response_times rt
-                           WHERE rt.provider = tok.provider
-                             AND rt.session_id = tok.session_id), 0) AS turn_count,
-                 tok.first_seen,
-                 COALESCE(
-                     (SELECT MAX(ts) FROM (
-                         SELECT MAX(timestamp) AS ts FROM token_snapshots
-                           WHERE provider = tok.provider AND session_id = tok.session_id
-                         UNION ALL
-                         SELECT MAX(timestamp) AS ts FROM response_times
-                           WHERE provider = tok.provider AND session_id = tok.session_id
-                     )), tok.last_active_tok) AS last_active,
-                 (SELECT t.cwd FROM token_snapshots t
-                    WHERE t.provider = tok.provider AND t.session_id = tok.session_id
-                      AND t.cwd IS NOT NULL
-                    ORDER BY t.timestamp DESC LIMIT 1) AS project,
-                 tok.has_subagents,
-                 (SELECT COUNT(*) FROM (
-                     SELECT agent_id FROM token_snapshots
-                       WHERE provider = tok.provider AND session_id = tok.session_id
-                         AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM response_times
-                       WHERE provider = tok.provider AND session_id = tok.session_id
-                         AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM tool_actions
-                       WHERE provider = tok.provider AND session_id = tok.session_id
-                         AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM retention_daily_aggregates
-                       WHERE provider = tok.provider AND session_id = tok.session_id
-                         AND agent_id != ''
-                 )) AS subagent_count
-             FROM tok
-             WHERE 1=1",
+            ",
         );
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from)];
         let hostname_param = if provider.is_some() { 3 } else { 2 };
 
         if let Some(provider) = provider {
-            sql.push_str(" AND tok.provider = ?2");
+            sql.push_str(" AND provider = ?2");
             params_vec.push(Box::new(provider.as_str().to_string()));
         }
 
         if let Some(host) = hostname {
-            sql.push_str(&format!(" AND tok.hostname = ?{hostname_param}"));
+            sql.push_str(&format!(" AND hostname = ?{hostname_param}"));
             params_vec.push(Box::new(host.to_string()));
         }
 
-        sql.push_str(" ORDER BY last_active DESC");
-        sql.push_str(&format!(" LIMIT {limit}"));
+        sql.push_str(&format!(
+            " GROUP BY provider, session_id, hostname
+             ), rankable AS MATERIALIZED (
+                 SELECT tok.*,
+                        (SELECT MAX(rt.timestamp) FROM response_times rt
+                          WHERE rt.provider = tok.provider
+                            AND rt.session_id = tok.session_id
+                            AND rt.timestamp >= ?1) AS last_active_rt
+                 FROM tok
+             ), candidates AS MATERIALIZED (
+                 SELECT rankable.*,
+                        CASE
+                            WHEN last_active_rt > last_active_tok THEN last_active_rt
+                            ELSE last_active_tok
+                        END AS last_active
+                 FROM rankable
+                 ORDER BY last_active DESC
+                 LIMIT {limit}
+             )
+             SELECT
+                 candidates.provider,
+                 candidates.session_id,
+                 candidates.hostname,
+                 candidates.total_tokens,
+                 COALESCE((SELECT COUNT(*) FROM response_times rt
+                           WHERE rt.provider = candidates.provider
+                             AND rt.session_id = candidates.session_id
+                             AND rt.timestamp >= ?1), 0) AS turn_count,
+                 candidates.first_seen,
+                 candidates.last_active,
+                 (SELECT t.cwd FROM token_snapshots t
+                    WHERE t.provider = candidates.provider
+                      AND t.session_id = candidates.session_id
+                      AND t.timestamp >= ?1
+                      AND t.cwd IS NOT NULL
+                    ORDER BY t.timestamp DESC LIMIT 1) AS project,
+                 candidates.has_subagents,
+                 (SELECT COUNT(*) FROM (
+                     SELECT agent_id FROM token_snapshots
+                       WHERE provider = candidates.provider
+                         AND session_id = candidates.session_id
+                         AND timestamp >= ?1
+                         AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM response_times
+                       WHERE provider = candidates.provider
+                         AND session_id = candidates.session_id
+                         AND timestamp >= ?1
+                         AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM tool_actions
+                       WHERE provider = candidates.provider
+                         AND session_id = candidates.session_id
+                         AND timestamp >= ?1
+                         AND agent_id IS NOT NULL
+                     UNION
+                     SELECT agent_id FROM retention_daily_aggregates
+                       WHERE provider = candidates.provider
+                         AND session_id = candidates.session_id
+                         AND day >= substr(?1, 1, 10)
+                         AND agent_id != ''
+                 )) AS subagent_count
+             FROM candidates
+             ORDER BY candidates.last_active DESC"
+        ));
+
+        (sql, params_vec)
+    }
+
+    pub fn get_session_breakdown(
+        &self,
+        range: &str,
+        hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+        limit: Option<i32>,
+    ) -> Result<Vec<SessionBreakdown>, String> {
+        let limit = limit.unwrap_or(10).clamp(1, 500);
+        let conn = self.open_view_reader()?;
+        let (sql, params_vec) =
+            Self::session_breakdown_query(range_from_timestamp(range), hostname, provider, limit);
 
         let mut stmt = conn
             .prepare(&sql)
@@ -14001,6 +14040,39 @@ impl Storage {
             results.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
         Ok(results)
+    }
+
+    /// Return the production session-breakdown query plan for timing evidence.
+    pub(crate) fn explain_session_breakdown_query(
+        &self,
+        range: &str,
+        hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+        limit: Option<i32>,
+    ) -> Result<Vec<String>, String> {
+        let limit = limit.unwrap_or(10).clamp(1, 500);
+        let conn = self.open_view_reader()?;
+        let (sql, params_vec) =
+            Self::session_breakdown_query(range_from_timestamp(range), hostname, provider, limit);
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec
+            .iter()
+            .map(|parameter| parameter.as_ref())
+            .collect();
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .map_err(|error| format!("Prepare session breakdown query plan: {error}"))?;
+        let rows = statement
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(format!(
+                    "{}:{} {}",
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(3)?
+                ))
+            })
+            .map_err(|error| format!("Query session breakdown plan: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Read session breakdown plan: {error}"))
     }
 
     /// Return one row per distinct `agent_id` that belongs to
