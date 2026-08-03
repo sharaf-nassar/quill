@@ -11,3 +11,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[rollup-retention-tests]] — Fold-before-prune coverage and hourly-authority test specs
 - [[frontend-cache-tests]] — Frontend invoke cache, refresh cadence, and lifecycle test specs
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
+- [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs

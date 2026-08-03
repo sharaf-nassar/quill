@@ -950,6 +950,8 @@ The migrated view slice is [[src-tauri/src/storage.rs#Storage#get_all_bucket_sta
 
 Multi-statement reads run in deferred transactions, giving one response a stable WAL snapshot while ingest commits concurrently. Cache probes and cache misses share that snapshot. SQL rows are fully materialized before parsing, project merging, downsampling, runtime turn walking, or history bucketing begins, shortening reader lifetime as well as removing writer-mutex contention.
 
+[[view-reader-tests#View Reader Contention Tests]] pins the five-second slow-reader acceptance boundary under fast view queries and concurrent ingest.
+
 ### Schema
 
 The database schema is versioned through migration 37 and includes usage, token, model analytics, context savings, learning, rule governance, session indexing, memory optimizer, code, runtime, retention aggregates, and metadata tables.

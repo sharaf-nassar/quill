@@ -8346,6 +8346,40 @@ impl Storage {
         Ok(conn)
     }
 
+    /// Pin a real view-reader snapshot for a controlled interval.
+    ///
+    /// The first query establishes the deferred transaction's WAL snapshot
+    /// before the rendezvous releases concurrent test work. Reading again
+    /// before commit lets the caller prove that the same snapshot survived
+    /// while an independent ingest writer committed new rows.
+    #[cfg(test)]
+    fn hold_view_reader_snapshot_for_test(
+        &self,
+        ready: std::sync::mpsc::SyncSender<()>,
+        hold_for: Duration,
+    ) -> Result<(i64, i64, Duration), String> {
+        let mut conn = self.open_view_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin injected view read snapshot: {error}"))?;
+        let rows_before = tx
+            .query_row("SELECT COUNT(*) FROM token_snapshots", [], |row| row.get(0))
+            .map_err(|error| format!("Establish injected view read snapshot: {error}"))?;
+        ready
+            .send(())
+            .map_err(|error| format!("Signal injected view read snapshot: {error}"))?;
+
+        let hold_started = Instant::now();
+        std::thread::sleep(hold_for);
+        let rows_after = tx
+            .query_row("SELECT COUNT(*) FROM token_snapshots", [], |row| row.get(0))
+            .map_err(|error| format!("Recheck injected view read snapshot: {error}"))?;
+        let held_for = hold_started.elapsed();
+        tx.commit()
+            .map_err(|error| format!("Commit injected view read snapshot: {error}"))?;
+        Ok((rows_before, rows_after, held_for))
+    }
+
     /// Check whether the database can be compacted without exhausting disk.
     pub(crate) fn preflight_database_compaction(&self) -> Result<u64, DatabaseCompactionResult> {
         let bytes_before = match std::fs::metadata(&self.db_path) {
@@ -20486,6 +20520,179 @@ mod tests {
                 pinned_now - range_to_duration(comparison),
             );
         }
+    }
+
+    /// Return the nearest-rank p95. One hundred samples make this exactly the
+    /// 95th ordered observation (index 94), with no interpolation ambiguity.
+    fn nearest_rank_p95(samples: &mut [Duration]) -> Duration {
+        assert!(!samples.is_empty(), "p95 requires at least one sample");
+        samples.sort_unstable();
+        let rank = (95 * samples.len()).div_ceil(100);
+        samples[rank - 1]
+    }
+
+    fn contention_token_payload(sequence: usize) -> TokenReportPayload {
+        TokenReportPayload {
+            provider: IntegrationProvider::Claude,
+            session_id: format!("contention-session-{sequence}"),
+            hostname: "contention-host".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            cwd: Some("/tmp/quill-contention-project".to_string()),
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: None,
+        }
+    }
+
+    // @lat: [[view-reader-tests#View Reader Contention Tests#Five-Second Snapshot Allows Fast Queries And Ingest]]
+    #[test]
+    #[serial]
+    fn five_second_view_snapshot_allows_fast_queries_and_ingest() {
+        const SLOW_READ_HOLD: Duration = Duration::from_secs(5);
+        const FAST_SAMPLES_PER_QUERY: usize = 100;
+        const FAST_P95_BUDGET: Duration = Duration::from_millis(100);
+
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(init_storage_in(&dir));
+        storage
+            .store_token_snapshot(&contention_token_payload(0))
+            .expect("seed token snapshot");
+
+        let (slow_ready_tx, slow_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let slow_storage = std::sync::Arc::clone(&storage);
+        let slow_reader = std::thread::spawn(move || {
+            slow_storage.hold_view_reader_snapshot_for_test(slow_ready_tx, SLOW_READ_HOLD)
+        });
+        slow_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("slow reader must establish its snapshot before contention starts");
+
+        let stop_writer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committed_writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (first_write_tx, first_write_rx) = std::sync::mpsc::sync_channel(0);
+        let writer_storage = std::sync::Arc::clone(&storage);
+        let writer_stop = std::sync::Arc::clone(&stop_writer);
+        let writer_commits = std::sync::Arc::clone(&committed_writes);
+        let writer = std::thread::spawn(move || {
+            let mut errors = Vec::new();
+            let mut sequence = 1_usize;
+            loop {
+                let result =
+                    writer_storage.store_token_snapshot(&contention_token_payload(sequence));
+                if sequence == 1 {
+                    first_write_tx
+                        .send(result.clone())
+                        .expect("contention test must await first ingest result");
+                }
+                match result {
+                    Ok(()) => {
+                        writer_commits.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    }
+                    Err(error) => {
+                        errors.push(error);
+                        break;
+                    }
+                }
+                sequence += 1;
+                if writer_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            errors
+        });
+        first_write_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ingest writer must report its first attempt")
+            .expect("first concurrent ingest must commit");
+
+        let mut host_latencies = Vec::with_capacity(FAST_SAMPLES_PER_QUERY);
+        let mut project_latencies = Vec::with_capacity(FAST_SAMPLES_PER_QUERY);
+        let mut fast_errors = Vec::new();
+        for _ in 0..FAST_SAMPLES_PER_QUERY {
+            let started = Instant::now();
+            if let Err(error) = storage.get_host_breakdown("1h") {
+                fast_errors.push(format!("host breakdown: {error}"));
+            }
+            host_latencies.push(started.elapsed());
+
+            let started = Instant::now();
+            if let Err(error) = storage.get_project_breakdown("1h") {
+                fast_errors.push(format!("project breakdown: {error}"));
+            }
+            project_latencies.push(started.elapsed());
+        }
+
+        stop_writer.store(true, std::sync::atomic::Ordering::Release);
+        let writer_errors = writer.join().expect("ingest writer thread must not panic");
+        let (snapshot_rows_before, snapshot_rows_after, held_for) = slow_reader
+            .join()
+            .expect("slow reader thread must not panic")
+            .expect("slow reader must complete without SQLite errors");
+        let committed_writes = committed_writes.load(std::sync::atomic::Ordering::Acquire);
+        let persisted_rows = {
+            let conn = storage.conn.lock();
+            conn.query_row("SELECT COUNT(*) FROM token_snapshots", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .expect("count persisted contention ingest rows")
+        };
+        let host_p95 = nearest_rank_p95(&mut host_latencies);
+        let project_p95 = nearest_rank_p95(&mut project_latencies);
+        let lock_or_busy_errors = fast_errors
+            .iter()
+            .chain(writer_errors.iter())
+            .filter(|error| {
+                let error = error.to_ascii_lowercase();
+                error.contains("locked") || error.contains("busy")
+            })
+            .count();
+
+        eprintln!(
+            "view contention: samples/query={FAST_SAMPLES_PER_QUERY} \
+             host_p95={host_p95:?} project_p95={project_p95:?} \
+             writes={committed_writes} persisted={persisted_rows} held={held_for:?}"
+        );
+
+        assert_eq!(lock_or_busy_errors, 0, "SQLite lock/busy errors observed");
+        assert!(fast_errors.is_empty(), "fast query errors: {fast_errors:?}");
+        assert!(writer_errors.is_empty(), "ingest errors: {writer_errors:?}");
+        assert!(
+            committed_writes > 0,
+            "concurrent ingest must commit evidence"
+        );
+        assert_eq!(
+            persisted_rows,
+            1 + committed_writes,
+            "every reported ingest commit must persist"
+        );
+        assert_eq!(
+            snapshot_rows_before, snapshot_rows_after,
+            "the injected reader must retain one stable WAL snapshot"
+        );
+        assert!(
+            persisted_rows > snapshot_rows_after as usize,
+            "ingest must commit while the slow snapshot remains pinned"
+        );
+        assert!(
+            held_for >= SLOW_READ_HOLD,
+            "slow snapshot held for {held_for:?}, expected at least {SLOW_READ_HOLD:?}"
+        );
+        assert!(
+            host_p95 <= FAST_P95_BUDGET,
+            "host breakdown p95 {host_p95:?} exceeded {FAST_P95_BUDGET:?}"
+        );
+        assert!(
+            project_p95 <= FAST_P95_BUDGET,
+            "project breakdown p95 {project_p95:?} exceeded {FAST_P95_BUDGET:?}"
+        );
+
+        drop(storage);
+        clear_env();
     }
 
     // @lat: [[backend#Database#Database compaction#Database Compaction Test Specs#Completed Footprint Report]]
