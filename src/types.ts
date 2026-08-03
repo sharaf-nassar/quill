@@ -846,6 +846,35 @@ export interface ModelUsageOverviewResponse {
   delegation: ModelDelegation;
 }
 
+export type RollupBackfillTarget = "model" | "runtime";
+export type RollupBackfillPhase = "preflight" | "folding" | "checkpointing";
+
+export interface RollupBackfillProgressEvent {
+  runId: number;
+  target: RollupBackfillTarget;
+  phase: RollupBackfillPhase;
+  rowsDone: number;
+  rowsTotal: number;
+  hourDoneThrough: number | null;
+}
+
+export interface RollupBackfillFinishedEvent {
+  runId: number;
+  target: RollupBackfillTarget;
+  status: "completed" | "interrupted" | "error";
+  detail: string | null;
+}
+
+export interface RebuildRollupResult {
+  runId: number | null;
+  target: RollupBackfillTarget;
+  status: "started" | "refused";
+  reason: string | null;
+  rowsDone: number;
+  rowsTotal: number;
+  hourDoneThrough: number | null;
+}
+
 export interface ModelSessionRow {
   provider: string;
   sessionId: string;

@@ -167,7 +167,7 @@ Identity obeys DESIGN.md's Model-Shade Rule exactly as the full page does. Each 
 
 A ranked row only exists because its model ran sessions, and a session that ran necessarily burned tokens — so a zero attributed-token figure is the absence of a measurement rather than a measurement of nothing, and it is what a provider whose observations carry no token columns looks like. [[src/components/widget/views/ModelsView.tsx#tokenReading]] therefore prints an em dash with the reason on hover instead of `0`, the same way every panel head states a figure it does not have. Times in both bands are 24-hour, matching the Usage readouts and the Charts axis; a 12-hour caption would print `05:39 PM` for the instant the axis calls `17:40`, and its meridiem suffix is not a tabular figure.
 
-Two disclosures keep a compact home here. Coverage states the share of token activity that carries model evidence whenever it is short of 100%, because activity recorded before a chain's first observation stays unattributed instead of being assigned a model. A retained-history line appears only while the backfill needs attention, carrying its state, its processed-source count, and a Retry while the run is retryable; a refused retry states its reason rather than vanishing. Emptiness is a claim the view has to earn: it names the specific negative — no retained sessions, no sessions in range, or sessions carrying no model identifier — only when the backend calls the scope final and the history inventory complete, and otherwise says the evidence is still being processed.
+Three disclosures keep a compact home here. Coverage states the share of token activity that carries model evidence whenever it is short of 100%, because activity recorded before a chain's first observation stays unattributed instead of being assigned a model. A retained-history line appears only while that source inventory needs attention, carrying its state, processed-source count, and Retry. A separate model-index line reads persisted `buildingIndex` on mount and committed [[src/hooks/useRollupBackfill.ts#useRollupBackfill]] events while present; it shows observation counts, raw-evidence fallback, stopped recovery, or the completed refresh. Emptiness is a claim the view has to earn from final backend scope.
 
 #### Context View
 
@@ -198,6 +198,12 @@ Full-text session search UI in `src/components/sessions/` for a shared Claude-pl
 - **FilterBar** — Multi-select filters for provider, project, host, role, date range, and git branch.
 - **ResultCard** — Search hit preview with provider badge, snippet, and per-session code-change pill. Takes the retention cutoff and swaps the line counts for a pruned marker when the hit predates it — see [[frontend#Frontend#Components#Retention Degradation]].
 - **DetailPanel** — Context message display with provider badge, match highlighting, and session-local code-change totals, with the same pruned marker as `ResultCard`.
+
+### Model Rollup Maintenance
+
+The Performance tab exposes model-index rebuild state without changing the legacy Graphite settings density.
+
+[[src/components/settings/PerformanceTab.tsx#PerformanceTab]] reuses `SettingRow` for the rebuild control and [[src/hooks/useRollupBackfill.ts#useRollupBackfill]] for run-scoped events. It enumerates starting, counted progress, lease refusal, recoverable failure with committed counts, and completion while preserving long-text wrapping and tabular figures. The widget uses the same hook but falls back to persisted `buildingIndex` when startup events occurred before mount.
 
 ### Retention Control
 

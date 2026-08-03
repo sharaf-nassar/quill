@@ -1090,9 +1090,13 @@ Three facets need narrower handling because migration 37 omits their full grain.
 
 Each chunk receives a 250 ms ceiling and row limit, runs its fold plus durable bookmark update in one immediate transaction under the shared ingest permit, then releases the permit before `wal_checkpoint(TRUNCATE)`. A disk preflight precedes every chunk.
 
-Checkpoint busy/failure and unreadable or insufficient disk space stop as typed terminal errors. A committed bookmark remains resumable if its following checkpoint fails; unexpected target SQL and invariant failures bubble to the caller.
+Checkpoint busy/failure and unreadable or insufficient disk space stop as typed terminal errors. A committed bookmark remains resumable if its following checkpoint fails; unexpected target SQL and invariant failures bubble to the caller and emit a generic failure detail instead of claiming a checkpoint fault.
 
 The runtime target prepares one source-keyed `session_events` block at a time outside the ingest permit, sorting and folding it in memory. Current source replacement writes one contiguous rowid block; the compact transaction revalidates its bounds, count, identity, content hash, and generation before replacing only unpruned rollup/state rows and advancing the source-end bookmark. Preparation can exceed the row target without extending the immediate transaction; compact commits still enforce the 250 ms ceiling. `raw_pruned=1` rows remain authoritative, the first commit reconciles live folds, and empty databases complete with a null terminal bookmark.
+
+The model target selects a row-budgeted half-open UTC-hour range before admission, then re-reads current raw evidence inside the permit transaction. It replaces only that range's `raw_pruned=0` groups and atomically stores the inclusive end-of-hour bookmark; live replacement refolds old hours directly, so rows arriving behind the bookmark remain exact. Empty databases commit `complete` immediately.
+
+[[src-tauri/src/lib.rs#spawn_model_rollup_backfill]] schedules incomplete model state after startup. [[src-tauri/src/lib.rs#rebuild_model_rollup]] reserves one target run, refuses active or queued maintenance without waiting, clears only raw-backed rows and bookmark state, then uses the same runner. Per-run progress and finished events are emitted only after their lifecycle transaction commits; run ids prevent delayed events from an older rebuild replacing current UI state.
 
 ###### Backfill Interrupt And Exact Resume
 

@@ -67,6 +67,7 @@ pub(crate) trait RollupBackfillTarget {
         &mut self,
         _conn: &Connection,
         _state: RollupBackfillState,
+        _max_rows: u64,
     ) -> rusqlite::Result<()> {
         Ok(())
     }
@@ -296,7 +297,10 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
     let mut state = target
         .load_state(conn)
         .map_err(RollupBackfillError::StateLoad)?;
-    let directory = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = db_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let required_bytes = controls.required_free_bytes();
 
     loop {
@@ -310,30 +314,30 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
         let available_bytes = match controls.probe_free_space(directory) {
             Ok(available) => available,
             Err(reason) => {
-                return Ok(finish(
-                    controls,
+                return Ok(RollupBackfillReport {
                     progress,
-                    RollupBackfillTerminal::Error(
+                    terminal: RollupBackfillTerminal::Error(
                         RollupBackfillTerminalError::DiskSpaceProbeFailed { reason },
                     ),
-                ));
+                });
             }
         };
         if available_bytes < required_bytes {
-            return Ok(finish(
-                controls,
+            return Ok(RollupBackfillReport {
                 progress,
-                RollupBackfillTerminal::Error(RollupBackfillTerminalError::InsufficientDiskSpace {
-                    required_bytes,
-                    available_bytes,
-                }),
-            ));
+                terminal: RollupBackfillTerminal::Error(
+                    RollupBackfillTerminalError::InsufficientDiskSpace {
+                        required_bytes,
+                        available_bytes,
+                    },
+                ),
+            });
         }
 
         progress.phase = RollupBackfillPhase::Folding;
         let previous = state;
         target
-            .prepare_chunk(conn, previous)
+            .prepare_chunk(conn, previous, controls.chunk_rows)
             .map_err(RollupBackfillError::FoldChunk)?;
         let deadline = Instant::now() + controls.chunk_duration();
         let chunk = with_ingest_write_permit(|| {
@@ -833,5 +837,27 @@ mod tests {
                 .expect("resume after checkpoint failures");
         assert_eq!(RollupBackfillTerminal::Completed, completed.terminal);
         assert_eq!(5, completed.progress.rows_done);
+    }
+
+    #[test]
+    #[serial]
+    fn relative_database_path_probes_current_directory() {
+        let (_directory, _path, mut conn) = fixture(0);
+        let current_directory = |path: &Path| {
+            assert_eq!(path, Path::new("."));
+            Ok(u64::MAX)
+        };
+        let controls = RollupBackfillControls {
+            free_space: Some(&current_directory),
+            ..controls()
+        };
+        let report = run_rollup_backfill(
+            &mut conn,
+            Path::new("relative.db"),
+            &mut TestTarget::immediate(),
+            &controls,
+        )
+        .expect("run relative-path backfill");
+        assert_eq!(report.terminal, RollupBackfillTerminal::Completed);
     }
 }

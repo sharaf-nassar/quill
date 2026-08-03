@@ -1926,6 +1926,18 @@ struct PreparedRuntimeBackfillSource {
     open_turn_started_ms: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PreparedModelBackfillRange {
+    start_ms: i64,
+    end_ms: i64,
+}
+
+#[derive(Default)]
+struct ModelRollupBackfillTarget {
+    prepared: Option<PreparedModelBackfillRange>,
+    chunk_changed: bool,
+}
+
 #[derive(Default)]
 struct RuntimeRollupBackfillTarget {
     prepared: Option<PreparedRuntimeBackfillSource>,
@@ -1943,6 +1955,10 @@ impl std::fmt::Display for RuntimeBackfillInvariant {
 impl std::error::Error for RuntimeBackfillInvariant {}
 
 fn runtime_backfill_sql_error(message: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(RuntimeBackfillInvariant(message.into())))
+}
+
+fn model_backfill_sql_error(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(RuntimeBackfillInvariant(message.into())))
 }
 
@@ -2690,6 +2706,286 @@ fn refold_runtime_source_identity(
     Ok(())
 }
 
+impl ModelRollupBackfillTarget {
+    fn prepare_range(
+        conn: &Connection,
+        after_ms: i64,
+        max_rows: u64,
+    ) -> rusqlite::Result<Option<PreparedModelBackfillRange>> {
+        let first_ms = conn
+            .query_row(
+                "SELECT observed_at_ms
+                 FROM model_usage_observations
+                 WHERE observed_at_ms > ?1
+                 ORDER BY observed_at_ms
+                 LIMIT 1",
+                params![after_ms],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(first_ms) = first_ms else {
+            return Ok(None);
+        };
+        let offset = i64::try_from(max_rows.saturating_sub(1)).map_err(|_| {
+            model_backfill_sql_error("Model backfill chunk row limit exceeds SQLite INTEGER range")
+        })?;
+        let boundary_ms = conn
+            .query_row(
+                "SELECT observed_at_ms
+                 FROM model_usage_observations
+                 WHERE observed_at_ms > ?1
+                 ORDER BY observed_at_ms
+                 LIMIT 1 OFFSET ?2",
+                params![after_ms, offset],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let boundary_ms = match boundary_ms {
+            Some(boundary_ms) => boundary_ms,
+            None => conn
+                .query_row(
+                    "SELECT MAX(observed_at_ms)
+                     FROM model_usage_observations
+                     WHERE observed_at_ms > ?1",
+                    params![after_ms],
+                    |row| row.get::<_, Option<i64>>(0),
+                )?
+                .unwrap_or(first_ms),
+        };
+        let start_ms = first_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+        let end_ms = boundary_ms
+            .div_euclid(MODEL_ROLLUP_HOUR_MS)
+            .checked_add(1)
+            .and_then(|hour| hour.checked_mul(MODEL_ROLLUP_HOUR_MS))
+            .ok_or_else(|| model_backfill_sql_error("Model backfill hour boundary overflowed"))?;
+        Ok(Some(PreparedModelBackfillRange { start_ms, end_ms }))
+    }
+}
+
+impl RollupBackfillTarget for ModelRollupBackfillTarget {
+    fn name(&self) -> &'static str {
+        "model"
+    }
+
+    fn load_state(&self, conn: &Connection) -> rusqlite::Result<RollupBackfillState> {
+        let (status, bookmark) = conn.query_row(
+            "SELECT model_backfill_status, model_backfill_done_through_ms
+             FROM rollup_meta WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        let done_through = if status == "complete" {
+            conn.query_row(
+                "SELECT MAX(observed_at_ms) FROM model_usage_observations",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+        } else {
+            bookmark
+        };
+        let rows_done = match done_through {
+            Some(done_through) => conn.query_row(
+                "SELECT COUNT(*) FROM model_usage_observations
+                 WHERE observed_at_ms <= ?1",
+                params![done_through],
+                |row| row.get::<_, u64>(0),
+            )?,
+            None => 0,
+        };
+        Ok(RollupBackfillState {
+            rows_done,
+            done_through,
+        })
+    }
+
+    fn count_total_rows(&self, conn: &Connection) -> rusqlite::Result<u64> {
+        conn.query_row("SELECT COUNT(*) FROM model_usage_observations", [], |row| {
+            row.get(0)
+        })
+    }
+
+    fn prepare_chunk(
+        &mut self,
+        conn: &Connection,
+        state: RollupBackfillState,
+        max_rows: u64,
+    ) -> rusqlite::Result<()> {
+        self.prepared = Self::prepare_range(conn, state.done_through.unwrap_or(-1), max_rows)?;
+        Ok(())
+    }
+
+    fn fold_chunk(
+        &mut self,
+        tx: &rusqlite::Transaction<'_>,
+        state: RollupBackfillState,
+        budget: RollupBackfillChunkBudget,
+    ) -> rusqlite::Result<RollupBackfillChunk> {
+        self.chunk_changed = false;
+        let reset_rows = if state.done_through.is_none() {
+            tx.execute("DELETE FROM model_usage_hourly WHERE raw_pruned = 0", [])?
+        } else {
+            0
+        };
+
+        // Boundary selection happened before the ingest permit. Re-read the
+        // current raw frontier inside this transaction so a replacement that
+        // landed between preparation and admission is folded, never copied
+        // from stale prepared data.
+        let after_ms = state.done_through.unwrap_or(-1);
+        let current_first = tx
+            .query_row(
+                "SELECT observed_at_ms
+                 FROM model_usage_observations
+                 WHERE observed_at_ms > ?1
+                 ORDER BY observed_at_ms
+                 LIMIT 1",
+                params![after_ms],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(current_first) = current_first else {
+            self.chunk_changed = reset_rows > 0;
+            return Ok(RollupBackfillChunk {
+                rows_processed: 0,
+                done_through: state.done_through,
+                completed: true,
+            });
+        };
+        let current_start = current_first.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+        let prepared_end = self
+            .prepared
+            .take()
+            .filter(|range| range.start_ms <= current_first && current_first < range.end_ms)
+            .map(|range| range.end_ms);
+        let end_ms = match prepared_end {
+            Some(end_ms) => end_ms,
+            None => current_start
+                .checked_add(MODEL_ROLLUP_HOUR_MS)
+                .ok_or_else(|| {
+                    model_backfill_sql_error("Model backfill hour boundary overflowed")
+                })?,
+        };
+
+        let rows_processed = tx.query_row(
+            "SELECT COUNT(*) FROM model_usage_observations
+             WHERE observed_at_ms > ?1 AND observed_at_ms < ?2",
+            params![after_ms, end_ms],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let deleted_rows = tx.execute(
+            "DELETE FROM model_usage_hourly
+             WHERE raw_pruned = 0 AND hour_utc >= ?1 AND hour_utc < ?2",
+            params![current_start, end_ms],
+        )?;
+        let inserted_rows = tx.execute(
+            "INSERT INTO model_usage_hourly (
+                 hour_utc, provider, derived_model_id, source_key,
+                 analytics_session_id, obs_count, turn_count, token_count,
+                 sidechain_count, input_tokens, input_tokens_present,
+                 output_tokens, output_tokens_present, cache_creation_tokens,
+                 cache_creation_tokens_present, cache_read_tokens,
+                 cache_read_tokens_present, first_observed_at_ms,
+                 last_observed_at_ms, raw_pruned
+             )
+             SELECT (observed_at_ms / ?1) * ?1,
+                    provider, COALESCE(derived_model_id, ''), source_key,
+                    analytics_session_id, COUNT(*),
+                    SUM(CASE WHEN observation_kind = 'turn' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN observation_kind = 'token' THEN 1 ELSE 0 END),
+                    SUM(is_sidechain), COALESCE(SUM(input_tokens), 0),
+                    COUNT(input_tokens), COALESCE(SUM(output_tokens), 0),
+                    COUNT(output_tokens), COALESCE(SUM(cache_creation_tokens), 0),
+                    COUNT(cache_creation_tokens),
+                    COALESCE(SUM(cache_read_tokens), 0), COUNT(cache_read_tokens),
+                    MIN(observed_at_ms), MAX(observed_at_ms), 0
+             FROM model_usage_observations
+             WHERE observed_at_ms >= ?2 AND observed_at_ms < ?3
+             GROUP BY (observed_at_ms / ?1) * ?1, provider,
+                      COALESCE(derived_model_id, ''), source_key,
+                      analytics_session_id
+             ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
+             DO UPDATE SET
+                 analytics_session_id = excluded.analytics_session_id,
+                 obs_count = excluded.obs_count,
+                 turn_count = excluded.turn_count,
+                 token_count = excluded.token_count,
+                 sidechain_count = excluded.sidechain_count,
+                 input_tokens = excluded.input_tokens,
+                 input_tokens_present = excluded.input_tokens_present,
+                 output_tokens = excluded.output_tokens,
+                 output_tokens_present = excluded.output_tokens_present,
+                 cache_creation_tokens = excluded.cache_creation_tokens,
+                 cache_creation_tokens_present = excluded.cache_creation_tokens_present,
+                 cache_read_tokens = excluded.cache_read_tokens,
+                 cache_read_tokens_present = excluded.cache_read_tokens_present,
+                 first_observed_at_ms = excluded.first_observed_at_ms,
+                 last_observed_at_ms = excluded.last_observed_at_ms
+             WHERE model_usage_hourly.raw_pruned = 0",
+            params![MODEL_ROLLUP_HOUR_MS, current_start, end_ms],
+        )?;
+        self.chunk_changed = reset_rows > 0 || deleted_rows > 0 || inserted_rows > 0;
+
+        let completed = !tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM model_usage_observations
+                 WHERE observed_at_ms >= ?1
+             )",
+            params![end_ms],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let done_through = end_ms.checked_sub(1).ok_or_else(|| {
+            model_backfill_sql_error("Model backfill inclusive bookmark underflowed")
+        })?;
+        if budget.should_yield() {
+            log::warn!(
+                "Model rollup backfill chunk through {done_through} exceeded the 250 ms target"
+            );
+        }
+        Ok(RollupBackfillChunk {
+            rows_processed,
+            done_through: Some(done_through),
+            completed,
+        })
+    }
+
+    fn persist_chunk(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        state: RollupBackfillState,
+        completed: bool,
+    ) -> rusqlite::Result<()> {
+        let desired_status = if completed { "complete" } else { "running" };
+        let desired_bookmark = if completed { None } else { state.done_through };
+        let (current_status, current_bookmark) = tx.query_row(
+            "SELECT model_backfill_status, model_backfill_done_through_ms
+             FROM rollup_meta WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )?;
+        let generation_changed = self.chunk_changed
+            || current_status != desired_status
+            || current_bookmark != desired_bookmark;
+        let updated = tx.execute(
+            "UPDATE rollup_meta
+             SET model_backfill_status = ?1,
+                 model_backfill_done_through_ms = ?2,
+                 rollup_generation = rollup_generation + ?3
+             WHERE id = 1",
+            params![
+                desired_status,
+                desired_bookmark,
+                i64::from(generation_changed)
+            ],
+        )?;
+        if updated != 1 {
+            return Err(model_backfill_sql_error(
+                "Model rollup metadata singleton is missing",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl RuntimeRollupBackfillTarget {
     fn prepare_source_rollup(
         conn: &Connection,
@@ -2930,6 +3226,7 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
         &mut self,
         conn: &Connection,
         state: RollupBackfillState,
+        _max_rows: u64,
     ) -> rusqlite::Result<()> {
         self.prepared = Self::prepare_source_rollup(conn, state.done_through.unwrap_or(0))?;
         Ok(())
@@ -4112,6 +4409,31 @@ fn model_rollup_building_index(conn: &Connection) -> Result<bool, String> {
         |row| row.get(0),
     )
     .map_err(|error| format!("Read model rollup backfill state: {error}"))
+}
+
+fn mark_model_rollup_backfill_failed(conn: &mut Connection) -> Result<(), String> {
+    crate::with_ingest_write_permit(|| {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Begin model backfill failure update: {error}"))?;
+        let status = tx
+            .query_row(
+                "SELECT model_backfill_status FROM rollup_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Read model backfill failure state: {error}"))?;
+        tx.execute(
+            "UPDATE rollup_meta
+             SET model_backfill_status = 'failed',
+                 rollup_generation = rollup_generation + ?1
+             WHERE id = 1",
+            params![i64::from(status != "failed")],
+        )
+        .map_err(|error| format!("Mark model backfill failed: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Commit model backfill failure state: {error}"))
+    })
 }
 
 /// Derive the display project for one session: the final path component of the
@@ -7440,15 +7762,93 @@ impl Storage {
         Ok(storage)
     }
 
-    /// Run or resume the runtime rollup's first-install backfill.
+    /// Report whether the model rollup's first-install backfill still needs work.
     ///
     /// A dedicated writer connection lets the shared runner release the ingest
     /// gate between chunks without retaining the primary connection mutex.
+    pub(crate) fn model_rollup_backfill_needed(&self) -> Result<bool, String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT model_backfill_status != 'complete'
+             FROM rollup_meta WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Read model rollup backfill status: {error}"))
+    }
+
+    pub(crate) fn run_model_rollup_backfill_with_controls(
+        &self,
+        controls: &RollupBackfillControls<'_>,
+    ) -> Result<RollupBackfillReport, String> {
+        let mut conn = Connection::open(&self.db_path)
+            .map_err(|error| format!("Open model backfill writer: {error}"))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .map_err(|error| format!("Configure model backfill timeout: {error}"))?;
+        let mut target = ModelRollupBackfillTarget::default();
+        let result = run_rollup_backfill(&mut conn, &self.db_path, &mut target, controls);
+        match result {
+            Ok(report) => {
+                if matches!(report.terminal, RollupBackfillTerminal::Error(_)) {
+                    mark_model_rollup_backfill_failed(&mut conn)?;
+                }
+                Ok(report)
+            }
+            Err(error) => {
+                mark_model_rollup_backfill_failed(&mut conn).map_err(|status_error| {
+                    format!(
+                        "Model backfill failed ({error}); marking it failed also failed: {status_error}"
+                    )
+                })?;
+                Err(format!("Model backfill failed: {error}"))
+            }
+        }
+    }
+
+    /// Reset a manual model rebuild while the caller holds an ingest permit.
+    /// Authoritative pruned rows survive; raw-backed rows are cleared so the
+    /// next chunk can rebuild from an unambiguous empty frontier.
+    pub(crate) fn reset_model_rollup_backfill(&self) -> Result<u64, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Begin model rollup rebuild reset: {error}"))?;
+        let (status, bookmark) = tx
+            .query_row(
+                "SELECT model_backfill_status, model_backfill_done_through_ms
+                 FROM rollup_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .map_err(|error| format!("Read model rollup rebuild state: {error}"))?;
+        let deleted = tx
+            .execute("DELETE FROM model_usage_hourly WHERE raw_pruned = 0", [])
+            .map_err(|error| format!("Clear raw-backed model rollup rows: {error}"))?;
+        let total = tx
+            .query_row("SELECT COUNT(*) FROM model_usage_observations", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(|error| format!("Count model rebuild observations: {error}"))?;
+        let changed = deleted > 0 || status != "pending" || bookmark.is_some();
+        tx.execute(
+            "UPDATE rollup_meta
+             SET model_backfill_status = 'pending',
+                 model_backfill_done_through_ms = NULL,
+                 rollup_generation = rollup_generation + ?1
+             WHERE id = 1",
+            params![i64::from(changed)],
+        )
+        .map_err(|error| format!("Reset model rollup rebuild state: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Commit model rollup rebuild reset: {error}"))?;
+        Ok(total)
+    }
+
     pub(crate) fn run_runtime_rollup_backfill(&self) -> Result<RollupBackfillReport, String> {
         self.run_runtime_rollup_backfill_with_controls(&RollupBackfillControls::default())
     }
 
-    fn run_runtime_rollup_backfill_with_controls(
+    pub(crate) fn run_runtime_rollup_backfill_with_controls(
         &self,
         controls: &RollupBackfillControls<'_>,
     ) -> Result<RollupBackfillReport, String> {
@@ -7486,6 +7886,48 @@ impl Storage {
                 Err(format!("Runtime backfill failed: {error}"))
             }
         }
+    }
+
+    pub(crate) fn reset_runtime_rollup_backfill(&self) -> Result<u64, String> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("Begin runtime rollup rebuild reset: {error}"))?;
+        let (status, bookmark) = tx
+            .query_row(
+                "SELECT runtime_backfill_status, runtime_backfill_done_through_rowid
+                 FROM rollup_meta WHERE id = 1",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .map_err(|error| format!("Read runtime rollup rebuild state: {error}"))?;
+        let deleted_rollups = tx
+            .execute("DELETE FROM runtime_hourly WHERE raw_pruned = 0", [])
+            .map_err(|error| format!("Clear raw-backed runtime rollup rows: {error}"))?;
+        let deleted_states = tx
+            .execute("DELETE FROM runtime_turn_state", [])
+            .map_err(|error| format!("Clear runtime rollup bookmarks: {error}"))?;
+        let total = tx
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source_key IS NOT NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(|error| format!("Count runtime rebuild events: {error}"))?;
+        let changed =
+            deleted_rollups > 0 || deleted_states > 0 || status != "pending" || bookmark.is_some();
+        tx.execute(
+            "UPDATE rollup_meta
+             SET runtime_backfill_status = 'pending',
+                 runtime_backfill_done_through_rowid = NULL,
+                 rollup_generation = rollup_generation + ?1
+             WHERE id = 1",
+            params![i64::from(changed)],
+        )
+        .map_err(|error| format!("Reset runtime rollup rebuild state: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("Commit runtime rollup rebuild reset: {error}"))?;
+        Ok(total)
     }
 
     /// Open an independent read-only connection for the two Models overview
@@ -23800,6 +24242,44 @@ mod tests {
         .expect("read rollup rows")
     }
 
+    fn raw_model_hourly_rows(storage: &Storage) -> Vec<ModelHourlyRollupRow> {
+        let conn = storage.conn.lock();
+        read_model_hourly_rollup_rows(
+            &conn,
+            "SELECT (observed_at_ms / 3600000) * 3600000,
+                    provider, COALESCE(derived_model_id, ''), source_key,
+                    analytics_session_id, COUNT(*),
+                    SUM(observation_kind = 'turn'),
+                    SUM(observation_kind = 'token'), SUM(is_sidechain),
+                    SUM(COALESCE(input_tokens, 0)), COUNT(input_tokens),
+                    SUM(COALESCE(output_tokens, 0)), COUNT(output_tokens),
+                    SUM(COALESCE(cache_creation_tokens, 0)),
+                    COUNT(cache_creation_tokens),
+                    SUM(COALESCE(cache_read_tokens, 0)), COUNT(cache_read_tokens),
+                    MIN(observed_at_ms), MAX(observed_at_ms), 0
+             FROM model_usage_observations
+             GROUP BY 1, 2, 3, 4, 5
+             ORDER BY 1, 2, 3, 4, 5",
+        )
+    }
+
+    fn unpruned_model_hourly_rows(storage: &Storage) -> Vec<ModelHourlyRollupRow> {
+        let conn = storage.conn.lock();
+        read_model_hourly_rollup_rows(
+            &conn,
+            "SELECT hour_utc, provider, derived_model_id, source_key,
+                    analytics_session_id, obs_count, turn_count, token_count,
+                    sidechain_count, input_tokens, input_tokens_present,
+                    output_tokens, output_tokens_present,
+                    cache_creation_tokens, cache_creation_tokens_present,
+                    cache_read_tokens, cache_read_tokens_present,
+                    first_observed_at_ms, last_observed_at_ms, raw_pruned
+             FROM model_usage_hourly
+             WHERE raw_pruned = 0
+             ORDER BY 1, 2, 3, 4, 5",
+        )
+    }
+
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Hourly Ingest Fold Exactness]]
     #[test]
     #[serial]
@@ -26590,7 +27070,7 @@ mod tests {
         {
             let conn = storage.conn.lock();
             conn.execute_batch(
-                "DELETE FROM schema_version WHERE version = 36;
+                "DELETE FROM schema_version WHERE version >= 36;
                  ALTER TABLE usage_snapshots DROP COLUMN source;
                  ALTER TABLE usage_snapshots DROP COLUMN account_label;
                  ALTER TABLE usage_snapshots DROP COLUMN account_id;
@@ -27415,6 +27895,291 @@ mod tests {
         );
     }
 
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Empty Completion And Committed Progress]]
+    #[test]
+    #[serial]
+    fn model_rollup_backfill_completes_empty_database_with_committed_progress() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let observer_path = storage.db_path.clone();
+        let observed_statuses = Mutex::new(Vec::<String>::new());
+        let observe = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            let observer = Connection::open(&observer_path).expect("open progress observer");
+            let status = observer
+                .query_row(
+                    "SELECT model_backfill_status FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read committed lifecycle before progress");
+            observed_statuses.lock().push(status);
+        };
+        let controls = RollupBackfillControls {
+            progress: Some(&observe),
+            ..RollupBackfillControls::default()
+        };
+
+        let started = Instant::now();
+        let report = storage
+            .run_model_rollup_backfill_with_controls(&controls)
+            .expect("empty model rollup backfill");
+        let elapsed = started.elapsed();
+        eprintln!(
+            "model_rollup_empty.elapsed_ms={:.3}",
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        assert_eq!(report.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(
+            (report.progress.rows_done, report.progress.rows_total),
+            (0, 0)
+        );
+        assert_eq!(observed_statuses.into_inner(), vec!["complete"]);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "empty database should not pay corpus-scale startup overhead"
+        );
+        clear_env();
+    }
+
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Exact Resume And Pruned Authority]]
+    #[test]
+    #[serial]
+    fn model_rollup_backfill_resumes_exactly_and_preserves_pruned_rows() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let at = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .expect("timestamp")
+                .with_timezone(&Utc)
+        };
+        let jsonl = [
+            claude_overview_turn(
+                &at("2026-07-30T10:05:00Z"),
+                "model-resume-session",
+                "model-a",
+                10,
+                "/work/resume",
+            ),
+            claude_overview_turn(
+                &at("2026-07-30T12:05:00Z"),
+                "model-resume-session",
+                "model-b",
+                20,
+                "/work/resume",
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "model-resume-source",
+            "model-resume-session",
+            &jsonl,
+        );
+        {
+            let conn = storage.conn.lock();
+            conn.execute(
+                "INSERT INTO model_usage_hourly (
+                     hour_utc, provider, derived_model_id, source_key,
+                     analytics_session_id, obs_count, turn_count, token_count,
+                     sidechain_count, input_tokens, input_tokens_present,
+                     output_tokens, output_tokens_present, cache_creation_tokens,
+                     cache_creation_tokens_present, cache_read_tokens,
+                     cache_read_tokens_present, first_observed_at_ms,
+                     last_observed_at_ms, raw_pruned
+                 ) VALUES (0, 'claude', 'pruned-model', 'pruned-source',
+                           'pruned-session', 1, 1, 0, 0, 0, 0, 0, 0, 0,
+                           0, 0, 0, 1, 1, 1)",
+                [],
+            )
+            .expect("seed authoritative pruned row");
+        }
+
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let controls = RollupBackfillControls {
+            chunk_rows: 1,
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        let first = storage
+            .run_model_rollup_backfill_with_controls(&controls)
+            .expect("interrupt first model chunk");
+        assert_eq!(first.terminal, RollupBackfillTerminal::Interrupted);
+        assert_eq!(first.progress.rows_done, 1);
+        let resumed = storage
+            .run_model_rollup_backfill_with_controls(&RollupBackfillControls::default())
+            .expect("resume model backfill");
+        assert_eq!(resumed.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(
+            raw_model_hourly_rows(&storage),
+            unpruned_model_hourly_rows(&storage)
+        );
+        let conn = storage.conn.lock();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM model_usage_hourly WHERE raw_pruned = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count authoritative pruned rows"),
+            1
+        );
+        clear_env();
+    }
+
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Late Old-Hour Ingest Handoff]]
+    #[test]
+    #[serial]
+    fn model_rollup_backfill_keeps_late_old_hour_ingest_after_bookmark() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let at = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .expect("timestamp")
+                .with_timezone(&Utc)
+        };
+        let initial = [
+            claude_overview_turn(
+                &at("2026-07-30T10:05:00Z"),
+                "late-session",
+                "model-a",
+                10,
+                "/work/late",
+            ),
+            claude_overview_turn(
+                &at("2026-07-30T12:05:00Z"),
+                "late-session",
+                "model-b",
+                20,
+                "/work/late",
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(&storage, &dir, "late-source", "late-session", &initial);
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let controls = RollupBackfillControls {
+            chunk_rows: 1,
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        let first = storage
+            .run_model_rollup_backfill_with_controls(&controls)
+            .expect("interrupt after first hour");
+        assert_eq!(first.terminal, RollupBackfillTerminal::Interrupted);
+
+        let late = claude_overview_turn(
+            &at("2026-07-30T09:05:00Z"),
+            "late-old-session",
+            "model-old",
+            7,
+            "/work/late-old",
+        );
+        seed_claude_model_source(&storage, &dir, "late-old-source", "late-old-session", &late);
+        storage
+            .run_model_rollup_backfill_with_controls(&RollupBackfillControls::default())
+            .expect("resume after late old-hour ingest");
+        assert_eq!(
+            raw_model_hourly_rows(&storage),
+            unpruned_model_hourly_rows(&storage)
+        );
+        clear_env();
+    }
+
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Mid-Run Source Replacement Handoff]]
+    #[test]
+    #[serial]
+    fn model_rollup_backfill_absorbs_source_replacement_between_chunks() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let at = |value: &str| {
+            DateTime::parse_from_rfc3339(value)
+                .expect("timestamp")
+                .with_timezone(&Utc)
+        };
+        let original = [
+            claude_overview_turn(
+                &at("2026-07-30T10:05:00Z"),
+                "replace-session",
+                "model-a",
+                10,
+                "/work/replace",
+            ),
+            claude_overview_turn(
+                &at("2026-07-30T12:05:00Z"),
+                "replace-session",
+                "model-b",
+                20,
+                "/work/replace",
+            ),
+        ]
+        .join("\n");
+        seed_claude_model_source(
+            &storage,
+            &dir,
+            "replace-source",
+            "replace-session",
+            &original,
+        );
+        let later = claude_overview_turn(
+            &at("2026-07-30T13:05:00Z"),
+            "later-session",
+            "model-c",
+            30,
+            "/work/later",
+        );
+        seed_claude_model_source(&storage, &dir, "later-source", "later-session", &later);
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let controls = RollupBackfillControls {
+            chunk_rows: 1,
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        storage
+            .run_model_rollup_backfill_with_controls(&controls)
+            .expect("interrupt before replacement");
+
+        let replacement = [
+            claude_overview_turn(
+                &at("2026-07-30T10:15:00Z"),
+                "replace-session",
+                "model-z",
+                50,
+                "/work/replace",
+            ),
+            claude_overview_turn(
+                &at("2026-07-30T11:15:00Z"),
+                "replace-session",
+                "model-z",
+                60,
+                "/work/replace",
+            ),
+        ]
+        .join("\n");
+        let (source, observations, fingerprint) =
+            prepare_claude_model_source(&dir, "replace-source", "replace-session", &replacement);
+        storage
+            .replace_model_source(&source, &observations, &fingerprint)
+            .expect("replace source between chunks");
+        storage
+            .run_model_rollup_backfill_with_controls(&RollupBackfillControls::default())
+            .expect("resume after replacement");
+        assert_eq!(
+            raw_model_hourly_rows(&storage),
+            unpruned_model_hourly_rows(&storage)
+        );
+        clear_env();
+    }
+
     fn runtime_snapshot(
         spec: &TranscriptSourceSpec<'_>,
         events: &[(String, crate::sessions::SessionEventKind)],
@@ -27784,7 +28549,7 @@ mod tests {
         let mut target = RuntimeRollupBackfillTarget::default();
         let state = target.load_state(&conn).expect("load pending state");
         target
-            .prepare_chunk(&conn, state)
+            .prepare_chunk(&conn, state, 3)
             .expect("prepare runtime source");
         conn.execute(
             "UPDATE transcript_analytics_sources

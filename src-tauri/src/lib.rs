@@ -67,8 +67,12 @@ use models::{
     SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
     TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError, UsageSource,
 };
-use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rand::RngCore;
+use rollup_backfill::{
+    RollupBackfillControls, RollupBackfillProgress, RollupBackfillTerminal,
+    RollupBackfillTerminalError,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{
@@ -91,6 +95,9 @@ static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static USAGE_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static INGEST_GATE: OnceLock<RwLock<()>> = OnceLock::new();
 static MAINTENANCE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static MODEL_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
+static RUNTIME_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
+static ROLLUP_BACKFILL_RUN_ID: AtomicU64 = AtomicU64::new(0);
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
 // Holds the tray's "Always on Top" CheckMenuItem so the Settings window can
 // keep the tray checkmark and the window state in sync after a toggle.
@@ -102,6 +109,8 @@ const MODEL_USAGE_LIVE_COMMIT_BATCH_SIZE: usize = 32;
 const TRANSCRIPT_ANALYTICS_LIVE_BATCH_SIZE: usize = 16;
 // Shared with `server.rs`, which emits the same event from the notify path.
 pub(crate) const TRANSCRIPT_ANALYTICS_UPDATED_EVENT: &str = "transcript-analytics-updated";
+const ROLLUP_BACKFILL_PROGRESS_EVENT: &str = "rollup-backfill-progress";
+const ROLLUP_BACKFILL_FINISHED_EVENT: &str = "rollup-backfill-finished";
 // Marker prefix `storage::Storage::init` puts in front of a schema upper-bound
 // rejection. It is an internal wire marker, never user-facing text.
 const SCHEMA_TOO_NEW_ERROR_PREFIX: &str = "SCHEMA_TOO_NEW:";
@@ -960,20 +969,249 @@ fn spawn_reserved_model_history_backfill(
     Ok(())
 }
 
-fn spawn_runtime_rollup_backfill() -> Result<(), String> {
-    let storage = get_storage()?;
-    tauri::async_runtime::spawn_blocking(move || match storage.run_runtime_rollup_backfill() {
-        Ok(report) => {
-            log::info!(
-                "Runtime rollup backfill finished: terminal={:?}, rows={}/{}",
-                report.terminal,
-                report.progress.rows_done,
-                report.progress.rows_total
-            );
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum RollupRebuildTarget {
+    Model,
+    Runtime,
+}
+
+impl RollupRebuildTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Runtime => "runtime",
         }
-        Err(error) => log::error!("Runtime rollup backfill failed: {error}"),
+    }
+
+    fn running_flag(self) -> &'static AtomicBool {
+        match self {
+            Self::Model => &MODEL_ROLLUP_BACKFILL_RUNNING,
+            Self::Runtime => &RUNTIME_ROLLUP_BACKFILL_RUNNING,
+        }
+    }
+}
+
+struct RollupBackfillReservation {
+    target: RollupRebuildTarget,
+    run_id: u64,
+}
+
+impl Drop for RollupBackfillReservation {
+    fn drop(&mut self) {
+        self.target
+            .running_flag()
+            .store(false, AtomicOrdering::Release);
+    }
+}
+
+fn try_reserve_rollup_backfill(target: RollupRebuildTarget) -> Option<RollupBackfillReservation> {
+    target
+        .running_flag()
+        .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+        .ok()
+        .map(|_| RollupBackfillReservation {
+            target,
+            run_id: ROLLUP_BACKFILL_RUN_ID
+                .fetch_add(1, AtomicOrdering::AcqRel)
+                .saturating_add(1),
+        })
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RollupBackfillProgressEvent {
+    run_id: u64,
+    target: &'static str,
+    phase: &'static str,
+    rows_done: u64,
+    rows_total: u64,
+    hour_done_through: Option<i64>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RollupBackfillFinishedEvent {
+    run_id: u64,
+    target: &'static str,
+    status: &'static str,
+    detail: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RebuildRollupResult {
+    run_id: Option<u64>,
+    target: &'static str,
+    status: &'static str,
+    reason: Option<String>,
+    rows_done: u64,
+    rows_total: u64,
+    hour_done_through: Option<i64>,
+}
+
+fn rollup_phase_label(phase: rollup_backfill::RollupBackfillPhase) -> &'static str {
+    match phase {
+        rollup_backfill::RollupBackfillPhase::Preflight => "preflight",
+        rollup_backfill::RollupBackfillPhase::Folding => "folding",
+        rollup_backfill::RollupBackfillPhase::Checkpointing => "checkpointing",
+    }
+}
+
+fn emit_rollup_backfill_progress(
+    app: &tauri::AppHandle,
+    target: RollupRebuildTarget,
+    run_id: u64,
+    progress: &RollupBackfillProgress,
+) {
+    let event = RollupBackfillProgressEvent {
+        run_id,
+        target: target.as_str(),
+        phase: rollup_phase_label(progress.phase),
+        rows_done: progress.rows_done,
+        rows_total: progress.rows_total,
+        hour_done_through: (target == RollupRebuildTarget::Model)
+            .then_some(progress.done_through)
+            .flatten(),
+    };
+    if let Err(error) = app.emit(ROLLUP_BACKFILL_PROGRESS_EVENT, event) {
+        log::warn!("Rollup backfill progress event could not be delivered: {error}");
+    }
+}
+
+fn rollup_terminal_detail(error: &RollupBackfillTerminalError) -> String {
+    match error {
+        RollupBackfillTerminalError::DiskSpaceProbeFailed { reason } => {
+            format!("Free-space check failed: {reason}. Rebuild after disk access is restored.")
+        }
+        RollupBackfillTerminalError::InsufficientDiskSpace {
+            required_bytes,
+            available_bytes,
+        } => format!(
+            "Not enough free disk space: {available_bytes} bytes available, {required_bytes} required. Free space, then rebuild again."
+        ),
+        RollupBackfillTerminalError::CheckpointBusy {
+            log_frames,
+            checkpointed_frames,
+        } => format!(
+            "The WAL checkpoint stayed busy ({checkpointed_frames}/{log_frames} frames). Close long-running Quill views, then rebuild again."
+        ),
+        RollupBackfillTerminalError::CheckpointFailed { reason } => {
+            format!(
+                "The WAL checkpoint failed: {reason}. Rebuild to resume from committed progress."
+            )
+        }
+    }
+}
+
+fn unexpected_rollup_failure_detail(error: &str) -> String {
+    format!("Index build failed: {error}. Rebuild to resume from committed progress.")
+}
+
+fn emit_rollup_backfill_finished_payload(
+    app: &tauri::AppHandle,
+    target: RollupRebuildTarget,
+    run_id: u64,
+    status: &'static str,
+    detail: Option<String>,
+) {
+    if let Err(error) = app.emit(
+        ROLLUP_BACKFILL_FINISHED_EVENT,
+        RollupBackfillFinishedEvent {
+            run_id,
+            target: target.as_str(),
+            status,
+            detail,
+        },
+    ) {
+        log::warn!("Rollup backfill finished event could not be delivered: {error}");
+    }
+}
+
+fn emit_rollup_backfill_finished(
+    app: &tauri::AppHandle,
+    target: RollupRebuildTarget,
+    run_id: u64,
+    terminal: &RollupBackfillTerminal,
+) {
+    let (status, detail) = match terminal {
+        RollupBackfillTerminal::Completed => ("completed", None),
+        RollupBackfillTerminal::Interrupted => (
+            "interrupted",
+            Some("Index build stopped before completion. Rebuild to continue.".to_string()),
+        ),
+        RollupBackfillTerminal::Error(error) => ("error", Some(rollup_terminal_detail(error))),
+    };
+    emit_rollup_backfill_finished_payload(app, target, run_id, status, detail);
+}
+
+fn spawn_rollup_backfill(
+    app: tauri::AppHandle,
+    target: RollupRebuildTarget,
+    reservation: RollupBackfillReservation,
+) -> Result<(), String> {
+    let storage = get_storage()?;
+    let run_id = reservation.run_id;
+    tauri::async_runtime::spawn_blocking(move || {
+        let progress_app = app.clone();
+        let progress = |value: &RollupBackfillProgress| {
+            emit_rollup_backfill_progress(&progress_app, target, run_id, value);
+        };
+        let controls = RollupBackfillControls {
+            progress: Some(&progress),
+            ..RollupBackfillControls::default()
+        };
+        let result = match target {
+            RollupRebuildTarget::Model => {
+                storage.run_model_rollup_backfill_with_controls(&controls)
+            }
+            RollupRebuildTarget::Runtime => {
+                storage.run_runtime_rollup_backfill_with_controls(&controls)
+            }
+        };
+        match result {
+            Ok(report) => {
+                emit_rollup_backfill_finished(&app, target, run_id, &report.terminal);
+                log::info!(
+                    "{} rollup backfill finished: terminal={:?}, rows={}/{}",
+                    target.as_str(),
+                    report.terminal,
+                    report.progress.rows_done,
+                    report.progress.rows_total
+                );
+            }
+            Err(error) => {
+                emit_rollup_backfill_finished_payload(
+                    &app,
+                    target,
+                    run_id,
+                    "error",
+                    Some(unexpected_rollup_failure_detail(&error)),
+                );
+                log::error!("{} rollup backfill failed: {error}", target.as_str());
+            }
+        }
+        drop(reservation);
     });
     Ok(())
+}
+
+fn spawn_model_rollup_backfill(app: tauri::AppHandle) -> Result<(), String> {
+    let storage = get_storage()?;
+    if !storage.model_rollup_backfill_needed()? {
+        return Ok(());
+    }
+    let Some(reservation) = try_reserve_rollup_backfill(RollupRebuildTarget::Model) else {
+        return Ok(());
+    };
+    spawn_rollup_backfill(app, RollupRebuildTarget::Model, reservation)
+}
+
+fn spawn_runtime_rollup_backfill(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(reservation) = try_reserve_rollup_backfill(RollupRebuildTarget::Runtime) else {
+        return Ok(());
+    };
+    spawn_rollup_backfill(app, RollupRebuildTarget::Runtime, reservation)
 }
 
 async fn reconcile_queued_model_usage_sources(
@@ -4058,11 +4296,83 @@ fn emit_retention_maintenance_finished<P: serde::Serialize + Clone>(
     }
 }
 
-/// Compact SQLite through the user-triggered maintenance path.
+/// Reset one rollup while holding a non-blocking ingest permit.
+fn try_reset_rollup_rebuild(
+    storage: &Storage,
+    target: RollupRebuildTarget,
+) -> Result<Option<u64>, String> {
+    let Some(_permit) = try_admit_rollup_rebuild() else {
+        return Ok(None);
+    };
+    match target {
+        RollupRebuildTarget::Model => storage.reset_model_rollup_backfill().map(Some),
+        RollupRebuildTarget::Runtime => storage.reset_runtime_rollup_backfill().map(Some),
+    }
+}
+
+fn try_admit_rollup_rebuild() -> Option<RwLockReadGuard<'static, ()>> {
+    ingest_gate().try_read()
+}
+
+/// Clear raw-backed rollup state and schedule a resumable rebuild.
 ///
-/// The maintenance writer gate quiesces app-owned ingest before preflight and
-/// VACUUM. Every operational failure becomes a structured `skipped` result so
-/// the Settings control can explain why no space was reclaimed.
+/// Admission is deliberately non-blocking. An active or queued maintenance
+/// writer wins the fair ingest gate and receives the database without a
+/// rebuild silently queuing behind it.
+#[tauri::command]
+async fn rebuild_model_rollup(
+    app: tauri::AppHandle,
+    target: RollupRebuildTarget,
+) -> Result<RebuildRollupResult, String> {
+    let storage = get_storage()?;
+    let Some(reservation) = try_reserve_rollup_backfill(target) else {
+        return Ok(RebuildRollupResult {
+            run_id: None,
+            target: target.as_str(),
+            status: "refused",
+            reason: Some(format!(
+                "A {} index build is already running. Wait for it to finish, then rebuild again.",
+                target.as_str()
+            )),
+            rows_done: 0,
+            rows_total: 0,
+            hour_done_through: None,
+        });
+    };
+    let reset =
+        tauri::async_runtime::spawn_blocking(move || try_reset_rollup_rebuild(storage, target))
+            .await
+            .map_err(|error| format!("Rollup rebuild reset task failed: {error}"))??;
+    let Some(rows_total) = reset else {
+        let run_id = reservation.run_id;
+        drop(reservation);
+        return Ok(RebuildRollupResult {
+            run_id: Some(run_id),
+            target: target.as_str(),
+            status: "refused",
+            reason: Some(
+                "Database maintenance is running or waiting to run. Wait for it to finish, then rebuild again."
+                    .to_string(),
+            ),
+            rows_done: 0,
+            rows_total: 0,
+            hour_done_through: None,
+        });
+    };
+
+    let run_id = reservation.run_id;
+    spawn_rollup_backfill(app, target, reservation)?;
+    Ok(RebuildRollupResult {
+        run_id: Some(run_id),
+        target: target.as_str(),
+        status: "started",
+        reason: None,
+        rows_done: 0,
+        rows_total,
+        hour_done_through: None,
+    })
+}
+
 #[tauri::command]
 async fn compact_database(
     app: tauri::AppHandle,
@@ -5608,7 +5918,10 @@ pub fn run() {
             // Blocking inventory/parsing stays off the UI thread; shared root
             // permits serialize this pass with any early live notifications.
             spawn_startup_transcript_analytics_reconciliation(app.handle().clone());
-            if let Err(error) = spawn_runtime_rollup_backfill() {
+            if let Err(error) = spawn_model_rollup_backfill(app.handle().clone()) {
+                log::error!("Could not schedule model rollup backfill: {error}");
+            }
+            if let Err(error) = spawn_runtime_rollup_backfill(app.handle().clone()) {
                 log::error!("Could not schedule runtime rollup backfill: {error}");
             }
             // Always-on incremental rescan so live coverage no longer depends
@@ -6078,6 +6391,7 @@ pub fn run() {
             get_runtime_settings,
             set_runtime_settings,
             compact_database,
+            rebuild_model_rollup,
             // The retention commands register beside `compact_database`: one
             // maintenance surface, one quiesce lease, one progress-event shape.
             get_retention_policy,
@@ -6279,6 +6593,63 @@ mod tests {
             .expect("write completes after maintenance releases the gate");
         worker.join().expect("write worker joins");
         assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Maintenance Admission Refusal]]
+    #[test]
+    #[serial_test::serial]
+    fn rollup_rebuild_refuses_active_and_queued_maintenance() {
+        use std::sync::mpsc;
+
+        let active = begin_ingest_quiesce();
+        assert!(
+            try_admit_rollup_rebuild().is_none(),
+            "an active maintenance writer must refuse rebuild admission"
+        );
+        drop(active);
+
+        let initial_reader = ingest_gate().read();
+        let (attempting_tx, attempting_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            attempting_tx.send(()).expect("signal queued writer");
+            let lease = begin_ingest_quiesce();
+            acquired_tx.send(()).expect("signal maintenance acquired");
+            release_rx.recv().expect("wait to release maintenance");
+            drop(lease);
+        });
+        attempting_rx.recv().expect("maintenance starts waiting");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            try_admit_rollup_rebuild().is_none(),
+            "a queued maintenance writer must not be bypassed by a new rebuild reader"
+        );
+        drop(initial_reader);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("queued maintenance acquires after reader releases");
+        release_tx.send(()).expect("release maintenance");
+        writer.join().expect("maintenance writer joins");
+    }
+
+    // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Unexpected Failures Stay Generic]]
+    #[test]
+    fn unexpected_rollup_failure_does_not_claim_a_checkpoint_error() {
+        let unexpected = unexpected_rollup_failure_detail("model fold invariant failed");
+        assert_eq!(
+            unexpected,
+            "Index build failed: model fold invariant failed. Rebuild to resume from committed progress."
+        );
+        assert!(!unexpected.contains("WAL checkpoint"));
+
+        let checkpoint = rollup_terminal_detail(&RollupBackfillTerminalError::CheckpointFailed {
+            reason: "checkpoint I/O error".to_string(),
+        });
+        assert_eq!(
+            checkpoint,
+            "The WAL checkpoint failed: checkpoint I/O error. Rebuild to resume from committed progress."
+        );
     }
 
     #[test]

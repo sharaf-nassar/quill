@@ -130,6 +130,41 @@ cargo test --release --lib model_hourly_ingest_fold_burst_p95_stays_within_budge
 
 Fold overhead is **5.316%**, within the required maximum of 10%.
 
+## Model rollup backfill
+
+The production model target ran on a worker-owned disposable copy. The frozen
+source and pristine copy both matched the pinned 13,525,123,072-byte SHA-256
+before mutation; the source remained mode `0444` and matched again after the
+copy, WAL, and SHM were removed.
+
+```bash
+cargo run --release --bin widget_query_perf_spike -- backfill-model COPY
+```
+
+| Measure | Result |
+| --- | ---: |
+| Raw observations backfilled | 4,201,401 / 4,201,401 |
+| First committed chunk | 5,239 rows |
+| First terminal | Interrupted |
+| Resume bookmark | 1,774,954,799,999 ms |
+| Final terminal / status | Completed / complete |
+| Chunks | 190 |
+| End-to-end backfill | 15,121.980 ms |
+| Raw-to-rollup missing or mismatched groups | 0 |
+| Extra unpruned groups | 0 |
+| `raw_pruned=1` rows before / after | 0 / 0 |
+| Max WAL after a checkpoint | 0 bytes |
+| WAL at finish | present, 0 bytes |
+| SHM while final connection was open | present |
+| Max progress-to-progress interval | 383.072 ms |
+
+The 383.072 ms interval spans off-permit boundary selection and disk preflight,
+the permit transaction, and the post-permit TRUNCATE checkpoint; it is not a
+lease or transaction duration. The focused fair-gate regression separately
+proves a queued maintenance writer acquires within the shared 250 ms chunk
+bound. The empty-database regression completed zero-of-zero in one committed
+terminal chunk in 28.684 ms, below its one-second small-database ceiling.
+
 ## Runtime ingest fold overhead
 
 The runtime-rollup benchmark compares production transcript replacement with

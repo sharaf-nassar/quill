@@ -29,6 +29,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useModelAnalytics } from "../../../hooks/useModelAnalytics";
+import { useRollupBackfill } from "../../../hooks/useRollupBackfill";
 import { formatNumber } from "../../../utils/format";
 import { formatTokenCount } from "../../../utils/tokens";
 import { modelIdentityKey } from "../../../types";
@@ -290,7 +291,14 @@ function ModelsView({ range }: ModelsViewProps) {
   // definition the observable one — the hook's own visibility guard handles
   // the hidden-window case.
   const { overview, backfill } = useModelAnalytics(range, null, true);
+  const modelRollup = useRollupBackfill("model");
   const data = overview.data;
+  const retryOverview = overview.retry;
+
+  const modelRollupCompleted = modelRollup.state.kind === "completed";
+  useEffect(() => {
+    if (modelRollupCompleted) retryOverview();
+  }, [modelRollupCompleted, retryOverview]);
 
   // Recency and "since" labels are relative, so they age on their own clock
   // rather than waiting for the next refresh.
@@ -340,6 +348,27 @@ function ModelsView({ range }: ModelsViewProps) {
 
   const loading = overview.initialLoading && data === null;
   const failed = overview.error !== null && data === null;
+  const buildingIndex = data?.buildingIndex === true;
+  const modelIndexNote = (() => {
+    const state = modelRollup.state;
+    if (state.kind === "running") {
+      return `Building model index · ${formatNumber(
+        state.progress.rowsDone,
+      )}/${formatNumber(
+        state.progress.rowsTotal,
+      )} observations · using raw evidence meanwhile`;
+    }
+    if (state.kind === "error") {
+      return `Model index build stopped · ${state.detail} Models is using raw evidence; rebuild in Settings › Performance.`;
+    }
+    if (state.kind === "completed" && buildingIndex) {
+      return "Model index complete · refreshing indexed analytics";
+    }
+    if (buildingIndex) {
+      return "Building model index · using raw evidence while retained observations are indexed";
+    }
+    return null;
+  })();
 
   if (failed) {
     return (
@@ -499,6 +528,12 @@ function ModelsView({ range }: ModelsViewProps) {
             title="Token activity recorded before a chain's first model observation stays unattributed instead of being assigned a model."
           >
             Coverage · {coverage}% of token activity carries model evidence
+          </p>
+        )}
+
+        {modelIndexNote !== null && (
+          <p className="wg-mv-note wg-num" role="status" aria-live="polite">
+            {modelIndexNote}
           </p>
         )}
 

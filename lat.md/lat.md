@@ -7,3 +7,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[data-flow]] — Token reporting, learning analysis, session indexing, and memory optimization
 - [[infrastructure]] — CI/CD pipeline, release process, build config, code quality, scripts
 - [[runtime-rollup-tests]] — Runtime finalization, replacement, and ingest-budget test specs
+- [[model-rollup-tests]] — Model backfill resume, authority, handoff, and maintenance test specs

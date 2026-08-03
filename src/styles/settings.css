@@ -182,6 +182,11 @@
   line-height: 1.45;
 }
 
+.settings-rollup-status {
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
 .settings-row-control {
   flex-shrink: 0;
   display: flex;

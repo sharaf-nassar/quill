@@ -30,7 +30,9 @@ works and you no longer need the backup.
 
 **Faster analytics groundwork**
 
-Quill adds empty hourly rollup tables for faster Models and runtime analytics.
-This database-format upgrade is one-way: older Quill versions cannot open the
-upgraded database. Existing raw analytics remain intact, and the migration
-does not backfill or delete them.
+Quill adds hourly rollups for faster Models and runtime analytics. Existing
+model history is indexed in resumable background chunks after upgrade; Models
+keeps using raw evidence and shows build progress until the index is complete.
+Settings → Performance can rebuild the model index without replacing history
+whose raw evidence was already pruned. The database-format upgrade is one-way:
+older Quill versions cannot open it, but existing raw analytics remain intact.

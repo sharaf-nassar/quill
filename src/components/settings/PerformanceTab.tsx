@@ -7,6 +7,7 @@ import {
   type RetentionWindowPreset,
 } from "../../hooks/useRetentionPolicy";
 import type { UseRuntimeSettingsResult } from "../../hooks/useRuntimeSettings";
+import { useRollupBackfill } from "../../hooks/useRollupBackfill";
 import { useToast } from "../../hooks/useToast";
 import type {
   RetentionAuditRecord,
@@ -172,6 +173,7 @@ function PerformanceTab({ runtime }: PerformanceTabProps) {
   const { toast } = useToast();
   const { settings, saving } = runtime;
   const retention = useRetentionPolicy();
+  const modelRollup = useRollupBackfill("model");
   const [compactionProgress, setCompactionProgress] =
     useState<CompactDatabaseProgress | null>(null);
   const [compactionResult, setCompactionResult] =
@@ -253,6 +255,8 @@ function PerformanceTab({ runtime }: PerformanceTabProps) {
    * into something the user never has to discover.
    */
   const maintenanceBusy = compacting || pruning;
+  const modelRollupBusy =
+    modelRollup.state.kind === "starting" || modelRollup.state.kind === "running";
 
   const compactDatabase = useCallback(async () => {
     setCompactionResult(null);
@@ -334,6 +338,40 @@ function PerformanceTab({ runtime }: PerformanceTabProps) {
         : "Reclaim unused SQLite pages. Quill pauses ingest while maintenance runs.";
 
   const retentionWindow = retention.policy.window_days;
+  const modelRollupDescription = (() => {
+    const state = modelRollup.state;
+    if (state.kind === "starting") return "Starting the model index rebuild…";
+    if (state.kind === "running") {
+      const { progress } = state;
+      const phase =
+        progress.phase === "preflight"
+          ? "Checking disk space"
+          : progress.phase === "checkpointing"
+            ? "Saving progress"
+            : "Building index";
+      return `${phase} · ${formatCount(progress.rowsDone)}/${formatCount(
+        progress.rowsTotal,
+      )} model observations. Models keeps using raw evidence until this completes.`;
+    }
+    if (state.kind === "refused") return `Not started: ${state.reason}`;
+    if (state.kind === "error") {
+      const saved =
+        state.progress === null
+          ? "No new progress was committed."
+          : `${formatCount(state.progress.rowsDone)}/${formatCount(
+              state.progress.rowsTotal,
+            )} observations are committed.`;
+      return `Stopped: ${state.detail} ${saved} Rebuild to resume.`;
+    }
+    if (state.kind === "completed") {
+      return state.progress === null
+        ? "Complete. Model analytics now use the rebuilt index. Raw-pruned history was preserved."
+        : `Complete: ${formatCount(state.progress.rowsDone)}/${formatCount(
+            state.progress.rowsTotal,
+          )} model observations indexed. Raw-pruned history was preserved.`;
+    }
+    return "Rebuild closed-hour model analytics from retained observations. Raw-pruned history remains authoritative and is never replaced.";
+  })();
   const retentionDescription = retention.loading
     ? "Reading the retention policy…"
     : retentionProgress
@@ -398,6 +436,24 @@ function PerformanceTab({ runtime }: PerformanceTabProps) {
             onClick={() => void compactDatabase()}
           >
             {compacting ? "Compacting…" : "Compact"}
+          </button>
+        }
+      />
+      <SettingRow
+        label="Rebuild model index"
+        description={
+          <span className="settings-rollup-status" role="status" aria-live="polite">
+            {modelRollupDescription}
+          </span>
+        }
+        control={
+          <button
+            type="button"
+            className="settings-button settings-button--compact"
+            disabled={maintenanceBusy || modelRollupBusy}
+            onClick={() => void modelRollup.rebuild().catch(() => undefined)}
+          >
+            {modelRollupBusy ? "Building…" : "Rebuild"}
           </button>
         }
       />

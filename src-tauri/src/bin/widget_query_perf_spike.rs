@@ -19,13 +19,13 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use quill_lib::widget_query_perf_study::{
-    WidgetQueryBenchmarkReport, backfill_runtime_rollup_copy, measure_runtime_90d,
-    run_widget_query_baseline,
+    WidgetQueryBenchmarkReport, backfill_model_rollup_copy, backfill_runtime_rollup_copy,
+    measure_runtime_90d, run_widget_query_baseline,
 };
 use rusqlite::{Connection, OpenFlags, backup::Backup, backup::StepResult};
 
 fn usage() -> &'static str {
-    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
+    "Usage:\n  widget_query_perf_spike freeze SOURCE DEST\n  widget_query_perf_spike backfill-model COPY\n  widget_query_perf_spike backfill-runtime COPY\n  widget_query_perf_spike measure-runtime CORPUS PINNED_END_RFC3339\n  widget_query_perf_spike measure CORPUS PINNED_END_RFC3339"
 }
 
 fn path_arg(value: Option<OsString>, name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -172,6 +172,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "runtime_backfill.elapsed_ms={:.3}",
                 started.elapsed().as_secs_f64() * 1_000.0
             );
+            Ok(())
+        }
+        "backfill-model" => {
+            let corpus = path_arg(args.next(), "COPY")?;
+            if args.next().is_some() {
+                return Err(format!("Unexpected argument.\n{}", usage()).into());
+            }
+            let report = backfill_model_rollup_copy(&corpus)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         "measure-runtime" => {
