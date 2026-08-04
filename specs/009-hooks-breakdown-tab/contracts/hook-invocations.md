@@ -17,7 +17,7 @@ JSONL records of the shape produced by Claude Code's harness:
   "attachment": {
     "type": "hook_success" | "hook_failure" | "hook_timeout" | "hook_blocked",
     "hookName": "PreToolUse:Bash",
-    "toolUseID": "<tool use id when PreToolUse/PostToolUse>",
+    "toolUseID": "<tool use id when PreToolUse/PostToolUse/PostToolUseFailure>",
     "hookEvent": "PreToolUse",
     "stdout": "...",
     "stderr": "...",
@@ -51,6 +51,8 @@ pub fn extract_hook_invocations_from_attachment(
 Returns `Some` exactly when `record.type == "attachment"` AND
 `record.attachment.type` begins with `hook_`. Returns `None` for every
 other record type (the dual-emission loop continues without action).
+
+Claude extraction does not impose the Codex HTTP endpoint's event whitelist. It preserves lifecycle names from transcript attachments, including the Quill-managed `PostToolUseFailure` observation and `StopFailure` session-sync events when Claude records those hook fires.
 
 ### Field mapping (Claude)
 

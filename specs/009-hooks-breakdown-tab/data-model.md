@@ -58,12 +58,12 @@ CREATE INDEX IF NOT EXISTS idx_hook_invocations_identity_cwd
 |-------|------|--------|-------|
 | `provider` | TEXT | ingest path | `"claude"` or `"codex"` |
 | `session_id` | TEXT | Claude JSONL `sessionId` (parent transcript id even for sub-agent rows) / Codex stdin `session_id` | Matches the `session_id` used by `session_events` and `skill_usages` |
-| `agent_id` | TEXT NULL | sub-agent JSONL filename (`agent-*.jsonl`) | NULL for parent-transcript rows; matches the carry pattern from `session_events` |
+| `agent_id` | TEXT NULL | Claude sub-agent JSONL filename (`agent-*.jsonl`) / Codex stdin `agent_id` | NULL for parent-thread rows; Codex supplies it on subagent lifecycle events |
 | `is_sidechain` | INT | 1 when extracted from a sub-agent transcript, 0 otherwise | Matches `session_events` |
 | `timestamp` | TEXT | Claude attachment `timestamp` / Codex stdin `ts` (ISO-8601 with offset) | Used for both query filtering and uniqueness |
-| `hook_event` | TEXT | Claude `hookEvent` / Codex `hook_event` | One of `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest` |
-| `hook_matcher` | TEXT NULL | parsed from `hookName` (e.g., `:startup` in `SessionStart:startup`, `:Bash` in `PreToolUse:Bash`) | NULL when no matcher |
-| `tool_name` | TEXT NULL | Codex stdin `tool_name` (for PreToolUse/PostToolUse) / Claude `tool_name` if present on the attachment | NULL when not applicable |
+| `hook_event` | TEXT | Claude `hookEvent` / Codex `hook_event` | Claude preserves emitted lifecycle names, including `PostToolUseFailure` and `StopFailure`; Codex HTTP ingest accepts its configured 11-event set |
+| `hook_matcher` | TEXT NULL | parsed from Claude `hookName` (e.g., `:startup` in `SessionStart:startup`, `:Bash` in `PreToolUse:Bash`) | NULL for Codex because command-hook stdin does not include the configured matcher |
+| `tool_name` | TEXT NULL | Codex stdin `tool_name` (for PreToolUse/PostToolUse) / Claude `tool_name` if present on the attachment | Claude failures may carry a tool name on `PostToolUseFailure`; NULL when not applicable |
 | `hook_identity` | TEXT | canonicalization per FR-003 / research R-D | The aggregation key for breakdown rows |
 | `script_command_raw` | TEXT NULL | Claude attachment `command` verbatim | Preserved for forensic drilldown; NULL on older Claude transcripts where `command` is absent and on Codex (event-scoped) |
 | `exit_code` | INT NULL | Claude attachment `exitCode` | NULL on Codex (event observed before exec result is known) |
@@ -204,7 +204,7 @@ runtime-events flag), so the next boot retries.
 
 - `provider` ∈ `{"claude", "codex"}`. Reject otherwise (400 from the HTTP
   endpoint; assertion on the Rust ingest path).
-- `hook_event` MUST be one of the eight known events. Reject unknown
+- `hook_event` MUST be one of the 11 known events. Reject unknown
   values to avoid silent drift.
 - `timestamp` MUST parse as ISO-8601 with offset. Reject malformed
   timestamps.

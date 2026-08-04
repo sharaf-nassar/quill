@@ -23,7 +23,8 @@ Content-Length: <n>
   "tool_name": "Bash",
   "cwd": "/home/mamba/work/quill",
   "ts": "2026-05-22T15:07:45.123Z",
-  "hook_matcher": "Bash"
+  "hook_matcher": null,
+  "agent_id": null
 }
 ```
 
@@ -31,11 +32,12 @@ Content-Length: <n>
 |-------|------|----------|------------|
 | `provider` | string | yes | Exactly `"codex"` for now. Claude continues to ingest from transcripts; sending `"claude"` is accepted but logged as a misconfiguration and persisted normally. |
 | `session_id` | string | yes | ≤ 128 chars. |
-| `hook_event` | string | yes | One of the eight known events. |
+| `hook_event` | string | yes | One of the 11 known events. |
 | `tool_name` | string | no | ≤ 64 chars. Present for PreToolUse / PostToolUse. |
 | `cwd` | string | no | ≤ 1024 chars. |
 | `ts` | string | yes | ISO-8601 with offset. |
 | `hook_matcher` | string | no | ≤ 64 chars. |
+| `agent_id` | string | no | ≤ 64 chars. Present on subagent lifecycle events. |
 
 ### Successful response
 
@@ -71,7 +73,7 @@ async fn post_hook_observed(
 
 1. Verify bearer token (constant-time comparison via existing helper).
 2. Validate fields per the table above.
-3. Reject `hook_event` not in the eight-event whitelist.
+3. Reject `hook_event` not in the 11-event whitelist.
 4. Build a `CodexHookObservation` struct.
 5. Spawn a blocking task to call
    `storage.store_codex_hook_observation(obs)`.
@@ -89,7 +91,7 @@ absorbs duplicates.
 ## 4. Producer: `hook-observe.cjs`
 
 Deployed at `~/.config/quill/codex/scripts/hook-observe.cjs`, registered
-by the installer onto each of the eight Codex hook events as a separate
+by the installer onto each of the 11 Codex hook events as a separate
 `[[hooks.<Event>]]` block with no matcher. Behavior:
 
 ```js
@@ -111,12 +113,13 @@ function main() {
     const config = loadConfig();
     postJSON(config, "/api/v1/hooks/observed", {
       provider: "codex",
-      session_id: input.session_id,
+      session_id: input.session_id || input.conversation_id || input.id || "",
       hook_event: event,
       tool_name: input.tool_name ?? null,
       cwd: input.cwd ?? null,
       ts: new Date().toISOString(),
-      hook_matcher: input.matcher ?? null,
+      hook_matcher: null,
+      agent_id: input.agent_id ?? null,
     }, "codex hook-observe");
   } catch {
     // swallow; never block the hook chain
@@ -143,20 +146,22 @@ Constraints:
 - A new helper `hook_observation_scripts_for(features) -> Vec<&str>`
   returns `vec!["hook-observe.cjs"]` when
   `features.activity_tracking` is true, empty otherwise.
-- The hook-group builder produces eight `CodexHookGroup` entries (one
+- The hook-group builder produces 11 `CodexHookGroup` entries (one
   per event from `CODEX_HOOK_EVENTS`), each with a single
   `CodexHookCommand { command: "node \"<absolute path to
   hook-observe.cjs>\"", timeout: 3 }`.
 - The installer's reinstall path detects orphaned entries by the
   `quill-codex-setup` marker comment (existing mechanism) so toggling
-  `activity_tracking` cleanly removes/re-adds the eight blocks.
+  `activity_tracking` cleanly removes/re-adds the 11 blocks.
 
 ## 6. Disable / opt-out
 
 When `activity_tracking` is set false in `IntegrationFeatures`, the
 installer:
 
-1. Removes the eight `hook-observe.cjs` entries from `~/.codex/config.toml`.
+1. Removes the 11 `hook-observe.cjs` entries from the active Codex
+   `config.toml` (`$CODEX_HOME/config.toml` when set, otherwise
+   `~/.codex/config.toml`).
 2. Removes `hook-observe.cjs` from `~/.config/quill/codex/scripts/`.
 
 The endpoint stays available (other producers may exist in the future),

@@ -8,8 +8,7 @@ use crate::integrations::manifest::OwnedAssetManifest;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::IntegrationFeatures;
 use chrono::Utc;
-use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +21,7 @@ use tauri::Manager;
 /// while holding the process-wide mutation lock, so a hung child must not be
 /// able to block every guarded operation indefinitely.
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, value};
 
 const HOOK_MARKER: &str = "quill-codex-setup";
 const CONTEXT_HOOK_MARKER: &str = "quill-codex-context-preservation";
@@ -33,8 +32,18 @@ const AGENTS_BLOCK_START: &str = "<!-- quill-managed:codex:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
 
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
+const INTEGRATION_STATE_FILE: &str = "integration-state.json";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
-const CODEX_HOOK_EVENTS: [(&str, &str); 10] = [
+const MANAGED_HOOK_SCRIPT_FILES: [&str; 7] = [
+    "observe.cjs",
+    "report-tokens.sh",
+    "session-sync.cjs",
+    "context-router.cjs",
+    "context-capture.cjs",
+    "hook-observe.cjs",
+    "session-end-learn.cjs",
+];
+const CODEX_HOOK_EVENTS: [(&str, &str); 11] = [
     ("PreToolUse", "pre_tool_use"),
     ("PermissionRequest", "permission_request"),
     ("PostToolUse", "post_tool_use"),
@@ -44,8 +53,15 @@ const CODEX_HOOK_EVENTS: [(&str, &str); 10] = [
     ("UserPromptSubmit", "user_prompt_submit"),
     ("SubagentStart", "subagent_start"),
     ("SubagentStop", "subagent_stop"),
+    ("SessionEnd", "session_end"),
     ("Stop", "stop"),
 ];
+
+pub(crate) fn is_supported_hook_event(event: &str) -> bool {
+    CODEX_HOOK_EVENTS
+        .iter()
+        .any(|(supported, _)| *supported == event)
+}
 
 // Every Codex script the installer can deploy. We always try to clean every
 // entry on reinstall regardless of the active feature set so flipping a
@@ -138,13 +154,36 @@ struct CodexHooksListEntry {
     hooks: Vec<CodexHookMetadata>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexHookMetadata {
     key: String,
+    event_name: String,
+    matcher: Option<String>,
     command: Option<String>,
+    timeout_sec: Option<u64>,
     source_path: PathBuf,
     current_hash: String,
+    enabled: bool,
+    trust_status: String,
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct CodexHookSignature {
+    event: String,
+    matcher: Option<String>,
+    command: String,
+    timeout: u64,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct CodexIntegrationState {
+    version: u8,
+    home: PathBuf,
+    prior_features_hooks: Option<bool>,
+    mcp_server_was_present: bool,
+    prior_mcp_provider: Option<String>,
+    prior_mcp_context_preservation: Option<String>,
 }
 
 struct CodexInstallPaths {
@@ -223,15 +262,14 @@ pub fn install(
             paths.hooks.clone(),
             paths.config.clone(),
             paths.agents.clone(),
+            integration_state_path(),
         ],
     )?;
     let published = deploy_files(app, features, snapshots)?;
 
     let setup_result = (|| {
         create_local_config()?;
-        remove_managed_hooks(&paths.hooks)?;
-        update_config_toml(features, &paths.config)?;
-        trust_codex_hooks(features, &paths)?;
+        update_config_toml(features, &paths)?;
         update_agents_md(&paths.agents)?;
         verify_with_paths(features, &paths)?;
         Ok(build_owned_manifest())
@@ -299,12 +337,13 @@ fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: Integrat
 pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
     let paths = resolve_codex_uninstall_paths()?;
     let manifest = build_owned_manifest();
-    remove_managed_hooks(&paths.hooks)?;
-    remove_managed_config_entries(&paths.config)?;
+    remove_managed_config_entries(&paths)?;
     remove_agents_block(&paths.agents)?;
     remove_owned_files(&manifest.files)?;
     remove_owned_directories(&manifest.directories)?;
     crate::restart::uninstall_codex_restart_assets(remove_shared_restart_assets)?;
+    remove_path(&integration_state_path())
+        .map_err(|err| format!("Failed to remove Codex integration state: {err}"))?;
     Ok(())
 }
 
@@ -366,57 +405,35 @@ fn verify_with_paths(
         ));
     }
 
-    let config_content = fs::read_to_string(&paths.config).unwrap_or_default();
-    if !config_content.contains("report-tokens.sh") {
-        return Err("Codex base hooks were not written to config.toml".to_string());
-    }
-    let has_observe_hook = config_content.contains("observe.cjs");
-    if features.activity_tracking && !has_observe_hook {
-        return Err("Codex activity tracking hooks were not written to config.toml".to_string());
-    }
-    if !features.activity_tracking && has_observe_hook {
-        return Err("Codex activity tracking hooks are still installed".to_string());
-    }
-
-    let has_context_hook = config_content.contains("context-router.cjs")
-        || config_content.contains("context-capture.cjs");
-    if features.context_preservation && !has_context_hook {
-        return Err("Codex context preservation hooks were not written to config.toml".to_string());
-    }
-    if !features.context_preservation && has_context_hook {
-        return Err("Codex context preservation hooks are still installed".to_string());
-    }
-    let has_pre_compact_hook = config_content.contains("[[hooks.PreCompact]]");
-    if features.context_preservation && !has_pre_compact_hook {
-        return Err("Codex PreCompact context hook was not written to config.toml".to_string());
-    }
-    if !features.context_preservation && has_pre_compact_hook {
-        return Err("Codex PreCompact context hook is still installed".to_string());
-    }
-    if !config_content.contains("[hooks.state") || !config_content.contains("trusted_hash") {
-        return Err("Codex hooks were not trusted in config.toml".to_string());
-    }
-
-    if !config_content.contains("hooks = true") {
+    let config_content = fs::read_to_string(&paths.config)
+        .map_err(|err| format!("Failed to read config.toml: {err}"))?;
+    let config = parse_config_doc(&config_content)?;
+    if nested_config_item(&config, &["features", "hooks"]).and_then(Item::as_bool) != Some(true) {
         return Err("config.toml does not enable hooks".to_string());
     }
-    if !(config_content.contains(MCP_BLOCK_START) || config_content.contains("[mcp_servers.quill]"))
-    {
+    if nested_config_item(&config, &["mcp_servers", "quill"]).is_none() {
         return Err("config.toml does not contain a Quill MCP server entry".to_string());
     }
-    if !config_content.contains("QUILL_PROVIDER = \"codex\"") {
+    if config_string(&config, &["mcp_servers", "quill", "env", "QUILL_PROVIDER"])?.as_deref()
+        != Some("codex")
+    {
         return Err("config.toml does not set QUILL_PROVIDER for Quill MCP".to_string());
     }
-    if features.context_preservation
-        && !config_content.contains("QUILL_CONTEXT_PRESERVATION = \"1\"")
+    let expected_context = if features.context_preservation {
+        "1"
+    } else {
+        "0"
+    };
+    if config_string(
+        &config,
+        &["mcp_servers", "quill", "env", "QUILL_CONTEXT_PRESERVATION"],
+    )?
+    .as_deref()
+        != Some(expected_context)
     {
-        return Err("config.toml does not enable Quill context preservation".to_string());
+        return Err("config.toml has the wrong Quill context preservation value".to_string());
     }
-    if !features.context_preservation
-        && config_content.contains("QUILL_CONTEXT_PRESERVATION = \"1\"")
-    {
-        return Err("config.toml still enables Quill context preservation".to_string());
-    }
+    validate_quill_hooks(features, &list_codex_hooks(paths)?, &paths.config, true)?;
 
     let context_tool = mcp_dir().join("tools").join("context.py");
     if features.context_preservation && !context_tool.exists() {
@@ -483,73 +500,317 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     Ok(())
 }
 
-fn trust_codex_hooks(
-    features: IntegrationFeatures,
-    paths: &CodexInstallPaths,
-) -> Result<(), String> {
-    let expected_count: usize = build_codex_hook_groups(features)
-        .iter()
-        .map(|group| group.hooks.len())
-        .sum();
-    if expected_count == 0 {
-        return Ok(());
-    }
-
+fn list_codex_hooks(paths: &CodexInstallPaths) -> Result<Vec<CodexHookMetadata>, String> {
     let cwd = std::env::current_dir()
         .ok()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let response: CodexHooksListResponse =
         run_codex_app_server_request(2, "hooks/list", serde_json::json!({ "cwds": [cwd] }), paths)?;
+    Ok(response
+        .data
+        .into_iter()
+        .flat_map(|entry| entry.hooks)
+        .collect())
+}
 
-    let script_root = scripts_dir().to_string_lossy().to_string();
-    let config_file = &paths.config;
-    let mut state = serde_json::Map::new();
+fn normalize_hook_event(event: &str) -> String {
+    event
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
 
-    for entry in response.data {
-        for hook in entry.hooks {
-            let Some(command) = hook.command.as_deref() else {
-                continue;
-            };
-            if !command.contains(&script_root) || !paths_equivalent(&hook.source_path, config_file)
-            {
-                continue;
-            }
-            state.insert(
-                hook.key,
-                serde_json::json!({
-                    "enabled": true,
-                    "trusted_hash": hook.current_hash,
-                }),
+fn hook_state_label(event: &str) -> Option<&'static str> {
+    let normalized = normalize_hook_event(event);
+    CODEX_HOOK_EVENTS.iter().find_map(|(name, state_label)| {
+        (normalize_hook_event(name) == normalized).then_some(*state_label)
+    })
+}
+
+fn managed_hook_commands() -> HashSet<String> {
+    [
+        format!("node {}", shell_quote(&scripts_dir().join("observe.cjs"))),
+        format!(
+            "node {}",
+            shell_quote(&scripts_dir().join("context-router.cjs"))
+        ),
+        format!(
+            "node {}",
+            shell_quote(&scripts_dir().join("context-capture.cjs"))
+        ),
+        format!(
+            "node {}",
+            shell_quote(&scripts_dir().join("session-sync.cjs"))
+        ),
+        shell_quote(&scripts_dir().join("report-tokens.sh")),
+        format!(
+            "node {}",
+            shell_quote(&scripts_dir().join("hook-observe.cjs"))
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn command_is_quill_owned(command: &str) -> bool {
+    command.contains(HOOK_MARKER)
+        || command.contains(CONTEXT_HOOK_MARKER)
+        || MANAGED_HOOK_SCRIPT_FILES.iter().any(|script| {
+            command.contains(&scripts_dir().join(script).to_string_lossy().to_string())
+                || command.contains(&format!("~/.config/quill/codex/scripts/{script}"))
+        })
+}
+
+fn hook_signature(
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+    timeout: u64,
+) -> CodexHookSignature {
+    CodexHookSignature {
+        event: normalize_hook_event(event),
+        matcher: matcher.map(ToOwned::to_owned),
+        command: command.to_string(),
+        timeout,
+    }
+}
+
+fn validate_quill_hooks(
+    features: IntegrationFeatures,
+    hooks: &[CodexHookMetadata],
+    config_path: &Path,
+    require_trusted: bool,
+) -> Result<(), String> {
+    let mut expected = HashMap::<CodexHookSignature, usize>::new();
+    for group in build_codex_hook_groups(features) {
+        for hook in group.hooks {
+            *expected
+                .entry(hook_signature(
+                    group.event,
+                    group.matcher.as_deref(),
+                    &hook.command,
+                    hook.timeout,
+                ))
+                .or_default() += 1;
+        }
+    }
+
+    let mut actual = HashMap::<CodexHookSignature, usize>::new();
+    for hook in hooks {
+        let Some(command) = hook.command.as_deref() else {
+            continue;
+        };
+        if !paths_equivalent(&hook.source_path, config_path) || !command_is_quill_owned(command) {
+            continue;
+        }
+        if require_trusted && !hook.enabled {
+            return Err(format!("Codex Quill hook is disabled: {}", hook.key));
+        }
+        if require_trusted && hook.trust_status != "trusted" {
+            return Err(format!("Codex Quill hook is not trusted: {}", hook.key));
+        }
+        let timeout = hook.timeout_sec.ok_or_else(|| {
+            format!(
+                "Codex hooks/list omitted timeout for Quill hook {}",
+                hook.key
+            )
+        })?;
+        *actual
+            .entry(hook_signature(
+                &hook.event_name,
+                hook.matcher.as_deref(),
+                command,
+                timeout,
+            ))
+            .or_default() += 1;
+    }
+
+    if actual != expected {
+        let actual_count: usize = actual.values().sum();
+        let expected_count: usize = expected.values().sum();
+        return Err(format!(
+            "Codex hooks/list returned {actual_count} exact Quill hooks, expected {expected_count}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn cloned_hook_state(doc: &DocumentMut) -> Result<Vec<(String, Item)>, String> {
+    let Some(state) = doc
+        .as_table()
+        .get("hooks")
+        .and_then(Item::as_table_like)
+        .and_then(|hooks| hooks.get("state"))
+    else {
+        return Ok(Vec::new());
+    };
+    let state = state
+        .as_table_like()
+        .ok_or_else(|| "config.toml hooks.state is not a table".to_string())?;
+    Ok(state
+        .iter()
+        .map(|(key, item)| (key.to_string(), item.clone()))
+        .collect())
+}
+
+fn path_is_affected(path: &Path, affected_sources: &[PathBuf]) -> bool {
+    affected_sources
+        .iter()
+        .any(|source| paths_equivalent(path, source))
+}
+
+fn affected_hook_sources(paths: &CodexInstallPaths, hooks: &[CodexHookMetadata]) -> Vec<PathBuf> {
+    let mut sources = vec![paths.config.clone(), paths.hooks.clone()];
+    for hook in hooks {
+        if (paths_equivalent(&hook.source_path, &paths.config)
+            || paths_equivalent(&hook.source_path, &paths.hooks))
+            && !sources.iter().any(|source| source == &hook.source_path)
+        {
+            sources.push(hook.source_path.clone());
+        }
+    }
+    sources
+}
+
+fn state_key_is_affected(key: &str, affected_sources: &[PathBuf]) -> bool {
+    let mut parts = key.rsplitn(4, ':');
+    let (Some(_handler), Some(_group), Some(event), Some(source)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    CODEX_HOOK_EVENTS
+        .iter()
+        .any(|(_, state_label)| *state_label == event)
+        && path_is_affected(Path::new(source), affected_sources)
+}
+
+fn hook_identity(hook: &CodexHookMetadata) -> (String, String, String) {
+    let source = hook
+        .source_path
+        .canonicalize()
+        .unwrap_or_else(|_| hook.source_path.clone())
+        .to_string_lossy()
+        .to_string();
+    (
+        source,
+        normalize_hook_event(&hook.event_name),
+        hook.current_hash.clone(),
+    )
+}
+
+/// `hooks.state` is Codex's current compatibility boundary for persisted hook
+/// review decisions. No public trust RPC exists, so keep all positional-key
+/// remapping here and preserve opaque third-party state objects as TOML items.
+fn reconcile_hook_state(
+    doc: &mut DocumentMut,
+    before: &[CodexHookMetadata],
+    after: &[CodexHookMetadata],
+    original_state: &[(String, Item)],
+    affected_sources: &[PathBuf],
+) -> Result<(), String> {
+    let original_by_key: HashMap<&str, &Item> = original_state
+        .iter()
+        .map(|(key, item)| (key.as_str(), item))
+        .collect();
+    let mut queues: HashMap<_, VecDeque<Option<Item>>> = HashMap::new();
+
+    for hook in before {
+        let is_affected = path_is_affected(&hook.source_path, affected_sources)
+            && hook_state_label(&hook.event_name).is_some();
+        let is_quill = hook
+            .command
+            .as_ref()
+            .is_some_and(|command| command_is_quill_owned(command));
+        if is_affected && !is_quill {
+            queues.entry(hook_identity(hook)).or_default().push_back(
+                original_by_key
+                    .get(hook.key.as_str())
+                    .map(|item| (*item).clone()),
             );
         }
     }
 
-    if state.len() != expected_count {
-        return Err(format!(
-            "Codex hooks/list returned {} Quill hooks, expected {expected_count}",
-            state.len()
-        ));
+    let mut rebuilt: Vec<(String, Item)> = original_state
+        .iter()
+        .filter(|(key, _)| !state_key_is_affected(key, affected_sources))
+        .cloned()
+        .collect();
+
+    for hook in after {
+        if !path_is_affected(&hook.source_path, affected_sources)
+            || hook_state_label(&hook.event_name).is_none()
+        {
+            continue;
+        }
+        let is_quill = hook
+            .command
+            .as_ref()
+            .is_some_and(|command| command_is_quill_owned(command));
+        if is_quill {
+            let mut state = Table::new();
+            state.insert("enabled", value(true));
+            state.insert("trusted_hash", value(hook.current_hash.clone()));
+            rebuilt.push((hook.key.clone(), Item::Table(state)));
+            continue;
+        }
+
+        let identity = hook_identity(hook);
+        let queue = queues.get_mut(&identity).ok_or_else(|| {
+            format!(
+                "Codex hook state changed ambiguously while remapping {}",
+                hook.key
+            )
+        })?;
+        if let Some(state) = queue.pop_front().ok_or_else(|| {
+            format!(
+                "Codex hook state duplicate queue exhausted for {}",
+                hook.key
+            )
+        })? {
+            rebuilt.push((hook.key.clone(), state));
+        }
     }
 
-    let _: serde_json::Value = run_codex_app_server_request(
-        3,
-        "config/batchWrite",
-        serde_json::json!({
-            "edits": [
-                {
-                    "keyPath": "hooks.state",
-                    "value": serde_json::Value::Object(state),
-                    "mergeStrategy": "upsert",
-                }
-            ],
-            "filePath": paths.config.to_string_lossy(),
-            "expectedVersion": null,
-            "reloadUserConfig": true,
-        }),
-        paths,
-    )?;
+    if queues.values().any(|queue| !queue.is_empty()) {
+        return Err("Codex hook state remap left unmatched third-party hooks".to_string());
+    }
 
+    let hooks = hooks_table_mut(doc)?;
+    if rebuilt.is_empty() {
+        hooks.remove("state");
+    } else {
+        let mut state = Table::new();
+        for (key, item) in rebuilt {
+            state.insert(&key, item);
+        }
+        hooks.insert("state", Item::Table(state));
+    }
+    if hooks.is_empty() {
+        doc.as_table_mut().remove("hooks");
+    }
+    Ok(())
+}
+
+fn ensure_no_quill_hooks(
+    hooks: &[CodexHookMetadata],
+    affected_sources: &[PathBuf],
+) -> Result<(), String> {
+    if let Some(hook) = hooks.iter().find(|hook| {
+        path_is_affected(&hook.source_path, affected_sources)
+            && hook
+                .command
+                .as_ref()
+                .is_some_and(|command| command_is_quill_owned(command))
+    }) {
+        return Err(format!(
+            "Codex Quill hook remained after uninstall edit: {}",
+            hook.key
+        ));
+    }
     Ok(())
 }
 
@@ -747,45 +1008,11 @@ fn detect_codex_cli() -> (bool, Vec<String>) {
     crate::config::detect_provider_cli("codex")
 }
 
-/// Detection must never fail because of `CODEX_HOME`: one custom override would
-/// otherwise fail-fast the whole `detect_all` collection and brick startup
-/// repair and disable for Claude and MiniMax too. A custom home is reported as
-/// home-not-detected (with a warning); only the default `~/.codex` counts as
-/// detected. Install/enable still reject a custom home at the point it matters.
 fn detect_codex_home() -> bool {
-    let Some(user_home) = dirs::home_dir() else {
-        return false;
-    };
-    let default_home = user_home.join(".codex");
-    if let Some(custom) =
-        classify_codex_home(std::env::var_os("CODEX_HOME").as_deref(), &default_home)
-    {
-        log::warn!(
-            "Custom CODEX_HOME {} is unsupported; reporting Codex home as not detected (Quill only manages {})",
-            custom.display(),
-            default_home.display()
-        );
-        return false;
+    if let Ok(Some(state)) = load_integration_state() {
+        return state.home.is_dir();
     }
-    default_home.is_dir()
-}
-
-/// Classify a `CODEX_HOME` override against the default home without touching
-/// process state. Returns `None` when the override is absent or resolves to the
-/// default (so Quill's default management applies), or `Some(custom)` for an
-/// unsupported custom home. The env value is injected so this stays unit-testable
-/// without `std::env::set_var`, which is unsound under a threaded test runner.
-fn classify_codex_home(env: Option<&OsStr>, default_home: &Path) -> Option<PathBuf> {
-    let value = env?;
-    if value.is_empty() {
-        return Some(PathBuf::new());
-    }
-    let configured = PathBuf::from(value);
-    if paths_equivalent(&configured, default_home) {
-        None
-    } else {
-        Some(configured)
-    }
+    configured_codex_home().is_ok_and(|home| home.is_dir())
 }
 
 fn quill_config_dir() -> PathBuf {
@@ -815,78 +1042,129 @@ fn deployment_targets() -> Vec<PathBuf> {
     vec![scripts_dir(), templates_dir(), mcp_dir()]
 }
 
-/// Resolve the Codex home for install/enable/verify. A custom `CODEX_HOME` is
-/// rejected here with a hard, clear error: this is the one place where failing
-/// closed is correct, because writing managed entries into a home Quill does not
-/// otherwise manage would strand them. Uninstall uses a separate resolver.
-fn resolve_codex_install_paths() -> Result<CodexInstallPaths, String> {
-    let user_home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let home = user_home.join(".codex");
+fn integration_state_path() -> PathBuf {
+    provider_root().join(INTEGRATION_STATE_FILE)
+}
 
-    if let Some(configured_home) = std::env::var_os("CODEX_HOME") {
-        if configured_home.is_empty() {
+fn configured_codex_home() -> Result<PathBuf, String> {
+    let default = dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".codex");
+    let home = match std::env::var_os("CODEX_HOME") {
+        Some(value) if value.is_empty() => {
             return Err("CODEX_HOME is set but empty".to_string());
         }
-        let configured_home = PathBuf::from(configured_home);
-        if configured_home != home {
-            let configured_canonical = configured_home.canonicalize().map_err(|err| {
-                format!(
-                    "Custom CODEX_HOME is unsupported; unset CODEX_HOME or set it to {} (failed to resolve {}: {err})",
-                    home.display(),
-                    configured_home.display()
-                )
-            })?;
-            let default_canonical = home.canonicalize().map_err(|err| {
-                format!(
-                    "Custom CODEX_HOME is unsupported; unset CODEX_HOME or set it to {} (failed to resolve the default: {err})",
-                    home.display()
-                )
-            })?;
-            if configured_canonical != default_canonical {
-                return Err(format!(
-                    "Custom CODEX_HOME {} is unsupported; Quill only manages the default {}",
-                    configured_home.display(),
-                    home.display()
-                ));
-            }
-        }
-    }
+        Some(value) => PathBuf::from(value),
+        None => default,
+    };
 
     match fs::metadata(&home) {
         Ok(metadata) if !metadata.is_dir() => {
-            return Err(format!("CODEX_HOME is not a directory: {}", home.display()));
+            Err(format!("CODEX_HOME is not a directory: {}", home.display()))
         }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(format!(
-                "Failed to inspect default CODEX_HOME {}: {err}",
-                home.display()
-            ));
-        }
+        Ok(_) => Ok(home),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(home),
+        Err(err) => Err(format!(
+            "Failed to inspect CODEX_HOME {}: {err}",
+            home.display()
+        )),
     }
+}
 
-    Ok(CodexInstallPaths {
+fn codex_paths(home: PathBuf) -> CodexInstallPaths {
+    CodexInstallPaths {
         hooks: home.join("hooks.json"),
         config: home.join("config.toml"),
         agents: home.join("AGENTS.md"),
         home,
+    }
+}
+
+fn load_integration_state() -> Result<Option<CodexIntegrationState>, String> {
+    let path = integration_state_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+    let state: CodexIntegrationState = serde_json::from_str(&content)
+        .map_err(|err| format!("Failed to parse {}: {err}", path.display()))?;
+    if state.version != 1 {
+        return Err(format!(
+            "Unsupported Codex integration state version {}",
+            state.version
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn write_integration_state(state: &CodexIntegrationState) -> Result<(), String> {
+    let path = integration_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(state)
+        .map_err(|err| format!("Failed to serialize Codex integration state: {err}"))?;
+    fs::write(&path, content).map_err(|err| format!("Failed to write {}: {err}", path.display()))
+}
+
+fn default_codex_home() -> Result<PathBuf, String> {
+    Ok(dirs::home_dir()
+        .ok_or("Cannot determine home directory")?
+        .join(".codex"))
+}
+
+fn config_has_managed_hooks(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(doc) = parse_config_doc(&content) else {
+        return false;
+    };
+    let Some(hooks) = doc.as_table().get("hooks").and_then(Item::as_table_like) else {
+        return false;
+    };
+    CODEX_HOOK_EVENTS.iter().any(|(event, _)| {
+        hooks
+            .get(event)
+            .and_then(Item::as_array_of_tables)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(Item::as_array_of_tables)
+                        .is_some_and(|handlers| handlers.iter().any(hook_command_is_managed))
+                })
+            })
     })
 }
 
-/// Resolve the Codex home for uninstall/disable. Invariant: Quill only ever
-/// writes to the default `~/.codex`, so uninstall always targets it regardless
-/// of a custom `CODEX_HOME` — otherwise a stray env var would strand managed
-/// entries and block disable entirely.
+fn resolve_codex_install_paths() -> Result<CodexInstallPaths, String> {
+    if let Some(state) = load_integration_state()? {
+        return Ok(codex_paths(state.home));
+    }
+    let configured = configured_codex_home()?;
+    let default = default_codex_home()?;
+    if !paths_equivalent(&configured, &default)
+        && config_has_managed_hooks(&default.join("config.toml"))
+    {
+        log::warn!(
+            "Using legacy managed Codex home {} before custom CODEX_HOME {}",
+            default.display(),
+            configured.display()
+        );
+        return Ok(codex_paths(default));
+    }
+    Ok(codex_paths(configured))
+}
+
 fn resolve_codex_uninstall_paths() -> Result<CodexInstallPaths, String> {
-    let user_home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let home = user_home.join(".codex");
-    Ok(CodexInstallPaths {
-        hooks: home.join("hooks.json"),
-        config: home.join("config.toml"),
-        agents: home.join("AGENTS.md"),
-        home,
-    })
+    Ok(codex_paths(
+        load_integration_state()?
+            .map(|state| state.home)
+            .unwrap_or(default_codex_home()?),
+    ))
 }
 
 fn app_data_dir() -> PathBuf {
@@ -1306,23 +1584,6 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
     groups
 }
 
-fn upsert_codex_inline_hooks(
-    content: &str,
-    features: IntegrationFeatures,
-    config_path: &Path,
-) -> Result<String, String> {
-    let mut doc = parse_config_doc(content)?;
-    remove_codex_inline_hooks_from_doc(&mut doc, config_path)?;
-    append_codex_inline_hooks(&mut doc, &build_codex_hook_groups(features))?;
-    Ok(normalize_toml_doc(doc))
-}
-
-fn remove_codex_inline_hooks(content: &str, config_path: &Path) -> Result<String, String> {
-    let mut doc = parse_config_doc(content)?;
-    remove_codex_inline_hooks_from_doc(&mut doc, config_path)?;
-    Ok(normalize_toml_doc(doc))
-}
-
 fn parse_config_doc(content: &str) -> Result<DocumentMut, String> {
     if content.trim().is_empty() {
         return Ok(DocumentMut::new());
@@ -1407,33 +1668,21 @@ fn codex_hook_command_table(hook: &CodexHookCommand) -> Table {
 
 fn remove_codex_inline_hooks_from_doc(
     doc: &mut DocumentMut,
-    config_path: &Path,
+    _config_path: &Path,
 ) -> Result<(), String> {
-    let script_root = scripts_dir().to_string_lossy().to_string();
-    let config_source = config_path.display().to_string();
-    let mut state_keys = HashSet::new();
-
     if let Some(hooks_table) = doc
         .as_table_mut()
         .get_mut("hooks")
         .and_then(Item::as_table_mut)
     {
         let mut empty_events = Vec::new();
-        for (event, state_label) in CODEX_HOOK_EVENTS {
+        for (event, _) in CODEX_HOOK_EVENTS {
             if let Some(item) = hooks_table.get_mut(event) {
                 let Some(array) = item.as_array_of_tables_mut() else {
                     continue;
                 };
-                collect_codex_hook_state_keys(
-                    event,
-                    state_label,
-                    array,
-                    &script_root,
-                    &config_source,
-                    &mut state_keys,
-                );
                 for group in array.iter_mut() {
-                    remove_codex_hook_commands_from_group(group, &script_root);
+                    remove_codex_hook_commands_from_group(group);
                 }
                 array.retain(|group| {
                     group
@@ -1449,7 +1698,6 @@ fn remove_codex_inline_hooks_from_doc(
         for event in empty_events {
             hooks_table.remove(event);
         }
-        remove_hook_state_keys(hooks_table, &state_keys);
     }
 
     let remove_hooks_table = doc
@@ -1464,83 +1712,324 @@ fn remove_codex_inline_hooks_from_doc(
     Ok(())
 }
 
-fn collect_codex_hook_state_keys(
-    _event: &str,
-    state_label: &str,
-    array: &ArrayOfTables,
-    script_root: &str,
-    config_source: &str,
-    state_keys: &mut HashSet<String>,
-) {
-    for (group_index, group) in array.iter().enumerate() {
-        let Some(hooks) = group.get("hooks").and_then(Item::as_array_of_tables) else {
-            continue;
-        };
-        for (handler_index, handler) in hooks.iter().enumerate() {
-            if hook_command_contains_script_root(handler, script_root) {
-                state_keys.insert(format!(
-                    "{config_source}:{state_label}:{group_index}:{handler_index}"
-                ));
-            }
-        }
-    }
-}
-
-fn remove_codex_hook_commands_from_group(group: &mut Table, script_root: &str) {
+fn remove_codex_hook_commands_from_group(group: &mut Table) {
     let Some(hooks) = group
         .get_mut("hooks")
         .and_then(Item::as_array_of_tables_mut)
     else {
         return;
     };
-    hooks.retain(|handler| !hook_command_contains_script_root(handler, script_root));
+    hooks.retain(|handler| !hook_command_is_managed(handler));
 }
 
-fn hook_command_contains_script_root(handler: &Table, script_root: &str) -> bool {
+fn hook_command_is_managed(handler: &Table) -> bool {
     handler
         .get("command")
         .and_then(Item::as_str)
-        .is_some_and(|command| command.contains(script_root))
+        .is_some_and(command_is_quill_owned)
 }
 
-fn remove_hook_state_keys(hooks_table: &mut Table, state_keys: &HashSet<String>) {
-    if state_keys.is_empty() {
-        return;
-    }
-    let Some(state_table) = hooks_table.get_mut("state").and_then(Item::as_table_mut) else {
-        return;
-    };
-    for key in state_keys {
-        state_table.remove(key);
-    }
-    if state_table.is_empty() {
-        hooks_table.remove("state");
-    }
-}
-
-fn update_config_toml(features: IntegrationFeatures, path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
+fn update_config_toml(
+    features: IntegrationFeatures,
+    paths: &CodexInstallPaths,
+) -> Result<(), String> {
+    if let Some(parent) = paths.config.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
     }
 
-    let existing = if path.exists() {
-        fs::read_to_string(path).map_err(|err| format!("Failed to read config.toml: {err}"))?
+    let existing = if paths.config.exists() {
+        fs::read_to_string(&paths.config)
+            .map_err(|err| format!("Failed to read config.toml: {err}"))?
     } else {
         String::new()
     };
-
-    let without_managed_block = strip_block(&existing, MCP_BLOCK_START, MCP_BLOCK_END);
-    let with_hooks = upsert_codex_inline_hooks(&without_managed_block, features, path)?;
-    let with_features = upsert_features_flag(&with_hooks);
-    let updated = if with_features.contains("[mcp_servers.quill]") {
-        ensure_codex_mcp_env(&with_features, features.context_preservation)
-    } else {
-        append_managed_mcp_block(&with_features, features.context_preservation)
+    let mut doc = parse_config_doc(&existing)?;
+    let before = list_codex_hooks(paths)?;
+    let affected_sources = affected_hook_sources(paths, &before);
+    let original_hook_state = cloned_hook_state(&doc)?;
+    let state = match load_integration_state()? {
+        Some(state) => {
+            if !paths_equivalent(&state.home, &paths.home) {
+                return Err(format!(
+                    "Codex integration state points to {}, not {}",
+                    state.home.display(),
+                    paths.home.display()
+                ));
+            }
+            state
+        }
+        None => capture_integration_state(&doc, &existing, &paths.home)?,
     };
+    write_integration_state(&state)?;
 
-    fs::write(path, updated).map_err(|err| format!("Failed to write config.toml: {err}"))?;
+    remove_managed_hooks(&paths.hooks)?;
+    remove_codex_inline_hooks_from_doc(&mut doc, &paths.config)?;
+    append_codex_inline_hooks(&mut doc, &build_codex_hook_groups(features))?;
+    configure_features(&mut doc)?;
+    configure_mcp(&mut doc, &state, features.context_preservation)?;
+    write_config_doc(&paths.config, doc)?;
+
+    let after = list_codex_hooks(paths)?;
+    ensure_no_quill_hooks(&after, std::slice::from_ref(&paths.hooks))?;
+    validate_quill_hooks(features, &after, &paths.config, false)?;
+    let updated = fs::read_to_string(&paths.config)
+        .map_err(|err| format!("Failed to reread config.toml: {err}"))?;
+    let mut doc = parse_config_doc(&updated)?;
+    reconcile_hook_state(
+        &mut doc,
+        &before,
+        &after,
+        &original_hook_state,
+        &affected_sources,
+    )?;
+    write_config_doc(&paths.config, doc)?;
     Ok(())
+}
+
+fn nested_config_item<'a>(doc: &'a DocumentMut, keys: &[&str]) -> Option<&'a Item> {
+    let mut item = doc.as_item();
+    for key in keys {
+        item = item.as_table_like()?.get(key)?;
+    }
+    Some(item)
+}
+
+fn config_string(doc: &DocumentMut, keys: &[&str]) -> Result<Option<String>, String> {
+    let Some(item) = nested_config_item(doc, keys) else {
+        return Ok(None);
+    };
+    item.as_str()
+        .map(|value| Some(value.to_string()))
+        .ok_or_else(|| format!("config.toml {} must be a string", keys.join(".")))
+}
+
+fn capture_integration_state(
+    doc: &DocumentMut,
+    original: &str,
+    home: &Path,
+) -> Result<CodexIntegrationState, String> {
+    let prior_features_hooks = if original.contains(FEATURES_MARKER) {
+        None
+    } else {
+        nested_config_item(doc, &["features", "hooks"])
+            .map(|item| {
+                item.as_bool()
+                    .ok_or_else(|| "config.toml features.hooks must be a boolean".to_string())
+            })
+            .transpose()?
+    };
+    let mcp_server_was_present = !original.contains(MCP_BLOCK_START)
+        && nested_config_item(doc, &["mcp_servers", "quill"]).is_some();
+
+    Ok(CodexIntegrationState {
+        version: 1,
+        home: home.to_path_buf(),
+        prior_features_hooks,
+        mcp_server_was_present,
+        prior_mcp_provider: mcp_server_was_present
+            .then(|| config_string(doc, &["mcp_servers", "quill", "env", "QUILL_PROVIDER"]))
+            .transpose()?
+            .flatten(),
+        prior_mcp_context_preservation: mcp_server_was_present
+            .then(|| {
+                config_string(
+                    doc,
+                    &["mcp_servers", "quill", "env", "QUILL_CONTEXT_PRESERVATION"],
+                )
+            })
+            .transpose()?
+            .flatten(),
+    })
+}
+
+fn empty_child_table(parent_is_inline: bool) -> Item {
+    if parent_is_inline {
+        value(InlineTable::new())
+    } else {
+        Item::Table(Table::new())
+    }
+}
+
+fn ensure_child_table_like<'a>(
+    parent: &'a mut Item,
+    key: &str,
+) -> Result<&'a mut dyn TableLike, String> {
+    let parent_is_inline = parent.is_inline_table();
+    let parent = parent
+        .as_table_like_mut()
+        .ok_or_else(|| format!("config.toml parent of {key} is not a table"))?;
+    if !parent.contains_key(key) {
+        parent.insert(key, empty_child_table(parent_is_inline));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| format!("config.toml {key} entry is not a table"))
+}
+
+fn configure_features(doc: &mut DocumentMut) -> Result<(), String> {
+    let features = ensure_child_table_like(doc.as_item_mut(), "features")?;
+    features.insert("hooks", value(true));
+    Ok(())
+}
+
+fn configure_mcp(
+    doc: &mut DocumentMut,
+    state: &CodexIntegrationState,
+    context_enabled: bool,
+) -> Result<(), String> {
+    let servers_are_inline = doc
+        .as_table()
+        .get("mcp_servers")
+        .is_some_and(Item::is_inline_table);
+    let servers = ensure_child_table_like(doc.as_item_mut(), "mcp_servers")?;
+    if state.mcp_server_was_present && !servers.contains_key("quill") {
+        return Err("User-owned mcp_servers.quill was removed after installation".to_string());
+    }
+    if !servers.contains_key("quill") {
+        servers.insert("quill", empty_child_table(servers_are_inline));
+    }
+    let server = servers
+        .get_mut("quill")
+        .ok_or_else(|| "config.toml mcp_servers.quill is missing".to_string())?;
+    let server_is_inline = server.is_inline_table();
+    let server = server
+        .as_table_like_mut()
+        .ok_or_else(|| "config.toml mcp_servers.quill is not a table".to_string())?;
+
+    if !state.mcp_server_was_present {
+        let mut args = Array::new();
+        for argument in [
+            "run".to_string(),
+            "--directory".to_string(),
+            mcp_dir().to_string_lossy().to_string(),
+            "python".to_string(),
+            "server.py".to_string(),
+        ] {
+            args.push(argument);
+        }
+        server.insert("command", value("uv"));
+        server.insert("args", value(args));
+        server.insert("enabled", value(true));
+    }
+
+    if !server.contains_key("env") {
+        server.insert("env", empty_child_table(server_is_inline));
+    }
+    let env = server
+        .get_mut("env")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| "config.toml mcp_servers.quill.env is not a table".to_string())?;
+    env.insert("QUILL_PROVIDER", value("codex"));
+    env.insert(
+        "QUILL_CONTEXT_PRESERVATION",
+        value(if context_enabled { "1" } else { "0" }),
+    );
+    Ok(())
+}
+
+fn restore_env_value(env: &mut dyn TableLike, key: &str, prior: Option<&str>) {
+    match prior {
+        Some(prior_value) => {
+            env.insert(key, value(prior_value));
+        }
+        None => {
+            env.remove(key);
+        }
+    }
+}
+
+fn restore_owned_config(
+    doc: &mut DocumentMut,
+    state: Option<&CodexIntegrationState>,
+    original: &str,
+) -> Result<(), String> {
+    if let Some(state) = state {
+        if let Some(prior) = state.prior_features_hooks {
+            ensure_child_table_like(doc.as_item_mut(), "features")?.insert("hooks", value(prior));
+        } else if let Some(features) = doc
+            .as_item_mut()
+            .as_table_like_mut()
+            .and_then(|root| root.get_mut("features"))
+            .and_then(Item::as_table_like_mut)
+        {
+            features.remove("hooks");
+        }
+    } else if original.contains(FEATURES_MARKER)
+        && let Some(features) = doc
+            .as_item_mut()
+            .as_table_like_mut()
+            .and_then(|root| root.get_mut("features"))
+            .and_then(Item::as_table_like_mut)
+    {
+        features.remove("hooks");
+    }
+
+    let remove_server = state.is_some_and(|state| !state.mcp_server_was_present)
+        || (state.is_none() && original.contains(MCP_BLOCK_START));
+    if let Some(servers) = doc
+        .as_item_mut()
+        .as_table_like_mut()
+        .and_then(|root| root.get_mut("mcp_servers"))
+        .and_then(Item::as_table_like_mut)
+    {
+        if remove_server {
+            servers.remove("quill");
+        } else if let Some(state) = state
+            && let Some(server) = servers.get_mut("quill").and_then(Item::as_table_like_mut)
+            && let Some(env) = server.get_mut("env").and_then(Item::as_table_like_mut)
+        {
+            restore_env_value(env, "QUILL_PROVIDER", state.prior_mcp_provider.as_deref());
+            restore_env_value(
+                env,
+                "QUILL_CONTEXT_PRESERVATION",
+                state.prior_mcp_context_preservation.as_deref(),
+            );
+            if env.is_empty() {
+                server.remove("env");
+            }
+        }
+    }
+
+    for key in ["features", "mcp_servers"] {
+        let remove = doc
+            .as_table()
+            .get(key)
+            .and_then(Item::as_table_like)
+            .is_some_and(TableLike::is_empty);
+        if remove {
+            doc.as_table_mut().remove(key);
+        }
+    }
+    Ok(())
+}
+
+fn write_config_doc(path: &Path, doc: DocumentMut) -> Result<(), String> {
+    let rendered = remove_legacy_config_markers(&normalize_toml_doc(doc));
+    let reparsed = parse_config_doc(&rendered)?;
+    fs::write(path, normalize_toml_doc(reparsed))
+        .map_err(|err| format!("Failed to write config.toml: {err}"))
+}
+
+fn remove_legacy_config_markers(content: &str) -> String {
+    let feature_suffix = format!(" # {FEATURES_MARKER}");
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        if line.trim() == MCP_BLOCK_START || line.trim() == MCP_BLOCK_END {
+            continue;
+        }
+        lines.push(
+            line.strip_suffix(&feature_suffix)
+                .unwrap_or(line)
+                .to_string(),
+        );
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
 }
 
 fn update_agents_md(path: &Path) -> Result<(), String> {
@@ -1587,29 +2076,37 @@ fn remove_managed_hooks(path: &Path) -> Result<(), String> {
 
     let content =
         fs::read_to_string(path).map_err(|err| format!("Failed to read hooks.json: {err}"))?;
-    let mut root: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(value) => value,
-        Err(_) => return Ok(()),
-    };
+    let mut root: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|err| format!("Failed to parse hooks.json: {err}"))?;
 
-    let script_root = scripts_dir().to_string_lossy().to_string();
     if let Some(hooks) = root
         .get_mut("hooks")
         .and_then(|value| value.as_object_mut())
     {
-        for entries in hooks.values_mut() {
+        let mut empty_owned_events = Vec::new();
+        for (event, entries) in hooks.iter_mut() {
             if let Some(arr) = entries.as_array_mut() {
-                arr.retain(|entry| {
-                    let raw = entry.to_string();
-                    !raw.contains(HOOK_MARKER)
-                        && !raw.contains(CONTEXT_HOOK_MARKER)
-                        && !raw.contains(&script_root)
-                });
+                let original_len = arr.len();
+                arr.retain_mut(prune_legacy_hook_group);
+                if arr.is_empty() && original_len != 0 {
+                    empty_owned_events.push(event.clone());
+                }
             }
         }
+        for event in empty_owned_events {
+            hooks.remove(&event);
+        }
+    }
+    if root
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+        && let Some(object) = root.as_object_mut()
+    {
+        object.remove("hooks");
     }
 
-    if hooks_json_has_no_active_hooks(&root) && hooks_json_has_no_other_entries(&root) {
+    if root.as_object().is_some_and(serde_json::Map::is_empty) {
         remove_path(path).map_err(|err| format!("Failed to remove hooks.json: {err}"))?;
         return Ok(());
     }
@@ -1620,36 +2117,116 @@ fn remove_managed_hooks(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn hooks_json_has_no_active_hooks(root: &serde_json::Value) -> bool {
-    root.get("hooks")
-        .and_then(serde_json::Value::as_object)
-        .is_none_or(|hooks| {
-            hooks
-                .values()
-                .all(|entries| entries.as_array().is_none_or(|entries| entries.is_empty()))
-        })
+fn legacy_group_marker(group: &serde_json::Value) -> bool {
+    group
+        .get("_source")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|source| source == HOOK_MARKER || source == CONTEXT_HOOK_MARKER)
 }
 
-fn hooks_json_has_no_other_entries(root: &serde_json::Value) -> bool {
-    root.as_object().is_none_or(|object| {
-        object.iter().all(|(key, value)| {
-            key == "hooks" || value.as_object().is_some_and(serde_json::Map::is_empty)
-        })
-    })
-}
-
-fn remove_managed_config_entries(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
+fn prune_legacy_hook_group(group: &mut serde_json::Value) -> bool {
+    let marked = legacy_group_marker(group);
+    let Some(handlers) = group
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return !json_hook_handler_is_managed(group);
+    };
+    let had_managed = handlers.iter().any(json_hook_handler_is_managed);
+    handlers.retain(|handler| !json_hook_handler_is_managed(handler));
+    if handlers.is_empty() {
+        return !(had_managed || marked);
     }
+    if marked && let Some(object) = group.as_object_mut() {
+        object.remove("_source");
+    }
+    true
+}
 
-    let content =
-        fs::read_to_string(path).map_err(|err| format!("Failed to read config.toml: {err}"))?;
-    let without_mcp = strip_block(&content, MCP_BLOCK_START, MCP_BLOCK_END);
-    let without_hooks = remove_codex_inline_hooks(&without_mcp, path)?;
-    let cleaned = remove_features_flag(&without_hooks);
-    fs::write(path, cleaned).map_err(|err| format!("Failed to write config.toml: {err}"))?;
+fn json_hook_handler_is_managed(handler: &serde_json::Value) -> bool {
+    handler
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(command_is_quill_owned)
+}
+
+fn remove_managed_config_entries(paths: &CodexInstallPaths) -> Result<(), String> {
+    let original_config = read_optional_text(&paths.config, "config.toml")?;
+    let original_hooks = read_optional_text(&paths.hooks, "hooks.json")?;
+    let result = (|| {
+        let before = list_codex_hooks(paths)?;
+        let affected_sources = affected_hook_sources(paths, &before);
+        let original = original_config.as_deref().unwrap_or_default();
+        let mut doc = parse_config_doc(original)?;
+        let original_hook_state = cloned_hook_state(&doc)?;
+        remove_managed_hooks(&paths.hooks)?;
+        remove_codex_inline_hooks_from_doc(&mut doc, &paths.config)?;
+        restore_owned_config(&mut doc, load_integration_state()?.as_ref(), original)?;
+        if original_config.is_some() {
+            write_config_doc(&paths.config, doc)?;
+        }
+
+        let after = list_codex_hooks(paths)?;
+        ensure_no_quill_hooks(&after, &affected_sources)?;
+        if original_config.is_some() {
+            let mut doc = parse_config_doc(
+                &fs::read_to_string(&paths.config)
+                    .map_err(|err| format!("Failed to reread config.toml: {err}"))?,
+            )?;
+            reconcile_hook_state(
+                &mut doc,
+                &before,
+                &after,
+                &original_hook_state,
+                &affected_sources,
+            )?;
+            write_config_doc(&paths.config, doc)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback) = restore_optional_text(&paths.config, original_config.as_deref()) {
+            rollback_errors.push(rollback);
+        }
+        if let Err(rollback) = restore_optional_text(&paths.hooks, original_hooks.as_deref()) {
+            rollback_errors.push(rollback);
+        }
+        return if rollback_errors.is_empty() {
+            Err(err)
+        } else {
+            Err(format!(
+                "{err}; configuration rollback failed: {}",
+                rollback_errors.join("; ")
+            ))
+        };
+    }
     Ok(())
+}
+
+fn read_optional_text(path: &Path, label: &str) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|err| format!("Failed to read {label}: {err}"))
+}
+
+fn restore_optional_text(path: &Path, original: Option<&str>) -> Result<(), String> {
+    match original {
+        Some(content) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("Failed to recreate {}: {err}", parent.display()))?;
+            }
+            fs::write(path, content)
+                .map_err(|err| format!("Failed to restore {}: {err}", path.display()))
+        }
+        None => remove_path(path)
+            .map_err(|err| format!("Failed to remove {} during rollback: {err}", path.display())),
+    }
 }
 
 fn remove_agents_block(path: &Path) -> Result<(), String> {
@@ -1760,230 +2337,9 @@ fn replace_block(content: &str, start_marker: &str, end_marker: &str, replacemen
     result
 }
 
-/// Codex hooks are stable and default-enabled since Codex 0.124.0, so this flag
-/// is not what turns hooks on. Quill keeps writing `hooks = true` only to
-/// re-enable them if a user had explicitly set `hooks = false`.
-fn upsert_features_flag(content: &str) -> String {
-    let managed_line = format!("hooks = true # {FEATURES_MARKER}");
-    let mut lines: Vec<String> = if content.is_empty() {
-        Vec::new()
-    } else {
-        content.lines().map(ToOwned::to_owned).collect()
-    };
-
-    let mut section_start = None;
-    let mut section_end = lines.len();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed == "[features]" {
-            section_start = Some(idx);
-            continue;
-        }
-        if section_start.is_some() && trimmed.starts_with('[') && trimmed.ends_with(']') {
-            section_end = idx;
-            break;
-        }
-    }
-
-    if let Some(start) = section_start {
-        let mut insert_at = section_end;
-        let mut found_hooks = false;
-        for idx in ((start + 1)..section_end).rev() {
-            let trimmed = lines[idx].trim_start();
-            if toml_key_matches(trimmed, "codex_hooks") {
-                lines.remove(idx);
-                insert_at -= 1;
-                continue;
-            }
-
-            if toml_key_matches(trimmed, "hooks") {
-                if found_hooks {
-                    lines.remove(idx);
-                    insert_at -= 1;
-                    continue;
-                }
-
-                let indent = &lines[idx][..lines[idx].len() - trimmed.len()];
-                lines[idx] = format!("{indent}{managed_line}");
-                found_hooks = true;
-            }
-        }
-
-        if found_hooks {
-            return normalize_lines(lines, content.ends_with('\n'));
-        }
-
-        lines.insert(insert_at, managed_line);
-        return normalize_lines(lines, true);
-    }
-
-    if !lines.is_empty() && !lines.last().is_some_and(|line| line.is_empty()) {
-        lines.push(String::new());
-    }
-    lines.push("[features]".to_string());
-    lines.push(managed_line);
-    normalize_lines(lines, true)
-}
-
-fn toml_key_matches(trimmed_line: &str, key: &str) -> bool {
-    trimmed_line
-        .strip_prefix(key)
-        .is_some_and(|rest| rest.trim_start().starts_with('='))
-}
-
-fn context_preservation_env_line(context_enabled: bool) -> &'static str {
-    if context_enabled {
-        "QUILL_CONTEXT_PRESERVATION = \"1\""
-    } else {
-        "QUILL_CONTEXT_PRESERVATION = \"0\""
-    }
-}
-
-fn append_managed_mcp_block(content: &str, context_enabled: bool) -> String {
-    let mcp_path = toml_string(&mcp_dir());
-    let context_line = context_preservation_env_line(context_enabled);
-    let block = format!(
-        "{MCP_BLOCK_START}\n[mcp_servers.quill]\ncommand = \"uv\"\nargs = [\"run\", \"--directory\", \"{mcp_path}\", \"python\", \"server.py\"]\nenabled = true\n\n[mcp_servers.quill.env]\nQUILL_PROVIDER = \"codex\"\n{context_line}\n{MCP_BLOCK_END}"
-    );
-
-    if content.trim().is_empty() {
-        return format!("{block}\n");
-    }
-
-    format!("{}\n\n{block}\n", content.trim_end())
-}
-
-fn ensure_codex_mcp_env(content: &str, context_enabled: bool) -> String {
-    let provider_line = "QUILL_PROVIDER = \"codex\"";
-    let context_line = context_preservation_env_line(context_enabled);
-    if content.contains("[mcp_servers.quill.env]") {
-        let mut lines = Vec::new();
-        let mut in_env_section = false;
-        let mut provider_written = false;
-        let mut context_written = false;
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if in_env_section && trimmed.starts_with('[') && trimmed.ends_with(']') {
-                if !provider_written {
-                    lines.push(provider_line.to_string());
-                }
-                if !context_written {
-                    lines.push(context_line.to_string());
-                }
-                in_env_section = false;
-            }
-
-            if in_env_section && trimmed.starts_with("QUILL_PROVIDER") {
-                lines.push(provider_line.to_string());
-                provider_written = true;
-                continue;
-            }
-            if in_env_section && trimmed.starts_with("QUILL_CONTEXT_PRESERVATION") {
-                lines.push(context_line.to_string());
-                context_written = true;
-                continue;
-            }
-
-            lines.push(line.to_string());
-            if trimmed == "[mcp_servers.quill.env]" {
-                in_env_section = true;
-                provider_written = false;
-                context_written = false;
-            }
-        }
-
-        if in_env_section {
-            if !provider_written {
-                lines.push(provider_line.to_string());
-            }
-            if !context_written {
-                lines.push(context_line.to_string());
-            }
-        }
-
-        return normalize_lines(lines, true);
-    }
-
-    let env_block = format!("[mcp_servers.quill.env]\n{provider_line}\n{context_line}");
-    if content.trim().is_empty() {
-        return format!("{env_block}\n");
-    }
-    format!("{}\n\n{env_block}\n", content.trim_end())
-}
-
-fn remove_features_flag(content: &str) -> String {
-    let mut lines: Vec<String> = content.lines().map(ToOwned::to_owned).collect();
-    lines.retain(|line| !line.contains(FEATURES_MARKER));
-
-    let mut cleaned = Vec::new();
-    let mut idx = 0;
-    while idx < lines.len() {
-        if lines[idx].trim() == "[features]" {
-            let mut next = idx + 1;
-            while next < lines.len()
-                && !(lines[next].trim().starts_with('[') && lines[next].trim().ends_with(']'))
-            {
-                next += 1;
-            }
-
-            let has_real_entries = lines[(idx + 1)..next]
-                .iter()
-                .any(|line| !line.trim().is_empty() && !line.trim().starts_with('#'));
-
-            if !has_real_entries {
-                idx = next;
-                while idx < lines.len() && lines[idx].trim().is_empty() {
-                    idx += 1;
-                }
-                continue;
-            }
-        }
-
-        cleaned.push(lines[idx].clone());
-        idx += 1;
-    }
-
-    normalize_lines(cleaned, true)
-}
-
-fn normalize_lines(lines: Vec<String>, trailing_newline: bool) -> String {
-    let mut output = lines.join("\n");
-    if trailing_newline && !output.ends_with('\n') {
-        output.push('\n');
-    }
-    output
-}
-
-fn toml_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "\\\\")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classify_codex_home_accepts_default_and_absent() {
-        let default_home = PathBuf::from("/home/user/.codex");
-        assert!(classify_codex_home(None, &default_home).is_none());
-        assert!(
-            classify_codex_home(Some(OsStr::new("/home/user/.codex")), &default_home).is_none()
-        );
-    }
-
-    #[test]
-    fn classify_codex_home_flags_custom_and_empty() {
-        let default_home = PathBuf::from("/home/user/.codex");
-        assert_eq!(
-            classify_codex_home(Some(OsStr::new("/tmp/other-codex")), &default_home),
-            Some(PathBuf::from("/tmp/other-codex"))
-        );
-        assert_eq!(
-            classify_codex_home(Some(OsStr::new("")), &default_home),
-            Some(PathBuf::new())
-        );
-    }
 
     // A hung `codex app-server` must not block the caller (and the process-wide
     // mutation lock it holds) forever: the read is bounded and the child reaped.

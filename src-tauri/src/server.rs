@@ -1039,7 +1039,7 @@ async fn post_observation(
 }
 
 // Feature 009: ingest Codex hook fires from the deployed
-// `hook-observe.cjs` observer. Validates the ten-event whitelist,
+// `hook-observe.cjs` observer. Validates the shared 11-event lifecycle set,
 // length-caps strings, fast-acks 202 ACCEPTED, and persists on a
 // background blocking task. The handler's response shape mirrors
 // `post_observation` so the script's fast-ack contract is preserved.
@@ -1050,19 +1050,6 @@ async fn post_hook_observed(
     headers: HeaderMap,
     Json(payload): Json<CodexHookObservation>,
 ) -> impl IntoResponse {
-    const ALLOWED_EVENTS: &[&str] = &[
-        "PreToolUse",
-        "PostToolUse",
-        "SessionStart",
-        "UserPromptSubmit",
-        "Stop",
-        "PreCompact",
-        "PostCompact",
-        "PermissionRequest",
-        "SubagentStart",
-        "SubagentStop",
-    ];
-
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
@@ -1075,7 +1062,7 @@ async fn post_hook_observed(
     if payload.session_id.is_empty() || payload.session_id.len() > MAX_SESSION_ID_LEN {
         return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
     }
-    if !ALLOWED_EVENTS.contains(&payload.hook_event.as_str()) {
+    if !crate::integrations::codex::is_supported_hook_event(&payload.hook_event) {
         return (
             StatusCode::BAD_REQUEST,
             format!("Unknown hook_event: {}", payload.hook_event),

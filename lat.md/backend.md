@@ -32,7 +32,7 @@ Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 | Session notify | 500 req/min |
 | Session messages | 100 req/min |
 
-`/api/v1/hooks/observed` (feature 009) shares the **Observations** bucket because both endpoints accept hook-fire telemetry whose call rate scales with tool-call volume in active sessions, and a hook chain that fires `PreToolUse` + `PostToolUse` + Quill's own scripts can saturate a stricter limit on a heavy bash-driven turn. The handler runs `check_auth` → `check_rate_limit_with_max(obs_rate_limiter, MAX_OBS_REQUESTS)` → validation (ten-event whitelist, ISO-8601 timestamp parse, length caps on `tool_name`/`hook_matcher`/`agent_id`) → background insert before returning `202 Accepted`, preserving the fast-ack contract observed by `src-tauri/codex-integration/scripts/hook-observe.cjs`.
+`/api/v1/hooks/observed` (feature 009) shares the **Observations** bucket because both endpoints accept hook-fire telemetry whose call rate scales with tool-call volume in active sessions, and a hook chain that fires `PreToolUse` + `PostToolUse` + Quill's own scripts can saturate a stricter limit on a heavy bash-driven turn. The handler runs `check_auth` → `check_rate_limit_with_max(obs_rate_limiter, MAX_OBS_REQUESTS)` → validation ([[src-tauri/src/integrations/codex.rs#is_supported_hook_event|the shared 11-event lifecycle set]], ISO-8601 timestamp parse, length caps on `tool_name`/`hook_matcher`/`agent_id`) → background insert before returning `202 Accepted`, preserving the fast-ack contract observed by `src-tauri/codex-integration/scripts/hook-observe.cjs`.
 
 ### Endpoints
 
@@ -1299,7 +1299,7 @@ Observed lifecycle-hook fires keyed for the Now-tab Hooks breakdown. Claude rows
 
 Codex rows are inserted by [[src-tauri/src/storage.rs#Storage#store_codex_hook_observation]] from the `POST /api/v1/hooks/observed` background blocking task. Codex identity is event-scoped (`hook_event` with an optional `:tool_name` suffix when the event is `PreToolUse` or `PostToolUse`) because the deployed `hook-observe.cjs` observer (`src-tauri/codex-integration/scripts/hook-observe.cjs`) fires on every event without per-script attribution — Codex registers multiple scripts per event and the observer cannot identify which sibling script ran. Quill ships its own Codex hooks (`session-sync.cjs`, `context-capture.cjs`, `context-router.cjs`, `observe.cjs`, `report-tokens.sh`, plus the new `hook-observe.cjs` itself when `activity_tracking` is on); third-party Codex hooks fire but are not attributed beyond the event level. Codex telemetry is gated on the same `activity_tracking` IntegrationFeatures flag that already gates `observe.cjs`.
 
-The endpoint accepts observations only for a ten-event whitelist (`PreToolUse`, `PostToolUse`, `SessionStart`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest`) after the `SubagentStart`/`SubagentStop` lifecycle events were added, and length-caps `agent_id` exactly as it caps `tool_name`. [[src-tauri/src/models.rs#CodexHookObservation]] carries a serde-defaulted `agent_id: Option<String>` that `hook-observe.cjs` sends on every payload, and `store_codex_hook_observation` preserves that optional attribution while the source-less chain remains the incoming session id. The `hook_identity` computation stays event-scoped and unchanged.
+The endpoint accepts observations only for the shared 11-event lifecycle set (`PreToolUse`, `PostToolUse`, `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`, `PreCompact`, `PostCompact`, `PermissionRequest`) and length-caps `agent_id` exactly as it caps `tool_name`. [[src-tauri/src/models.rs#CodexHookObservation]] carries a serde-defaulted `agent_id: Option<String>` that `hook-observe.cjs` sends on every payload; Codex supplies it for subagent lifecycle events, and `store_codex_hook_observation` preserves that optional attribution while the source-less chain remains the incoming session id. Codex command-hook stdin does not include the configured matcher, so the observer sends `hook_matcher: null`; `hook_identity` remains event-scoped and uses `tool_name` only for tool events.
 
 [[src-tauri/src/storage.rs#Storage#delete_session_data]] cascades direct deletion through all five analytics tables. Project and host deletion use retained registry ownership and recorded live origin instead of row-local guesses.
 
@@ -1615,7 +1615,7 @@ The `confirm_enable_provider` command accepts an optional `api_key` parameter us
 
 `get_provider_statuses`, `rescan_integrations`, `confirm_enable_provider`, `confirm_disable_provider`, `get_context_preservation_status`, `set_context_preservation_enabled`, `set_minimax_api_key`, `set_cpa_connection`, `clear_cpa_connection`, `get_cpa_connection_status`, `get_runtime_settings`, `set_runtime_settings`, `get_integration_features`, `set_activity_tracking_enabled`, `set_context_telemetry_enabled`, and `set_brevity_enabled`.
 
-At startup, [[src-tauri/src/integrations/manager.rs]] verifies enabled, detected Claude and Codex providers against the stored context-preservation setting. Missing or stale Quill-managed hooks, MCP assets, templates, or unexpectedly present context assets trigger an idempotent reinstall of either the base-only or context-enabled asset set; repair failures leave the provider enabled but persist `last_error` and an error setup state.
+At startup, [[src-tauri/src/integrations/manager.rs]] verifies enabled, detected Claude and Codex providers against the stored context-preservation setting. Codex verification resolves the install-state home, parses semantic feature/MCP values, and requires `hooks/list` to return every exact Quill handler enabled and trusted; substring matches no longer count as installed. Missing or stale assets trigger an idempotent reinstall, while repair failures leave the provider enabled but persist `last_error` and an error setup state.
 
 ### Runtime Settings Commands (2)
 
@@ -1976,6 +1976,8 @@ Most read and trigger commands accept an optional provider filter for Claude, Co
 `discover_restart_instances`, `discover_claude_instances` (compat alias), `request_restart`, `cancel_restart`, `get_restart_status`, `install_restart_hooks`, `check_restart_hooks_installed`.
 
 Restart commands expose a shared provider-aware row model across Claude and Codex. Hook install/check commands accept an optional provider parameter so restart setup can be applied per provider.
+
+Claude setup resolves its persisted `ClaudePaths`, runs under the integration mutation guard, and commits settings, restart ownership, hook assets, and shell RC blocks as one restart-specific transaction. `check_restart_hooks_installed` parses exact handler command/args/timeout tuples and verifies current script/block contents; malformed state or configuration reports not installed instead of accepting a filename substring.
 
 ### UI Commands (4)
 

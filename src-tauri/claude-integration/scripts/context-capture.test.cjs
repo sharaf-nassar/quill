@@ -13,6 +13,7 @@ const path = require("path");
 const scriptPath = path.join(__dirname, "context-capture.cjs");
 const codexScriptPath = path.join(__dirname, "..", "..", "codex-integration", "scripts", "context-capture.cjs");
 const capture = require("./context-capture.cjs");
+const FIXTURE_TIME_MS = Date.now() - 5 * 60_000;
 let passed = 0;
 let failed = 0;
 
@@ -51,10 +52,14 @@ function seedSnapshots(home, records) {
   fs.writeFileSync(path.join(dir, "snapshots.jsonl"), records.map(jsonLine).join(""), "utf8");
 }
 
+function fixtureTimestamp(offsetMs = 0) {
+  return new Date(FIXTURE_TIME_MS + offsetMs).toISOString();
+}
+
 function event(extra) {
   return {
     kind: "event",
-    timestamp: "2026-07-23T12:00:00.000Z",
+    timestamp: fixtureTimestamp(),
     provider: "claude",
     session_id: "prior-session",
     cwd: "/project",
@@ -145,7 +150,7 @@ it("scopes main checkout and worktree .git-file projects separately", () => with
     }),
     event({
       cwd: worktree,
-      timestamp: "2026-07-23T12:01:00.000Z",
+      timestamp: fixtureTimestamp(60_000),
       prompt_summary: "Worktree context.",
       hints: { decisions: [], tasks: ["Keep worktree only."] },
     }),
@@ -179,7 +184,7 @@ it("classifies prompts at the triviality boundary", () => {
 
 it("omits trivial prompts from SessionStart directives", () => withFixture((home) => {
   seedRecords(home, [
-    event({ timestamp: "2026-07-23T12:01:00.000Z", prompt_summary: "ctc" }),
+    event({ timestamp: fixtureTimestamp(60_000), prompt_summary: "ctc" }),
     event({ prompt_summary: "Implement the continuity capture update." }),
   ]);
   const text = directive(runCapture(home, {
@@ -265,12 +270,12 @@ it("anchors the 2026-05-18 mixed-hints shape to one coherent session", () => wit
   seedRecords(home, [
     event({
       session_id: "thread-a",
-      timestamp: "2026-07-23T12:02:00.000Z",
+      timestamp: fixtureTimestamp(120_000),
       prompt_summary: "Implement the newest unrelated task.",
     }),
     event({
       session_id: "thread-b",
-      timestamp: "2026-07-23T12:01:00.000Z",
+      timestamp: fixtureTimestamp(60_000),
       prompt_summary: "Finish the coherent continuity migration.",
       hints: { tasks: ["Thread B task."], decisions: ["Thread B decision."] },
     }),
@@ -291,7 +296,7 @@ it("uses snapshot fields first and fills empty snapshot hints from events", () =
   })]);
   seedSnapshots(home, [{
     kind: "snapshot",
-    timestamp: "2026-07-23T12:01:00.000Z",
+    timestamp: fixtureTimestamp(60_000),
     provider: "claude",
     session_id: "anchor",
     cwd: "/project",

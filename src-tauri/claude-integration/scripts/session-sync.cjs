@@ -7,8 +7,14 @@ const os = require("os");
 const crypto = require("crypto");
 const https = require("https");
 const http = require("http");
+const { performance } = require("perf_hooks");
 const LOCAL_TIMEOUT_MS = 1500;
 const REMOTE_TIMEOUT_MS = 2000;
+const RUN_BUDGET_MS = 8000;
+// A first-row rejection in a 500-message chunk needs 17 depth-first requests
+// to isolate/drop the row and acknowledge every valid sibling. One extra
+// request lets the same final lifecycle hook advance into the next chunk.
+const MAX_HTTP_ATTEMPTS = 18;
 // Must match MAX_MESSAGES_PER_REQUEST in src-tauri/src/server.rs.
 const MAX_MESSAGES_PER_REQUEST = 500;
 // Must match MAX_STRING_LEN in src-tauri/src/server.rs (byte length).
@@ -89,16 +95,51 @@ class SyncRequestError extends Error {
   }
 }
 
+class SyncBudget {
+  constructor(now = () => performance.now()) {
+    this.now = now;
+    this.deadline = now() + RUN_BUDGET_MS;
+    this.attempts = 0;
+  }
+
+  remainingMs() {
+    return Math.max(0, this.deadline - this.now());
+  }
+
+  canRequest() {
+    return this.remainingMs() > 0 && this.attempts < MAX_HTTP_ATTEMPTS;
+  }
+
+  claimRequest() {
+    const remaining = this.remainingMs();
+    if (remaining <= 0 || this.attempts >= MAX_HTTP_ATTEMPTS) return 0;
+    this.attempts += 1;
+    return remaining;
+  }
+}
+
+class SyncBudgetError extends Error {
+  constructor() {
+    super("run budget exhausted");
+    this.name = "SyncBudgetError";
+  }
+}
+
 function isEnvelopeRejection(detail) {
   if (typeof detail !== "string" || detail.length === 0) return false;
   return ENVELOPE_REJECTIONS.some((known) => detail.includes(known));
 }
 
-function postJSON(config, endpoint, payload) {
+function postJSON(config, endpoint, payload, budget) {
   const body = JSON.stringify(payload);
   const url = new URL(`${config.url}${endpoint}`);
   const mod = url.protocol === "https:" ? https : http;
-  const timeoutMs = isLocal(config.url) ? LOCAL_TIMEOUT_MS : REMOTE_TIMEOUT_MS;
+  const remainingMs = budget.claimRequest();
+  if (remainingMs <= 0) return Promise.reject(new SyncBudgetError());
+  const timeoutMs = Math.max(1, Math.floor(Math.min(
+    isLocal(config.url) ? LOCAL_TIMEOUT_MS : REMOTE_TIMEOUT_MS,
+    remainingMs,
+  )));
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -635,6 +676,18 @@ function deriveCwd(cwd) {
   return Buffer.byteLength(cwd, "utf8") <= MAX_CWD_LEN ? cwd : null;
 }
 
+function firstMessageChunk(messages) {
+  let end = Math.min(MAX_MESSAGES_PER_REQUEST, messages.length);
+  if (
+    end < messages.length
+    && messages[end - 1].message.role === "user"
+    && messages[end].message.role === "assistant"
+  ) {
+    end -= 1;
+  }
+  return messages.slice(0, end);
+}
+
 function cleanupOrphanedCursorTemps(trackingFile) {
   const directory = path.dirname(trackingFile);
   const prefix = `${path.basename(trackingFile)}.tmp-`;
@@ -700,9 +753,16 @@ function persistCursor(trackingFile, cursor, ownerToken) {
 // O(log n) requests; that record is dropped and loudly logged so the rest of
 // the stream keeps flowing.
 //
-// Returns { sent, dropped }. `sent: false` means the caller must leave the
-// cursor untouched and retry on a later hook fire.
-async function sendChunkWithBisect(config, envelope, chunk, lease) {
+// Returns { sent, dropped }. `sent: false` means the caller retries from the
+// last segment acknowledged through `acknowledge` on a later hook fire.
+async function sendChunkWithBisect(
+  config,
+  envelope,
+  chunk,
+  lease,
+  budget,
+  acknowledge,
+) {
   if (chunk.length === 0) return { sent: true, dropped: [] };
   if (!renewSessionLease(lease)) return { sent: false, dropped: [] };
 
@@ -710,7 +770,10 @@ async function sendChunkWithBisect(config, envelope, chunk, lease) {
     await postJSON(config, "/api/v1/sessions/messages", {
       ...envelope,
       messages: chunk.map(({ message }) => message),
-    });
+    }, budget);
+    if (!renewSessionLease(lease) || !acknowledge(chunk)) {
+      return { sent: false, dropped: [] };
+    }
     return { sent: true, dropped: [] };
   } catch (err) {
     if (err?.permanent !== true) {
@@ -732,23 +795,42 @@ async function sendChunkWithBisect(config, envelope, chunk, lease) {
         `dropping unacceptable record ${poisoned.message.uuid} at transcript line `
         + `${poisoned.sourceLineOrdinal} of session ${envelope.session_id}: ${err.message}`,
       );
+      if (!renewSessionLease(lease) || !acknowledge(chunk)) {
+        return { sent: false, dropped: [] };
+      }
       return { sent: true, dropped: [poisoned] };
     }
 
     const midpoint = Math.floor(chunk.length / 2);
-    const head = await sendChunkWithBisect(config, envelope, chunk.slice(0, midpoint), lease);
+    const head = await sendChunkWithBisect(
+      config,
+      envelope,
+      chunk.slice(0, midpoint),
+      lease,
+      budget,
+      acknowledge,
+    );
     if (!head.sent) return head;
-    const tail = await sendChunkWithBisect(config, envelope, chunk.slice(midpoint), lease);
+    const tail = await sendChunkWithBisect(
+      config,
+      envelope,
+      chunk.slice(midpoint),
+      lease,
+      budget,
+      acknowledge,
+    );
     return { sent: tail.sent, dropped: [...head.dropped, ...tail.dropped] };
   }
 }
 
 async function main() {
   try {
+    const budget = new SyncBudget();
     const raw = fs.readFileSync(0, "utf8");
     const input = JSON.parse(raw);
 
     if (input.stop_hook_active) return;
+    if (!["Stop", "StopFailure", "SessionEnd"].includes(input.hook_event_name)) return;
 
     const sessionId = input.session_id;
     const transcriptPath = input.transcript_path;
@@ -785,14 +867,12 @@ async function main() {
     }
 
     if (isLocal(config.url)) {
-      // LOCAL: full-transcript reindexing is expensive, so only do it on Stop.
-      if (input.hook_event_name !== "Stop") return;
       try {
         await postJSON(config, "/api/v1/sessions/notify", {
           provider: "claude",
           session_id: sessionId,
           jsonl_path: transcriptPath,
-        });
+        }, budget);
       } catch (err) {
         // A closed desktop app is the routine case here, so only a rejection
         // the server would repeat forever is worth reporting every time.
@@ -878,6 +958,8 @@ async function main() {
         );
       }
 
+      if (budget.remainingMs() <= 0) return;
+
       if (sendableMessages.length === 0) {
         // Lines with no runtime records need no server acknowledgement.
         if (cursorCeiling <= lastSent) return;
@@ -895,23 +977,20 @@ async function main() {
         git_branch: input.git_branch || null,
       };
 
-      let offset = 0;
-      while (offset < sendableMessages.length) {
-        let chunkEnd = Math.min(
-          offset + MAX_MESSAGES_PER_REQUEST,
-          sendableMessages.length,
+      const acknowledge = (segment) => {
+        persistCursor(
+          trackingFile,
+          segment.at(-1).sourceLineOrdinal + 1,
+          lease.token,
         );
+        return true;
+      };
+      let offset = 0;
+      while (offset < sendableMessages.length && budget.canRequest()) {
         // Keep a normal Claude user/assistant turn in one transaction when a
         // 500-row boundary would otherwise split it. This preserves response
         // timing while retaining the same hard request limit.
-        if (
-          chunkEnd < sendableMessages.length
-          && sendableMessages[chunkEnd - 1].message.role === "user"
-          && sendableMessages[chunkEnd].message.role === "assistant"
-        ) {
-          chunkEnd -= 1;
-        }
-        const chunk = sendableMessages.slice(offset, chunkEnd);
+        const chunk = firstMessageChunk(sendableMessages.slice(offset));
         const nativeRoots = new Set(
           chunk.map(({ rootSessionId }) => rootSessionId).filter(Boolean),
         );
@@ -929,15 +1008,15 @@ async function main() {
           { ...envelope, session_id: rootSessionId },
           chunk,
           lease,
+          budget,
+          acknowledge,
         );
         if (!sent) return;
+        offset += chunk.length;
+      }
+      if (offset === sendableMessages.length && budget.remainingMs() > 0) {
         if (!renewSessionLease(lease)) return;
-        persistCursor(
-          trackingFile,
-          sendableMessages[chunkEnd]?.sourceLineOrdinal ?? cursorCeiling,
-          lease.token,
-        );
-        offset = chunkEnd;
+        persistCursor(trackingFile, cursorCeiling, lease.token);
       }
     } finally {
       releaseSessionLease(lease);
@@ -947,4 +1026,6 @@ async function main() {
   }
 }
 
-void main();
+if (require.main === module) void main();
+
+module.exports = { SyncBudget, firstMessageChunk, sendChunkWithBisect };

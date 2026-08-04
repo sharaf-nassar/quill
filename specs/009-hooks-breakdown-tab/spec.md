@@ -137,7 +137,7 @@ regardless of the Now tab's active timeframe.
   other surrogate — each fire is one fire.
 - Codex provides per-event observation only, not per-script. When the user
   enables the Codex provider filter, the rendered rows are keyed by hook
-  event (and matcher where present), not by script path. This asymmetry is
+  event (and tool name for tool events), not by script path. This asymmetry is
   surfaced via an inline help affordance on the breakdown header so users
   understand why Codex rows look coarser than Claude rows.
 - Quill's `activity_tracking` flag is off. Hook telemetry on Codex stops
@@ -150,8 +150,9 @@ regardless of the Now tab's active timeframe.
   pattern (analogous to Skills migration 23) so existing sessions surface
   retroactively without manual intervention.
 - A hook timed out (Codex `timeout=3` etc.). The fact that it started is
-  observable even if it didn't complete — the Codex observer script is the
-  first thing called, so it logs the event before any timeout risk.
+  observable even if a sibling hook didn't complete — Codex launches matching
+  command hooks concurrently, and the observer reports the lifecycle event
+  independently.
 - A hook fires inside a Claude sub-agent run (sidechain transcript). The
   fire is recorded with `is_sidechain=1` and the sub-agent's `agent_id`, but
   rolled up into the same script row as parent-transcript fires for that
@@ -201,10 +202,10 @@ regardless of the Now tab's active timeframe.
   alongside the established skill-usage and session-event extraction.
 - **FR-011**: System MUST capture Codex hook firings by deploying a new
   Quill-managed observer script registered against every Codex hook event
-  type (eight events: `PreToolUse`, `PostToolUse`, `SessionStart`,
-  `UserPromptSubmit`, `Stop`, `PreCompact`, `PostCompact`,
-  `PermissionRequest`) without any matcher restriction, so every fire of
-  every event is observed.
+  type (11 events: `PreToolUse`, `PostToolUse`, `SessionStart`,
+  `SessionEnd`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, `Stop`,
+  `PreCompact`, `PostCompact`, `PermissionRequest`) without any matcher
+  restriction, so every fire of every event is observed.
 - **FR-012**: System MUST accept hook observations from Codex via a
   dedicated HTTP endpoint distinct from the existing learning observations
   endpoint, validating provider, hook_event, session_id, and timestamp on
@@ -238,8 +239,9 @@ regardless of the Now tab's active timeframe.
   `SessionStart`, `PreToolUse`), hook matcher / tool name when applicable,
   canonicalized script command (Claude only, may be absent on older
   records), timestamp, working directory, host, plus the sub-agent identity
-  pair (`is_sidechain`, `agent_id`) inherited from the existing transcript
-  ingestion contract. One row per fire.
+  pair (`is_sidechain`, `agent_id`). Codex supplies `agent_id` on subagent
+  lifecycle events but does not supply the configured matcher on stdin. One
+  row per fire.
 - **Hook Identity**: The aggregation key used to group invocations into
   breakdown rows. On Claude it is the canonicalized form of the script
   command per FR-003 (`quill:<basename>` for Quill paths, verbatim

@@ -5,7 +5,8 @@ use crate::integrations::deploy::{
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::models::IntegrationFeatures;
 use std::collections::HashSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::Manager;
@@ -18,6 +19,265 @@ fn config_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join(".config")
         .join("quill")
+}
+
+const INTEGRATION_STATE_VERSION: u8 = 1;
+const INTEGRATION_STATE_FILE: &str = "integration-state.json";
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClaudePaths {
+    pub(crate) config_dir: PathBuf,
+    pub(crate) settings: PathBuf,
+    pub(crate) mcp_config: PathBuf,
+    pub(crate) instructions: PathBuf,
+    pub(crate) commands: PathBuf,
+    pub(crate) legacy_hooks: PathBuf,
+    pub(crate) state: PathBuf,
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct ClaudeIntegrationState {
+    version: u8,
+    config_dir: PathBuf,
+    mcp_config: PathBuf,
+    main_installed: bool,
+    restart_installed: bool,
+    mcp_state_captured: bool,
+    mcp_server_was_present: bool,
+    prior_mcp_server: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeRuntimePaths {
+    node: PathBuf,
+    git: PathBuf,
+}
+
+fn integration_state_path() -> PathBuf {
+    config_dir().join("claude").join(INTEGRATION_STATE_FILE)
+}
+
+fn paths_for(config_dir: PathBuf, mcp_config: PathBuf) -> ClaudePaths {
+    ClaudePaths {
+        settings: config_dir.join("settings.json"),
+        instructions: config_dir.join("CLAUDE.md"),
+        commands: config_dir.join("commands"),
+        legacy_hooks: config_dir.join("hooks"),
+        state: integration_state_path(),
+        config_dir,
+        mcp_config,
+    }
+}
+
+fn default_claude_paths() -> Result<ClaudePaths, String> {
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    Ok(paths_for(home.join(".claude"), home.join(".claude.json")))
+}
+
+fn configured_claude_paths() -> Result<ClaudePaths, String> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(value) if value.is_empty() => Err("CLAUDE_CONFIG_DIR is set but empty".to_string()),
+        Some(value) => {
+            let config_dir = PathBuf::from(value);
+            match fs::metadata(&config_dir) {
+                Ok(metadata) if !metadata.is_dir() => Err(format!(
+                    "CLAUDE_CONFIG_DIR is not a directory: {}",
+                    config_dir.display()
+                )),
+                Ok(_) => Ok(paths_for(
+                    config_dir.clone(),
+                    config_dir.join(".claude.json"),
+                )),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(paths_for(
+                    config_dir.clone(),
+                    config_dir.join(".claude.json"),
+                )),
+                Err(err) => Err(format!(
+                    "Failed to inspect CLAUDE_CONFIG_DIR {}: {err}",
+                    config_dir.display()
+                )),
+            }
+        }
+        None => default_claude_paths(),
+    }
+}
+
+fn paths_from_state(state: &ClaudeIntegrationState) -> ClaudePaths {
+    paths_for(state.config_dir.clone(), state.mcp_config.clone())
+}
+
+fn load_integration_state() -> Result<Option<ClaudeIntegrationState>, String> {
+    let path = integration_state_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)
+        .map_err(|err| format!("Failed to read {}: {err}", path.display()))?;
+    let state: ClaudeIntegrationState = serde_json::from_str(&content)
+        .map_err(|err| format!("Failed to parse {}: {err}", path.display()))?;
+    if state.version != INTEGRATION_STATE_VERSION {
+        return Err(format!(
+            "Unsupported Claude integration state version {}",
+            state.version
+        ));
+    }
+    if state.mcp_state_captured && state.mcp_server_was_present != state.prior_mcp_server.is_some()
+    {
+        return Err("Claude integration state has inconsistent MCP ownership".to_string());
+    }
+    Ok(Some(state))
+}
+
+fn write_integration_state(state: &ClaudeIntegrationState) -> Result<(), String> {
+    let path = integration_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
+    }
+    let content = serde_json::to_vec_pretty(state)
+        .map_err(|err| format!("Failed to serialize Claude integration state: {err}"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|err| format!("Failed to open {}: {err}", path.display()))?;
+    file.write_all(&content)
+        .map_err(|err| format!("Failed to write {}: {err}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("Failed to secure {}: {err}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn empty_integration_state(paths: &ClaudePaths) -> ClaudeIntegrationState {
+    ClaudeIntegrationState {
+        version: INTEGRATION_STATE_VERSION,
+        config_dir: paths.config_dir.clone(),
+        mcp_config: paths.mcp_config.clone(),
+        main_installed: false,
+        restart_installed: false,
+        mcp_state_captured: false,
+        mcp_server_was_present: false,
+        prior_mcp_server: None,
+    }
+}
+
+fn ensure_state_paths(state: &ClaudeIntegrationState, paths: &ClaudePaths) -> Result<(), String> {
+    if state.config_dir == paths.config_dir && state.mcp_config == paths.mcp_config {
+        return Ok(());
+    }
+    Err(format!(
+        "Claude integration state points to {} and {}, not {} and {}",
+        state.config_dir.display(),
+        state.mcp_config.display(),
+        paths.config_dir.display(),
+        paths.mcp_config.display()
+    ))
+}
+
+pub(crate) fn set_claude_restart_installed(
+    paths: &ClaudePaths,
+    installed: bool,
+) -> Result<(), String> {
+    let mut state = load_integration_state()?.unwrap_or_else(|| empty_integration_state(paths));
+    ensure_state_paths(&state, paths)?;
+    state.restart_installed = installed;
+    if !state.main_installed && !state.restart_installed {
+        return remove_path(&paths.state)
+            .map_err(|err| format!("Failed to remove Claude integration state: {err}"));
+    }
+    write_integration_state(&state)
+}
+
+pub(crate) fn resolve_claude_install_paths() -> Result<ClaudePaths, String> {
+    if let Some(state) = load_integration_state()? {
+        return Ok(paths_from_state(&state));
+    }
+
+    let configured = configured_claude_paths()?;
+    let default = default_claude_paths()?;
+    if (configured.config_dir != default.config_dir || configured.mcp_config != default.mcp_config)
+        && has_managed_install(&default)
+    {
+        log::warn!(
+            "Using legacy managed Claude directory {} before CLAUDE_CONFIG_DIR {}",
+            default.config_dir.display(),
+            configured.config_dir.display()
+        );
+        return Ok(default);
+    }
+    Ok(configured)
+}
+
+pub(crate) fn resolve_claude_uninstall_paths() -> Result<ClaudePaths, String> {
+    Ok(load_integration_state()?
+        .as_ref()
+        .map(paths_from_state)
+        .unwrap_or(default_claude_paths()?))
+}
+
+pub(crate) fn detect_claude_home() -> bool {
+    match resolve_claude_install_paths() {
+        Ok(paths) => paths.config_dir.is_dir(),
+        Err(err) => {
+            log::warn!("Failed to resolve Claude configuration directory: {err}");
+            configured_claude_paths().is_ok_and(|paths| paths.config_dir.is_dir())
+        }
+    }
+}
+
+pub(crate) fn resolve_node_executable() -> Result<PathBuf, String> {
+    let node = crate::config::resolve_command_path("node")
+        .ok_or_else(|| "Node.js 18 or newer is required for Claude hooks".to_string())?;
+    let output = Command::new(&node)
+        .arg("--version")
+        .env("PATH", crate::config::path_for_resolved_command(&node))
+        .output()
+        .map_err(|err| format!("Failed to run {} --version: {err}", node.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version exited unsuccessfully",
+            node.display()
+        ));
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    let major = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .ok_or_else(|| format!("Could not parse Node.js version: {}", version.trim()))?;
+    if major < 18 {
+        return Err(format!(
+            "Node.js 18 or newer is required for Claude hooks; found {}",
+            version.trim()
+        ));
+    }
+    Ok(node)
+}
+
+fn resolve_runtime_paths() -> Result<ClaudeRuntimePaths, String> {
+    let node = resolve_node_executable()?;
+    let git = crate::config::resolve_command_path("git")
+        .ok_or_else(|| "Git is required for the Claude qbuild guard".to_string())?;
+    let output = Command::new(&git)
+        .arg("--version")
+        .env("PATH", crate::config::path_for_resolved_command(&git))
+        .output()
+        .map_err(|err| format!("Failed to run {} --version: {err}", git.display()))?;
+    if !output.status.success() {
+        return Err(format!("{} --version exited unsuccessfully", git.display()));
+    }
+    Ok(ClaudeRuntimePaths { node, git })
 }
 
 /// Returns the platform-aware app data dir
@@ -64,39 +324,27 @@ fn templates_dir() -> PathBuf {
     config_dir().join("templates")
 }
 
-/// Returns ~/.claude/commands/
-fn commands_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".claude")
-        .join("commands")
-}
-
 fn deployment_targets() -> Vec<PathBuf> {
     vec![scripts_dir(), mcp_dir(), templates_dir()]
 }
 
-fn install_transaction_paths() -> Result<Vec<PathBuf>, String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let claude_dir = home.join(".claude");
-    let settings_path = claude_dir.join("settings.json");
-    let hooks_dir = claude_dir.join("hooks");
-    let mut paths = vec![
+fn install_transaction_paths(paths: &ClaudePaths) -> Vec<PathBuf> {
+    let mut transaction_paths = vec![
         config_dir().join("config.json"),
-        home.join(".claude.json"),
-        settings_path.clone(),
-        settings_path.with_extension("json.bak"),
-        claude_dir.join("CLAUDE.md"),
-        hooks_dir.join("quill-hook.sh"),
-        hooks_dir.join("quill-observe.cjs"),
-        hooks_dir.join("quill-session-end-learn.cjs"),
+        paths.mcp_config.clone(),
+        paths.settings.clone(),
+        paths.instructions.clone(),
+        paths.legacy_hooks.join("quill-hook.sh"),
+        paths.legacy_hooks.join("quill-observe.cjs"),
+        paths.legacy_hooks.join("quill-session-end-learn.cjs"),
+        paths.state.clone(),
     ];
-    paths.extend(
+    transaction_paths.extend(
         MANAGED_COMMAND_FILES
             .into_iter()
-            .map(|name| commands_dir().join(name)),
+            .map(|name| paths.commands.join(name)),
     );
-    Ok(paths)
+    transaction_paths
 }
 
 /// Get the short hostname, falling back to "local".
@@ -124,9 +372,9 @@ const MANAGED_COMMAND_FILES: [&str; 5] = [
 // orphaned in `~/.config/quill/scripts/`.
 const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
     "observe.cjs",
-    "qbuild-guard.sh",
+    "qbuild-guard.cjs",
     "session-sync.cjs",
-    "report-tokens.sh",
+    "report-tokens.cjs",
     "context-router.cjs",
     "context-capture.cjs",
     "context-telemetry.cjs",
@@ -138,7 +386,7 @@ const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
 // telemetry can be disabled while context preservation stays on.
 fn base_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
     let mut scripts: Vec<&'static str> =
-        vec!["qbuild-guard.sh", "session-sync.cjs", "report-tokens.sh"];
+        vec!["qbuild-guard.cjs", "session-sync.cjs", "report-tokens.cjs"];
     if features.activity_tracking {
         scripts.push("observe.cjs");
     }
@@ -162,10 +410,10 @@ fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
     ALL_MANAGED_SCRIPT_FILES.into_iter()
 }
 
-fn build_owned_manifest() -> OwnedAssetManifest {
+fn build_owned_manifest(paths: &ClaudePaths) -> OwnedAssetManifest {
     let mut files: Vec<String> = MANAGED_COMMAND_FILES
         .into_iter()
-        .map(|name| commands_dir().join(name).to_string_lossy().to_string())
+        .map(|name| paths.commands.join(name).to_string_lossy().to_string())
         .collect();
     files.extend(
         all_managed_script_files()
@@ -223,8 +471,8 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 
 /// Remove Quill-managed command files from ~/.claude/commands/ (shared directory).
 /// Uses an explicit list of all current AND previously shipped names to clean stale files.
-fn clean_quill_commands() -> Result<(), String> {
-    let dir = commands_dir();
+fn clean_quill_commands(paths: &ClaudePaths) -> Result<(), String> {
+    let dir = &paths.commands;
     if !dir.exists() {
         return Ok(());
     }
@@ -239,14 +487,6 @@ fn clean_quill_commands() -> Result<(), String> {
     Ok(())
 }
 
-fn shell_quote(path: &Path) -> String {
-    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
-}
-
-pub(crate) fn owned_asset_manifest() -> OwnedAssetManifest {
-    build_owned_manifest()
-}
-
 pub(crate) fn recover_interrupted_install() -> Result<(), String> {
     recover_staged_batch(&deployment_targets())
 }
@@ -255,18 +495,23 @@ pub fn install_with_manifest(
     app: &tauri::AppHandle,
     features: IntegrationFeatures,
 ) -> Result<OwnedAssetManifest, String> {
+    let paths = resolve_claude_install_paths()?;
+    let runtime = resolve_runtime_paths()?;
+    preflight_configuration(&paths)?;
     let deployment_targets = deployment_targets();
-    let snapshots = FileSnapshots::capture(&deployment_targets, &install_transaction_paths()?)?;
-    let published = deploy_files(app, features, snapshots)?;
+    let snapshots =
+        FileSnapshots::capture(&deployment_targets, &install_transaction_paths(&paths))?;
+    let published = deploy_files(app, features, &paths, snapshots)?;
 
     let setup_result = (|| {
+        ensure_main_integration_state(&paths)?;
         create_local_config()?;
-        register_mcp_server(features)?;
-        register_hooks(features)?;
-        update_claude_md()?;
-        cleanup_legacy_hooks()?;
-        verify(features)?;
-        Ok(build_owned_manifest())
+        register_mcp_server(features, &paths)?;
+        register_hooks(features, &paths, &runtime)?;
+        update_claude_md(&paths)?;
+        cleanup_legacy_hook_files(&paths)?;
+        verify_with_paths(features, &paths, &runtime)?;
+        Ok(build_owned_manifest(&paths))
     })();
 
     match setup_result {
@@ -301,6 +546,10 @@ fn deployment_stamp(
 /// verification still passes, letting repair skip the full transactional
 /// reinstall (which would swap the MCP tree and force a `uv` resync).
 pub(crate) fn deployment_is_current(app: &tauri::AppHandle, features: IntegrationFeatures) -> bool {
+    if !load_integration_state().is_ok_and(|state| state.is_some_and(|state| state.main_installed))
+    {
+        return false;
+    }
     let Ok(stamp) = deployment_stamp(app, features) else {
         return false;
     };
@@ -323,37 +572,40 @@ fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: Integrat
     }
 }
 
-pub fn uninstall_with_manifest(manifest: &OwnedAssetManifest) -> Result<(), String> {
-    remove_owned_files(&manifest.files)?;
-    remove_managed_command_files()?;
-    cleanup_quill_hooks()?;
-    remove_quill_mcp_key(manifest)?;
-    remove_claude_md_sections(&manifest.markdown_blocks)?;
-    remove_owned_directories(&manifest.directories)?;
-    Ok(())
-}
+pub fn uninstall() -> Result<(), String> {
+    let paths = resolve_claude_uninstall_paths()?;
+    let state = load_integration_state()?;
+    preflight_configuration(&paths)?;
 
-fn remove_owned_files(paths: &[String]) -> Result<(), String> {
-    let mut seen = HashSet::new();
-    for raw_path in paths {
-        if !seen.insert(raw_path.to_owned()) {
-            continue;
-        }
+    let manifest = build_owned_manifest(&paths);
+    let targets = deployment_targets();
+    let snapshots = FileSnapshots::capture(&targets, &install_transaction_paths(&paths))?;
+    let published = publish_empty_deployment(snapshots)?;
+    let result = (|| {
+        remove_managed_command_files(&paths)?;
+        cleanup_quill_hooks(&paths)?;
+        restore_quill_mcp(&paths, state.as_ref())?;
+        remove_claude_md_sections(&paths)?;
+        cleanup_legacy_hook_files(&paths)?;
+        verify_uninstalled(&paths)?;
+        mark_main_uninstalled(&paths)?;
+        Ok(())
+    })();
 
-        let path = PathBuf::from(raw_path);
-        if path.exists()
-            && let Err(err) = fs::remove_file(&path)
-        {
-            return Err(format!("Failed to remove file {}: {err}", path.display()));
-        }
+    if let Err(err) = result {
+        return Err(published.rollback_with_error(err));
+    }
+    published.commit()?;
+    if let Err(err) = remove_owned_directories(&manifest.directories) {
+        log::warn!("Claude uninstall committed but empty directory cleanup failed: {err}");
     }
     Ok(())
 }
 
-fn remove_managed_command_files() -> Result<(), String> {
+fn remove_managed_command_files(claude_paths: &ClaudePaths) -> Result<(), String> {
     let mut paths = HashSet::new();
     for name in &MANAGED_COMMAND_FILES {
-        let path = commands_dir().join(name);
+        let path = claude_paths.commands.join(name);
         paths.insert(path);
     }
 
@@ -395,70 +647,14 @@ fn remove_owned_directories(directories: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn remove_quill_mcp_key(manifest: &OwnedAssetManifest) -> Result<(), String> {
-    let claude_json_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude.json");
-
-    if !claude_json_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&claude_json_path)
-        .map_err(|err| format!("Failed to read .claude.json: {err}"))?;
-
-    let mut root: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-
-    let mut removed_keys = false;
-    let mut keys: HashSet<&str> = manifest.config_keys.iter().map(String::as_str).collect();
-    keys.insert(MCP_SERVER_KEY);
-
-    for key in keys {
-        let mut parts = key.split('.').collect::<Vec<_>>();
-        if parts.is_empty() {
-            continue;
-        }
-
-        let leaf = parts.pop().unwrap_or_default();
-        let parent = parts
-            .iter()
-            .try_fold(&mut root, |cursor, part| match cursor.get_mut(*part) {
-                Some(next) if next.is_object() => Ok::<_, ()>(next),
-                _ => Err(()),
-            });
-
-        if let Ok(parent_obj) = parent
-            && let Some(parent_map) = parent_obj.as_object_mut()
-            && parent_map.remove(leaf).is_some()
-        {
-            removed_keys = true;
-        }
-    }
-
-    if removed_keys {
-        let content = serde_json::to_string_pretty(&root)
-            .map_err(|err| format!("Failed to serialize .claude.json: {err}"))?;
-        fs::write(&claude_json_path, content)
-            .map_err(|err| format!("Failed to write .claude.json: {err}"))?;
-    }
-
-    Ok(())
-}
-
-fn remove_claude_md_sections(_blocks: &[String]) -> Result<(), String> {
-    let claude_md_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude")
-        .join("CLAUDE.md");
+fn remove_claude_md_sections(paths: &ClaudePaths) -> Result<(), String> {
+    let claude_md_path = &paths.instructions;
 
     if !claude_md_path.exists() {
         return Ok(());
     }
 
-    let original = fs::read_to_string(&claude_md_path)
+    let original = fs::read_to_string(claude_md_path)
         .map_err(|err| format!("Failed to read CLAUDE.md: {err}"))?;
 
     // Brevity block lifecycle is owned by `crate::brevity`; do not touch it here.
@@ -510,55 +706,175 @@ fn remove_claude_md_sections(_blocks: &[String]) -> Result<(), String> {
     };
 
     if updated != original {
-        fs::write(&claude_md_path, updated)
+        fs::write(claude_md_path, updated)
             .map_err(|err| format!("Failed to write CLAUDE.md: {err}"))?;
     }
 
     Ok(())
 }
 
-fn cleanup_quill_hooks() -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let settings_path = home.join(".claude").join("settings.json");
-
-    if !settings_path.exists() {
-        return Ok(());
+fn read_json_object(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
     }
+    let content = fs::read_to_string(path)
+        .map_err(|err| format!("Failed to read {label} at {}: {err}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|err| format!("Failed to parse {label} at {}: {err}", path.display()))?;
+    if !value.is_object() {
+        return Err(format!(
+            "{label} root is not an object at {}",
+            path.display()
+        ));
+    }
+    Ok(value)
+}
 
-    let content = fs::read_to_string(&settings_path)
-        .map_err(|err| format!("Failed to read settings.json: {err}"))?;
+pub(crate) fn read_settings_object(path: &Path) -> Result<serde_json::Value, String> {
+    read_json_object(path, "settings.json")
+}
 
-    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
+pub(crate) fn write_settings_object(
+    path: &Path,
+    settings: &serde_json::Value,
+) -> Result<(), String> {
+    if !settings.is_object() {
+        return Err("settings.json root is not an object".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
+    }
+    let output = serde_json::to_string_pretty(settings)
+        .map_err(|err| format!("Failed to serialize settings.json: {err}"))?;
+    fs::write(path, output)
+        .map_err(|err| format!("Failed to write settings.json at {}: {err}", path.display()))
+}
+
+pub(crate) fn remove_matching_hook_handlers<F>(
+    settings: &mut serde_json::Value,
+    mut owned: F,
+) -> Result<bool, String>
+where
+    F: FnMut(&serde_json::Value) -> bool,
+{
+    let root = settings
+        .as_object_mut()
+        .ok_or("settings.json root is not an object")?;
+    let Some(hooks_value) = root.get_mut("hooks") else {
+        return Ok(false);
     };
-
+    let hooks = hooks_value
+        .as_object_mut()
+        .ok_or("settings.json hooks field is not an object")?;
     let mut modified = false;
-    let quill_scripts_path = scripts_dir().to_string_lossy().to_string();
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for (_event, entries) in hooks.iter_mut() {
-            if let Some(arr) = entries.as_array_mut() {
-                let before = arr.len();
-                arr.retain(|entry| {
-                    let raw = entry.to_string();
-                    !raw.contains(HOOK_MARKER)
-                        && !raw.contains(CONTEXT_HOOK_MARKER)
-                        && !raw.contains(&quill_scripts_path)
+    let mut empty_events = Vec::new();
+    for (event, entries_value) in hooks.iter_mut() {
+        let entries = entries_value
+            .as_array_mut()
+            .ok_or_else(|| format!("settings.json hooks.{event} is not an array"))?;
+        let original_group_count = entries.len();
+        let mut retained_groups = Vec::with_capacity(entries.len());
+        for mut group in entries.drain(..) {
+            let group_object = group
+                .as_object_mut()
+                .ok_or_else(|| format!("settings.json hooks.{event} group is not an object"))?;
+            let (removed, handlers_empty) = {
+                let handlers = group_object
+                    .get_mut("hooks")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or_else(|| {
+                        format!("settings.json hooks.{event} group hooks is not an array")
+                    })?;
+                let original_handler_count = handlers.len();
+                handlers.retain(|handler| !owned(handler));
+                (
+                    handlers.len() != original_handler_count,
+                    handlers.is_empty(),
+                )
+            };
+            modified |= removed;
+            if !removed || !handlers_empty {
+                retained_groups.push(group);
+            }
+        }
+        *entries = retained_groups;
+        if entries.is_empty() && original_group_count > 0 {
+            empty_events.push(event.clone());
+        }
+    }
+    for event in empty_events {
+        hooks.remove(&event);
+    }
+    if modified && hooks.is_empty() {
+        root.remove("hooks");
+    }
+    Ok(modified)
+}
+
+fn strip_orphaned_main_sources(settings: &mut serde_json::Value, paths: &ClaudePaths) -> bool {
+    let Some(hooks) = settings
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    let mut modified = false;
+    for groups in hooks
+        .values_mut()
+        .filter_map(serde_json::Value::as_array_mut)
+    {
+        for group in groups {
+            let marked = group
+                .get("_source")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|source| source == HOOK_MARKER || source == CONTEXT_HOOK_MARKER);
+            let has_managed = group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|handlers| {
+                    handlers
+                        .iter()
+                        .any(|handler| hook_handler_is_managed(handler, paths))
                 });
-                if arr.len() != before {
-                    modified = true;
-                }
+            if marked && !has_managed {
+                group
+                    .as_object_mut()
+                    .expect("validated hook group")
+                    .remove("_source");
+                modified = true;
             }
         }
     }
+    modified
+}
 
-    if modified {
-        let output = serde_json::to_string_pretty(&settings)
-            .map_err(|err| format!("Failed to serialize settings.json: {err}"))?;
-        fs::write(&settings_path, output)
-            .map_err(|err| format!("Failed to write settings.json: {err}"))?;
+fn cleanup_quill_hooks(paths: &ClaudePaths) -> Result<(), String> {
+    if !paths.settings.exists() {
+        return Ok(());
     }
+    let mut settings = read_settings_object(&paths.settings)?;
+    let mut modified = remove_matching_hook_handlers(&mut settings, |handler| {
+        hook_handler_is_managed(handler, paths)
+    })?;
+    modified |= strip_orphaned_main_sources(&mut settings, paths);
+    if modified {
+        write_settings_object(&paths.settings, &settings)?;
+    }
+    Ok(())
+}
 
+fn preflight_configuration(paths: &ClaudePaths) -> Result<(), String> {
+    if paths.settings.exists() {
+        let mut settings = read_settings_object(&paths.settings)?;
+        remove_matching_hook_handlers(&mut settings, |handler| {
+            hook_handler_is_managed(handler, paths)
+        })?;
+    }
+    if paths.mcp_config.exists() {
+        let root = read_json_object(&paths.mcp_config, ".claude.json")?;
+        mcp_server_entry(&root)?;
+    }
     Ok(())
 }
 
@@ -566,6 +882,7 @@ fn cleanup_quill_hooks() -> Result<(), String> {
 fn deploy_files(
     app: &tauri::AppHandle,
     features: IntegrationFeatures,
+    paths: &ClaudePaths,
     snapshots: FileSnapshots,
 ) -> Result<PublishedBatch, String> {
     let staged_result = (|| {
@@ -615,29 +932,26 @@ fn deploy_files(
         }
         validate_staged_mcp(staged_mcp.path(), features.context_preservation)?;
 
-        // Make shell scripts executable on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            for script in &["report-tokens.sh", "qbuild-guard.sh"] {
-                let path = staged_scripts.path().join(script);
-                if path.exists() {
-                    fs::set_permissions(&path, perms.clone())
-                        .map_err(|e| format!("Failed to set permissions on {script}: {e}"))?;
-                }
-            }
-        }
-
         // Clean only our commands from the shared ~/.claude/commands/ directory.
-        clean_quill_commands()?;
-        copy_dir_recursive(&source.join("commands"), &commands_dir())?;
+        clean_quill_commands(paths)?;
+        copy_dir_recursive(&source.join("commands"), &paths.commands)?;
 
         Ok(vec![staged_scripts, staged_mcp, staged_templates])
     })();
 
     match staged_result {
         Ok(stages) => publish_staged_batch(stages, snapshots),
+        Err(err) => Err(snapshots.restore_with_error(err)),
+    }
+}
+
+fn publish_empty_deployment(snapshots: FileSnapshots) -> Result<PublishedBatch, String> {
+    let staged = deployment_targets()
+        .into_iter()
+        .map(StagedDirectory::new)
+        .collect::<Result<Vec<_>, _>>();
+    match staged {
+        Ok(staged) => publish_staged_batch(staged, snapshots),
         Err(err) => Err(snapshots.restore_with_error(err)),
     }
 }
@@ -792,7 +1106,7 @@ const LEGACY_HEADING: &str = "### Session History Search (Quill MCP)";
 const LEGACY_MARKER_PREFIX: &str = "<!-- quill-v";
 
 /// Update the Quill MCP section in ~/.claude/CLAUDE.md from the deployed template.
-fn update_claude_md() -> Result<(), String> {
+fn update_claude_md(paths: &ClaudePaths) -> Result<(), String> {
     let template_path = templates_dir().join("claude-md-section.md");
     if !template_path.exists() {
         log::debug!("No claude-md-section.md template found — skipping CLAUDE.md update");
@@ -805,10 +1119,7 @@ fn update_claude_md() -> Result<(), String> {
     // Wrap the template content in block markers
     let block_content = format!("{BLOCK_START}\n{}\n{BLOCK_END}", raw_template.trim());
 
-    let claude_md_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude")
-        .join("CLAUDE.md");
+    let claude_md_path = &paths.instructions;
 
     // If CLAUDE.md doesn't exist, create it with the block
     if !claude_md_path.exists() {
@@ -816,14 +1127,14 @@ fn update_claude_md() -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
         }
-        fs::write(&claude_md_path, format!("{block_content}\n"))
+        fs::write(claude_md_path, format!("{block_content}\n"))
             .map_err(|e| format!("Failed to create CLAUDE.md: {e}"))?;
         log::info!("Created ~/.claude/CLAUDE.md with Quill MCP section");
         return Ok(());
     }
 
-    let content = fs::read_to_string(&claude_md_path)
-        .map_err(|e| format!("Failed to read CLAUDE.md: {e}"))?;
+    let content =
+        fs::read_to_string(claude_md_path).map_err(|e| format!("Failed to read CLAUDE.md: {e}"))?;
 
     // Check if current block content is already present (no update needed)
     if content.contains(&block_content) {
@@ -851,7 +1162,7 @@ fn update_claude_md() -> Result<(), String> {
         result
     };
 
-    fs::write(&claude_md_path, &updated).map_err(|e| format!("Failed to write CLAUDE.md: {e}"))?;
+    fs::write(claude_md_path, &updated).map_err(|e| format!("Failed to write CLAUDE.md: {e}"))?;
     log::info!("Updated Quill MCP section in ~/.claude/CLAUDE.md");
     Ok(())
 }
@@ -979,31 +1290,82 @@ fn migrate_legacy_section(content: &str, block_content: &str) -> String {
 
 // ── MCP server registration ──
 
-/// Merge a `quill` MCP server entry into ~/.claude.json.
-fn register_mcp_server(features: IntegrationFeatures) -> Result<(), String> {
-    let claude_json_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude.json");
-
-    let mut root: serde_json::Value = if claude_json_path.exists() {
-        let content = fs::read_to_string(&claude_json_path)
-            .map_err(|e| format!("Failed to read .claude.json: {e}"))?;
-        serde_json::from_str(&content).map_err(|e| format!("Failed to parse .claude.json: {e}"))?
-    } else {
-        serde_json::json!({})
-    };
-
+fn quill_mcp_entry(features: IntegrationFeatures) -> serde_json::Value {
     let mcp_path = mcp_dir();
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
-
-    let quill_entry = serde_json::json!({
+    serde_json::json!({
         "command": "uv",
         "args": ["run", "--directory", mcp_path_str, "python", "server.py"],
         "env": {
             "QUILL_PROVIDER": "claude",
             "QUILL_CONTEXT_PRESERVATION": if features.context_preservation { "1" } else { "0" }
         }
-    });
+    })
+}
+
+fn mcp_entry_is_managed(entry: &serde_json::Value) -> bool {
+    entry
+        == &quill_mcp_entry(IntegrationFeatures {
+            context_preservation: false,
+            ..IntegrationFeatures::default()
+        })
+        || entry
+            == &quill_mcp_entry(IntegrationFeatures {
+                context_preservation: true,
+                ..IntegrationFeatures::default()
+            })
+}
+
+fn mcp_server_entry(root: &serde_json::Value) -> Result<Option<&serde_json::Value>, String> {
+    let Some(servers) = root.get("mcpServers") else {
+        return Ok(None);
+    };
+    let servers = servers
+        .as_object()
+        .ok_or(".claude.json mcpServers is not an object")?;
+    let entry = servers.get("quill");
+    if entry.is_some_and(|entry| !entry.is_object()) {
+        return Err(".claude.json mcpServers.quill is not an object".to_string());
+    }
+    Ok(entry)
+}
+
+fn write_json_object(path: &Path, value: &serde_json::Value, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("Failed to serialize {label}: {err}"))?;
+    fs::write(path, content)
+        .map_err(|err| format!("Failed to write {label} at {}: {err}", path.display()))
+}
+
+fn prepare_main_install_state(
+    state: &mut ClaudeIntegrationState,
+    existing: Option<serde_json::Value>,
+) {
+    if !state.main_installed || !state.mcp_state_captured {
+        let prior = existing.filter(|entry| !mcp_entry_is_managed(entry));
+        state.mcp_server_was_present = prior.is_some();
+        state.prior_mcp_server = prior;
+        state.mcp_state_captured = true;
+    }
+    state.main_installed = true;
+}
+
+fn ensure_main_integration_state(paths: &ClaudePaths) -> Result<(), String> {
+    let root = read_json_object(&paths.mcp_config, ".claude.json")?;
+    let existing = mcp_server_entry(&root)?.cloned();
+    let mut state = load_integration_state()?.unwrap_or_else(|| empty_integration_state(paths));
+    ensure_state_paths(&state, paths)?;
+    prepare_main_install_state(&mut state, existing);
+    write_integration_state(&state)
+}
+
+/// Merge a `quill` MCP server entry into the resolved Claude user state.
+fn register_mcp_server(features: IntegrationFeatures, paths: &ClaudePaths) -> Result<(), String> {
+    let mut root = read_json_object(&paths.mcp_config, ".claude.json")?;
 
     let mcp_servers = root
         .as_object_mut()
@@ -1015,15 +1377,63 @@ fn register_mcp_server(features: IntegrationFeatures) -> Result<(), String> {
         .as_object_mut()
         .ok_or("mcpServers is not an object")?;
 
-    mcp_servers_obj.insert("quill".to_string(), quill_entry);
-
-    let content = serde_json::to_string_pretty(&root)
-        .map_err(|e| format!("Failed to serialize .claude.json: {e}"))?;
-    fs::write(&claude_json_path, content)
-        .map_err(|e| format!("Failed to write .claude.json: {e}"))?;
+    mcp_servers_obj.insert("quill".to_string(), quill_mcp_entry(features));
+    write_json_object(&paths.mcp_config, &root, ".claude.json")?;
 
     log::info!("Registered quill MCP server in .claude.json");
     Ok(())
+}
+
+fn restore_quill_mcp(
+    paths: &ClaudePaths,
+    state: Option<&ClaudeIntegrationState>,
+) -> Result<(), String> {
+    if !paths.mcp_config.exists() {
+        if let Some(prior) = state.and_then(|state| state.prior_mcp_server.as_ref()) {
+            let mut root = serde_json::json!({ "mcpServers": {} });
+            root["mcpServers"]["quill"] = prior.clone();
+            write_json_object(&paths.mcp_config, &root, ".claude.json")?;
+        }
+        return Ok(());
+    }
+
+    let mut root = read_json_object(&paths.mcp_config, ".claude.json")?;
+    let current_is_managed = mcp_server_entry(&root)?.is_some_and(mcp_entry_is_managed);
+    if !current_is_managed {
+        return Ok(());
+    }
+    let servers = root
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(".claude.json mcpServers is not an object")?;
+    match state.and_then(|state| state.prior_mcp_server.clone()) {
+        Some(prior) => {
+            servers.insert("quill".to_string(), prior);
+        }
+        None => {
+            servers.remove("quill");
+        }
+    }
+    if servers.is_empty() {
+        root.as_object_mut()
+            .ok_or(".claude.json root is not an object")?
+            .remove("mcpServers");
+    }
+    write_json_object(&paths.mcp_config, &root, ".claude.json")
+}
+
+fn mark_main_uninstalled(paths: &ClaudePaths) -> Result<(), String> {
+    let Some(mut state) = load_integration_state()? else {
+        return Ok(());
+    };
+    ensure_state_paths(&state, paths)?;
+    state.main_installed = false;
+    if !state.restart_installed {
+        remove_path(&paths.state)
+            .map_err(|err| format!("Failed to remove Claude integration state: {err}"))
+    } else {
+        write_integration_state(&state)
+    }
 }
 
 // ── Hook registration ──
@@ -1031,251 +1441,234 @@ fn register_mcp_server(features: IntegrationFeatures) -> Result<(), String> {
 const HOOK_MARKER: &str = "quill-setup";
 const CONTEXT_HOOK_MARKER: &str = "quill-context-preservation";
 
-/// Merge all Quill hooks into ~/.claude/settings.json.
-fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
-    let settings_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude")
-        .join("settings.json");
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClaudeHookCommand {
+    command: String,
+    args: Vec<String>,
+    timeout: u64,
+}
 
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)
-            .map_err(|e| format!("Failed to read settings.json: {e}"))?;
-        match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => {
-                // Back up malformed file
-                let backup = settings_path.with_extension("json.bak");
-                fs::copy(&settings_path, &backup).map_err(|err| {
-                    format!(
-                        "Failed to back up malformed settings.json to {}: {err}",
-                        backup.display()
-                    )
-                })?;
-                serde_json::json!({})
-            }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClaudeHookGroup {
+    event: &'static str,
+    matcher: Option<&'static str>,
+    source: &'static str,
+    hooks: Vec<ClaudeHookCommand>,
+}
+
+fn cjs_command(runtime: &ClaudeRuntimePaths, script: &str, timeout: u64) -> ClaudeHookCommand {
+    ClaudeHookCommand {
+        command: runtime.node.to_string_lossy().to_string(),
+        args: vec![scripts_dir().join(script).to_string_lossy().to_string()],
+        timeout,
+    }
+}
+
+fn expected_hook_groups(
+    features: IntegrationFeatures,
+    runtime: &ClaudeRuntimePaths,
+) -> Vec<ClaudeHookGroup> {
+    let observe = cjs_command(runtime, "observe.cjs", 3);
+    let sync = cjs_command(runtime, "session-sync.cjs", 10);
+    let capture = cjs_command(runtime, "context-capture.cjs", 5);
+    let mut qbuild = cjs_command(runtime, "qbuild-guard.cjs", 5);
+    qbuild.args.push(runtime.git.to_string_lossy().to_string());
+    let mut groups = vec![
+        ClaudeHookGroup {
+            event: "PreToolUse",
+            matcher: Some("Edit|Write|NotebookEdit"),
+            source: HOOK_MARKER,
+            hooks: vec![qbuild],
+        },
+        ClaudeHookGroup {
+            event: "Stop",
+            matcher: None,
+            source: HOOK_MARKER,
+            hooks: vec![cjs_command(runtime, "report-tokens.cjs", 5), sync.clone()],
+        },
+        ClaudeHookGroup {
+            event: "StopFailure",
+            matcher: None,
+            source: HOOK_MARKER,
+            hooks: vec![sync.clone()],
+        },
+        ClaudeHookGroup {
+            event: "SessionEnd",
+            matcher: None,
+            source: HOOK_MARKER,
+            hooks: vec![sync],
+        },
+    ];
+    if features.activity_tracking {
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            groups.push(ClaudeHookGroup {
+                event,
+                matcher: Some("*"),
+                source: HOOK_MARKER,
+                hooks: vec![observe.clone()],
+            });
         }
-    } else {
-        if let Some(parent) = settings_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("Failed to create {}: {err}", parent.display()))?;
-        }
-        serde_json::json!({})
+    }
+    if features.context_preservation {
+        groups.extend([
+            ClaudeHookGroup {
+                event: "SessionStart",
+                matcher: None,
+                source: CONTEXT_HOOK_MARKER,
+                hooks: vec![capture.clone()],
+            },
+            ClaudeHookGroup {
+                event: "PreToolUse",
+                matcher: Some("*"),
+                source: CONTEXT_HOOK_MARKER,
+                hooks: vec![cjs_command(runtime, "context-router.cjs", 5)],
+            },
+            ClaudeHookGroup {
+                event: "UserPromptSubmit",
+                matcher: None,
+                source: CONTEXT_HOOK_MARKER,
+                hooks: vec![capture.clone()],
+            },
+            ClaudeHookGroup {
+                event: "PreCompact",
+                matcher: None,
+                source: CONTEXT_HOOK_MARKER,
+                hooks: vec![capture.clone()],
+            },
+            ClaudeHookGroup {
+                event: "Stop",
+                matcher: None,
+                source: CONTEXT_HOOK_MARKER,
+                hooks: vec![capture],
+            },
+        ]);
+    }
+    groups
+}
+
+fn hook_command_json(command: &ClaudeHookCommand) -> serde_json::Value {
+    serde_json::json!({
+        "type": "command",
+        "command": command.command,
+        "args": command.args,
+        "timeout": command.timeout,
+    })
+}
+
+fn hook_group_json(group: &ClaudeHookGroup) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "_source": group.source,
+        "hooks": group.hooks.iter().map(hook_command_json).collect::<Vec<_>>(),
+    });
+    if let Some(matcher) = group.matcher {
+        value["matcher"] = serde_json::Value::String(matcher.to_string());
+    }
+    value
+}
+
+fn legacy_quote(path: &Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
+}
+
+fn hook_handler_is_managed(handler: &serde_json::Value, paths: &ClaudePaths) -> bool {
+    let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
+        return false;
     };
+    let managed_scripts = ALL_MANAGED_SCRIPT_FILES
+        .into_iter()
+        .chain(["qbuild-guard.sh", "report-tokens.sh"])
+        .map(|name| scripts_dir().join(name))
+        .collect::<Vec<_>>();
+    if handler
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| args.first())
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|arg| managed_scripts.iter().any(|path| path == Path::new(arg)))
+    {
+        return true;
+    }
+    if managed_scripts.iter().any(|path| {
+        command == format!("node {}", legacy_quote(path)) || command == legacy_quote(path)
+    }) {
+        return true;
+    }
+    [
+        ("quill-hook.sh", "bash"),
+        ("quill-observe.cjs", "node"),
+        ("quill-session-end-learn.cjs", "node"),
+    ]
+    .into_iter()
+    .any(|(name, executable)| {
+        command
+            == format!(
+                "{executable} {}",
+                legacy_quote(&paths.legacy_hooks.join(name))
+            )
+    })
+}
 
+fn has_managed_install(paths: &ClaudePaths) -> bool {
+    if let Ok(settings) = read_settings_object(&paths.settings)
+        && settings
+            .get("hooks")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|hooks| {
+                hooks.values().any(|groups| {
+                    groups.as_array().is_some_and(|groups| {
+                        groups.iter().any(|group| {
+                            group
+                                .get("hooks")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|handlers| {
+                                    handlers
+                                        .iter()
+                                        .any(|handler| hook_handler_is_managed(handler, paths))
+                                })
+                        })
+                    })
+                })
+            })
+    {
+        return true;
+    }
+    if let Ok(root) = read_json_object(&paths.mcp_config, ".claude.json")
+        && mcp_server_entry(&root)
+            .ok()
+            .flatten()
+            .is_some_and(mcp_entry_is_managed)
+    {
+        return true;
+    }
+    fs::read_to_string(&paths.instructions).is_ok_and(|content| content.contains(BLOCK_START))
+}
+
+fn register_hooks(
+    features: IntegrationFeatures,
+    paths: &ClaudePaths,
+    runtime: &ClaudeRuntimePaths,
+) -> Result<(), String> {
+    let mut settings = read_settings_object(&paths.settings)?;
+    remove_matching_hook_handlers(&mut settings, |handler| {
+        hook_handler_is_managed(handler, paths)
+    })?;
+    strip_orphaned_main_sources(&mut settings, paths);
     let hooks = settings
         .as_object_mut()
         .ok_or("settings.json root is not an object")?
         .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-
-    let hooks_obj = hooks
+        .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .ok_or("hooks field is not an object")?;
-
-    let sd = scripts_dir();
-    let observe_command = format!("node {}", shell_quote(&sd.join("observe.cjs")));
-    let context_router_command = format!("node {}", shell_quote(&sd.join("context-router.cjs")));
-    let context_capture_command = format!("node {}", shell_quote(&sd.join("context-capture.cjs")));
-    let qbuild_guard_command = shell_quote(&sd.join("qbuild-guard.sh"));
-    let report_tokens_command = shell_quote(&sd.join("report-tokens.sh"));
-    let session_sync_command = format!("node {}", shell_quote(&sd.join("session-sync.cjs")));
-
-    let mut hook_defs: Vec<(&str, &str, serde_json::Value)> = Vec::new();
-
-    // Activity-tracking observe.cjs hooks are gated on the feature flag so
-    // privacy-conscious users can keep token reporting and session sync but
-    // skip the live tool-call telemetry.
-    if features.activity_tracking {
-        hook_defs.push((
-            "PreToolUse",
-            "*",
-            serde_json::json!({
-                "_source": HOOK_MARKER,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": observe_command.clone(),
-                        "timeout": 3
-                    }
-                ]
-            }),
-        ));
-    }
-
-    hook_defs.push((
-        "PreToolUse",
-        "Edit|Write|NotebookEdit",
-        serde_json::json!({
-            "_source": HOOK_MARKER,
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": qbuild_guard_command,
-                    "timeout": 5
-                }
-            ]
-        }),
-    ));
-
-    if features.activity_tracking {
-        hook_defs.push((
-            "PostToolUse",
-            "*",
-            serde_json::json!({
-                "_source": HOOK_MARKER,
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": observe_command.clone(),
-                        "timeout": 3
-                    }
-                ]
-            }),
-        ));
-    }
-
-    hook_defs.push((
-        "Stop",
-        "",
-        serde_json::json!({
-            "_source": HOOK_MARKER,
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": report_tokens_command,
-                    "timeout": 5
-                },
-                {
-                    "type": "command",
-                    "command": session_sync_command,
-                    "timeout": 3
-                }
-            ]
-        }),
-    ));
-
-    if features.context_preservation {
-        hook_defs.extend([
-            (
-                "SessionStart",
-                "",
-                serde_json::json!({
-                    "_source": CONTEXT_HOOK_MARKER,
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": context_capture_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }),
-            ),
-            (
-                "PreToolUse",
-                "*",
-                serde_json::json!({
-                    "_source": CONTEXT_HOOK_MARKER,
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": context_router_command,
-                            "timeout": 5
-                        }
-                    ]
-                }),
-            ),
-            (
-                "UserPromptSubmit",
-                "",
-                serde_json::json!({
-                    "_source": CONTEXT_HOOK_MARKER,
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": context_capture_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }),
-            ),
-            (
-                "PreCompact",
-                "",
-                serde_json::json!({
-                    "_source": CONTEXT_HOOK_MARKER,
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": context_capture_command.clone(),
-                            "timeout": 5
-                        }
-                    ]
-                }),
-            ),
-            (
-                "Stop",
-                "",
-                serde_json::json!({
-                    "_source": CONTEXT_HOOK_MARKER,
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": context_capture_command,
-                            "timeout": 5
-                        }
-                    ]
-                }),
-            ),
-        ]);
-    }
-
-    // First pass: remove ALL existing Quill entries across all events.
-    // Matches both marked entries (_source: "quill-setup") AND unmarked legacy entries
-    // that reference our scripts directory (from before the marker was introduced).
-    let quill_scripts_path = sd.to_string_lossy().to_string();
-    let mut empty_events = Vec::new();
-    for (event, entries) in hooks_obj.iter_mut() {
-        if let Some(arr) = entries.as_array_mut() {
-            arr.retain(|entry| {
-                let s = entry.to_string();
-                !s.contains(HOOK_MARKER)
-                    && !s.contains(CONTEXT_HOOK_MARKER)
-                    && !s.contains(&quill_scripts_path)
-            });
-            if arr.is_empty() {
-                empty_events.push(event.clone());
-            }
-        }
-    }
-    // Drop event keys left with an empty array so we don't leave cruft
-    // (e.g. "PreCompact": []) behind.
-    for event in empty_events {
-        hooks_obj.remove(&event);
-    }
-
-    // Second pass: add the current set of hooks.
-    for (event, matcher, entry) in &hook_defs {
-        let arr = hooks_obj
-            .entry(*event)
-            .or_insert_with(|| serde_json::json!([]));
-
-        let arr = arr
+        .ok_or("settings.json hooks field is not an object")?;
+    for group in expected_hook_groups(features, runtime) {
+        hooks
+            .entry(group.event)
+            .or_insert_with(|| serde_json::json!([]))
             .as_array_mut()
-            .ok_or(format!("{event} is not an array"))?;
-
-        let mut hook_entry = entry.clone();
-        if !matcher.is_empty() {
-            hook_entry["matcher"] = serde_json::Value::String(matcher.to_string());
-        }
-        arr.push(hook_entry);
+            .ok_or_else(|| format!("settings.json hooks.{} is not an array", group.event))?
+            .push(hook_group_json(&group));
     }
-
-    let content = serde_json::to_string_pretty(&settings)
-        .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    fs::write(&settings_path, content)
-        .map_err(|e| format!("Failed to write settings.json: {e}"))?;
-
+    write_settings_object(&paths.settings, &settings)?;
     log::info!("Registered Quill hooks in settings.json");
     Ok(())
 }
@@ -1283,17 +1676,148 @@ fn register_hooks(features: IntegrationFeatures) -> Result<(), String> {
 // ── MCP verification ──
 
 pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
+    let paths = resolve_claude_install_paths()?;
+    let runtime = resolve_runtime_paths()?;
+    verify_with_paths(features, &paths, &runtime)
+}
+
+fn hook_handler_matches(value: &serde_json::Value, expected: &ClaudeHookCommand) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(raw_args) = object.get("args").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(args) = raw_args
+        .iter()
+        .map(|value| value.as_str().map(ToString::to_string))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    object.get("type").and_then(serde_json::Value::as_str) == Some("command")
+        && object.get("command").and_then(serde_json::Value::as_str)
+            == Some(expected.command.as_str())
+        && args == expected.args
+        && object.get("timeout").and_then(serde_json::Value::as_u64) == Some(expected.timeout)
+}
+
+fn hook_group_matches(
+    value: &serde_json::Value,
+    expected: &ClaudeHookGroup,
+) -> Result<bool, String> {
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "settings.json hooks.{} group is not an object",
+            expected.event
+        )
+    })?;
+    let matcher = match object.get("matcher") {
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            format!(
+                "settings.json hooks.{} matcher is not a string",
+                expected.event
+            )
+        })?),
+        None => None,
+    };
+    if matcher != expected.matcher {
+        return Ok(false);
+    }
+    let handlers = object
+        .get("hooks")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "settings.json hooks.{} group hooks is not an array",
+                expected.event
+            )
+        })?;
+    if handlers.len() != expected.hooks.len() {
+        return Ok(false);
+    }
+    handlers
+        .iter()
+        .zip(&expected.hooks)
+        .try_fold(true, |matches, (actual, expected)| {
+            Ok(matches && hook_handler_matches(actual, expected))
+        })
+}
+
+fn verify_hook_settings(
+    settings: &serde_json::Value,
+    paths: &ClaudePaths,
+    expected: &[ClaudeHookGroup],
+) -> Result<(), String> {
+    let hooks = settings
+        .get("hooks")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("settings.json hooks field is not an object")?;
+    let mut managed_handler_count = 0usize;
+    for (event, groups) in hooks {
+        let groups = groups
+            .as_array()
+            .ok_or_else(|| format!("settings.json hooks.{event} is not an array"))?;
+        for group in groups {
+            let handlers = group
+                .get("hooks")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    format!("settings.json hooks.{event} group hooks is not an array")
+                })?;
+            managed_handler_count += handlers
+                .iter()
+                .filter(|handler| hook_handler_is_managed(handler, paths))
+                .count();
+        }
+    }
+    let expected_handler_count = expected
+        .iter()
+        .map(|group| group.hooks.len())
+        .sum::<usize>();
+    if managed_handler_count != expected_handler_count {
+        return Err(format!(
+            "Claude settings contain {managed_handler_count} managed handlers; expected {expected_handler_count}"
+        ));
+    }
+    for expected_group in expected {
+        let groups = hooks
+            .get(expected_group.event)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("Claude hook event {} is missing", expected_group.event))?;
+        let matches = groups
+            .iter()
+            .map(|group| hook_group_matches(group, expected_group))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|matches| *matches)
+            .count();
+        if matches != 1 {
+            return Err(format!(
+                "Claude hook event {} has {matches} exact managed groups; expected 1",
+                expected_group.event
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_with_paths(
+    features: IntegrationFeatures,
+    paths: &ClaudePaths,
+    runtime: &ClaudeRuntimePaths,
+) -> Result<(), String> {
     let mut missing = Vec::new();
 
     let expected_base = base_scripts_for(features);
     for script in &expected_base {
-        if !scripts_dir().join(script).exists() {
+        if !scripts_dir().join(script).is_file() {
             missing.push((*script).to_string());
         }
     }
     let expected_context = context_scripts_for(features);
     for script in &expected_context {
-        if !scripts_dir().join(script).exists() {
+        if !scripts_dir().join(script).is_file() {
             missing.push((*script).to_string());
         }
     }
@@ -1301,16 +1825,16 @@ pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
     // recent toggle-off cleanly removes the orphaned file.
     for script in ALL_MANAGED_SCRIPT_FILES {
         let still_expected = expected_base.contains(&script) || expected_context.contains(&script);
-        if !still_expected && scripts_dir().join(script).exists() {
+        if !still_expected && path_exists(&scripts_dir().join(script))? {
             return Err(format!(
                 "Claude managed script is still installed but not expected: {script}"
             ));
         }
     }
-    if !mcp_dir().join("server.py").exists() {
+    if !mcp_dir().join("server.py").is_file() {
         missing.push("mcp/server.py".to_string());
     }
-    if !templates_dir().join("claude-md-section.md").exists() {
+    if !templates_dir().join("claude-md-section.md").is_file() {
         missing.push("templates/claude-md-section.md".to_string());
     }
 
@@ -1321,58 +1845,15 @@ pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
         ));
     }
 
-    let settings_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude")
-        .join("settings.json");
-    let settings_content = fs::read_to_string(&settings_path).unwrap_or_default();
-    if !settings_content.contains(HOOK_MARKER) {
-        return Err("Claude hooks were not written to settings.json".to_string());
-    }
-    if !settings_content.contains("report-tokens.sh") {
-        return Err("Claude base hooks were not written to settings.json".to_string());
-    }
-    let has_observe_hook = settings_content.contains("observe.cjs");
-    if features.activity_tracking && !has_observe_hook {
-        return Err("Claude activity tracking hooks were not written to settings.json".to_string());
-    }
-    if !features.activity_tracking && has_observe_hook {
-        return Err("Claude activity tracking hooks are still installed".to_string());
-    }
+    let settings = read_settings_object(&paths.settings)?;
+    let expected_hooks = expected_hook_groups(features, runtime);
+    verify_hook_settings(&settings, paths, &expected_hooks)?;
 
-    let has_context_hook = settings_content.contains("context-router.cjs")
-        || settings_content.contains("context-capture.cjs");
-    if features.context_preservation && !has_context_hook {
+    let mcp_config = read_json_object(&paths.mcp_config, ".claude.json")?;
+    if mcp_server_entry(&mcp_config)? != Some(&quill_mcp_entry(features)) {
         return Err(
-            "Claude context preservation hooks were not written to settings.json".to_string(),
+            ".claude.json Quill MCP entry does not match expected configuration".to_string(),
         );
-    }
-    if !features.context_preservation && has_context_hook {
-        return Err("Claude context preservation hooks are still installed".to_string());
-    }
-
-    let claude_json_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude.json");
-    let claude_json_content = fs::read_to_string(&claude_json_path).unwrap_or_default();
-    if !claude_json_content.contains("\"mcpServers\"") || !claude_json_content.contains("\"quill\"")
-    {
-        return Err(".claude.json does not contain a Quill MCP server entry".to_string());
-    }
-    if !claude_json_content.contains("\"QUILL_PROVIDER\"")
-        || !claude_json_content.contains("\"claude\"")
-    {
-        return Err(".claude.json does not set QUILL_PROVIDER for Quill MCP".to_string());
-    }
-    if features.context_preservation
-        && !claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"")
-    {
-        return Err(".claude.json does not enable Quill context preservation".to_string());
-    }
-    if !features.context_preservation
-        && claude_json_content.contains("\"QUILL_CONTEXT_PRESERVATION\": \"1\"")
-    {
-        return Err(".claude.json still enables Quill context preservation".to_string());
     }
 
     let context_tool = mcp_dir().join("tools").join("context.py");
@@ -1383,17 +1864,80 @@ pub fn verify(features: IntegrationFeatures) -> Result<(), String> {
         return Err("Claude context MCP tool is still installed".to_string());
     }
 
-    let claude_md_path = dirs::home_dir()
-        .ok_or("Cannot determine home directory")?
-        .join(".claude")
-        .join("CLAUDE.md");
-    let claude_md_content = fs::read_to_string(&claude_md_path).unwrap_or_default();
-    if !claude_md_content.contains(BLOCK_START) {
-        return Err("CLAUDE.md does not contain the Quill managed block".to_string());
+    let template = fs::read_to_string(templates_dir().join("claude-md-section.md"))
+        .map_err(|err| format!("Failed to read Claude instruction template: {err}"))?;
+    let expected_block = format!("{BLOCK_START}\n{}\n{BLOCK_END}", template.trim());
+    let claude_md_content = fs::read_to_string(&paths.instructions)
+        .map_err(|err| format!("Failed to read {}: {err}", paths.instructions.display()))?;
+    if claude_md_content.matches(&expected_block).count() != 1 {
+        return Err("CLAUDE.md does not contain exactly one current Quill block".to_string());
+    }
+
+    let state = load_integration_state()?.ok_or("Claude integration state is missing")?;
+    ensure_state_paths(&state, paths)?;
+    if !state.main_installed || !state.mcp_state_captured {
+        return Err("Claude integration ownership state is incomplete".to_string());
     }
 
     verify_mcp(features)?;
 
+    Ok(())
+}
+
+fn verify_uninstalled(paths: &ClaudePaths) -> Result<(), String> {
+    if paths.settings.exists() {
+        let settings = read_settings_object(&paths.settings)?;
+        let hooks = settings.get("hooks").and_then(serde_json::Value::as_object);
+        if hooks.is_some_and(|hooks| {
+            hooks.values().any(|groups| {
+                groups.as_array().is_some_and(|groups| {
+                    groups.iter().any(|group| {
+                        group
+                            .get("hooks")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|handlers| {
+                                handlers
+                                    .iter()
+                                    .any(|handler| hook_handler_is_managed(handler, paths))
+                            })
+                    })
+                })
+            })
+        }) {
+            return Err("Claude settings still contain managed hook handlers".to_string());
+        }
+    }
+    if paths.mcp_config.exists() {
+        let root = read_json_object(&paths.mcp_config, ".claude.json")?;
+        if mcp_server_entry(&root)?.is_some_and(mcp_entry_is_managed) {
+            return Err(".claude.json still contains the managed Quill MCP entry".to_string());
+        }
+    }
+    if paths.instructions.exists()
+        && fs::read_to_string(&paths.instructions)
+            .map_err(|err| format!("Failed to read {}: {err}", paths.instructions.display()))?
+            .contains(BLOCK_START)
+    {
+        return Err("CLAUDE.md still contains the managed Quill block".to_string());
+    }
+    for name in MANAGED_COMMAND_FILES {
+        if path_exists(&paths.commands.join(name))? {
+            return Err(format!("Claude command is still installed: {name}"));
+        }
+    }
+    for directory in deployment_targets() {
+        if directory.is_dir()
+            && fs::read_dir(&directory)
+                .map_err(|err| format!("Failed to inspect {}: {err}", directory.display()))?
+                .next()
+                .is_some()
+        {
+            return Err(format!(
+                "Claude managed directory is not empty after uninstall: {}",
+                directory.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1451,11 +1995,8 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
 
 // ── Legacy cleanup ──
 
-/// Remove old manually-deployed hooks and update settings.json.
-fn cleanup_legacy_hooks() -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
-    let hooks_dir = home.join(".claude").join("hooks");
-
+/// Remove old manually-deployed hook files after their exact handlers are pruned.
+fn cleanup_legacy_hook_files(paths: &ClaudePaths) -> Result<(), String> {
     // Remove legacy hook files
     let legacy_files = [
         "quill-hook.sh",
@@ -1464,56 +2005,12 @@ fn cleanup_legacy_hooks() -> Result<(), String> {
     ];
 
     for file in &legacy_files {
-        let path = hooks_dir.join(file);
+        let path = paths.legacy_hooks.join(file);
         if path_exists(&path)? {
             remove_path(&path)
                 .map_err(|err| format!("Failed to remove legacy hook {}: {err}", path.display()))?;
             log::info!("Removed legacy hook file: {}", path.display());
         }
-    }
-
-    // Clean legacy entries from settings.json
-    let settings_path = home.join(".claude").join("settings.json");
-    if !settings_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&settings_path)
-        .map_err(|e| format!("Failed to read settings.json: {e}"))?;
-    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return Ok(()), // Can't parse — nothing to clean
-    };
-
-    let legacy_markers = [
-        "quill-hook.sh",
-        "quill-observe.cjs",
-        "quill-session-end-learn.cjs",
-    ];
-
-    let mut modified = false;
-
-    if let Some(hooks) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for (_event, entries) in hooks.iter_mut() {
-            if let Some(arr) = entries.as_array_mut() {
-                let before_len = arr.len();
-                arr.retain(|entry| {
-                    let s = entry.to_string();
-                    !legacy_markers.iter().any(|m| s.contains(m))
-                });
-                if arr.len() != before_len {
-                    modified = true;
-                }
-            }
-        }
-    }
-
-    if modified {
-        let output = serde_json::to_string_pretty(&settings)
-            .map_err(|e| format!("Failed to serialize settings: {e}"))?;
-        fs::write(&settings_path, output)
-            .map_err(|e| format!("Failed to write settings.json: {e}"))?;
-        log::info!("Cleaned legacy hook entries from settings.json");
     }
 
     Ok(())
@@ -1526,4 +2023,179 @@ fn cleanup_legacy_hooks() -> Result<(), String> {
 #[allow(dead_code)]
 pub fn setup_local(app: &tauri::AppHandle) -> Result<(), String> {
     install_with_manifest(app, IntegrationFeatures::default()).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_paths() -> ClaudePaths {
+        paths_for(
+            PathBuf::from("/tmp/quill-claude-config"),
+            PathBuf::from("/tmp/quill-claude-config/.claude.json"),
+        )
+    }
+
+    fn managed_handler(script: &str, timeout: u64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "command",
+            "command": "/usr/bin/node",
+            "args": [scripts_dir().join(script).to_string_lossy()],
+            "timeout": timeout,
+        })
+    }
+
+    #[test]
+    fn semantic_hook_cleanup_preserves_foreign_siblings_and_metadata() {
+        let paths = fixture_paths();
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "_source": HOOK_MARKER,
+                    "matcher": "*",
+                    "custom": { "keep": true },
+                    "hooks": [
+                        managed_handler("observe.cjs", 3),
+                        { "type": "command", "command": "/usr/bin/true", "args": [], "timeout": 2 }
+                    ]
+                }]
+            }
+        });
+
+        assert!(
+            remove_matching_hook_handlers(&mut settings, |handler| {
+                hook_handler_is_managed(handler, &paths)
+            })
+            .unwrap()
+        );
+        assert!(strip_orphaned_main_sources(&mut settings, &paths));
+        let group = &settings["hooks"]["PreToolUse"][0];
+        assert_eq!(group["matcher"], "*");
+        assert_eq!(group["custom"]["keep"], true);
+        assert!(group.get("_source").is_none());
+        assert_eq!(group["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(group["hooks"][0]["command"], "/usr/bin/true");
+    }
+
+    #[test]
+    fn malformed_hook_shape_is_not_mutated() {
+        let mut settings = serde_json::json!({ "hooks": { "PreToolUse": {} } });
+        let original = settings.clone();
+        assert!(remove_matching_hook_handlers(&mut settings, |_| true).is_err());
+        assert_eq!(settings, original);
+    }
+
+    #[test]
+    fn structural_hook_verification_rejects_wrong_timeout() {
+        let paths = fixture_paths();
+        let expected = ClaudeHookGroup {
+            event: "PostToolUse",
+            matcher: Some("*"),
+            source: HOOK_MARKER,
+            hooks: vec![ClaudeHookCommand {
+                command: "/usr/bin/node".to_string(),
+                args: vec![
+                    scripts_dir()
+                        .join("observe.cjs")
+                        .to_string_lossy()
+                        .to_string(),
+                ],
+                timeout: 3,
+            }],
+        };
+        let mut settings = serde_json::json!({
+            "hooks": { "PostToolUse": [hook_group_json(&expected)] }
+        });
+        assert!(verify_hook_settings(&settings, &paths, std::slice::from_ref(&expected)).is_ok());
+        settings["hooks"]["PostToolUse"][0]["hooks"][0]["timeout"] = serde_json::json!(4);
+        assert!(verify_hook_settings(&settings, &paths, &[expected]).is_err());
+    }
+
+    #[test]
+    fn uninstall_restores_prior_mcp_entry_but_preserves_user_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("claude");
+        let mcp_config = config.join(".claude.json");
+        let paths = paths_for(config, mcp_config.clone());
+        let prior = serde_json::json!({ "command": "prior", "args": ["serve"] });
+        let state = ClaudeIntegrationState {
+            version: INTEGRATION_STATE_VERSION,
+            config_dir: paths.config_dir.clone(),
+            mcp_config: paths.mcp_config.clone(),
+            main_installed: true,
+            restart_installed: false,
+            mcp_state_captured: true,
+            mcp_server_was_present: true,
+            prior_mcp_server: Some(prior.clone()),
+        };
+        write_json_object(
+            &mcp_config,
+            &serde_json::json!({
+                "mcpServers": { "quill": quill_mcp_entry(IntegrationFeatures::default()) }
+            }),
+            ".claude.json",
+        )
+        .unwrap();
+        restore_quill_mcp(&paths, Some(&state)).unwrap();
+        let restored = read_json_object(&mcp_config, ".claude.json").unwrap();
+        assert_eq!(restored["mcpServers"]["quill"], prior);
+
+        let replacement = serde_json::json!({ "command": "new-user-server", "args": [] });
+        write_json_object(
+            &mcp_config,
+            &serde_json::json!({ "mcpServers": { "quill": replacement.clone() } }),
+            ".claude.json",
+        )
+        .unwrap();
+        restore_quill_mcp(&paths, Some(&state)).unwrap();
+        let preserved = read_json_object(&mcp_config, ".claude.json").unwrap();
+        assert_eq!(preserved["mcpServers"]["quill"], replacement);
+    }
+
+    #[test]
+    fn reinstall_recaptures_mcp_replacement_while_restart_keeps_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("claude");
+        let mcp_config = config.join(".claude.json");
+        let paths = paths_for(config, mcp_config.clone());
+        let prior = serde_json::json!({ "command": "prior-a", "args": [] });
+        let replacement = serde_json::json!({ "command": "replacement-b", "args": [] });
+        let mut state = ClaudeIntegrationState {
+            version: INTEGRATION_STATE_VERSION,
+            config_dir: paths.config_dir.clone(),
+            mcp_config: paths.mcp_config.clone(),
+            main_installed: true,
+            restart_installed: true,
+            mcp_state_captured: true,
+            mcp_server_was_present: true,
+            prior_mcp_server: Some(prior.clone()),
+        };
+
+        write_json_object(
+            &mcp_config,
+            &serde_json::json!({
+                "mcpServers": { "quill": quill_mcp_entry(IntegrationFeatures::default()) }
+            }),
+            ".claude.json",
+        )
+        .unwrap();
+        restore_quill_mcp(&paths, Some(&state)).unwrap();
+        state.main_installed = false;
+        assert!(state.restart_installed);
+
+        write_json_object(
+            &mcp_config,
+            &serde_json::json!({ "mcpServers": { "quill": replacement.clone() } }),
+            ".claude.json",
+        )
+        .unwrap();
+        let root = read_json_object(&mcp_config, ".claude.json").unwrap();
+        prepare_main_install_state(&mut state, mcp_server_entry(&root).unwrap().cloned());
+        assert_eq!(state.prior_mcp_server, Some(replacement.clone()));
+
+        register_mcp_server(IntegrationFeatures::default(), &paths).unwrap();
+        restore_quill_mcp(&paths, Some(&state)).unwrap();
+        let restored = read_json_object(&mcp_config, ".claude.json").unwrap();
+        assert_eq!(restored["mcpServers"]["quill"], replacement);
+    }
 }

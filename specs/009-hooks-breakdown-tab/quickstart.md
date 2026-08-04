@@ -7,9 +7,7 @@ Mirrors the structure of `specs/008-runtime-redesign/quickstart.md`.
 
 - Local clone with the `009-hooks-breakdown-tab` branch checked out.
 - A Quill build that includes migration 27 (i.e., this branch).
-- A Codex install (≥ the version that supports the `[hooks]` config
-  block; verified working on the version recorded in
-  `~/.codex/config.toml` at the time of writing).
+- A Codex install that supports inline hooks in `config.toml`.
 - A Claude Code install (any version that emits `type:"attachment"`
   records with `attachment.type: "hook_*"` — confirmed present in current
   Claude Code transcripts).
@@ -137,10 +135,15 @@ In Quill Settings → Integration Features, toggle **Activity tracking**
 off. Confirm:
 
 ```bash
-grep -A 3 "hook-observe" ~/.codex/config.toml
+CODEX_STATE="$HOME/.config/quill/codex/integration-state.json"
+CODEX_CONFIG_HOME="$(
+  node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).home' \
+    "$CODEX_STATE"
+)"
+grep -A 3 "hook-observe" "$CODEX_CONFIG_HOME/config.toml"
 ```
 
-returns nothing (the eight Quill-managed observer blocks are removed),
+returns nothing (the 11 Quill-managed observer blocks are removed),
 and:
 
 ```bash
@@ -210,8 +213,10 @@ If the feature needs to be backed out before merge:
    ```sql
    DELETE FROM settings WHERE key = 'hook_invocation_reingest_pending';
    ```
-4. Remove the eight Codex `[[hooks.<Event>]]` blocks whose `command`
-   contains `hook-observe.cjs` from `~/.codex/config.toml`.
+4. Read the persisted Codex home from
+   `~/.config/quill/codex/integration-state.json` as in Step 6, then remove
+   the 11 `[[hooks.<Event>]]` blocks whose `command` contains
+   `hook-observe.cjs` from `$CODEX_CONFIG_HOME/config.toml`.
 5. Remove `~/.config/quill/codex/scripts/hook-observe.cjs`.
 
 Backing out is safe because the table is additive and shares no schema

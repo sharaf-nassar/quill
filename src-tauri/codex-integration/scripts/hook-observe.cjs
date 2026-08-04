@@ -7,8 +7,8 @@
 // Quill installer registers this single-purpose script on every Codex
 // hook event (PreToolUse, PostToolUse, SessionStart, UserPromptSubmit,
 // Stop, PreCompact, PostCompact, PermissionRequest, SubagentStart,
-// SubagentStop). On each invocation
-// the script POSTs one event record to /api/v1/hooks/observed, then
+// SubagentStop, SessionEnd). On each invocation the script POSTs one event
+// record to /api/v1/hooks/observed, then
 // exits with code 0 so it never blocks the hook chain. The endpoint
 // fast-acks 202 ACCEPTED, persists in the background, and emits a
 // `hooks-observed-updated` Tauri event so the Now-tab Hooks breakdown
@@ -105,7 +105,7 @@ function main() {
       tool_name: input.tool_name || null,
       cwd: input.cwd || null,
       ts: new Date().toISOString(),
-      hook_matcher: input.matcher || null,
+      hook_matcher: null,
       agent_id: input.agent_id || null,
     };
     postJSON(config, "/api/v1/hooks/observed", payload, "codex hook-observe");

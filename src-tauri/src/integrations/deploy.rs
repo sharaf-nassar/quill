@@ -251,6 +251,20 @@ impl FileSnapshots {
             Err(rollback) => format!("{primary}; installation rollback failed: {rollback}"),
         }
     }
+
+    /// Commit a configuration-only transaction that did not publish asset trees.
+    pub(crate) fn commit(self) -> Result<(), String> {
+        if let Err(err) = remove_existing_path(&self.marker) {
+            let primary = format!(
+                "Failed to commit configuration transaction {}: {err}",
+                self.marker.display()
+            );
+            return Err(with_rollback_error(primary, &self.targets, &self.marker));
+        }
+
+        cleanup_snapshots_best_effort(&self.marker);
+        Ok(())
+    }
 }
 
 /// Recover a prior batch before inspecting deployment sources or constructing new stages.
@@ -1674,6 +1688,24 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o400, "read-only permission must be restored");
         }
+    }
+
+    #[test]
+    fn configuration_only_commit_keeps_mutation_and_clears_transaction() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("restart-transaction");
+        let config = dir.path().join("settings.json");
+        write_file(&config, b"old");
+
+        let snapshots =
+            FileSnapshots::capture(std::slice::from_ref(&target), std::slice::from_ref(&config))
+                .unwrap();
+        write_file(&config, b"new");
+        snapshots.commit().unwrap();
+
+        assert_eq!(read_file(&config), "new");
+        assert!(!dir.path().join(TRANSACTION_MARKER).exists());
+        assert!(!dir.path().join(SNAPSHOT_DIRECTORY).exists());
     }
 
     #[cfg(unix)]

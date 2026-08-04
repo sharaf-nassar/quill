@@ -399,7 +399,7 @@ Graceful restart of running Claude and Codex sessions via [[src-tauri/src/restar
 
 Uses provider-specific discovery with a shared row model.
 
-Claude instances come from Quill state files in `~/.cache/quill/claude-state/` plus process scanning. Codex instances come from process scanning and `~/.codex/sessions/` metadata queues per cwd so multiple same-directory sessions can still map to distinct restart rows.
+Claude instances come from Quill state files in `~/.cache/quill/claude-state/` plus process scanning. The restart CJS hook writes `processing` on `UserPromptSubmit`/`PreToolUse`, `idle` on `Stop`/`StopFailure`, and `exited` on `SessionEnd`. Codex instances come from process scanning and `<Codex home>/sessions/` metadata queues per cwd so multiple same-directory sessions can still map to distinct restart rows.
 
 ### Restart Flow
 
@@ -419,7 +419,13 @@ Force restart skips the idle-wait phase.
 
 Restart hook actions are provider-aware.
 
-Claude install writes Quill hook scripts into `~/.claude/settings.json` plus shell integration. Codex restart setup currently installs shell integration only, while Codex integration installs only telemetry/session hooks; the `qbuild-guard.sh` edit guard remains Claude-only because Codex hook coverage does not intercept `apply patch` edits. The shared shell integration is only removed when the last restart-capable provider is disabled, and the restart window groups instances by provider with setup banners per provider when integration is missing.
+Claude restart setup is on-demand and uses the same pinned [[src-tauri/src/claude_setup.rs#ClaudePaths]] as provider setup. It registers one non-executable `claude-restart-hook.cjs` Node exec-form handler on `UserPromptSubmit`, `PreToolUse`, `Stop`, `StopFailure`, and `SessionEnd`, each with a 2-second timeout. Codex restart setup installs only shared shell integration; provider telemetry/session hooks remain separate.
+
+Restart install, repair, and uninstall snapshot Claude settings, shared and restart ownership state, hook assets, the shell script, and every touched `.bashrc`, `.bash_profile`, or `.zshrc` before mutation. A dedicated cache transaction marker avoids collision with the main Claude deployment; rollback restores all snapshots, and [[src-tauri/src/restart.rs#startup_cleanup]] recovers an interrupted transaction on app startup. Component flags keep pinned Claude path state until both main and restart ownership are gone, so an uninstall failure remains retryable.
+
+Shell setup owns a bounded `# quill-managed:restart:start` / `# quill-managed:restart:end` block containing one exact source line. Repair removes prior bounded blocks and migrates only the exact legacy `# quill-shell-integration` plus source-line pair; unrelated lines that merely mention Quill survive. Verification requires current script contents, exactly one block in every recorded RC file, and exact hook commands/args/timeouts rather than substring markers.
+
+The shared shell integration is removed only when the last restart-capable provider is disabled. The restart window groups instances by provider and shows setup banners when exact provider verification fails.
 
 ## Settings Window
 
