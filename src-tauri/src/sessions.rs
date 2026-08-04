@@ -289,8 +289,9 @@ fn retained_jsonl_source_layout_hint(
                     project.to_str().unwrap_or("unknown"),
                 ),
             }),
-            [project, _session, subagents, descendants @ ..]
-                if *subagents == std::ffi::OsStr::new("subagents") && !descendants.is_empty() =>
+            [project, _session, subagents, ..]
+                if *subagents == std::ffi::OsStr::new("subagents")
+                    && is_claude_subagent_transcript(canonical_path) =>
             {
                 Some(RetainedJsonlSourceLayoutHint::ClaudeSubagent {
                     default_project: SessionIndex::project_display_name(
@@ -305,6 +306,14 @@ fn retained_jsonl_source_layout_hint(
         }
         IntegrationProvider::Codex | IntegrationProvider::MiniMax => None,
     }
+}
+
+/// Claude workflows store bookkeeping JSONL beside actual `agent-*.jsonl`
+/// transcripts. Only the latter use the Claude transcript schema.
+fn is_claude_subagent_transcript(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".jsonl"))
 }
 
 /// Enumerate Claude and Codex transcript roots independently.
@@ -662,10 +671,7 @@ fn collect_claude_jsonl_candidates(
                     let subagent_path = entry.path();
                     if path_is_directory(&subagent_path, provider, diagnostic, true) {
                         stack.push(subagent_path);
-                    } else if subagent_path
-                        .extension()
-                        .is_some_and(|extension| extension == "jsonl")
-                    {
+                    } else if is_claude_subagent_transcript(&subagent_path) {
                         collection.candidates.push(DiscoveredSessionFile {
                             provider,
                             path: subagent_path,
@@ -910,8 +916,6 @@ pub struct SessionSchema {
     pub commands_run: Field,
     pub tool_details: Field,
     pub display_text: Field,
-    #[allow(dead_code)]
-    pub schema: Schema,
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,7 +1050,6 @@ impl SessionIndex {
             commands_run,
             tool_details,
             display_text,
-            schema: schema.clone(),
         };
 
         (schema, fields)
@@ -1301,7 +1304,7 @@ impl SessionIndex {
     /// under the supplied `projects_dir`. Two explicit passes per project:
     /// first picks up `<projectSlug>/*.jsonl` (parents), second recurses the
     /// whole `<projectSlug>/<session-uuid>/subagents/` subtree for every
-    /// `.jsonl` at any depth — both flat `subagents/agent-*.jsonl` and
+    /// `agent-*.jsonl` at any depth — both flat `subagents/agent-*.jsonl` and
     /// Workflow-nested `subagents/workflows/wf_<id>/agent-*.jsonl`. We avoid
     /// walkdir and stay bounded to that subtree so unrelated JSONLs nested
     /// elsewhere never sneak in.
@@ -4286,12 +4289,9 @@ mod tests {
         )
         .expect("write workflow subagent jsonl");
 
-        // Decoy non-jsonl file anywhere in the subtree must be ignored.
-        fs::write(
-            workflow_dir.join("agent-b.meta.json"),
-            r#"{"agentType":"x"}"#,
-        )
-        .expect("write decoy");
+        // Workflow bookkeeping must not be mistaken for an agent transcript.
+        fs::write(workflow_dir.join("journal.jsonl"), r#"{"entries":[]}"#)
+            .expect("write workflow journal");
 
         let files =
             SessionIndex::discover_claude_session_files_in(tmp.path()).expect("discover ok");
@@ -4336,8 +4336,31 @@ mod tests {
         assert!(
             !files
                 .iter()
-                .any(|f| f.path.to_string_lossy().ends_with("meta.json")),
-            "non-jsonl decoy must be filtered out at any depth"
+                .any(|f| f.path.to_string_lossy().ends_with("journal.jsonl")),
+            "workflow journals must be filtered out at any depth"
+        );
+
+        let canonical_root = fs::canonicalize(tmp.path()).expect("canonical root");
+        let canonical_agent =
+            fs::canonicalize(workflow_dir.join("agent-b.jsonl")).expect("canonical agent");
+        let canonical_journal =
+            fs::canonicalize(workflow_dir.join("journal.jsonl")).expect("canonical journal");
+        assert!(matches!(
+            retained_jsonl_source_layout_hint(
+                IntegrationProvider::Claude,
+                &canonical_root,
+                &canonical_agent,
+            ),
+            Some(RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. })
+        ));
+        assert_eq!(
+            retained_jsonl_source_layout_hint(
+                IntegrationProvider::Claude,
+                &canonical_root,
+                &canonical_journal,
+            ),
+            None,
+            "retained notify validation must reject workflow journals too"
         );
 
         let retained = enumerate_provider_source_root(

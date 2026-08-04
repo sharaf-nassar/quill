@@ -14,7 +14,7 @@
 //! 6. write `<file>.original.md` backup, then overwrite original with the
 //!    compressed version. On final failure, restore the backup and remove it.
 
-use std::path::Path;
+use std::{future::Future, path::Path, pin::Pin};
 
 mod detect;
 mod prompt;
@@ -41,8 +41,9 @@ pub enum CompressOutcome {
 
 /// Pluggable LLM call so the orchestrator (memory_optimizer) can reuse its
 /// existing ai_client wiring while keeping this module testable.
-pub type LlmCall<'a> =
-    &'a (dyn Fn(String) -> futures::future::BoxFuture<'a, Result<String, String>> + Sync);
+pub type LlmCall<'a> = &'a (
+        dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> + Sync
+    );
 
 /// Compress a single file in place. Pure orchestrator: the actual LLM call
 /// goes through the supplied closure so we do not hard-couple to a single

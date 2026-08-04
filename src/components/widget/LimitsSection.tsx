@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import type {
   CpaAccountHealth,
   CpaPoolAggregate,
@@ -6,6 +6,8 @@ import type {
   ProviderStatus,
   UsageBucket,
   UsageData,
+  UsageProviderError,
+  UsageSource,
 } from "../../types";
 import { providerLabel } from "../../utils/providers";
 
@@ -25,11 +27,25 @@ type RowState = "ready" | "pending" | "setup" | "unavailable";
 type CpaProvider = Extract<IntegrationProvider, "claude" | "codex">;
 type AccountState = "ready" | "disabled" | "unavailable" | "cooling";
 type LimitWindowKind = "five-hour" | "seven-day" | "fable";
+type LimitsSyncState = "live" | "offline" | "paused" | "cached" | "idle";
 
 const TICK_MS = 10_000;
 const MAX_VISIBLE_ACCOUNTS = 6;
 const CPA_PROVIDERS: readonly CpaProvider[] = ["claude", "codex"];
 const PRIMARY_MINIMAX_MODELS = ["M*", "coding-plan-search", "coding-plan-vlm"];
+const SYNC_SENTENCE: Record<LimitsSyncState, string> = {
+  live: "Live data",
+  offline: "Offline — showing cached data",
+  paused: "Live polling paused",
+  cached: "Showing cached data",
+  idle: "No live provider",
+};
+const SYNC_BADGE: Partial<Record<LimitsSyncState, string>> = {
+  offline: "Offline",
+  paused: "Paused",
+  cached: "Cached",
+};
+const DEGRADED_SYNC_PRECEDENCE = ["offline", "cached", "paused"] as const;
 
 interface WindowDefinition {
   key: string;
@@ -75,6 +91,47 @@ interface CpaResetReadout {
   remainingMs: number | null;
   resetText: string;
   severity: Severity;
+}
+
+function syncStateForSource(
+  errors: UsageProviderError[],
+  source: UsageSource,
+): Exclude<LimitsSyncState, "idle"> {
+  const kinds = errors
+    .filter((error) => (error.source ?? "direct") === source)
+    .map((error) => error.kind);
+  if (kinds.includes("network")) return "offline";
+  if (kinds.includes("stale")) return "cached";
+  if (kinds.includes("paused")) return "paused";
+  return "live";
+}
+
+function syncStateFor(
+  providerErrors: UsageProviderError[] | null,
+  hasUsageSource: boolean,
+): LimitsSyncState {
+  if (providerErrors === null) return "idle";
+
+  const sourceStates = [
+    syncStateForSource(providerErrors, "direct"),
+    syncStateForSource(providerErrors, "cpa"),
+  ];
+  const degradedState = DEGRADED_SYNC_PRECEDENCE.find((state) =>
+    sourceStates.includes(state),
+  );
+  if (degradedState) return degradedState;
+  return hasUsageSource ? "live" : "idle";
+}
+
+function formatElapsed(lastSyncAt: number | null, now: number): string {
+  if (lastSyncAt === null) return "—";
+  const seconds = Math.max(0, Math.floor((now - lastSyncAt) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 function limitWindowKind(key: string): LimitWindowKind | null {
@@ -746,18 +803,50 @@ function CpaRow({
 interface LimitsSectionProps {
   data: UsageData | null;
   statuses: ProviderStatus[];
+  providerErrors: UsageProviderError[] | null;
+  hasUsageSource: boolean;
+  lastSyncAt: number | null;
+  onRefresh: () => Promise<void>;
 }
 
 // @lat: [[frontend#Frontend#Components#Widget Limits Band]]
-function LimitsSection({ data, statuses }: LimitsSectionProps) {
+function LimitsSection({
+  data,
+  statuses,
+  providerErrors,
+  hasUsageSource,
+  lastSyncAt,
+  onRefresh,
+}: LimitsSectionProps) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [expanded, setExpanded] = useState<Set<CpaProvider>>(() => new Set());
+  const [elapsed, setElapsed] = useState(() => formatElapsed(lastSyncAt, Date.now()));
+  const [refreshing, setRefreshing] = useState(false);
   const disclosurePrefix = useId().replace(/\W/g, "");
 
   useEffect(() => {
     const interval = setInterval(() => setNowMs(Date.now()), TICK_MS);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    const apply = () => {
+      const next = formatElapsed(lastSyncAt, Date.now());
+      setElapsed((previous) => (previous === next ? previous : next));
+    };
+    apply();
+    const timer = setInterval(apply, 1000);
+    return () => clearInterval(timer);
+  }, [lastSyncAt]);
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await onRefresh();
+    } finally {
+      setRefreshing(false);
+    }
+  }, [onRefresh]);
 
   const direct = useMemo(
     () => directRows(statuses, data, nowMs),
@@ -778,6 +867,9 @@ function LimitsSection({ data, statuses }: LimitsSectionProps) {
   const otherAccountCount = (data?.cpa_accounts ?? []).filter(
     (account) => asCpaProvider(account.provider) === null,
   ).length;
+  const syncState = syncStateFor(providerErrors, hasUsageSource);
+  const badge = SYNC_BADGE[syncState];
+  const sentence = SYNC_SENTENCE[syncState];
 
   if (direct.length === 0 && cpa.length === 0 && otherAccountCount === 0) {
     return null;
@@ -785,7 +877,25 @@ function LimitsSection({ data, statuses }: LimitsSectionProps) {
 
   return (
     <section className="wg-limits wg-num" aria-label="Subscription limits">
-      <span className="wg-limits-title">Limits</span>
+      <div className="wg-limits-head">
+        <span className="wg-limits-title">Limits</span>
+        <button
+          type="button"
+          className="wg-pill wg-pill-button"
+          data-state={syncState}
+          aria-label={`Refresh live data. ${sentence}. Last read ${elapsed} ago.`}
+          aria-busy={refreshing}
+          disabled={refreshing}
+          title={`Click to refresh · Last read ${elapsed} ago`}
+          onClick={() => void handleRefresh()}
+        >
+          <span className="wg-pill-dot" aria-hidden="true" />
+          {badge && <span aria-hidden="true">{badge}</span>}
+          <span className="wg-num" aria-hidden="true">
+            {elapsed}
+          </span>
+        </button>
+      </div>
       {providerOrder.map((provider) => {
         const directRow = directByProvider.get(provider);
         const cpaRow =

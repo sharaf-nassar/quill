@@ -64,8 +64,8 @@ const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
 const isoIn = (msAhead: number) => new Date(now + msAhead).toISOString();
 // `created_at` columns are DB-populated by SQLite `datetime('now')`, which is a
 // space-separated naive-UTC string with NO "Z" (e.g. "2026-06-30 12:00:00").
-// utils/time.ts#timeAgo appends the "Z" to read it as UTC, so pre-suffixing one
-// here double-stamps it -> Invalid Date -> "NaNd ago" in the learning header.
+// utils/time.ts#timeAgo appends "Z" only to zone-less values, matching SQLite's
+// UTC semantics without corrupting the RFC3339 timestamps used elsewhere.
 const sqliteUtc = (msAgo: number) =>
   new Date(now - msAgo).toISOString().replace("T", " ").slice(0, -5);
 

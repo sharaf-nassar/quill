@@ -21,12 +21,11 @@ export type ProviderErrorKind =
   | "network"
   | "config"
   | "auth"
-  | "rate_limit"
   | "server"
   // Live polling is paused for a transient, non-failure reason (a stale Claude
   // access token returned 401 while still logged in). Rendered as the muted
-  // "Paused" variant of the widget's sync pill
-  // (src/components/widget/WidgetTitleBar.tsx), never a red prompt.
+  // "Paused" variant of the widget's Limits-header sync control
+  // (src/components/widget/LimitsSection.tsx), never a red prompt.
   | "paused"
   // Rows are being served from the last-persisted snapshot during a rate-limit
   // cooldown (a 429 armed it, or one just landed), so the values may be out of

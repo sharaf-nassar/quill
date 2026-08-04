@@ -109,14 +109,11 @@ specs/005-learning-system-hardening/
 ├── research.md          # Phase 0 output (R-1 … R-7 decisions)
 ├── data-model.md        # Phase 1 output (schema + entities + state machines)
 ├── quickstart.md        # Phase 1 output (maintainer verification walkthrough)
-├── contracts/           # Phase 1 output (internal module + IPC + HTTP contracts)
-│   ├── redaction.md
-│   ├── rule-governance.md
-│   ├── evaluation-harness.md
-│   └── ipc-and-feedback.md
-├── checklists/
-│   └── requirements.md  # Spec quality checklist (all items pass)
-└── tasks.md             # Phase 2 output (/speckit-tasks — NOT created here)
+└── contracts/           # Phase 1 output (internal module + IPC + HTTP contracts)
+    ├── redaction.md
+    ├── rule-governance.md
+    ├── evaluation-harness.md
+    └── ipc-and-feedback.md
 ```
 
 ### Source Code (repository root)

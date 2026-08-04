@@ -79,12 +79,11 @@ specs/011-session-model-analytics/
 ├── research.md
 ├── data-model.md
 ├── quickstart.md
-├── contracts/
-│   ├── model-analytics-ipc.md
-│   ├── model-backfill.md
-│   ├── model-observation-ingest.md
-│   └── model-session-detail-ipc.md
-└── tasks.md                         # Created later by /speckit-tasks
+└── contracts/
+    ├── model-analytics-ipc.md
+    ├── model-backfill.md
+    ├── model-observation-ingest.md
+    └── model-session-detail-ipc.md
 
 DESIGN.md                            # Five-tab and model-selection semantics
 .impeccable/design.json              # Machine-readable Analytics tab specimen

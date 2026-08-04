@@ -22,22 +22,9 @@
 
 import { contextSavingsInsight } from "./insightLine";
 import { useContextSavingsStats } from "../../../hooks/useContextSavingsStats";
-import { formatNumber } from "../../../utils/format";
+import { formatBytes, formatNumber } from "../../../utils/format";
 import { formatTokenCount } from "../../../utils/tokens";
 import type { ContextSavingsSummary, RangeType } from "../../../types";
-
-/** Byte sizes for the headline sub-lines: `4.6 MB`, `812 KB`, `140 B`. */
-function formatBytes(value: number): string {
-  if (value < 1024) return `${formatNumber(value)} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let scaled = value / 1024;
-  let unitIndex = 0;
-  while (scaled >= 1024 && unitIndex < units.length - 1) {
-    scaled /= 1024;
-    unitIndex += 1;
-  }
-  return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[unitIndex]}`;
-}
 
 /**
  * Tokens written to local storage instead of staying in the live transcript.

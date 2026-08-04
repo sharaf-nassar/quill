@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useToast } from "../../hooks/useToast";
 import { providerLabel } from "../../utils/providers";
+import "../../styles/restart.css";
 import type {
 	IntegrationProvider,
 	RestartInstance,
@@ -212,7 +213,7 @@ function RestartPanel() {
 	}, [providersWithInstancesKey, readHookStatuses, toast]);
 
 	if (!status) {
-		return <div className="restart-panel restart-panel--loading">Loading...</div>;
+		return <div className="restart-window restart-panel restart-panel--loading">Loading...</div>;
 	}
 
 	const { phase, instances, waiting_on, elapsed_seconds } = status;
@@ -228,7 +229,7 @@ function RestartPanel() {
 	);
 
 	return (
-		<div className="restart-panel">
+		<div className="restart-window restart-panel">
 			<div className="restart-list">
 				{instanceCount === 0 ? (
 					<div className="restart-empty">

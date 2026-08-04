@@ -50,7 +50,7 @@ A dev-only Vite plugin in [[vite.config.ts]] (`apply: "serve"`) relaxes the stri
 
 [[src/App.tsx]] is the widget shell: a freely resizable window holding [[src/components/widget/WidgetTitleBar.tsx]], a hairline, and one scrolling content column. The split-pane layout and its draggable divider were replaced by the widget redesign.
 
-The shell owns only the app-lifecycle work that has no other home: usage polling every 3 minutes via `fetch_usage_data()` while a provider is enabled, the four-hour updater check, the right-click Refresh/Quit menu, and close-to-tray on both the titlebar control and the window manager's close request. Manual Refresh updates integration status; the polling effect owns the resulting usage fetch after that status settles, preventing duplicate requests. When no provider is enabled the column shows one shell-level empty state with a rescan action in place of every band.
+The shell owns only the app-lifecycle work that has no other home: usage polling every 3 minutes via `fetch_usage_data()` while a provider is enabled, the four-hour updater check, the right-click Refresh/Quit menu, and close-to-tray on both the titlebar control and the window manager's close request. The context-menu Refresh updates integration status; the Limits-header freshness control uses [[src-tauri/src/lib.rs#refresh_usage_data]] to request live usage directly. When no provider is enabled the column shows one shell-level empty state with a rescan action in place of every band.
 
 Geometry is the user's, not the shell's. The window drags freely on both axes and `tauri.conf.json` declares floors (320x200) and no ceiling; the earlier content-derived height — a `ResizeObserver` that called `setSize` with the measured height and a fixed 360px width — was deleted rather than gated, because free resize and auto-height cannot both own the geometry and a dormant effect would reclaim the window on the first content change. `.wg-shell` fills the viewport at `height: 100vh`, and only the column below the titlebar scrolls, which is what keeps the widget reachable under webview zoom or when the user drags it shorter than its content.
 
@@ -62,7 +62,7 @@ The drag itself comes from [[src/components/WindowResizeHandles.tsx]], because a
 
 The widget nests [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]] above a scrolling content column holding [[src/components/widget/LimitsSection.tsx]] and, below it, the switchable view region ([[lat.md/frontend#Frontend#Components#Widget View Region]]).
 
-`WidgetTitleBar` carries the widget's whole chrome contract in three grid tracks: the brand glyph and `QUILL` wordmark on the left, the update button centred on the window (rendered only once the updater check has found a release, wired to `install_app_update`), and a right cluster of the sync freshness pill, the always-on-top toggle, the settings key, and the close key. The bar and its non-interactive children carry `data-tauri-drag-region`, so a decorationless window stays draggable. The sync pill is a `role="status"` `aria-live="polite"` region showing real elapsed time since the last successful read; it absorbs the old usage pill vocabulary as slate variants (`offline` beats `cached` beats `paused`, mirroring the precedence those pills used) and never turns red. The always-on-top toggle reads and writes the persisted `always_on_top` setting through [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]], so the tray checkitem, the Settings toggle, and the titlebar are one state; a failed write surfaces as a toast rather than a button that lies. Both the settings key and the ⌘M/Ctrl+M accelerator registered in [[src/main.tsx]] go through [[src/lib/manageWindow.ts#openManageWindow]], which focuses an existing Manage window instead of stacking a second one.
+`WidgetTitleBar` carries the widget's whole chrome contract in three grid tracks: the brand glyph and `Quill` wordmark on the left, the update button centred on the window (rendered only once the 4-hour updater check finds a release, wired to `install_app_update`), and a right cluster of the always-on-top toggle, the settings key, and the close key. The bar and its non-interactive children carry `data-tauri-drag-region`, so a decorationless window stays draggable. The always-on-top toggle reads and writes the persisted `always_on_top` setting through [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]], so the tray checkitem, the Settings toggle, and the titlebar are one state; a failed write surfaces as a toast rather than a button that lies. Both the settings key and the ⌘M/Ctrl+M accelerator registered in [[src/main.tsx]] go through [[src/lib/manageWindow.ts#openManageWindow]], which focuses an existing Manage window instead of stacking a second one.
 
 ## Components
 
@@ -95,7 +95,9 @@ Recharts is hostile to those treatments and costs 3.7 MB for shapes the widget c
 
 ### Widget Limits Band
 
-[[src/components/widget/LimitsSection.tsx#LimitsSection]] is the widget's whole subscription readout: one authoritative row per provider with optional CPA account detail.
+[[src/components/widget/LimitsSection.tsx#LimitsSection]] is the subscription readout: its header keeps LIMITS left and the live-data refresh control right above one authoritative provider row with optional CPA account detail.
+
+The native button retains the elapsed readout, tooltip, disabled `aria-busy` state, and slate degraded vocabulary (`offline` beats `cached` beats `paused`) while it requests live usage through [[src-tauri/src/lib.rs#refresh_usage_data]].
 
 Each row has a fixed identity region and fluid meter region. Every cell places its window label at inline-start and its percent geometrically centered over the gauge. Summary values step up one type size over account values. Window identity is derived from canonical bucket keys: 5-hour labels reuse Runtime light blue, 7-day labels Projects teal, and Fable labels Tokens-per-LOC purple across direct, aggregate, and account rows. These are metric-category tokens, not severity tokens. Raw labels remain visible and other dynamic windows stay neutral, so hue is never the only cue. Each expanded CPA account window with reset metadata repeats the aggregate cell's dedicated footer, centered beneath its matching track with a 10px tabular countdown. Missing countdowns render a dash; elapsed ones render neutral `now`. Direct rows end with their nearest reset, and a CPA pool replaces its matching direct row while present.
 
@@ -330,9 +332,9 @@ so an unbounded range is precisely the change that breaks the proof.
 
 ### Restart Component
 
-Controls for restarting Claude Code instances from the dedicated Restart window.
+Controls for restarting Claude Code and Codex instances from Manage → Instances.
 
-- **RestartPanel** (`src/components/restart/RestartPanel.tsx`, 205 lines) — Instance list with status indicators, force restart option, and hook installation prompt.
+- **RestartPanel** ([[src/components/restart/RestartPanel.tsx#RestartPanel]]) — Lazy-loaded Manage section with status indicators, force restart, and hook installation prompts. It owns its stylesheet and root window class directly; no wrapper window component remains.
 
 ## Custom Hooks
 

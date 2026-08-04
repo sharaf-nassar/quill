@@ -15,6 +15,7 @@ import type {
   RetentionMaintenanceResult,
   RetentionPreview,
 } from "../../types";
+import { formatBytes } from "../../utils/format";
 import { formatRetentionCutoff } from "../../utils/retention";
 import SettingRow from "./SettingRow";
 import Toggle from "./Toggle";
@@ -81,14 +82,6 @@ const STALE_PREVIEW_REASON = "stale_preview";
  * does not claim the database had nothing to prune.
  */
 const BUSY_REASON = "another maintenance operation is running";
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length);
-  const value = bytes / 1024 ** index;
-  return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index - 1]}`;
-}
 
 function formatCount(rows: number): string {
   return rows.toLocaleString();

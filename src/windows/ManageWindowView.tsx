@@ -20,7 +20,7 @@ import "../styles/manage.css";
 // Lazy-load sections so only the active chunk is fetched.
 const SessionsSection = lazy(() => import("./SessionsWindowView"));
 const LearningSection = lazy(() => import("./LearningWindow"));
-const InstancesSection = lazy(() => import("./RestartWindowView"));
+const InstancesSection = lazy(() => import("../components/restart/RestartPanel"));
 const SettingsSection = lazy(() => import("./SettingsWindowView"));
 
 // ── Section icons (14px line glyphs, shared visual language with the widget

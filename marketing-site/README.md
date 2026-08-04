@@ -8,10 +8,9 @@ Source for the [Quill](https://github.com/sharaf-nassar/quill) marketing site. S
 marketing-site/
 ├── index.html              Single page; nine anchored sections (analytics + agent tools)
 ├── styles.css              Signal Theater theme; no framework; self-hosted woff2 fonts
-├── motion.js               Progressive GSAP scroll-reveal (motion-rise) only
+├── motion.js               Progressive native scroll-reveal (motion-rise) only
 ├── README.md               This file
 └── assets/
-    ├── favicon.svg         Legacy SVG fallback; cyan/dark scheme aware
     ├── logo.png            Real Quill app icon (tiled) — used as favicon
     ├── logo-mark.png       Borderless feather mark (app-icon frame stripped) — header brand
     ├── og-image.png        1200×630 social-share preview — logo mark beside the widget's
@@ -53,7 +52,7 @@ The original seven (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#lea
 
 ## Visual direction
 
-[Signal Theater](../specs/001-marketing-site/spec.md#clarifications) — revised 2026-05-12. The page reads like a premium desktop instrument panel for agent work: Quill's quiet dark app surface, the real quill logo mark, cyan/purple logo accents, clipped geometry, dense screenshot proof, GSAP scroll-reveal motion, and no generic SaaS cards.
+[Signal Theater](../specs/001-marketing-site/spec.md#clarifications) — revised 2026-05-12. The page reads like a premium desktop instrument panel for agent work: Quill's quiet dark app surface, the real quill logo mark, cyan/purple logo accents, clipped geometry, dense screenshot proof, native scroll-reveal motion, and no generic SaaS cards.
 
 ## Screenshot display & section layout
 
@@ -131,7 +130,7 @@ The launcher uses env-var path overrides (`QUILL_DEMO_MODE=1`, `QUILL_DATA_DIR`,
 - Replace a screenshot in place (same filename, new content): bump its `?v=N` query on every `<img src>`/preload reference in `index.html`. Browsers cache images by URL and may serve a stale cached copy otherwise — re-capturing without bumping leaves visitors looking at the old shot.
 - Visual direction stays Signal Theater — see [spec.md § Clarifications](../specs/001-marketing-site/spec.md#clarifications). Avoid generic SaaS-landing-page conventions.
 - No tracking scripts, no third-party analytics, no *remote* fonts (FR-028, FR-007). Display/body fonts are self-hosted woff2 under `assets/fonts/` (Space Grotesk, Geist — OFL), served same-origin and preloaded.
-- Page MUST stay readable with JavaScript disabled (FR-024). GSAP loads from CDN as progressive motion enhancement only; core content, anchors, links, and screenshots must work when scripts fail or motion is reduced.
+- Page MUST stay readable with JavaScript disabled (FR-024). Native scroll reveal is progressive enhancement only; core content, anchors, links, and screenshots must work when scripts fail or motion is reduced.
 
 ## Deploy
 

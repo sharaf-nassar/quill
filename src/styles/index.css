@@ -987,8 +987,8 @@ body {
 }
 
 /* ─── Status pill — sync freshness and degraded data states ───
-   Rendered as role="status" aria-live="polite". Degraded variants are slate,
-   never red: a stale read is not an alarm. */
+   The freshness readout is also its manual refresh control. Degraded variants
+   are slate, never red: a stale read is not an alarm. */
 .wg-pill {
   display: inline-flex;
   align-items: center;
@@ -998,6 +998,29 @@ body {
   color: var(--faint);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+.wg-pill-button {
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  transition:
+    color 0.12s ease,
+    background-color 0.12s ease;
+}
+
+.wg-pill-button:hover:not(:disabled),
+.wg-pill-button:active:not(:disabled) {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.wg-pill-button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .wg-pill-dot {
@@ -1145,9 +1168,18 @@ body {
 .wg-limits-title {
   font-size: 10px;
   font-weight: 600;
+  transform: translateY(1px);
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--label);
+}
+
+.wg-limits-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  min-width: 0;
 }
 
 .wg-limits-row {
@@ -1900,16 +1932,11 @@ body {
 }
 
 .wg-glyph {
-  display: grid;
-  place-items: center;
+  display: block;
   flex: 0 0 18px;
   width: 18px;
   height: 18px;
-  border-radius: 5px;
-  background: rgba(34, 211, 238, 0.12);
-  color: var(--signal-cyan);
-  font-size: 10px;
-  font-weight: 700;
+  background: url("../../marketing-site/assets/logo-mark.png") center / contain no-repeat;
 }
 
 .wg-wordmark {
@@ -1931,12 +1958,6 @@ body {
   justify-self: end;
   gap: var(--space-xs);
   min-width: 0;
-}
-
-/* The sync pill sits closer to the keycaps than they sit to each other, so
-   the cluster reads as "status, then controls". */
-.wg-tb-right .wg-pill {
-  margin-right: var(--space-xs);
 }
 
 /* Update button — the app's only update affordance, shown only when the

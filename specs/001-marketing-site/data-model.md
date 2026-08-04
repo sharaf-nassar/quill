@@ -90,12 +90,11 @@ The site is one HTML page with sibling CSS and assets. No subroutes.
 marketing-site/
 ├── index.html                  # The single page; references styles.css and /assets/*
 ├── styles.css                  # Signal Theater theme; one file
-├── motion.js                   # Progressive GSAP motion and carousel controls
+├── motion.js                   # Progressive native scroll-reveal behavior
 ├── assets/
 │   ├── screenshots/            # Per § 3 above
 │   ├── logo.png                # Real Quill app icon used in header + favicon
-│   ├── og-image.png            # 1200x630 social-share preview
-│   └── favicon.svg             # Legacy SVG fallback, cyan/dark scheme aware
+│   └── og-image.png            # 1200x630 social-share preview
 └── README.md                   # Maps the folder, links the spec, notes the deploy contract
 ```
 
@@ -103,7 +102,7 @@ marketing-site/
 - One HTML file. Splitting into multiple pages requires a new clarification round (Q2 was answered "single page").
 - One CSS file. No `@import` of remote stylesheets (FR-028 — no third-party loads).
 - JavaScript is progressive only. Core content, anchors, links, and screenshots MUST stay readable without scripts, and motion MUST respect `prefers-reduced-motion`.
-- All durable assets are local. Third-party scripts are limited to the GSAP progressive-motion CDN; no tracking, analytics, or remote fonts are allowed.
+- All durable assets and scripts are local; no tracking, analytics, remote fonts, or third-party runtime scripts are allowed.
 
 ## Relationships
 

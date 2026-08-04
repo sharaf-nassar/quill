@@ -3,6 +3,21 @@ export function formatNumber(n: number): string {
 	return n.toLocaleString("en-US");
 }
 
+/** Format a byte count using binary units. */
+export function formatBytes(bytes: number): string {
+	if (bytes < 1024) {
+		return `${formatNumber(bytes)} B`;
+	}
+	const units = ["KB", "MB", "GB", "TB"];
+	let scaled = bytes / 1024;
+	let unitIndex = 0;
+	while (scaled >= 1024 && unitIndex < units.length - 1) {
+		scaled /= 1024;
+		unitIndex += 1;
+	}
+	return `${scaled >= 10 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[unitIndex]}`;
+}
+
 /** Format seconds to human-readable: 45 → "45s", 125 → "2m 5s", 3661 → "1h 1m", 90000 → "1d 1h" */
 export function formatDurationSecs(secs: number | null): string {
 	if (secs === null) return "—";

@@ -73,10 +73,6 @@ pub fn load_integration_features(storage: &Storage) -> Result<IntegrationFeature
     })
 }
 
-pub fn get_integration_features(storage: &Storage) -> Result<IntegrationFeatures, String> {
-    load_integration_features(storage)
-}
-
 fn emit_features(app: &AppHandle, features: &IntegrationFeatures) {
     let _ = app.emit("integration-features-updated", features);
 }

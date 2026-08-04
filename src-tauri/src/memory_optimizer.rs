@@ -978,7 +978,10 @@ pub async fn run_prose_compression(
                 .await
                 .map(|outcome| outcome.value)
                 .map_err(|e| e.to_string())
-            }) as futures::future::BoxFuture<'_, Result<String, String>>
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = Result<String, String>> + Send + '_>,
+                >
         };
 
         match crate::compress_prose::compress_file(&path, &call_llm).await {

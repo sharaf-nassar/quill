@@ -44,9 +44,8 @@ specs/002-track-session-skills/
 ├── research.md
 ├── data-model.md
 ├── quickstart.md
-├── contracts/
-│   └── skill-breakdown-command.md
-└── tasks.md
+└── contracts/
+    └── skill-breakdown-command.md
 ```
 
 ### Source Code (repository root)

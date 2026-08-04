@@ -125,7 +125,8 @@ restyling, or building any UI — they describe the target visual system.
   Systems Pages). `.impeccable/design.json` is its machine-readable sidecar.
 
 These describe the target system, not necessarily the current `src/` — when they
-diverge, the design files are the intent.
+diverge, the design files are the intent. The Manage, settings, and release-notes
+windows keep their current density until their own redesign pass (DESIGN.md §6).
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

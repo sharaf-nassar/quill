@@ -25,7 +25,6 @@
     "core:tray:default",
     "window-state:default",
     "updater:default",
-    "process:allow-restart",
     "log:default",
     "dialog:default"
   ]

@@ -47,11 +47,8 @@ specs/004-quill-native-insights/
 ├── research.md          # Phase 0 — design decisions + alternatives
 ├── data-model.md        # Phase 1 — entities & shapes
 ├── quickstart.md        # Phase 1 — maintainer verification walkthrough
-├── contracts/
-│   └── stream-c.md      # Phase 1 — internal Stream C module contract
-├── checklists/
-│   └── requirements.md  # Spec quality checklist (from /speckit-specify)
-└── tasks.md             # Phase 2 — created by /speckit-tasks (NOT here)
+└── contracts/
+    └── stream-c.md      # Phase 1 — internal Stream C module contract
 ```
 
 ### Source Code (repository root)

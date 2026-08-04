@@ -152,13 +152,6 @@ pub enum ProviderErrorKind {
     Config,
     // The provider rejected the credentials we sent (401 Unauthorized).
     Auth,
-    // Provider returned 429. The poller no longer surfaces this cause-oriented
-    // kind — it writes a rate-limit cooldown and pushes the consequence-oriented
-    // `Stale` (see below) instead, so the pill reads "showing cached data"
-    // rather than naming the cause. Kept (dead) so the enum still documents the
-    // 429 mapping without another payload change.
-    #[allow(dead_code)]
-    RateLimit,
     // Provider responded but with a non-success status or unparseable body.
     Server,
     // Live polling is temporarily paused for a transient, non-failure reason —
@@ -1844,7 +1837,6 @@ mod tests {
             (ProviderErrorKind::Network, "\"network\""),
             (ProviderErrorKind::Config, "\"config\""),
             (ProviderErrorKind::Auth, "\"auth\""),
-            (ProviderErrorKind::RateLimit, "\"rate_limit\""),
             (ProviderErrorKind::Server, "\"server\""),
             (ProviderErrorKind::Paused, "\"paused\""),
         ];

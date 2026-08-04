@@ -86,6 +86,7 @@ static USAGE_CACHE: OnceLock<Mutex<Option<UsageCacheEntry>>> = OnceLock::new();
 static USAGE_REFRESH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 static USAGE_CACHE_EPOCH: AtomicU64 = AtomicU64::new(0);
 static INGEST_GATE: OnceLock<RwLock<()>> = OnceLock::new();
+static ROLLUP_BACKFILL_WRITE_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 static MAINTENANCE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static MODEL_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static RUNTIME_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -122,6 +123,10 @@ pub(crate) struct IngestQuiesceGuard {
 
 fn ingest_gate() -> &'static RwLock<()> {
     INGEST_GATE.get_or_init(|| RwLock::new(()))
+}
+
+fn rollup_backfill_write_gate() -> &'static Mutex<()> {
+    ROLLUP_BACKFILL_WRITE_GATE.get_or_init(|| Mutex::new(()))
 }
 
 pub(crate) fn begin_ingest_quiesce() -> IngestQuiesceGuard {
@@ -167,6 +172,16 @@ pub(crate) fn ingest_is_quiesced() -> bool {
 pub(crate) fn with_ingest_write_permit<T>(operation: impl FnOnce() -> T) -> T {
     let _gate = ingest_gate().read();
     operation()
+}
+
+/// Serialize a rollup chunk with a live Codex hook insert.
+///
+/// Rollup backfills use a dedicated SQLite connection, while hook inserts use
+/// Storage's primary connection. The ingest permit only excludes maintenance,
+/// so these two writers need this narrow gate without serializing other ingest.
+pub(crate) fn with_rollup_backfill_write_permit<T>(operation: impl FnOnce() -> T) -> T {
+    let _gate = rollup_backfill_write_gate().lock();
+    with_ingest_write_permit(operation)
 }
 // How long the fatal-storage dialog gets to come back with an answer before
 // the watchdog terminates the process anyway. Long enough to read the dialog
@@ -665,7 +680,7 @@ fn spawn_startup_transcript_analytics_reconciliation(app: tauri::AppHandle) {
                     summary.completed_all_roots,
                 );
                 if let Some(error) = &summary.failure {
-                    log::error!("Startup transcript analytics reconciliation incomplete: {error}");
+                    log::warn!("Startup transcript analytics reconciliation incomplete: {error}");
                 }
                 if (summary.replaced_sources > 0 || summary.pruned_sources > 0)
                     && let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ())
@@ -1686,11 +1701,8 @@ async fn maybe_prompt_appimage_integration(app: &tauri::AppHandle) {
             // (multi-MB copy) to the blocking pool, then show the result dialog.
             if confirmed {
                 tauri::async_runtime::spawn(async move {
-                    let integrate_handle = app_handle.clone();
-                    let result = tauri::async_runtime::spawn_blocking(move || {
-                        appimage_integration::integrate(&integrate_handle)
-                    })
-                    .await;
+                    let result =
+                        tauri::async_runtime::spawn_blocking(appimage_integration::integrate).await;
                     match result {
                         Ok(Ok(())) => {
                             app_handle
@@ -2338,7 +2350,10 @@ fn current_usage_context() -> Option<(Vec<ProviderStatus>, UsageData)> {
         .map(|entry| (entry.statuses.clone(), entry.usage.clone()))
 }
 
-fn current_recent_usage_cache(provider_status_key: &str) -> Option<UsageData> {
+fn current_recent_usage_cache(provider_status_key: &str, force: bool) -> Option<UsageData> {
+    if force {
+        return None;
+    }
     let recent_cutoff = Utc::now() - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
     usage_cache()
         .lock()
@@ -2620,7 +2635,10 @@ fn emit_usage_updates(
     Ok(())
 }
 
-async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData, String> {
+async fn refresh_usage_cache(
+    app: Option<&tauri::AppHandle>,
+    force: bool,
+) -> Result<UsageData, String> {
     let _refresh_guard = usage_refresh_lock().lock().await;
 
     loop {
@@ -2628,7 +2646,7 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
         let cpa_connection = load_cpa_connection()?;
         let status_key = provider_status_key(&statuses, cpa_connection.as_ref());
 
-        if let Some(usage) = current_recent_usage_cache(&status_key) {
+        if let Some(usage) = current_recent_usage_cache(&status_key, force) {
             return Ok(usage);
         }
 
@@ -2671,8 +2689,9 @@ async fn refresh_usage_cache(app: Option<&tauri::AppHandle>) -> Result<UsageData
                     let now = Utc::now();
                     let recent_cutoff = now - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
 
-                    if latest_usage_snapshot_at(provider)
-                        .is_some_and(|timestamp| timestamp >= recent_cutoff)
+                    if !force
+                        && latest_usage_snapshot_at(provider)
+                            .is_some_and(|timestamp| timestamp >= recent_cutoff)
                         && let Some(mut buckets) = load_cached_usage_buckets(provider)
                     {
                         display_buckets.append(&mut buckets);
@@ -3018,7 +3037,7 @@ async fn fetch_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
         Ok(statuses) => {
             let cpa_connection = load_cpa_connection()?;
             let status_key = provider_status_key(&statuses, cpa_connection.as_ref());
-            if let Some(usage) = current_recent_usage_cache(&status_key) {
+            if let Some(usage) = current_recent_usage_cache(&status_key, false) {
                 emit_usage_updates(&app, &statuses, &usage)?;
                 return Ok(usage);
             }
@@ -3032,7 +3051,14 @@ async fn fetch_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
         }
     }
 
-    refresh_usage_cache(Some(&app)).await
+    refresh_usage_cache(Some(&app), false).await
+}
+
+/// Refresh live usage on demand, bypassing only freshness caches. Provider
+/// cooldowns still protect rate-limited and offline sources.
+#[tauri::command]
+async fn refresh_usage_data(app: tauri::AppHandle) -> Result<UsageData, String> {
+    refresh_usage_cache(Some(&app), true).await
 }
 
 #[tauri::command]
@@ -3652,7 +3678,7 @@ async fn set_context_preservation_enabled(
     }?;
 
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after context preservation toggle failed: {error}");
     }
 
@@ -3662,7 +3688,7 @@ async fn set_context_preservation_enabled(
 #[tauri::command]
 async fn get_integration_features() -> Result<models::IntegrationFeatures, String> {
     let storage = get_storage()?;
-    integrations::get_integration_features(storage)
+    integrations::load_integration_features(storage)
 }
 
 #[tauri::command]
@@ -3701,7 +3727,7 @@ async fn rescan_integrations(app: tauri::AppHandle) -> Result<Vec<ProviderStatus
     // refresh it to match the new detection state — matching the pattern in
     // confirm_enable_provider / confirm_disable_provider.
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after rescan failed: {error}");
     }
 
@@ -3720,7 +3746,7 @@ async fn confirm_enable_provider(
     }?;
 
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after enabling provider failed: {error}");
     }
 
@@ -3738,7 +3764,7 @@ async fn confirm_disable_provider(
     }?;
 
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after disabling provider failed: {error}");
     }
 
@@ -5128,7 +5154,7 @@ async fn set_minimax_api_key(
     }?;
 
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after MiniMax key update failed: {error}");
     }
 
@@ -5146,7 +5172,7 @@ async fn set_cpa_connection(
         tokio::task::block_in_place(|| integrations::manager::set_cpa_connection(validated))?;
 
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after CPA connection update failed: {error}");
     }
 
@@ -5163,7 +5189,7 @@ async fn clear_cpa_connection(
     // restoring CPA rows after disconnect. Clearing the in-memory entry makes
     // the next emit rebuild from direct sources only.
     clear_usage_cache().await;
-    if let Err(error) = refresh_usage_cache(Some(&app)).await {
+    if let Err(error) = refresh_usage_cache(Some(&app), false).await {
         log::warn!("Usage refresh after CPA disconnect failed: {error}");
     }
 
@@ -5880,7 +5906,6 @@ pub fn run() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_process::init())
         // The plugin's automatic restore applies every flag, which for the
         // decorationless widget would also replay a saved `decorated` or
         // `visible` value over the config. Skipping the initial restore for
@@ -6101,7 +6126,7 @@ pub fn run() {
                         if !enabled {
                             continue;
                         }
-                        if let Err(error) = refresh_usage_cache(Some(&usage_refresh_handle)).await {
+                        if let Err(error) = refresh_usage_cache(Some(&usage_refresh_handle), false).await {
                             log::warn!("Periodic usage refresh failed: {error}");
                         }
                     }
@@ -6379,6 +6404,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             fetch_usage_data,
+            refresh_usage_data,
             get_indicator_primary_provider,
             set_indicator_primary_provider,
             get_indicator_state,
@@ -6496,6 +6522,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn forced_usage_refresh_bypasses_recent_process_cache() {
+        let key = "manual-refresh-test";
+        let usage = UsageData {
+            buckets: Vec::new(),
+            provider_errors: Vec::new(),
+            provider_credits: Vec::new(),
+            cpa_accounts: Vec::new(),
+            cpa_pools: Vec::new(),
+            error: None,
+        };
+        store_usage_cache(usage, key, &[]);
+
+        assert!(current_recent_usage_cache(key, false).is_some());
+        assert!(current_recent_usage_cache(key, true).is_none());
+
+        *usage_cache().lock() = None;
+    }
 
     #[test]
     fn source_builds_do_not_offer_published_updates() {

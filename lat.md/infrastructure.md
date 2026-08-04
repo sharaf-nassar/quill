@@ -97,7 +97,7 @@ Triggers on `push` to `main` with a paths filter on `marketing-site/**` and the 
 
 The marketing site is a static GitHub Pages deliverable that sells Quill through real product screenshots and stable anchored sections.
 
-`marketing-site/index.html` owns the single-page content and the public `#hero`, `#analytics`, `#context`, `#search`, `#live`, `#learning`, `#memory`, `#brevity`, and `#install` fragments (the original seven are a stable deep-link contract; `#memory` and `#brevity` were added 2026-06-19). `marketing-site/styles.css` owns the Signal Theater visual system: Quill's quiet dark app surface, actual logo mark, cyan/purple logo accents, clipped geometry, dense screenshot proof, and an alternating two-column spotlight rhythm that shows each lean per-section screenshot whole at its natural aspect (no cover-cropping), with self-hosted Space Grotesk (display) and Geist (body) woff2 fonts under `assets/fonts/` (OFL, preloaded, no remote fonts). `marketing-site/motion.js` adds progressive GSAP scroll-reveal (the `.motion-rise` effect) only — no pinning, scrubbed text, or carousel; the content remains readable when JavaScript is disabled or the CDN motion library fails.
+`marketing-site/index.html` owns the single-page content and the public `#hero`, `#analytics`, `#context`, `#search`, `#live`, `#learning`, `#memory`, `#brevity`, and `#install` fragments (the original seven are a stable deep-link contract; `#memory` and `#brevity` were added 2026-06-19). `marketing-site/styles.css` owns the Signal Theater visual system: Quill's quiet dark app surface, actual logo mark, cyan/purple logo accents, clipped geometry, dense screenshot proof, and an alternating two-column spotlight rhythm that shows each lean per-section screenshot whole at its natural aspect (no cover-cropping), with self-hosted Space Grotesk (display) and Geist (body) woff2 fonts under `assets/fonts/` (OFL, preloaded, no remote fonts). `marketing-site/motion.js` progressively adds the `.motion-rise` reveal with native `IntersectionObserver` plus CSS transitions. Reduced-motion clients and browsers without the observer skip the pending class, so content stays readable without JavaScript or motion support.
 
 The stylesheet link includes a version query so palette changes are not masked by stale browser caches during local preview or GitHub Pages deploys.
 
@@ -124,11 +124,11 @@ Available subcommands for the release script.
 
 Uses `codex` when installed, otherwise falls back to `claude`; `--ai claude` or `--ai codex` overrides the default selection.
 
-The Codex path pins `gpt-5.4`, `model_reasoning_effort="xhigh"`, and `service_tier="fast"` in non-interactive mode, forces `-C` to the git repo root, and leaves Claude on its existing inference path.
+The Codex path pins `gpt-5.5`, `model_reasoning_effort="xhigh"`, and `service_tier="fast"` in ephemeral non-interactive mode, forces `-C` to the git repo root, and leaves Claude on its existing inference path.
 
-When release notes are generated through Codex in an interactive terminal, `release.sh` shows a live spinner plus a framed tail of the last 20 user-meaningful Codex progress lines. Internal hook, MCP, router, and sandbox-noise lines stay hidden unless the run fails.
+Codex writes its native execution stream directly to the terminal while `--output-last-message` captures only the final response in a temporary file for the release body. `release.sh` adds no spinner, filtering, panel renderer, polling loop, or duplicate log buffer.
 
-Prompt instructs the model to focus on user-visible features only, omitting refactors, dependency updates, and CI changes. Output format: "## What's New" section with bold feature headings.
+Prompt instructs the model to focus on user-visible features only, omitting refactors, dependency updates, and CI changes. It opens with a short value summary, then uses only the non-empty Highlights, Improvements, Fixes, and Upgrade Notes sections.
 
 ## Code Quality
 
@@ -182,7 +182,7 @@ Output is `hero.png` (widget on the Usage view), copied to `live.png` because th
 
 Default output directory is `marketing-site/assets/screenshots/` (overridable via `OUTDIR=...`). Captures use ImageMagick `import` then upscale 2× via `convert -filter Catrom -resize 200%` for HiDPI rendering on the marketing site (override with `RETINA=0`).
 
-What is published today came from the 2026-08-01 refresh, the first taken against a live build rather than a render: every widget shot is a real `import` grab of a sandboxed instance, so no view switcher carries a `:focus-visible` ring any more. `hero.png` and `live.png` are the widget on its Usage view (LIMITS band, six-hour two-provider chart, full readout grid, session breakdown), `analytics-charts.png` is the Charts view and `analytics-context.png` the Context view. `sessions.png` and `learning.png` are Manage sections at the workspace's own 960×680, replacing the 2026-06-24 shots of the standalone windows that no longer exist; `memory.png` and `brevity.png` are cropped out of the Learning and Settings sections that now host them. `og-image.png` is recomposed from the fresh widget shots (logo mark beside the Usage frame with the Charts view behind). The root `README.md` mirrors the widget set from `screenshots/widget-{usage,charts,context}.png`.
+What is published today came from the 2026-08-01 refresh, the first taken against a live build rather than a render: every widget shot is a real `import` grab of a sandboxed instance, so no view switcher carries a `:focus-visible` ring any more. `hero.png` and `live.png` are the widget on its Usage view (LIMITS band, six-hour two-provider chart, full readout grid, session breakdown), `analytics-charts.png` is the Charts view and `analytics-context.png` the Context view. `sessions.png` and `learning.png` are Manage sections at the workspace's own 960×680, replacing the 2026-06-24 shots of the standalone windows that no longer exist; `memory.png` and `brevity.png` are cropped out of the Learning and Settings sections that now host them. `og-image.png` is recomposed from the fresh widget shots (logo mark beside the Usage frame with the Charts view behind). The root `README.md` embeds these canonical `marketing-site/assets/screenshots/` files directly; no root screenshot mirrors are maintained.
 
 That refresh also showed the documented GL-surface constraint no longer holds on the maintainer's GNOME/Mutter (X11) host: `import` reads the `target/debug` binary's window fine, and a plain `cargo build` embeds `frontendDist` rather than loading `devUrl`, so the AppImage detour is unnecessary. The demo instance instead runs under `dbus-run-session` with an isolated `HOME` — both now owned by [[infrastructure#Scripts#Demo Launcher]] rather than by hand — which gives it its own `tauri-plugin-single-instance` lock so it can coexist with the maintainer's own Quill, and keeps the demo's provider-enable, brevity and memory writes off the real `~/.claude`. Any second window titled `Quill` must be unmapped for the run, because the script resolves its target by window name.
 
@@ -215,6 +215,12 @@ Each launcher creates a stable per-user sandbox directory (`/tmp/quill-demo-$USE
 `scripts/mac.sh` bootstraps a macOS 14+ machine by installing Homebrew with the current official installer, then refreshing Homebrew metadata before installing or upgrading the moving `node` formula and `docker-desktop` cask.
 
 The script exits early on non-macOS hosts and unsupported macOS releases so failures are explicit. It treats Docker as Docker Desktop on macOS because that installs the app/runtime rather than only the standalone `docker` client binary.
+
+## MCP Verification Environment
+
+MCP import verification for Claude and Codex removes inherited `PYTHONHOME`
+and `PYTHONPATH`. This isolates `uv run ... python` from packaged-launcher
+variables while preserving each provider's normal runtime environment.
 
 ## Claude Integration Deployment
 
@@ -334,7 +340,7 @@ Key runtime and dev dependencies for both frontend and backend.
 
 React 19, React DOM, Tauri API v2, the Tauri updater plugin, Sentry React 10, DOMPurify 3.4, and Marked 18.
 
-Recharts was removed with the widget redesign — all visualization is the internal SVG kit — and the window-state and process JS bindings went with the dead-code sweep, leaving their Rust crates in place.
+Recharts was removed with the widget redesign — all visualization is the internal SVG kit. The process JS binding and Rust plugin were removed together; the window-state JS binding is gone while its Rust plugin remains.
 
 ### Frontend Dev
 
@@ -346,7 +352,7 @@ Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 
 **Core runtime**: Tauri 2, Axum 0.8, Tokio 1, rusqlite 0.31 (bundled), Tantivy 0.25, reqwest 0.13, rig-core 0.32.
 
-**Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-process 2, tauri-plugin-log 2.
+**Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-log 2.
 
 **Utilities**: serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
 

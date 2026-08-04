@@ -48,11 +48,8 @@ specs/006-learning-hardening-followups/
 ├── research.md          # Phase 0 — design options + decisions (R-A1..A3, R-B1..B3)
 ├── data-model.md        # Phase 1 — schema impact (none) + metadata/type deltas + reconciliation
 ├── quickstart.md        # Phase 1 — maintainer verification walkthrough
-├── contracts/
-│   └── confinement-and-atomicity.md   # Phase 1 — honest-confinement + version/evidence-atomicity contracts
-├── checklists/
-│   └── requirements.md  # spec quality checklist (all pass)
-└── tasks.md             # Phase 2 — /speckit-tasks (NOT created here; after approval)
+└── contracts/
+    └── confinement-and-atomicity.md   # Phase 1 — honest-confinement + version/evidence-atomicity contracts
 ```
 
 ### Source Code (repository root)

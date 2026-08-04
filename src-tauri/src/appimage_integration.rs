@@ -426,14 +426,12 @@ fn resolve_sources() -> Result<(PathBuf, Option<PathBuf>), String> {
 ///
 /// Idempotent (every write overwrites). On **any** error it returns `Err` and
 /// does **not** persist state, so the decision stays unrecorded and a later
-/// launch or Settings click can retry (FR-006/FR-007/FR-009). The `app` handle
-/// is accepted for signature parity with the command layer and future use; the
-/// routine itself needs only env + home dir.
+/// launch or Settings click can retry (FR-006/FR-007/FR-009).
 ///
 /// Calls only synchronous storage (no `run_blocking` / `block_in_place`), so it
 /// is a plain blocking function safe to run on any thread — callers off a Tokio
 /// worker (e.g. the GTK dialog callback) must wrap it in `spawn_blocking`.
-pub fn integrate(_app: &tauri::AppHandle) -> Result<(), String> {
+pub fn integrate() -> Result<(), String> {
     let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
     let (appimage_src, icon_src) = resolve_sources()?;
     let targets = target_paths(&home);
@@ -475,8 +473,8 @@ pub async fn get_appimage_integration_status() -> IntegrationStatus {
 /// and must not block a Tokio worker); returns `Err(message)` on failure
 /// (rendered as a toast) with the decision left unrecorded for retry.
 #[tauri::command]
-pub async fn integrate_appimage(app: tauri::AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || integrate(&app))
+pub async fn integrate_appimage() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(integrate)
         .await
         .map_err(|e| e.to_string())?
 }

@@ -1903,7 +1903,8 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     };
     let uv_path_env = crate::config::path_for_resolved_command(&uv_path);
 
-    let uv_check = Command::new(&uv_path)
+    let mut uv_check = Command::new(&uv_path);
+    let uv_check = crate::integrations::clean_mcp_verification_environment(&mut uv_check)
         .arg("--version")
         .env("PATH", &uv_path_env)
         .output()
@@ -1917,7 +1918,8 @@ fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
     let mcp_path = mcp_dir();
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
 
-    let verify = Command::new(&uv_path)
+    let mut verify = Command::new(&uv_path);
+    let verify = crate::integrations::clean_mcp_verification_environment(&mut verify)
         .args([
             "run",
             "--directory",

@@ -45,10 +45,7 @@ specs/003-cc-inference-migration/
 ├── data-model.md        # Phase 1 output (this command) — entities and storage shape
 ├── contracts/
 │   └── cc-client.md     # Phase 1 output (this command) — internal cc_client module contract
-├── quickstart.md        # Phase 1 output (this command) — maintainer walkthrough
-├── checklists/
-│   └── requirements.md  # Quality checklist (created by /speckit-specify)
-└── tasks.md             # Phase 2 output (NOT created by /speckit-plan; /speckit-tasks emits it)
+└── quickstart.md        # Phase 1 output (this command) — maintainer walkthrough
 ```
 
 ### Source Code (repository root)

@@ -69,10 +69,10 @@ function App({ integrations }: AppProps) {
             !cpaPoolProviders.has(error.provider),
         );
 
-  const requestUsageData = useCallback(() => {
-    if (usageRequestRef.current) return usageRequestRef.current;
+  const requestUsageData = useCallback((force = false) => {
+    if (!force && usageRequestRef.current) return usageRequestRef.current;
 
-    const request = invoke<UsageData>("fetch_usage_data");
+    const request = invoke<UsageData>(force ? "refresh_usage_data" : "fetch_usage_data");
     usageRequestRef.current = request;
     const clearRequest = () => {
       if (usageRequestRef.current === request) usageRequestRef.current = null;
@@ -81,8 +81,11 @@ function App({ integrations }: AppProps) {
     return request;
   }, []);
 
-  const refresh = useCallback(async (isActive: () => boolean = () => true) => {
-    const request = requestUsageData();
+  const refresh = useCallback(async (
+    isActive: () => boolean = () => true,
+    force = false,
+  ) => {
+    const request = requestUsageData(force);
     try {
       const data = await request;
       if (!isActive() || appliedUsageRequestRef.current === request) return;
@@ -256,6 +259,11 @@ function App({ integrations }: AppProps) {
     await refreshIntegrations();
   };
 
+  const handleUsageRefresh = useCallback(
+    () => refresh(() => true, true),
+    [refresh],
+  );
+
   const emptyState = (() => {
     if (providersError) {
       return {
@@ -281,9 +289,6 @@ function App({ integrations }: AppProps) {
   return (
     <div className="wg-shell" onContextMenu={handleContextMenu} onClick={closeMenu}>
       <WidgetTitleBar
-        providerErrors={titlebarProviderErrors}
-        hasUsageSource={hasUsageSource}
-        lastSyncAt={lastSyncAt}
         pendingUpdate={pendingUpdate}
         updating={updating}
         onUpdate={() => void handleUpdate()}
@@ -314,7 +319,14 @@ function App({ integrations }: AppProps) {
             </div>
           ) : (
             <>
-              <LimitsSection data={usageData} statuses={statuses} />
+              <LimitsSection
+                data={usageData}
+                statuses={statuses}
+                providerErrors={titlebarProviderErrors}
+                hasUsageSource={hasUsageSource}
+                lastSyncAt={lastSyncAt}
+                onRefresh={handleUsageRefresh}
+              />
               <div className="wg-rule" />
               <ViewRegion />
             </>

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 use crate::retention_engine::available_disk_space;
-use crate::with_ingest_write_permit;
+use crate::with_rollup_backfill_write_permit;
 
 /// Hard ceiling communicated to every target callback.
 pub(crate) const ROLLUP_BACKFILL_CHUNK_TARGET: Duration = Duration::from_millis(250);
@@ -357,7 +357,7 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
         if let Some(hook) = controls.before_chunk_permit {
             hook();
         }
-        let chunk = with_ingest_write_permit(|| {
+        let chunk = with_rollup_backfill_write_permit(|| {
             #[cfg(test)]
             if let Some(hook) = controls.after_chunk_permit {
                 hook();

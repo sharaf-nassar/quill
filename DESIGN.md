@@ -309,10 +309,10 @@ is drawn from the metric ramp (`--metric-net-lines` up,
 `--metric-loc-per-hr` down), never from green/red.
 
 **The Cyan Category Rule.** Signal Cyan `#22d3ee` is Quill's own brand accent —
-the titlebar glyph, the update invitation, the marketing tie — and the Runtime
-metric hue. The 5-hour limit label explicitly reuses the Runtime category token.
-These roles cannot be confused with a provider or severity; that is exactly why
-cyan is never assigned to a provider family. Cyan is not an interactive accent:
+the update invitation, the marketing tie — and the Runtime metric hue. The
+5-hour limit label explicitly reuses the Runtime category token. These roles
+cannot be confused with a provider or severity; that is exactly why cyan is
+never assigned to a provider family. Cyan is not an interactive accent:
 selection and focus remain Signal Blue.
 
 **The Dimming Ladder Rule.** Hierarchy is built by brightness, not hue. Step
@@ -406,8 +406,7 @@ fill — the plane stays quiet until you reach for it.
 - **States:** hover lifts the glyph to Text Hi over the `hover` fill; a
   latched key (always-on-top engaged) keeps the brighter glyph. 120ms on
   color and background; never animate layout.
-- This is the whole titlebar right cluster: sync pill, always-on-top, settings,
-  close.
+- This is the whole titlebar right cluster: always-on-top, settings, close.
 
 ### Toggle Strips (range, breakdown mode, any button group)
 - **Shape:** 6px radius, 3px × 9px padding, 10px meta type, transparent at rest.
@@ -427,10 +426,11 @@ fill — the plane stays quiet until you reach for it.
   shadow.
 
 ### Status Pills and Chips
-- **Sync pill:** text and a hairline dot, no capsule. `role="status"`,
-  `aria-live="polite"`, tabular elapsed time in `faint`. Its degraded variants
-  (offline, paused, cached) key off `data-state` and stay slate — a freshness
-  pill never turns red.
+- **Sync control:** the native button at the right of the LIMITS header has a
+  text-and-hairline-dot readout, no capsule, tabular elapsed time in `faint`,
+  and an `aria-busy` state during a live request. Its degraded variants
+  (offline, paused, cached) key off `data-state` and stay slate — it never
+  turns red.
 - **Identity chip:** 999px, 8px micro type, 1px×6px, a ~10% tint of the
   provider's fixed hue with the hue at full strength as text. One provider, one
   color, every surface.

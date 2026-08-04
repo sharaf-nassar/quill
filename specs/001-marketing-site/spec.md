@@ -21,7 +21,7 @@
 
 ### Session 2026-05-11
 
-- Q: The evidence-packet page still feels too flat and unimpressive; how should the page move further upmarket? → A: **Signal Theater** — a dark, cinematic desktop-instrument direction. The page keeps real Quill screenshots and stable anchors, but uses asymmetric hero composition, gapless screenshot bento, horizontal proof accordion, GSAP-pinned scroll narrative, scrubbed text reveal, and a focused install close. JavaScript is progressive enhancement only; content remains readable without it.
+- Q: The evidence-packet page still feels too flat and unimpressive; how should the page move further upmarket? → A: **Signal Theater** — a dark, cinematic desktop-instrument direction. The page keeps real Quill screenshots and stable anchors, but uses asymmetric hero composition, alternating screenshot spotlights, native scroll reveal, and a focused install close. JavaScript is progressive enhancement only; content remains readable without it.
 
 ### Session 2026-05-12
 
@@ -129,7 +129,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 
 #### Content structure
 
-- **FR-009**: The site MUST include a hero section with a headline, a one-line value proposition, a primary call-to-action, and a primary screenshot of the desktop app's main window. The screenshot MAY be augmented with CSS/JS motion that is not required for comprehension. The hero MUST NOT use a `<video>` tag. The hero MUST degrade to a fully readable static screenshot when JavaScript is disabled, GSAP fails to load, or `prefers-reduced-motion: reduce` is set.
+- **FR-009**: The site MUST include a hero section with a headline, a one-line value proposition, a primary call-to-action, and a primary screenshot of the desktop app's main window. The screenshot MAY be augmented with CSS/JS motion that is not required for comprehension. The hero MUST NOT use a `<video>` tag. The hero MUST degrade to a fully readable static screenshot when JavaScript is disabled, the motion script fails to load, or `prefers-reduced-motion: reduce` is set.
 - **FR-010**: The site MUST include dedicated feature sections for at least Live Usage, Analytics Dashboard (Now, Trends, Charts, Context tabs), Context Savings, Session Search, and Learning System.
 - **FR-011**: Each feature section MUST include a benefit-oriented heading, a short description, and at least one screenshot showing that feature in the actual UI.
 - **FR-012**: The Analytics section MUST explicitly explain *how analytics and insights help when working with an LLM* — covering at minimum: subscription-usage awareness (Pro/Max/Plus 5-hour and 7-day windows), latency visibility, token-efficiency feedback, context savings, code velocity, and routing-cost transparency.

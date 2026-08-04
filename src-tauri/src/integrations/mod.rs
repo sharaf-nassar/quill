@@ -8,10 +8,11 @@ pub mod minimax;
 pub mod types;
 
 use parking_lot::{Mutex, MutexGuard};
+use std::process::Command;
 
 pub use manager::{
     confirm_disable, confirm_enable_with_key, detect_all, force_rescan,
-    get_context_preservation_status, get_integration_features, load_statuses,
+    get_context_preservation_status, load_integration_features, load_statuses,
     set_activity_tracking_enabled, set_brevity_enabled, set_context_preservation_enabled,
     set_context_telemetry_enabled, set_minimax_api_key, startup_refresh,
 };
@@ -47,5 +48,30 @@ pub(crate) fn integration_mutation_guard() -> Result<MutexGuard<'static, ()>, St
             "Provider install recovery could not complete: {}",
             errors.join("; ")
         ))
+    }
+}
+
+/// Remove launcher-owned Python variables before an MCP import check.
+pub(crate) fn clean_mcp_verification_environment(command: &mut Command) -> &mut Command {
+    command.env_remove("PYTHONHOME").env_remove("PYTHONPATH")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn mcp_verification_ignores_inherited_python_environment() {
+        let mut command = Command::new("true");
+        clean_mcp_verification_environment(&mut command);
+
+        for variable in ["PYTHONHOME", "PYTHONPATH"] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == OsStr::new(variable) && value.is_none())
+            );
+        }
     }
 }

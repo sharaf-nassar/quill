@@ -323,10 +323,6 @@
   letter-spacing: 0.3px;
 }
 
-.learning-status-tools {
-  font-size: 11px;
-}
-
 .learning-tool-name {
   color: var(--readout);
   font-family: "Geist Mono", "SF Mono", "Fira Code", monospace;

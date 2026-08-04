@@ -48,11 +48,8 @@ specs/007-landlock-inference-sandbox/
 ├── research.md          # Phase 0 design decisions (R-A..R-F)
 ├── data-model.md        # Phase 1 vocabulary + classifier deltas (no schema change)
 ├── quickstart.md        # Phase 1 maintainer verification walkthrough
-├── contracts/
-│   └── landlock-sandbox.md   # Phase 1 confinement-chain contract
-├── checklists/
-│   └── requirements.md  # spec quality checklist
-└── tasks.md             # Phase 2 — /speckit-tasks (NOT created here)
+└── contracts/
+    └── landlock-sandbox.md   # Phase 1 confinement-chain contract
 ```
 
 ### Source Code (repository root)

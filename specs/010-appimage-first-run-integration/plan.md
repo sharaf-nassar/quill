@@ -52,10 +52,8 @@ specs/010-appimage-first-run-integration/
 ├── research.md          # Phase 0 — decisions & rationale (R-A..R-I)
 ├── data-model.md        # Phase 1 — state + entities
 ├── quickstart.md        # Phase 1 — maintainer verification walkthrough
-├── contracts/
-│   └── ipc-commands.md  # Phase 1 — get_appimage_integration_status + integrate_appimage
-└── checklists/
-    └── requirements.md  # /speckit-specify quality checklist
+└── contracts/
+    └── ipc-commands.md  # Phase 1 — get_appimage_integration_status + integrate_appimage
 ```
 
 ### Source Code (repository root)

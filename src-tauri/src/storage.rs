@@ -17902,20 +17902,22 @@ impl Storage {
             hostname: None,
             message_id: None,
         };
-        self.store_live_session_analytics(
-            obs.provider,
-            &obs.session_id,
-            LiveAnalyticsOrigin {
-                project: None,
-                cwd: obs.cwd.as_deref().map(Path::new),
-                hostname: None,
-            },
-            LiveSessionAnalyticsRows {
-                messages: &[],
-                session_events: &[],
-                hook_invocations: std::slice::from_ref(&invocation),
-            },
-        )
+        crate::with_rollup_backfill_write_permit(|| {
+            self.store_live_session_analytics(
+                obs.provider,
+                &obs.session_id,
+                LiveAnalyticsOrigin {
+                    project: None,
+                    cwd: obs.cwd.as_deref().map(Path::new),
+                    hostname: None,
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &[],
+                    session_events: &[],
+                    hook_invocations: std::slice::from_ref(&invocation),
+                },
+            )
+        })
     }
 
     /// Atomically persist one source-less analytics batch and the exact origin
@@ -28612,6 +28614,85 @@ mod tests {
             0,
             "TRUNCATE checkpoint must start the contention run at zero WAL bytes"
         );
+    }
+
+    // @lat: [[data-flow#Hook Telemetry Pipeline]]
+    #[test]
+    #[serial]
+    fn codex_hook_observation_waits_for_rollup_chunk_writer() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = std::sync::Arc::new(init_storage_in(&dir));
+        let (writer_ready_tx, writer_ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_writer_tx, release_writer_rx) = std::sync::mpsc::sync_channel(0);
+        let writer = std::thread::spawn(move || {
+            crate::with_rollup_backfill_write_permit(|| {
+                writer_ready_tx
+                    .send(())
+                    .expect("signal rollup writer gate acquisition");
+                release_writer_rx
+                    .recv()
+                    .expect("release rollup writer gate");
+            });
+        });
+        writer_ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("rollup writer holds gate");
+
+        let hook_storage = std::sync::Arc::clone(&storage);
+        let (hook_attempt_tx, hook_attempt_rx) = std::sync::mpsc::sync_channel(0);
+        let (hook_done_tx, hook_done_rx) = std::sync::mpsc::channel();
+        let hook = std::thread::spawn(move || {
+            hook_attempt_tx
+                .send(())
+                .expect("signal Codex hook persistence attempt");
+            let result =
+                hook_storage.store_codex_hook_observation(&crate::models::CodexHookObservation {
+                    provider: IntegrationProvider::Codex,
+                    session_id: "codex-hook-gate-session".to_string(),
+                    hook_event: "PreToolUse".to_string(),
+                    tool_name: Some("Bash".to_string()),
+                    cwd: None,
+                    ts: "2026-08-04T12:00:00Z".to_string(),
+                    hook_matcher: None,
+                    agent_id: None,
+                });
+            hook_done_tx
+                .send(result)
+                .expect("report Codex hook persistence result");
+        });
+        hook_attempt_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Codex hook reaches writer gate");
+        assert!(
+            matches!(
+                hook_done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "Codex hook must wait while a rollup chunk owns the writer gate"
+        );
+
+        release_writer_tx
+            .send(())
+            .expect("release rollup writer gate");
+        writer.join().expect("rollup writer joins");
+        hook_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Codex hook persists after rollup writer releases gate")
+            .expect("Codex hook persistence succeeds");
+        hook.join().expect("Codex hook worker joins");
+
+        let hook_count = storage
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM hook_invocations
+                 WHERE provider = ?1 AND session_id = ?2",
+                params!["codex", "codex-hook-gate-session"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count persisted Codex hook");
+        assert_eq!(hook_count, 1);
     }
 
     fn assert_rollup_wal_bound(

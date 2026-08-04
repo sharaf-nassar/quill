@@ -5,12 +5,12 @@
 
 ## Summary
 
-Build a static, single-page marketing site for Quill, hosted at the project's GitHub Pages URL, with a **Signal Theater** visual identity: Quill's dark app surface, actual logo mark, clipped geometry, Cabinet Grotesk display stack, cyan/purple logo accents, progressive GSAP motion, and real dark product screenshots as the primary proof. The page deep-links to seven anchored sections (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`). All UI screenshots come from a sandboxed Quill instance pointed at temp directories via two new env vars (`QUILL_DATA_DIR`, `QUILL_RULES_DIR`) gated by an opt-in `QUILL_DEMO_MODE=1` flag, so a maintainer's personal Quill state is never touched. The existing seeder (`scripts/populate_dummy_data.py`) and screenshot driver (`scripts/take_screenshots.sh`) are extended; two new cross-platform launchers wire the sandbox together. A new GitHub Actions workflow (`.github/workflows/pages.yml`) deploys the site via `actions/deploy-pages`.
+Build a static, single-page marketing site for Quill, hosted at the project's GitHub Pages URL, with a **Signal Theater** visual identity: Quill's dark app surface, actual logo mark, clipped geometry, Cabinet Grotesk display stack, cyan/purple logo accents, progressive native motion, and real dark product screenshots as the primary proof. The page deep-links to seven anchored sections (`#hero`, `#live`, `#analytics`, `#context`, `#search`, `#learning`, `#install`). All UI screenshots come from a sandboxed Quill instance pointed at temp directories via two new env vars (`QUILL_DATA_DIR`, `QUILL_RULES_DIR`) gated by an opt-in `QUILL_DEMO_MODE=1` flag, so a maintainer's personal Quill state is never touched. The existing seeder (`scripts/populate_dummy_data.py`) and screenshot driver (`scripts/take_screenshots.sh`) are extended; two new cross-platform launchers wire the sandbox together. A new GitHub Actions workflow (`.github/workflows/pages.yml`) deploys the site via `actions/deploy-pages`.
 
 ## Technical Context
 
 **Language/Version**: HTML5 + CSS3 + small progressive JavaScript for the site; Rust 2024 edition for the env-var override (existing toolchain); Python 3 for the seeder extension (existing).
-**Primary Dependencies**: GSAP from CDN for progressive marketing-page motion; no framework and no build step. GitHub Actions: `actions/checkout@v4`, `actions/configure-pages@v5`, `actions/upload-pages-artifact@v3`, `actions/deploy-pages@v4`. App-side reuses existing crates (`tauri`, `directories` already pulled by Tauri).
+**Primary Dependencies**: Browser-native IntersectionObserver and CSS transitions for progressive marketing-page motion; no framework, runtime dependency, or build step. GitHub Actions: `actions/checkout@v4`, `actions/configure-pages@v5`, `actions/upload-pages-artifact@v3`, `actions/deploy-pages@v4`. App-side reuses existing crates (`tauri`, `directories` already pulled by Tauri).
 **Storage**: N/A for the marketing site (static deliverable). Demo Quill instance writes its SQLite DB to `$QUILL_DATA_DIR/usage.db` instead of the platform default.
 **Testing**: Site — manual Lighthouse run (Chrome DevTools or `npx @lhci/cli`) before merge, manual cross-browser smoke (latest Chromium, Firefox, WebKit). App-side — one new unit test in `src-tauri/src/data_paths.rs` covering the env-var resolver under set / unset / demo-mode-off cases. Seeder — manual launcher round-trip on Linux at minimum.
 **Target Platform**: GitHub Pages (`https://*.github.io/quill/`) for the site. Demo Quill isolation works on Linux, macOS, and Windows.
@@ -44,15 +44,12 @@ specs/001-marketing-site/
 ├── research.md          # Phase 0 output — decisions, rationale, alternatives
 ├── data-model.md        # Phase 1 output — sandbox layout, asset naming
 ├── quickstart.md        # Phase 1 output — maintainer walkthrough
-├── contracts/           # Phase 1 output — public-surface contracts
-│   ├── site-anchors.md
-│   ├── env-vars.md
-│   ├── seeder-cli.md
-│   ├── launcher-cli.md
-│   └── pages-workflow.md
-├── checklists/
-│   └── requirements.md  # Already written by /speckit-specify
-└── tasks.md             # Phase 2 output — created by /speckit-tasks (not this command)
+└── contracts/           # Phase 1 output — public-surface contracts
+    ├── site-anchors.md
+    ├── env-vars.md
+    ├── seeder-cli.md
+    ├── launcher-cli.md
+    └── pages-workflow.md
 ```
 
 ### Source Code (repository root)
@@ -61,7 +58,7 @@ specs/001-marketing-site/
 marketing-site/                              # NEW — site source root (FR-002)
 ├── index.html                               # Single page with seven anchored sections
 ├── styles.css                               # Signal Theater theme; no remote fonts
-├── motion.js                                # Progressive GSAP scroll + carousel behavior
+├── motion.js                                # Progressive native scroll-reveal behavior
 ├── assets/
 │   ├── screenshots/                         # @2x PNG captures from sandboxed Quill
 │   │   ├── hero.png
@@ -71,8 +68,7 @@ marketing-site/                              # NEW — site source root (FR-002)
 │   │   ├── analytics-context.png
 │   │   ├── sessions.png
 │   │   └── learning.png
-│   ├── og-image.png                         # 1200x630 social-share preview
-│   └── favicon.svg
+│   └── og-image.png                         # 1200x630 social-share preview
 └── README.md                                # Source-tree map and contribution notes
 
 .github/workflows/

@@ -117,9 +117,9 @@ leaves the frame, and one view below it that the header's dropdown swaps.
     <td align="center"><strong>Context</strong></td>
   </tr>
   <tr>
-    <td valign="top"><img src="screenshots/widget-usage.png" width="300" alt="The Quill widget on its Usage view: LIMITS rows for Claude and Codex with utilization bars and reset countdowns, a six-hour token chart, runtime and tokens-per-line readouts with sparklines, and a session breakdown" /></td>
-    <td valign="top"><img src="screenshots/widget-charts.png" width="300" alt="The Quill widget on its Charts view: stacked tokens, code-added-and-removed, and cache-hit timelines under the LIMITS band" /></td>
-    <td valign="top"><img src="screenshots/widget-context.png" width="300" alt="The Quill widget on its Context view: preserved and retrieved token totals with a ratio bar, the tokens-saved insight line, and routing cost" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/hero.png" width="300" alt="The Quill widget on its Usage view: LIMITS rows for Claude and Codex with utilization bars and reset countdowns, a six-hour token chart, runtime and tokens-per-line readouts with sparklines, and a session breakdown" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-charts.png" width="300" alt="The Quill widget on its Charts view: stacked tokens, code-added-and-removed, and cache-hit timelines under the LIMITS band" /></td>
+    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-context.png" width="300" alt="The Quill widget on its Context view: preserved and retrieved token totals with a ratio bar, the tokens-saved insight line, and routing cost" /></td>
   </tr>
 </table>
 
@@ -382,7 +382,6 @@ src/                          # React frontend
     ManageWindowView.tsx      # Rail-navigated Manage workspace hosting the four sections
     SessionsWindowView.tsx    # Sessions section (session search)
     LearningWindow.tsx        # Learning section (Rules / Memory / Runs)
-    RestartWindowView.tsx     # Instances section
     SettingsWindowView.tsx    # Settings section
     ReleaseNotesWindow.tsx    # Release notes viewer window
   hooks/                      # IPC data hooks
