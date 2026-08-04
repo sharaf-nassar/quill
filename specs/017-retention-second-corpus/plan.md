@@ -1,5 +1,7 @@
 # Implementation Plan: Retention Second Corpus
 
+**Historical implementation plan.** `retention_corpus`, `retention_study`, and the older `retention_spike` named below were removed on 2026-08-03. Paths and commands record the completed design and are not runnable.
+
 ## Architecture Approach
 
 Feature 017 delivers study tooling and a reproducible protocol, not a second

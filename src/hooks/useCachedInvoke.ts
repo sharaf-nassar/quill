@@ -6,13 +6,6 @@ import {
 	type CachedInvokeSnapshot,
 } from "./cachedInvokeStore";
 
-export {
-	CACHED_INVOKE_COALESCE_MS,
-	CACHED_INVOKE_TTL_MS,
-	cleanupInvokeListeners,
-	invalidateCachedInvoke,
-} from "./cachedInvokeStore";
-
 interface RequestState<T, E> {
 	cacheKey: string;
 	data: T | null;

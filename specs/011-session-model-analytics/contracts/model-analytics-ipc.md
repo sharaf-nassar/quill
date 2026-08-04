@@ -1,12 +1,13 @@
 # Contract: Model Analytics IPC
 
-These Tauri commands return bounded summary, table, history, and backfill data for
-the Models tab. Serialized Rust fields use camelCase.
+Four Tauri commands expose the current Models overview, session paging,
+session detail, and retained-history retry surfaces. Serialized Rust fields use
+camelCase and every command rejects with the shared structured error below.
 
 ## Shared types
 
 ```ts
-type ModelRange = "1h" | "24h" | "7d" | "30d";
+type ModelRange = "1h" | "6h" | "24h" | "7d" | "30d";
 
 type ModelIdentity = {
   provider: string;
@@ -34,15 +35,19 @@ type ModelBackfillStatus = {
 };
 ```
 
-`provider: null` means all providers. A concrete provider uses Quill's existing
-provider vocabulary; model IDs remain unconstrained opaque strings.
+`provider: null` means all providers. Concrete providers use Quill's provider
+vocabulary. Model IDs remain opaque strings but must pass the ingest boundary's
+non-empty, scalar-count, and control-character validation.
 
-## Command: `get_model_analytics`
+The shipped TypeScript `ModelRange` and UI expose the five values above. Rust's
+validator also accepts `90d` for direct internal callers.
+
+## Command: `get_model_usage_overview`
 
 ### Request
 
 ```ts
-invoke("get_model_analytics", {
+invoke("get_model_usage_overview", {
   range: ModelRange,
   provider: string | null,
 });
@@ -51,7 +56,7 @@ invoke("get_model_analytics", {
 ### Response
 
 ```ts
-type ModelAnalyticsResponse = {
+type ModelUsageOverviewResponse = {
   generatedAt: string;
   range: ModelRange;
   provider: string | null;
@@ -63,135 +68,245 @@ type ModelAnalyticsResponse = {
     inventoryComplete: boolean;
     scopeFinal: boolean;
   };
-  summary: {
+  backfill: ModelBackfillStatus;
+  buildingIndex?: boolean;
+  totals: {
+    sessions: number;
+    projects: number;
+    turns: number;
     attributedTokens: number;
-    unattributedTokens: number;
     totalTokens: number;
-    attributedCoveragePercent: number | null;
+    coveragePercent: number | null;
     distinctModels: number;
     multiModelSessions: number;
   };
-  models: ModelUsageRow[];
-  backfill: ModelBackfillStatus;
-};
-
-type ModelUsageRow = {
-  identity: ModelIdentity;
-  attributedTokens: number;
-  attributedSharePercent: number | null;
-  inputTokens: number;
-  outputTokens: number;
-  cacheCreationTokens: number;
-  cacheReadTokens: number;
-  observedTurns: number;
-  sessionCount: number;
-  cacheReadSharePercent: number | null;
-  firstSeen: string;
-  lastSeen: string;
+  runningNow: Array<{
+    provider: string;
+    modelId: string;
+    lastSeenAt: string;
+    runningSinceAt: string;
+    previousModelId: string | null;
+  }>;
+  models: Array<{
+    identity: ModelIdentity;
+    sessions: number;
+    sessionPercent: number | null;
+    projects: number;
+    turns: number;
+    primaryIn: number;
+    daysActive: number;
+    attributedTokens: number;
+    sharePercent: number | null;
+    firstSeen: string;
+    lastSeen: string;
+  }>;
+  activity: {
+    bucketSeconds: number;
+    bucketStarts: string[];
+    series: Array<{
+      identity: ModelIdentity;
+      sessionsPerBucket: number[];
+    }>;
+  };
+  projectMatrix: Array<{
+    project: string;
+    totalSessions: number;
+    cells: Array<{
+      identity: ModelIdentity;
+      sessions: number;
+    }>;
+  }>;
+  combinations: {
+    single: number;
+    dual: number;
+    threePlus: number;
+    topPairs: Array<{
+      a: ModelIdentity;
+      b: ModelIdentity;
+      sharedSessions: number;
+    }>;
+  };
+  delegation: {
+    parentTokens: number;
+    subagentTokens: number;
+    parentTop: {
+      identity: ModelIdentity;
+      sharePercent: number;
+    } | null;
+    subagentTop: {
+      identity: ModelIdentity;
+      sharePercent: number;
+    } | null;
+  };
 };
 ```
 
-The backend returns every observed model in scope. Default order is attributed
-tokens descending, then provider and raw model ID ascending. The frontend may
-stably sort the complete response by any displayed column without changing
-scope.
+The command returns the complete current Models-page payload from one SQLite
+read snapshot. `models` is provider-qualified carry-forward attribution;
+`activity` is a zero-filled fixed bucket axis; `projectMatrix`, `combinations`,
+and `delegation` are bounded overview facets. `buildingIndex` is true while the
+hourly model rollup is not complete and the reader therefore preserves its raw
+evidence path.
 
-`globalSessionCount` counts distinct `(provider, analyticsSessionId)` pairs across
-all unsuppressed retained source activity, independent of active range/provider.
-`scopedSessionCount` counts distinct pairs with at least one normalized observation
-timestamp inside the half-open active interval `[rangeStart, rangeEnd)`, joined to
-unsuppressed source ownership and the provider filter. `scopedEvidenceCount`
-counts accepted non-null model observations in that same scope.
-`representedProviders` comes from any normalized observation timestamp inside the
-selected interval joined to an unsuppressed source, so it can include a provider
-with zero accepted model IDs. Source first/last interval overlap alone never proves
-in-range activity.
+`globalSessionCount` is independent of the selected scope.
+`scopedSessionCount`, `scopedEvidenceCount`, represented providers, totals, and
+facets require actual normalized observations inside the half-open selected
+range and optional provider filter. Suppressed sources contribute nothing.
+`scopeFinal` is true only when inventory is complete, status is `complete`, no
+root or source failed, and no source remains.
 
-Suppressed sources contribute no scope or empty-state facts.
-`scope.inventoryComplete` equals persisted backfill completeness; it is not
-inferred from status because a partial run can have complete root discovery plus
-individual unreadable sources. `scopeFinal` is true only when status is complete,
-inventory is complete, failed roots/sources are zero, and remaining sources are
-zero. Only `scopeFinal` authorizes final empty claims.
-
-### Empty-state precedence
-
-1. `scopeFinal && globalSessionCount === 0`: no sessions exist.
-2. `scopeFinal && scopedSessionCount === 0`: active provider/range has no session activity.
-3. `scopeFinal && scopedSessionCount > 0 && scopedEvidenceCount === 0`: no reliable model
-   evidence exists in scope.
-4. Otherwise render recovered data plus provisional/incomplete scope wording,
-   even when backfill is partial or failed.
-
-## Command: `get_model_history`
+## Command: `get_model_sessions`
 
 ### Request
 
 ```ts
-invoke("get_model_history", {
+invoke("get_model_sessions", {
   range: ModelRange,
-  provider: string | null,
-  selectedModel: ModelIdentity | null,
+  modelProvider: string,
+  modelId: string,
+  cursor?: string | null,
+  limit?: number | null,
+});
+```
+
+`limit` defaults to 20 and is clamped to 1 through 100. `cursor` is opaque and
+belongs to the exact range and model identity that produced it.
+
+### Response
+
+```ts
+type ModelSessionsResponse = {
+  identity: ModelIdentity;
+  total: number;
+  nextCursor: string | null;
+  sessions: Array<{
+    provider: string;
+    sessionId: string;
+    displayName: string;
+    cwd: string | null;
+    hostname: string | null;
+    selectedModelTokens: number;
+    selectedModelTurns: number;
+    lastActivityAt: string;
+    primaryModel: ModelIdentity;
+    distinctModels: number;
+    hasWithinChainSwitches: boolean;
+    chainCount: number;
+  }>;
+};
+```
+
+Sessions order by last activity descending, then provider and session ID
+ascending. Every aggregate is limited to the requested range. A malformed,
+stale, or foreign cursor returns `invalid_cursor` rather than an empty page.
+
+## Command: `get_session_model_history`
+
+### Request
+
+```ts
+invoke("get_session_model_history", {
+  provider: string,
+  sessionId: string,
+  range: ModelRange,
 });
 ```
 
 ### Response
 
 ```ts
-type ModelHistoryResponse = {
-  generatedAt: string;
-  range: ModelRange;
-  provider: string | null;
-  selectedModel: ModelIdentity | null;
-  bucketSeconds: number;
-  buildingIndex?: boolean;
-  points: Array<{
-    bucketStart: string;
-    bucketEnd: string;
+type SessionModelHistoryResponse = {
+  provider: string;
+  sessionId: string;
+  displayName: string;
+  primaryModel: ModelIdentity | null;
+  distinctModels: number;
+  switchCount: number;
+  attributedTokens: number;
+  unattributedTokens: number;
+  chains: Array<{
+    chainId: string;
+    parentChainId: string | null;
+    kind: "parent" | "subagent";
+    agentId: string | null;
+    switchCount: number;
     attributedTokens: number;
     unattributedTokens: number;
-    selectedModelTokens: number | null;
+    segments: Array<
+      | {
+          kind: "model";
+          identity: ModelIdentity;
+          startedAt: string;
+          endedAt: string;
+          turnCount: number;
+          attributedTokens: number;
+        }
+      | {
+          kind: "modelGap";
+          startedAt: string;
+          endedAt: string;
+          turnCount: number;
+        }
+    >;
   }>;
 };
 ```
 
-`buildingIndex` is true while the hourly model rollup is pending, running, or
-failed and history therefore preserves the established raw query. After
-completion it is false. Complete closed UTC hours use rollups only when one
-hour fits wholly inside one existing response bucket; boundary-crossing and
-current hours remain raw, preserving the fixed sliding bucket axis.
+Consecutive same-model turns compress into one model segment. Consecutive
+null-model turns compress into a `modelGap`, which resets adjacency. Parent and
+subagent chains remain separate. A session with no retained evidence in the
+selected range returns `not_found`.
 
-Bucket widths are fixed by range: 300 seconds for `1h`, 3,600 for `24h`, 21,600
-for `7d`, and 86,400 for `30d`. Empty buckets are returned as zeros so chart axes
-remain stable. Selected-model tokens are a subset of attributed tokens and never
-hide the aggregate attributed/unattributed series.
+## Command: `retry_model_history_backfill`
 
-## Refresh contract
+### Request and response
 
-`ModelsTab` owns one `model-analytics-updated` listener and one 60-second fallback
-poll while mounted. Backend events arrive after commit. The first unhandled event
-opens a fixed one-second coalescing window; later events join that window without
-extending its deadline. One trailing refresh starts when the window closes, so a
-continuous event stream cannot starve the five-second visibility target.
+```ts
+const status = await invoke<ModelBackfillStatus>(
+  "retry_model_history_backfill",
+);
+```
 
-Each event or poll refreshes aggregates and history and advances one
-frontend-only monotonically increasing refresh generation consumed by mounted
-detail hooks. Model selection alone refetches history and selected-model sessions,
-not aggregates. Range or provider changes create a new request identity and clear
-selection when that identity is no longer represented. Responses from an older
-identity or generation are ignored.
+If no retained-history run is scheduled, retry advances the generation,
+commits a `pending` status with trigger `retry`, emits that committed status,
+and schedules the worker. If one is already scheduled, it returns the current
+status without starting another run. Retry never deletes valid observations.
 
-Aggregates and history expose independent initial-loading, refresh-loading,
-error, and retry state. Refreshing an unchanged request identity keeps its last
-successful response visible until replacement succeeds. Each error notice retries
-only its failed command for the current range, provider, and selected model. Data
-from an old scope is never presented as belonging to a new scope.
+## Current refresh contract
 
-Range and provider filters are separately labeled native-button groups using
-`aria-pressed`, not tab roles. The history chart has an accessible label and a
-visually hidden semantic table containing bucket bounds plus attributed,
-unattributed, and selected-model values. Model inspection uses a native selection
-button while the adjacent raw identifier remains selectable and copyable.
+The current Models view mounts `useModelAnalytics`, which calls only
+`get_model_usage_overview` plus `retry_model_history_backfill`. Session paging
+and session history remain supported IPC commands, but today's Models view has
+no inspect panel and does not mount detail hooks.
+
+Overview cache identity is the command plus exact `{ range, provider }`
+arguments. Entries live for 45 seconds across React unmounts. A data-changing
+`model-analytics-updated` event invalidates matching entries; status-only events
+with `dataChanged: false` do not. Mounted visible subscribers join the widget's
+shared fixed five-second refresh fan-out. Hidden subscribers stay stale and
+refresh when visible again.
+
+While the Models view is active, a 60-second fallback poll refreshes the same
+overview identity. Hidden or inactive polls defer one refresh until the view is
+observable. A same-scope refresh retains the last accepted response beside its
+refresh or error state. Accepted overview responses merge backfill status by
+generation and monotonic lifecycle/progress facts; a delayed older snapshot
+cannot roll status backward. Overview Retry retries only the overview request;
+backfill Retry uses its separate guarded command state.
+
+## Event: `model-analytics-updated`
+
+```ts
+type ModelAnalyticsUpdatedEvent = {
+  generation: number;
+  status: "pending" | "running" | "complete" | "partial" | "failed";
+  dataChanged: boolean;
+  updatedAt: string;
+};
+```
+
+Events are advisory and follow committed state or data changes. They never carry
+overview rows; clients refetch authoritative command responses.
 
 ## Error contract
 
@@ -211,8 +326,5 @@ type ModelAnalyticsError = {
 ```
 
 Every query and retry command rejects with this serialized object, never a plain
-string. Validation messages are bounded and user-safe. Full storage/internal
-details stay in local logs; the returned storage message remains generic.
-Malformed or foreign keyset cursors use `invalid_cursor`; capped limits are not
-errors; `not_found` is reserved for stale session detail. Unexpected errors are
-not converted into empty successful responses.
+string. Validation messages are bounded and user-safe. Storage details remain
+in local logs. Unexpected errors do not become empty successful responses.

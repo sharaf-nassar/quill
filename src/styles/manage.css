@@ -203,9 +203,7 @@
   overflow: hidden;
 }
 
-/* Each section reuses its existing window-view component. Suppress that
- * component's own window chrome (titlebar + close) so it sits flush inside the
- * pane, and let it fill the available height (overriding its 100vh wrapper). */
+/* Let each section fill the pane instead of its standalone 100vh wrapper. */
 .manage-content > .sessions-window,
 .manage-content > .learning-window,
 .manage-content > .restart-window,
@@ -215,12 +213,6 @@
   min-height: 0;
   border: none;
   background: transparent;
-}
-.manage-content .sessions-window-titlebar,
-.manage-content .learning-window-titlebar,
-.manage-content .restart-window-titlebar,
-.manage-content .settings-window-titlebar {
-  display: none;
 }
 
 /* Suspense fallback while a section chunk loads. */

@@ -24,13 +24,13 @@ use crate::sessions::{
     RetainedJsonlSourceLayoutHint,
 };
 use crate::storage::{
-    ModelSourceChange, ModelSourceFastFingerprint, ModelSourceFingerprint,
-    ModelSourceReplacementOutcome, Storage, StoredModelSource, classify_model_source_change,
-    model_source_fast_fingerprint,
+    ModelSourceChange, ModelSourceReplacementOutcome, Storage, StoredModelSource,
+    classify_model_source_change,
 };
 use crate::transcript_identity::{
-    IdentityError, JsonlRecord, NativeChainIdentity, RETAINED_TRANSCRIPT_MAX_BYTES,
-    SourceRootGraph, resolve_codex_native_identity,
+    IdentityError, JsonlRecord, ModelSourceFastFingerprint, ModelSourceFingerprint,
+    NativeChainIdentity, SourceRootGraph, model_source_fast_fingerprint, read_stable_transcript,
+    resolve_codex_native_identity,
 };
 
 const MODEL_ID_MAX_SCALARS: usize = 256;
@@ -2984,7 +2984,7 @@ fn source_fast_fingerprint(
             discovered.canonical_path.display()
         )
     })?;
-    model_source_fast_fingerprint(&discovered.canonical_path, &metadata)
+    model_source_fast_fingerprint(&metadata).map_err(|error| error.to_string())
 }
 
 fn stage_source_content(staged: &mut StagedModelSource, hostname: &str) {
@@ -3050,35 +3050,8 @@ fn read_stable_source_bytes(
     discovered: &DiscoveredRetainedJsonlSource,
     expected_fast: ModelSourceFastFingerprint,
 ) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-
-    // Reject a known-oversize source from its already-collected fingerprint
-    // before opening it, so a huge transcript is never read into memory.
-    if u64::try_from(expected_fast.size_bytes())
-        .is_ok_and(|size| size > RETAINED_TRANSCRIPT_MAX_BYTES)
-    {
-        return Err(format!(
-            "source exceeds {RETAINED_TRANSCRIPT_MAX_BYTES}-byte model reconciliation cap"
-        ));
-    }
-
-    // Bound the read itself so a source that grows past the cap between
-    // fingerprinting and reading still cannot exhaust memory: read at most one
-    // byte beyond the cap and reject anything that reaches it, keeping the
-    // oversize path consistent with the read/re-fingerprint stability check.
-    let file = std::fs::File::open(&discovered.canonical_path)
-        .map_err(|error| format!("open complete source bytes: {error}"))?;
-    let mut contents = Vec::new();
-    file.take(RETAINED_TRANSCRIPT_MAX_BYTES.saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(|error| format!("read complete source bytes: {error}"))?;
-    if contents.len() as u64 > RETAINED_TRANSCRIPT_MAX_BYTES {
-        return Err(format!(
-            "source grew past {RETAINED_TRANSCRIPT_MAX_BYTES}-byte model reconciliation cap while reading"
-        ));
-    }
-
-    let observed_fast = source_fast_fingerprint(discovered)?;
+    let (contents, observed_fast) =
+        read_stable_transcript(&discovered.canonical_path).map_err(|error| error.to_string())?;
     if observed_fast != expected_fast {
         return Err("source changed while it was being read".to_string());
     }

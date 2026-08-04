@@ -98,18 +98,15 @@ The SQLite database file path varies by operating system.
 - Linux: `~/.local/share/com.quilltoolkit.app/usage.db`
 - macOS: `~/Library/Application Support/com.quilltoolkit.app/usage.db`
 
-### VACUUM maintenance spike
+### VACUUM maintenance evidence
 
-[[src-tauri/src/bin/vacuum_spike.rs]] creates and removes a 7.45 GB synthetic SQLite copy to measure VACUUM and demonstrate that a process-wide quiesce flag makes ingest retry during maintenance.
+The frozen measurement in `specs/013-analytics-query-perf/vacuum-spike.md` records compaction cost and the ingest-quiesce behavior that production maintenance preserves.
 
-### Index-drop query plan spike
+### Provider/source index plan evidence
 
-[[src-tauri/src/bin/eqp_index_drop_spike.rs]] proves that dropping the plain `(provider, source_key)` index on `session_events` costs no query its index seek, by comparing `EXPLAIN QUERY PLAN` output before and after the drop.
+The frozen proof in `specs/014-retention-pruning/eqp-index-drop-proof.md` established that SQLite uses the partial source-owned unique index after a redundant plain provider/source index is removed.
 
-Every `session_events` statement constrained on `(provider, source_key)` — the three source-owned delete sites — must report a search through the partial `uidx_se_owned(provider, source_key, event_key) WHERE source_key IS NOT NULL`, because `source_key = ?` implies `source_key IS NOT NULL`. That implication is SQLite-version-dependent, so the spike proves it against the vendored build rather than assuming it. A single `SCAN` fails the run with a nonzero exit.
-
-Plans are read from an in-memory replica so nothing is written. Setting `QUILL_EQP_DB` to a real `usage.db` opens it read-only, records whether `ANALYZE` statistics could be steering the planner, and rebuilds the replica from that database's own DDL instead of the vendored copy.
-
+Current regression tests extend that proof across all five transcript analytics tables and the bundled SQLite version. Each source-owned delete must report its `uidx_*_owned` seek and no table scan.
 ### Redundant provider/source index drop
 
 [[src-tauri/src/storage.rs#ensure_startup_indexes]] drops `idx_session_events_provider_source(provider, source_key)` on every open, because the partial `uidx_se_owned` already serves every statement that index existed for.
@@ -127,7 +124,7 @@ Correctness rests on `source_key = ?` implying `source_key IS NOT NULL`, which
 keeps the partial `uidx_se_owned(provider, source_key, event_key) WHERE
 source_key IS NOT NULL` usable for all three source-owned delete sites. That
 implication is SQLite-version-dependent, so it was proved by the
-[[backend#Backend#Database#Index-drop query plan spike]] before the drop
+[[backend#Backend#Database#Provider/source index plan evidence]] before the drop
 shipped and is pinned permanently by the test specs below. Retention drops
 exactly this one index and no other — `idx_se_timestamp_chain` is recreated in
 the same function precisely because `get_llm_runtime_stats` pins it with
@@ -153,30 +150,17 @@ All three `(provider, source_key)` `session_events` delete statements must
 still report a search through `uidx_se_owned` and never a `SCAN`, so a future
 query change cannot silently trade the drop for a full table scan.
 
-### Index-drop footprint spike
+### Provider/source index footprint evidence
 
-[[src-tauri/src/bin/index_drop_measure_spike.rs]] measures what the index drop buys and what it costs on a production-sized copy: reclaimed whole-file bytes, `DROP INDEX` wall time, and the WAL the drop produces.
+The frozen measurement in `specs/014-retention-pruning/index-drop-measurement.md` records the storage benefit and maintenance cost of removing a redundant provider/source index.
 
-It observes rather than asserts, since every figure is corpus-dependent; its
-only failure modes are a source database that never carried the index and an
-index that survived its own `DROP`. The source is opened read-only and copied
-with `VACUUM INTO`, which is safe while the app writes and yields an
-already-compacted baseline, so the before/after delta is the index's own
-footprint instead of that footprint plus unrelated free pages. The copy's WAL
-is truncated before the drop so the recorded WAL delta belongs to the drop
-alone, and the final `VACUUM` runs on a dedicated connection mirroring
-[[src-tauri/src/storage.rs#Storage#vacuum_database]]. Recorded results live in
-`specs/014-retention-pruning/index-drop-measurement.md`: on a 7.55 GB database
-the drop took 416 ms, dirtied 471 KiB of WAL, freed no filesystem bytes until
-compaction, and reclaimed 727 MB once VACUUM ran.
-
+On the measured 7.55 GB database, the drop took 416 ms, dirtied 471 KiB of WAL, and reclaimed 727 MB after VACUUM. Production keeps the proven index removal; the one-off corpus utility is no longer shipped.
 ### Retention timing spike
 
-[[src-tauri/src/bin/retention_spike.rs]] measures a ~700k-row chunked delete on the frozen retention corpus and publishes the numeric budgets the delete engine and its preflight are built against. It is a measurement, not a test.
+The frozen measurement in `specs/014-retention-pruning/retention-timing-spike.md` supplies the numeric budgets used by the retention delete engine and preflight.
 
-It consumes the same `pub` builder the retention tests do, which is what keeps
-budget numbers and acceptance numbers on one corpus. Against a 2M-row, 1.29 GB
-database it sweeps five chunk sizes on a fresh copy each, and fixes: a
+The measurement used the same fixture retained by acceptance tests. Against a
+2M-row, 1.29 GB database it swept five chunk sizes and fixed: a
 **25,000-row chunk** (the largest whose p95 transaction hold stays under one
 second — the visible-progress threshold for a background job, not the
 instantaneous-response one), **789 WAL bytes per row**, **11 TEMP bytes per
@@ -204,37 +188,9 @@ Full numbers live in `specs/014-retention-pruning/retention-timing-spike.md`.
 
 ### Widget query benchmark corpus
 
-[[src-tauri/src/bin/widget_query_perf_spike.rs]] freezes and measures the
-production-size corpora used for feature 020's reproducible widget-query A/B
-and corrected-volume sizing evidence.
+Feature 020's frozen evidence records production-scale query timings, planner audits, and corrected rollup volume without keeping corpus tooling in the application crate.
 
-`freeze` reads a live WAL-backed database through SQLite's online backup API,
-refuses to overwrite an existing destination, validates the resulting snapshot,
-and makes it read-only. `measure` rejects writable corpora, opens a fresh
-read-only storage handle per query or view fan-out, and pins all 24h, 30d, and
-90d windows to one thread-local endpoint. Each operation runs cold and then
-immediately warm; view totals cover backend work only and explicitly exclude
-IPC and frontend rendering. It retains the real storage SQL and Rust
-post-processing while never running migrations, cleanup, or retention against
-the corpus. The database remains local and untracked; only its path, hash,
-endpoints, protocol, and timing table are committed in
-`specs/020-widget-query-perf/timing-measurement.md`.
-
-The original `usage-2026-08-02.db` remains the immutable BEFORE and post-A/B
-timing baseline. Corrected-volume acceptance uses a distinct
-`usage-2026-08-03.db`: two stable retained-file inventories bracket one
-read-only registry snapshot, and freeze starts only when durable reconciliation
-is complete with zero missing or fingerprint-mismatched current sources. Two
-independently derived 90-day fixtures must then match normalized raw and hybrid
-overview/history results before cleanup. That corpus measures 1,031 bytes per
-model rollup row including indexes, making the conservative 1.8-million-row
-annual envelope 1.856 GB rather than the original 350-byte estimate's ~650 MB.
-
-`diagnose-model` is the read-only residual-work audit for the same pinned
-corpus. It reports rollup lifecycle and authority counts, raw/rollup
-cardinalities, and SQLite query plans for the overview project-ranking and
-history boundary-hour stages without changing the database.
-
+The immutable protocols and results remain in `specs/020-widget-query-perf/timing-measurement.md`. They established the current read-only connection settings, bounded planner analysis, raw/hybrid overview parity, and a conservative 1.856 GB annual model-rollup envelope.
 ### Database compaction
 
 [[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.
@@ -264,33 +220,7 @@ and load the new statistics on open. Result caches remain valid because planner
 statistics cannot change query semantics. Skipped preflight/VACUUM paths and
 retention-triggered compaction do not run ANALYZE.
 
-The maintainer-only [[src-tauri/src/widget_query_perf_study.rs#audit_widget_query_plans]]
-captures expanded SQL from real feature-020 production readers, derives stable
-literal-normalized identities, and replays the exact statements for before and
-after `EXPLAIN QUERY PLAN`. It fails closed on statement-set, occurrence,
-SCAN/SEARCH/index/temp-order, material timing, or output-size drift.
-
-The maintainer binary can persist large full and focused reports through a
-create-only, flushed, synced Rust file handle before returning a fail verdict.
-The merged frozen-corpus gate covers 250 pending/raw and 16,086 completed SQL
-statements over the same 42 timed paths. Each state changed 10 plans with zero
-conservative plan regressions.
-
-Model history's pending raw fallback checks durable active-source ownership
-with a correlated primary-key `EXISTS` lookup; it does not create source or
-authority temp tables. Completed history instead joins the per-call temp
-active-source table and excludes keys in the per-call temp pruned-authority
-table from split indexed residual seeks. Provider-series, session-candidate,
-and represented-provider aggregations retain their audited grouping or range
-indexes.
-
-Fail-closed full runs retained two pending and four completed one-shot timing
-flags. Exact canonical 8+8 statless/analyzed alternation cleared all six under
-the unchanged 5 ms plus 25% threshold, with identical outputs and zero focused
-plan regressions. Bounded analysis retains 121 pending or 123 completed
-`sqlite_stat1` rows, reloads planner state, checkpoints 0/0, and passes
-`quick_check`.
-
+Frozen planner and timing evidence remains in `specs/020-widget-query-perf/`. Production keeps the verified bounded ANALYZE path without shipping its one-off trace and corpus audit machinery.
 #### Database Compaction Test Specs
 
 These specs pin the user-triggered maintenance result contract without needing
@@ -376,49 +306,15 @@ today's code, not a design guarantee: **a future learning pipeline that sources
 observations from `tool_actions` becomes a retention stakeholder, and this entire
 analysis must be redone at that point.**
 
-### Retention corpus study utility
-
-[[src-tauri/src/bin/retention_corpus.rs]] and [[src-tauri/src/retention_study.rs]] provide an unsupported, maintainer-only protocol for approved local corpus study without changing Tauri, IPC, product CLI, policy, presets, or production schema.
-
-The protocol requires explicit approval, source, workspace, and cancellation
-paths. It inventories source SQLite read-only, rejects non-Quill or too-new
-schemas before mutation, records database/WAL/SHM identity, size, presence, and
-SHA-256 before and after reads, then creates fresh SQLite page backups by
-bounded cancellable `rusqlite::backup` steps. Only verified private scratch
-copies enter [[src-tauri/src/storage.rs#Storage#init_study_scratch]] and current
-retention replay; ordinary copies and `VACUUM INTO` are prohibited.
-
-Each replay has eight explicit observations: archive-off and archive-on each
-run three ordinal `controlled_warm` copies and one separately labelled ordinal
-`best_effort_cold` copy. Every observation uses a new backup; warm copies run
-the fixed read-only counts for the three retention target tables before timing,
-while cold copies remain unprimed. Mode, cache state, ordinal, backup, timing,
-cancellation, cleanup, and typed missing or failed state remain private
-manifest evidence, so no cold result can substitute for a controlled run.
-
-Private manifests conform to
-`specs/017-retention-second-corpus/private-manifest.schema.json`; private
-scratch, sidecars, archives, manifests, and cancellation markers clean up by
-default. The separate renderer writes a new privacy-signed scrubbed report,
-suppresses category/month cells below 10, and keeps the real inventory, index
-drop copy, and synthetic timing fixture as distinct baselines. The
-`synthetic-smoke` command exercises fixture mechanics without generating
-second-corpus evidence; `dbstat` remains an offline scratch-only capability
-pending real-corpus disposition.
-
 ### Retention fixture
 
-[[src-tauri/src/retention_fixture.rs#build_retention_fixture]] builds the one frozen synthetic corpus that every retention test and the retention timing spike run against, so acceptance numbers and budget numbers can never drift onto separate corpora.
+[[src-tauri/src/retention_fixture.rs#build_retention_fixture]] builds the test-only frozen synthetic corpus used by every retention acceptance test.
 
-It is ordinary `pub` non-test code rather than a `#[cfg(test)]` helper because
-[[src-tauri/src/bin/retention_spike.rs]] is a separate crate that cannot link
-test-only items. The builder sets `QUILL_DEMO_MODE` and `QUILL_DATA_DIR` to a
-fresh temp directory and then creates the database through `Storage::init`, so
-the schema comes from the real migration path and carries every index a
-production database has — a hand-written `CREATE TABLE` would silently miss the
-partial unique indexes retention's query plans depend on. That env block is
+The builder sets `QUILL_DEMO_MODE` and `QUILL_DATA_DIR` to a fresh temp
+directory and creates the database through `Storage::init`, so the schema comes
+from real migrations and startup index cleanup. That env block is
 process-global, so **every consuming test must be annotated `#[serial]`**. The
-overrides are left set afterwards, matching the `init_storage_in` harness, so a
+overrides remain set afterwards, matching the `init_storage_in` harness, so a
 consumer's own `Storage::init()` lands on the same database.
 
 Rows sit in fixed 30-day buckets counted back from an anchor instant, bucket 0
@@ -475,8 +371,8 @@ silently produce a corpus whose boundary math no longer holds.
 
 [[src-tauri/src/retention.rs]] owns everything durable about retention: three rows of the existing `settings` table, their value grammars, the two serialized shapes, cutoff derivation, and the monotonic watermark rule. There is no schema migration and no schema-version bump.
 
-The keys follow the backend-only dotted convention already used by
-`transcript_rescan.*`. `retention.window_days` holds the configured window as a
+The keys follow the backend-only dotted convention used by other settings.
+`retention.window_days` holds the configured window as a
 decimal integer; `retention.watermark` holds the insert-time cutoff as a
 conforming 24-character timestamp; `retention.last_run` holds the JSON
 [[src-tauri/src/retention.rs#RetentionAuditRecord]]. Every row is
@@ -579,9 +475,9 @@ never turn a completed prune into a failed one.
 This spec pins the contract at the layer that owns it, so a missed cache or a
 missing emission fails here rather than as an unexplained stale count in the UI.
 
-##### All Five Caches Drained And Event Emitted
+##### All Caches Drained And Event Emitted
 
-With all five caches warmed through their real read paths, the completion path
+With all three caches warmed through their real read paths, the completion path
 must leave every one of them empty and must emit exactly
 `transcript-analytics-updated`.
 
@@ -1066,28 +962,17 @@ Retention deletes model observations older than its confirmed cutoff with the tr
 
 [[src-tauri/src/lib.rs#run]] resets an interrupted running pass to a fresh `startup_resume` generation after storage initialization and reserves one nonblocking worker for migration-pending or resumed work. The reservation waits for live reconciliation to release the shared process permit instead of discarding historical work.
 
-[[src-tauri/src/storage.rs#Storage#get_model_analytics]] reads aggregates and backfill state from one SQLite snapshot. Global sessions use all unsuppressed retained source ownership, while range sessions, represented providers, evidence, coverage, and model rows require actual normalized timestamps in the half-open range. Cache-read share remains unavailable when any contributing token row lacks a required dimension.
-
-Migration 29 adds the `derived_model_id` column plus its index and re-arms `model_backfill_state` to pending under a bumped generation with a `migration` trigger, so existing installs re-attribute retained evidence on the next startup pass. Because attribution is computed only during parsing, the migration also nulls `mtime_ns` and `content_sha256` on active `ok` sources so [[src-tauri/src/storage.rs#classify_model_source_change]] cannot short-circuit them to fast/content-unchanged; the re-armed pass therefore genuinely re-parses pre-upgrade transcripts and stamps `derived_model_id` instead of leaving it null forever. [[src-tauri/src/model_usage.rs#apply_carry_forward_attribution]] stamps every parsed observation with its chain's running model — the last non-null, non-`<synthetic>` raw turn id; synthetic turns never update the running model, and rows before any model evidence stay null — while `raw_model_id` remains untouched replayable evidence. All analytics aggregation keys attribution on `derived_model_id`: `get_model_analytics` coverage, shares, and model rows; `get_model_history` series; `get_model_sessions` matching, primary, and distinct models; and `get_session_model_history` token totals. Segment and switch semantics intentionally stay on raw turn evidence.
+Migration 29 adds the `derived_model_id` column plus its index and re-arms `model_backfill_state` to pending under a bumped generation with a `migration` trigger, so existing installs re-attribute retained evidence on the next startup pass. Because attribution is computed only during parsing, the migration also nulls `mtime_ns` and `content_sha256` on active `ok` sources so [[src-tauri/src/storage.rs#classify_model_source_change]] cannot short-circuit them to fast/content-unchanged; the re-armed pass therefore genuinely re-parses pre-upgrade transcripts and stamps `derived_model_id` instead of leaving it null forever. [[src-tauri/src/model_usage.rs#apply_carry_forward_attribution]] stamps every parsed observation with its chain's running model — the last non-null, non-`<synthetic>` raw turn id; synthetic turns never update the running model, and rows before any model evidence stay null — while `raw_model_id` remains untouched replayable evidence. Overview, session paging, and session detail key attribution on `derived_model_id`; segment and switch semantics stay on raw turn evidence.
 
 Attributed coverage uses one token-bearing observation population: rows with derived attribution form the numerator, and rows still null after carry-forward form the unattributed remainder. A zero-token denominator stays unavailable. Tokenless turns still contribute model, session, first/last-seen, primary-model, and switch evidence.
 
-[[src-tauri/src/storage.rs#Storage#get_model_history]] reads one matching snapshot into fixed, zero-filled UTC buckets: 5 minutes for 1 hour, 1 hour for 24 hours, 6 hours for 7 days, and 1 day for 30 days. It keeps attributed, unattributed, and optional provider-qualified selected-model series separate while excluding suppressed sources; like every other aggregate, series attribution keys on `derived_model_id`.
-
-While rollup construction is incomplete, history checks active source
-ownership with a correlated primary-key `EXISTS` lookup because it projects no
-source columns. This preserves suppression semantics while keeping statless
-and analyzed raw-fallback plans identical. Completed history instead joins its
-per-read active-source table and excludes materialized pruned authority from
-split, indexed raw residual seeks.
-
-The aggregate, history, overview, and paged-session commands each open a short-lived read-only connection through [[src-tauri/src/storage.rs#Storage#open_view_reader]] and start their deferred transaction there, so none waits on the primary storage mutex or serializes behind ingestion writes; WAL still governs database-level writer/readers safely. That reader opens `SQLITE_OPEN_READ_ONLY` — the main-database write guard — and sets `temp_store=MEMORY`, a `mmap_size`, and a larger `cache_size` so the overview's in-memory scratch table stays off disk; it does not set `PRAGMA query_only`, which is incompatible with that temp table and redundant with the read-only open flag. The frontend's Models page now issues only the overview command; aggregate and history remain served for compatibility and tests.
+The overview and paged-session commands each open a short-lived read-only connection through [[src-tauri/src/storage.rs#Storage#open_view_reader]] and start their deferred transaction there, so neither waits on the primary storage mutex or serializes behind ingestion writes. The reader uses `SQLITE_OPEN_READ_ONLY`, in-memory temp storage, mmap, and a larger cache; it omits `query_only` because the overview needs temp tables.
 
 ##### Analytics Cache Primitive
 
 The in-process analytics cache shares typed results only while every source table still has the version observed at insertion.
 
-[[src-tauri/src/storage.rs#CacheKey]] identifies command-specific request dimensions and a 30-second wall-clock bucket so sliding windows naturally expire at a bucket boundary. [[src-tauri/src/storage.rs#get_or_compute]] checks the 45-second TTL and a [[src-tauri/src/storage.rs#TableVersions]] fingerprint made from each trusted table's indexed high-water marker. The TTL bounds delete staleness. Model overview and history fingerprints also include the singleton `rollup_meta.rollup_generation`, so an UPSERT that changes an existing hourly row retires their cached payloads even when raw-table and rollup-row maxima stay fixed; raw-only model analytics and unrelated bucket/context commands keep their existing probe sets. A failed SQLite probe bypasses the cache and computes fresh rather than serving data whose validity cannot be checked. Each [[src-tauri/src/storage.rs#Storage]] owns typed caches for model, bucket-stat, and context-savings commands, preventing results from one database instance from leaking into another. [[src-tauri/src/storage.rs#Storage#get_all_bucket_stats]] caches ordered current buckets and day range against `usage_snapshots`; [[src-tauri/src/storage.rs#Storage#get_context_savings_analytics]] caches range and limit against `context_savings_events`.
+[[src-tauri/src/storage.rs#CacheKey]] identifies command-specific request dimensions and a 30-second wall-clock bucket so sliding windows naturally expire at a bucket boundary. [[src-tauri/src/storage.rs#get_or_compute]] checks the 45-second TTL and a [[src-tauri/src/storage.rs#TableVersions]] fingerprint made from indexed high-water markers. Model overview also fingerprints `rollup_meta.rollup_generation`; bucket and context commands keep their own probes. A failed probe bypasses the cache and computes fresh. Each [[src-tauri/src/storage.rs#Storage]] owns its three typed caches.
 
 [[src-tauri/src/storage.rs#Storage#get_model_usage_overview]] serves the Models-page overview from one read-only deferred-transaction snapshot as a [[src-tauri/src/models.rs#ModelUsageOverviewResponse]]. During rollup build it preserves the established raw temp-table path. After completion, `scoped_overview` contains aggregate-grain closed UTC hours plus raw leading/current-hour rows, so it never rematerializes the full closed observation range; provider filtering remains sargable. The response carries: range totals (sessions, projects, turns, tokens, coverage); per-model reach rows (sessions, projects, turns, primary-in count, days active, tokens and share); a running-now entry per provider pairing the latest contiguous model run with its predecessor; fixed-bucket per-model distinct-session activity; a top-8 project × model session matrix; per-session model-count combinations with top co-occurrence pairs; and a parent-versus-subagent token split. Exact facet routing and non-decomposable exceptions are inventoried in [[backend#Backend#Database#Schema#Hourly Analytics Rollups]].
 
@@ -1121,17 +1006,11 @@ Asserts exact input and cache-read decomposition across three monotonic turns, a
 
 A flipped checksum nibble and a truncated envelope both decode to an [[src-tauri/src/storage.rs#ModelSessionsQueryError]] invalid-cursor error rather than a mismatched or partial page.
 
-##### Model History Bucketing and Suppression
-
-[[src-tauri/src/storage.rs#Storage#get_model_history]] and [[src-tauri/src/storage.rs#Storage#get_model_analytics]] bucket seeded evidence and exclude suppressed sources.
-
-Observations seeded through the real [[src-tauri/src/storage.rs#Storage#replace_model_source|replace write path]] land attributed and unattributed tokens in their timestamp-containing fixed buckets with matching aggregate totals and coverage, while a source flipped to suppressed contributes to neither query, guarding the shared [[src-tauri/src/storage.rs#ACTIVE_MODEL_SOURCE_PREDICATE]].
-
 ##### Model Hourly Ingest Fold Exactness
 
 The model replacement transaction must leave its unpruned hourly rollup exactly equal to a raw source group-by and must roll every fold mutation back on failure.
 
-Seeded observations span UTC hours, model identities, missing and invalid attribution, explicit zeroes, and absent token dimensions. Replacing the same source refolds rather than doubles counts, advances `rollup_generation` once, and a forced metadata failure preserves raw rows, rollup rows, and generation atomically.
+Seeded observations span UTC hours, model identities, missing and invalid attribution, explicit zeroes, and absent token dimensions. Replacement refolds rather than doubles counts and advances `rollup_generation` once. Forced metadata failure and SQLite integer overflow both roll raw rows, rollups, source metadata, and generation back atomically.
 
 ##### Model Hourly Ingest Fold Burst Budget
 
@@ -1156,17 +1035,17 @@ Rollup-dependent cache fingerprints must change when an existing hourly row is u
 
 The regression warms a model cache entry, commits an independent-connection UPSERT plus generation bump, proves raw COUNT/MAX and rollup COUNT/MAX stay fixed, and requires the next probe to recompute.
 
-##### Hybrid Model Overview and History Parity
+##### Hybrid Model Overview Parity
 
-Completed model-rollup reads must equal the established raw computation across overview facets and history buckets, while incomplete states remain on raw evidence.
+Completed model-rollup reads must equal the established raw computation across overview facets, while incomplete states remain on raw evidence.
 
-The seeded comparison pins an unaligned endpoint, covers closed and open hours, missing and explicit-zero evidence, suppression, selected-model history, and pending/running/failed versus completed-empty `buildingIndex` states.
+The seeded comparison pins an unaligned endpoint and covers closed and open hours, missing and explicit-zero evidence, suppression, raw-pruned authority, and completed-empty `buildingIndex` state.
 
 ##### Bounded Completed Model Raw Seeks
 
 Completed rollup reads must seek only exact raw boundary intervals and scoped sessions instead of scanning the full observation window.
 
-SQLite 3.45 plan checks require history/activity residual ranges, project prefix/tie lookups, and paged running-turn reads to use bounded indexes without raw scans or temporary ordering.
+SQLite 3.45 plan checks require activity residual ranges, project prefix/tie lookups, and paged running-turn reads to use bounded indexes without raw scans or temporary ordering.
 
 ##### Running Model Pagination Parity
 
@@ -1178,7 +1057,7 @@ More than 1,024 same-prefix turns put decisive ordinal and binary-key ties on th
 
 Migration 37 creates source-keyed rollup storage for bounded model and runtime reads while preserving raw evidence.
 
-- **model_usage_hourly** — One row per UTC hour, provider, derived model, and source. It denormalizes analytics session identity; stores observation, turn, token, sidechain, and NULL-aware token-dimension counts and sums; retains first/last evidence bounds and a `raw_pruned` marker. [[src-tauri/src/storage.rs#Storage#replace_model_source]] preaggregates each retained batch and UPSERTs it in the raw replacement transaction. A non-colliding empty derived-model key represents raw NULL attribution because normalized provider model ids cannot be empty.
+- **model_usage_hourly** — One row per UTC hour, provider, derived model, and source. It denormalizes analytics session identity; stores observation, turn, token, sidechain, and NULL-aware token-dimension counts and sums; retains first/last evidence bounds and a `raw_pruned` marker. [[src-tauri/src/storage.rs#Storage#replace_model_source]] inserts retained raw evidence, then groups it into this table with one SQLite `INSERT SELECT` in the same replacement transaction. A non-colliding empty derived-model key represents raw NULL attribution because normalized provider model ids cannot be empty.
 - **runtime_hourly** — One row per UTC hour, provider, and source. It denormalizes session identity and stores finalized turn count, runtime seconds, turn bounds, and a `raw_pruned` marker. [[src-tauri/src/storage.rs#refold_runtime_source]] preserves the 5-minute logical-turn continuity rule; ordinary longer gaps close at the prior event, while an `asst_tool_use` followed by `user_tool_result` contributes its persisted gap clamped to 6 hours. Each closed turn belongs wholly to its start UTC hour.
 - **runtime_turn_state** — One row per provider/source finalization bookmark, with the highest finalized raw rowid and the remaining open logical turn's start. Open turns are not folded into `runtime_hourly`.
 - **rollup_meta** — Singleton generation plus independent model/runtime backfill status and resumable bookmarks.
@@ -1479,7 +1358,7 @@ An oversized fixture with a matching stored fingerprint raises `SourceTooLarge`,
 
 ##### Retained Transcript Size Cap
 
-[[src-tauri/src/transcript_analytics.rs#read_stable_transcript]] enforces the 256 MiB retained cap from `metadata().len()` before allocating anything.
+[[src-tauri/src/transcript_identity.rs#read_stable_transcript]] enforces the 256 MiB retained cap from `metadata().len()` before allocating anything.
 
 The guard is what keeps one pathological transcript from exhausting memory during a whole-root pass, and it must reject on apparent length rather than after a partial read.
 
@@ -1571,11 +1450,11 @@ gated by the info log level, so it adds no elapsed-time calculation when
 observability is disabled; before each command's cache map is wired it reports
 `cache=miss` and retains the same stable log shape for later cache work.
 
-### Model Analytics Commands (6)
+### Model Analytics Commands (4)
 
-Model analytics IPC exposes validated aggregate, overview, history, paged-session, session-detail, and backfill operations through one structured, user-safe error contract.
+Model analytics IPC exposes overview, paged-session, session-detail, and backfill operations through one structured, user-safe error contract.
 
-[[src-tauri/src/lib.rs#get_model_analytics]] validates the fixed time range and optional existing Quill provider identifier before reading one analytics snapshot off the async command thread. [[src-tauri/src/lib.rs#get_model_history]] also validates an optional exact raw model identity and rejects provider-filter mismatches. [[src-tauri/src/lib.rs#get_model_usage_overview]] validates the same fixed range before reading the one-snapshot Models-page overview described in [[backend#Database#Schema#Model Analytics Evidence]] off the async command thread.
+[[src-tauri/src/lib.rs#get_model_usage_overview]] validates the fixed time range and optional provider before reading the one-snapshot Models-page overview described in [[backend#Database#Schema#Model Analytics Evidence]] off the async command thread.
 
 [[src-tauri/src/lib.rs#get_model_sessions]] validates the fixed range and exact provider-qualified opaque model ID, preserves the storage-owned 20-row null default, and clamps signed numeric limits to 1–100 before platform-independent conversion. Malformed, foreign, or stale opaque cursors return `invalid_cursor` without exposing cursor diagnostics.
 
@@ -1583,7 +1462,7 @@ Model analytics IPC exposes validated aggregate, overview, history, paged-sessio
 
 [[src-tauri/src/lib.rs#retry_model_history_backfill]] reserves scheduling before advancing the durable retry generation, returns current state when that retained pass is already scheduled or running, and treats an unowned persisted `running` row as interrupted work. A live-source owner can release the shared process permit before the pending pass starts.
 
-Storage and blocking-task failures stay in local logs. All five commands return only the bounded serialized model analytics error envelope, and model IDs use shared opaque Unicode validation without a catalog or version allowlist.
+Storage and blocking-task failures stay in local logs. All four commands return only the bounded serialized model analytics error envelope, and model IDs use shared opaque Unicode validation without a catalog or version allowlist.
 
 ### Indicator Commands (3)
 
@@ -2044,11 +1923,11 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
 
-When a transcript is reprocessed, Quill coalesces repeated `notify` requests per session and applies each Tantivy rewrite under one writer lock with a single commit. Retained SQLite analytics are independently coalesced by canonical `(provider, source_key)` and replaced across all five tables in one transaction. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven `notify` ingestion that ran before the file was tracked in `index_state.json` cannot stack duplicate copies on top.
+When a transcript is reprocessed, Quill coalesces repeated search `notify` requests per session and applies each Tantivy rewrite under one writer lock with a single commit. One retained-source coordinator separately tracks model and transcript completion under canonical `(provider, source_key)`; transcript replacement still spans all five tables in one transaction. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven indexing cannot stack duplicate copies.
 
 Skill usage is derived by [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]], which recognizes read-like loads of a `SKILL.md` file and derives the skill name from that file's parent directory. Retained rows are owned and replayed by canonical source, and the extractor does not infer skills from assistant prose, available-skill lists, or skill-file maintenance edits. Flattened `/sessions/messages` payloads contain no tool-action detail and emit no skill rows.
 
-The Claude walker descends into `<projectSlug>/<session-uuid>/subagents/agent-*.jsonl` in addition to the flat parent transcript at `<projectSlug>/*.jsonl`, and each `DiscoveredSessionFile` carries an `is_subagent` flag so downstream extraction can tell the two apart. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid` from each JSON record. Codex retained analytics preserves the first child `session_meta.id` as `chain_id` and resolves `parent_thread_id`, falling back to `forked_from_id`, as `parent_chain_id`; later ancestor restatements cannot replace child identity. Per-session Claude sub-agent files live in one flat directory — multi-level hierarchy is reconstructed at query time via `parent_uuid` chains rather than nested filesystem layout.
+The shared Claude candidate walker descends through the complete `<projectSlug>/<session-uuid>/subagents/**` subtree in addition to flat parent transcripts. Its permissive search view preserves original paths, project labels, and `is_subagent`; its strict retained view canonicalizes containment and source identity. This includes flat and Workflow-nested agents without admitting unrelated nested JSONL files. Claude extraction reads `isSidechain`, `agentId`, and `parentUuid`; Codex preserves the first child `session_meta.id` and resolves `parent_thread_id`, falling back to `forked_from_id`.
 
 The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
 
@@ -2064,7 +1943,7 @@ The default-search field weights are: `files_modified` (4.0), `code_changes` (2.
 
 [[src-tauri/src/cc_client.rs]] is the single inference surface for the app. Every LLM call (learning streams + synthesis, memory optimizer, prose compression) spawns the `claude` CLI in headless one-shot mode rather than making a direct HTTP request to Anthropic.
 
-Public surface: [[src-tauri/src/cc_client.rs#invoke_typed]] for schema-validated structured output and [[src-tauri/src/cc_client.rs#invoke_text]] for free-form prose. Model routing: Sonnet 4.6 (pinned by full model name `claude-sonnet-4-6`) for all work — pattern extraction, learning synthesis (single-model since feature 005 US5 T060/H-7; no rolling `sonnet` alias, stable cost attribution), and prose work. The `Haiku`/`Sonnet` enum variants are retained dead-code-only for easy revert. `--json-schema` is unreliable (the CLI does not enforce it), so typed calls do not use it. `invoke_typed` instead embeds the JSON Schema in the prompt, grants the headless agent a `Write`-only tool sandboxed to a per-call temp dir, and has it write the result to `out.json`; Quill reads that file and `serde_json::from_str::<T>` is the sole validation (missing/invalid → `SchemaValidationFailed`, no app-side retry). `invoke_text` is unchanged (free-form, total tool isolation).
+Public surface: [[src-tauri/src/cc_client.rs#invoke_typed]] for schema-validated structured output and [[src-tauri/src/cc_client.rs#invoke_text]] for free-form prose. Model routing is pinned at the CLI boundary to `claude-sonnet-4-6` for all work — pattern extraction, learning synthesis (single-model since feature 005 US5 T060/H-7; no rolling `sonnet` alias, stable cost attribution), and prose work. `--json-schema` is unreliable (the CLI does not enforce it), so typed calls do not use it. `invoke_typed` instead embeds the JSON Schema in the prompt, grants the headless agent a `Write`-only tool sandboxed to a per-call temp dir, and has it write the result to `out.json`; Quill reads that file and `serde_json::from_str::<T>` is the sole validation (missing/invalid → `SchemaValidationFailed`, no app-side retry). `invoke_text` is unchanged (free-form, total tool isolation).
 
 The `claude` binary is located via [[src-tauri/src/config.rs#resolve_command_path]] — the same cached, login-shell-aware resolver used for provider CLI detection — so it picks up Anthropic's `claude migrate-installer` target and auto-refreshes when the user triggers a PATH rescan. Each invocation runs `claude -p --output-format json --model <alias> --append-system-prompt <preamble> --tools "" --disable-slash-commands --no-session-persistence --setting-sources "" --exclude-dynamic-system-prompt-sections` and pipes the prompt body on stdin, joined with `wait_with_output` in a single future so a large prompt cannot deadlock against the child's stdout. The subprocess is isolated from the user's interactive Claude Code configuration (their hooks, slash commands, plugins, CLAUDE.md auto-discovery, and session history are all suppressed) and runs with `CLAUDE_CODE_*`, `ANTHROPIC_*`, and `NODE_OPTIONS` scrubbed from the inherited environment.
 

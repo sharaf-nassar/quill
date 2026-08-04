@@ -1,11 +1,7 @@
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { ModelAnalyticsUpdatedEvent } from "../types";
-import {
-	cachedInvokeStore,
-	cleanupInvokeListeners,
-	registerInvokeEventListeners,
-} from "./cachedInvokeStore";
+import { cachedInvokeStore } from "./cachedInvokeStore";
 
 const INGEST_EVENTS = [
 	"tokens-updated",
@@ -24,27 +20,24 @@ export function useCachedInvokeEvents(): void {
 	useEffect(() => {
 		let disposed = false;
 		const refreshMounted = () => document.visibilityState !== "hidden";
-		const listeners = registerInvokeEventListeners(
-			[...INGEST_EVENTS, "model-analytics-updated"],
-			listen,
-			(eventName, event) => {
-				if (disposed) return;
-				if (
-					eventName === "model-analytics-updated" &&
-					(event.payload as ModelAnalyticsUpdatedEvent).dataChanged === false
-				) {
-					return;
-				}
-				cachedInvokeStore.invalidateEvent(
-					eventName,
-					refreshMounted(),
-				);
-			},
+		const listeners = [...INGEST_EVENTS, "model-analytics-updated"].map(
+			(eventName) =>
+				listen(eventName, (event) => {
+					if (disposed) return;
+					if (
+						eventName === "model-analytics-updated" &&
+						(event.payload as ModelAnalyticsUpdatedEvent).dataChanged === false
+					) {
+						return;
+					}
+					cachedInvokeStore.invalidateEvent(eventName, refreshMounted());
+				}).catch((error: unknown) => {
+					if (!disposed) {
+						console.error("Cached invoke event listener failed:", error);
+					}
+					return () => {};
+				}),
 		);
-
-		const cleanupListeners = cleanupInvokeListeners(listeners, (error) => {
-			console.error("Cached invoke event listener failed:", error);
-		});
 		const handleVisibilityChange = () => {
 			if (document.visibilityState !== "hidden") {
 				cachedInvokeStore.refreshStaleSubscribers();
@@ -55,7 +48,9 @@ export function useCachedInvokeEvents(): void {
 		return () => {
 			disposed = true;
 			document.removeEventListener("visibilitychange", handleVisibilityChange);
-			cleanupListeners();
+			void Promise.all(listeners).then((unlisteners) => {
+				for (const unlisten of unlisteners) unlisten();
+			});
 		};
 	}, []);
 }

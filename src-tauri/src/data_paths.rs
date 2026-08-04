@@ -22,6 +22,21 @@ use std::sync::Once;
 const DEMO_MODE_ENV: &str = "QUILL_DEMO_MODE";
 const DATA_DIR_ENV: &str = "QUILL_DATA_DIR";
 const RULES_DIR_ENV: &str = "QUILL_RULES_DIR";
+
+/// Platform-aware production app-data directory without demo-mode overrides.
+pub fn default_app_data_dir() -> Option<PathBuf> {
+    dirs::data_local_dir()
+        .or_else(|| {
+            dirs::home_dir().map(|home| {
+                if cfg!(target_os = "macos") {
+                    home.join("Library").join("Application Support")
+                } else {
+                    home.join(".local").join("share")
+                }
+            })
+        })
+        .map(|path| path.join("com.quilltoolkit.app"))
+}
 const CLAUDE_PROJECTS_DIR_ENV: &str = "QUILL_CLAUDE_PROJECTS_DIR";
 const CODEX_SESSIONS_DIR_ENV: &str = "QUILL_CODEX_SESSIONS_DIR";
 
@@ -255,18 +270,7 @@ fn peek_data_dir_for_banner() -> PathBuf {
     }
     // No AppHandle here, so fall back to the same computation Tauri's
     // app_data_dir() performs internally.
-    dirs::data_local_dir()
-        .or_else(|| {
-            dirs::home_dir().map(|h| {
-                if cfg!(target_os = "macos") {
-                    h.join("Library").join("Application Support")
-                } else {
-                    h.join(".local").join("share")
-                }
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("com.quilltoolkit.app")
+    default_app_data_dir().unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"))
 }
 
 #[cfg(test)]

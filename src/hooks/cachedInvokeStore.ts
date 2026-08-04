@@ -198,18 +198,6 @@ export class CachedInvokeStore {
 		this.start(entry);
 	}
 
-	invalidate(descriptor: CachedInvokeDescriptor): void {
-		const key = cachedInvokeKey(descriptor);
-		const entry = this.entries.get(key);
-		if (entry === undefined) return;
-		entry.acceptedAt = Number.NEGATIVE_INFINITY;
-		entry.error = null;
-		if (entry.subscribers.size > 0) {
-			this.pendingKeys.add(key);
-			this.scheduleFanout();
-		}
-	}
-
 	invalidateEvent(eventName: string, refreshMounted = true): void {
 		for (const [key, entry] of this.entries) {
 			if (!entry.invalidationEvents.has(eventName)) continue;
@@ -232,17 +220,6 @@ export class CachedInvokeStore {
 			}
 		}
 		this.scheduleFanout();
-	}
-
-	clear(): void {
-		if (this.fanoutTimer !== null) {
-			this.clock.clearTimer(this.fanoutTimer);
-			this.fanoutTimer = null;
-		}
-		for (const entry of this.entries.values()) entry.generation += 1;
-		this.pendingKeys.clear();
-		this.entries.clear();
-		this.lastFanoutStartedAt = Number.NEGATIVE_INFINITY;
 	}
 
 	debugState(): {
@@ -382,58 +359,4 @@ export class CachedInvokeStore {
 	}
 }
 
-interface InvokeEvent {
-	payload: unknown;
-}
-
-export function registerInvokeEventListeners(
-	eventNames: readonly string[],
-	listenToEvent: (
-		eventName: string,
-		handler: (event: InvokeEvent) => void,
-	) => Promise<() => void>,
-	handleEvent: (eventName: string, event: InvokeEvent) => void,
-): Array<Promise<() => void>> {
-	return eventNames.map((eventName) =>
-		listenToEvent(eventName, (event) => handleEvent(eventName, event)),
-	);
-}
-
-export function cleanupInvokeListeners(
-	listeners: ReadonlyArray<Promise<() => void>>,
-	onError?: (error: unknown) => void,
-): () => void {
-	let disposed = false;
-	const active = new Set<() => void>();
-
-	for (const listener of listeners) {
-		void listener.then(
-			(unlisten) => {
-				if (disposed) {
-					unlisten();
-				} else {
-					active.add(unlisten);
-				}
-			},
-			(error: unknown) => {
-				if (!disposed) onError?.(error);
-			},
-		);
-	}
-
-	return () => {
-		if (disposed) return;
-		disposed = true;
-		for (const unlisten of active) unlisten();
-		active.clear();
-	};
-}
-
 export const cachedInvokeStore = new CachedInvokeStore();
-
-export function invalidateCachedInvoke(
-	command: string,
-	args?: unknown,
-): void {
-	cachedInvokeStore.invalidate({ command, args });
-}

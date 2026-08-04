@@ -78,9 +78,10 @@ pub(crate) enum RetainedNotifySourceValidationError {
     Unavailable(&'static str),
 }
 
-#[derive(Debug)]
-struct RetainedJsonlCandidate {
-    filesystem_path: PathBuf,
+#[derive(Default)]
+struct TranscriptCandidateCollection {
+    candidates: Vec<DiscoveredSessionFile>,
+    search_error: Option<String>,
 }
 
 /// Validate one notified path without walking either provider transcript tree.
@@ -288,8 +289,8 @@ fn retained_jsonl_source_layout_hint(
                     project.to_str().unwrap_or("unknown"),
                 ),
             }),
-            [project, _session, subagents, _transcript]
-                if *subagents == std::ffi::OsStr::new("subagents") =>
+            [project, _session, subagents, descendants @ ..]
+                if *subagents == std::ffi::OsStr::new("subagents") && !descendants.is_empty() =>
             {
                 Some(RetainedJsonlSourceLayoutHint::ClaudeSubagent {
                     default_project: SessionIndex::project_display_name(
@@ -389,7 +390,7 @@ fn enumerate_provider_source_root(
         &Path,
         IntegrationProvider,
         &mut Option<String>,
-    ) -> Vec<RetainedJsonlCandidate>,
+    ) -> TranscriptCandidateCollection,
 ) -> ProviderSourceRoot {
     let mut diagnostic = None;
 
@@ -483,16 +484,16 @@ fn enumerate_provider_source_root(
         }
     };
 
-    let candidates = collect_candidates(&resolved_root_path, provider, &mut diagnostic);
+    let candidates = collect_candidates(&resolved_root_path, provider, &mut diagnostic).candidates;
     let mut sources = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let canonical_path = match std::fs::canonicalize(&candidate.filesystem_path) {
+        let canonical_path = match std::fs::canonicalize(&candidate.path) {
             Ok(path) => path,
             Err(error) => {
                 log_inventory_io_error(
                     provider,
                     "canonicalize JSONL source",
-                    &candidate.filesystem_path,
+                    &candidate.path,
                     &error,
                 );
                 record_root_failure(
@@ -542,7 +543,7 @@ fn enumerate_provider_source_root(
             provider,
             source_root_key,
             source_key: canonical_source_key(source_root_key, &canonical_path),
-            filesystem_path: candidate.filesystem_path,
+            filesystem_path: candidate.path,
             canonical_path,
             layout_hint,
         });
@@ -591,24 +592,48 @@ fn collect_claude_jsonl_candidates(
     projects_dir: &Path,
     provider: IntegrationProvider,
     diagnostic: &mut Option<String>,
-) -> Vec<RetainedJsonlCandidate> {
-    let mut candidates = Vec::new();
+) -> TranscriptCandidateCollection {
+    let mut collection = TranscriptCandidateCollection::default();
+    let project_entries = match read_directory_entries(projects_dir, provider, diagnostic) {
+        Ok(entries) => entries,
+        Err(error) => {
+            collection.search_error = Some(format!("Read projects dir: {error}"));
+            return collection;
+        }
+    };
 
-    for project_entry in read_directory_entries(projects_dir, provider, diagnostic) {
+    for project_entry in project_entries {
         let project_dir = project_entry.path();
         if !path_is_directory(&project_dir, provider, diagnostic, true) {
             continue;
         }
+        let project_dir_name = project_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown");
+        let default_project = SessionIndex::project_display_name(project_dir_name);
+        let project_entries = match read_directory_entries(&project_dir, provider, diagnostic) {
+            Ok(entries) => entries,
+            Err(error) => {
+                collection
+                    .search_error
+                    .get_or_insert_with(|| format!("Read project dir: {error}"));
+                continue;
+            }
+        };
 
-        for entry in read_directory_entries(&project_dir, provider, diagnostic) {
+        for entry in project_entries {
             let path = entry.path();
 
             if path
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
             {
-                candidates.push(RetainedJsonlCandidate {
-                    filesystem_path: path.clone(),
+                collection.candidates.push(DiscoveredSessionFile {
+                    provider,
+                    path: path.clone(),
+                    default_project: default_project.clone(),
+                    is_subagent: false,
                 });
             }
 
@@ -621,29 +646,47 @@ fn collect_claude_jsonl_candidates(
                 continue;
             }
 
-            for subagent_entry in read_directory_entries(&subagents_dir, provider, diagnostic) {
-                let subagent_path = subagent_entry.path();
-                if subagent_path
-                    .extension()
-                    .is_some_and(|extension| extension == "jsonl")
+            let mut stack = vec![subagents_dir];
+            let mut visited = HashSet::new();
+            while let Some(directory) = stack.pop() {
+                if let Ok(canonical) = std::fs::canonicalize(&directory)
+                    && !visited.insert(canonical)
                 {
-                    candidates.push(RetainedJsonlCandidate {
-                        filesystem_path: subagent_path,
-                    });
+                    continue;
+                }
+                let entries = match read_directory_entries(&directory, provider, diagnostic) {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+                for entry in entries {
+                    let subagent_path = entry.path();
+                    if path_is_directory(&subagent_path, provider, diagnostic, true) {
+                        stack.push(subagent_path);
+                    } else if subagent_path
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+                    {
+                        collection.candidates.push(DiscoveredSessionFile {
+                            provider,
+                            path: subagent_path,
+                            default_project: default_project.clone(),
+                            is_subagent: true,
+                        });
+                    }
                 }
             }
         }
     }
 
-    candidates
+    collection
 }
 
 fn collect_codex_jsonl_candidates(
     sessions_dir: &Path,
     provider: IntegrationProvider,
     diagnostic: &mut Option<String>,
-) -> Vec<RetainedJsonlCandidate> {
-    let mut candidates = Vec::new();
+) -> TranscriptCandidateCollection {
+    let mut collection = TranscriptCandidateCollection::default();
 
     for entry in walkdir::WalkDir::new(sessions_dir)
         .sort_by_file_name()
@@ -668,20 +711,23 @@ fn collect_codex_jsonl_candidates(
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
         {
-            candidates.push(RetainedJsonlCandidate {
-                filesystem_path: entry.into_path(),
+            collection.candidates.push(DiscoveredSessionFile {
+                provider,
+                path: entry.into_path(),
+                default_project: "unknown".to_string(),
+                is_subagent: false,
             });
         }
     }
 
-    candidates
+    collection
 }
 
 fn read_directory_entries(
     directory: &Path,
     provider: IntegrationProvider,
     diagnostic: &mut Option<String>,
-) -> Vec<std::fs::DirEntry> {
+) -> Result<Vec<std::fs::DirEntry>, std::io::Error> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
@@ -691,7 +737,7 @@ fn read_directory_entries(
                 provider,
                 "could not read all transcript directories.",
             );
-            return Vec::new();
+            return Err(error);
         }
     };
 
@@ -715,7 +761,7 @@ fn read_directory_entries(
         }
     }
     collected.sort_by_key(std::fs::DirEntry::file_name);
-    collected
+    Ok(collected)
 }
 
 fn path_is_directory(
@@ -1265,101 +1311,35 @@ impl SessionIndex {
         if !projects_dir.exists() {
             return Ok(Vec::new());
         }
-
-        let mut files = Vec::new();
-        for project_entry in std::fs::read_dir(projects_dir)
-            .map_err(|e| format!("Read projects dir: {e}"))?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-        {
-            let project_dir = project_entry.path();
-            let project_dir_name = project_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-            let project_name = Self::project_display_name(project_dir_name);
-
-            // (1) Parent transcripts: <projectSlug>/*.jsonl
-            for entry in std::fs::read_dir(&project_dir)
-                .map_err(|e| format!("Read project dir: {e}"))?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
-            {
-                files.push(DiscoveredSessionFile {
-                    provider: IntegrationProvider::Claude,
-                    path: entry.path(),
-                    default_project: project_name.clone(),
-                    is_subagent: false,
-                });
-            }
-
-            // (2) Sub-agent transcripts live somewhere under
-            // <projectSlug>/<session-uuid>/subagents/. They appear flat as
-            // `subagents/agent-*.jsonl`, and one level deeper for
-            // Workflow-spawned agents as
-            // `subagents/workflows/wf_<id>/agent-*.jsonl`. Walk the entire
-            // subagents/ subtree with an explicit stack (no walkdir) so every
-            // `.jsonl` at any depth is collected, staying bounded to that
-            // subtree so unrelated nested JSONLs never sneak in.
-            for session_entry in std::fs::read_dir(&project_dir)
-                .map_err(|e| format!("Read project dir: {e}"))?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-            {
-                let subagents_dir = session_entry.path().join("subagents");
-                if !subagents_dir.is_dir() {
-                    continue;
-                }
-                let mut stack = vec![subagents_dir];
-                while let Some(dir) = stack.pop() {
-                    // Skip an unreadable directory rather than aborting the
-                    // whole scan, matching the entry-level filter_map below.
-                    let Ok(read_dir) = std::fs::read_dir(&dir) else {
-                        continue;
-                    };
-                    for entry in read_dir.filter_map(|e| e.ok()) {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            stack.push(path);
-                        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-                            files.push(DiscoveredSessionFile {
-                                provider: IntegrationProvider::Claude,
-                                path,
-                                default_project: project_name.clone(),
-                                is_subagent: true,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(files)
+        let mut diagnostic = None;
+        let collection = collect_claude_jsonl_candidates(
+            projects_dir,
+            IntegrationProvider::Claude,
+            &mut diagnostic,
+        );
+        collection
+            .search_error
+            .map_or_else(|| Ok(collection.candidates), Err)
     }
 
     fn discover_codex_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
         let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
+        Self::discover_codex_session_files_in(&sessions_dir)
+    }
 
+    fn discover_codex_session_files_in(
+        sessions_dir: &Path,
+    ) -> Result<Vec<DiscoveredSessionFile>, String> {
         if !sessions_dir.exists() {
             return Ok(Vec::new());
         }
-
-        let mut files = Vec::new();
-        for entry in walkdir::WalkDir::new(&sessions_dir)
-            .into_iter()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-        {
-            files.push(DiscoveredSessionFile {
-                provider: IntegrationProvider::Codex,
-                path: entry.path().to_path_buf(),
-                default_project: "unknown".to_string(),
-                is_subagent: false,
-            });
-        }
-
-        Ok(files)
+        let mut diagnostic = None;
+        Ok(collect_codex_jsonl_candidates(
+            sessions_dir,
+            IntegrationProvider::Codex,
+            &mut diagnostic,
+        )
+        .candidates)
     }
 
     /// Scan Claude and Codex session JSONL files and index new/modified files.
@@ -1370,12 +1350,6 @@ impl SessionIndex {
         storage: Option<&crate::storage::Storage>,
     ) -> Result<usize, String> {
         use tauri::Emitter;
-
-        // @lat: [[data-flow#Model Observation Reconciliation]]
-        // Keep model-source discovery independent from Session Search's mtime
-        // cache and extraction outcome. Admission is non-blocking; the shared
-        // model runner performs fingerprint reconciliation in the background.
-        enqueue_startup_model_source_reconciliation(app_handle);
 
         let mut total_indexed = 0usize;
         let mut index_changed = false;
@@ -4039,53 +4013,35 @@ pub(crate) fn find_session_path(
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
     match provider {
-        IntegrationProvider::Claude => {
-            let projects_dir = crate::data_paths::resolve_claude_projects_dir();
-
-            if !projects_dir.exists() {
-                return Ok(None);
-            }
-
-            for project_entry in std::fs::read_dir(&projects_dir)
-                .map_err(|e| format!("Read projects: {e}"))?
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_dir())
-            {
-                let candidate = project_entry.path().join(format!("{session_id}.jsonl"));
-                if candidate.exists() {
-                    return Ok(Some(candidate));
-                }
-            }
-
-            Ok(None)
-        }
+        IntegrationProvider::Claude => Ok(SessionIndex::discover_claude_session_files()?
+            .into_iter()
+            .find(|source| {
+                !source.is_subagent
+                    && source.path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
+            })
+            .map(|source| source.path)),
         IntegrationProvider::Codex => {
-            let sessions_dir = dirs::home_dir()
-                .ok_or("Cannot determine home directory")?
-                .join(".codex")
-                .join("sessions");
-
-            if !sessions_dir.exists() {
-                return Ok(None);
-            }
-
-            let expected_suffix = format!("{session_id}.jsonl");
-            for entry in walkdir::WalkDir::new(&sessions_dir)
-                .into_iter()
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_type().is_file())
-                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-            {
-                let file_name = entry.file_name().to_string_lossy();
-                if file_name.ends_with(&expected_suffix) {
-                    return Ok(Some(entry.path().to_path_buf()));
-                }
-            }
-
-            Ok(None)
+            let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
+            find_codex_session_path_in(&sessions_dir, session_id)
         }
         IntegrationProvider::MiniMax => Ok(None),
     }
+}
+
+fn find_codex_session_path_in(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let expected_suffix = format!("{session_id}.jsonl");
+    Ok(SessionIndex::discover_codex_session_files_in(sessions_dir)?
+        .into_iter()
+        .find(|source| {
+            source
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(&expected_suffix))
+        })
+        .map(|source| source.path))
 }
 
 // ---------------------------------------------------------------------------
@@ -4382,6 +4338,40 @@ mod tests {
                 .iter()
                 .any(|f| f.path.to_string_lossy().ends_with("meta.json")),
             "non-jsonl decoy must be filtered out at any depth"
+        );
+
+        let retained = enumerate_provider_source_root(
+            IntegrationProvider::Claude,
+            CLAUDE_SOURCE_ROOT_KEY,
+            tmp.path().to_path_buf(),
+            collect_claude_jsonl_candidates,
+        );
+        assert_eq!(retained.outcome, ProviderRootEnumerationOutcome::Complete);
+        assert_eq!(retained.sources.len(), 3);
+        assert!(retained.sources.iter().any(|source| {
+            source
+                .filesystem_path
+                .to_string_lossy()
+                .ends_with("agent-b.jsonl")
+                && matches!(
+                    source.layout_hint,
+                    RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. }
+                )
+        }));
+    }
+
+    #[test]
+    fn codex_session_lookup_uses_the_supplied_sessions_root() {
+        let tmp = TempDir::new().expect("tempdir");
+        let session_id = "72acc77e-e91c-451f-80b2-748e85fffa1f";
+        let nested = tmp.path().join("2026").join("08").join("03");
+        fs::create_dir_all(&nested).expect("mkdir rollout tree");
+        let rollout = nested.join(format!("rollout-2026-08-03T12-00-00-{session_id}.jsonl"));
+        fs::write(&rollout, "{}\n").expect("write rollout");
+
+        assert_eq!(
+            find_codex_session_path_in(tmp.path(), session_id).expect("lookup"),
+            Some(rollout)
         );
     }
 }

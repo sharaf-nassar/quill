@@ -139,10 +139,9 @@ Acceptance criteria (resolved: RETIRE — see Clarifications Q1/Q2):
 ## Constraints
 
 - **Single shared script:** the hook lives at
-  `src-tauri/claude-integration/scripts/context-capture.cjs` with a
-  byte-identical copy at `src-tauri/codex-integration/scripts/` (deployed to
-  `~/.config/quill/scripts/`). Both copies must stay identical; provider is
-  inferred at runtime. Any change ships to both providers at once.
+  `src-tauri/claude-integration/scripts/context-capture.cjs` and is deployed
+  to both providers. Provider is inferred at runtime, so every change ships
+  to Claude and Codex at once.
 - **Zero-dependency Node:** the script is plain `.cjs` run by `node` with a
   5-second hook timeout and swallowed errors by design. No npm dependencies
   are available; reading SQLite from it would need a child process
@@ -218,9 +217,9 @@ A: **Full repo scrub, non-destructive elsewhere.** Scrub exactly:
 `README.md:67`, `src-tauri/claude-integration/mcp/server.py:51-52`
 (instruction bullet), the three tool definitions in
 `src-tauri/claude-integration/mcp/tools/context.py` (1952, 2043, 2147 + their
-`source=` emitters), and the three retired names in `CONTEXT_TOOLS` of BOTH
-`src-tauri/claude-integration/scripts/context-capture.cjs:25-27` and
-`src-tauri/codex-integration/scripts/context-capture.cjs:25-27`
+`source=` emitters), and the three retired names in `CONTEXT_TOOLS` of the
+shared Claude/Codex resource
+`src-tauri/claude-integration/scripts/context-capture.cjs:25-27`
 (`context-router.cjs` arrays contain none of them — untouched). Keep: the
 `mcp.continuity` taxonomy entry in `src-tauri/src/context_category.rs` and
 its tests (verified zero-code-change safe — the Telemetry tile falls back

@@ -190,15 +190,21 @@ Keyboard input exercised `Home` (Now), `ArrowRight` (Trends then Charts), `End`
 (Context), and `ArrowLeft` (Models). Each command moved visible focus and selected
 the matching panel. Models remained the fourth tab in the five-tab set.
 
-### Independent requests and Retry
+### Historical pre-widget independent requests and Retry
 
-A browser-only scoped failure wrapper rejected one command at a time while
-leaving the argument-aware fixtures unchanged:
+This preserved browser evidence predates the usage-frequency Models widget.
+The former aggregate/history commands named below were removed; the current
+surface is `get_model_usage_overview`, `get_model_sessions`,
+`get_session_model_history`, and `retry_model_history_backfill`.
 
-- On `24h`, `get_model_history` failed while aggregate data remained visible.
-  `Retry history` issued only `get_model_history`, cleared its error, and restored
-  24 semantic-table buckets.
-- On `7d`, `get_model_analytics` failed while successful 28-bucket history
+A browser-only scoped failure wrapper rejected one former command at a time
+while leaving the argument-aware fixtures unchanged:
+
+- On `24h`, retired pre-widget `get_model_history` failed while aggregate data
+  remained visible. `Retry history` issued only `get_model_history`, cleared its
+  error, and restored 24 semantic-table buckets.
+- On `7d`, retired pre-widget `get_model_analytics` failed while successful
+  28-bucket history
   remained visible. `Retry summary and table` issued only
   `get_model_analytics`, cleared its error, and restored five model rows.
 
@@ -289,12 +295,14 @@ enabled`, and every provider flag remained disabled. Despite that zero-snapshot
 state, Analytics → Models was present, had `aria-selected="true"`, and its panel
 was visible.
 
-Before adding timing-only live sources, both the real
+Before adding timing-only live sources, both the real retired pre-widget
 `get_model_analytics({ range: "1h", provider: null })` IPC response and rendered
 model table contained all 6/6 accepted provider-qualified identities from the
-fixture table above. The native UI showed 480 of 2,511 tokens attributed (19.1%)
-and six model rows. Inspector output retained the complete 256-`a` identifier,
-confirmed its Unicode-scalar length was 256, and contained no 257-scalar row.
+fixture table above. The current equivalent aggregate surface is
+`get_model_usage_overview`. The native UI showed 480 of 2,511 tokens attributed
+(19.1%) and six model rows. Inspector output retained the complete 256-`a`
+identifier, confirmed its Unicode-scalar length was 256, and contained no
+257-scalar row.
 Both provider-qualified `shared/model.snapshot` rows and the unseen
 `future/model.snapshot-2099` row were present. This was real aggregate/UI output,
 not the browser mock.
@@ -1334,6 +1342,10 @@ WebKit's outer target protocol forwarded JSON-encoded `Runtime.evaluate`
 messages to `page-7` over
 `ws://127.0.0.1:9251/socket/1/1/WebPage`. The evaluated page called the real
 native surface, not browser fixtures:
+
+The `get_model_analytics` call below is preserved pre-widget evidence, not a
+current command. Current clients use `get_model_usage_overview`; the detail call
+remains current.
 
 ```js
 const aggregate = await window.__TAURI_INTERNALS__.invoke(

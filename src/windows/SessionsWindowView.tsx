@@ -1,5 +1,4 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import SearchBar from "../components/sessions/SearchBar";
 import FilterBar from "../components/sessions/FilterBar";
@@ -233,24 +232,8 @@ function SessionsWindowView() {
 		[query, filters],
 	);
 
-	const handleClose = async () => {
-		await getCurrentWindow().close();
-	};
-
 	return (
 		<div className="sessions-window">
-			<div className="sessions-window-titlebar" data-tauri-drag-region>
-				<span className="sessions-window-title" data-tauri-drag-region>
-					Session Search
-				</span>
-				<button
-					className="sessions-window-close"
-					onClick={handleClose}
-					aria-label="Close"
-				>
-					&times;
-				</button>
-			</div>
 			<div className="sessions-split">
 				<div className="sessions-list-panel">
 					<div className="sessions-list-scroll">

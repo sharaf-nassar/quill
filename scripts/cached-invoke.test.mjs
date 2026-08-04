@@ -4,16 +4,12 @@ import {
 	CACHED_INVOKE_COALESCE_MS,
 	CachedInvokeStore,
 	cachedInvokeKey,
-	cleanupInvokeListeners,
-	registerInvokeEventListeners,
 } from "../src/hooks/cachedInvokeStore.ts";
 import {
 	breakdownQuery,
 	codeInsightsHistoryQueries,
-	queryRangeMs,
 	usageBreakdownQueries,
 	weeklyTrendQueries,
-	WIDGET_DISPLAY_RANGES,
 } from "../src/hooks/widgetQueryPlan.ts";
 
 class FakeClock {
@@ -147,14 +143,11 @@ test("listener registration does not synthesize cache invalidations", async () =
 	);
 	await settle();
 
-	const listenerPromises = registerInvokeEventListeners(
-		["tokens-updated"],
-		async (eventName, callback) => {
-			callbacks.set(eventName, callback);
-			return () => {};
-		},
-		(eventName) => store.invalidateEvent(eventName),
-	);
+	const listenerPromises = ["tokens-updated"].map(async (eventName) => {
+		const callback = () => store.invalidateEvent(eventName);
+		callbacks.set(eventName, callback);
+		return () => {};
+	});
 	await Promise.all(listenerPromises);
 	clock.tick(CACHED_INVOKE_COALESCE_MS + 1);
 	await settle();
@@ -254,61 +247,26 @@ test("stable argument keys coalesce object order but isolate changed ranges", as
 // @lat: [[widget-range-tests#Widget Range Query Tests#Displayed Windows Bound Every Query]]
 test("widget query plans request only the displayed range or its exact prior period", () => {
 	const queryLog = [];
-	for (const displayedRange of WIDGET_DISPLAY_RANGES) {
-		for (const query of codeInsightsHistoryQueries(displayedRange)) {
-			queryLog.push({
-				view: "usage",
-				hook: "useCodeInsights",
-				displayedRange,
-				command: query.command,
-				requestedRange: query.requestedRange,
-				window: query.window,
-			});
-		}
-	}
-	for (const query of weeklyTrendQueries()) {
-		queryLog.push({
-			view: "trends",
-			hook: "useWeeklyTrends",
-			displayedRange: "7d",
-			command: query.command,
-			requestedRange: query.requestedRange,
-			window: query.window,
-		});
-	}
-	for (const query of usageBreakdownQueries("skills", "6h")) {
-		queryLog.push({
-			view: "usage",
-			hook: "useBreakdownData",
-			displayedRange: "6h",
-			command: query.command,
-			requestedRange: query.requestedRange,
-			window: "current",
-		});
-	}
-
-	for (const query of queryLog) {
-		const displayedMs = queryRangeMs(query.displayedRange);
-		const requestedMs = queryRangeMs(query.requestedRange);
-		if (requestedMs > displayedMs) {
-			assert.equal(query.window, "comparison");
-			assert.equal(requestedMs, displayedMs * 2);
-		} else {
-			assert.ok(requestedMs <= displayedMs);
-		}
-	}
-
-	assert.deepEqual(
-		codeInsightsHistoryQueries("6h").map(({ command, args }) => ({ command, args })),
-		[
+	for (const [displayedRange, requestedRange] of [
+		["1h", "2h"],
+		["6h", "12h"],
+		["24h", "2d"],
+		["7d", "14d"],
+	]) {
+		const queries = codeInsightsHistoryQueries(displayedRange).map(
+			({ command, args }) => ({ command, args }),
+		);
+		assert.deepEqual(queries, [
 			{
 				command: "get_token_history",
-				args: { range: "12h", hostname: null, sessionId: null, cwd: null },
+				args: { range: requestedRange, hostname: null, sessionId: null, cwd: null },
 			},
-			{ command: "get_code_stats_history", args: { range: "12h" } },
-			{ command: "get_llm_runtime_stats", args: { range: "12h" } },
-		],
-	);
+			{ command: "get_code_stats_history", args: { range: requestedRange } },
+			{ command: "get_llm_runtime_stats", args: { range: requestedRange } },
+		]);
+		queryLog.push({ displayedRange, queries });
+	}
+
 	assert.deepEqual(
 		weeklyTrendQueries().map(({ command, args }) => ({ command, args })),
 		[
@@ -326,7 +284,10 @@ test("widget query plans request only the displayed range or its exact prior per
 			{ command: "get_llm_runtime_stats", args: { range: "14d" } },
 		],
 	);
-	assert.equal(breakdownQuery("skills", "6h").args.allTime, false);
+	assert.deepEqual(breakdownQuery("skills", "6h"), {
+		command: "get_skill_breakdown",
+		args: { range: "6h", provider: null, allTime: false, limit: 100 },
+	});
 	console.info(`[range-query-window] ${JSON.stringify(queryLog)}`);
 });
 
@@ -387,7 +348,7 @@ test("a rejected request retains stale data and immediate retry recovers", async
 });
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Strict Mode cleanup releases resources]]
-test("Strict Mode-style cleanup leaks neither registrations nor timers", async () => {
+test("Strict Mode-style cleanup releases cache timers", async () => {
 	const clock = new FakeClock();
 	const store = makeStore(clock);
 	const key = cachedInvokeKey({ command: "get_llm_runtime_stats", args: { range: "6h" } });
@@ -407,18 +368,4 @@ test("Strict Mode-style cleanup leaks neither registrations nor timers", async (
 		pendingRefreshes: 0,
 		hasFanoutTimer: false,
 	});
-
-	let resolveListener;
-	let unlistenCalls = 0;
-	const listener = new Promise((resolve) => {
-		resolveListener = resolve;
-	});
-	const cleanup = cleanupInvokeListeners([listener]);
-	cleanup();
-	cleanup();
-	resolveListener(() => {
-		unlistenCalls += 1;
-	});
-	await settle();
-	assert.equal(unlistenCalls, 1);
 });

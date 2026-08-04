@@ -158,6 +158,40 @@ impl StagedDirectory {
     }
 }
 
+/// Recursively copy every file from `src` into `dst`.
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    if !src.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(dst)
+        .map_err(|err| format!("Failed to create directory {}: {err}", dst.display()))?;
+
+    for entry in walkdir::WalkDir::new(src).min_depth(1).follow_links(true) {
+        let entry = entry.map_err(|err| format!("Failed to walk {}: {err}", src.display()))?;
+        let relative = entry
+            .path()
+            .strip_prefix(src)
+            .map_err(|err| format!("Failed to strip prefix: {err}"))?;
+        let target = dst.join(relative);
+
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&target)
+                .map_err(|err| format!("Failed to create dir {}: {err}", target.display()))?;
+        } else {
+            fs::copy(entry.path(), &target).map_err(|err| {
+                format!(
+                    "Failed to copy {} -> {}: {err}",
+                    entry.path().display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 impl PublishedBatch {
     /// Make the published trees authoritative, then clean their old backups best-effort.
     pub(crate) fn commit(self) -> Result<(), String> {

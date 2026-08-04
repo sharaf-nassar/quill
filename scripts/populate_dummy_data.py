@@ -7,6 +7,7 @@ Default usage (writes to your real Quill DB after backing it up):
 
 Sandboxed usage (writes only inside an arbitrary dir, no backup, no running-Quill guard):
     python3 scripts/populate_dummy_data.py \\
+        --bin src-tauri/target/debug/quill \\
         --data-dir /tmp/quill-demo/data \\
         --rules-dir /tmp/quill-demo/rules \\
         --projects-dir /tmp/quill-demo/projects \\
@@ -27,6 +28,7 @@ import random
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -107,7 +109,6 @@ def rand_hex(n: int = 40) -> str:
 
 def check_quill_not_running() -> None:
 	"""Ensure Quill is not running — restoring over an active WAL connection corrupts the DB."""
-	import subprocess
 	result = subprocess.run(
 		["pgrep", "-f", "quill"],
 		capture_output=True, text=True,
@@ -134,868 +135,55 @@ def backup_db() -> None:
 	print(f"  Backed up DB to {BAK_PATH}")
 
 
-# Tables the seeder wipes and rewrites in full, each mapped to the columns that
-# only exist in the CURRENT app schema. A sandbox left over from an older seeder
-# revision — or one the running app has since migrated — can hold the same table
-# under a different shape, and `CREATE TABLE IF NOT EXISTS` silently keeps it. A
-# rerun then dies on the first INSERT ("NOT NULL constraint failed:
-# tool_actions.action_key"). Dropping the stale table costs nothing here because
-# every row of it is rewritten later in the same run.
-SCHEMA_SHAPE_MARKERS: dict[str, tuple[str, ...]] = {
-	"token_snapshots": ("is_sidechain", "agent_id", "parent_uuid"),
-	"tool_actions": ("action_key", "chain_id", "lines_added", "lines_removed"),
-	"response_times": ("chain_id", "source_key"),
-	"session_events": ("event_key", "chain_id"),
-	"skill_usages": ("chain_id", "source_key"),
-	"hook_invocations": ("chain_id", "source_key"),
-	"model_usage_observations": ("derived_model_id",),
-}
+def resolve_quill_bin(configured: Path | None) -> Path:
+	"""Find the executable that owns the production migration path."""
+	if configured is not None:
+		candidates = [configured]
+	else:
+		name = "quill.exe" if os.name == "nt" else "quill"
+		found = shutil.which("quill")
+		repo_root = Path(__file__).resolve().parents[1]
+		candidates = ([Path(found)] if found else []) + [
+			repo_root / "src-tauri" / "target" / "release" / name,
+			repo_root / "src-tauri" / "target" / "debug" / name,
+		]
+	for candidate in candidates:
+		candidate = candidate.expanduser().resolve()
+		if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+			return candidate
+	raise FileNotFoundError("Quill binary not found; pass --bin PATH or build Quill first")
 
 
-def drop_stale_tables(conn: sqlite3.Connection) -> None:
-	"""Drop any seeder-owned table whose on-disk shape predates this script."""
-	for table, required in SCHEMA_SHAPE_MARKERS.items():
-		exists = conn.execute(
-			"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-			(table,),
-		).fetchone()
-		if exists is None:
-			continue
-		# Table names come from the literal map above, never from user input.
-		columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-		missing = [column for column in required if column not in columns]
-		if missing:
-			conn.execute(f"DROP TABLE {table}")
-			log(f"  rebuilt stale {table} (missing {', '.join(missing)})")
-
-
-def ensure_schema(conn: sqlite3.Connection) -> None:
-	"""Run the same migrations the Rust app would run so all tables exist."""
-	drop_stale_tables(conn)
-	conn.executescript("""
-		PRAGMA journal_mode=WAL;
-		PRAGMA busy_timeout=5000;
-
-		-- NOTE: provider + bucket_key are added by Rust migration 14 when this
-		-- table is opened by the app. We create them up-front (with the same
-		-- shape migration 14 produces) so the seeder can write Codex rows that
-		-- survive: migration 14's RENAME/backfill only runs when the columns are
-		-- ABSENT, and it would otherwise force every row to provider='claude'.
-		-- get_latest_usage_buckets() reads the latest row per (provider,
-		-- bucket_key), so both columns must carry real values here.
-		CREATE TABLE IF NOT EXISTS usage_snapshots (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			timestamp TEXT NOT NULL,
-			provider TEXT NOT NULL DEFAULT 'claude',
-			bucket_key TEXT NOT NULL,
-			bucket_label TEXT NOT NULL,
-			utilization REAL NOT NULL,
-			resets_at TEXT,
-			created_at TEXT DEFAULT (datetime('now'))
-		);
-
-		CREATE TABLE IF NOT EXISTS usage_hourly (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			hour TEXT NOT NULL,
-			provider TEXT NOT NULL DEFAULT 'claude',
-			bucket_key TEXT NOT NULL,
-			bucket_label TEXT NOT NULL,
-			avg_utilization REAL NOT NULL,
-			max_utilization REAL NOT NULL,
-			min_utilization REAL NOT NULL,
-			sample_count INTEGER NOT NULL,
-			UNIQUE(hour, provider, bucket_key)
-		);
-
-		-- token_snapshots: `cwd` (mig 1) + `provider` (mig 12) + the sub-agent
-		-- trio from mig 20 folded in. `is_sidechain` is NOT optional: it is
-		-- read by get_session_breakdown, and a DB stamped past migration 20
-		-- without it makes the Usage view's breakdown read "unavailable".
-		CREATE TABLE IF NOT EXISTS token_snapshots (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			session_id TEXT NOT NULL,
-			hostname TEXT NOT NULL DEFAULT 'local',
-			timestamp TEXT NOT NULL,
-			input_tokens INTEGER NOT NULL,
-			output_tokens INTEGER NOT NULL,
-			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
-			cwd TEXT DEFAULT NULL,
-			created_at TEXT DEFAULT (datetime('now')),
-			provider TEXT NOT NULL DEFAULT 'claude',
-			is_sidechain INTEGER NOT NULL DEFAULT 0,
-			agent_id TEXT DEFAULT NULL,
-			parent_uuid TEXT DEFAULT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_sidechain
-			ON token_snapshots(provider, session_id, is_sidechain);
-		CREATE INDEX IF NOT EXISTS idx_token_snap_provider_session_agent
-			ON token_snapshots(provider, session_id, agent_id);
-
-		-- token_hourly: rebuilt by mig 12 with `provider` and UNIQUE(hour,
-		-- provider, hostname).
-		CREATE TABLE IF NOT EXISTS token_hourly (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			hour TEXT NOT NULL,
-			provider TEXT NOT NULL DEFAULT 'claude',
-			hostname TEXT NOT NULL DEFAULT 'local',
-			total_input INTEGER NOT NULL,
-			total_output INTEGER NOT NULL,
-			total_cache_creation INTEGER NOT NULL DEFAULT 0,
-			total_cache_read INTEGER NOT NULL DEFAULT 0,
-			turn_count INTEGER NOT NULL,
-			UNIQUE(hour, hostname, provider)
-		);
-
-		CREATE TABLE IF NOT EXISTS settings (
-			key TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		);
-
-		-- observations: `provider` added by mig 12.
-		CREATE TABLE IF NOT EXISTS observations (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			session_id TEXT NOT NULL,
-			timestamp TEXT NOT NULL,
-			hook_phase TEXT NOT NULL,
-			tool_name TEXT NOT NULL,
-			tool_input TEXT,
-			tool_output TEXT,
-			cwd TEXT,
-			created_at TEXT DEFAULT (datetime('now')),
-			provider TEXT NOT NULL DEFAULT 'claude'
-		);
-
-		-- learning_runs: + logs (mig 5), phases (mig 9), provider_scope (mig 12),
-		-- inference_metadata (mig 24).
-		CREATE TABLE IF NOT EXISTS learning_runs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			trigger_mode TEXT NOT NULL,
-			observations_analyzed INTEGER NOT NULL DEFAULT 0,
-			rules_created INTEGER NOT NULL DEFAULT 0,
-			rules_updated INTEGER NOT NULL DEFAULT 0,
-			duration_ms INTEGER,
-			status TEXT NOT NULL DEFAULT 'running',
-			error TEXT,
-			created_at TEXT DEFAULT (datetime('now')),
-			logs TEXT DEFAULT NULL,
-			phases TEXT DEFAULT NULL,
-			provider_scope TEXT NOT NULL DEFAULT '["claude"]',
-			inference_metadata TEXT DEFAULT NULL
-		);
-
-		-- learned_rules: TRUE v28 shape. Base cols + source (mig 4-ish),
-		-- content (mig 11), provider_scope (mig 12), content_hash (mig 15), and
-		-- the six migration-25 provenance/lifecycle columns.
-		CREATE TABLE IF NOT EXISTS learned_rules (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT NOT NULL UNIQUE,
-			domain TEXT,
-			confidence REAL NOT NULL DEFAULT 0.5,
-			observation_count INTEGER NOT NULL DEFAULT 0,
-			file_path TEXT NOT NULL,
-			created_at TEXT DEFAULT (datetime('now')),
-			updated_at TEXT DEFAULT (datetime('now')),
-			source TEXT DEFAULT 'observations',
-			alpha REAL NOT NULL DEFAULT 1.0,
-			beta_param REAL NOT NULL DEFAULT 1.0,
-			last_evidence_at TEXT DEFAULT NULL,
-			state TEXT NOT NULL DEFAULT 'emerging',
-			project TEXT DEFAULT NULL,
-			is_anti_pattern INTEGER NOT NULL DEFAULT 0,
-			confirmed_projects TEXT DEFAULT NULL,
-			content TEXT DEFAULT NULL,
-			provider_scope TEXT NOT NULL DEFAULT '["claude"]',
-			content_hash TEXT DEFAULT NULL,
-			lifecycle TEXT NOT NULL DEFAULT 'candidate',
-			origin_run_id INTEGER,
-			origin_model TEXT,
-			origin_at TEXT,
-			current_version INTEGER NOT NULL DEFAULT 1,
-			superseded_by TEXT
-		);
-
-		CREATE TABLE IF NOT EXISTS schema_version (
-			version INTEGER PRIMARY KEY
-		);
-
-		-- observation_summaries: rebuilt by mig 12 with `provider` and
-		-- UNIQUE(period, provider, project).
-		CREATE TABLE IF NOT EXISTS observation_summaries (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			period TEXT NOT NULL,
-			provider TEXT NOT NULL DEFAULT 'claude',
-			project TEXT,
-			tool_counts TEXT NOT NULL,
-			error_count INTEGER NOT NULL DEFAULT 0,
-			total_observations INTEGER NOT NULL DEFAULT 0,
-			created_at TEXT DEFAULT (datetime('now')),
-			UNIQUE(period, provider, project)
-		);
-
-		-- tool_actions: rebuilt by mig 30 (source-owned identity: source_key +
-		-- action_key + chain_id) and extended by mig 33 with the stored line
-		-- counts the code-stat queries read directly. Seeded rows are LIVE rows
-		-- (source_key NULL), which is the shape `uidx_ta_live` keys and the one
-		-- reconciliation never deletes.
-		CREATE TABLE IF NOT EXISTS tool_actions (
-			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider        TEXT NOT NULL DEFAULT 'claude',
-			source_key      TEXT,
-			action_key      TEXT NOT NULL CHECK(length(action_key) > 0),
-			message_id      TEXT NOT NULL,
-			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
-			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
-			parent_chain_id TEXT,
-			tool_name       TEXT NOT NULL,
-			category        TEXT NOT NULL,
-			file_path       TEXT,
-			summary         TEXT NOT NULL,
-			full_input      TEXT,
-			full_output     TEXT,
-			timestamp       TEXT NOT NULL,
-			is_sidechain    INTEGER NOT NULL DEFAULT 0,
-			agent_id        TEXT,
-			parent_uuid     TEXT,
-			lines_added     INTEGER,
-			lines_removed   INTEGER,
-			CHECK(source_key IS NULL OR length(source_key) > 0)
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_ta_owned
-			ON tool_actions(provider, source_key, action_key)
-			WHERE source_key IS NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_ta_live
-			ON tool_actions(provider, session_id, action_key)
-			WHERE source_key IS NULL;
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_source
-			ON tool_actions(provider, source_key);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session
-			ON tool_actions(provider, session_id);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_session
-			ON tool_actions(session_id);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_message
-			ON tool_actions(message_id);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_file
-			ON tool_actions(file_path);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_category
-			ON tool_actions(category);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session_sidechain
-			ON tool_actions(provider, session_id, is_sidechain);
-		CREATE INDEX IF NOT EXISTS idx_tool_actions_provider_session_agent
-			ON tool_actions(provider, session_id, agent_id);
-
-		CREATE TABLE IF NOT EXISTS memory_files (
-			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			project_path    TEXT NOT NULL,
-			file_path       TEXT NOT NULL,
-			content_hash    TEXT NOT NULL,
-			last_scanned_at TEXT NOT NULL,
-			UNIQUE(project_path, file_path)
-		);
-
-		-- optimization_runs: + provider_scope (mig 12), inference_metadata (mig 24).
-		CREATE TABLE IF NOT EXISTS optimization_runs (
-			id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-			project_path        TEXT NOT NULL,
-			trigger             TEXT NOT NULL,
-			memories_scanned    INTEGER NOT NULL DEFAULT 0,
-			suggestions_created INTEGER NOT NULL DEFAULT 0,
-			context_sources     TEXT NOT NULL DEFAULT '{}',
-			status              TEXT NOT NULL DEFAULT 'running',
-			error               TEXT,
-			started_at          TEXT NOT NULL,
-			completed_at        TEXT,
-			provider_scope      TEXT NOT NULL DEFAULT '["claude"]',
-			inference_metadata  TEXT DEFAULT NULL
-		);
-
-		CREATE TABLE IF NOT EXISTS optimization_suggestions (
-			id               INTEGER PRIMARY KEY AUTOINCREMENT,
-			run_id           INTEGER NOT NULL REFERENCES optimization_runs(id),
-			project_path     TEXT NOT NULL,
-			action_type      TEXT NOT NULL,
-			target_file      TEXT,
-			reasoning        TEXT NOT NULL,
-			proposed_content TEXT,
-			merge_sources    TEXT,
-			status           TEXT NOT NULL DEFAULT 'pending',
-			error            TEXT,
-			resolved_at      TEXT,
-			created_at       TEXT NOT NULL,
-			original_content TEXT,
-			diff_summary     TEXT,
-			backup_data      TEXT,
-			group_id         TEXT,
-			provider_scope   TEXT NOT NULL DEFAULT '["claude"]'
-		);
-
-		CREATE TABLE IF NOT EXISTS git_snapshots (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			project      TEXT NOT NULL UNIQUE,
-			commit_hash  TEXT NOT NULL,
-			commit_count INTEGER NOT NULL,
-			raw_data     TEXT NOT NULL,
-			created_at   TEXT DEFAULT (datetime('now'))
-		);
-
-		-- response_times: rebuilt by mig 30 around the source-owned identity
-		-- (source_key + chain_id); the old UNIQUE became two partial indexes.
-		CREATE TABLE IF NOT EXISTS response_times (
-			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider        TEXT NOT NULL DEFAULT 'claude',
-			source_key      TEXT,
-			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
-			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
-			parent_chain_id TEXT,
-			timestamp       TEXT NOT NULL,
-			response_secs   REAL,
-			idle_secs       REAL,
-			created_at      TEXT DEFAULT (datetime('now')),
-			is_sidechain    INTEGER NOT NULL DEFAULT 0,
-			agent_id        TEXT,
-			parent_uuid     TEXT,
-			CHECK(source_key IS NULL OR length(source_key) > 0)
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_rt_owned
-			ON response_times(provider, source_key, chain_id, timestamp)
-			WHERE source_key IS NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_rt_live
-			ON response_times(provider, session_id, chain_id, timestamp)
-			WHERE source_key IS NULL;
-		CREATE INDEX IF NOT EXISTS idx_response_times_provider_source
-			ON response_times(provider, source_key);
-		CREATE INDEX IF NOT EXISTS idx_rt_provider_session
-			ON response_times(provider, session_id);
-		CREATE INDEX IF NOT EXISTS idx_rt_session
-			ON response_times(session_id);
-		CREATE INDEX IF NOT EXISTS idx_rt_timestamp
-			ON response_times(timestamp);
-		CREATE INDEX IF NOT EXISTS idx_rt_provider_session_sidechain
-			ON response_times(provider, session_id, is_sidechain);
-		CREATE INDEX IF NOT EXISTS idx_rt_provider_session_agent
-			ON response_times(provider, session_id, agent_id);
-
-		CREATE TABLE IF NOT EXISTS context_savings_events (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			event_id TEXT NOT NULL UNIQUE,
-			schema_version INTEGER NOT NULL,
-			provider TEXT NOT NULL,
-			session_id TEXT,
-			hostname TEXT NOT NULL,
-			cwd TEXT,
-			timestamp TEXT NOT NULL,
-			event_type TEXT NOT NULL,
-			source TEXT NOT NULL,
-			decision TEXT NOT NULL,
-			category TEXT NOT NULL DEFAULT 'unknown',
-			reason TEXT,
-			delivered INTEGER NOT NULL,
-			indexed_bytes INTEGER,
-			returned_bytes INTEGER,
-			input_bytes INTEGER,
-			tokens_indexed_est INTEGER,
-			tokens_returned_est INTEGER,
-			tokens_saved_est INTEGER,
-			tokens_preserved_est INTEGER,
-			estimate_method TEXT,
-			estimate_confidence REAL,
-			source_ref TEXT,
-			snapshot_ref TEXT,
-			metadata_json TEXT,
-			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-
-		-- session_events: the per-JSONL-line timeline feeding get_llm_runtime_stats
-		-- (feature 008), rebuilt by mig 30 around (source_key, event_key) and
-		-- indexed for the bounded runtime walk by migs 31/32. The LLM RUNTIME
-		-- card reads this table EXCLUSIVELY; without rows it shows "no data".
-		CREATE TABLE IF NOT EXISTS session_events (
-			provider        TEXT NOT NULL,
-			source_key      TEXT,
-			event_key       TEXT NOT NULL CHECK(length(event_key) > 0),
-			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
-			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
-			parent_chain_id TEXT,
-			agent_id        TEXT,
-			is_sidechain    INTEGER NOT NULL DEFAULT 0,
-			timestamp       TEXT NOT NULL,
-			kind            TEXT NOT NULL,
-			uuid            TEXT,
-			parent_uuid     TEXT,
-			CHECK(source_key IS NULL OR length(source_key) > 0)
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_owned
-			ON session_events(provider, source_key, event_key)
-			WHERE source_key IS NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_se_live
-			ON session_events(provider, session_id, event_key)
-			WHERE source_key IS NULL;
-		CREATE INDEX IF NOT EXISTS idx_session_events_provider_source
-			ON session_events(provider, source_key);
-		CREATE INDEX IF NOT EXISTS idx_se_timestamp
-			ON session_events(timestamp);
-		CREATE INDEX IF NOT EXISTS idx_se_chain
-			ON session_events(provider, session_id, chain_id, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_se_provider_session_sidechain
-			ON session_events(provider, session_id, is_sidechain, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_se_provider_chain_timestamp
-			ON session_events(provider, chain_id, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_se_timestamp_chain
-			ON session_events(timestamp, provider, chain_id, is_sidechain, kind, session_id);
-
-		-- ── Tables created by migrations 21/25/27 ──────────────────────────────
-		-- The app records schema_version up to the latest (28), so it runs ZERO
-		-- migrations against this DB. Every table a migration would otherwise
-		-- CREATE must therefore exist here in final shape, or the app's queries
-		-- against them fail. Shapes copied verbatim from src-tauri/src/storage.rs.
-
-		-- skill_usages: mig 21 (table) + mig 22 (cwd, hostname), rebuilt by
-		-- mig 30 with the source-owned identity columns.
-		CREATE TABLE IF NOT EXISTS skill_usages (
-			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider        TEXT NOT NULL,
-			source_key      TEXT,
-			session_id      TEXT NOT NULL CHECK(length(session_id) > 0),
-			chain_id        TEXT NOT NULL CHECK(length(chain_id) > 0),
-			parent_chain_id TEXT,
-			message_id      TEXT NOT NULL,
-			skill_name      TEXT NOT NULL,
-			skill_path      TEXT NOT NULL,
-			timestamp       TEXT NOT NULL,
-			tool_name       TEXT,
-			created_at      TEXT DEFAULT (datetime('now')),
-			cwd             TEXT,
-			hostname        TEXT,
-			CHECK(source_key IS NULL OR length(source_key) > 0)
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_su_owned
-			ON skill_usages(provider, source_key, message_id, skill_name,
-							skill_path, timestamp)
-			WHERE source_key IS NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_su_live
-			ON skill_usages(provider, session_id, message_id, skill_name,
-							skill_path, timestamp)
-			WHERE source_key IS NULL;
-		CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_source
-			ON skill_usages(provider, source_key);
-		CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_ts
-			ON skill_usages(provider, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_skill_usages_provider_session
-			ON skill_usages(provider, session_id);
-		CREATE INDEX IF NOT EXISTS idx_skill_usages_skill_ts
-			ON skill_usages(skill_name, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_skill_usages_skill_cwd
-			ON skill_usages(skill_name, cwd);
-
-		-- rule_versions: mig 25 (append-only rule content history).
-		CREATE TABLE IF NOT EXISTS rule_versions (
-			id              INTEGER PRIMARY KEY AUTOINCREMENT,
-			rule_id         INTEGER NOT NULL
-								REFERENCES learned_rules(id) ON DELETE CASCADE,
-			version         INTEGER NOT NULL,
-			content         TEXT NOT NULL,
-			content_hash    TEXT NOT NULL,
-			domain          TEXT,
-			is_anti_pattern INTEGER NOT NULL DEFAULT 0,
-			provider_scope  TEXT NOT NULL DEFAULT '["claude"]',
-			source          TEXT,
-			run_id          INTEGER,
-			change_kind     TEXT NOT NULL,
-			rolled_back_from INTEGER,
-			author          TEXT NOT NULL DEFAULT 'system',
-			created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-			UNIQUE(rule_id, version)
-		);
-		CREATE INDEX IF NOT EXISTS idx_rule_versions_rule_version
-			ON rule_versions(rule_id, version DESC);
-
-		-- rule_evidence_citations: mig 25 (grounding snapshot; no FK on obs).
-		CREATE TABLE IF NOT EXISTS rule_evidence_citations (
-			id             INTEGER PRIMARY KEY AUTOINCREMENT,
-			rule_id        INTEGER NOT NULL
-							   REFERENCES learned_rules(id) ON DELETE CASCADE,
-			run_id         INTEGER,
-			rule_version   INTEGER,
-			observation_id INTEGER,
-			provider       TEXT,
-			session_id     TEXT,
-			cwd            TEXT,
-			tool_name      TEXT,
-			evidence_ts    TEXT,
-			snippet        TEXT,
-			kind           TEXT,
-			ref_id         TEXT,
-			created_at     TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-		CREATE INDEX IF NOT EXISTS idx_rule_evidence_rule_version
-			ON rule_evidence_citations(rule_id, rule_version);
-		CREATE INDEX IF NOT EXISTS idx_rule_evidence_run
-			ON rule_evidence_citations(run_id);
-		CREATE INDEX IF NOT EXISTS idx_rule_evidence_observation
-			ON rule_evidence_citations(observation_id);
-
-		-- rule_tombstones: mig 25 (durable suppression, name-keyed).
-		CREATE TABLE IF NOT EXISTS rule_tombstones (
-			rule_name         TEXT PRIMARY KEY,
-			rule_id           INTEGER,
-			tombstoned_at     TEXT NOT NULL DEFAULT (datetime('now')),
-			tombstoned_by     TEXT NOT NULL,
-			reason            TEXT,
-			last_content_hash TEXT,
-			reactivated_at    TEXT,
-			reactivated_by    TEXT
-		);
-		CREATE INDEX IF NOT EXISTS idx_rule_tombstones_reactivated
-			ON rule_tombstones(reactivated_at);
-
-		-- operator_feedback: mig 25 (primary outcome signal).
-		CREATE TABLE IF NOT EXISTS operator_feedback (
-			id                INTEGER PRIMARY KEY AUTOINCREMENT,
-			rule_name         TEXT NOT NULL,
-			actor             TEXT NOT NULL DEFAULT 'operator',
-			feedback          TEXT NOT NULL,
-			note              TEXT,
-			rule_content_hash TEXT,
-			created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-			updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
-			UNIQUE(rule_name, actor)
-		);
-
-		-- evaluation_results: mig 25 (counterfactual verdicts).
-		CREATE TABLE IF NOT EXISTS evaluation_results (
-			id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-			rule_name          TEXT NOT NULL,
-			learning_run_id    INTEGER REFERENCES learning_runs(id),
-			replay_set_version TEXT,
-			judge_model        TEXT,
-			evaluated_at       TEXT NOT NULL DEFAULT (datetime('now')),
-			verdict            TEXT,
-			delta              REAL,
-			regression         INTEGER NOT NULL DEFAULT 0,
-			negative_transfer  INTEGER NOT NULL DEFAULT 0,
-			judge_uncalibrated INTEGER NOT NULL DEFAULT 0,
-			replay_set_stale   INTEGER NOT NULL DEFAULT 0,
-			agreement_score    REAL,
-			rationale          TEXT,
-			per_case_json      TEXT
-		);
-		CREATE INDEX IF NOT EXISTS idx_evaluation_results_rule_evaluated
-			ON evaluation_results(rule_name, evaluated_at DESC);
-
-		-- reviewer_overrides: mig 25 (audited regression overrides).
-		CREATE TABLE IF NOT EXISTS reviewer_overrides (
-			id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-			rule_name          TEXT NOT NULL,
-			replay_set_version TEXT,
-			overridden_by      TEXT,
-			reason             TEXT NOT NULL,
-			overridden_at      TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-
-		-- hook_invocations: mig 27 (hooks-breakdown tab source), rebuilt by
-		-- mig 30 with the source-owned identity columns.
-		CREATE TABLE IF NOT EXISTS hook_invocations (
-			provider           TEXT NOT NULL,
-			source_key         TEXT,
-			session_id         TEXT NOT NULL CHECK(length(session_id) > 0),
-			chain_id           TEXT NOT NULL CHECK(length(chain_id) > 0),
-			parent_chain_id    TEXT,
-			agent_id           TEXT,
-			is_sidechain       INTEGER NOT NULL DEFAULT 0,
-			timestamp          TEXT NOT NULL,
-			hook_event         TEXT NOT NULL,
-			hook_matcher       TEXT,
-			tool_name          TEXT,
-			hook_identity      TEXT NOT NULL,
-			script_command_raw TEXT,
-			exit_code          INTEGER,
-			duration_ms        INTEGER,
-			cwd                TEXT,
-			hostname           TEXT,
-			message_id         TEXT,
-			CHECK(source_key IS NULL OR length(source_key) > 0)
-		);
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_hi_owned
-			ON hook_invocations(provider, source_key, chain_id, timestamp,
-								hook_identity)
-			WHERE source_key IS NOT NULL;
-		CREATE UNIQUE INDEX IF NOT EXISTS uidx_hi_live
-			ON hook_invocations(provider, session_id, chain_id, timestamp,
-								hook_identity)
-			WHERE source_key IS NULL;
-		CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_source
-			ON hook_invocations(provider, source_key);
-		CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_ts
-			ON hook_invocations(provider, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_hook_invocations_provider_session
-			ON hook_invocations(provider, session_id);
-		CREATE INDEX IF NOT EXISTS idx_hook_invocations_identity_ts
-			ON hook_invocations(hook_identity, timestamp);
-		CREATE INDEX IF NOT EXISTS idx_hook_invocations_identity_cwd
-			ON hook_invocations(hook_identity, cwd);
-
-		-- Model analytics: migration 28. Retained JSONL files remain source of
-		-- truth; these tables cache provider-qualified evidence and reconciliation
-		-- state without a model catalog.
-		CREATE TABLE IF NOT EXISTS model_usage_observations (
-			id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-			provider              TEXT NOT NULL,
-			source_key            TEXT NOT NULL,
-			source_record_key     TEXT NOT NULL,
-			source_ordinal        INTEGER NOT NULL,
-			observation_kind      TEXT NOT NULL,
-			source_session_id     TEXT NOT NULL,
-			analytics_session_id  TEXT NOT NULL,
-			chain_id              TEXT NOT NULL,
-			parent_chain_id       TEXT,
-			agent_id              TEXT,
-			turn_id               TEXT,
-			raw_model_id          TEXT,
-			cwd                   TEXT,
-			hostname              TEXT,
-			is_sidechain          INTEGER NOT NULL,
-			observed_at_ms        INTEGER NOT NULL,
-			input_tokens          INTEGER,
-			output_tokens         INTEGER,
-			cache_creation_tokens INTEGER,
-			cache_read_tokens     INTEGER,
-			model_evidence        TEXT NOT NULL,
-			token_evidence        TEXT NOT NULL,
-			derived_model_id      TEXT,
-			UNIQUE(provider, source_key, source_record_key),
-			CHECK(source_ordinal >= 0),
-			CHECK(observation_kind IN ('turn', 'token')),
-			CHECK(is_sidechain IN (0, 1)),
-			CHECK(observed_at_ms >= 0),
-			CHECK(input_tokens IS NULL OR input_tokens BETWEEN 0 AND 100000000),
-			CHECK(output_tokens IS NULL OR output_tokens BETWEEN 0 AND 100000000),
-			CHECK(cache_creation_tokens IS NULL OR cache_creation_tokens BETWEEN 0 AND 100000000),
-			CHECK(cache_read_tokens IS NULL OR cache_read_tokens BETWEEN 0 AND 100000000),
-			CHECK(model_evidence IN ('explicit', 'missing', 'invalid')),
-			CHECK(token_evidence IN ('direct', 'cumulative_delta', 'unavailable'))
-		);
-		CREATE INDEX IF NOT EXISTS idx_model_observations_observed_provider
-			ON model_usage_observations(observed_at_ms, provider);
-		CREATE INDEX IF NOT EXISTS idx_model_observations_model_time
-			ON model_usage_observations(provider, raw_model_id, observed_at_ms);
-		CREATE INDEX IF NOT EXISTS idx_model_observations_session_time
-			ON model_usage_observations(provider, analytics_session_id, observed_at_ms);
-		CREATE INDEX IF NOT EXISTS idx_model_observations_chain_time
-			ON model_usage_observations(provider, analytics_session_id, chain_id, observed_at_ms, source_ordinal);
-		CREATE INDEX IF NOT EXISTS idx_model_observations_source
-			ON model_usage_observations(provider, source_key);
-		CREATE INDEX IF NOT EXISTS idx_model_observations_derived_model_time
-			ON model_usage_observations(provider, derived_model_id, observed_at_ms);
-
-		CREATE TABLE IF NOT EXISTS model_observation_sources (
-			provider              TEXT NOT NULL,
-			source_key            TEXT NOT NULL,
-			source_root_key       TEXT NOT NULL,
-			source_path           TEXT NOT NULL,
-			source_session_id     TEXT,
-			analytics_session_id  TEXT,
-			chain_id              TEXT,
-			parent_chain_id       TEXT,
-			agent_id              TEXT,
-			is_sidechain          INTEGER NOT NULL,
-			cwd                   TEXT,
-			hostname              TEXT,
-			first_activity_at_ms  INTEGER,
-			last_activity_at_ms   INTEGER,
-			mtime_ns              INTEGER,
-			size_bytes            INTEGER,
-			content_sha256        TEXT,
-			last_error            TEXT,
-			suppressed_sha256     TEXT,
-			suppressed_at_ms      INTEGER,
-			seen_generation       INTEGER NOT NULL,
-			processing_status     TEXT NOT NULL,
-			observation_count     INTEGER NOT NULL,
-			last_attempt_at_ms    INTEGER,
-			last_success_at_ms    INTEGER,
-			PRIMARY KEY(provider, source_key),
-			CHECK(is_sidechain IN (0, 1)),
-			CHECK(first_activity_at_ms IS NULL OR first_activity_at_ms >= 0),
-			CHECK(last_activity_at_ms IS NULL OR last_activity_at_ms >= 0),
-			CHECK(mtime_ns IS NULL OR mtime_ns >= 0),
-			CHECK(size_bytes IS NULL OR size_bytes >= 0),
-			CHECK(suppressed_at_ms IS NULL OR suppressed_at_ms >= 0),
-			CHECK(seen_generation >= 0),
-			CHECK(processing_status IN ('pending', 'ok', 'stale', 'failed', 'suppressed')),
-			CHECK(observation_count >= 0),
-			CHECK(last_attempt_at_ms IS NULL OR last_attempt_at_ms >= 0),
-			CHECK(last_success_at_ms IS NULL OR last_success_at_ms >= 0)
-		);
-		CREATE INDEX IF NOT EXISTS idx_model_sources_activity
-			ON model_observation_sources(provider, first_activity_at_ms, last_activity_at_ms);
-		CREATE INDEX IF NOT EXISTS idx_model_sources_session
-			ON model_observation_sources(provider, analytics_session_id);
-		CREATE INDEX IF NOT EXISTS idx_model_sources_cwd
-			ON model_observation_sources(provider, cwd);
-		CREATE INDEX IF NOT EXISTS idx_model_sources_hostname
-			ON model_observation_sources(provider, hostname);
-		CREATE INDEX IF NOT EXISTS idx_model_sources_root_generation
-			ON model_observation_sources(provider, source_root_key, seen_generation);
-
-		CREATE TABLE IF NOT EXISTS model_backfill_state (
-			id                     INTEGER PRIMARY KEY CHECK(id = 1),
-			generation             INTEGER NOT NULL,
-			trigger                TEXT NOT NULL,
-			status                 TEXT NOT NULL,
-			total_roots            INTEGER NOT NULL,
-			completed_roots        INTEGER NOT NULL,
-			failed_roots           INTEGER NOT NULL,
-			inventory_complete     INTEGER NOT NULL,
-			total_sources          INTEGER NOT NULL,
-			source_total_published INTEGER NOT NULL DEFAULT 0,
-			processed_sources      INTEGER NOT NULL,
-			failed_sources         INTEGER NOT NULL,
-			skipped_sources        INTEGER NOT NULL,
-			remaining_sources      INTEGER NOT NULL,
-			observations_written   INTEGER NOT NULL,
-			started_at_ms          INTEGER,
-			updated_at_ms          INTEGER NOT NULL,
-			finished_at_ms         INTEGER,
-			last_error             TEXT,
-			CHECK(generation >= 0),
-			CHECK(trigger IN ('migration', 'startup_resume', 'retry', 'reconcile')),
-			CHECK(status IN ('pending', 'running', 'complete', 'partial', 'failed')),
-			CHECK(total_roots >= 0),
-			CHECK(completed_roots >= 0),
-			CHECK(failed_roots >= 0),
-			CHECK(inventory_complete IN (0, 1)),
-			CHECK(total_sources >= 0),
-			CHECK(source_total_published IN (0, 1)),
-			CHECK(processed_sources >= 0),
-			CHECK(failed_sources >= 0),
-			CHECK(skipped_sources >= 0),
-			CHECK(remaining_sources >= 0),
-			CHECK(observations_written >= 0),
-			CHECK(started_at_ms IS NULL OR started_at_ms >= 0),
-			CHECK(updated_at_ms >= 0),
-			CHECK(finished_at_ms IS NULL OR finished_at_ms >= 0)
-		);
-
-		-- ── Tables created by migrations 30/31/35 ──────────────────────────────
-		-- Nothing seeds these, but a DB stamped at the latest version runs zero
-		-- migrations, so the app would query tables that were never created.
-
-		-- transcript_analytics_sources: mig 30 (per-JSONL reconciliation state).
-		CREATE TABLE IF NOT EXISTS transcript_analytics_sources (
-			provider             TEXT NOT NULL,
-			source_key           TEXT NOT NULL,
-			source_root_key      TEXT NOT NULL,
-			source_path          TEXT NOT NULL,
-			source_session_id    TEXT,
-			analytics_session_id TEXT,
-			chain_id             TEXT,
-			parent_chain_id      TEXT,
-			agent_id             TEXT,
-			is_sidechain         INTEGER NOT NULL DEFAULT 0,
-			project              TEXT,
-			cwd                  TEXT,
-			hostname             TEXT,
-			mtime_ns             INTEGER,
-			size_bytes           INTEGER,
-			content_sha256       TEXT,
-			seen_generation      INTEGER NOT NULL DEFAULT 0,
-			processing_status    TEXT NOT NULL DEFAULT 'pending',
-			last_attempt_at_ms   INTEGER,
-			last_success_at_ms   INTEGER,
-			last_error           TEXT,
-			suppressed_sha256    TEXT,
-			suppressed_at_ms     INTEGER,
-			PRIMARY KEY(provider, source_key),
-			CHECK(length(source_key) > 0),
-			CHECK(length(source_root_key) > 0),
-			CHECK(length(source_path) > 0),
-			CHECK(source_session_id IS NULL OR length(source_session_id) > 0),
-			CHECK(analytics_session_id IS NULL OR length(analytics_session_id) > 0),
-			CHECK(chain_id IS NULL OR length(chain_id) > 0),
-			CHECK(is_sidechain IN (0, 1)),
-			CHECK(mtime_ns IS NULL OR mtime_ns >= 0),
-			CHECK(size_bytes IS NULL OR size_bytes >= 0),
-			CHECK(seen_generation >= 0),
-			CHECK(processing_status IN ('pending', 'ok', 'stale', 'failed', 'suppressed')),
-			CHECK(last_attempt_at_ms IS NULL OR last_attempt_at_ms >= 0),
-			CHECK(last_success_at_ms IS NULL OR last_success_at_ms >= 0),
-			CHECK(suppressed_at_ms IS NULL OR suppressed_at_ms >= 0)
-		);
-		CREATE INDEX IF NOT EXISTS idx_tas_root_generation
-			ON transcript_analytics_sources(provider, source_root_key, seen_generation);
-		CREATE INDEX IF NOT EXISTS idx_tas_session
-			ON transcript_analytics_sources(provider, analytics_session_id);
-		CREATE INDEX IF NOT EXISTS idx_tas_project
-			ON transcript_analytics_sources(project);
-		CREATE INDEX IF NOT EXISTS idx_tas_cwd
-			ON transcript_analytics_sources(cwd);
-		CREATE INDEX IF NOT EXISTS idx_tas_host
-			ON transcript_analytics_sources(hostname);
-
-		-- live_analytics_sessions: mig 30 (origin registry for source-less rows).
-		CREATE TABLE IF NOT EXISTS live_analytics_sessions (
-			provider   TEXT NOT NULL,
-			session_id TEXT NOT NULL CHECK(length(session_id) > 0),
-			project    TEXT,
-			cwd        TEXT,
-			hostname   TEXT,
-			updated_at TEXT NOT NULL,
-			PRIMARY KEY(provider, session_id)
-		);
-		CREATE INDEX IF NOT EXISTS idx_las_project
-			ON live_analytics_sessions(project);
-		CREATE INDEX IF NOT EXISTS idx_las_cwd
-			ON live_analytics_sessions(cwd);
-		CREATE INDEX IF NOT EXISTS idx_las_host
-			ON live_analytics_sessions(hostname);
-
-		-- project_path_renames: mig 31.
-		CREATE TABLE IF NOT EXISTS project_path_renames (
-			old_path   TEXT PRIMARY KEY CHECK(length(old_path) > 0),
-			new_path   TEXT NOT NULL CHECK(length(new_path) > 0),
-			updated_at TEXT NOT NULL,
-			CHECK(old_path != new_path)
-		);
-		CREATE INDEX IF NOT EXISTS idx_project_path_renames_new
-			ON project_path_renames(new_path);
-
-		-- retention_daily_aggregates: mig 35.
-		CREATE TABLE IF NOT EXISTS retention_daily_aggregates (
-			provider            TEXT NOT NULL,
-			source_key          TEXT NOT NULL,
-			session_id          TEXT NOT NULL,
-			day                 TEXT NOT NULL,
-			agent_id            TEXT NOT NULL DEFAULT '',
-			file_path           TEXT NOT NULL DEFAULT '',
-			tool_action_count   INTEGER NOT NULL DEFAULT 0,
-			session_event_count INTEGER NOT NULL DEFAULT 0,
-			code_change_count   INTEGER NOT NULL DEFAULT 0,
-			lines_added         INTEGER NOT NULL DEFAULT 0,
-			lines_removed       INTEGER NOT NULL DEFAULT 0,
-			PRIMARY KEY(provider, source_key, session_id, day, agent_id, file_path)
-		);
-		CREATE INDEX IF NOT EXISTS idx_retention_daily_session
-			ON retention_daily_aggregates(provider, session_id);
-		CREATE INDEX IF NOT EXISTS idx_retention_daily_day
-			ON retention_daily_aggregates(day);
-	""")
+def initialize_database(quill_bin: Path) -> None:
+	"""Create or migrate usage.db through Quill's production Rust schema path."""
+	subprocess.run([str(quill_bin), "--init-database", str(DB_PATH)], check=True)
 
 
 def clear_tables(conn: sqlite3.Connection) -> None:
 	tables = [
 		"usage_snapshots", "usage_hourly", "token_snapshots", "token_hourly",
 		"settings", "observations", "learning_runs", "learned_rules",
-		"schema_version", "observation_summaries", "tool_actions",
+		"observation_summaries", "tool_actions",
 		"memory_files", "optimization_runs", "optimization_suggestions",
 		"git_snapshots", "response_times", "context_savings_events",
 		"session_events", "skill_usages", "hook_invocations",
 		"rule_versions", "rule_evidence_citations", "rule_tombstones",
 		"operator_feedback", "evaluation_results", "reviewer_overrides",
 		"model_usage_observations", "model_observation_sources",
-		"model_backfill_state",
+		"model_backfill_state", "model_usage_hourly", "runtime_hourly",
+		"runtime_turn_state",
 	]
 	for tbl in tables:
 		conn.execute(f"DELETE FROM {tbl}")
+	conn.execute(
+		"""UPDATE rollup_meta
+		SET rollup_generation = 0,
+			model_backfill_status = 'pending',
+			model_backfill_done_through_ms = NULL,
+			runtime_backfill_status = 'pending',
+			runtime_backfill_done_through_rowid = NULL
+		WHERE id = 1"""
+	)
 
 
 # ── 1. usage_snapshots ────────────────────────────────────────────────────────
@@ -1622,25 +810,6 @@ def populate_learned_rules(conn: sqlite3.Connection) -> None:
 		f"{LEARNED_DIR}/{{{','.join(RULE_SCOPE_DIRS)}}}, "
 		f"{len(rows) - written} discovered candidates)"
 	)
-
-
-# ── 9. schema_version ─────────────────────────────────────────────────────────
-
-def populate_schema_version(conn: sqlite3.Connection) -> None:
-	# Record EVERY migration version up to the app's latest (35). The Rust
-	# migration runner guards each block with `if current_version < N`, so
-	# recording 1..35 makes the app run ZERO migrations against the seeded DB.
-	# This is required because ensure_schema already builds every table in its
-	# final post-migration shape — re-running ALTER ADD COLUMN migrations would
-	# collide (e.g. "duplicate column name: cwd"), and migration 30 would move
-	# every seeded analytics row into a `_legacy_v30` archive that migration 34
-	# then drops, emptying the Charts CODE timeline the capture photographs.
-	# Bump this together with ensure_schema when storage.rs adds a migration
-	# beyond 35 (search: INSERT INTO schema_version (version) VALUES).
-	LATEST_SCHEMA_VERSION = 35
-	for v in range(1, LATEST_SCHEMA_VERSION + 1):
-		conn.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)", (v,))
-	print(f"  schema_version: versions 1-{LATEST_SCHEMA_VERSION}")
 
 
 # ── 10. observation_summaries ─────────────────────────────────────────────────
@@ -3441,6 +2610,10 @@ def parse_args() -> argparse.Namespace:
 		help="Directory to write usage.db into. Default: platform app_data_dir for Quill.",
 	)
 	parser.add_argument(
+		"--bin", type=Path, default=None,
+		help="Quill executable used to initialize and migrate usage.db.",
+	)
+	parser.add_argument(
 		"--rules-dir", type=Path, default=None,
 		help="Directory to write sample learned-rule .md files into. Default: ~/.claude/rules/learned/.",
 	)
@@ -3522,11 +2695,13 @@ def main() -> None:
 	PROJECTS_DIR = projects_dir
 	CODEX_SESSIONS_DIR = args.codex_sessions_dir
 	MEMORY_HOME = args.home_dir
+	quill_bin = resolve_quill_bin(args.bin)
 
 	random.seed(args.seed)
 
 	log(f"\nQuill Dummy Data Seeder")
 	log(f"DB path:    {DB_PATH}")
+	log(f"Quill bin:  {quill_bin}")
 	log(f"Rules path: {LEARNED_DIR}")
 	if CODEX_SESSIONS_DIR is not None:
 		log(f"Codex path: {CODEX_SESSIONS_DIR}")
@@ -3549,14 +2724,14 @@ def main() -> None:
 		log()
 
 	DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+	log("Step 2: Initializing schema through Quill migrations...")
+	initialize_database(quill_bin)
+	log()
+
 	conn = sqlite3.connect(str(DB_PATH))
 	conn.execute("PRAGMA foreign_keys = OFF")
 
 	try:
-		log("Step 2: Ensuring schema exists...")
-		ensure_schema(conn)
-		log()
-
 		log("Step 3: Clearing existing data...")
 		clear_tables(conn)
 		log()
@@ -3570,7 +2745,6 @@ def main() -> None:
 		populate_observations(conn)
 		populate_learning_runs(conn)
 		populate_learned_rules(conn)
-		populate_schema_version(conn)
 		populate_observation_summaries(conn)
 		populate_tool_actions(conn)
 		populate_memory_files(conn)

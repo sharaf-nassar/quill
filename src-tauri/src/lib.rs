@@ -34,13 +34,9 @@ pub mod retention;
 /// the delete engine, and exporting it would drag `Storage` into the crate's
 /// public surface through `run_retention_delete_phase`.
 mod retention_engine;
-/// Frozen synthetic corpus shared by the retention tests and the retention
-/// timing spike. Deliberately non-test code: `src/bin/retention_spike.rs` is a
-/// separate crate and cannot link `#[cfg(test)]` items.
-pub mod retention_fixture;
-/// Maintainer-only retention corpus protocol. This is intentionally a Cargo
-/// binary support module, not a Tauri, IPC, or supported-CLI surface.
-pub mod retention_study;
+/// Frozen synthetic corpus shared by the retention tests.
+#[cfg(test)]
+mod retention_fixture;
 /// Shared bounded runner for resumable hourly-rollup backfills.
 mod rollup_backfill;
 mod rule_watcher;
@@ -50,19 +46,15 @@ mod storage;
 mod transcript_analytics;
 mod transcript_identity;
 mod tray_keepalive;
-/// Maintainer-only, read-only benchmark protocol for widget query performance.
-/// This is Cargo-binary support, not a Tauri, IPC, or supported-CLI surface.
-pub mod widget_query_perf_study;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
     ActivitySeriesResponse, BucketStats, CodeStats, CodeStatsHistoryPoint,
     ContextPreservationStatus, ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown,
     LearnedRule, LearningRun, LearningSettings, LlmRuntimeStats, ModelAnalyticsError,
-    ModelAnalyticsErrorCode, ModelAnalyticsResponse, ModelAnalyticsUpdatedEvent,
-    ModelBackfillState, ModelBackfillStatus, ModelHistoryResponse, ModelIdentity, ModelRange,
-    ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens,
-    ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
+    ModelAnalyticsErrorCode, ModelAnalyticsUpdatedEvent, ModelBackfillState, ModelBackfillStatus,
+    ModelIdentity, ModelRange, ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown,
+    ProjectTokens, ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
     SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats,
     SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
     TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError, UsageSource,
@@ -255,139 +247,15 @@ const WIDGET_MIN_HEIGHT: f64 = 200.0;
 const LIVE_USAGE_INTERVAL_MIN_SECS: i64 = 60;
 const LIVE_USAGE_INTERVAL_MAX_SECS: i64 = 600;
 
-// Backend-only keys for the periodic transcript rescan loop. These are read
-// from the settings table on every tick and are intentionally kept out of the
-// RuntimeSettings IPC struct and Settings UI.
-const TRANSCRIPT_RESCAN_ENABLED_KEY: &str = "transcript_rescan.enabled";
-const TRANSCRIPT_RESCAN_INTERVAL_KEY: &str = "transcript_rescan.interval_seconds";
-const TRANSCRIPT_RESCAN_ENABLED_DEFAULT: bool = true;
-const TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS: i64 = 120;
-const TRANSCRIPT_RESCAN_INTERVAL_MIN_SECS: i64 = 60;
-const TRANSCRIPT_RESCAN_INTERVAL_MAX_SECS: i64 = 600;
+const TRANSCRIPT_RESCAN_INTERVAL_SECS: u64 = 120;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ModelUsageLiveSourceKey {
+struct RetainedLiveSourceKey {
     provider: &'static str,
     source_key: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct TranscriptAnalyticsLiveSourceKey {
-    provider: &'static str,
-    source_key: String,
-}
-
-#[derive(Default)]
-struct TranscriptAnalyticsRunnerInner {
-    live_sources: HashMap<TranscriptAnalyticsLiveSourceKey, QueuedTranscriptAnalyticsSource>,
-    drain_scheduled: bool,
-}
-
-#[derive(Clone)]
-struct QueuedTranscriptAnalyticsSource {
-    source: sessions::DiscoveredRetainedJsonlSource,
-    consecutive_failures: u32,
-    ready_at: std::time::Instant,
-}
-
-pub(crate) struct TranscriptAnalyticsRunnerState {
-    inner: Mutex<TranscriptAnalyticsRunnerInner>,
-    wake: tokio::sync::Notify,
-}
-
-impl TranscriptAnalyticsRunnerState {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(TranscriptAnalyticsRunnerInner::default()),
-            wake: tokio::sync::Notify::new(),
-        }
-    }
-    fn enqueue(&self, source: sessions::DiscoveredRetainedJsonlSource) -> Result<bool, String> {
-        if !matches!(
-            source.provider,
-            integrations::IntegrationProvider::Claude | integrations::IntegrationProvider::Codex
-        ) || source.source_key.is_empty()
-            || source.source_root_key.is_empty()
-            || !source.canonical_path.is_absolute()
-        {
-            return Err("Invalid retained transcript analytics source identity".into());
-        }
-        let key = TranscriptAnalyticsLiveSourceKey {
-            provider: source.provider.as_str(),
-            source_key: source.source_key.clone(),
-        };
-        let mut inner = self.inner.lock();
-        inner.live_sources.insert(
-            key,
-            QueuedTranscriptAnalyticsSource {
-                source,
-                consecutive_failures: 0,
-                ready_at: std::time::Instant::now(),
-            },
-        );
-        self.wake.notify_one();
-        if inner.drain_scheduled {
-            Ok(false)
-        } else {
-            inner.drain_scheduled = true;
-            Ok(true)
-        }
-    }
-    fn take_batch(&self) -> Vec<QueuedTranscriptAnalyticsSource> {
-        let mut inner = self.inner.lock();
-        let now = std::time::Instant::now();
-        let keys: Vec<_> = inner
-            .live_sources
-            .iter()
-            .filter(|(_, queued)| queued.ready_at <= now)
-            .map(|(key, _)| key)
-            .take(TRANSCRIPT_ANALYTICS_LIVE_BATCH_SIZE)
-            .cloned()
-            .collect();
-        keys.into_iter()
-            .filter_map(|key| inner.live_sources.remove(&key))
-            .collect()
-    }
-
-    fn requeue_failed(&self, queued: QueuedTranscriptAnalyticsSource) {
-        let mut inner = self.inner.lock();
-        let key = TranscriptAnalyticsLiveSourceKey {
-            provider: queued.source.provider.as_str(),
-            source_key: queued.source.source_key.clone(),
-        };
-        // Preserve a fresher notification admitted while this attempt ran.
-        inner.live_sources.entry(key).or_insert_with(|| {
-            let consecutive_failures = queued.consecutive_failures.saturating_add(1);
-            QueuedTranscriptAnalyticsSource {
-                source: queued.source,
-                consecutive_failures,
-                ready_at: std::time::Instant::now()
-                    + model_usage_failure_retry_delay(consecutive_failures),
-            }
-        });
-        self.wake.notify_one();
-    }
-
-    fn finish_or_next_delay(&self) -> Option<std::time::Duration> {
-        let mut inner = self.inner.lock();
-        if inner.live_sources.is_empty() {
-            inner.drain_scheduled = false;
-            None
-        } else {
-            let now = std::time::Instant::now();
-            Some(
-                inner
-                    .live_sources
-                    .values()
-                    .map(|queued| queued.ready_at.saturating_duration_since(now))
-                    .min()
-                    .unwrap_or_default(),
-            )
-        }
-    }
-}
-
-impl ModelUsageLiveSourceKey {
+impl RetainedLiveSourceKey {
     fn from_source(source: &sessions::DiscoveredRetainedJsonlSource) -> Self {
         Self {
             provider: source.provider.as_str(),
@@ -396,94 +264,266 @@ impl ModelUsageLiveSourceKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedLiveDomain {
+    Model,
+    Transcript,
+}
+
+#[derive(Clone, Copy)]
+struct RetainedLiveDomains {
+    model: bool,
+    transcript: bool,
+}
+
+impl RetainedLiveDomains {
+    const BOTH: Self = Self {
+        model: true,
+        transcript: true,
+    };
+    const MODEL: Self = Self {
+        model: true,
+        transcript: false,
+    };
+}
+
+struct RetainedDomainWork {
+    pending: bool,
+    running_revision: Option<u64>,
+    failures: u32,
+    ready_at: std::time::Instant,
+}
+
+impl RetainedDomainWork {
+    fn new() -> Self {
+        Self {
+            pending: false,
+            running_revision: None,
+            failures: 0,
+            ready_at: std::time::Instant::now(),
+        }
+    }
+
+    fn arm(&mut self) {
+        self.pending = true;
+        self.failures = 0;
+        self.ready_at = std::time::Instant::now();
+    }
+
+    fn has_work(&self) -> bool {
+        self.pending || self.running_revision.is_some()
+    }
+}
+
+struct RetainedLiveSource {
+    source: sessions::DiscoveredRetainedJsonlSource,
+    revision: u64,
+    model: RetainedDomainWork,
+    transcript: RetainedDomainWork,
+}
+
+impl RetainedLiveSource {
+    fn new(source: sessions::DiscoveredRetainedJsonlSource) -> Self {
+        Self {
+            source,
+            revision: 0,
+            model: RetainedDomainWork::new(),
+            transcript: RetainedDomainWork::new(),
+        }
+    }
+
+    fn domain(&self, domain: RetainedLiveDomain) -> &RetainedDomainWork {
+        match domain {
+            RetainedLiveDomain::Model => &self.model,
+            RetainedLiveDomain::Transcript => &self.transcript,
+        }
+    }
+
+    fn domain_mut(&mut self, domain: RetainedLiveDomain) -> &mut RetainedDomainWork {
+        match domain {
+            RetainedLiveDomain::Model => &mut self.model,
+            RetainedLiveDomain::Transcript => &mut self.transcript,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RetainedDomainJob {
+    key: RetainedLiveSourceKey,
+    source: sessions::DiscoveredRetainedJsonlSource,
+    revision: u64,
+}
+
 #[derive(Default)]
-struct ModelUsageRunnerInner {
-    live_sources: HashMap<ModelUsageLiveSourceKey, sessions::DiscoveredRetainedJsonlSource>,
-    drain_scheduled: bool,
+struct RetainedSourceRunnerInner {
+    live_sources: HashMap<RetainedLiveSourceKey, RetainedLiveSource>,
+    model_drain_scheduled: bool,
+    transcript_drain_scheduled: bool,
     retained_backfill_scheduled: bool,
 }
 
-/// Process-owned scheduling state for model source reconciliation.
-///
-/// The live queue deliberately keys work by provider plus canonical source key,
-/// not by session ID. The process-wide atomic permit in `model_usage` remains
-/// the final authority for runner ownership.
-pub(crate) struct ModelUsageRunnerState {
-    inner: Mutex<ModelUsageRunnerInner>,
+#[derive(Default)]
+struct RetainedDrainSchedule {
+    model: bool,
+    transcript: bool,
 }
 
-impl ModelUsageRunnerState {
+/// One canonical-source coordinator with independent domain completion.
+pub(crate) struct RetainedSourceRunnerState {
+    inner: Mutex<RetainedSourceRunnerInner>,
+    wake: tokio::sync::Notify,
+}
+
+impl RetainedSourceRunnerState {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(ModelUsageRunnerInner::default()),
+            inner: Mutex::new(RetainedSourceRunnerInner::default()),
+            wake: tokio::sync::Notify::new(),
         }
     }
 
     fn enqueue_live_source(
         &self,
         source: sessions::DiscoveredRetainedJsonlSource,
-    ) -> Result<(ModelUsageLiveQueueAdmission, bool), String> {
+        domains: RetainedLiveDomains,
+    ) -> Result<(RetainedLiveQueueAdmission, RetainedDrainSchedule), String> {
         if !matches!(
             source.provider,
             integrations::IntegrationProvider::Claude | integrations::IntegrationProvider::Codex
-        ) {
-            return Err("Unsupported provider for model source reconciliation".to_string());
-        }
-        if source.source_root_key.is_empty()
+        ) || source.source_root_key.is_empty()
             || source.source_key.is_empty()
             || !source.canonical_path.is_absolute()
         {
-            return Err("Invalid retained model source identity".to_string());
+            return Err("Invalid retained transcript source identity".into());
         }
 
-        let key = ModelUsageLiveSourceKey::from_source(&source);
+        let key = RetainedLiveSourceKey::from_source(&source);
         let mut inner = self.inner.lock();
         let admission = if let Some(queued) = inner.live_sources.get_mut(&key) {
-            if queued.canonical_path != source.canonical_path
-                || queued.source_root_key != source.source_root_key
+            if queued.source.canonical_path != source.canonical_path
+                || queued.source.source_root_key != source.source_root_key
             {
-                return Err("Conflicting canonical path for retained model source key".to_string());
+                return Err("Conflicting canonical path for retained source key".into());
             }
-            *queued = source;
-            ModelUsageLiveQueueAdmission::Coalesced
+            queued.revision = queued.revision.saturating_add(1);
+            queued.source = source;
+            RetainedLiveQueueAdmission::Coalesced
         } else {
-            inner.live_sources.insert(key, source);
-            ModelUsageLiveQueueAdmission::Queued
+            inner
+                .live_sources
+                .insert(key.clone(), RetainedLiveSource::new(source));
+            RetainedLiveQueueAdmission::Queued
         };
 
-        let should_schedule = !inner.drain_scheduled;
-        if should_schedule {
-            inner.drain_scheduled = true;
+        let queued = inner
+            .live_sources
+            .get_mut(&key)
+            .expect("inserted retained source must be present");
+        if domains.model {
+            queued.model.arm();
         }
-        Ok((admission, should_schedule))
+        if domains.transcript {
+            queued.transcript.arm();
+        }
+
+        let mut schedule = RetainedDrainSchedule::default();
+        if domains.model && !inner.model_drain_scheduled {
+            inner.model_drain_scheduled = true;
+            schedule.model = true;
+        }
+        if domains.transcript && !inner.transcript_drain_scheduled {
+            inner.transcript_drain_scheduled = true;
+            schedule.transcript = true;
+        }
+        drop(inner);
+        self.wake.notify_waiters();
+        Ok((admission, schedule))
     }
 
-    fn take_live_sources(&self) -> Vec<sessions::DiscoveredRetainedJsonlSource> {
+    fn take_ready(&self, domain: RetainedLiveDomain, limit: usize) -> Vec<RetainedDomainJob> {
+        let mut inner = self.inner.lock();
+        let now = std::time::Instant::now();
+        let mut jobs = Vec::new();
+        for (key, queued) in &mut inner.live_sources {
+            if jobs.len() == limit {
+                break;
+            }
+            let work = queued.domain(domain);
+            if !work.pending || work.running_revision.is_some() || work.ready_at > now {
+                continue;
+            }
+            let revision = queued.revision;
+            let source = queued.source.clone();
+            let work = queued.domain_mut(domain);
+            work.pending = false;
+            work.running_revision = Some(revision);
+            jobs.push(RetainedDomainJob {
+                key: key.clone(),
+                source,
+                revision,
+            });
+        }
+        jobs
+    }
+
+    fn finish(&self, domain: RetainedLiveDomain, job: &RetainedDomainJob, succeeded: bool) {
+        let mut inner = self.inner.lock();
+        let Some(queued) = inner.live_sources.get_mut(&job.key) else {
+            return;
+        };
+        let current_revision = queued.revision;
+        let work = queued.domain_mut(domain);
+        if work.running_revision != Some(job.revision) {
+            return;
+        }
+        work.running_revision = None;
+        if current_revision == job.revision {
+            if succeeded {
+                work.pending = false;
+                work.failures = 0;
+            } else {
+                work.pending = true;
+                work.failures = work.failures.saturating_add(1);
+                work.ready_at =
+                    std::time::Instant::now() + model_usage_failure_retry_delay(work.failures);
+            }
+        }
+        inner
+            .live_sources
+            .retain(|_, source| source.model.has_work() || source.transcript.has_work());
+        drop(inner);
+        self.wake.notify_waiters();
+    }
+
+    fn finish_or_next_delay(&self, domain: RetainedLiveDomain) -> Option<std::time::Duration> {
         let mut inner = self.inner.lock();
         inner
             .live_sources
-            .drain()
-            .map(|(_, source)| source)
-            .collect()
-    }
-
-    fn requeue_live_sources(&self, sources: Vec<sessions::DiscoveredRetainedJsonlSource>) {
-        let mut inner = self.inner.lock();
-        for source in sources {
-            let key = ModelUsageLiveSourceKey::from_source(&source);
-            // Preserve a notification admitted while the failed batch ran.
-            inner.live_sources.entry(key).or_insert(source);
+            .retain(|_, source| source.model.has_work() || source.transcript.has_work());
+        if !inner
+            .live_sources
+            .values()
+            .any(|source| source.domain(domain).has_work())
+        {
+            match domain {
+                RetainedLiveDomain::Model => inner.model_drain_scheduled = false,
+                RetainedLiveDomain::Transcript => inner.transcript_drain_scheduled = false,
+            }
+            return None;
         }
-    }
-
-    fn has_live_work_or_finish_drain(&self) -> bool {
-        let mut inner = self.inner.lock();
-        if inner.live_sources.is_empty() {
-            inner.drain_scheduled = false;
-            false
-        } else {
-            true
-        }
+        let now = std::time::Instant::now();
+        Some(
+            inner
+                .live_sources
+                .values()
+                .filter_map(|source| {
+                    let work = source.domain(domain);
+                    (work.pending && work.running_revision.is_none())
+                        .then(|| work.ready_at.saturating_duration_since(now))
+                })
+                .min()
+                .unwrap_or(MODEL_USAGE_PERMIT_RETRY_DELAY),
+        )
     }
 
     fn try_reserve_retained_backfill(
@@ -501,6 +541,7 @@ impl ModelUsageRunnerState {
 
     fn release_retained_backfill(&self) {
         self.inner.lock().retained_backfill_scheduled = false;
+        self.wake.notify_waiters();
     }
 
     fn retained_backfill_is_scheduled(&self) -> bool {
@@ -515,7 +556,7 @@ impl ModelUsageRunnerState {
 /// for live reconciliation to release the shared process permit and is also
 /// released if initialization or the async task fails.
 struct ModelHistoryBackfillScheduleReservation {
-    state: Arc<ModelUsageRunnerState>,
+    state: Arc<RetainedSourceRunnerState>,
 }
 
 impl Drop for ModelHistoryBackfillScheduleReservation {
@@ -525,7 +566,7 @@ impl Drop for ModelHistoryBackfillScheduleReservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ModelUsageLiveQueueAdmission {
+pub(crate) enum RetainedLiveQueueAdmission {
     Queued,
     Coalesced,
 }
@@ -575,30 +616,34 @@ fn model_usage_failure_retry_delay(consecutive_failures: u32) -> std::time::Dura
 pub(crate) fn enqueue_model_usage_live_source(
     app_handle: &tauri::AppHandle,
     source: sessions::DiscoveredRetainedJsonlSource,
-) -> Result<ModelUsageLiveQueueAdmission, String> {
-    let state = app_handle
-        .try_state::<Arc<ModelUsageRunnerState>>()
-        .ok_or_else(|| "Model usage runner state is not initialized".to_string())?;
-    let state = Arc::clone(state.inner());
-    let (admission, should_schedule) = state.enqueue_live_source(source)?;
-    if should_schedule {
-        spawn_model_usage_live_queue_drain(app_handle.clone(), Arc::downgrade(&state));
-    }
-    Ok(admission)
+) -> Result<RetainedLiveQueueAdmission, String> {
+    enqueue_retained_source_domains(app_handle, source, RetainedLiveDomains::MODEL)
 }
 
-pub(crate) fn enqueue_transcript_analytics_live_source(
-    app: &tauri::AppHandle,
+pub(crate) fn enqueue_retained_live_source(
+    app_handle: &tauri::AppHandle,
     source: sessions::DiscoveredRetainedJsonlSource,
-) -> Result<(), String> {
-    let state = app
-        .try_state::<Arc<TranscriptAnalyticsRunnerState>>()
-        .ok_or_else(|| "Transcript analytics runner state is not initialized".to_string())?;
+) -> Result<RetainedLiveQueueAdmission, String> {
+    enqueue_retained_source_domains(app_handle, source, RetainedLiveDomains::BOTH)
+}
+
+fn enqueue_retained_source_domains(
+    app_handle: &tauri::AppHandle,
+    source: sessions::DiscoveredRetainedJsonlSource,
+    domains: RetainedLiveDomains,
+) -> Result<RetainedLiveQueueAdmission, String> {
+    let state = app_handle
+        .try_state::<Arc<RetainedSourceRunnerState>>()
+        .ok_or_else(|| "Retained source runner state is not initialized".to_string())?;
     let state = Arc::clone(state.inner());
-    if state.enqueue(source)? {
-        spawn_transcript_analytics_live_queue_drain(app.clone(), Arc::downgrade(&state));
+    let (admission, schedule) = state.enqueue_live_source(source, domains)?;
+    if schedule.model {
+        spawn_model_usage_live_queue_drain(app_handle.clone(), Arc::downgrade(&state));
     }
-    Ok(())
+    if schedule.transcript {
+        spawn_transcript_analytics_live_queue_drain(app_handle.clone(), Arc::downgrade(&state));
+    }
+    Ok(admission)
 }
 
 fn spawn_startup_transcript_analytics_reconciliation(app: tauri::AppHandle) {
@@ -665,34 +710,10 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
         // the work the startup full walk already covered.
         let mut watermark = std::time::SystemTime::now();
         loop {
-            let (enabled, interval_secs) = STORAGE
-                .get()
-                .map(|storage| {
-                    (
-                        read_bool_setting(
-                            storage,
-                            TRANSCRIPT_RESCAN_ENABLED_KEY,
-                            TRANSCRIPT_RESCAN_ENABLED_DEFAULT,
-                        ),
-                        read_i64_setting(
-                            storage,
-                            TRANSCRIPT_RESCAN_INTERVAL_KEY,
-                            TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS,
-                        )
-                        .clamp(
-                            TRANSCRIPT_RESCAN_INTERVAL_MIN_SECS,
-                            TRANSCRIPT_RESCAN_INTERVAL_MAX_SECS,
-                        ),
-                    )
-                })
-                .unwrap_or((
-                    TRANSCRIPT_RESCAN_ENABLED_DEFAULT,
-                    TRANSCRIPT_RESCAN_INTERVAL_DEFAULT_SECS,
-                ));
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs as u64)).await;
-            if !enabled {
-                continue;
-            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                TRANSCRIPT_RESCAN_INTERVAL_SECS,
+            ))
+            .await;
 
             // Capture the tick start before enumerating so a source modified
             // during the walk is caught by this tick or the next, never lost.
@@ -724,11 +745,8 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
                 }
             }
             for source in changed {
-                if let Err(error) = enqueue_model_usage_live_source(&app, source.clone()) {
-                    log::warn!("Transcript rescan failed to enqueue model source: {error}");
-                }
-                if let Err(error) = enqueue_transcript_analytics_live_source(&app, source) {
-                    log::warn!("Transcript rescan failed to enqueue analytics source: {error}");
+                if let Err(error) = enqueue_retained_live_source(&app, source) {
+                    log::warn!("Transcript rescan failed to enqueue retained source: {error}");
                 }
             }
             log::info!(
@@ -764,7 +782,7 @@ fn collect_rescan_changed_sources(
 
 fn spawn_transcript_analytics_live_queue_drain(
     app: tauri::AppHandle,
-    state: Weak<TranscriptAnalyticsRunnerState>,
+    state: Weak<RetainedSourceRunnerState>,
 ) {
     tauri::async_runtime::spawn(async move {
         drain_transcript_analytics_live_queue(app, state).await;
@@ -781,15 +799,18 @@ fn spawn_transcript_analytics_live_queue_drain(
 /// itself is already gone.
 async fn drain_transcript_analytics_live_queue(
     app: tauri::AppHandle,
-    state: Weak<TranscriptAnalyticsRunnerState>,
+    state: Weak<RetainedSourceRunnerState>,
 ) {
     loop {
         let Some(state_ref) = state.upgrade() else {
             return;
         };
-        let batch = state_ref.take_batch();
+        let batch = state_ref.take_ready(
+            RetainedLiveDomain::Transcript,
+            TRANSCRIPT_ANALYTICS_LIVE_BATCH_SIZE,
+        );
         if batch.is_empty() {
-            let Some(delay) = state_ref.finish_or_next_delay() else {
+            let Some(delay) = state_ref.finish_or_next_delay(RetainedLiveDomain::Transcript) else {
                 return;
             };
             tokio::select! {
@@ -805,13 +826,13 @@ async fn drain_transcript_analytics_live_queue(
             Ok::<_, String>(
                 batch
                     .into_iter()
-                    .map(|queued| {
+                    .map(|job| {
                         let outcome = transcript_analytics::reconcile_live_transcript_source(
                             storage,
-                            &queued.source,
+                            &job.source,
                             &hostname,
                         );
-                        (queued, outcome)
+                        (job, outcome)
                     })
                     .collect::<Vec<_>>(),
             )
@@ -819,44 +840,43 @@ async fn drain_transcript_analytics_live_queue(
         .await;
         match result {
             Ok(Ok(outcomes)) => {
-                for (queued, outcome) in outcomes {
-                    match outcome {
+                for (job, outcome) in outcomes {
+                    let succeeded = match outcome {
                         Ok(transcript_analytics::TranscriptSourceResult::Replaced) => {
                             if let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ()) {
                                 log::warn!(
                                     "Failed to emit committed transcript analytics update: {error}"
                                 );
                             }
+                            true
                         }
                         Ok(
                             transcript_analytics::TranscriptSourceResult::SuppressedUnchanged
                             | transcript_analytics::TranscriptSourceResult::StaleGeneration,
-                        ) => {}
+                        ) => true,
                         Err(error) => {
                             log::error!(
                                 "Live transcript analytics failed for {}: {error}",
-                                queued.source.source_key
+                                job.source.source_key
                             );
-                            state_ref.requeue_failed(queued);
+                            false
                         }
-                    }
+                    };
+                    state_ref.finish(RetainedLiveDomain::Transcript, &job, succeeded);
                 }
             }
             Ok(Err(error)) => {
                 log::error!("Live transcript analytics storage failed: {error}");
-                for queued in retry_batch {
-                    state_ref.requeue_failed(queued);
+                for job in retry_batch {
+                    state_ref.finish(RetainedLiveDomain::Transcript, &job, false);
                 }
             }
             Err(error) => {
                 log::error!("Live transcript analytics worker failed: {error}");
-                for queued in retry_batch {
-                    state_ref.requeue_failed(queued);
+                for job in retry_batch {
+                    state_ref.finish(RetainedLiveDomain::Transcript, &job, false);
                 }
             }
-        }
-        if state_ref.finish_or_next_delay().is_none() {
-            return;
         }
         tokio::task::yield_now().await;
     }
@@ -864,7 +884,7 @@ async fn drain_transcript_analytics_live_queue(
 
 fn spawn_model_usage_live_queue_drain(
     app_handle: tauri::AppHandle,
-    state: Weak<ModelUsageRunnerState>,
+    state: Weak<RetainedSourceRunnerState>,
 ) {
     tauri::async_runtime::spawn(async move {
         drain_model_usage_live_queue(app_handle, state).await;
@@ -873,44 +893,51 @@ fn spawn_model_usage_live_queue_drain(
 
 async fn drain_model_usage_live_queue(
     app_handle: tauri::AppHandle,
-    state: Weak<ModelUsageRunnerState>,
+    state: Weak<RetainedSourceRunnerState>,
 ) {
-    let mut consecutive_work_failures = 0_u32;
     loop {
         let Some(state_ref) = state.upgrade() else {
             return;
         };
-        if !state_ref.has_live_work_or_finish_drain() {
+        let Some(delay) = state_ref.finish_or_next_delay(RetainedLiveDomain::Model) else {
             return;
+        };
+        if !delay.is_zero() {
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = state_ref.wake.notified() => {}
+            }
+            continue;
         }
         if state_ref.retained_backfill_is_scheduled() {
-            drop(state_ref);
-            tokio::time::sleep(MODEL_USAGE_PERMIT_RETRY_DELAY).await;
+            tokio::select! {
+                () = tokio::time::sleep(MODEL_USAGE_PERMIT_RETRY_DELAY) => {}
+                () = state_ref.wake.notified() => {}
+            }
             continue;
         }
 
         // The active getter is advisory only. Atomic acquisition decides who
         // owns all retained-history, startup, and live reconciliation work.
         let Some(permit) = model_usage::try_acquire_model_usage_runner() else {
-            drop(state_ref);
             tokio::time::sleep(MODEL_USAGE_PERMIT_RETRY_DELAY).await;
             continue;
         };
 
-        let queued = state_ref.take_live_sources();
-        drop(state_ref);
-        if queued.is_empty() {
+        let jobs = state_ref.take_ready(RetainedLiveDomain::Model, usize::MAX);
+        if jobs.is_empty() {
             drop(permit);
             continue;
         }
 
-        let retry_sources = queued.clone();
+        let queued = jobs.iter().map(|job| job.source.clone()).collect();
         match reconcile_queued_model_usage_sources(app_handle.clone(), queued, permit).await {
             Ok(_) => {
-                consecutive_work_failures = 0;
+                for job in &jobs {
+                    state_ref.finish(RetainedLiveDomain::Model, job, true);
+                }
             }
             Err(failure) => {
-                consecutive_work_failures = consecutive_work_failures.saturating_add(1);
                 log::error!(
                     "Live model source reconciliation failed: {}; committed before failure: processed={}, skipped={}, failed={}, observations={}, data_changed={}",
                     failure.error,
@@ -920,15 +947,12 @@ async fn drain_model_usage_live_queue(
                     failure.committed.observations_written,
                     failure.committed.data_changed,
                 );
-                if let Some(state_ref) = state.upgrade() {
-                    state_ref.requeue_live_sources(retry_sources);
-                } else {
-                    return;
+                for job in &jobs {
+                    state_ref.finish(RetainedLiveDomain::Model, job, false);
                 }
-                tokio::time::sleep(model_usage_failure_retry_delay(consecutive_work_failures))
-                    .await;
             }
         }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -1726,18 +1750,8 @@ fn get_storage() -> Result<&'static Storage, String> {
 /// override) so anything reported to the user names the directory the database
 /// is actually opened from.
 fn app_data_dir() -> std::path::PathBuf {
-    let default_app_dir = dirs::data_local_dir()
-        .or_else(|| {
-            dirs::home_dir().map(|home| {
-                if cfg!(target_os = "macos") {
-                    home.join("Library").join("Application Support")
-                } else {
-                    home.join(".local").join("share")
-                }
-            })
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("com.quilltoolkit.app");
+    let default_app_dir = crate::data_paths::default_app_data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp").join("com.quilltoolkit.app"));
     crate::data_paths::resolve_data_dir_with_default(default_app_dir)
 }
 
@@ -3146,25 +3160,6 @@ fn validate_model_identity(
     Ok(ModelIdentity { provider, model_id })
 }
 
-fn validate_selected_model(
-    selected_model: Option<ModelIdentity>,
-    provider_filter: Option<&str>,
-) -> Result<Option<ModelIdentity>, ModelAnalyticsError> {
-    let Some(selected_model) = selected_model else {
-        return Ok(None);
-    };
-
-    let selected_model = validate_model_identity(selected_model.provider, selected_model.model_id)?;
-    if provider_filter.is_some_and(|filter| filter != selected_model.provider) {
-        return Err(ModelAnalyticsError::new(
-            ModelAnalyticsErrorCode::InvalidProvider,
-            "Selected model provider must match the active provider filter.",
-        ));
-    }
-
-    Ok(Some(selected_model))
-}
-
 fn model_analytics_storage_error(
     context: &str,
     error: impl std::fmt::Display,
@@ -3210,49 +3205,8 @@ fn normalize_model_sessions_limit(
         .transpose()
 }
 
-/// Return provider-qualified model aggregates from one retained-evidence snapshot.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
-#[tauri::command]
-async fn get_model_analytics(
-    range: String,
-    provider: Option<String>,
-) -> Result<ModelAnalyticsResponse, ModelAnalyticsError> {
-    let started_at = std::time::Instant::now();
-    let range = ModelRange::try_from(range.as_str())?;
-    let provider = validate_model_analytics_provider(provider)?;
-    let range_for_log = range.as_str();
-    let provider_for_log = provider.clone();
-    let storage = get_storage().map_err(|error| {
-        model_analytics_storage_error("Model analytics storage unavailable", error)
-    })?;
-
-    let result = match tauri::async_runtime::spawn_blocking(move || {
-        storage.get_model_analytics(range, provider.as_deref())
-    })
-    .await
-    {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err(model_analytics_storage_error(
-            "Failed to read model analytics",
-            error,
-        )),
-        Err(error) => Err(model_analytics_storage_error(
-            "Model analytics blocking task failed",
-            error,
-        )),
-    };
-    log_analytics_command_timing(
-        "get_model_analytics",
-        range_for_log,
-        provider_for_log.as_deref(),
-        "miss",
-        started_at,
-    );
-    result
-}
-
 /// Return the usage-frequency Models overview from one retained-evidence snapshot.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
 #[tauri::command]
 async fn get_model_usage_overview(
     range: String,
@@ -3292,51 +3246,8 @@ async fn get_model_usage_overview(
     result
 }
 
-/// Return fixed-bucket model history, optionally scoped to one exact identity.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
-#[tauri::command]
-async fn get_model_history(
-    range: String,
-    provider: Option<String>,
-    selected_model: Option<ModelIdentity>,
-) -> Result<ModelHistoryResponse, ModelAnalyticsError> {
-    let started_at = std::time::Instant::now();
-    let range = ModelRange::try_from(range.as_str())?;
-    let provider = validate_model_analytics_provider(provider)?;
-    let selected_model = validate_selected_model(selected_model, provider.as_deref())?;
-    let range_for_log = range.as_str();
-    let provider_for_log = provider.clone();
-    let storage = get_storage().map_err(|error| {
-        model_analytics_storage_error("Model history storage unavailable", error)
-    })?;
-
-    let result = match tauri::async_runtime::spawn_blocking(move || {
-        storage.get_model_history(range, provider.as_deref(), selected_model.as_ref())
-    })
-    .await
-    {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err(model_analytics_storage_error(
-            "Failed to read model history",
-            error,
-        )),
-        Err(error) => Err(model_analytics_storage_error(
-            "Model history blocking task failed",
-            error,
-        )),
-    };
-    log_analytics_command_timing(
-        "get_model_history",
-        range_for_log,
-        provider_for_log.as_deref(),
-        "miss",
-        started_at,
-    );
-    result
-}
-
 /// Page sessions that contain one exact provider-qualified raw model identity.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
 #[tauri::command]
 async fn get_model_sessions(
     range: String,
@@ -3376,7 +3287,7 @@ async fn get_model_sessions(
 }
 
 /// Return chain-separated model history for one provider-owned session.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
 #[tauri::command]
 async fn get_session_model_history(
     provider: String,
@@ -3410,7 +3321,7 @@ async fn get_session_model_history(
 }
 
 /// Start a fresh retained-history generation unless one is already scheduled.
-// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (6)]]
+// @lat: [[backend#Tauri IPC Commands#Model Analytics Commands (4)]]
 #[tauri::command]
 async fn retry_model_history_backfill(
     app_handle: tauri::AppHandle,
@@ -3419,7 +3330,7 @@ async fn retry_model_history_backfill(
         model_analytics_storage_error("Model backfill storage unavailable", error)
     })?;
     let state = app_handle
-        .try_state::<Arc<ModelUsageRunnerState>>()
+        .try_state::<Arc<RetainedSourceRunnerState>>()
         .map(|state| Arc::clone(state.inner()))
         .ok_or_else(|| {
             model_analytics_storage_error(
@@ -5925,6 +5836,19 @@ async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Initialize one explicit database through Quill's production migrations.
+///
+/// This is the narrow process boundary used by the dummy-data seeder. It does
+/// not start Tauri or run unrelated production cleanup.
+#[doc(hidden)]
+pub fn initialize_database(path: &std::path::Path) -> Result<(), String> {
+    Storage::initialize_database(path)
+}
+
+fn packaged_version_allows_updates(major: u64, minor: u64, patch: u64) -> bool {
+    (major, minor, patch) != (0, 0, 0)
+}
+
 pub fn run() {
     // Must run before any Tauri plugin is constructed so the new instance
     // does not race the dying predecessor for the single-instance lock.
@@ -5945,7 +5869,17 @@ pub fn run() {
                 .max_file_size(5_000_000) // 5 MB rotation
                 .build(),
         )
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .default_version_comparator(|current, update| {
+                    packaged_version_allows_updates(
+                        current.major,
+                        current.minor,
+                        current.patch,
+                    ) && update.version > current
+                })
+                .build(),
+        )
         .plugin(tauri_plugin_process::init())
         // The plugin's automatic restore applies every flag, which for the
         // decorationless widget would also replay a saved `decorated` or
@@ -5986,9 +5920,8 @@ pub fn run() {
             // HTTP server starts, so a state-changing learning IPC can never
             // race ahead of an initialized token.
             app.manage(LearningCapability::generate());
-            let model_usage_runner_state = Arc::new(ModelUsageRunnerState::new());
+            let model_usage_runner_state = Arc::new(RetainedSourceRunnerState::new());
             app.manage(Arc::clone(&model_usage_runner_state));
-            app.manage(Arc::new(TranscriptAnalyticsRunnerState::new()));
             // Retained runtime analytics are a startup responsibility, not a
             // side effect of opening or manually syncing Session Search.
             // Blocking inventory/parsing stays off the UI thread; shared root
@@ -6453,9 +6386,7 @@ pub fn run() {
             get_usage_stats,
             get_all_bucket_stats,
             get_snapshot_count,
-            get_model_analytics,
             get_model_usage_overview,
-            get_model_history,
             get_model_sessions,
             get_session_model_history,
             retry_model_history_backfill,
@@ -6565,6 +6496,133 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_builds_do_not_offer_published_updates() {
+        assert!(!packaged_version_allows_updates(0, 0, 0));
+        assert!(packaged_version_allows_updates(0, 3, 39));
+    }
+
+    fn retained_test_source(key: &str) -> sessions::DiscoveredRetainedJsonlSource {
+        let path = std::env::temp_dir().join(format!("quill-{key}.jsonl"));
+        sessions::DiscoveredRetainedJsonlSource {
+            provider: integrations::IntegrationProvider::Claude,
+            source_root_key: "claude:projects",
+            source_key: key.to_owned(),
+            filesystem_path: path.clone(),
+            canonical_path: path,
+            layout_hint: sessions::RetainedJsonlSourceLayoutHint::ClaudeParent {
+                default_project: "quill".to_owned(),
+            },
+        }
+    }
+
+    // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Independent Domain Retry]]
+    #[test]
+    fn retained_source_coordinator_retries_only_the_failed_domain() {
+        let state = RetainedSourceRunnerState::new();
+        let source = retained_test_source("independent-retry");
+        let (_, schedule) = state
+            .enqueue_live_source(source, RetainedLiveDomains::BOTH)
+            .expect("enqueue");
+        assert!(schedule.model && schedule.transcript);
+
+        let model = state.take_ready(RetainedLiveDomain::Model, 1);
+        let transcript = state.take_ready(RetainedLiveDomain::Transcript, 1);
+        state.finish(RetainedLiveDomain::Model, &model[0], true);
+        state.finish(RetainedLiveDomain::Transcript, &transcript[0], false);
+
+        let inner = state.inner.lock();
+        let queued = inner.live_sources.values().next().expect("retry retained");
+        assert!(!queued.model.has_work());
+        assert!(queued.transcript.pending);
+        assert_eq!(queued.transcript.failures, 1);
+    }
+
+    // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Newer Notification Wins]]
+    #[test]
+    fn retained_source_coordinator_rearms_both_domains_for_a_newer_notification() {
+        let state = RetainedSourceRunnerState::new();
+        let source = retained_test_source("newer-notify");
+        state
+            .enqueue_live_source(source.clone(), RetainedLiveDomains::BOTH)
+            .expect("first enqueue");
+        let running = state.take_ready(RetainedLiveDomain::Model, 1);
+        let (admission, _) = state
+            .enqueue_live_source(source, RetainedLiveDomains::BOTH)
+            .expect("newer enqueue");
+        assert_eq!(admission, RetainedLiveQueueAdmission::Coalesced);
+
+        state.finish(RetainedLiveDomain::Model, &running[0], true);
+        let inner = state.inner.lock();
+        let queued = inner
+            .live_sources
+            .values()
+            .next()
+            .expect("newer work retained");
+        assert_eq!(queued.revision, 1);
+        assert!(queued.model.pending);
+        assert!(queued.transcript.pending);
+        assert!(queued.model.running_revision.is_none());
+    }
+
+    // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Healthy Sibling Progress]]
+    #[test]
+    fn retained_source_coordinator_keeps_healthy_siblings_moving() {
+        let state = RetainedSourceRunnerState::new();
+        for key in ["failing-source", "healthy-source"] {
+            state
+                .enqueue_live_source(retained_test_source(key), RetainedLiveDomains::BOTH)
+                .expect("enqueue sibling");
+        }
+        let jobs = state.take_ready(RetainedLiveDomain::Transcript, 2);
+        for job in &jobs {
+            state.finish(
+                RetainedLiveDomain::Transcript,
+                job,
+                job.source.source_key == "healthy-source",
+            );
+        }
+
+        let inner = state.inner.lock();
+        let failing = inner
+            .live_sources
+            .values()
+            .find(|source| source.source.source_key == "failing-source")
+            .expect("failed source retained");
+        let healthy = inner
+            .live_sources
+            .values()
+            .find(|source| source.source.source_key == "healthy-source")
+            .expect("healthy model work retained");
+        assert!(failing.transcript.pending);
+        assert!(!healthy.transcript.has_work());
+        assert!(healthy.model.pending);
+    }
+
+    // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Live Source Coordinator Test Specs#Model Backfill Isolation]]
+    #[test]
+    fn retained_source_coordinator_model_backfill_does_not_block_transcripts() {
+        let state = Arc::new(RetainedSourceRunnerState::new());
+        let reservation = state
+            .try_reserve_retained_backfill()
+            .expect("reserve model backfill");
+        state
+            .enqueue_live_source(
+                retained_test_source("backfill-isolation"),
+                RetainedLiveDomains::BOTH,
+            )
+            .expect("enqueue");
+
+        assert!(state.retained_backfill_is_scheduled());
+        assert_eq!(
+            state.take_ready(RetainedLiveDomain::Transcript, 1).len(),
+            1,
+            "model reservation must not gate transcript work"
+        );
+        drop(reservation);
+        assert!(!state.retained_backfill_is_scheduled());
+    }
 
     // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Unconfigured source null impact]]
     #[test]

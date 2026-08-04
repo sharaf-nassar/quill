@@ -112,13 +112,17 @@ partial run can still have complete inventory when every root was enumerated but
 individual sources failed.
 
 Fast comparison uses nanosecond mtime and size. Changed candidates receive a
-SHA-256 content fingerprint after reading. Unchanged fingerprints are no-ops.
+SHA-256 fingerprint from one shared bounded stable read that verifies the path
+and opened file before and after reading. Unchanged fingerprints are no-ops.
 Progress and data events follow committed batches, not speculative work.
 
-Live transcript notifications enter a model queue keyed by provider and canonical
-source path before the existing session-keyed search queue can coalesce payloads.
-Only repeat notifications for the same source coalesce, so parent and subagent
-paths that share a session remain independently reconciled.
+Live transcript notifications enter one coordinator keyed by provider and
+canonical source path before the existing session-keyed search queue can
+coalesce payloads. Model and transcript work retain independent running
+revisions, completion, failure counts, and ready times, so one failure cannot
+replay a committed sibling domain or delay a healthy source. Only repeat
+notifications for the same source coalesce; a newer notification rearms both
+domains without letting the older completion clear it.
 
 **Rationale**: Claude parent and subagent files can share a root session ID, so
 session-scoped replacement can erase sibling evidence. Source-scoped replacement

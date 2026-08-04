@@ -434,7 +434,7 @@ src-tauri/                    # Rust backend
     compress_prose.rs         # Caveman pre-pass (detect / prompt / validate submodules)
     brevity.rs                # Managed brevity block in provider agent files
     context_category.rs       # Context-savings event taxonomy
-    retention*.rs             # Retention policy, pruning engine, and corpus study
+    retention*.rs             # Retention policy, test fixture, and pruning engine
     restart.rs                # Claude Code instance restart management
     releases.rs               # GitHub release notes
     appimage_integration.rs   # Linux applications-menu install

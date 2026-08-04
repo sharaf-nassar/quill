@@ -2,11 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::fs::Metadata;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::time::UNIX_EPOCH;
 
 use crate::integrations::IntegrationProvider;
 use crate::sessions::{
@@ -17,17 +14,18 @@ use crate::sessions::{
 };
 use crate::storage::{
     Storage, StoredTranscriptAnalyticsSource, TranscriptAnalyticsReplacement,
-    UnchangedTranscriptAnalyticsSource, model_source_content_sha256,
+    UnchangedTranscriptAnalyticsSource,
 };
+#[cfg(test)]
+use crate::transcript_identity::RETAINED_TRANSCRIPT_MAX_BYTES;
 use crate::transcript_identity::{
-    IdentityError, JsonlRecord, NativeChainIdentity, RETAINED_TRANSCRIPT_MAX_BYTES,
-    SourceRootGraph, parse_jsonl_records, resolve_codex_native_identity,
+    IdentityError, JsonlRecord, ModelSourceFastFingerprint, NativeChainIdentity, SourceRootGraph,
+    StableTranscriptReadError, model_source_content_sha256, model_source_fast_fingerprint,
+    parse_jsonl_records, read_stable_transcript, resolve_codex_native_identity,
 };
 use chrono::DateTime;
 use parking_lot::{Condvar, Mutex};
 use serde_json::Value;
-
-const STABLE_READ_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TranscriptReconciliationRootKey {
@@ -84,88 +82,6 @@ fn acquire_transcript_reconciliation(
     }
     active.extend(roots.iter().cloned());
     Ok(TranscriptReconciliationPermit { roots })
-}
-
-#[cfg(unix)]
-type SourceFileIdentity = (u64, u64);
-#[cfg(not(unix))]
-type SourceFileIdentity = Option<std::time::SystemTime>;
-
-#[cfg(unix)]
-fn source_file_identity(metadata: &Metadata) -> SourceFileIdentity {
-    use std::os::unix::fs::MetadataExt;
-    (metadata.dev(), metadata.ino())
-}
-
-// Windows' `volume_serial_number`/`file_index` are gated behind the unstable
-// `windows_by_handle` feature, so stable release builds fall back to creation
-// time. This identity only guards intra-read swap detection alongside the
-// separately tracked mtime and size; durable cross-rename identity comes from
-// the JSONL native chain, not the file system.
-#[cfg(not(unix))]
-fn source_file_identity(metadata: &Metadata) -> SourceFileIdentity {
-    metadata.created().ok()
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct StableSourceStat {
-    identity: SourceFileIdentity,
-    mtime_ns: i64,
-    size_bytes: i64,
-}
-
-fn stable_source_stat(metadata: &Metadata) -> Result<StableSourceStat, TranscriptAnalyticsError> {
-    let modified = metadata
-        .modified()
-        .map_err(TranscriptAnalyticsError::Read)?;
-    let elapsed = modified
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| TranscriptAnalyticsError::InvalidSourceMetadata)?;
-    Ok(StableSourceStat {
-        identity: source_file_identity(metadata),
-        mtime_ns: i64::try_from(elapsed.as_nanos())
-            .map_err(|_| TranscriptAnalyticsError::InvalidSourceMetadata)?,
-        size_bytes: i64::try_from(metadata.len())
-            .map_err(|_| TranscriptAnalyticsError::InvalidSourceMetadata)?,
-    })
-}
-
-fn read_stable_transcript(
-    path: &std::path::Path,
-) -> Result<(Vec<u8>, StableSourceStat), TranscriptAnalyticsError> {
-    for _ in 0..STABLE_READ_MAX_ATTEMPTS {
-        let before =
-            stable_source_stat(&std::fs::metadata(path).map_err(TranscriptAnalyticsError::Read)?)?;
-        if u64::try_from(before.size_bytes).is_ok_and(|size| size > RETAINED_TRANSCRIPT_MAX_BYTES) {
-            return Err(TranscriptAnalyticsError::SourceTooLarge);
-        }
-
-        let mut file = std::fs::File::open(path).map_err(TranscriptAnalyticsError::Read)?;
-        let opened_before =
-            stable_source_stat(&file.metadata().map_err(TranscriptAnalyticsError::Read)?)?;
-        if opened_before != before {
-            continue;
-        }
-
-        let mut bytes = Vec::new();
-        file.by_ref()
-            .take(RETAINED_TRANSCRIPT_MAX_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(TranscriptAnalyticsError::Read)?;
-        if bytes.len() as u64 > RETAINED_TRANSCRIPT_MAX_BYTES {
-            return Err(TranscriptAnalyticsError::SourceTooLarge);
-        }
-
-        let opened_after =
-            stable_source_stat(&file.metadata().map_err(TranscriptAnalyticsError::Read)?)?;
-        let after =
-            stable_source_stat(&std::fs::metadata(path).map_err(TranscriptAnalyticsError::Read)?)?;
-        let read_size_matches = usize::try_from(after.size_bytes).ok() == Some(bytes.len());
-        if before == opened_after && before == after && read_size_matches {
-            return Ok((bytes, after));
-        }
-    }
-    Err(TranscriptAnalyticsError::UnstableSource)
 }
 
 #[derive(Clone, Debug)]
@@ -417,7 +333,7 @@ enum ClassifiedTranscriptSource {
 /// Raw bytes of a source that must be re-parsed, read exactly once.
 struct ChangedTranscriptSourceBytes {
     bytes: Vec<u8>,
-    stable_stat: StableSourceStat,
+    stable_stat: ModelSourceFastFingerprint,
     content_sha256: String,
 }
 
@@ -451,13 +367,13 @@ fn classify_transcript_source_freshness(
 
     let metadata =
         std::fs::metadata(&source.canonical_path).map_err(TranscriptAnalyticsError::Read)?;
-    let stat = stable_source_stat(&metadata)?;
+    let stat = model_source_fast_fingerprint(&metadata).map_err(TranscriptAnalyticsError::from)?;
     let suppressed =
         existing.processing_status == "suppressed" || existing.suppressed_sha256.is_some();
     let has_last_good_identity = stored_native_identity(existing).is_some();
     let fast_unchanged = !force_full_reparse
-        && existing.mtime_ns == Some(stat.mtime_ns)
-        && existing.size_bytes == Some(stat.size_bytes)
+        && existing.mtime_ns == Some(stat.mtime_ns())
+        && existing.size_bytes == Some(stat.size_bytes())
         && existing.content_sha256.is_some();
 
     if suppressed
@@ -475,8 +391,8 @@ fn classify_transcript_source_freshness(
                     source_root_key: source.source_root_key,
                     source_path: source.canonical_path.clone(),
                     generation,
-                    mtime_ns: stat.mtime_ns,
-                    size_bytes: stat.size_bytes,
+                    mtime_ns: stat.mtime_ns(),
+                    size_bytes: stat.size_bytes(),
                     content_sha256: None,
                     stale_generation_error: "unchanged transcript generation advanced during refresh",
                 },
@@ -484,7 +400,8 @@ fn classify_transcript_source_freshness(
         )));
     }
 
-    let (bytes, stable_stat) = read_stable_transcript(&source.canonical_path)?;
+    let (bytes, stable_stat) =
+        read_stable_transcript(&source.canonical_path).map_err(TranscriptAnalyticsError::from)?;
     let content_sha256 = model_source_content_sha256(&bytes);
     if !force_full_reparse
         && existing.processing_status == "ok"
@@ -503,8 +420,8 @@ fn classify_transcript_source_freshness(
                     source_root_key: source.source_root_key,
                     source_path: source.canonical_path.clone(),
                     generation,
-                    mtime_ns: stable_stat.mtime_ns,
-                    size_bytes: stable_stat.size_bytes,
+                    mtime_ns: stable_stat.mtime_ns(),
+                    size_bytes: stable_stat.size_bytes(),
                     content_sha256: Some(content_sha256),
                     stale_generation_error: "content-unchanged transcript generation advanced during refresh",
                 },
@@ -524,7 +441,8 @@ fn classify_transcript_source_freshness(
 fn read_changed_transcript_source(
     source: &DiscoveredRetainedJsonlSource,
 ) -> Result<Box<ChangedTranscriptSourceBytes>, TranscriptAnalyticsError> {
-    let (bytes, stable_stat) = read_stable_transcript(&source.canonical_path)?;
+    let (bytes, stable_stat) =
+        read_stable_transcript(&source.canonical_path).map_err(TranscriptAnalyticsError::from)?;
     let content_sha256 = model_source_content_sha256(&bytes);
     Ok(Box::new(ChangedTranscriptSourceBytes {
         bytes,
@@ -1290,6 +1208,17 @@ impl fmt::Display for TranscriptAnalyticsError {
 
 impl std::error::Error for TranscriptAnalyticsError {}
 
+impl From<StableTranscriptReadError> for TranscriptAnalyticsError {
+    fn from(error: StableTranscriptReadError) -> Self {
+        match error {
+            StableTranscriptReadError::Read(error) => Self::Read(error),
+            StableTranscriptReadError::InvalidMetadata => Self::InvalidSourceMetadata,
+            StableTranscriptReadError::SourceTooLarge => Self::SourceTooLarge,
+            StableTranscriptReadError::UnstableSource => Self::UnstableSource,
+        }
+    }
+}
+
 impl From<IdentityError> for TranscriptAnalyticsError {
     fn from(error: IdentityError) -> Self {
         Self::Identity(error)
@@ -1535,7 +1464,8 @@ pub(crate) fn parse_transcript_analytics_source(
     source: &DiscoveredRetainedJsonlSource,
     hostname: &str,
 ) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
-    let (bytes, stable_stat) = read_stable_transcript(&source.canonical_path)?;
+    let (bytes, stable_stat) =
+        read_stable_transcript(&source.canonical_path).map_err(TranscriptAnalyticsError::from)?;
     let content_sha256 = model_source_content_sha256(&bytes);
     parse_transcript_analytics_source_bytes(source, hostname, bytes, stable_stat, content_sha256)
 }
@@ -1544,7 +1474,7 @@ fn parse_transcript_analytics_source_bytes(
     source: &DiscoveredRetainedJsonlSource,
     hostname: &str,
     bytes: Vec<u8>,
-    stable_stat: StableSourceStat,
+    stable_stat: ModelSourceFastFingerprint,
     content_sha256: String,
 ) -> Result<ParsedTranscriptAnalyticsSource, TranscriptAnalyticsError> {
     let contents =
@@ -1693,8 +1623,8 @@ fn parse_transcript_analytics_source_bytes(
             project,
             cwd,
             hostname: hostname.to_owned(),
-            mtime_ns: stable_stat.mtime_ns,
-            size_bytes: stable_stat.size_bytes,
+            mtime_ns: stable_stat.mtime_ns(),
+            size_bytes: stable_stat.size_bytes(),
             content_sha256,
             seen_generation: 0,
         },
@@ -1780,7 +1710,7 @@ mod tests {
     use serial_test::serial;
     use std::fs::{File, FileTimes};
     use std::path::Path;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
     use tempfile::TempDir;
 
     const TEST_HOSTNAME: &str = "host-a";
@@ -1866,8 +1796,8 @@ mod tests {
 
     fn stat_of(path: &Path) -> (i64, i64) {
         let metadata = std::fs::metadata(path).expect("transcript metadata");
-        let stat = stable_source_stat(&metadata).expect("stable transcript stat");
-        (stat.mtime_ns, stat.size_bytes)
+        let stat = model_source_fast_fingerprint(&metadata).expect("stable transcript stat");
+        (stat.mtime_ns(), stat.size_bytes())
     }
 
     fn content_digest_of(path: &Path) -> String {
@@ -2350,7 +2280,7 @@ mod tests {
         let discovered = write_oversized_sparse_source(dir.path(), "sess-huge.jsonl");
         assert!(matches!(
             read_stable_transcript(&discovered.canonical_path),
-            Err(TranscriptAnalyticsError::SourceTooLarge)
+            Err(StableTranscriptReadError::SourceTooLarge)
         ));
     }
 

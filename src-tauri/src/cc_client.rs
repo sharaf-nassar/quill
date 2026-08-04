@@ -70,27 +70,6 @@ impl Phase {
     }
 }
 
-/// Model selection alias understood by `claude --model`.
-#[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // `Sonnet`/`Haiku` retained for easy revert; the pipeline is single-model Sonnet46 (extraction + synthesis)
-pub enum Model {
-    Haiku,
-    Sonnet,
-    /// Sonnet 4.6 pinned by full model name (not the rolling `sonnet`
-    /// alias). Used for all extraction streams and the memory optimizer.
-    Sonnet46,
-}
-
-impl Model {
-    fn alias(self) -> &'static str {
-        match self {
-            Model::Haiku => "haiku",
-            Model::Sonnet => "sonnet",
-            Model::Sonnet46 => "claude-sonnet-4-6",
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // OS-level confinement for the spawned `claude` CLI (H-5 / FR-005 / SC-013).
 //
@@ -114,8 +93,7 @@ impl Model {
 // `#[cfg(target_os=...)]` arm in `detect_sandbox_kind`/`apply_sandbox`, so on
 // any single target the others read as dead. They are all live across the
 // supported platforms and all reachable via `as_str` (the persisted/serialized
-// form), mirroring the `#[allow(dead_code)]` the `Model` enum already uses for
-// platform/revert-retained variants.
+// form).
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxKind {
@@ -947,7 +925,6 @@ pub struct InvokeArgs {
     pub phase: Phase,
     pub prompt: String,
     pub preamble: String,
-    pub model: Model,
     /// Output budget upper bound. Carried into the metadata record so
     /// future analysis can correlate budget vs. actual usage; the
     /// `claude` CLI does not expose a direct max-tokens knob in
@@ -1241,7 +1218,7 @@ fn build_command(
 
     // Headless one-shot mode with the documented JSON envelope.
     cmd.arg("-p").arg("--output-format").arg("json");
-    cmd.arg("--model").arg(args.model.alias());
+    cmd.arg("--model").arg("claude-sonnet-4-6");
     cmd.arg("--append-system-prompt").arg(&args.preamble);
 
     cmd.arg("--disable-slash-commands");
@@ -2069,7 +2046,6 @@ mod tests {
             phase,
             prompt: "unused — the double short-circuits before spawn".into(),
             preamble: String::new(),
-            model: Model::Sonnet46,
             max_tokens: 4096,
         }
     }

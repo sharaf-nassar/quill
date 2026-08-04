@@ -2,6 +2,8 @@
 
 This maintainer-only protocol studies an explicitly approved local corpus without opening, migrating, copying, or mutating the source database.
 
+**Archived 2026-08-03.** The `retention_corpus` binary and its support module were removed. Command blocks below preserve the approved protocol as historical evidence and are not runnable.
+
 ## Preconditions
 
 Use a named local `usage.db`, private approval JSON, private workspace, and

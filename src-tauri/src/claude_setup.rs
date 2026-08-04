@@ -1,6 +1,6 @@
 use crate::integrations::deploy::{
-    FileSnapshots, PublishedBatch, StagedDirectory, path_exists, publish_staged_batch,
-    recover_staged_batch, remove_path, validate_staged_mcp,
+    FileSnapshots, PublishedBatch, StagedDirectory, copy_dir_recursive, path_exists,
+    publish_staged_batch, recover_staged_batch, remove_path, validate_staged_mcp,
 };
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::models::IntegrationFeatures;
@@ -289,18 +289,8 @@ fn resolve_runtime_paths() -> Result<ClaudeRuntimePaths, String> {
 /// behavior (with no demo override) is byte-identical to the previous direct
 /// `dirs::data_local_dir()` lookup.
 fn app_data_dir() -> PathBuf {
-    let default = dirs::data_local_dir()
-        .or_else(|| {
-            dirs::home_dir().map(|h| {
-                if cfg!(target_os = "macos") {
-                    h.join("Library").join("Application Support")
-                } else {
-                    h.join(".local").join("share")
-                }
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("com.quilltoolkit.app");
+    let default = crate::data_paths::default_app_data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"));
     crate::data_paths::resolve_data_dir_with_default(default)
 }
 
@@ -433,41 +423,6 @@ fn build_owned_manifest(paths: &ClaudePaths) -> OwnedAssetManifest {
 }
 
 // ── File deployment ──
-
-/// Recursively copy all files from `src` into `dst`, creating directories as needed.
-fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    if !src.exists() {
-        return Ok(()); // Source subdirectory not present in bundle — skip
-    }
-    fs::create_dir_all(dst)
-        .map_err(|e| format!("Failed to create directory {}: {e}", dst.display()))?;
-
-    let walker = walkdir::WalkDir::new(src).min_depth(1).follow_links(true);
-
-    for entry in walker {
-        let entry = entry.map_err(|e| format!("Failed to walk {}: {e}", src.display()))?;
-        let relative = entry
-            .path()
-            .strip_prefix(src)
-            .map_err(|e| format!("Failed to strip prefix: {e}"))?;
-        let target = dst.join(relative);
-
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .map_err(|e| format!("Failed to create dir {}: {e}", target.display()))?;
-        } else {
-            fs::copy(entry.path(), &target).map_err(|e| {
-                format!(
-                    "Failed to copy {} -> {}: {e}",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
-}
 
 /// Remove Quill-managed command files from ~/.claude/commands/ (shared directory).
 /// Uses an explicit list of all current AND previously shipped names to clean stale files.
@@ -2014,15 +1969,6 @@ fn cleanup_legacy_hook_files(paths: &ClaudePaths) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-// ── Main orchestrator ──
-
-/// Set up Claude Code integration locally when the Quill widget runs on the same machine.
-/// Called on widget startup.
-#[allow(dead_code)]
-pub fn setup_local(app: &tauri::AppHandle) -> Result<(), String> {
-    install_with_manifest(app, IntegrationFeatures::default()).map(|_| ())
 }
 
 #[cfg(test)]

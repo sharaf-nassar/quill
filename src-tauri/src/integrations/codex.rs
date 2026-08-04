@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::integrations::deploy::{
-    FileSnapshots, PublishedBatch, StagedDirectory, path_exists, publish_staged_batch,
-    recover_staged_batch, remove_path, validate_staged_mcp,
+    FileSnapshots, PublishedBatch, StagedDirectory, copy_dir_recursive, path_exists,
+    publish_staged_batch, recover_staged_batch, remove_path, validate_staged_mcp,
 };
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
@@ -301,12 +301,9 @@ fn deployment_stamp(
         .resource_dir()
         .map_err(|err| format!("Cannot get resource dir: {err}"))?;
     let codex_source = resource_dir.join("codex-integration");
-    let shared_mcp_source = resource_dir.join("claude-integration").join("mcp");
+    let shared_source = resource_dir.join("claude-integration");
     let inputs = format!("{}\u{1f}{features:?}", env!("CARGO_PKG_VERSION"));
-    crate::integrations::deploy::deployment_stamp_current(
-        &[&codex_source, &shared_mcp_source],
-        &inputs,
-    )
+    crate::integrations::deploy::deployment_stamp_current(&[&codex_source, &shared_source], &inputs)
 }
 
 /// Fast path for startup repair: the deployment is current when the stamp
@@ -527,31 +524,6 @@ fn hook_state_label(event: &str) -> Option<&'static str> {
     CODEX_HOOK_EVENTS.iter().find_map(|(name, state_label)| {
         (normalize_hook_event(name) == normalized).then_some(*state_label)
     })
-}
-
-fn managed_hook_commands() -> HashSet<String> {
-    [
-        format!("node {}", shell_quote(&scripts_dir().join("observe.cjs"))),
-        format!(
-            "node {}",
-            shell_quote(&scripts_dir().join("context-router.cjs"))
-        ),
-        format!(
-            "node {}",
-            shell_quote(&scripts_dir().join("context-capture.cjs"))
-        ),
-        format!(
-            "node {}",
-            shell_quote(&scripts_dir().join("session-sync.cjs"))
-        ),
-        shell_quote(&scripts_dir().join("report-tokens.sh")),
-        format!(
-            "node {}",
-            shell_quote(&scripts_dir().join("hook-observe.cjs"))
-        ),
-    ]
-    .into_iter()
-    .collect()
 }
 
 fn command_is_quill_owned(command: &str) -> bool {
@@ -1168,18 +1140,8 @@ fn resolve_codex_uninstall_paths() -> Result<CodexInstallPaths, String> {
 }
 
 fn app_data_dir() -> PathBuf {
-    let default = dirs::data_local_dir()
-        .or_else(|| {
-            dirs::home_dir().map(|home| {
-                if cfg!(target_os = "macos") {
-                    home.join("Library").join("Application Support")
-                } else {
-                    home.join(".local").join("share")
-                }
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("com.quilltoolkit.app");
+    let default = crate::data_paths::default_app_data_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"));
     crate::data_paths::resolve_data_dir_with_default(default)
 }
 
@@ -1215,40 +1177,6 @@ fn build_owned_manifest() -> OwnedAssetManifest {
     }
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    if !src.exists() {
-        return Ok(());
-    }
-
-    fs::create_dir_all(dst)
-        .map_err(|err| format!("Failed to create directory {}: {err}", dst.display()))?;
-
-    let walker = walkdir::WalkDir::new(src).min_depth(1).follow_links(true);
-    for entry in walker {
-        let entry = entry.map_err(|err| format!("Failed to walk {}: {err}", src.display()))?;
-        let relative = entry
-            .path()
-            .strip_prefix(src)
-            .map_err(|err| format!("Failed to strip prefix: {err}"))?;
-        let target = dst.join(relative);
-
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target)
-                .map_err(|err| format!("Failed to create dir {}: {err}", target.display()))?;
-        } else {
-            fs::copy(entry.path(), &target).map_err(|err| {
-                format!(
-                    "Failed to copy {} -> {}: {err}",
-                    entry.path().display(),
-                    target.display()
-                )
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
 fn copy_named_files(src_dir: &Path, dst_dir: &Path, file_names: &[&str]) -> Result<(), String> {
     for file_name in file_names {
         let source = src_dir.join(file_name);
@@ -1282,7 +1210,8 @@ fn deploy_files(
             .resource_dir()
             .map_err(|err| format!("Cannot get resource dir: {err}"))?;
         let codex_source = resource_dir.join("codex-integration");
-        let shared_mcp_source = resource_dir.join("claude-integration").join("mcp");
+        let shared_source = resource_dir.join("claude-integration");
+        let shared_mcp_source = shared_source.join("mcp");
 
         if !codex_source.exists() {
             return Err(format!(
@@ -1311,7 +1240,7 @@ fn deploy_files(
         let context_scripts = context_scripts_for(features);
         if !context_scripts.is_empty() {
             copy_named_files(
-                &codex_source.join("scripts"),
+                &shared_source.join("scripts"),
                 staged_scripts.path(),
                 &context_scripts,
             )?;

@@ -1,5 +1,7 @@
 # Spec: widget-query-perf
 
+**Historical evidence note.** The spike binaries cited by this completed spec were removed on 2026-08-03. Their references identify frozen measurement provenance, not runnable current tooling.
+
 ## Problem Statement
 
 Widget views (Usage, Trends, Charts, Models, Context) load slowly and get

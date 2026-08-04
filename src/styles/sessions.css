@@ -6,45 +6,6 @@
   background: var(--console-black);
 }
 
-.sessions-window-titlebar {
-  display: flex;
-  align-items: center;
-  min-height: 28px;
-  padding: 2px 8px;
-  background: var(--console-black);
-  flex-shrink: 0;
-}
-
-.sessions-window-title {
-  flex: 1;
-  color: rgba(255, 255, 255, 0.5);
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 1.5px;
-  text-transform: uppercase;
-}
-
-.sessions-window-close {
-  background: none;
-  border: none;
-  color: rgba(255, 255, 255, 0.4);
-  font-size: 16px;
-  cursor: pointer;
-  padding: 4px 8px;
-  min-width: 28px;
-  min-height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 4px;
-  line-height: 1;
-}
-
-.sessions-window-close:hover {
-  background: rgba(255, 255, 255, 0.1);
-  color: rgba(255, 255, 255, 0.7);
-}
-
 /* ─── Split panel layout ─── */
 .sessions-split {
   flex: 1;

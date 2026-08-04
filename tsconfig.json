@@ -6,13 +6,10 @@
     "jsx": "react-jsx",
     "strict": true,
     "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
     "noEmit": true,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true
+    "esModuleInterop": true
   },
   "include": ["src"]
 }

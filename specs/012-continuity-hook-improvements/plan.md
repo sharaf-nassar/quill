@@ -47,8 +47,7 @@ Files touched:
 
 | File | Change |
 |------|--------|
-| `src-tauri/claude-integration/scripts/context-capture.cjs` | Rewrite `buildDirective` + add selection helpers (triviality predicate, coherence anchor, snapshot-first sourcing); harden `pruneJsonlFile` (77–94) with lockfile + atomic rename; drop 3 retired names from `CONTEXT_TOOLS` (25–27); add `source`/`trivialSkipped`/`coherent` to the `capture.guidance` telemetry metadata (435–447) |
-| `src-tauri/codex-integration/scripts/context-capture.cjs` | Byte-identical mirror of the above (verified identical today via `cmp`) |
+| `src-tauri/claude-integration/scripts/context-capture.cjs` | Shared Claude/Codex resource: rewrite `buildDirective` + add selection helpers (triviality predicate, coherence anchor, snapshot-first sourcing); harden `pruneJsonlFile` (77–94) with lockfile + atomic rename; drop 3 retired names from `CONTEXT_TOOLS` (25–27); add `source`/`trivialSkipped`/`coherent` to the `capture.guidance` telemetry metadata (435–447) |
 | `src-tauri/claude-integration/mcp/tools/context.py` | Delete `quill_record_continuity_event` (1951–2007), `_resolve_source_refs` helper (2010–2039, used only by the snapshot creator), `quill_create_compaction_snapshot` (2042–2143), `quill_get_compaction_snapshot` (2146–2206 = EOF) |
 | `src-tauri/claude-integration/mcp/server.py` | Remove instruction bullet at 51–52 (`quill_record_continuity_event / quill_create_compaction_snapshot: preserve …`) |
 | `README.md` | Line 67: drop the three retired tool names from the Context MCP tools enumeration |

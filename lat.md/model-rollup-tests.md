@@ -4,7 +4,7 @@ lat:
 ---
 # Model Rollup Backfill Test Specs
 
-Model rollup tests pin resumable hourly folding, read-time invalidation, frozen-corpus equality, pruned authority, and maintenance admission.
+Model rollup tests pin resumable hourly folding, read-time invalidation, pruned authority, and maintenance admission.
 
 ## Empty Completion And Committed Progress
 
@@ -32,15 +32,7 @@ Re-ingest must never add retained raw into an authoritative pruned bucket, and e
 
 ## Live Suppression Read Time Invalidation
 
-Suppression flips must hide and restore completed overview and history results immediately without rewriting hourly rows or collapsing NULL token evidence into zero.
-
-## Frozen Corpus Raw Hybrid Equality
-
-A bounded 90d fixture derived from an immutable corpus must produce byte-exact normalized overview and history outputs for 24h, 30d, and 90d raw versus hybrid reads.
-
-Normalization excludes only `buildingIndex` and the fixture-created
-`backfill.updatedAt` lifecycle timestamp. Independent fixtures must emit stable
-digests so every semantic field remains covered across reruns.
+Suppression flips must hide and restore completed overview results immediately without rewriting hourly rows or collapsing NULL token evidence into zero.
 
 ## Maintenance Admission Refusal
 

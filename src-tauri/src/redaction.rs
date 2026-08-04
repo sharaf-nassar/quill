@@ -15,7 +15,7 @@
 //!    `SECRET|TOKEN|KEY|PASSWORD|PASSWD|API|CREDENTIAL` (broadened with the
 //!    `compress_prose/detect.rs` `SENSITIVE_NAME_TOKENS` list:
 //!    `ACCESSKEY`/`PRIVATEKEY`/`PASSWD`/`CREDENTIAL`). Generalized from the
-//!    legacy `prompt_utils::redact_secrets`; the proven anchored shapes are
+//!    retired prompt redactor; the proven anchored shapes are
 //!    kept verbatim. Only the secret *value* is masked; the key/frame stays.
 //! 2. **Connection-string / URL userinfo** — `scheme://user:password@host`
 //!    masks only the `:password@` segment; scheme, host, and path survive.
@@ -46,7 +46,7 @@
 //!   `git_analysis.rs`, and `memory_optimizer.rs`.
 
 /// Idempotent mask token. Chosen so it matches none of the detector layers
-/// (kept stable from the legacy `prompt_utils::redact_secrets`).
+/// (kept stable from the retired prompt redactor).
 pub const MASK: &str = "\u{2039}redacted\u{203a}"; // ‹redacted›
 
 /// Redact recognized secrets and PII from `input`, returning a new `String`.

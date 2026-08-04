@@ -6,6 +6,7 @@ The seeder writes deterministic dummy content into a Quill data directory plus a
 
 ```text
 python3 scripts/populate_dummy_data.py
+       [--bin PATH]
        [--data-dir PATH]
        [--rules-dir PATH]
        [--projects-dir PATH]
@@ -21,6 +22,7 @@ python3 scripts/populate_dummy_data.py
 
 | Flag             | Type | Default                                                    | Effect                                                                    |
 |------------------|------|------------------------------------------------------------|----------------------------------------------------------------------------|
+| `--bin`          | path | `quill` on `PATH`, then repo release/debug build            | Executable whose hidden initializer creates or migrates `usage.db`.        |
 | `--data-dir`     | path | platform `app_data_dir()` for `com.quilltoolkit.app`       | Directory the seeder writes `usage.db` into. Created if it does not exist. |
 | `--rules-dir`    | path | `~/.claude/rules/learned/` (legacy; today's seeder writes here) | Directory the seeder writes sample learned-rule `.md` files into.          |
 | `--projects-dir` | path | `~/.claude/projects/`                                      | Directory the seeder writes fictional Claude session JSONL files into (one subdir per project, two `<sessionId>.jsonl` files per subdir). Created if it does not exist. |
@@ -40,7 +42,7 @@ python3 scripts/populate_dummy_data.py
 5. **`--seed` exposed for forward compatibility** — same default produces same byte-output (regression-safe). Legacy Claude-only reruns retain their regular-file replacement behavior, while symlink/junction parents and targets remain forbidden.
 6. **Complete model fixtures require an isolated triple override** — `--data-dir`, `--projects-dir`, and `--codex-sessions-dir`. This mode writes ownership-marked Claude and Codex JSONLs, exact migration-28 source fingerprints/keys and observations, plus root-complete state only when runtime discovery exactly matches seeded sources. Reruns remove only marker-owned JSONLs. Every target must remain beneath its canonical configured root through ordinary directories: symlink/junction parents and targets are refused, and exclusive creation never truncates an unmarked collision. Production Claude/Codex roots cannot be used.
 7. **Post-core failures attempt migration-safe recovery** — after the core schema/data commit, a cleanup, JSONL, fingerprint, observation, or model-state failure attempts to restore the migration-28 singleton to `pending` with incomplete/zero progress in a separate transaction, warns if recovery itself fails, and preserves the original error.
-8. **The DB is stamped at the app's latest schema version and built in that shape** — the seeder creates every analytics table exactly as migrations 30/31/33/35 leave it (source-owned identity columns, stored `lines_added`/`lines_removed`, the reconciliation and retention tables) and records versions 1..35, so opening it runs zero migrations. A stamped-but-stale shape is the failure mode this guards: migration 20 would leave `token_snapshots` without `is_sidechain`, and migration 30 would archive every seeded analytics row for migration 34 to drop. A seeder-owned table found on disk in an older shape is dropped and rebuilt rather than reused, so reruns over an existing sandbox never fail on a missing `action_key`.
+8. **The selected Quill binary owns schema initialization** — after backup, the seeder invokes `quill --init-database PATH`, which applies the same Rust migrations through version 37 as app startup without launching Tauri or running unrelated cleanup. Python never creates tables, drops stale shapes, or writes `schema_version`. Legitimate old databases migrate; newer or inconsistent schemas fail. Reruns clear fixture and hourly rows, then reset `rollup_meta` to pending with null bookmarks so rollups rebuild from current evidence.
 9. **Canonical source keys mirror Rust bytes** — Unix uses canonical path bytes. Windows restores the verbatim `\\?\` drive or `\\?\UNC\` form returned by `std::fs::canonicalize`, then hex-encodes each UTF-16 code unit's big-endian bytes exactly like `sessions.rs`.
 
 ## Exit codes
@@ -62,12 +64,13 @@ python3 scripts/populate_dummy_data.py
 
 ## Backwards compatibility
 
-Callers that run `python3 scripts/populate_dummy_data.py` with no flags MUST observe the existing v0 behavior: writes to `~/.local/share/com.quilltoolkit.app/usage.db`, backs the existing DB up, refuses to run while Quill is alive. The new flags are strictly additive.
+Callers that run `python3 scripts/populate_dummy_data.py` with no flags still write to `~/.local/share/com.quilltoolkit.app/usage.db`, back up the existing DB, and refuse to run while Quill is alive. They must have `quill` on `PATH` or a repo release/debug build; `--bin` selects another executable explicitly.
 
 ## Test surface
 
 A small integration test (manual: shell command + `sqlite3 .schema`) verifies:
 - `--data-dir /tmp/x` creates `/tmp/x/usage.db` with the expected schema.
+- Fresh and rerun databases contain one version-37 record and reset `rollup_meta` to pending with null bookmarks.
 - Default invocation still writes to the legacy path.
 - `--seed 42` (default) produces identical row counts on re-run.
 - Fresh and different-seed rerun isolated modes each expose exactly the same runtime-discoverable JSONL set as the DB source inventory, use success/completion timestamps at or after file mtimes, and record 2/2 complete roots.

@@ -1,5 +1,4 @@
-import { useCallback, useState } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useState } from "react";
 import { useIntegrations } from "../hooks/useIntegrations";
 import { useIntegrationFeatures } from "../hooks/useIntegrationFeatures";
 import { useRuntimeSettings } from "../hooks/useRuntimeSettings";
@@ -22,25 +21,8 @@ function SettingsWindowView() {
 
   const [active, setActive] = useState<SettingsTabId>("general");
 
-  const handleClose = useCallback(async () => {
-    await getCurrentWindow().close();
-  }, []);
-
   return (
     <div className="settings-window">
-      <div className="settings-window-titlebar" data-tauri-drag-region>
-        <span className="settings-window-title" data-tauri-drag-region>
-          Settings
-        </span>
-        <button
-          type="button"
-          className="settings-window-close"
-          onClick={() => void handleClose()}
-          aria-label="Close"
-        >
-          &times;
-        </button>
-      </div>
       <SettingsTabs active={active} onChange={setActive} />
       <div className="settings-content">
         {active === "general" && (

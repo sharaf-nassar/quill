@@ -1,12 +1,9 @@
 //! Frozen synthetic corpus for retention pruning (feature 014).
 //!
-//! Every Phase 2 retention test and the retention timing spike run against
-//! **this one builder**. That is the whole point of the module: acceptance
-//! numbers and budget numbers have to come from the same corpus, or the two
-//! drift apart and a passing test stops saying anything about the measured
-//! budget. Because `src-tauri/src/bin/retention_spike.rs` is a separate crate
-//! that cannot see `#[cfg(test)]` code, this is ordinary `pub` non-test code
-//! rather than a test helper.
+//! Every retention acceptance test runs against **this one builder**, keeping
+//! cutoff, shape, and row-count assertions on one corpus. The historical
+//! timing evidence was captured from the same fixture before its one-off
+//! measurement binary was removed.
 //!
 //! # Contract
 //!
@@ -239,8 +236,6 @@ impl Default for RetentionFixtureSpec {
 pub struct RetentionMonthBucket {
     /// 0 is the most recent bucket.
     pub index: u32,
-    /// Older bound, exclusive of any generated row (rows sit strictly inside).
-    pub start: DateTime<Utc>,
     /// Newer bound, exclusive. Equal to `plan.boundary(index)`.
     pub end: DateTime<Utc>,
     /// Owned conforming rows in this bucket, per owned table.
@@ -347,17 +342,12 @@ impl RetentionFixturePlan {
 ///
 /// Dropping this removes the temp directory, so hold it for the whole test.
 pub struct RetentionFixture {
-    data_dir: TempDir,
+    _data_dir: TempDir,
     db_path: PathBuf,
     plan: RetentionFixturePlan,
 }
 
 impl RetentionFixture {
-    /// Temp directory the `QUILL_DATA_DIR` override points at.
-    pub fn data_dir(&self) -> &Path {
-        self.data_dir.path()
-    }
-
     /// Path of the SQLite database `Storage::init` created.
     pub fn db_path(&self) -> &Path {
         &self.db_path
@@ -525,7 +515,7 @@ pub fn build_retention_fixture(
     drop(conn);
 
     Ok(RetentionFixture {
-        data_dir,
+        _data_dir: data_dir,
         db_path,
         plan,
     })
@@ -558,7 +548,6 @@ fn build_plan(spec: &RetentionFixtureSpec) -> RetentionFixturePlan {
             let end = anchor - TimeDelta::days(BUCKET_DAYS * i64::from(index));
             RetentionMonthBucket {
                 index,
-                start: end - TimeDelta::days(BUCKET_DAYS),
                 end,
                 owned_conforming_rows: u64::from(spec.owned_rows_per_month),
                 owned_non_conforming_rows: NON_CONFORMING_SHAPES.len() as u64,

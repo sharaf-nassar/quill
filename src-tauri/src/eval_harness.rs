@@ -6,7 +6,7 @@
 //!
 //! For each frozen replay case the harness runs the candidate rule WITH and
 //! WITHOUT through the local [`crate::cc_client`] path (pinned
-//! [`Model::Sonnet46`], `N=3` majority/median), then asks a calibrated judge
+//! pinned Sonnet 4.6, `N=3` majority/median), then asks a calibrated judge
 //! for a typed [`EvalVerdict`]. A signed `delta` past a dead-band — or a
 //! negative-transfer signal — is a regression. The judge is calibrated against
 //! the maintainer-authored `expected_judgment` labels (Cohen's κ vs the frozen
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::cc_client::{self, InvokeArgs, Model, Phase};
+use crate::cc_client::{self, InvokeArgs, Phase};
 
 // ---------------------------------------------------------------------------
 // Tunable constants (contract Decisions 3/4/6).
@@ -629,8 +629,6 @@ fn invoke_args(phase: Phase, prompt: String, preamble: &str) -> InvokeArgs {
         phase,
         prompt,
         preamble: preamble.to_string(),
-        // Pinned per contract Decision 2 — NOT the rolling `sonnet` alias.
-        model: Model::Sonnet46,
         max_tokens: 2048,
     }
 }

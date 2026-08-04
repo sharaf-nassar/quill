@@ -65,11 +65,17 @@ cache-read share, first/last seen, sortable columns, selected-model history, and
 
 ### Implementation for User Story 1
 
+Tasks T012 through T027 are preserved pre-widget completion records. Their
+aggregate/history UI was replaced by the current `get_model_usage_overview`,
+`get_model_sessions`, `get_session_model_history`, and
+`retry_model_history_backfill` surface documented in
+`contracts/model-analytics-ipc.md`.
+
 - [X] T012 [US1] Implement all-retained global distinct-session scope plus active-range/provider sessions and represented providers from actual normalized timestamps in `[rangeStart, rangeEnd)` joined to unsuppressed source ownership—never first/last interval overlap—with observation-derived evidence count, trustworthy-final scope, entirely unattributed providers, unbounded provider-qualified models per session, exact coverage, distinct/multi-model counts, complete Unicode-scalar/BINARY-ordered rows, totals/turns/sessions/first/last seen, and nullable cache-read share in `src-tauri/src/storage.rs`
 - [X] T013 [US1] Implement zero-filled 5-minute/1-hour/6-hour/1-day attributed, unattributed, and selected-model history buckets for `1h`/`24h`/`7d`/`30d` in `src-tauri/src/storage.rs`
 - [X] T014 [P] [US1] Invoke source fingerprint reconciliation independently of `IndexState.file_mtimes` from `SessionIndex::startup_scan`, preserving typed read failures and source-scoped ownership in `src-tauri/src/sessions.rs`
 - [X] T015 [P] [US1] Admit every validated `/sessions/notify` transcript path to the model queue before existing session-keyed Tantivy coalescing, coalesce model work only by provider/canonical source key, run it despite empty extracted search messages, preserve search behavior, and exclude direct `/sessions/messages` payloads in `src-tauri/src/server.rs`
-- [X] T016 [US1] Implement and register `get_model_analytics` and `get_model_history` with range/provider/model validation and the shared serialized bounded `ModelAnalyticsError` envelope in `src-tauri/src/lib.rs`
+- [X] T016 [US1] Historical pre-widget task: implement and register `get_model_analytics` and `get_model_history` with range/provider/model validation and the shared serialized bounded `ModelAnalyticsError` envelope in `src-tauri/src/lib.rs`. Both commands were later retired; the current surface is `get_model_usage_overview`, `get_model_sessions`, `get_session_model_history`, and `retry_model_history_backfill`.
 - [X] T017 [P] [US1] Create `useModelAnalytics` with independent aggregate/history initial/refresh/error state and Retry callbacks, request-identity guards, a fixed one-second coalescing window whose deadline starts at the first `model-analytics-updated` event, a 60-second fallback poll, a shared frontend-only refresh generation for detail hooks, retained same-scope successful data, and React Strict Mode-safe listener/timer cleanup in `src/hooks/useModelAnalytics.ts`
 - [X] T018 [P] [US1] Build the compact coverage, distinct-model, and multi-model summary rail with tabular numerics and unavailable coverage semantics in `src/components/analytics/models/ModelSummaryStrip.tsx`
 - [X] T019 [P] [US1] Build the labeled aggregate attributed/unattributed history chart with fixed range axes, a visually hidden semantic bucket table containing bounds and every series value, and a signal-blue selected-model overlay explicitly labeled as selection—not model identity—that never hides aggregate coverage in `src/components/analytics/models/ModelUsageHistory.tsx`

@@ -31,6 +31,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useModelAnalytics } from "../../../hooks/useModelAnalytics";
 import { useRollupBackfill } from "../../../hooks/useRollupBackfill";
 import { formatNumber } from "../../../utils/format";
+import { providerTag } from "../../../utils/providers";
 import { formatTokenCount } from "../../../utils/tokens";
 import { modelIdentityKey } from "../../../types";
 import type {
@@ -141,12 +142,6 @@ function shadeFor(
   identity: ModelIdentity,
 ): string {
   return shades.get(modelIdentityKey(identity)) ?? NEUTRAL_SHADE;
-}
-
-/** Provider chip text. An unrecognized producer still has to be named. */
-function providerTag(provider: string): string {
-  if (provider === "mini_max") return "MINIMAX";
-  return provider.replace(/_/g, "").toUpperCase();
 }
 
 /** Chip tone; unknown providers stay neutral rather than borrowing a hue. */

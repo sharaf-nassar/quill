@@ -1,10 +1,8 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -19,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::integrations::IntegrationProvider;
 use crate::model_usage::{
     CompletedModelSourceRoot, ModelUsageDiagnostic, NormalizedObservation, NormalizedSource,
-    ObservationKind, SourceProcessingStatus,
+    SourceProcessingStatus,
 };
 use crate::retention::{
     RETENTION_LAST_RUN_KEY, RETENTION_WATERMARK_KEY, RETENTION_WINDOW_DAYS_KEY,
@@ -32,6 +30,7 @@ use crate::rollup_backfill::{
     RollupBackfillState, RollupBackfillTarget, RollupBackfillTerminal, run_rollup_backfill,
 };
 use crate::transcript_analytics::TranscriptAnalyticsSnapshot;
+use crate::transcript_identity::{ModelSourceFastFingerprint, ModelSourceFingerprint};
 
 /// What the insert-time retention watermark did to one snapshot replacement.
 ///
@@ -82,20 +81,18 @@ use crate::models::{
     ContextSavingsEventPayload, ContextSavingsInsertResult, ContextSavingsSummary,
     ContextSavingsTimeseriesPoint, DataPoint, EvidenceRef, GitSnapshot, HostBreakdown,
     LanguageBreakdown, LearnedRule, LearnedRulePayload, LearningRun, LearningRunPayload,
-    LearningStatus, LlmRuntimeStats, ModelAnalyticsResponse, ModelAnalyticsScope,
-    ModelAnalyticsSummary, ModelBackfillDiagnostic, ModelBackfillState, ModelBackfillStatus,
-    ModelBackfillTrigger, ModelHistoryPoint, ModelHistoryResponse, ModelIdentity,
+    LearningStatus, LlmRuntimeStats, ModelAnalyticsScope, ModelBackfillDiagnostic,
+    ModelBackfillState, ModelBackfillStatus, ModelBackfillTrigger, ModelIdentity,
     ModelOverviewActivity, ModelOverviewActivitySeries, ModelOverviewCombinations,
     ModelOverviewDelegation, ModelOverviewDelegationTop, ModelOverviewPair,
     ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
     ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse,
-    ModelUsageOverviewResponse, ModelUsageRow, ObservationPayload, ObservationSummary,
-    ProjectBreakdown, ProjectTokens, ProviderTokenSeries, ProviderTokenSeriesResponse,
-    RunInferenceCall, RunInferenceConfinement, RunInferenceSummary, SessionBreakdown,
-    SessionCodeStats, SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse,
-    SessionModelSegment, SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown,
-    SubagentNode, TokenDataPoint, TokenReportPayload, TokenStats, ToolCount, UsageBucket,
-    UsageSource,
+    ModelUsageOverviewResponse, ObservationPayload, ObservationSummary, ProjectBreakdown,
+    ProjectTokens, ProviderTokenSeries, ProviderTokenSeriesResponse, RunInferenceCall,
+    RunInferenceConfinement, RunInferenceSummary, SessionBreakdown, SessionCodeStats,
+    SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment,
+    SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown, SubagentNode, TokenDataPoint,
+    TokenReportPayload, TokenStats, ToolCount, UsageBucket, UsageSource,
 };
 
 /// Highest migration this build knows how to apply. Every migration gate is a
@@ -108,86 +105,6 @@ pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 37;
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
 
-#[derive(Clone, Debug)]
-pub(crate) struct WidgetQueryTraceStatement {
-    pub(crate) path: String,
-    pub(crate) connection_id: u64,
-    pub(crate) sql: String,
-}
-
-#[derive(Default)]
-struct WidgetQueryTraceState {
-    path: String,
-    connection_id: u64,
-    statements: Vec<WidgetQueryTraceStatement>,
-}
-
-thread_local! {
-    static WIDGET_QUERY_TRACE: RefCell<Option<WidgetQueryTraceState>> = const { RefCell::new(None) };
-}
-
-pub(crate) fn begin_widget_query_trace() -> Result<(), String> {
-    WIDGET_QUERY_TRACE.with(|trace| {
-        let mut trace = trace.borrow_mut();
-        if trace.is_some() {
-            return Err("Widget query SQL trace is already active on this thread".to_string());
-        }
-        *trace = Some(WidgetQueryTraceState::default());
-        Ok(())
-    })
-}
-
-pub(crate) fn set_widget_query_trace_path(path: impl Into<String>) {
-    WIDGET_QUERY_TRACE.with(|trace| {
-        if let Some(trace) = trace.borrow_mut().as_mut() {
-            trace.path = path.into();
-        }
-    });
-}
-
-pub(crate) fn finish_widget_query_trace() -> Result<Vec<WidgetQueryTraceStatement>, String> {
-    WIDGET_QUERY_TRACE.with(|trace| {
-        trace
-            .borrow_mut()
-            .take()
-            .map(|trace| trace.statements)
-            .ok_or_else(|| "Widget query SQL trace is not active on this thread".to_string())
-    })
-}
-
-fn widget_query_trace_is_active() -> bool {
-    WIDGET_QUERY_TRACE.with(|trace| trace.borrow().is_some())
-}
-
-fn record_widget_query_statement(sql: &str) {
-    WIDGET_QUERY_TRACE.with(|trace| {
-        let mut trace = trace.borrow_mut();
-        let Some(trace) = trace.as_mut() else {
-            return;
-        };
-        if trace.path.is_empty() {
-            return;
-        }
-        trace.statements.push(WidgetQueryTraceStatement {
-            path: trace.path.clone(),
-            connection_id: trace.connection_id,
-            sql: sql.to_string(),
-        });
-    });
-}
-
-fn attach_widget_query_trace(conn: &mut Connection) {
-    if widget_query_trace_is_active() {
-        WIDGET_QUERY_TRACE.with(|trace| {
-            if let Some(trace) = trace.borrow_mut().as_mut() {
-                trace.connection_id = trace.connection_id.saturating_add(1);
-            }
-        });
-        conn.trace(Some(record_widget_query_statement));
-    }
-}
-
-const PROVIDER_SETTINGS_KEY: &str = "integration.providers.v1";
 const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1";
 // NUL cannot occur in a filesystem path, so encoded rows cannot collide with
 // legacy plain-Unicode paths that happen to resemble one of these tags.
@@ -227,7 +144,6 @@ pub(crate) struct CacheKey {
     command: &'static str,
     range: ModelRange,
     provider: Option<String>,
-    selected_model: Option<(String, String)>,
     time_bucket: i64,
 }
 
@@ -243,16 +159,8 @@ impl CacheKey {
             command,
             range,
             provider: provider.map(str::to_owned),
-            selected_model: None,
             time_bucket: now.timestamp().div_euclid(ANALYTICS_CACHE_BUCKET_SECS),
         }
-    }
-
-    /// Add the selected model discriminator needed by the history command.
-    pub(crate) fn with_selected_model(mut self, selected_model: Option<&ModelIdentity>) -> Self {
-        self.selected_model =
-            selected_model.map(|identity| (identity.provider.clone(), identity.model_id.clone()));
-        self
     }
 
     /// Build a key for commands whose request dimensions do not match the
@@ -262,7 +170,6 @@ impl CacheKey {
             command,
             range: ModelRange::OneHour,
             provider: Some(request),
-            selected_model: None,
             time_bucket: now.timestamp().div_euclid(ANALYTICS_CACHE_BUCKET_SECS),
         }
     }
@@ -316,15 +223,6 @@ impl CacheTable {
     }
 }
 
-const MODEL_ANALYTICS_CACHE_TABLES: [CacheTable; 3] = [
-    CacheTable::Column {
-        table: "model_usage_observations",
-        high_water_column: "observed_at_ms",
-    },
-    CacheTable::RowId("model_observation_sources"),
-    CacheTable::RowId("model_backfill_state"),
-];
-
 const ROLLUP_GENERATION_CACHE_TABLE: CacheTable = CacheTable::Column {
     table: "rollup_meta",
     high_water_column: "rollup_generation",
@@ -337,15 +235,6 @@ const MODEL_USAGE_OVERVIEW_CACHE_TABLES: [CacheTable; 4] = [
     },
     CacheTable::RowId("model_observation_sources"),
     CacheTable::RowId("model_backfill_state"),
-    ROLLUP_GENERATION_CACHE_TABLE,
-];
-
-const MODEL_HISTORY_CACHE_TABLES: [CacheTable; 3] = [
-    CacheTable::Column {
-        table: "model_usage_observations",
-        high_water_column: "observed_at_ms",
-    },
-    CacheTable::RowId("model_observation_sources"),
     ROLLUP_GENERATION_CACHE_TABLE,
 ];
 
@@ -635,47 +524,6 @@ pub struct SessionEventInput<'a> {
     pub parent_uuid: Option<&'a str>,
 }
 
-/// Provider-qualified ownership and chain attribution shared by every row in
-/// one transcript analytics snapshot. `source_key = None` is reserved for
-/// live, non-transcript writes.
-#[allow(dead_code)] // Consumed by transcript analytics reconciliation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TranscriptAnalyticsAttribution<'a> {
-    pub(crate) source_key: Option<&'a str>,
-    pub(crate) chain_id: &'a str,
-    pub(crate) parent_chain_id: Option<&'a str>,
-}
-
-/// Last-good source registry values committed alongside a source-owned
-/// analytics snapshot.
-#[allow(dead_code)] // Consumed by transcript analytics reconciliation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TranscriptAnalyticsSourceInput<'a> {
-    pub(crate) provider: IntegrationProvider,
-    pub(crate) source_key: &'a str,
-    pub(crate) source_root_key: &'a str,
-    pub(crate) source_path: &'a Path,
-    pub(crate) source_session_id: Option<&'a str>,
-    pub(crate) analytics_session_id: Option<&'a str>,
-    pub(crate) chain_id: Option<&'a str>,
-    pub(crate) parent_chain_id: Option<&'a str>,
-    pub(crate) agent_id: Option<&'a str>,
-    pub(crate) is_sidechain: bool,
-    pub(crate) project: Option<&'a str>,
-    pub(crate) cwd: Option<&'a Path>,
-    pub(crate) hostname: Option<&'a str>,
-    pub(crate) mtime_ns: Option<i64>,
-    pub(crate) size_bytes: Option<i64>,
-    pub(crate) content_sha256: Option<&'a str>,
-    pub(crate) seen_generation: i64,
-    pub(crate) processing_status: &'a str,
-    pub(crate) last_attempt_at_ms: Option<i64>,
-    pub(crate) last_success_at_ms: Option<i64>,
-    pub(crate) last_error: Option<&'a str>,
-    pub(crate) suppressed_sha256: Option<&'a str>,
-    pub(crate) suppressed_at_ms: Option<i64>,
-}
-
 /// Persisted transcript analytics source state used to seed later inventory
 /// and root-resolution passes without reparsing unchanged files.
 #[allow(dead_code)] // Consumed by transcript analytics reconciliation.
@@ -780,51 +628,6 @@ pub struct HookInvocationInput<'a> {
     pub cwd: Option<&'a str>,
     pub hostname: Option<&'a str>,
     pub message_id: Option<&'a str>,
-}
-
-/// Filesystem metadata used for the model-source fast path.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ModelSourceFastFingerprint {
-    mtime_ns: i64,
-    size_bytes: i64,
-}
-
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
-impl ModelSourceFastFingerprint {
-    pub(crate) const fn mtime_ns(self) -> i64 {
-        self.mtime_ns
-    }
-
-    pub(crate) const fn size_bytes(self) -> i64 {
-        self.size_bytes
-    }
-}
-
-/// Complete fingerprint computed from one already-read source buffer.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModelSourceFingerprint {
-    fast: ModelSourceFastFingerprint,
-    content_sha256: String,
-}
-
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
-impl ModelSourceFingerprint {
-    pub(crate) fn from_content(fast: ModelSourceFastFingerprint, content: &[u8]) -> Self {
-        Self {
-            fast,
-            content_sha256: model_source_content_sha256(content),
-        }
-    }
-
-    pub(crate) const fn fast(&self) -> ModelSourceFastFingerprint {
-        self.fast
-    }
-
-    pub(crate) fn content_sha256(&self) -> &str {
-        &self.content_sha256
-    }
 }
 
 /// Last successfully parsed ownership and activity metadata retained on error.
@@ -1002,18 +805,8 @@ fn evidence_weighted_score(
 }
 
 fn db_path() -> Result<PathBuf, String> {
-    let data_dir = dirs::data_local_dir()
-        .or_else(|| {
-            dirs::home_dir().map(|h| {
-                if cfg!(target_os = "macos") {
-                    h.join("Library").join("Application Support")
-                } else {
-                    h.join(".local").join("share")
-                }
-            })
-        })
-        .ok_or("Cannot determine data directory")?;
-    let default_app_dir = data_dir.join("com.quilltoolkit.app");
+    let default_app_dir =
+        crate::data_paths::default_app_data_dir().ok_or("Cannot determine data directory")?;
     let app_dir = crate::data_paths::resolve_data_dir_with_default(default_app_dir);
     std::fs::create_dir_all(&app_dir).map_err(|e| format!("Failed to create app data dir: {e}"))?;
 
@@ -1401,86 +1194,9 @@ fn range_to_duration(range: &str) -> TimeDelta {
 }
 
 thread_local! {
-    /// Maintainer-study clock override. Production never sets this value.
+    /// Test clock override. Production never sets this value.
     static PINNED_QUERY_NOW: std::cell::RefCell<Option<DateTime<Utc>>> =
         const { std::cell::RefCell::new(None) };
-
-    /// Opt-in maintainer-study collector for one model-overview call.
-    /// Production leaves this `None`; each mark then performs only one TLS
-    /// option check and never reads the clock.
-    static MODEL_OVERVIEW_STAGE_COLLECTOR:
-        std::cell::RefCell<Option<ModelOverviewStageCollector>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ModelOverviewStageTiming {
-    pub(crate) stage: &'static str,
-    pub(crate) elapsed_ms: f64,
-}
-
-struct ModelOverviewStageCollector {
-    last_mark: Instant,
-    timings: Vec<ModelOverviewStageTiming>,
-}
-
-fn mark_model_overview_stage(stage: &'static str) {
-    MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(collector) = slot.as_mut() else {
-            return;
-        };
-        let now = Instant::now();
-        collector.timings.push(ModelOverviewStageTiming {
-            stage,
-            elapsed_ms: now.duration_since(collector.last_mark).as_secs_f64() * 1_000.0,
-        });
-        collector.last_mark = now;
-    });
-}
-
-/// Collect internal model-overview stages for one synchronous maintainer run.
-///
-/// The collector is thread-local and restored across nesting or unwinding, so
-/// production callers and concurrent threads retain the disabled fast path.
-pub(crate) fn with_model_overview_stage_timings<T>(
-    operation: impl FnOnce() -> T,
-) -> (T, Vec<ModelOverviewStageTiming>) {
-    struct RestoreCollector {
-        previous: Option<ModelOverviewStageCollector>,
-        active: bool,
-    }
-
-    impl Drop for RestoreCollector {
-        fn drop(&mut self) {
-            if self.active {
-                MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
-                    slot.replace(self.previous.take());
-                });
-            }
-        }
-    }
-
-    let previous = MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
-        slot.replace(Some(ModelOverviewStageCollector {
-            last_mark: Instant::now(),
-            timings: Vec::new(),
-        }))
-    });
-    let mut restore = RestoreCollector {
-        previous,
-        active: true,
-    };
-    let result = operation();
-    let collector = MODEL_OVERVIEW_STAGE_COLLECTOR.with(|slot| {
-        let collector = slot.replace(restore.previous.take());
-        restore.active = false;
-        collector
-    });
-    (
-        result,
-        collector.map_or_else(Vec::new, |collector| collector.timings),
-    )
 }
 
 fn query_now() -> DateTime<Utc> {
@@ -1489,10 +1205,11 @@ fn query_now() -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
-/// Run one synchronous maintainer study with stable range endpoints.
+/// Run one synchronous test with stable range endpoints.
 ///
 /// The override is thread-local and restored even if `operation` unwinds, so
 /// production callers on other threads continue to use the wall clock.
+#[cfg(test)]
 pub(crate) fn with_pinned_query_now<T>(now: DateTime<Utc>, operation: impl FnOnce() -> T) -> T {
     struct RestorePinnedNow(Option<DateTime<Utc>>);
 
@@ -1955,19 +1672,25 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
         }
     }
 
-    // `idx_session_events_provider_source(provider, source_key)` (migration 30)
-    // is a strict prefix of the partial `uidx_se_owned(provider, source_key,
-    // event_key) WHERE source_key IS NOT NULL`, and every statement that could
-    // want it constrains `source_key = ?`, which implies `source_key IS NOT
-    // NULL` and keeps the partial index usable — proved by
-    // `src-tauri/src/bin/eqp_index_drop_spike.rs`, pinned by
-    // `dropped_provider_source_index_leaves_owned_deletes_on_uidx_se_owned`.
-    // Retention drops exactly this one index and no other;
+    // Migration 30's plain `(provider, source_key)` indexes are strict prefixes
+    // of the partial `uidx_*_owned` indexes, and every statement that could
+    // want them constrains `source_key = ?`, which implies `source_key IS NOT
+    // NULL` and keeps the partial indexes usable. The regression below pins
+    // that planner behavior against the bundled SQLite build.
+    //
+    // Fresh databases no longer create four of these indexes; the idempotent
+    // drops remove all five from databases initialized by older builds.
     // `idx_se_timestamp_chain` above is recreated on every open because
     // `get_llm_runtime_stats` pins it with `INDEXED BY`.
     // @lat: [[backend#Backend#Database#Redundant provider/source index drop]]
-    conn.execute_batch("DROP INDEX IF EXISTS idx_session_events_provider_source;")
-        .map_err(|e| format!("Failed to drop redundant session event index: {e}"))?;
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_session_events_provider_source;
+         DROP INDEX IF EXISTS idx_response_times_provider_source;
+         DROP INDEX IF EXISTS idx_tool_actions_provider_source;
+         DROP INDEX IF EXISTS idx_skill_usages_provider_source;
+         DROP INDEX IF EXISTS idx_hook_invocations_provider_source;",
+    )
+    .map_err(|e| format!("Failed to drop redundant provider/source indexes: {e}"))?;
 
     Ok(())
 }
@@ -2033,31 +1756,6 @@ struct PreparedModelObservation<'a> {
 const MODEL_ROLLUP_HOUR_MS: i64 = 3_600_000;
 const RUNTIME_IDLE_THRESHOLD_MS: i64 = 5 * 60 * 1_000;
 const RUNTIME_TOOL_WAIT_MAX_MS: i64 = 6 * 60 * 60 * 1_000;
-// Normalized model ids are non-empty, so this value cannot collide with a
-// provider-supplied identity. The rollup schema needs a non-NULL key while
-// raw evidence keeps NULL derived ids for the unattributed bucket.
-const MODEL_ROLLUP_UNATTRIBUTED_ID: &str = "";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PreparedModelHourlyRollup<'a> {
-    hour_utc: i64,
-    derived_model_id: &'a str,
-    analytics_session_id: &'a str,
-    obs_count: i64,
-    turn_count: i64,
-    token_count: i64,
-    sidechain_count: i64,
-    input_tokens: i64,
-    input_tokens_present: i64,
-    output_tokens: i64,
-    output_tokens_present: i64,
-    cache_creation_tokens: i64,
-    cache_creation_tokens_present: i64,
-    cache_read_tokens: i64,
-    cache_read_tokens_present: i64,
-    first_observed_at_ms: i64,
-    last_observed_at_ms: i64,
-}
 
 #[derive(Clone, Debug)]
 struct PersistedRuntimeEvent {
@@ -2215,50 +1913,6 @@ struct CurrentModelSourceSuppression {
     last_success_at_ms: Option<i64>,
     observation_count: i64,
     has_observations: bool,
-}
-
-/// Convert already-fetched filesystem metadata into an exact SQLite-safe
-/// nanosecond mtime and byte size without performing another stat.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
-pub(crate) fn model_source_fast_fingerprint(
-    path: &Path,
-    metadata: &Metadata,
-) -> Result<ModelSourceFastFingerprint, String> {
-    let modified = metadata.modified().map_err(|error| {
-        format!(
-            "Read model source modification time for {}: {error}",
-            path.display()
-        )
-    })?;
-    let elapsed = modified.duration_since(UNIX_EPOCH).map_err(|error| {
-        format!(
-            "Model source modification time predates Unix epoch for {}: {error}",
-            path.display()
-        )
-    })?;
-    let mtime_ns = i64::try_from(elapsed.as_nanos()).map_err(|_| {
-        format!(
-            "Model source modification time exceeds SQLite INTEGER range for {}",
-            path.display()
-        )
-    })?;
-    let size_bytes = i64::try_from(metadata.len()).map_err(|_| {
-        format!(
-            "Model source size exceeds SQLite INTEGER range for {}",
-            path.display()
-        )
-    })?;
-
-    Ok(ModelSourceFastFingerprint {
-        mtime_ns,
-        size_bytes,
-    })
-}
-
-/// Hash the same complete source bytes that parsing will consume.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
-pub(crate) fn model_source_content_sha256(content: &[u8]) -> String {
-    hex::encode(Sha256::digest(content))
 }
 
 /// Classify one source in two stages: callers omit `content_sha256` before
@@ -2622,111 +2276,6 @@ fn prepare_model_observations<'a>(
             })
         })
         .collect()
-}
-
-fn checked_add_model_rollup_value(value: &mut i64, amount: i64, field: &str) -> Result<(), String> {
-    *value = value
-        .checked_add(amount)
-        .ok_or_else(|| format!("Model hourly rollup {field} exceeds SQLite INTEGER range"))?;
-    Ok(())
-}
-
-// @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups]]
-fn prepare_model_hourly_rollups<'a>(
-    source: &'a NormalizedSource,
-    observations: &'a [PreparedModelObservation<'a>],
-) -> Result<Vec<PreparedModelHourlyRollup<'a>>, String> {
-    let Some(analytics_session_id) = source.analytics_session_id.as_deref() else {
-        if observations.is_empty() {
-            return Ok(Vec::new());
-        }
-        return Err("Model source with observations must have an analytics session id".to_string());
-    };
-    let mut rollups = BTreeMap::<(i64, &'a str), PreparedModelHourlyRollup<'a>>::new();
-
-    for prepared in observations {
-        let observation = prepared.observation;
-        let metadata = observation.metadata();
-        if metadata.analytics_session_id != analytics_session_id {
-            return Err(format!(
-                "Model observation analytics session {} does not match source analytics session {analytics_session_id}",
-                metadata.analytics_session_id
-            ));
-        }
-        let hour_utc = (metadata.observed_at_ms / MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
-        let derived_model_id = observation
-            .derived_model_id()
-            .unwrap_or(MODEL_ROLLUP_UNATTRIBUTED_ID);
-        let rollup = rollups
-            .entry((hour_utc, derived_model_id))
-            .or_insert_with(|| PreparedModelHourlyRollup {
-                hour_utc,
-                derived_model_id,
-                analytics_session_id,
-                obs_count: 0,
-                turn_count: 0,
-                token_count: 0,
-                sidechain_count: 0,
-                input_tokens: 0,
-                input_tokens_present: 0,
-                output_tokens: 0,
-                output_tokens_present: 0,
-                cache_creation_tokens: 0,
-                cache_creation_tokens_present: 0,
-                cache_read_tokens: 0,
-                cache_read_tokens_present: 0,
-                first_observed_at_ms: metadata.observed_at_ms,
-                last_observed_at_ms: metadata.observed_at_ms,
-            });
-
-        checked_add_model_rollup_value(&mut rollup.obs_count, 1, "observation count")?;
-        match metadata.kind {
-            ObservationKind::Turn => {
-                checked_add_model_rollup_value(&mut rollup.turn_count, 1, "turn count")?;
-            }
-            ObservationKind::Token => {
-                checked_add_model_rollup_value(&mut rollup.token_count, 1, "token count")?;
-            }
-        }
-        if metadata.is_sidechain {
-            checked_add_model_rollup_value(&mut rollup.sidechain_count, 1, "sidechain count")?;
-        }
-        for (amount, total, present, field) in [
-            (
-                observation.input_tokens(),
-                &mut rollup.input_tokens,
-                &mut rollup.input_tokens_present,
-                "input tokens",
-            ),
-            (
-                observation.output_tokens(),
-                &mut rollup.output_tokens,
-                &mut rollup.output_tokens_present,
-                "output tokens",
-            ),
-            (
-                observation.cache_creation_tokens(),
-                &mut rollup.cache_creation_tokens,
-                &mut rollup.cache_creation_tokens_present,
-                "cache creation tokens",
-            ),
-            (
-                observation.cache_read_tokens(),
-                &mut rollup.cache_read_tokens,
-                &mut rollup.cache_read_tokens_present,
-                "cache read tokens",
-            ),
-        ] {
-            if let Some(amount) = amount {
-                checked_add_model_rollup_value(total, amount, field)?;
-                checked_add_model_rollup_value(present, 1, &format!("{field} present count"))?;
-            }
-        }
-        rollup.first_observed_at_ms = rollup.first_observed_at_ms.min(metadata.observed_at_ms);
-        rollup.last_observed_at_ms = rollup.last_observed_at_ms.max(metadata.observed_at_ms);
-    }
-
-    Ok(rollups.into_values().collect())
 }
 
 // @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups]]
@@ -4421,37 +3970,6 @@ fn require_running_model_backfill(status: &ModelBackfillStatus) -> Result<(), St
     }
 }
 
-struct ModelAnalyticsAggregateRow {
-    scoped_session_count: i64,
-    scoped_evidence_count: i64,
-    total_tokens: i64,
-    attributed_tokens: i64,
-    distinct_models: i64,
-    multi_model_sessions: i64,
-}
-
-struct ModelUsageAggregateRow {
-    provider: String,
-    derived_model_id: String,
-    attributed_tokens: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cache_creation_tokens: i64,
-    cache_read_tokens: i64,
-    observed_turns: i64,
-    session_count: i64,
-    incomplete_cache_share_rows: i64,
-    first_seen_ms: i64,
-    last_seen_ms: i64,
-}
-
-struct ModelHistoryAggregateRow {
-    bucket_index: i64,
-    attributed_tokens: i64,
-    unattributed_tokens: i64,
-    selected_model_tokens: i64,
-}
-
 const MODEL_SESSIONS_DEFAULT_LIMIT: usize = 20;
 const MODEL_SESSIONS_MAX_LIMIT: usize = 100;
 /// Top projects retained in the overview project matrix.
@@ -4907,17 +4425,6 @@ fn model_range_duration(range: ModelRange) -> TimeDelta {
         ModelRange::SevenDays => TimeDelta::days(7),
         ModelRange::ThirtyDays => TimeDelta::days(30),
         ModelRange::NinetyDays => TimeDelta::days(90),
-    }
-}
-
-fn model_history_bucket_seconds(range: ModelRange) -> i64 {
-    match range {
-        ModelRange::OneHour => 5 * 60,
-        ModelRange::SixHours => 15 * 60,
-        ModelRange::TwentyFourHours => 60 * 60,
-        ModelRange::SevenDays => 6 * 60 * 60,
-        ModelRange::ThirtyDays => 24 * 60 * 60,
-        ModelRange::NinetyDays => 24 * 60 * 60,
     }
 }
 
@@ -5439,9 +4946,7 @@ fn read_model_backfill_source_total_published(conn: &Connection) -> Result<bool,
 pub struct Storage {
     conn: Mutex<Connection>,
     db_path: PathBuf,
-    model_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelAnalyticsResponse>>>,
     model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
-    model_history_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelHistoryResponse>>>,
     bucket_stats_cache: Mutex<HashMap<CacheKey, CacheEntry<Vec<BucketStats>>>>,
     context_savings_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ContextSavingsAnalytics>>>,
 }
@@ -5498,8 +5003,9 @@ fn available_disk_space(path: &Path) -> Result<u64, String> {
         ));
     }
     let stats = unsafe { stats.assume_init() };
-    stats
-        .f_bavail
+    #[allow(clippy::useless_conversion)] // `f_bavail` is u32 on Apple, u64 on Linux.
+    let available_blocks = u64::from(stats.f_bavail);
+    available_blocks
         .checked_mul(stats.f_frsize)
         .ok_or_else(|| "Free disk space value overflowed during compaction preflight".to_string())
 }
@@ -6243,62 +5749,8 @@ impl Storage {
         Self::init_at(db_path()?, true)
     }
 
-    /// Open one explicit, disposable study scratch database through the same
-    /// schema and migration path as production. It never resolves data paths
-    /// and deliberately omits production-only startup cleanup and archival.
-    pub(crate) fn init_study_scratch(path: &Path) -> Result<Self, String> {
-        Self::init_at(path.to_path_buf(), false)
-    }
-
-    /// Open a frozen performance corpus without running migrations, cleanup,
-    /// retention, or any other startup mutation.
-    pub(crate) fn init_widget_query_benchmark(path: &Path) -> Result<Self, String> {
-        let mut conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|error| format!("Open widget query benchmark corpus: {error}"))?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|error| format!("Configure widget query benchmark timeout: {error}"))?;
-        conn.execute_batch(
-            "PRAGMA temp_store = MEMORY;
-             PRAGMA mmap_size = 268435456;
-             PRAGMA cache_size = -65536;
-             PRAGMA query_only = ON;",
-        )
-        .map_err(|error| format!("Configure widget query benchmark reader: {error}"))?;
-        attach_widget_query_trace(&mut conn);
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-            db_path: path.to_path_buf(),
-            model_analytics_cache: Mutex::new(HashMap::new()),
-            model_usage_overview_cache: Mutex::new(HashMap::new()),
-            model_history_cache: Mutex::new(HashMap::new()),
-            bucket_stats_cache: Mutex::new(HashMap::new()),
-            context_savings_analytics_cache: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Open a disposable writable corpus copy for the feature-020 ANALYZE
-    /// audit without running migrations, cleanup, or startup maintenance.
-    pub(crate) fn init_widget_query_maintenance_audit(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|error| format!("Open writable widget query audit copy: {error}"))?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(|error| format!("Configure writable widget query audit timeout: {error}"))?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            db_path: path.to_path_buf(),
-            model_analytics_cache: Mutex::new(HashMap::new()),
-            model_usage_overview_cache: Mutex::new(HashMap::new()),
-            model_history_cache: Mutex::new(HashMap::new()),
-            bucket_stats_cache: Mutex::new(HashMap::new()),
-            context_savings_analytics_cache: Mutex::new(HashMap::new()),
-        })
+    pub(crate) fn initialize_database(path: &Path) -> Result<(), String> {
+        Self::init_at(path.to_path_buf(), false).map(drop)
     }
 
     fn init_at(path: PathBuf, production_startup: bool) -> Result<Self, String> {
@@ -8110,14 +7562,6 @@ impl Storage {
                      ) WHERE source_key IS NOT NULL;
                  CREATE INDEX idx_session_events_provider_source
                      ON session_events(provider, source_key);
-                 CREATE INDEX idx_response_times_provider_source
-                     ON response_times(provider, source_key);
-                 CREATE INDEX idx_tool_actions_provider_source
-                     ON tool_actions(provider, source_key);
-                 CREATE INDEX idx_skill_usages_provider_source
-                     ON skill_usages(provider, source_key);
-                 CREATE INDEX idx_hook_invocations_provider_source
-                     ON hook_invocations(provider, source_key);
 
                  CREATE INDEX idx_se_timestamp
                      ON session_events(timestamp);
@@ -8638,9 +8082,7 @@ impl Storage {
         let storage = Self {
             conn: Mutex::new(conn),
             db_path: path,
-            model_analytics_cache: Mutex::new(HashMap::new()),
             model_usage_overview_cache: Mutex::new(HashMap::new()),
-            model_history_cache: Mutex::new(HashMap::new()),
             bucket_stats_cache: Mutex::new(HashMap::new()),
             context_savings_analytics_cache: Mutex::new(HashMap::new()),
         };
@@ -8765,6 +8207,7 @@ impl Storage {
         Ok(total)
     }
 
+    #[cfg(test)]
     pub(crate) fn run_runtime_rollup_backfill(&self) -> Result<RollupBackfillReport, String> {
         self.run_runtime_rollup_backfill_with_controls(&RollupBackfillControls::default())
     }
@@ -8860,7 +8303,7 @@ impl Storage {
     /// observes one WAL snapshot without using the writer connection mutex.
     // @lat: [[backend#Database#View Query Reader Connections]]
     fn open_view_reader(&self) -> Result<Connection, String> {
-        let mut conn = Connection::open_with_flags(
+        let conn = Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -8877,7 +8320,6 @@ impl Storage {
              PRAGMA cache_size = -65536;",
         )
         .map_err(|error| format!("Configure view reader pragmas: {error}"))?;
-        attach_widget_query_trace(&mut conn);
         Ok(conn)
     }
 
@@ -9546,356 +8988,12 @@ impl Storage {
             .map_err(|error| format!("Commit model backfill terminal update: {error}"))?;
         Ok(status)
     }
-
-    /// Aggregate retained model evidence for one half-open range snapshot.
-    ///
-    /// Global inventory facts come from unsuppressed source ownership. Every
-    /// range/provider fact comes from an actual normalized observation joined
-    /// back to that ownership; source activity bounds are never treated as a
-    /// continuous interval.
-    pub(crate) fn get_model_analytics(
-        &self,
-        range: ModelRange,
-        provider: Option<&str>,
-    ) -> Result<ModelAnalyticsResponse, String> {
-        let range_end = query_now();
-        let probe_connection = self.open_view_reader()?;
-        let key = CacheKey::new("get_model_analytics", range, provider, range_end);
-        get_or_compute(
-            &self.model_analytics_cache,
-            key,
-            &probe_connection,
-            &MODEL_ANALYTICS_CACHE_TABLES,
-            || self.get_model_analytics_uncached(range, provider, range_end),
-        )
-    }
-
-    fn get_model_analytics_uncached(
-        &self,
-        range: ModelRange,
-        provider: Option<&str>,
-        range_end: DateTime<Utc>,
-    ) -> Result<ModelAnalyticsResponse, String> {
-        let range_end_ms = range_end.timestamp_millis();
-        let range_start_ms = (range_end - model_range_duration(range)).timestamp_millis();
-        let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
-
-        let mut conn = self.open_view_reader()?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|error| format!("Begin model analytics read snapshot: {error}"))?;
-
-        let backfill = read_model_backfill_status(&tx)?;
-        let global_session_count = tx
-            .query_row(
-                &format!(
-                    "SELECT COUNT(*)
-                 FROM (
-                     SELECT source.provider, source.analytics_session_id
-                     FROM model_observation_sources AS source
-                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                       AND source.analytics_session_id IS NOT NULL
-                     GROUP BY source.provider COLLATE BINARY,
-                              source.analytics_session_id COLLATE BINARY
-                 ) AS retained_sessions"
-                ),
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| format!("Query global model analytics session scope: {error}"))?;
-
-        let aggregate = tx
-            .query_row(
-                &format!(
-                    "WITH scoped_observations AS MATERIALIZED (
-                     SELECT observation.provider,
-                            observation.analytics_session_id,
-                            observation.derived_model_id,
-                            observation.input_tokens,
-                            observation.output_tokens,
-                            observation.cache_creation_tokens,
-                            observation.cache_read_tokens
-                     FROM model_usage_observations AS observation
-                     JOIN model_observation_sources AS source
-                       ON source.provider = observation.provider
-                      AND source.source_key = observation.source_key
-                     WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                       AND observation.observed_at_ms >= ?1
-                       AND observation.observed_at_ms < ?2
-                       AND (?3 IS NULL OR observation.provider = ?3)
-                 )
-                 SELECT
-                     (
-                         SELECT COUNT(*)
-                         FROM (
-                             SELECT provider, analytics_session_id
-                             FROM scoped_observations
-                             GROUP BY provider COLLATE BINARY,
-                                      analytics_session_id COLLATE BINARY
-                         ) AS scoped_sessions
-                     ),
-                     (
-                         SELECT COUNT(*)
-                         FROM scoped_observations
-                         WHERE derived_model_id IS NOT NULL
-                     ),
-                     COALESCE((
-                         SELECT SUM(
-                             COALESCE(input_tokens, 0)
-                             + COALESCE(output_tokens, 0)
-                             + COALESCE(cache_creation_tokens, 0)
-                             + COALESCE(cache_read_tokens, 0)
-                         )
-                         FROM scoped_observations
-                     ), 0),
-                     COALESCE((
-                         SELECT SUM(
-                             COALESCE(input_tokens, 0)
-                             + COALESCE(output_tokens, 0)
-                             + COALESCE(cache_creation_tokens, 0)
-                             + COALESCE(cache_read_tokens, 0)
-                         )
-                         FROM scoped_observations
-                         WHERE derived_model_id IS NOT NULL
-                     ), 0),
-                     (
-                         SELECT COUNT(*)
-                         FROM (
-                             SELECT provider, derived_model_id
-                             FROM scoped_observations
-                             WHERE derived_model_id IS NOT NULL
-                             GROUP BY provider COLLATE BINARY,
-                                      derived_model_id COLLATE BINARY
-                         ) AS scoped_models
-                     ),
-                     (
-                         SELECT COUNT(*)
-                         FROM (
-                             SELECT provider, analytics_session_id
-                             FROM (
-                                 SELECT provider, analytics_session_id, derived_model_id
-                                 FROM scoped_observations
-                                 WHERE derived_model_id IS NOT NULL
-                                 GROUP BY provider COLLATE BINARY,
-                                          analytics_session_id COLLATE BINARY,
-                                          derived_model_id COLLATE BINARY
-                             ) AS session_model_identities
-                             GROUP BY provider COLLATE BINARY,
-                                      analytics_session_id COLLATE BINARY
-                             HAVING COUNT(*) > 1
-                         ) AS multi_model_session_ids
-                     )"
-                ),
-                params![range_start_ms, range_end_ms, provider],
-                |row| {
-                    Ok(ModelAnalyticsAggregateRow {
-                        scoped_session_count: row.get(0)?,
-                        scoped_evidence_count: row.get(1)?,
-                        total_tokens: row.get(2)?,
-                        attributed_tokens: row.get(3)?,
-                        distinct_models: row.get(4)?,
-                        multi_model_sessions: row.get(5)?,
-                    })
-                },
-            )
-            .map_err(|error| format!("Query model analytics aggregate scope: {error}"))?;
-
-        let mut represented_provider_statement = tx
-            .prepare_cached(&format!(
-                "SELECT observation.provider
-                 FROM model_usage_observations AS observation
-                      INDEXED BY idx_model_observations_observed_provider
-                 JOIN model_observation_sources AS source
-                   ON source.provider = observation.provider
-                  AND source.source_key = observation.source_key
-                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                   AND observation.observed_at_ms >= ?1
-                   AND observation.observed_at_ms < ?2
-                 GROUP BY observation.provider COLLATE BINARY
-                 ORDER BY observation.provider COLLATE BINARY ASC",
-            ))
-            .map_err(|error| format!("Prepare represented model providers query: {error}"))?;
-        let represented_provider_rows = represented_provider_statement
-            .query_map(params![range_start_ms, range_end_ms], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|error| format!("Query represented model providers: {error}"))?;
-        let mut represented_providers = Vec::new();
-        for row in represented_provider_rows {
-            represented_providers.push(
-                row.map_err(|error| format!("Read represented model provider row: {error}"))?,
-            );
-        }
-        drop(represented_provider_statement);
-
-        let mut model_statement = tx
-            .prepare_cached(&format!(
-                "SELECT
-                     observation.provider,
-                     observation.derived_model_id,
-                     SUM(
-                         COALESCE(observation.input_tokens, 0)
-                         + COALESCE(observation.output_tokens, 0)
-                         + COALESCE(observation.cache_creation_tokens, 0)
-                         + COALESCE(observation.cache_read_tokens, 0)
-                     ) AS attributed_tokens,
-                     SUM(COALESCE(observation.input_tokens, 0)) AS input_tokens,
-                     SUM(COALESCE(observation.output_tokens, 0)) AS output_tokens,
-                     SUM(COALESCE(observation.cache_creation_tokens, 0))
-                         AS cache_creation_tokens,
-                     SUM(COALESCE(observation.cache_read_tokens, 0))
-                         AS cache_read_tokens,
-                     SUM(CASE WHEN observation.observation_kind = 'turn'
-                              THEN 1 ELSE 0 END) AS observed_turns,
-                     COUNT(DISTINCT observation.analytics_session_id COLLATE BINARY)
-                         AS session_count,
-                     SUM(
-                         CASE
-                             WHEN (
-                                 observation.input_tokens IS NOT NULL
-                                 OR observation.output_tokens IS NOT NULL
-                                 OR observation.cache_creation_tokens IS NOT NULL
-                                 OR observation.cache_read_tokens IS NOT NULL
-                             ) AND (
-                                 observation.input_tokens IS NULL
-                                 OR observation.cache_creation_tokens IS NULL
-                                 OR observation.cache_read_tokens IS NULL
-                             )
-                             THEN 1 ELSE 0
-                         END
-                     ) AS incomplete_cache_share_rows,
-                     MIN(observation.observed_at_ms) AS first_seen_ms,
-                     MAX(observation.observed_at_ms) AS last_seen_ms
-                 FROM model_usage_observations AS observation
-                 JOIN model_observation_sources AS source
-                   ON source.provider = observation.provider
-                  AND source.source_key = observation.source_key
-                 WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
-                   AND observation.observed_at_ms >= ?1
-                   AND observation.observed_at_ms < ?2
-                   AND (?3 IS NULL OR observation.provider = ?3)
-                   AND observation.derived_model_id IS NOT NULL
-                 GROUP BY observation.provider COLLATE BINARY,
-                          observation.derived_model_id COLLATE BINARY
-                 ORDER BY attributed_tokens DESC,
-                          observation.provider COLLATE BINARY ASC,
-                          observation.derived_model_id COLLATE BINARY ASC",
-            ))
-            .map_err(|error| format!("Prepare model usage rows query: {error}"))?;
-        let model_aggregate_rows = model_statement
-            .query_map(params![range_start_ms, range_end_ms, provider], |row| {
-                Ok(ModelUsageAggregateRow {
-                    provider: row.get(0)?,
-                    derived_model_id: row.get(1)?,
-                    attributed_tokens: row.get(2)?,
-                    input_tokens: row.get(3)?,
-                    output_tokens: row.get(4)?,
-                    cache_creation_tokens: row.get(5)?,
-                    cache_read_tokens: row.get(6)?,
-                    observed_turns: row.get(7)?,
-                    session_count: row.get(8)?,
-                    incomplete_cache_share_rows: row.get(9)?,
-                    first_seen_ms: row.get(10)?,
-                    last_seen_ms: row.get(11)?,
-                })
-            })
-            .map_err(|error| format!("Query model usage rows: {error}"))?;
-
-        let mut models = Vec::new();
-        for aggregate_row in model_aggregate_rows {
-            let row = aggregate_row
-                .map_err(|error| format!("Read model usage aggregate row: {error}"))?;
-            let cache_read_denominator = row
-                .input_tokens
-                .checked_add(row.cache_creation_tokens)
-                .and_then(|value| value.checked_add(row.cache_read_tokens))
-                .ok_or_else(|| {
-                    format!(
-                        "Model cache-read denominator overflow for provider {}",
-                        row.provider
-                    )
-                })?;
-            let cache_read_share_percent = (row.incomplete_cache_share_rows == 0)
-                .then(|| model_percentage(row.cache_read_tokens, cache_read_denominator))
-                .flatten();
-
-            models.push(ModelUsageRow {
-                identity: ModelIdentity {
-                    provider: row.provider,
-                    model_id: row.derived_model_id,
-                },
-                attributed_tokens: row.attributed_tokens,
-                attributed_share_percent: model_percentage(
-                    row.attributed_tokens,
-                    aggregate.attributed_tokens,
-                ),
-                input_tokens: row.input_tokens,
-                output_tokens: row.output_tokens,
-                cache_creation_tokens: row.cache_creation_tokens,
-                cache_read_tokens: row.cache_read_tokens,
-                observed_turns: row.observed_turns,
-                session_count: row.session_count,
-                cache_read_share_percent,
-                first_seen: model_observation_millis_to_rfc3339(
-                    row.first_seen_ms,
-                    "first_seen_ms",
-                )?,
-                last_seen: model_observation_millis_to_rfc3339(row.last_seen_ms, "last_seen_ms")?,
-            });
-        }
-        drop(model_statement);
-
-        let unattributed_tokens = aggregate
-            .total_tokens
-            .checked_sub(aggregate.attributed_tokens)
-            .filter(|value| *value >= 0)
-            .ok_or_else(|| {
-                "Model analytics attributed tokens exceed the scoped token total".to_string()
-            })?;
-        let scope_final = backfill.status == ModelBackfillState::Complete
-            && backfill.inventory_complete
-            && backfill.failed_roots == 0
-            && backfill.failed_sources == 0
-            && backfill.remaining_sources == 0;
-
-        tx.commit()
-            .map_err(|error| format!("Commit model analytics read snapshot: {error}"))?;
-
-        Ok(ModelAnalyticsResponse {
-            generated_at,
-            range,
-            provider: provider.map(str::to_owned),
-            represented_providers,
-            scope: ModelAnalyticsScope {
-                global_session_count,
-                scoped_session_count: aggregate.scoped_session_count,
-                scoped_evidence_count: aggregate.scoped_evidence_count,
-                inventory_complete: backfill.inventory_complete,
-                scope_final,
-            },
-            summary: ModelAnalyticsSummary {
-                attributed_tokens: aggregate.attributed_tokens,
-                unattributed_tokens,
-                total_tokens: aggregate.total_tokens,
-                attributed_coverage_percent: model_percentage(
-                    aggregate.attributed_tokens,
-                    aggregate.total_tokens,
-                ),
-                distinct_models: aggregate.distinct_models,
-                multi_model_sessions: aggregate.multi_model_sessions,
-            },
-            models,
-            backfill,
-        })
-    }
-
     /// Aggregate the redesigned Models tab usage-frequency overview.
     ///
     /// Every attribution fact keys on carry-forward `derived_model_id` over
     /// unsuppressed sources in the half-open range, while raw evidence stays
     /// stored untouched. One deferred read-only transaction on an independent
-    /// read connection snapshots the whole response, matching
-    /// `get_model_analytics`.
+    /// read connection snapshots the whole response.
     pub(crate) fn get_model_usage_overview(
         &self,
         range: ModelRange,
@@ -9919,7 +9017,6 @@ impl Storage {
         provider: Option<&str>,
         range_end: DateTime<Utc>,
     ) -> Result<ModelUsageOverviewResponse, String> {
-        mark_model_overview_stage("cache_probe");
         let range_end_ms = range_end.timestamp_millis();
         let range_millis = model_range_duration(range).num_milliseconds();
         let range_start_ms = range_end_ms
@@ -9949,7 +9046,6 @@ impl Storage {
                 "bucket_start",
             )?);
         }
-        mark_model_overview_stage("range_axis");
 
         let mut conn = self.open_view_reader()?;
         let tx = conn
@@ -9991,7 +9087,6 @@ impl Storage {
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| format!("Query global model overview session scope: {error}"))?;
-        mark_model_overview_stage("snapshot_authority");
 
         // While the rollup is building, preserve the established raw path.
         // Once complete, materialize aggregate-grain closed hours plus only the
@@ -10146,7 +9241,6 @@ impl Storage {
         }
         tx.execute(&create_scoped_sql, create_params.as_slice())
             .map_err(|error| format!("Materialize model overview scoped rows: {error}"))?;
-        mark_model_overview_stage("scoped_materialization");
         tx.execute_batch(
             "CREATE INDEX temp.scoped_overview_provider_session
                  ON scoped_overview(provider, analytics_session_id);
@@ -10154,7 +9248,6 @@ impl Storage {
                  ON scoped_overview(provider, derived_model_id);",
         )
         .map_err(|error| format!("Index model overview scoped rows: {error}"))?;
-        mark_model_overview_stage("scoped_indexes");
 
         struct OverviewTotalsRow {
             sessions: i64,
@@ -10216,7 +9309,6 @@ impl Storage {
                 },
             )
             .map_err(|error| format!("Query model overview totals: {error}"))?;
-        mark_model_overview_stage("totals");
 
         // This time-range grouping is deliberately pinned: bounded ANALYZE
         // otherwise substitutes the derived-model skip-scan even though this
@@ -10289,7 +9381,6 @@ impl Storage {
             );
         }
         drop(represented_provider_statement);
-        mark_model_overview_stage("represented_providers");
 
         // Per-session representative project: the latest non-null effective
         // cwd inside the range, matching the `get_model_sessions` convention
@@ -10338,7 +9429,6 @@ impl Storage {
                 );
             }
         }
-        mark_model_overview_stage("project_rollup_fallback");
         if !building_index {
             type ProjectCandidate = (String, i64, i64, String, String, i64);
             let mut raw_candidates = BTreeMap::<(String, String), ProjectCandidate>::new();
@@ -10461,7 +9551,6 @@ impl Storage {
                 session_projects.insert(key, model_overview_project(Some(&candidate.0)));
             }
         }
-        mark_model_overview_stage("project_raw_candidates");
 
         // Per-(session, model) attributed stats drive model reach, primary
         // attribution, combinations, and the project matrix.
@@ -10518,8 +9607,6 @@ impl Storage {
             }
         }
 
-        mark_model_overview_stage("session_models");
-
         // Per-model activity days and first/last attributed evidence.
         struct ModelMetaRow {
             days_active: i64,
@@ -10568,8 +9655,6 @@ impl Storage {
                 );
             }
         }
-
-        mark_model_overview_stage("model_meta");
 
         // Fixed-bucket distinct-session activity per model.
         let mut activity_buckets = HashMap::<(String, String), Vec<i64>>::new();
@@ -10681,8 +9766,6 @@ impl Storage {
             }
         }
 
-        mark_model_overview_stage("activity");
-
         // Attributed tokens split by owning-source sidechain flag.
         let mut parent_tokens = 0_i64;
         let mut subagent_tokens = 0_i64;
@@ -10741,8 +9824,6 @@ impl Storage {
                 }
             }
         }
-
-        mark_model_overview_stage("delegation");
 
         // Latest contiguous attributed-model run per provider. Stream bounded
         // pages in the observed-time index order and stop once every represented
@@ -10838,7 +9919,6 @@ impl Storage {
                 }
             }
         }
-        mark_model_overview_stage("running_query");
 
         // Emit in represented-provider order, honoring the provider filter, so
         // the response ordering matches the previous loop over the sorted list.
@@ -10866,7 +9946,6 @@ impl Storage {
 
         tx.commit()
             .map_err(|error| format!("Commit model overview read snapshot: {error}"))?;
-        mark_model_overview_stage("snapshot_commit");
 
         // Fold per-(session, model) stats into model reach, primary counts,
         // combinations, and the project matrix.
@@ -11154,267 +10233,7 @@ impl Storage {
             },
             delegation,
         };
-        mark_model_overview_stage("response_fold");
         Ok(response)
-    }
-
-    /// Aggregate retained model evidence into a fixed, zero-filled UTC axis.
-    ///
-    /// Bucket membership uses actual observation timestamps in the half-open
-    /// request interval. Source activity bounds never manufacture history, and
-    /// suppressed source ownership never contributes tokens.
-    // @lat: [[backend#Database#Schema#Model Analytics Evidence]]
-    pub(crate) fn get_model_history(
-        &self,
-        range: ModelRange,
-        provider: Option<&str>,
-        selected_model: Option<&ModelIdentity>,
-    ) -> Result<ModelHistoryResponse, String> {
-        let range_end = query_now();
-        let probe_connection = self.open_view_reader()?;
-        let key = CacheKey::new("get_model_history", range, provider, range_end)
-            .with_selected_model(selected_model);
-        get_or_compute(
-            &self.model_history_cache,
-            key,
-            &probe_connection,
-            &MODEL_HISTORY_CACHE_TABLES,
-            || self.get_model_history_uncached(range, provider, selected_model, range_end),
-        )
-    }
-
-    fn get_model_history_uncached(
-        &self,
-        range: ModelRange,
-        provider: Option<&str>,
-        selected_model: Option<&ModelIdentity>,
-        range_end: DateTime<Utc>,
-    ) -> Result<ModelHistoryResponse, String> {
-        let range_end_ms = range_end.timestamp_millis();
-        let range_millis = model_range_duration(range).num_milliseconds();
-        let range_start_ms = range_end_ms
-            .checked_sub(range_millis)
-            .ok_or_else(|| "Model history range boundary overflow".to_string())?;
-        let bucket_seconds = model_history_bucket_seconds(range);
-        let bucket_millis = bucket_seconds
-            .checked_mul(1_000)
-            .ok_or_else(|| "Model history bucket width overflow".to_string())?;
-        let bucket_count = range_millis
-            .checked_div(bucket_millis)
-            .filter(|count| *count > 0 && range_millis % bucket_millis == 0)
-            .ok_or_else(|| "Model history range does not divide into fixed buckets".to_string())?;
-        let point_capacity = usize::try_from(bucket_count)
-            .map_err(|_| "Model history bucket count exceeds platform capacity".to_string())?;
-        let generated_at = model_observation_millis_to_rfc3339(range_end_ms, "range_end")?;
-
-        let mut points = Vec::with_capacity(point_capacity);
-        for bucket_index in 0..bucket_count {
-            let bucket_offset = bucket_index
-                .checked_mul(bucket_millis)
-                .ok_or_else(|| "Model history bucket offset overflow".to_string())?;
-            let bucket_start_ms = range_start_ms
-                .checked_add(bucket_offset)
-                .ok_or_else(|| "Model history bucket start overflow".to_string())?;
-            let bucket_end_ms = bucket_start_ms
-                .checked_add(bucket_millis)
-                .ok_or_else(|| "Model history bucket end overflow".to_string())?;
-
-            points.push(ModelHistoryPoint {
-                bucket_start: model_observation_millis_to_rfc3339(bucket_start_ms, "bucket_start")?,
-                bucket_end: model_observation_millis_to_rfc3339(bucket_end_ms, "bucket_end")?,
-                attributed_tokens: 0,
-                unattributed_tokens: 0,
-                selected_model_tokens: selected_model.map(|_| 0),
-            });
-        }
-
-        let selected_provider = selected_model.map(|identity| identity.provider.as_str());
-        let selected_model_id = selected_model.map(|identity| identity.model_id.as_str());
-        let mut conn = self.open_view_reader()?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|error| format!("Begin model history read snapshot: {error}"))?;
-        let building_index = model_rollup_building_index(&tx)?;
-        let (rollup_start_ms, rollup_end_ms) =
-            model_rollup_closed_bounds(range_start_ms, range_end_ms);
-        let residual_ranges = if building_index {
-            Vec::new()
-        } else {
-            model_rollup_residual_ranges(
-                range_start_ms,
-                range_end_ms,
-                bucket_millis,
-                rollup_start_ms,
-                rollup_end_ms,
-            )?
-        };
-        let has_pruned_authority = !building_index
-            && model_rollup_has_pruned_authority(&tx, range_start_ms, range_end_ms)?;
-        if !building_index {
-            materialize_model_read_authority(
-                &tx,
-                range_start_ms,
-                range_end_ms,
-                has_pruned_authority,
-            )?;
-        }
-        let mut history_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-            Box::new(range_start_ms),
-            Box::new(range_end_ms),
-            Box::new(bucket_millis),
-            Box::new(provider.map(str::to_owned)),
-            Box::new(selected_provider.map(str::to_owned)),
-            Box::new(selected_model_id.map(str::to_owned)),
-            Box::new(rollup_start_ms),
-            Box::new(rollup_end_ms),
-        ];
-        let history_source = if building_index {
-            format!(
-                "SELECT observation.observed_at_ms,
-                        observation.provider,
-                        observation.derived_model_id,
-                        COALESCE(observation.input_tokens, 0)
-                            + COALESCE(observation.output_tokens, 0)
-                            + COALESCE(observation.cache_creation_tokens, 0)
-                            + COALESCE(observation.cache_read_tokens, 0) AS token_amount
-                 FROM model_usage_observations AS observation
-                 WHERE EXISTS (
-                       SELECT 1
-                       FROM model_observation_sources AS source
-                       WHERE source.provider = observation.provider
-                         AND source.source_key = observation.source_key
-                         AND {ACTIVE_MODEL_SOURCE_PREDICATE}
-                   )
-                   AND observation.observed_at_ms >= ?1
-                   AND observation.observed_at_ms < ?2
-                   AND (?4 IS NULL OR observation.provider = ?4)
-                   AND ?7 = ?7 AND ?8 = ?8"
-            )
-        } else {
-            let mut sql = format!(
-                "SELECT rollup.hour_utc AS observed_at_ms,
-                        rollup.provider,
-                        NULLIF(rollup.derived_model_id, '') AS derived_model_id,
-                        rollup.input_tokens + rollup.output_tokens
-                            + rollup.cache_creation_tokens + rollup.cache_read_tokens
-                            AS token_amount
-                 FROM model_usage_hourly AS rollup
-                 JOIN active_model_read_sources AS source
-                   ON source.provider = rollup.provider
-                  AND source.source_key = rollup.source_key
-                 WHERE rollup.hour_utc >= ?7
-                   AND rollup.hour_utc < ?8
-                   AND (?4 IS NULL OR rollup.provider = ?4)
-                   AND (
-                       rollup.raw_pruned = 1
-                       OR (rollup.hour_utc - ?1) / ?3
-                          = (rollup.hour_utc + {MODEL_ROLLUP_HOUR_MS} - 1 - ?1) / ?3
-                   )"
-            );
-            for &(raw_start_ms, raw_end_ms) in &residual_ranges {
-                let start_parameter = history_params.len() + 1;
-                let end_parameter = start_parameter + 1;
-                history_params.push(Box::new(raw_start_ms));
-                history_params.push(Box::new(raw_end_ms));
-                sql.push_str(" UNION ALL ");
-                sql.push_str(&model_raw_residual_branch_sql(
-                    "observation.observed_at_ms,
-                     observation.provider,
-                     observation.derived_model_id,
-                     COALESCE(observation.input_tokens, 0)
-                         + COALESCE(observation.output_tokens, 0)
-                         + COALESCE(observation.cache_creation_tokens, 0)
-                         + COALESCE(observation.cache_read_tokens, 0)",
-                    start_parameter,
-                    end_parameter,
-                    4,
-                    has_pruned_authority,
-                ));
-            }
-            sql
-        };
-        let mut statement = tx
-            .prepare_cached(&format!(
-                "SELECT
-                     (observation.observed_at_ms - ?1) / ?3 AS bucket_index,
-                     SUM(
-                         CASE WHEN observation.derived_model_id IS NOT NULL THEN
-                             observation.token_amount
-                         ELSE 0 END
-                     ) AS attributed_tokens,
-                     SUM(
-                         CASE WHEN observation.derived_model_id IS NULL THEN
-                             observation.token_amount
-                         ELSE 0 END
-                     ) AS unattributed_tokens,
-                     SUM(
-                         CASE
-                             WHEN ?5 IS NOT NULL
-                              AND observation.provider COLLATE BINARY = ?5
-                              AND observation.derived_model_id COLLATE BINARY = ?6
-                             THEN observation.token_amount
-                             ELSE 0
-                         END
-                     ) AS selected_model_tokens
-                 FROM ({history_source}) AS observation
-                 GROUP BY bucket_index
-                 ORDER BY bucket_index ASC",
-            ))
-            .map_err(|error| format!("Prepare model history query: {error}"))?;
-        let rows = statement
-            .query_map(rusqlite::params_from_iter(history_params.iter()), |row| {
-                Ok(ModelHistoryAggregateRow {
-                    bucket_index: row.get(0)?,
-                    attributed_tokens: row.get(1)?,
-                    unattributed_tokens: row.get(2)?,
-                    selected_model_tokens: row.get(3)?,
-                })
-            })
-            .map_err(|error| format!("Query model history: {error}"))?;
-
-        for aggregate_row in rows {
-            let row = aggregate_row
-                .map_err(|error| format!("Read model history aggregate row: {error}"))?;
-            let bucket_index = usize::try_from(row.bucket_index)
-                .map_err(|_| format!("Invalid model history bucket index: {}", row.bucket_index))?;
-            let point = points.get_mut(bucket_index).ok_or_else(|| {
-                format!(
-                    "Model history bucket index outside fixed axis: {}",
-                    row.bucket_index
-                )
-            })?;
-            if row.attributed_tokens < 0
-                || row.unattributed_tokens < 0
-                || row.selected_model_tokens < 0
-            {
-                return Err("Model history aggregate contained negative tokens".to_string());
-            }
-            if row.selected_model_tokens > row.attributed_tokens {
-                return Err(
-                    "Selected model history exceeded aggregate attributed tokens".to_string(),
-                );
-            }
-
-            point.attributed_tokens = row.attributed_tokens;
-            point.unattributed_tokens = row.unattributed_tokens;
-            if selected_model.is_some() {
-                point.selected_model_tokens = Some(row.selected_model_tokens);
-            }
-        }
-        drop(statement);
-
-        tx.commit()
-            .map_err(|error| format!("Commit model history read snapshot: {error}"))?;
-
-        Ok(ModelHistoryResponse {
-            generated_at,
-            range,
-            provider: provider.map(str::to_owned),
-            selected_model: selected_model.cloned(),
-            bucket_seconds,
-            points,
-            building_index,
-        })
     }
 
     /// Page in-range sessions containing one exact provider-qualified model.
@@ -12136,30 +10955,6 @@ impl Storage {
         })()
     }
 
-    /// Look up one provider-owned source without mutating reconciliation state.
-    #[allow(dead_code)] // T010/T029 consume persisted source inventory.
-    pub(crate) fn get_model_source(
-        &self,
-        provider: IntegrationProvider,
-        source_key: &str,
-    ) -> Result<Option<StoredModelSource>, String> {
-        let conn = self.conn.lock();
-        let sql = format!(
-            "SELECT {MODEL_SOURCE_STATE_COLUMNS}
-             FROM model_observation_sources
-             WHERE provider = ?1 AND source_key = ?2"
-        );
-        let row = conn
-            .query_row(&sql, params![provider.as_str(), source_key], |row| {
-                read_raw_model_source(row)
-            })
-            .optional()
-            .map_err(|error| format!("Read model source {source_key}: {error}"))?;
-
-        row.map(|row| stored_model_source_from_raw(provider, row))
-            .transpose()
-    }
-
     /// Enumerate only sources owned by one exact provider/root pair.
     #[allow(dead_code)] // T010/T029 consume persisted source inventory.
     pub(crate) fn list_model_sources_for_root(
@@ -12540,10 +11335,22 @@ impl Storage {
                 });
             }
         }
-        let model_hourly_rollups = if fold_model_rollup {
-            prepare_model_hourly_rollups(source, &retained_observations)?
+        let rollup_analytics_session_id = if fold_model_rollup && !retained_observations.is_empty()
+        {
+            let analytics_session_id = source.analytics_session_id.as_deref().ok_or_else(|| {
+                "Model source with observations must have an analytics session id".to_string()
+            })?;
+            if let Some(observation) = retained_observations.iter().find(|observation| {
+                observation.observation.metadata().analytics_session_id != analytics_session_id
+            }) {
+                return Err(format!(
+                    "Model observation analytics session {} does not match source analytics session {analytics_session_id}",
+                    observation.observation.metadata().analytics_session_id
+                ));
+            }
+            Some(analytics_session_id)
         } else {
-            Vec::new()
+            None
         };
         let deleted_model_rollup_rows = if fold_model_rollup {
             tx.execute(
@@ -12613,11 +11420,10 @@ impl Storage {
             }
         }
 
-        let mut folded_model_rollup_rows = 0_usize;
-        if fold_model_rollup {
-            let mut stmt = tx
-                .prepare_cached(
-                    "INSERT INTO model_usage_hourly (
+        // @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups]]
+        let folded_model_rollup_rows = if fold_model_rollup {
+            tx.execute(
+                "INSERT INTO model_usage_hourly (
                         hour_utc, provider, derived_model_id, source_key,
                         analytics_session_id, obs_count, turn_count,
                         token_count, sidechain_count, input_tokens,
@@ -12626,73 +11432,34 @@ impl Storage {
                         cache_creation_tokens_present, cache_read_tokens,
                         cache_read_tokens_present, first_observed_at_ms,
                         last_observed_at_ms, raw_pruned
-                     ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                        ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 0
                      )
+                     SELECT (observed_at_ms / ?4) * ?4,
+                            provider, COALESCE(derived_model_id, ''), source_key,
+                            ?3, COUNT(*), SUM(observation_kind = 'turn'),
+                            SUM(observation_kind = 'token'), SUM(is_sidechain),
+                            SUM(COALESCE(input_tokens, 0)), COUNT(input_tokens),
+                            SUM(COALESCE(output_tokens, 0)), COUNT(output_tokens),
+                            SUM(COALESCE(cache_creation_tokens, 0)),
+                            COUNT(cache_creation_tokens),
+                            SUM(COALESCE(cache_read_tokens, 0)),
+                            COUNT(cache_read_tokens), MIN(observed_at_ms),
+                            MAX(observed_at_ms), 0
+                     FROM model_usage_observations
+                     WHERE provider = ?1 AND source_key = ?2
+                     GROUP BY 1, 2, 3, 4
                      ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
-                     DO UPDATE SET
-                        analytics_session_id = excluded.analytics_session_id,
-                        obs_count = model_usage_hourly.obs_count + excluded.obs_count,
-                        turn_count = model_usage_hourly.turn_count + excluded.turn_count,
-                        token_count = model_usage_hourly.token_count + excluded.token_count,
-                        sidechain_count = model_usage_hourly.sidechain_count
-                                          + excluded.sidechain_count,
-                        input_tokens = model_usage_hourly.input_tokens
-                                       + excluded.input_tokens,
-                        input_tokens_present = model_usage_hourly.input_tokens_present
-                                               + excluded.input_tokens_present,
-                        output_tokens = model_usage_hourly.output_tokens
-                                        + excluded.output_tokens,
-                        output_tokens_present = model_usage_hourly.output_tokens_present
-                                                + excluded.output_tokens_present,
-                        cache_creation_tokens = model_usage_hourly.cache_creation_tokens
-                                                + excluded.cache_creation_tokens,
-                        cache_creation_tokens_present =
-                            model_usage_hourly.cache_creation_tokens_present
-                            + excluded.cache_creation_tokens_present,
-                        cache_read_tokens = model_usage_hourly.cache_read_tokens
-                                            + excluded.cache_read_tokens,
-                        cache_read_tokens_present =
-                            model_usage_hourly.cache_read_tokens_present
-                            + excluded.cache_read_tokens_present,
-                        first_observed_at_ms = MIN(
-                            model_usage_hourly.first_observed_at_ms,
-                            excluded.first_observed_at_ms
-                        ),
-                        last_observed_at_ms = MAX(
-                            model_usage_hourly.last_observed_at_ms,
-                            excluded.last_observed_at_ms
-                        )
-                     WHERE model_usage_hourly.raw_pruned = 0",
-                )
-                .map_err(|error| format!("Prepare model hourly rollup UPSERT: {error}"))?;
-            for rollup in &model_hourly_rollups {
-                folded_model_rollup_rows += stmt
-                    .execute(params![
-                        rollup.hour_utc,
-                        source.provider.as_str(),
-                        rollup.derived_model_id,
-                        source.source_key,
-                        rollup.analytics_session_id,
-                        rollup.obs_count,
-                        rollup.turn_count,
-                        rollup.token_count,
-                        rollup.sidechain_count,
-                        rollup.input_tokens,
-                        rollup.input_tokens_present,
-                        rollup.output_tokens,
-                        rollup.output_tokens_present,
-                        rollup.cache_creation_tokens,
-                        rollup.cache_creation_tokens_present,
-                        rollup.cache_read_tokens,
-                        rollup.cache_read_tokens_present,
-                        rollup.first_observed_at_ms,
-                        rollup.last_observed_at_ms,
-                    ])
-                    .map_err(|error| format!("UPSERT model hourly rollup: {error}"))?;
-            }
-        }
+                     DO NOTHING",
+                params![
+                    source.provider.as_str(),
+                    source.source_key,
+                    rollup_analytics_session_id,
+                    MODEL_ROLLUP_HOUR_MS,
+                ],
+            )
+            .map_err(|error| format!("Fold model hourly rollup: {error}"))?
+        } else {
+            0
+        };
         if deleted_model_rollup_rows > 0 || folded_model_rollup_rows > 0 {
             let updated = tx
                 .execute(
@@ -14772,39 +13539,6 @@ impl Storage {
         Ok(results)
     }
 
-    /// Return the production session-breakdown query plan for timing evidence.
-    pub(crate) fn explain_session_breakdown_query(
-        &self,
-        range: &str,
-        hostname: Option<&str>,
-        provider: Option<IntegrationProvider>,
-        limit: Option<i32>,
-    ) -> Result<Vec<String>, String> {
-        let limit = limit.unwrap_or(10).clamp(1, 500);
-        let conn = self.open_view_reader()?;
-        let (sql, params_vec) =
-            Self::session_breakdown_query(range_from_timestamp(range), hostname, provider, limit);
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec
-            .iter()
-            .map(|parameter| parameter.as_ref())
-            .collect();
-        let mut statement = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .map_err(|error| format!("Prepare session breakdown query plan: {error}"))?;
-        let rows = statement
-            .query_map(params_refs.as_slice(), |row| {
-                Ok(format!(
-                    "{}:{} {}",
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(3)?
-                ))
-            })
-            .map_err(|error| format!("Query session breakdown plan: {error}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Read session breakdown plan: {error}"))
-    }
-
     /// Return one row per distinct `agent_id` that belongs to
     /// `(provider, session_id)`. Each row aggregates the agent's own rows
     /// across `token_snapshots`, `response_times`, and `tool_actions`. The
@@ -15139,10 +13873,6 @@ impl Storage {
         .map_err(|e| format!("Settings prefix delete error: {e}"))?;
         Ok(())
     }
-
-    pub fn get_provider_settings_json(&self) -> Result<Option<String>, String> {
-        self.get_setting(PROVIDER_SETTINGS_KEY)
-    }
 }
 
 /// Retention policy primitive — the database half of [`crate::retention`].
@@ -15268,19 +13998,13 @@ impl Storage {
     /// the day one of these commands starts reading `tool_actions` or
     /// `session_events`, the completion path is already right.
     pub fn clear_analytics_caches(&self) {
-        self.model_analytics_cache.lock().clear();
         self.model_usage_overview_cache.lock().clear();
-        self.model_history_cache.lock().clear();
         self.bucket_stats_cache.lock().clear();
         self.context_savings_analytics_cache.lock().clear();
     }
 }
 
 impl Storage {
-    pub fn set_provider_settings_json(&self, value: &str) -> Result<(), String> {
-        self.set_setting(PROVIDER_SETTINGS_KEY, value)
-    }
-
     #[allow(dead_code)]
     pub fn get_indicator_primary_provider(&self) -> Result<Option<IntegrationProvider>, String> {
         let Some(raw) = self.get_setting(INDICATOR_PRIMARY_PROVIDER_KEY)? else {
@@ -18372,17 +17096,6 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub fn update_rule_content_hash(&self, name: &str, hash: &str) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE learned_rules SET content_hash = ?1, updated_at = datetime('now') WHERE name = ?2",
-            params![hash, name],
-        )
-        .map_err(|e| format!("Update content_hash error: {e}"))?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
     pub fn reconcile_learned_rules(&self) -> Result<bool, String> {
         use sha2::{Digest, Sha256};
 
@@ -18846,18 +17559,8 @@ impl Storage {
         // Archive root: `<data_local>/legacy-rules-archive/<ISO8601>/`,
         // resolved exactly like `db_path()` so demo-mode overrides apply and
         // the dir is never inside a watched learned-rules tree.
-        let data_dir = dirs::data_local_dir()
-            .or_else(|| {
-                dirs::home_dir().map(|h| {
-                    if cfg!(target_os = "macos") {
-                        h.join("Library").join("Application Support")
-                    } else {
-                        h.join(".local").join("share")
-                    }
-                })
-            })
-            .ok_or("Cannot determine data directory")?;
-        let default_app_dir = data_dir.join("com.quilltoolkit.app");
+        let default_app_dir =
+            crate::data_paths::default_app_data_dir().ok_or("Cannot determine data directory")?;
         let app_dir = crate::data_paths::resolve_data_dir_with_default(default_app_dir);
         let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let archive_dir = app_dir.join("legacy-rules-archive").join(&stamp);
@@ -19918,18 +18621,6 @@ impl Storage {
             .map_err(|e| format!("Failed to query memory files: {e}"))?;
         rows.collect::<Result<std::collections::HashMap<_, _>, _>>()
             .map_err(|e| format!("Failed to collect memory file hashes: {e}"))
-    }
-
-    /// Delete suggestion (for undeny — removes from DB so it's no longer in denial blocklist).
-    #[allow(dead_code)]
-    pub fn delete_suggestion(&self, suggestion_id: i64) -> Result<(), String> {
-        let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM optimization_suggestions WHERE id = ?1",
-            rusqlite::params![suggestion_id],
-        )
-        .map_err(|e| format!("Failed to delete suggestion: {e}"))?;
-        Ok(())
     }
 
     /// Get all suggestions for a specific optimization run.
@@ -21546,19 +20237,13 @@ mod tests {
         clear_env();
     }
 
-    /// Populate all five analytics caches through their real read paths, so
+    /// Populate all three analytics caches through their real read paths, so
     /// the drain is proved against entries `get_or_compute` actually stored
     /// rather than against hand-inserted ones.
     fn warm_all_analytics_caches(storage: &Storage) {
         storage
-            .get_model_analytics(ModelRange::TwentyFourHours, None)
-            .expect("warm model analytics cache");
-        storage
             .get_model_usage_overview(ModelRange::TwentyFourHours, None)
             .expect("warm model usage overview cache");
-        storage
-            .get_model_history(ModelRange::TwentyFourHours, None, None)
-            .expect("warm model history cache");
         storage
             .get_all_bucket_stats(&[], 30)
             .expect("warm bucket stats cache");
@@ -21567,18 +20252,16 @@ mod tests {
             .expect("warm context savings analytics cache");
     }
 
-    /// The five caches' current entry counts, in declaration order.
-    fn analytics_cache_lens(storage: &Storage) -> [usize; 5] {
+    /// The three caches' current entry counts, in declaration order.
+    fn analytics_cache_lens(storage: &Storage) -> [usize; 3] {
         [
-            storage.model_analytics_cache.lock().len(),
             storage.model_usage_overview_cache.lock().len(),
-            storage.model_history_cache.lock().len(),
             storage.bucket_stats_cache.lock().len(),
             storage.context_savings_analytics_cache.lock().len(),
         ]
     }
 
-    // @lat: [[backend#Backend#Database#Analytics cache invalidation on prune#Analytics Cache Invalidation Test Specs#All Five Caches Drained And Event Emitted]]
+    // @lat: [[backend#Backend#Database#Analytics cache invalidation on prune#Analytics Cache Invalidation Test Specs#All Caches Drained And Event Emitted]]
     #[test]
     #[serial]
     fn retention_completion_drains_every_analytics_cache_and_emits() {
@@ -21597,7 +20280,7 @@ mod tests {
 
         assert_eq!(
             analytics_cache_lens(&storage),
-            [0; 5],
+            [0; 3],
             "retention's completion path must leave no cached payload behind"
         );
         assert_eq!(emitted, vec![crate::TRANSCRIPT_ANALYTICS_UPDATED_EVENT]);
@@ -21638,21 +20321,28 @@ mod tests {
     // @lat: [[backend#Backend#Database#Redundant provider/source index drop#Provider Source Index Drop Test Specs#Redundant Index Gone After Open]]
     #[test]
     #[serial]
-    fn startup_open_drops_provider_source_index_and_keeps_timestamp_chain() {
+    fn startup_open_drops_provider_source_indexes_and_keeps_timestamp_chain() {
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
+        let redundant_indexes = [
+            "idx_session_events_provider_source",
+            "idx_response_times_provider_source",
+            "idx_tool_actions_provider_source",
+            "idx_skill_usages_provider_source",
+            "idx_hook_invocations_provider_source",
+        ];
 
         {
             let conn = storage.conn.lock();
-            // Migration 30 creates the index on this very open, so the drop is
-            // exercised for real rather than passing vacuously.
-            assert!(
-                !index_present(&conn, "idx_session_events_provider_source"),
-                "redundant provider/source index survived the open"
-            );
+            for index in redundant_indexes {
+                assert!(
+                    !index_present(&conn, index),
+                    "redundant provider/source index survived the open: {index}"
+                );
+            }
             assert!(
                 index_present(&conn, "idx_se_timestamp_chain"),
-                "retention must drop exactly one index and no other"
+                "provider/source cleanup must preserve the pinned runtime index"
             );
             conn.prepare(
                 "SELECT timestamp, kind, provider, session_id, chain_id
@@ -21661,14 +20351,32 @@ mod tests {
                  ORDER BY provider, chain_id, timestamp, rowid",
             )
             .expect("pinned runtime query still prepares");
+            conn.execute_batch(
+                "CREATE INDEX idx_session_events_provider_source
+                     ON session_events(provider, source_key);
+                 CREATE INDEX idx_response_times_provider_source
+                     ON response_times(provider, source_key);
+                 CREATE INDEX idx_tool_actions_provider_source
+                     ON tool_actions(provider, source_key);
+                 CREATE INDEX idx_skill_usages_provider_source
+                     ON skill_usages(provider, source_key);
+                 CREATE INDEX idx_hook_invocations_provider_source
+                     ON hook_invocations(provider, source_key);",
+            )
+            .expect("seed legacy provider/source indexes");
         }
         drop(storage);
 
-        // Reopening an already-dropped database must be a no-op, not an error.
+        // Reopening an older database removes every legacy plain index.
         let reopened = Storage::init().expect("reopen storage");
         {
             let conn = reopened.conn.lock();
-            assert!(!index_present(&conn, "idx_session_events_provider_source"));
+            for index in redundant_indexes {
+                assert!(
+                    !index_present(&conn, index),
+                    "legacy index survived: {index}"
+                );
+            }
             assert!(index_present(&conn, "idx_se_timestamp_chain"));
         }
         clear_env();
@@ -21677,36 +20385,29 @@ mod tests {
     // @lat: [[backend#Backend#Database#Redundant provider/source index drop#Provider Source Index Drop Test Specs#Owned Deletes Keep Their Index Seek]]
     #[test]
     #[serial]
-    fn dropped_provider_source_index_leaves_owned_deletes_on_uidx_se_owned() {
+    fn dropped_provider_source_indexes_leave_owned_deletes_on_unique_indexes() {
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
         let conn = storage.conn.lock();
 
-        // Verbatim from the three `(provider, source_key)` `session_events`
-        // delete sites, which issue them through `format!("... {table} ...")`.
-        let sites = [
-            (
-                "suppress_transcript_analytics_sources_in_transaction",
-                "DELETE FROM session_events WHERE provider = ?1 AND source_key = ?2",
-            ),
-            (
-                "prune_transcript_analytics_sources_for_root",
-                "DELETE FROM session_events WHERE provider=?1 AND source_key=?2",
-            ),
-            (
-                "replace_transcript_analytics_snapshot",
-                "DELETE FROM session_events WHERE provider=?1 AND source_key=?2",
-            ),
+        // All source-owned delete sites use this exact generic table shape.
+        let tables = [
+            ("session_events", "uidx_se_owned"),
+            ("response_times", "uidx_rt_owned"),
+            ("tool_actions", "uidx_ta_owned"),
+            ("skill_usages", "uidx_su_owned"),
+            ("hook_invocations", "uidx_hi_owned"),
         ];
-        for (site, sql) in sites {
-            let detail = query_plan_detail(&conn, sql);
+        for (table, index) in tables {
+            let sql = format!("DELETE FROM {table} WHERE provider = ?1 AND source_key = ?2");
+            let detail = query_plan_detail(&conn, &sql);
             assert!(
-                detail.contains("uidx_se_owned"),
-                "{site} lost its partial-index seek: {detail}"
+                detail.contains(index),
+                "{table} lost its partial-index seek: {detail}"
             );
             assert!(
                 !detail.contains("SCAN"),
-                "{site} degraded to a table scan: {detail}"
+                "{table} degraded to a table scan: {detail}"
             );
         }
         drop(conn);
@@ -25664,7 +24365,8 @@ mod tests {
         let path = dir.path().join(format!("{source_key}.jsonl"));
         std::fs::write(&path, jsonl).expect("write transcript");
         let metadata = std::fs::metadata(&path).expect("stat transcript");
-        let fast = model_source_fast_fingerprint(&path, &metadata).expect("fast fingerprint");
+        let fast = crate::transcript_identity::model_source_fast_fingerprint(&metadata)
+            .expect("fast fingerprint");
         let fingerprint = ModelSourceFingerprint::from_content(fast, jsonl.as_bytes());
 
         let now_ms = Utc::now().timestamp_millis();
@@ -25740,7 +24442,8 @@ mod tests {
         let path = dir.path().join(format!("{source_key}.jsonl"));
         std::fs::write(&path, jsonl).expect("write transcript");
         let metadata = std::fs::metadata(&path).expect("stat transcript");
-        let fast = model_source_fast_fingerprint(&path, &metadata).expect("fast fingerprint");
+        let fast = crate::transcript_identity::model_source_fast_fingerprint(&metadata)
+            .expect("fast fingerprint");
         let fingerprint = ModelSourceFingerprint::from_content(fast, jsonl.as_bytes());
 
         let now_ms = Utc::now().timestamp_millis();
@@ -26032,6 +24735,71 @@ mod tests {
                 .expect("read rolled-back generation"),
                 2
             );
+            conn.execute_batch(
+                "PRAGMA ignore_check_constraints = ON;
+                 CREATE TRIGGER overflow_model_hourly_sum
+                 AFTER INSERT ON model_usage_observations
+                 WHEN NEW.source_key = 'overflow-source'
+                 BEGIN
+                     UPDATE model_usage_observations
+                     SET input_tokens = 9223372036854775807
+                     WHERE rowid = NEW.rowid;
+                 END;",
+            )
+            .expect("install rollup overflow trigger");
+        }
+
+        let overflow_jsonl = [
+            r#"{"type":"assistant","timestamp":"2026-07-30T13:00:00Z","sessionId":"overflow-session","message":{"model":"model-d","usage":{"input_tokens":1}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-07-30T13:01:00Z","sessionId":"overflow-session","message":{"model":"model-d","usage":{"input_tokens":1}}}"#,
+        ]
+        .join("\n");
+        let (overflow_source, overflow_observations, overflow_fingerprint) =
+            prepare_claude_model_source(
+                &dir,
+                "overflow-source",
+                "overflow-session",
+                &overflow_jsonl,
+            );
+        let error = storage
+            .replace_model_source(
+                &overflow_source,
+                &overflow_observations,
+                &overflow_fingerprint,
+            )
+            .expect_err("integer overflow must abort replacement");
+        assert!(error.contains("integer overflow"), "{error}");
+        {
+            let conn = storage.conn.lock();
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
+                .expect("restore check constraints");
+            for table in [
+                "model_usage_observations",
+                "model_usage_hourly",
+                "model_observation_sources",
+            ] {
+                assert_eq!(
+                    conn.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table} WHERE source_key = 'overflow-source'"
+                        ),
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .expect("count overflow rows"),
+                    0,
+                    "overflow must roll back {table}"
+                );
+            }
+            assert_eq!(
+                conn.query_row(
+                    "SELECT rollup_generation FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .expect("read generation after overflow"),
+                2
+            );
         }
         clear_env();
     }
@@ -26256,164 +25024,6 @@ mod tests {
         ));
     }
 
-    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model History Bucketing and Suppression]]
-    #[test]
-    #[serial]
-    fn get_model_history_and_analytics_bucket_and_exclude_suppressed_sources() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-
-        let base = Utc::now();
-        let obs1 = base - TimeDelta::minutes(50);
-        let obs2 = base - TimeDelta::minutes(10);
-        let obs3 = base - TimeDelta::minutes(30);
-        // Active source: two attributed turns and one model-less (unattributed) turn.
-        let active_jsonl = [
-            format!(
-                r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-active","message":{{"model":"claude-opus-4","usage":{{"input_tokens":100,"output_tokens":20}}}}}}"#,
-                obs1.to_rfc3339()
-            ),
-            format!(
-                r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-active","message":{{"model":"claude-opus-4","usage":{{"input_tokens":200,"output_tokens":0}}}}}}"#,
-                obs2.to_rfc3339()
-            ),
-            format!(
-                r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-active","message":{{"usage":{{"input_tokens":30}}}}}}"#,
-                obs3.to_rfc3339()
-            ),
-        ]
-        .join("\n");
-        seed_claude_model_source(&storage, &dir, "sk-active", "sess-active", &active_jsonl);
-
-        // Suppressed source: its tokens must never contribute to either query.
-        let suppressed_jsonl = format!(
-            r#"{{"type":"assistant","timestamp":"{}","sessionId":"sess-suppressed","message":{{"model":"claude-sonnet","usage":{{"input_tokens":999,"output_tokens":999}}}}}}"#,
-            (base - TimeDelta::minutes(20)).to_rfc3339()
-        );
-        seed_claude_model_source(
-            &storage,
-            &dir,
-            "sk-suppressed",
-            "sess-suppressed",
-            &suppressed_jsonl,
-        );
-        // Flip the source to suppressed while leaving its observation rows in
-        // place, exercising ACTIVE_MODEL_SOURCE_PREDICATE directly.
-        storage
-            .conn
-            .lock()
-            .execute(
-                "UPDATE model_observation_sources
-                 SET processing_status = 'suppressed', suppressed_sha256 = 'deadbeef'
-                 WHERE provider = 'claude' AND source_key = 'sk-suppressed'",
-                [],
-            )
-            .expect("suppress source");
-
-        let analytics = storage
-            .get_model_analytics(ModelRange::OneHour, None)
-            .expect("analytics");
-        // Carry-forward attribution derives the model-less obs3 turn from the
-        // preceding claude-opus-4 evidence in the same chain, so every claude
-        // token is attributed.
-        assert_eq!(analytics.summary.total_tokens, 350);
-        assert_eq!(analytics.summary.attributed_tokens, 350);
-        assert_eq!(analytics.summary.unattributed_tokens, 0);
-        assert_eq!(analytics.summary.distinct_models, 1);
-        let coverage = analytics
-            .summary
-            .attributed_coverage_percent
-            .expect("coverage present");
-        assert!((coverage - 100.0).abs() < 1e-9, "coverage {coverage}");
-        assert_eq!(
-            analytics.models.len(),
-            1,
-            "suppressed model row must be excluded"
-        );
-        assert_eq!(analytics.models[0].identity.model_id, "claude-opus-4");
-        assert_eq!(analytics.models[0].attributed_tokens, 350);
-
-        // Cross-provider evidence seeded after the analytics assertions: one
-        // pre-evidence Codex token delta (stays unattributed), turn_context
-        // model evidence, then two token deltas that inherit the chain model
-        // through carry-forward — one sharing obs3's bucket and one obs2's.
-        let obs_codex_pre = base - TimeDelta::minutes(52);
-        let codex_jsonl = [
-            format!(
-                r#"{{"type":"session_meta","timestamp":"{}","payload":{{"id":"sess-codex"}}}}"#,
-                (base - TimeDelta::minutes(55)).to_rfc3339()
-            ),
-            format!(
-                r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":10,"cached_input_tokens":0,"output_tokens":0,"cache_creation_tokens":0}}}}}}}}"#,
-                obs_codex_pre.to_rfc3339()
-            ),
-            format!(
-                r#"{{"type":"turn_context","timestamp":"{}","payload":{{"model":"gpt-5-codex"}}}}"#,
-                (base - TimeDelta::minutes(51)).to_rfc3339()
-            ),
-            format!(
-                r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":50,"cached_input_tokens":0,"output_tokens":10,"cache_creation_tokens":0}}}}}}}}"#,
-                obs3.to_rfc3339()
-            ),
-            format!(
-                r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":110,"cached_input_tokens":0,"output_tokens":30,"cache_creation_tokens":0}}}}}}}}"#,
-                obs2.to_rfc3339()
-            ),
-        ]
-        .join("\n");
-        seed_codex_model_source(&storage, &dir, "sk-codex", "sess-codex", &codex_jsonl);
-
-        let cross_provider = storage
-            .get_model_analytics(ModelRange::OneHour, None)
-            .expect("cross-provider analytics");
-        assert_eq!(cross_provider.summary.total_tokens, 490);
-        assert_eq!(cross_provider.summary.attributed_tokens, 480);
-        assert_eq!(cross_provider.summary.unattributed_tokens, 10);
-        assert_eq!(cross_provider.summary.distinct_models, 2);
-
-        let history = storage
-            .get_model_history(ModelRange::OneHour, None, None)
-            .expect("history");
-        let total_attributed: i64 = history.points.iter().map(|p| p.attributed_tokens).sum();
-        let total_unattributed: i64 = history.points.iter().map(|p| p.unattributed_tokens).sum();
-        assert_eq!(total_attributed, 480);
-        assert_eq!(total_unattributed, 10);
-
-        let bucket_of = |points: &[ModelHistoryPoint], at_ms: i64| -> usize {
-            points
-                .iter()
-                .position(|point| {
-                    let start = DateTime::parse_from_rfc3339(&point.bucket_start)
-                        .unwrap()
-                        .timestamp_millis();
-                    let end = DateTime::parse_from_rfc3339(&point.bucket_end)
-                        .unwrap()
-                        .timestamp_millis();
-                    at_ms >= start && at_ms < end
-                })
-                .expect("observation lands inside a fixed bucket")
-        };
-        let bucket1 = bucket_of(&history.points, obs1.timestamp_millis());
-        let bucket2 = bucket_of(&history.points, obs2.timestamp_millis());
-        let bucket3 = bucket_of(&history.points, obs3.timestamp_millis());
-        let bucket_pre = bucket_of(&history.points, obs_codex_pre.timestamp_millis());
-        assert_ne!(
-            bucket1, bucket2,
-            "distinct offsets land in distinct buckets"
-        );
-        assert_eq!(history.points[bucket1].attributed_tokens, 120);
-        assert_eq!(history.points[bucket2].attributed_tokens, 280);
-        // The claude model-less turn and the codex deltas in obs3's bucket are
-        // all derived-attributed, so nothing there is unattributed.
-        assert_eq!(history.points[bucket3].attributed_tokens, 80);
-        assert_eq!(history.points[bucket3].unattributed_tokens, 0);
-        // Only the pre-evidence codex delta stays unattributed.
-        assert_eq!(history.points[bucket_pre].unattributed_tokens, 10);
-
-        clear_env();
-    }
-
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Bounded Completed Model Raw Seeks]]
     #[test]
     #[serial]
@@ -26583,10 +25193,10 @@ mod tests {
         clear_env();
     }
 
-    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Hybrid Model Overview and History Parity]]
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Hybrid Model Overview Parity]]
     #[test]
     #[serial]
-    fn hybrid_model_overview_and_history_match_raw_at_unaligned_boundaries() {
+    fn hybrid_model_overview_matches_raw_at_unaligned_boundaries() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
@@ -26875,26 +25485,10 @@ mod tests {
                 .any(|row| row.project == "tie-z"),
             "project ties must use binary source-key order after matching time, ordinal, and record"
         );
-        let selected = ModelIdentity {
-            provider: "claude".to_string(),
-            model_id: "model-a".to_string(),
-        };
-        let raw_history = storage
-            .get_model_history_uncached(
-                ModelRange::TwentyFourHours,
-                None,
-                Some(&selected),
-                pinned_now,
-            )
-            .expect("raw history");
         let raw_week_overview = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("raw week overview");
-        let raw_week_history = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
-            .expect("raw week history");
         assert!(raw_overview.building_index);
-        assert!(raw_history.building_index);
 
         storage
             .conn
@@ -26907,22 +25501,10 @@ mod tests {
         let hybrid_overview = storage
             .get_model_usage_overview_uncached(ModelRange::TwentyFourHours, None, pinned_now)
             .expect("hybrid overview");
-        let hybrid_history = storage
-            .get_model_history_uncached(
-                ModelRange::TwentyFourHours,
-                None,
-                Some(&selected),
-                pinned_now,
-            )
-            .expect("hybrid history");
         let hybrid_week_overview = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("hybrid week overview");
-        let hybrid_week_history = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
-            .expect("hybrid week history");
         assert!(!hybrid_overview.building_index);
-        assert!(!hybrid_history.building_index);
 
         let mut raw_overview_json = serde_json::to_value(&raw_overview).expect("raw overview json");
         let mut hybrid_overview_json =
@@ -26937,19 +25519,6 @@ mod tests {
             .remove("buildingIndex");
         assert_eq!(hybrid_overview_json, raw_overview_json);
 
-        let mut raw_history_json = serde_json::to_value(&raw_history).expect("raw history json");
-        let mut hybrid_history_json =
-            serde_json::to_value(&hybrid_history).expect("hybrid history json");
-        raw_history_json
-            .as_object_mut()
-            .expect("raw history object")
-            .remove("buildingIndex");
-        hybrid_history_json
-            .as_object_mut()
-            .expect("hybrid history object")
-            .remove("buildingIndex");
-        assert_eq!(hybrid_history_json, raw_history_json);
-
         let mut raw_week_overview_json =
             serde_json::to_value(&raw_week_overview).expect("raw week overview json");
         let mut hybrid_week_overview_json =
@@ -26963,20 +25532,6 @@ mod tests {
             .expect("hybrid week overview object")
             .remove("buildingIndex");
         assert_eq!(hybrid_week_overview_json, raw_week_overview_json);
-
-        let mut raw_week_history_json =
-            serde_json::to_value(&raw_week_history).expect("raw week history json");
-        let mut hybrid_week_history_json =
-            serde_json::to_value(&hybrid_week_history).expect("hybrid week history json");
-        raw_week_history_json
-            .as_object_mut()
-            .expect("raw week history object")
-            .remove("buildingIndex");
-        hybrid_week_history_json
-            .as_object_mut()
-            .expect("hybrid week history object")
-            .remove("buildingIndex");
-        assert_eq!(hybrid_week_history_json, raw_week_history_json);
 
         let pruned_hour = at("2026-07-19T13:00:00Z").timestamp_millis();
         let pruned_project_hour = at("2026-07-19T14:00:00Z").timestamp_millis();
@@ -27006,9 +25561,6 @@ mod tests {
         let before_raw_delete = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("overview before authoritative raw delete");
-        let history_before_raw_delete = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
-            .expect("history before authoritative raw delete");
         storage
             .conn
             .lock()
@@ -27036,9 +25588,6 @@ mod tests {
         let after_raw_delete = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("overview after authoritative raw delete");
-        let history_after_raw_delete = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, Some(&selected), pinned_now)
-            .expect("history after authoritative raw delete");
         assert!(
             after_raw_delete
                 .project_matrix
@@ -27050,31 +25599,6 @@ mod tests {
             serde_json::to_value(after_raw_delete).expect("post-prune overview json"),
             serde_json::to_value(before_raw_delete).expect("pre-prune overview json")
         );
-        assert_eq!(
-            serde_json::to_value(history_after_raw_delete).expect("post-prune history json"),
-            serde_json::to_value(history_before_raw_delete).expect("pre-prune history json")
-        );
-
-        for status in ["pending", "running", "failed"] {
-            storage
-                .conn
-                .lock()
-                .execute(
-                    "UPDATE rollup_meta SET model_backfill_status = ?1 WHERE id = 1",
-                    [status],
-                )
-                .expect("set incomplete rollup state");
-            let response = storage
-                .get_model_history_uncached(
-                    ModelRange::TwentyFourHours,
-                    Some("claude"),
-                    Some(&selected),
-                    pinned_now,
-                )
-                .expect("raw fallback history");
-            assert!(response.building_index, "status {status}");
-        }
-
         drop(storage);
         clear_env();
         let empty_dir = TempDir::new().expect("empty tempdir");
@@ -27130,9 +25654,6 @@ mod tests {
         let baseline = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("read active hybrid overview");
-        let baseline_history = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, None, pinned_now)
-            .expect("read active hybrid history");
         let rollups_before = unpruned_model_hourly_rows(&storage);
         assert_eq!(baseline.totals.total_tokens, 7);
         assert_eq!(rollups_before.len(), 1);
@@ -27152,19 +25673,8 @@ mod tests {
         let suppressed = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("read suppressed hybrid overview");
-        let suppressed_history = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, None, pinned_now)
-            .expect("read suppressed hybrid history");
         assert_eq!(suppressed.totals.total_tokens, 0);
         assert!(suppressed.models.is_empty());
-        assert_eq!(
-            suppressed_history
-                .points
-                .iter()
-                .map(|point| point.attributed_tokens + point.unattributed_tokens)
-                .sum::<i64>(),
-            0
-        );
         assert_eq!(
             unpruned_model_hourly_rows(&storage),
             rollups_before,
@@ -27184,16 +25694,9 @@ mod tests {
         let restored = storage
             .get_model_usage_overview_uncached(ModelRange::SevenDays, None, pinned_now)
             .expect("read restored hybrid overview");
-        let restored_history = storage
-            .get_model_history_uncached(ModelRange::SevenDays, None, None, pinned_now)
-            .expect("read restored hybrid history");
         assert_eq!(
             serde_json::to_value(restored).expect("restored overview json"),
             serde_json::to_value(baseline).expect("baseline overview json")
-        );
-        assert_eq!(
-            serde_json::to_value(restored_history).expect("restored history json"),
-            serde_json::to_value(baseline_history).expect("baseline history json")
         );
         clear_env();
     }

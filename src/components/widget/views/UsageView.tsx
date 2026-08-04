@@ -27,7 +27,7 @@ import { selectInsightLine } from "./insightLine";
 import { useActivitySeries, useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
 import { useBreakdownData } from "../../../hooks/useBreakdownData";
 import { useCachedInvoke } from "../../../hooks/useCachedInvoke";
-import { shouldLoadSecondaryProjects } from "../../../hooks/widgetQueryPlan";
+import { queryRangeMs, shouldLoadSecondaryProjects } from "../../../hooks/widgetQueryPlan";
 import { useCodeInsights } from "../../../hooks/useCodeInsights";
 import { useCodeStats } from "../../../hooks/useCodeStats";
 import { useContextSavingsStats } from "../../../hooks/useContextSavingsStats";
@@ -35,6 +35,7 @@ import { useLlmRuntimeStats } from "../../../hooks/useLlmRuntimeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
 import { openManageWindow } from "../../../lib/manageWindow";
 import { formatDurationSecs, formatNumber } from "../../../utils/format";
+import { providerHue, providerTag } from "../../../utils/providers";
 import { formatRetentionCutoff } from "../../../utils/retention";
 import { formatTokenCount } from "../../../utils/tokens";
 import type {
@@ -78,34 +79,6 @@ const MODES: ReadonlyArray<{ id: BreakdownMode; label: string }> = [
 const HOOK_ASYMMETRY_HELP =
   "Claude hooks are tracked per script. Codex hooks are tracked per event " +
   "because Codex doesn't log per-script hook executions.";
-
-function rangeMs(range: RangeType): number {
-  switch (range) {
-    case "1h":
-      return 60 * 60_000;
-    case "6h":
-      return 6 * 60 * 60_000;
-    case "24h":
-      return 24 * 60 * 60_000;
-    case "7d":
-      return 7 * 24 * 60 * 60_000;
-    case "30d":
-      return 30 * 24 * 60 * 60_000;
-  }
-}
-
-/** Provider identity hue. An unrecognized producer still has to be charted. */
-function providerHue(provider: string): string {
-  if (provider === "claude") return "var(--provider-claude)";
-  if (provider === "codex") return "var(--provider-codex)";
-  if (provider === "mini_max") return "var(--provider-minimax)";
-  return "var(--provider-agent)";
-}
-
-function providerTag(provider: string): string {
-  if (provider === "mini_max") return "MINIMAX";
-  return provider.replace(/_/g, "").toUpperCase();
-}
 
 /** Counts read as plain integers until they get long enough to need compacting. */
 function formatCount(value: number): string {
@@ -235,7 +208,7 @@ function netLineBuckets(
   range: RangeType,
   buckets: number,
 ): number[] {
-  const windowMs = rangeMs(range);
+  const windowMs = queryRangeMs(range);
   const start = Date.now() - windowMs;
   const bucketMs = windowMs / buckets;
   const values = new Array<number>(buckets).fill(0);

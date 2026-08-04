@@ -10,33 +10,12 @@ pub enum IntegrationProvider {
     MiniMax,
 }
 
-#[allow(dead_code)]
 impl IntegrationProvider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::MiniMax => "mini_max",
-        }
-    }
-
-    pub fn cli_name(self) -> &'static str {
-        self.as_str()
-    }
-
-    pub fn home_dir_name(self) -> &'static str {
-        match self {
-            Self::Claude => ".claude",
-            Self::Codex => ".codex",
-            Self::MiniMax => "",
-        }
-    }
-
-    /// Returns true if this provider requires a local CLI installation.
-    pub fn requires_cli(self) -> bool {
-        match self {
-            Self::Claude | Self::Codex => true,
-            Self::MiniMax => false,
         }
     }
 }

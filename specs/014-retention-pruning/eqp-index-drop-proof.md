@@ -5,11 +5,11 @@ idx_session_events_provider_source`. Verdict: **pass** — after the drop every
 `session_events` statement constrained on `(provider, source_key)` still
 reports `SEARCH ... USING INDEX uidx_se_owned`. No plan degrades to a `SCAN`.
 
-Reproduce with `cargo run --bin eqp_index_drop_spike` from `src-tauri/`
-(`src-tauri/src/bin/eqp_index_drop_spike.rs`). Set `QUILL_EQP_DB` to a real
+**Archived 2026-08-03.** `eqp_index_drop_spike` was removed after this proof was frozen. The original, no-longer-runnable invocation was `cargo run --bin eqp_index_drop_spike` from `src-tauri/`
+(`src-tauri/src/bin/eqp_index_drop_spike.rs`). It accepted `QUILL_EQP_DB` to name a real
 `usage.db` to dump that database's own `session_events` DDL, confirm it
 carries no `ANALYZE` statistics, and rebuild the fixture from the live schema
-instead of the vendored copy. The spike only reads plans; it never writes to
+instead of the vendored copy. The spike only read plans; it never wrote to
 the database named by `QUILL_EQP_DB`.
 
 ## Query inventory

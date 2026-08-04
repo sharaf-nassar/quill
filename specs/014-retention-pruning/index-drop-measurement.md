@@ -7,7 +7,7 @@ worth it and the startup cost every user pays once is known before it ships.
 The pass/fail gate is [`eqp-index-drop-proof.md`](./eqp-index-drop-proof.md);
 the permanent regression assertions live in `storage.rs`'s test module.
 
-Reproduce with
+**Archived 2026-08-03.** `index_drop_measure_spike` was removed after this measurement was frozen. Its original, no-longer-runnable invocation was
 `QUILL_INDEX_DROP_DB=~/.local/share/com.quilltoolkit.app/usage.db cargo run
 --release --bin index_drop_measure_spike` from `src-tauri/`
 (`src-tauri/src/bin/index_drop_measure_spike.rs`).

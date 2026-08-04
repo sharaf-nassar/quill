@@ -1,5 +1,7 @@
 # Spec: retention-pruning (database footprint reduction)
 
+**Historical evidence note.** The spike binaries referenced by this completed spec were removed on 2026-08-03. Their recorded results remain authoritative; named paths and invocations are not runnable.
+
 ## Problem Statement
 
 Quill's SQLite database grows without bound. Nothing in the app ever deletes a

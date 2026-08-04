@@ -17,9 +17,7 @@ import CommandPalette, {
 } from "../components/CommandPalette";
 import "../styles/manage.css";
 
-// Sections reuse their existing window-view components; the per-window chrome is
-// suppressed via manage.css when rendered inside the pane. Lazy-loaded so only
-// the active section's chunk is fetched.
+// Lazy-load sections so only the active chunk is fetched.
 const SessionsSection = lazy(() => import("./SessionsWindowView"));
 const LearningSection = lazy(() => import("./LearningWindow"));
 const InstancesSection = lazy(() => import("./RestartWindowView"));

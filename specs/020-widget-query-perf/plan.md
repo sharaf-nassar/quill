@@ -1,5 +1,7 @@
 # Plan: widget-query-perf
 
+**Historical implementation plan.** The spike binaries cited below were removed on 2026-08-03 after measurements were frozen. Their paths describe precedent, not current runnable tooling.
+
 Implementation plan for the clarified spec (all 7 Clarifications binding).
 Slice cut per Q5: A = model rollup (S1), B = runtime stats (S2) first and
 independent; C = readers (S3), D = refresh honesty (S4), E = query cleanups

@@ -86,29 +86,6 @@ pub fn detect_all() -> Result<Vec<ProviderStatus>, String> {
     detect_all_with_storage(&storage)
 }
 
-#[allow(dead_code)]
-pub fn request_enable(provider: IntegrationProvider) -> Result<ProviderStatus, String> {
-    let mut status = detect_all()?
-        .into_iter()
-        .find(|status| status.provider == provider)
-        .ok_or_else(|| format!("Unknown provider: {provider:?}"))?;
-    status.user_has_made_choice = true;
-    status.setup_state = match status.setup_state {
-        ProviderSetupState::Installed => ProviderSetupState::Installed,
-        ProviderSetupState::Error => ProviderSetupState::Error,
-        _ => ProviderSetupState::Installing,
-    };
-    Ok(status)
-}
-
-#[allow(dead_code)]
-pub fn confirm_enable(
-    app: &AppHandle,
-    provider: IntegrationProvider,
-) -> Result<ProviderStatus, String> {
-    confirm_enable_with_key(app, provider, None)
-}
-
 pub fn confirm_enable_with_key(
     app: &AppHandle,
     provider: IntegrationProvider,
@@ -599,7 +576,7 @@ fn merge_saved_statuses(
 }
 
 fn load_saved_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    let Some(json) = storage.get_provider_settings_json()? else {
+    let Some(json) = storage.get_setting("integration.providers.v1")? else {
         return Ok(Vec::new());
     };
 
@@ -614,7 +591,7 @@ fn load_saved_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String>
 
 fn save_statuses(storage: &Storage, statuses: &[ProviderStatus]) -> Result<(), String> {
     let json = serde_json::to_string(statuses).map_err(|e| e.to_string())?;
-    storage.set_provider_settings_json(&json)
+    storage.set_setting("integration.providers.v1", &json)
 }
 
 fn log_statuses(statuses: &[ProviderStatus]) {

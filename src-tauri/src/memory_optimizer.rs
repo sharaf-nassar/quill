@@ -705,7 +705,6 @@ pub async fn run_optimization_with_run(
             phase: crate::cc_client::Phase::MemoryOptimizer,
             prompt,
             preamble: preamble.to_string(),
-            model: crate::cc_client::Model::Sonnet46,
             max_tokens,
         })
         .await
@@ -974,7 +973,6 @@ pub async fn run_prose_compression(
                     phase: crate::cc_client::Phase::ProseCompression,
                     prompt,
                     preamble,
-                    model: crate::cc_client::Model::Sonnet46,
                     max_tokens,
                 })
                 .await

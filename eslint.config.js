@@ -1,6 +1,5 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
-import react from "eslint-plugin-react";
 import reactHooks from "eslint-plugin-react-hooks";
 import globals from "globals";
 
@@ -19,7 +18,6 @@ export default tseslint.config(
     files: ["src/**/*.{ts,tsx}"],
     extends: [js.configs.recommended, ...tseslint.configs.recommended],
     plugins: {
-      react,
       "react-hooks": reactHooks,
     },
     languageOptions: {
@@ -34,9 +32,6 @@ export default tseslint.config(
     },
     rules: {
       ...reactHooks.configs.recommended.rules,
-      // Track JSX variable usage for no-unused-vars
-      "react/jsx-uses-react": "error",
-      "react/jsx-uses-vars": "error",
       // Disable React Compiler rules — this project doesn't use the compiler
       "react-hooks/set-state-in-effect": "off",
       "react-hooks/preserve-manual-memoization": "off",

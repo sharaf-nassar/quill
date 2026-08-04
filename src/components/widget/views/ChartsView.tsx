@@ -39,6 +39,7 @@ import { useCodeStats } from "../../../hooks/useCodeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
 import { useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
 import { formatNumber } from "../../../utils/format";
+import { providerHue, providerTag } from "../../../utils/providers";
 import { formatRetentionCutoff } from "../../../utils/retention";
 import { formatTokenCount } from "../../../utils/tokens";
 import type {
@@ -71,19 +72,6 @@ const HUE_CACHE = "var(--metric-runtime)";
  */
 function gradientId(prefix: string, key: string): string {
   return `${prefix}-${key.replace(/\W/g, "")}`;
-}
-
-/** Provider identity hue. An unrecognized producer still has to be charted. */
-function providerHue(provider: string): string {
-  if (provider === "claude") return "var(--provider-claude)";
-  if (provider === "codex") return "var(--provider-codex)";
-  if (provider === "mini_max") return "var(--provider-minimax)";
-  return "var(--provider-agent)";
-}
-
-function providerTag(provider: string): string {
-  if (provider === "mini_max") return "MINIMAX";
-  return provider.replace(/_/g, "").toUpperCase();
 }
 
 const DAY_MS = 86_400_000;

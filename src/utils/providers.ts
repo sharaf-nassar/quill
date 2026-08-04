@@ -8,6 +8,20 @@ export function providerLabel(provider: IntegrationProvider): string {
   return "MiniMax";
 }
 
+export function providerTag(provider: string): string {
+  if (provider === "claude" || provider === "codex" || provider === "mini_max") {
+    return providerLabel(provider).toUpperCase();
+  }
+  return provider.replace(/_/g, "").toUpperCase();
+}
+
+export function providerHue(provider: string): string {
+  if (provider === "claude") return "var(--provider-claude)";
+  if (provider === "codex") return "var(--provider-codex)";
+  if (provider === "mini_max") return "var(--provider-minimax)";
+  return "var(--provider-agent)";
+}
+
 export function normalizeProviderScope(
   scope: IntegrationProvider[] | null | undefined,
 ): IntegrationProvider[] {

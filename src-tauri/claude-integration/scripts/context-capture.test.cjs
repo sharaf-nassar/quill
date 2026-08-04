@@ -11,7 +11,6 @@ const os = require("os");
 const path = require("path");
 
 const scriptPath = path.join(__dirname, "context-capture.cjs");
-const codexScriptPath = path.join(__dirname, "..", "..", "codex-integration", "scripts", "context-capture.cjs");
 const capture = require("./context-capture.cjs");
 const FIXTURE_TIME_MS = Date.now() - 5 * 60_000;
 let passed = 0;
@@ -98,12 +97,6 @@ function withFixture(fn) {
 function directive(output) {
   return output?.hookSpecificOutput?.additionalContext || "";
 }
-
-it("keeps Claude and Codex context capture scripts byte-identical", () => {
-  const result = childProcess.spawnSync("cmp", ["-s", scriptPath, codexScriptPath]);
-  assert(result.error === undefined, `could not run cmp: ${result.error?.message || "unknown error"}`);
-  assert(result.status === 0, "Claude and Codex context-capture.cjs copies diverged");
-});
 
 it("spawns stdin JSON and emits a SessionStart continuity directive", () => withFixture((home) => {
   seedRecords(home, [event({

@@ -94,6 +94,7 @@ Write-Host "[demo] codex:    $env:QUILL_CODEX_SESSIONS_DIR"
 
 $seederArgs = @(
     (Join-Path $RepoRoot "scripts\populate_dummy_data.py"),
+    "--bin",          $QuillBin,
     "--data-dir",     $env:QUILL_DATA_DIR,
     "--rules-dir",    $env:QUILL_RULES_DIR,
     "--projects-dir", $env:QUILL_CLAUDE_PROJECTS_DIR,

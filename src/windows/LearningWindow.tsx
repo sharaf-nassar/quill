@@ -1,5 +1,4 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useLearningData } from "../hooks/useLearningData";
 import { normalizeProviderScope } from "../utils/providers";
 import StatusStrip from "../components/learning/StatusStrip";
@@ -162,17 +161,9 @@ function LearningPanel() {
     updateSettings({ ...settings, enabled: on });
   };
 
-  const handleClose = async () => {
-    await getCurrentWindow().close();
-  };
-
   if (loading) {
     return (
       <div className="learning-window">
-        <div className="learning-window-titlebar" data-tauri-drag-region>
-          <span className="learning-window-title" data-tauri-drag-region>Learning</span>
-          <button className="learning-window-close" onClick={handleClose} aria-label="Close">&times;</button>
-        </div>
         <div className="learning-app">
           <div className="learning-loading">Loading...</div>
         </div>
@@ -182,10 +173,6 @@ function LearningPanel() {
 
   return (
     <div className="learning-window">
-      <div className="learning-window-titlebar" data-tauri-drag-region>
-        <span className="learning-window-title" data-tauri-drag-region>Learning</span>
-        <button className="learning-window-close" onClick={handleClose} aria-label="Close">&times;</button>
-      </div>
       <div className="learning-app">
       <div className="learning-toolbar">
         <span className="learning-toolbar-label">Learning</span>

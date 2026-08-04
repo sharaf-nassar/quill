@@ -5,6 +5,8 @@ records the final feature-020 query, contention, cache, and planner gates. Later
 sections retain diagnostic attempts as history; this final verdict supersedes
 their interim failures and deferred decisions.
 
+**Archived tooling 2026-08-03.** `widget_query_perf_spike` was removed after this record was frozen. Every command line below is an original measurement transcript, not a runnable current command.
+
 ## Frozen corpus
 
 The source was the live Linux database at
@@ -33,7 +35,7 @@ table contributes to a recorded result.
 
 ## Protocol
 
-`widget_query_perf_spike` is a maintainer-only Cargo binary. `freeze` opens the
+`widget_query_perf_spike` was a maintainer-only Cargo binary. `freeze` opened the
 source read-only, refuses to overwrite its destination, uses SQLite online
 backup, validates the copy, and removes destination write permission. `measure`
 refuses a writable corpus and opens a fresh read-only `Storage` for each query,

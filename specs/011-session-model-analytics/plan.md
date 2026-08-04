@@ -125,7 +125,7 @@ src/
 └── types.ts                      # Model analytics contract types
 
 scripts/
-├── populate_dummy_data.py        # Matching schema plus Claude/Codex JSONLs
+├── populate_dummy_data.py        # Migrated database plus Claude/Codex JSONLs
 ├── run_quill_demo.sh             # Isolated cross-provider demo paths
 └── run_quill_demo.ps1            # Windows isolated demo paths
 ```
@@ -153,11 +153,13 @@ Build a process-guarded background runner that persists root-discovery
 completeness, inventories every supported source, replaces one changed source per
 short transaction, retains last-known-good rows on read failure, and prunes only
 after complete discovery. Resolve cross-source root graphs after adapter parsing.
-Start pending or interrupted work during app setup, expose retry, and integrate
-the same source replacer with startup scan plus a source-keyed live queue admitted
-before session-keyed search coalescing. Existing deletion transactions explicitly
-delete observation children and suppress retained sources; suppressed rows never
-contribute analytics scope, and no independent expiry is introduced.
+Start pending or interrupted work during app setup and expose retry. Shared
+provider walkers derive strict retained and permissive search views. Validated
+live sources enter one canonical-source coordinator with independent model and
+transcript completion, revision, and backoff before session-keyed search
+coalescing. Existing deletion transactions explicitly delete observation
+children and suppress retained sources; suppressed rows never contribute
+analytics scope, and no independent expiry is introduced.
 
 ### Phase 3: Aggregation and IPC
 

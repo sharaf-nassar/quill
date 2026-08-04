@@ -561,8 +561,9 @@ pub(crate) fn available_disk_space(path: &Path) -> Result<u64, String> {
     }
     // SAFETY: `statvfs` returned 0, so it initialized the struct.
     let stats = unsafe { stats.assume_init() };
-    stats
-        .f_bavail
+    #[allow(clippy::useless_conversion)] // `f_bavail` is u32 on Apple, u64 on Linux.
+    let available_blocks = u64::from(stats.f_bavail);
+    available_blocks
         .checked_mul(stats.f_frsize)
         .ok_or_else(|| "Free disk space value overflowed the delete-phase preflight".to_string())
 }

@@ -443,7 +443,6 @@ async fn analyze_observations_stream(
         phase: crate::cc_client::Phase::StreamA,
         prompt,
         preamble: preamble.to_string(),
-        model: crate::cc_client::Model::Sonnet46,
         max_tokens,
     })
     .await
@@ -552,7 +551,6 @@ async fn analyze_git_stream(
         phase: crate::cc_client::Phase::StreamB,
         prompt,
         preamble: preamble.to_string(),
-        model: crate::cc_client::Model::Sonnet46,
         max_tokens,
     })
     .await
@@ -721,7 +719,6 @@ async fn analyze_sessions_stream(
         phase: crate::cc_client::Phase::StreamC,
         prompt,
         preamble: preamble.to_string(),
-        model: crate::cc_client::Model::Sonnet46,
         max_tokens,
     })
     .await
@@ -745,10 +742,8 @@ async fn analyze_sessions_stream(
 
 /// Synthesis phase: combine findings from Stream A and Stream B into a final AnalysisOutput.
 /// Uses the pinned Sonnet 4.6 model to cross-reference patterns, resolve
-/// contradictions, and deduplicate. Feature 005 US5 T060 (R-7.2 / H-7 /
-/// FR-025): synthesis is pinned to `Model::Sonnet46` (the full pinned model
-/// name), not the rolling `sonnet` alias, so the pipeline is single-model and
-/// per-run cost is attributed to a stable model id.
+/// contradictions, and deduplicate. The client pins Sonnet 4.6 so the
+/// pipeline stays single-model and costs retain a stable model id.
 #[allow(clippy::too_many_arguments)]
 async fn synthesize_findings(
     obs_findings: Option<&StreamFindings>,
@@ -864,10 +859,6 @@ async fn synthesize_findings(
             phase: crate::cc_client::Phase::Synthesis,
             prompt,
             preamble: preamble.to_string(),
-            // Feature 005 US5 T060 (R-7.2 / H-7 / FR-025): pinned Sonnet 4.6,
-            // not the rolling `sonnet` alias — single-model pipeline + stable
-            // cost attribution.
-            model: crate::cc_client::Model::Sonnet46,
             max_tokens,
         })
         .await
@@ -2175,9 +2166,6 @@ mod tests {
                 phase: crate::cc_client::Phase::Synthesis,
                 prompt: "synthesis prompt body".to_string(),
                 preamble: "synthesis preamble".to_string(),
-                // Feature 005 US5 T060: synthesis is pinned to Sonnet 4.6
-                // (single-model pipeline); mirror the production model arg.
-                model: crate::cc_client::Model::Sonnet46,
                 max_tokens: 8192,
             })
             .await
@@ -2210,8 +2198,6 @@ mod tests {
             phase: crate::cc_client::Phase::Synthesis,
             prompt: "p".to_string(),
             preamble: "pre".to_string(),
-            // Feature 005 US5 T060: pinned Sonnet 4.6 (single-model pipeline).
-            model: crate::cc_client::Model::Sonnet46,
             max_tokens: 8192,
         })
         .await

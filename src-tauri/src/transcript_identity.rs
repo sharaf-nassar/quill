@@ -2,14 +2,176 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::fs::Metadata;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::integrations::IntegrationProvider;
 
 /// Shared retained-transcript read cap used by model and runtime analytics.
 pub(crate) const RETAINED_TRANSCRIPT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const STABLE_READ_MAX_ATTEMPTS: usize = 3;
+
+/// Filesystem metadata used by both retained analytics fast paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourceFastFingerprint {
+    pub(crate) mtime_ns: i64,
+    pub(crate) size_bytes: i64,
+}
+
+impl ModelSourceFastFingerprint {
+    pub(crate) const fn mtime_ns(self) -> i64 {
+        self.mtime_ns
+    }
+
+    pub(crate) const fn size_bytes(self) -> i64 {
+        self.size_bytes
+    }
+}
+
+/// Complete fingerprint computed from one stable source buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSourceFingerprint {
+    fast: ModelSourceFastFingerprint,
+    content_sha256: String,
+}
+
+impl ModelSourceFingerprint {
+    pub(crate) fn from_content(fast: ModelSourceFastFingerprint, content: &[u8]) -> Self {
+        Self {
+            fast,
+            content_sha256: model_source_content_sha256(content),
+        }
+    }
+
+    pub(crate) const fn fast(&self) -> ModelSourceFastFingerprint {
+        self.fast
+    }
+
+    pub(crate) fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum StableTranscriptReadError {
+    Read(std::io::Error),
+    InvalidMetadata,
+    SourceTooLarge,
+    UnstableSource,
+}
+
+impl fmt::Display for StableTranscriptReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => write!(formatter, "cannot read retained transcript: {error}"),
+            Self::InvalidMetadata => formatter.write_str("retained transcript metadata is invalid"),
+            Self::SourceTooLarge => formatter.write_str("retained transcript exceeds 256 MiB"),
+            Self::UnstableSource => {
+                formatter.write_str("retained transcript changed during bounded read retries")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StableTranscriptReadError {}
+
+#[cfg(unix)]
+type SourceFileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type SourceFileIdentity = Option<std::time::SystemTime>;
+
+#[cfg(unix)]
+fn source_file_identity(metadata: &Metadata) -> SourceFileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn source_file_identity(metadata: &Metadata) -> SourceFileIdentity {
+    metadata.created().ok()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StableSourceStat {
+    identity: SourceFileIdentity,
+    fast: ModelSourceFastFingerprint,
+}
+
+fn stable_source_stat(metadata: &Metadata) -> Result<StableSourceStat, StableTranscriptReadError> {
+    let modified = metadata
+        .modified()
+        .map_err(StableTranscriptReadError::Read)?;
+    let elapsed = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StableTranscriptReadError::InvalidMetadata)?;
+    Ok(StableSourceStat {
+        identity: source_file_identity(metadata),
+        fast: ModelSourceFastFingerprint {
+            mtime_ns: i64::try_from(elapsed.as_nanos())
+                .map_err(|_| StableTranscriptReadError::InvalidMetadata)?,
+            size_bytes: i64::try_from(metadata.len())
+                .map_err(|_| StableTranscriptReadError::InvalidMetadata)?,
+        },
+    })
+}
+
+/// Convert already-fetched metadata without another stat.
+pub(crate) fn model_source_fast_fingerprint(
+    metadata: &Metadata,
+) -> Result<ModelSourceFastFingerprint, StableTranscriptReadError> {
+    stable_source_stat(metadata).map(|stat| stat.fast)
+}
+
+/// Read one bounded source version, rejecting path swaps and concurrent writes.
+pub(crate) fn read_stable_transcript(
+    path: &Path,
+) -> Result<(Vec<u8>, ModelSourceFastFingerprint), StableTranscriptReadError> {
+    for _ in 0..STABLE_READ_MAX_ATTEMPTS {
+        let before =
+            stable_source_stat(&std::fs::metadata(path).map_err(StableTranscriptReadError::Read)?)?;
+        if u64::try_from(before.fast.size_bytes())
+            .is_ok_and(|size| size > RETAINED_TRANSCRIPT_MAX_BYTES)
+        {
+            return Err(StableTranscriptReadError::SourceTooLarge);
+        }
+
+        let mut file = std::fs::File::open(path).map_err(StableTranscriptReadError::Read)?;
+        let opened_before =
+            stable_source_stat(&file.metadata().map_err(StableTranscriptReadError::Read)?)?;
+        if opened_before != before {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        file.by_ref()
+            .take(RETAINED_TRANSCRIPT_MAX_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(StableTranscriptReadError::Read)?;
+        if bytes.len() as u64 > RETAINED_TRANSCRIPT_MAX_BYTES {
+            return Err(StableTranscriptReadError::SourceTooLarge);
+        }
+
+        let opened_after =
+            stable_source_stat(&file.metadata().map_err(StableTranscriptReadError::Read)?)?;
+        let after =
+            stable_source_stat(&std::fs::metadata(path).map_err(StableTranscriptReadError::Read)?)?;
+        let read_size_matches = usize::try_from(after.fast.size_bytes()).ok() == Some(bytes.len());
+        if before == opened_after && before == after && read_size_matches {
+            return Ok((bytes, after.fast));
+        }
+    }
+    Err(StableTranscriptReadError::UnstableSource)
+}
+
+/// Hash the exact stable bytes consumed by either analytics parser.
+pub(crate) fn model_source_content_sha256(content: &[u8]) -> String {
+    hex::encode(Sha256::digest(content))
+}
 
 /// One successfully decoded JSONL record and its zero-based source ordinal.
 #[derive(Clone, Debug)]

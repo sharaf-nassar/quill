@@ -94,40 +94,6 @@ fn classify_validation_retry(
         }
     }
 }
-#[derive(Clone)]
-struct PendingAnalyticsAdmission {
-    source: sessions::DiscoveredRetainedJsonlSource,
-    generation: u64,
-    model_pending: bool,
-    transcript_pending: bool,
-    consecutive_failures: u32,
-    wake: Arc<tokio::sync::Notify>,
-}
-
-impl PendingAnalyticsAdmission {
-    fn apply_attempt(
-        &mut self,
-        generation: u64,
-        model_succeeded: bool,
-        transcript_succeeded: bool,
-    ) -> bool {
-        if self.generation != generation {
-            return false;
-        }
-        if self.model_pending && model_succeeded {
-            self.model_pending = false;
-        }
-        if self.transcript_pending && transcript_succeeded {
-            self.transcript_pending = false;
-        }
-        true
-    }
-
-    fn is_complete(&self) -> bool {
-        !self.model_pending && !self.transcript_pending
-    }
-}
-
 struct ServerState {
     storage: &'static Storage,
     secret: String,
@@ -137,7 +103,6 @@ struct ServerState {
     session_rate_limiter: Mutex<VecDeque<Instant>>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     pending_validation_retries: Mutex<HashMap<String, PendingValidationRetry>>,
-    pending_analytics_admissions: Mutex<HashMap<String, PendingAnalyticsAdmission>>,
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
 }
@@ -194,7 +159,6 @@ pub async fn start_server(
         session_rate_limiter: Mutex::new(VecDeque::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
         pending_validation_retries: Mutex::new(HashMap::new()),
-        pending_analytics_admissions: Mutex::new(HashMap::new()),
         app_handle,
         session_index,
     });
@@ -494,7 +458,7 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                 .await;
                 match result.map(classify_validation_retry) {
                     Ok(ValidationRetryOutcome::Promote(source)) => {
-                        queue_validated_analytics_admission(state.clone(), source);
+                        enqueue_validated_retained_source(&state, source);
                         if state.session_index.is_some() {
                             queue_session_notify(state.clone(), payload);
                         }
@@ -546,113 +510,12 @@ fn remove_validation_retry(state: &ServerState, key: &str, generation: u64) {
     }
 }
 
-fn analytics_admission_key(source: &sessions::DiscoveredRetainedJsonlSource) -> String {
-    format!("{}:{}", source.provider.as_str(), source.source_key)
-}
-
-fn queue_validated_analytics_admission(
-    state: Arc<ServerState>,
+fn enqueue_validated_retained_source(
+    state: &ServerState,
     source: sessions::DiscoveredRetainedJsonlSource,
 ) {
-    let key = analytics_admission_key(&source);
-    let should_spawn = {
-        let mut pending = state.pending_analytics_admissions.lock();
-        if let Some(entry) = pending.get_mut(&key) {
-            entry.source = source;
-            entry.generation = entry.generation.saturating_add(1);
-            entry.model_pending = true;
-            entry.transcript_pending = true;
-            entry.consecutive_failures = 0;
-            entry.wake.notify_one();
-            false
-        } else {
-            pending.insert(
-                key.clone(),
-                PendingAnalyticsAdmission {
-                    source,
-                    generation: 0,
-                    model_pending: true,
-                    transcript_pending: true,
-                    consecutive_failures: 0,
-                    wake: Arc::new(tokio::sync::Notify::new()),
-                },
-            );
-            true
-        }
-    };
-    if should_spawn {
-        tauri::async_runtime::spawn(drain_analytics_admission_retry(state, key));
-    }
-}
-
-async fn drain_analytics_admission_retry(state: Arc<ServerState>, key: String) {
-    loop {
-        let Some(pending) = state.pending_analytics_admissions.lock().get(&key).cloned() else {
-            return;
-        };
-
-        let model_error = pending
-            .model_pending
-            .then(|| {
-                crate::enqueue_model_usage_live_source(&state.app_handle, pending.source.clone())
-                    .err()
-            })
-            .flatten();
-        let transcript_error = pending
-            .transcript_pending
-            .then(|| {
-                crate::enqueue_transcript_analytics_live_source(
-                    &state.app_handle,
-                    pending.source.clone(),
-                )
-                .err()
-            })
-            .flatten();
-        if let Some(error) = &model_error {
-            log::error!("Failed to admit retained transcript to model queue: {error}");
-        }
-        if let Some(error) = &transcript_error {
-            log::error!("Failed to admit retained transcript to analytics queue: {error}");
-        }
-
-        let retry_delay = {
-            let mut admissions = state.pending_analytics_admissions.lock();
-            let Some(current) = admissions.get_mut(&key) else {
-                return;
-            };
-            if !current.apply_attempt(
-                pending.generation,
-                model_error.is_none(),
-                transcript_error.is_none(),
-            ) {
-                None
-            } else {
-                if current.is_complete() {
-                    admissions.remove(&key);
-                    return;
-                }
-                current.consecutive_failures = current.consecutive_failures.saturating_add(1);
-                let doublings = current.consecutive_failures.saturating_sub(1).min(5);
-                if current.consecutive_failures == 6 {
-                    log::warn!(
-                        "Analytics admission reached capped backoff for provider={}; retaining pending work",
-                        current.source.provider.as_str(),
-                    );
-                }
-                Some((
-                    Duration::from_secs(1_u64 << doublings),
-                    Arc::clone(&current.wake),
-                ))
-            }
-        };
-        if let Some((delay, wake)) = retry_delay {
-            tokio::select! {
-                () = tokio::time::sleep(delay) => {}
-                () = wake.notified() => {}
-            }
-        } else {
-            tokio::task::yield_now().await;
-        }
+    if let Err(error) = crate::enqueue_retained_live_source(&state.app_handle, source) {
+        log::error!("Failed to enqueue validated retained transcript: {error}");
     }
 }
 
@@ -1531,9 +1394,8 @@ async fn post_session_notify(
     };
 
     if let Some(source) = model_source {
-        // Canonical-source admission has its own retry lifecycle. Session
-        // Search availability cannot suppress either analytics pipeline.
-        queue_validated_analytics_admission(state.clone(), source);
+        // Session Search availability cannot suppress either analytics domain.
+        enqueue_validated_retained_source(&state, source);
     }
 
     if state.session_index.is_none() {

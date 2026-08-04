@@ -1,5 +1,7 @@
 # Plan: retention-pruning
 
+**Historical implementation plan.** The spike binaries named below were removed on 2026-08-03 after their evidence was frozen. Their paths and commands document completed design work and are not current runnable surfaces.
+
 Implementation plan for the clarified spec. All seven Clarifications (Q1–Q7)
 are binding, as are the Spec Review's code-verified corrections. Scope is one
 epic in two phases: **Phase 1 non-destructive** (drop

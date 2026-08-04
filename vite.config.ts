@@ -1,10 +1,6 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { sentryVitePlugin } from "@sentry/vite-plugin";
-import { resolve } from "path";
-import { fileURLToPath } from "url";
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
 const sentryUpload =
   process.env.SENTRY_AUTH_TOKEN && process.env.NODE_ENV === "production"
@@ -64,13 +60,7 @@ export default defineConfig({
   envPrefix: ["VITE_", "TAURI_"],
   build: {
     target: "esnext",
-    minify: "esbuild",
     sourcemap: true,
     chunkSizeWarningLimit: 550,
-    rollupOptions: {
-      input: {
-        main: resolve(__dirname, "index.html"),
-      },
-    },
   },
 });

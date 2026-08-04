@@ -1,14 +1,14 @@
 # Retention timing spike — measured budgets
 
-Output of `src-tauri/src/bin/retention_spike.rs`, the measurement the plan
+Captured output of the former `src-tauri/src/bin/retention_spike.rs`, the measurement the plan
 defers every retention numeric budget to ("*Budgets come from a spike, not
 from this document*", plan.md). This file records what the spike measured and
 the constants the chunked delete engine and its preflight are therefore
 allowed to hard-code. It is a **measurement, not a test** — nothing here is a
 CI threshold.
 
-Reproduce with `cargo run --release --bin retention_spike` from `src-tauri/`.
-The `QUILL_RETENTION_SPIKE_*` environment variables shrink the corpus for a
+**Archived 2026-08-03.** `retention_spike` was removed after these budgets were frozen. Its original invocation, `cargo run --release --bin retention_spike` from `src-tauri/`, is no longer runnable.
+The former `QUILL_RETENTION_SPIKE_*` environment variables could shrink the corpus for a
 smoke run; every number below comes from the defaults.
 
 ## Environment

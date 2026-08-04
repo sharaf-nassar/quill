@@ -4,9 +4,6 @@ import type {
   RangeType,
 } from "../types";
 
-export const WIDGET_DISPLAY_RANGES = ["1h", "6h", "24h", "7d"] as const;
-
-export type WidgetDisplayRange = (typeof WIDGET_DISPLAY_RANGES)[number];
 export type HistoryQueryRange = RangeType | "2h" | "12h" | "2d" | "14d";
 
 const RANGE_DURATION_MS: Record<HistoryQueryRange, number> = {
@@ -21,11 +18,9 @@ const RANGE_DURATION_MS: Record<HistoryQueryRange, number> = {
   "30d": 30 * 24 * 60 * 60 * 1000,
 };
 
-export interface WidgetQueryDescriptor {
+interface WidgetQueryDescriptor {
   readonly command: string;
   readonly args: Readonly<Record<string, unknown>>;
-  readonly requestedRange: HistoryQueryRange;
-  readonly window: "current" | "comparison";
 }
 
 export function queryRangeMs(range: HistoryQueryRange): number {
@@ -65,20 +60,14 @@ export function codeInsightsHistoryQueries(
         sessionId: null,
         cwd: null,
       },
-      requestedRange,
-      window: "comparison",
     },
     {
       command: "get_code_stats_history",
       args: { range: requestedRange },
-      requestedRange,
-      window: "comparison",
     },
     {
       command: "get_llm_runtime_stats",
       args: { range: requestedRange },
-      requestedRange,
-      window: "comparison",
     },
   ];
 }
@@ -96,20 +85,14 @@ export function weeklyTrendQueries(): readonly WidgetQueryDescriptor[] {
         sessionId: null,
         cwd: null,
       },
-      requestedRange: WEEKLY_TRENDS_HISTORY_RANGE,
-      window: "comparison",
     },
     {
       command: "get_code_stats_history",
       args: { range: WEEKLY_TRENDS_HISTORY_RANGE },
-      requestedRange: WEEKLY_TRENDS_HISTORY_RANGE,
-      window: "comparison",
     },
     {
       command: "get_llm_runtime_stats",
       args: { range: WEEKLY_TRENDS_HISTORY_RANGE },
-      requestedRange: WEEKLY_TRENDS_HISTORY_RANGE,
-      window: "comparison",
     },
   ];
 }
@@ -121,13 +104,6 @@ export interface BreakdownQueryOptions {
   readonly hookProvider?: IntegrationProvider | null;
 }
 
-export interface BreakdownQueryDescriptor {
-  readonly command: string;
-  readonly args: Readonly<Record<string, unknown>>;
-  readonly requestedRange: RangeType;
-  readonly mode: BreakdownMode;
-}
-
 const SESSION_BREAKDOWN_LIMIT = 200;
 const SKILL_BREAKDOWN_LIMIT = 100;
 const HOOK_BREAKDOWN_LIMIT = 100;
@@ -136,7 +112,7 @@ export function breakdownQuery(
   mode: BreakdownMode,
   range: RangeType,
   options: BreakdownQueryOptions = {},
-): BreakdownQueryDescriptor {
+): WidgetQueryDescriptor {
   const command =
     mode === "hosts"
       ? "get_host_breakdown"
@@ -166,7 +142,7 @@ export function breakdownQuery(
           ? { range, hostname: null, limit: SESSION_BREAKDOWN_LIMIT }
           : { range };
 
-  return { command, args, requestedRange: range, mode };
+  return { command, args };
 }
 
 /** The visible Projects readout needs a second query except in Projects mode. */
@@ -177,7 +153,7 @@ export function shouldLoadSecondaryProjects(mode: BreakdownMode): boolean {
 export function usageBreakdownQueries(
   mode: BreakdownMode,
   range: RangeType,
-): readonly BreakdownQueryDescriptor[] {
+): readonly WidgetQueryDescriptor[] {
   const selected = breakdownQuery(mode, range);
   return shouldLoadSecondaryProjects(mode)
     ? [selected, breakdownQuery("projects", range)]

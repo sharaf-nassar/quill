@@ -117,6 +117,7 @@ echo "[demo] home:     $HOME" >&2
 # ── Seed ──────────────────────────────────────────────────────────────────────
 
 if ! python3 "$REPO_ROOT/scripts/populate_dummy_data.py" \
+		--bin "$QUILL_BIN" \
 		--data-dir "$QUILL_DATA_DIR" \
 		--rules-dir "$QUILL_RULES_DIR" \
 		--projects-dir "$QUILL_CLAUDE_PROJECTS_DIR" \

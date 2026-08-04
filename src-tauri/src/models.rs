@@ -1482,69 +1482,6 @@ pub struct ModelAnalyticsScope {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct ModelAnalyticsSummary {
-    pub attributed_tokens: i64,
-    pub unattributed_tokens: i64,
-    pub total_tokens: i64,
-    pub attributed_coverage_percent: Option<f64>,
-    pub distinct_models: i64,
-    pub multi_model_sessions: i64,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelUsageRow {
-    pub identity: ModelIdentity,
-    pub attributed_tokens: i64,
-    pub attributed_share_percent: Option<f64>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub observed_turns: i64,
-    pub session_count: i64,
-    pub cache_read_share_percent: Option<f64>,
-    pub first_seen: String,
-    pub last_seen: String,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelAnalyticsResponse {
-    pub generated_at: String,
-    pub range: ModelRange,
-    pub provider: Option<String>,
-    pub represented_providers: Vec<String>,
-    pub scope: ModelAnalyticsScope,
-    pub summary: ModelAnalyticsSummary,
-    pub models: Vec<ModelUsageRow>,
-    pub backfill: ModelBackfillStatus,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelHistoryPoint {
-    pub bucket_start: String,
-    pub bucket_end: String,
-    pub attributed_tokens: i64,
-    pub unattributed_tokens: i64,
-    pub selected_model_tokens: Option<i64>,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelHistoryResponse {
-    pub generated_at: String,
-    pub range: ModelRange,
-    pub provider: Option<String>,
-    pub selected_model: Option<ModelIdentity>,
-    pub bucket_seconds: i64,
-    pub points: Vec<ModelHistoryPoint>,
-    pub building_index: bool,
-}
-
-#[derive(Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
 pub struct ModelSessionRow {
     pub provider: String,
     pub session_id: String,

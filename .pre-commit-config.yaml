@@ -32,7 +32,7 @@ repos:
       - id: clippy
         name: clippy
         language: system
-        entry: scripts/precommit-rust.sh
+        entry: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
         pass_filenames: false
         types: [rust]
 
