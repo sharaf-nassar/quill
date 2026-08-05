@@ -2132,6 +2132,7 @@ mod observed_subagent_tests {
         }
     }
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Lifecycle Fold And Coverage Boundaries]]
     #[test]
     fn lifecycle_truth_table_covers_both_providers() {
         const T1: &str = "2030-01-01T00:00:01Z";

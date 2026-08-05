@@ -656,14 +656,11 @@ function UsageView({ range }: UsageViewProps) {
           )}
         </div>
 
-        {/* Retention keeps its disclosure in the mode that actually degrades:
-            `get_session_breakdown` reads pruned tool activity, while skill and
-            hook counts are never pruned (constitution #1). */}
         {mode === "sessions" && retention.cutoff && (
           <p
             className="wg-breakdown-note"
             role="note"
-            title="Sub-agent trees and tool activity recorded before this date were pruned. Sessions that end before it are marked, not zeroed."
+            title="Tool activity recorded before this date was pruned."
           >
             Retention · tool activity before {formatRetentionCutoff(retention.cutoff)} was pruned
           </p>

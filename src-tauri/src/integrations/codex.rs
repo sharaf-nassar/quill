@@ -2320,6 +2320,7 @@ mod tests {
         assert!(child.reaped, "the hung child must be reaped");
     }
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Managed Lifecycle Hooks]]
     #[test]
     fn hook_observer_contract_preserves_registrations_and_activity_gate() {
         let source = include_str!("../../codex-integration/scripts/hook-observe.cjs");

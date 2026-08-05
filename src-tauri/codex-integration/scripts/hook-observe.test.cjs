@@ -8,6 +8,7 @@ const { buildPayload } = require("./hook-observe.cjs");
 
 const now = new Date("2026-08-04T12:34:56.789Z");
 
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Lifecycle Payloads]]
 test("builds complete lifecycle payloads from official Codex fields", () => {
   for (const source of ["startup", "resume", "clear", "compact"]) {
     const payload = buildPayload(

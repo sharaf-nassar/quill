@@ -6542,6 +6542,7 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Nullable Sessions IPC Overlay]]
     #[test]
     fn session_breakdown_command_overlay_preserves_nullable_ipc() {
         let state = server::ObservedSubagentState::default();

@@ -2026,6 +2026,7 @@ mod tests {
             .count()
     }
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Managed Lifecycle Hooks]]
     #[test]
     fn lifecycle_observers_follow_activity_tracking() {
         let runtime = fixture_runtime();

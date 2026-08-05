@@ -21119,6 +21119,7 @@ mod tests {
 
     /// Session totals still roll up parent and sub-agent chains, while live
     /// subagent coverage remains a command-layer overlay.
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Sessions SQL Excludes Historical Agent State]]
     #[test]
     #[serial]
     fn get_session_breakdown_rolls_up_subagent_tokens() {
@@ -28675,6 +28676,7 @@ mod tests {
         assert_eq!(hook_count, 1);
     }
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Audit Persistence Is Non-Authoritative]]
     #[test]
     #[serial]
     fn hook_observation_preserves_same_time_agent_identity() {

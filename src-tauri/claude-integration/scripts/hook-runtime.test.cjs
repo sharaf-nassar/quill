@@ -99,6 +99,7 @@ it("maps PostToolUseFailure details into a post observation", () => {
     "failure metadata was lost");
 });
 
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Lifecycle Payloads]]
 it("builds Claude lifecycle observations with official sources and identities", () => {
   const timestamp = "2026-08-04T12:34:56.789Z";
   const config = { hostname: "configured-host" };

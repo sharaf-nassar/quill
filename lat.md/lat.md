@@ -10,6 +10,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[model-rollup-tests]] — Model backfill resume, authority, handoff, and maintenance test specs
 - [[rollup-retention-tests]] — Fold-before-prune coverage and hourly-authority test specs
 - [[frontend-cache-tests]] — Frontend invoke cache, refresh cadence, and lifecycle test specs
+- [[live-subagent-count-tests]] — Observed subagent lifecycle, IPC, provider, audit, and Sessions-row test specs
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs

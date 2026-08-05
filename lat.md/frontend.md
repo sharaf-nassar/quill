@@ -133,7 +133,7 @@ The insight line carries one computed insight per window, chosen by the rotation
 
 Priority is fixed and ordered by how much of the story the rest of the widget does not already tell — savings appears nowhere else, the cached-token volume is only implied by the footer, and the provider split is already drawn directly above, so it speaks last. The first eligible candidate wins, and a higher-priority candidate whose source has not answered yet holds the line empty rather than letting a lower one appear and be swapped out a moment later; a failed read counts as answered-with-nothing, so one broken source cannot mute the line. Selection is a pure function of the window and its resolved data — no clock and no counter rotates it under the reader, so the same window with the same data always states the same thing.
 
-The breakdown switches five modes over one row grammar — status dot, name, identity chip, dim secondary count, primary value, recency — filled per mode: Sessions (provider chip, tokens, live count in the header), Projects (session count, tokens), Hosts (turns, tokens), Skills (range-scoped uses, last used), Hooks (QUILL chip where Quill-deployed, fires, last fired). The visible Projects readout uses one secondary project request except while Projects is selected, when the selected breakdown result supplies both regions; no command-and-args key mounts twice. Honesty disclosures keep the home that matches their data: the Hooks header carries the Claude/Codex tracking-asymmetry help, and the condensed retention line sits in Sessions, the only mode whose source [[lat.md/frontend#Frontend#Components#Retention Degradation]] actually prunes — skill and hook counts are never pruned, so claiming loss there would be its own lie.
+The breakdown switches five modes over one row grammar — status dot, name, optional metadata, identity chip, primary value, recency — filled per mode: Sessions (positive observed-subagent count, provider chip, tokens), Projects (session count, tokens), Hosts (turns, tokens), Skills (range-scoped uses, last used), Hooks (QUILL chip where Quill-deployed, fires, last fired). Session project text is the only shrinkable item, so the optional count and fixed provider/token/recency columns survive the 320 px minimum. The visible Projects readout uses one secondary project request except while Projects is selected, when the selected breakdown result supplies both regions; no command-and-args key mounts twice. The Hooks header retains its Claude/Codex audit-tracking disclosure.
 
 #### Trends View
 
@@ -268,14 +268,12 @@ purpose: `range_to_duration` caps every range-based reader at 30 days and the
 retention preset floor is 30 days, so `get_code_stats`,
 `get_code_stats_history` and `get_llm_runtime_stats` provably cannot reach a
 pruned row and must **not** carry the banner — claiming loss where there is none
-is as dishonest as hiding loss where there is. Only the session-scoped readers
-degrade: `get_session_breakdown` and `get_session_subagent_tree` (surface
-`sessions`) and `get_batch_session_code_stats` (surface `session-search`).
-Session search still mounts the full banner from
+is as dishonest as hiding loss where there is. Only Session Search renders
+this banner for `get_batch_session_code_stats` (surface `session-search`). It
+mounts the full banner from
 [[src/windows/SessionsWindowView.tsx]]; the widget has no room for a
-multi-line disclosure, so its Sessions breakdown, Trends rows, and Charts
-panels state the same cutoff as a condensed one-line variant placed in the
-band whose own source is pruned. Styling is chrome-grey by design:
+multi-line disclosure, so affected Trends rows and Charts panels state the
+same cutoff as a condensed one-line variant. Styling is chrome-grey by design:
 DESIGN.md reserves green/amber/red for the severity meter, and a boundary the
 user opted into is a fact about the instrument, not an alarm.
 
@@ -291,19 +289,6 @@ the delete engine's `length(timestamp) = 24 AND timestamp LIKE '%Z'` conformance
 guard, which refuses to delete rows it cannot compare), and "pruned" means
 *pre-cutoff*, never *provably empty* — live rows and non-conforming timestamps
 survive below the watermark, so all copy says "may be incomplete".
-
-#### Mixed-Horizon Sub-Agent Counts
-
-`SessionBreakdown.subagent_count` is an accepted, documented limitation rather than a bug to fix here: it can outlive the tree it summarises, so the Sessions breakdown renders it marked instead of exact.
-
-The count unions range-bounded `token_snapshots ∪ response_times ∪ tool_actions`
-with overlapping `retention_daily_aggregates`. Retention prunes only raw tool
-actions, and the retained table has daily rather than exact-timestamp grain, so
-the partial first day remains a mixed horizon and can disagree with its own
-drilldown. The treatment is to dagger the badge, explain the mixed horizon in
-its title, and replace the tree's "No sub-agents" empty state with "Sub-agent
-detail pruned (before <date>)" so the contradiction is named rather than left
-for the user to discover. `has_subagents` degrades the same way.
 
 The same shape appears in session search from the other direction: the
 full-text index is never pruned, so a hit survives after the SQL rows behind its
@@ -329,6 +314,14 @@ an invariant instead of an edit:
 
 The 30-day cap is what makes the three range-based readers provably unaffected,
 so an unbounded range is precisely the change that breaks the proof.
+
+### Observed Subagent Counts
+
+Sessions rows render only positive current-process lifecycle evidence; null and zero reserve no element and make no numeric claim.
+
+[[src/components/widget/views/UsageView.tsx#UsageView]] orders each row as project → optional `+N` → provider → tokens → recency. The count is neutral, tabular, non-focusable, independent of the recency-based live dot, and exposes exactly one `aria-label`: `1 subagent observed open` or `N subagents observed open`. Long projects ellipsize before fixed columns clip at 320 px.
+
+`SessionBreakdown.observed_subagent_count` is a required `number | null`. Positive means Quill observed that many root-linked starts without later observed stops inside a trustworthy current-boot epoch; it does not prove process liveness. Disabled or incomplete coverage stays null, and a missed stop can remain positive until parent end or restart.
 
 ### Restart Component
 
@@ -425,7 +418,9 @@ invalidates entries; only an emitted event does. `tokens-updated`,
 `sessions-index-updated`, `transcript-analytics-updated`,
 `context-savings-updated`, `hooks-observed-updated`, and data-changing
 `model-analytics-updated` events each invalidate only hooks that declared that
-dependency.
+dependency. Sessions and Hooks both declare `hooks-observed-updated`; accepted
+lifecycle changes therefore join the same mounted fan-out no later than five
+seconds after the event, with no feature-specific timer or polling path.
 
 `useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 
@@ -454,7 +449,7 @@ There is no crosshair context any more: the widget's Charts view keeps its three
 
 Key type categories: usage/token tracking (`UsageBucket`, `TokenDataPoint`, `TokenStats`, `ProviderCredits`), context savings (`ContextSavingsAnalytics`, `ContextSavingsEvent`), indicator state (`IndicatorPrimaryProvider`, `IndicatorMetric`, `StatusIndicatorState`), analytics (`BucketStats`, `SessionHealthStats`, `ResponseTimeStats`), learning (`LearnedRule`, `LearningRun`, `LearningSettings`), session search (`SearchHit`, `SearchResults`, `SessionContext`), restart (`ClaudeInstance`, `RestartStatus`), memory (`MemoryFile`, `OptimizationSuggestion`).
 
-Display enums: `RangeType` (now carrying the widget's `6h` step), `TrendType`, `BreakdownMode`, `SortMode`. `TimeMode` and `AnalyticsTab` went with the usage-row time modes and the analytics tab bar. `RangeType` carries the all-range retention invariant in its doc comment, and `SessionBreakdown.subagent_count` / `SessionCodeStats` carry their retention degradation notes — both described in [[frontend#Frontend#Components#Retention Degradation]].
+Display enums: `RangeType` (now carrying the widget's `6h` step), `TrendType`, `BreakdownMode`, `SortMode`. `TimeMode` and `AnalyticsTab` went with the usage-row time modes and the analytics tab bar. `RangeType` carries the all-range retention invariant in its doc comment. `SessionBreakdown.observed_subagent_count` carries the nullable current-boot contract described in [[frontend#Frontend#Components#Observed Subagent Counts]]; `SessionCodeStats` retains its independent retention note.
 
 Retention types (`RetentionPolicy`, `RetentionPreview`, `RetentionAuditRecord`, `RetentionMaintenanceProgress`, `RetentionMaintenanceResult`) mirror [[src-tauri/src/retention.rs]] and keep snake_case because they arrive straight off `invoke()` with no mapping layer.
 

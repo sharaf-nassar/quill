@@ -3,6 +3,7 @@ import test from "node:test";
 import { handleInvoke } from "../src/mocks/ipcFixtures.ts";
 import { formatObservedSubagentCount } from "../src/utils/format.ts";
 
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Positive-Only Sessions Rows]]
 test("formats observed subagent counts without inventing unknown or zero", () => {
 	assert.equal(formatObservedSubagentCount(null), null);
 	assert.equal(formatObservedSubagentCount(0), null);
