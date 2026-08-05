@@ -22,6 +22,14 @@ Sibling lifecycle rows retain distinct audit identities, while a failed SQLite a
 
 Command-layer enrichment overlays exact provider, host, and root matches while unmatched storage rows serialize the required field as null.
 
+## Observed-Only Session Merge
+
+An active root with validated root cwd synthesizes before token storage, advances from later activity without accepting subagent cwd, and merges into a later retained row without duplication.
+
+## Observed-Only Merge Boundaries
+
+Synthetic rows obey active coverage, normalized hostname and provider filters, selected range, deterministic limit, provider disable, and global tracking disable.
+
 ## Claude Lifecycle Payloads
 
 Claude's observer carries official lifecycle sources and normalized identity fields, rejecting malformed evidence before transport.
@@ -41,3 +49,11 @@ Codex integration verification preserves the existing event registration set and
 ## Positive-Only Sessions Rows
 
 Frontend formatting and fixtures omit null and zero, expose exact singular or plural labels once, and keep positive counts visible on idle rows.
+
+## Observed-Only Sessions Presentation
+
+Frontend provenance formatting renders unavailable synthetic tokens as an em dash and omits the false zero-turn tooltip claim while retained rows keep real metrics.
+
+## Agent Count Icon Contract
+
+Sessions preserve project, agent count, provider, tokens, and recency order while the count cluster centers an assistive-hidden branch icon beside one labeled tabular count.

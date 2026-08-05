@@ -1436,7 +1436,7 @@ MiniMax live usage comes from the coding plan API at `api.minimax.io` via [[src-
 
 `get_session_breakdown` now accepts optional provider and limit arguments so Codex live views can request a provider-scoped active set without being crowded out by Claude sessions.
 
-`get_session_breakdown` remains provider-agnostic at the row level and rolls up parent plus subagent token and response rows. Storage returns `observed_subagent_count: None`; the Tauri command overlays the shared process-local snapshot by exact provider, hostname, and root session before serializing the required nullable field. The production SQL contains no agent-count enrichment, retention aggregate, or hook-audit scan.
+`get_session_breakdown` remains provider-agnostic at the row level and rolls up parent plus subagent token and response rows. Storage stays retained-only and returns `observed_subagent_count: None` plus `observed_only: false`. The Tauri command merges the shared process-local snapshot by exact provider, normalized hostname, and root session. It advances matching retained rows from valid current-process activity and appends only active, range-matching roots with validated root cwd. Synthetic rows carry `observed_only: true`; ended, unknown, invalid, filtered, or out-of-range roots never synthesize. The production SQL contains no agent-count enrichment, retention aggregate, or hook-audit scan.
 
 The query first materializes range-, provider-, and hostname-scoped token groups, ranks them with a range-bounded indexed response-time maximum, and materializes the requested top-N before turn and project enrichment. Historical transcript and analytics storage remain available to their owning readers but do not project current subagent state.
 

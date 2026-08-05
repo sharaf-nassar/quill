@@ -38,6 +38,7 @@ import {
   formatDurationSecs,
   formatNumber,
   formatObservedSubagentCount,
+  resolveSessionMetrics,
 } from "../../../utils/format";
 import { providerHue, providerTag } from "../../../utils/providers";
 import { formatRetentionCutoff } from "../../../utils/retention";
@@ -322,6 +323,11 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
   const lastActive = new Date(row.last_active).getTime();
   const name = projectName(row.project) ?? row.session_id.slice(0, 8);
   const observedSubagents = formatObservedSubagentCount(row.observed_subagent_count);
+  const metrics = resolveSessionMetrics(
+    formatTokenCount(row.total_tokens),
+    `${formatNumber(row.turn_count)} turns`,
+    row.observed_only,
+  );
   return {
     key: `${row.provider}:${row.hostname}:${row.session_id}`,
     live: Number.isFinite(lastActive) && nowMs - lastActive < LIVE_WINDOW_MS,
@@ -329,9 +335,9 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     chip: { text: providerTag(row.provider), tone: row.provider },
     meta: observedSubagents?.text,
     metaLabel: observedSubagents?.ariaLabel,
-    value: formatTokenCount(row.total_tokens),
+    value: metrics.tokens,
     ago: formatRecency(row.last_active, nowMs),
-    title: `${name} · ${row.hostname} · ${formatNumber(row.turn_count)} turns`,
+    title: [name, row.hostname, metrics.turns].filter(Boolean).join(" · "),
   };
 }
 
@@ -700,7 +706,23 @@ function UsageView({ range }: UsageViewProps) {
                 )}
                 <span className="wg-row-name">{row.name}</span>
                 {row.meta && (
-                  <span className="wg-row-meta wg-num" aria-label={row.metaLabel}>
+                  <span
+                    className="wg-row-meta wg-num"
+                    data-agent={row.metaLabel ? "true" : undefined}
+                    aria-label={row.metaLabel}
+                  >
+                    {row.metaLabel && (
+                      <svg
+                        className="wg-row-agent-icon"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        aria-hidden="true"
+                      >
+                        <circle cx="3" cy="2.5" r="1.25" />
+                        <circle cx="9" cy="9.5" r="1.25" />
+                        <path d="M3 3.75v2A3.75 3.75 0 0 0 6.75 9.5H7.5M3 5.5h2.25A2.75 2.75 0 0 0 8 2.75V2.5" />
+                      </svg>
+                    )}
                     {row.meta}
                   </span>
                 )}

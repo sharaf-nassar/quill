@@ -3503,11 +3503,18 @@ async fn get_session_breakdown(
     observed_subagents: tauri::State<'_, Arc<server::ObservedSubagentState>>,
 ) -> Result<Vec<SessionBreakdown>, String> {
     let storage = get_storage()?;
-    let mut rows = run_blocking(move || {
+    let range_from = storage::range_from_timestamp(&range);
+    let observed_hostname = hostname.clone();
+    let rows = run_blocking(move || {
         storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)
     })?;
-    observed_subagents.overlay(&mut rows);
-    Ok(rows)
+    Ok(observed_subagents.merge(
+        rows,
+        &range_from,
+        observed_hostname.as_deref(),
+        provider,
+        limit,
+    ))
 }
 
 #[tauri::command]
@@ -3704,6 +3711,7 @@ async fn set_activity_tracking_enabled(
     let features =
         run_blocking(move || integrations::set_activity_tracking_enabled(&app_handle, enabled))?;
     observed_subagents.set_activity_tracking_enabled(enabled);
+    let _ = app.emit("hooks-observed-updated", ());
     Ok(features)
 }
 
@@ -3753,6 +3761,7 @@ async fn confirm_enable_provider(
         run_blocking(move || integrations::confirm_enable_with_key(&app_handle, provider, api_key))
     }?;
     observed_subagents.set_provider_enabled(provider, true);
+    let _ = app.emit("hooks-observed-updated", ());
 
     clear_usage_cache().await;
     if let Err(error) = refresh_usage_cache(Some(&app), false).await {
@@ -3773,6 +3782,7 @@ async fn confirm_disable_provider(
         run_blocking(move || integrations::confirm_disable(&app_handle, provider))
     }?;
     observed_subagents.set_provider_enabled(provider, false);
+    let _ = app.emit("hooks-observed-updated", ());
 
     clear_usage_cache().await;
     if let Err(error) = refresh_usage_cache(Some(&app), false).await {
@@ -6578,12 +6588,14 @@ mod tests {
             last_active: "2030-01-01T00:00:02Z".to_string(),
             project: None,
             observed_subagent_count: None,
+            observed_only: false,
         };
         let mut rows = vec![row("covered-root"), row("storage-only-root")];
-        state.overlay(&mut rows);
+        rows = state.merge(rows, "2029-01-01T00:00:00Z", None, None, None);
 
         assert_eq!(rows[0].observed_subagent_count, Some(1));
         assert_eq!(rows[1].observed_subagent_count, None);
+        assert!(!rows[0].observed_only && !rows[1].observed_only);
         assert_eq!(
             serde_json::to_value(&rows).expect("serialize SessionBreakdown IPC")[1]["observed_subagent_count"],
             serde_json::Value::Null

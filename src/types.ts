@@ -195,6 +195,8 @@ export interface SessionBreakdown {
   project: string | null;
   /** Current-boot hook coverage: null when Quill cannot make an exact claim. */
   observed_subagent_count: number | null;
+  /** True until retained token metrics arrive for a current-boot observed root. */
+  observed_only: boolean;
 }
 
 export interface SkillBreakdown {

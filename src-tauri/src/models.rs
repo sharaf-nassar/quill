@@ -297,6 +297,9 @@ pub struct SessionBreakdown {
     /// Current-process hook coverage: null is unknown, zero is covered with
     /// none open, and positive is the root-linked observed-open count.
     pub observed_subagent_count: Option<u32>,
+    /// True when current-process hook evidence supplied the row before the
+    /// first retained token snapshot made its metrics available.
+    pub observed_only: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]

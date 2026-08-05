@@ -319,9 +319,9 @@ so an unbounded range is precisely the change that breaks the proof.
 
 Sessions rows render only positive current-process lifecycle evidence; null and zero reserve no element and make no numeric claim.
 
-[[src/components/widget/views/UsageView.tsx#UsageView]] orders each row as project → optional `+N` → provider → tokens → recency. The count is neutral, tabular, non-focusable, independent of the recency-based live dot, and exposes exactly one `aria-label`: `1 subagent observed open` or `N subagents observed open`. Long projects ellipsize before fixed columns clip at 320 px.
+[[src/components/widget/views/UsageView.tsx#UsageView]] orders each row as project → optional agent count → provider → tokens → recency. Positive counts use a centered inline Agent Orchid branch glyph plus tabular `+N`. The glyph is hidden from assistive technology; its cluster exposes exactly one `aria-label`: `1 subagent observed open` or `N subagents observed open`. Long projects ellipsize before fixed columns clip at 320 px.
 
-`SessionBreakdown.observed_subagent_count` is a required `number | null`. Positive means Quill observed that many root-linked starts without later observed stops inside a trustworthy current-boot epoch; it does not prove process liveness. Disabled or incomplete coverage stays null, and a missed stop can remain positive until parent end or restart.
+`SessionBreakdown.observed_subagent_count` is a required `number | null`. Positive means Quill observed that many root-linked starts without later observed stops inside a trustworthy current-boot epoch; it does not prove process liveness. `observed_only` marks an active current-process root that lacks retained token metrics, so the row renders an em dash for tokens and makes no turns claim. Disabled or incomplete coverage stays null, and a missed stop can remain positive until parent end or restart.
 
 ### Restart Component
 

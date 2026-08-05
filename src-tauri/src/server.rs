@@ -89,6 +89,8 @@ struct ObservedRoot {
     coverage: ObservedCoverage,
     agents: HashMap<String, ObservedAgent>,
     watermark: Option<DateTime<Utc>>,
+    cwd: Option<String>,
+    last_activity: Option<DateTime<Utc>>,
 }
 
 impl ObservedRoot {
@@ -99,6 +101,8 @@ impl ObservedRoot {
             }),
             agents: HashMap::new(),
             watermark: barrier,
+            cwd: None,
+            last_activity: None,
         }
     }
 
@@ -113,19 +117,31 @@ impl ObservedRoot {
             self.advance_watermark(at);
         }
         self.agents.clear();
+        self.cwd = None;
+        self.last_activity = None;
         self.coverage = ObservedCoverage::Invalid(self.watermark);
         true
     }
 
-    fn preserve_compaction(&mut self, at: DateTime<Utc>) -> bool {
+    fn preserve_compaction(&mut self, at: DateTime<Utc>, cwd: Option<String>) -> bool {
         self.advance_watermark(at);
         if matches!(&self.coverage, ObservedCoverage::Invalid(_)) {
             self.coverage = ObservedCoverage::Invalid(self.watermark);
         }
-        false
+        if !matches!(&self.coverage, ObservedCoverage::Active(epoch) if at >= *epoch) {
+            return false;
+        }
+
+        let can_update_cwd = self.last_activity.is_none_or(|last| at >= last);
+        let mut changed = self.observe_activity(at);
+        if can_update_cwd && cwd.is_some() && self.cwd != cwd {
+            self.cwd = cwd;
+            changed = true;
+        }
+        changed
     }
 
-    fn start_epoch(&mut self, at: DateTime<Utc>) -> bool {
+    fn start_epoch(&mut self, at: DateTime<Utc>, cwd: Option<String>) -> bool {
         match &self.coverage {
             ObservedCoverage::Invalid(Some(blocked)) if at <= *blocked => return false,
             ObservedCoverage::Active(current) | ObservedCoverage::Ended(current) => {
@@ -145,6 +161,14 @@ impl ObservedRoot {
         self.agents.retain(|_, agent| agent.at > at);
         self.advance_watermark(at);
         self.coverage = ObservedCoverage::Active(at);
+        self.cwd = cwd;
+        self.last_activity = Some(
+            self.agents
+                .values()
+                .map(|agent| agent.at)
+                .max()
+                .map_or(at, |agent_at| agent_at.max(at)),
+        );
         true
     }
 
@@ -172,6 +196,19 @@ impl ObservedRoot {
         self.agents.clear();
         self.advance_watermark(at);
         self.coverage = ObservedCoverage::Ended(at);
+        self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
+        true
+    }
+
+    fn observe_activity(&mut self, at: DateTime<Utc>) -> bool {
+        let ObservedCoverage::Active(epoch) = &self.coverage else {
+            return false;
+        };
+        if at < *epoch || self.last_activity.as_ref().is_some_and(|last| at <= *last) {
+            return false;
+        }
+        self.advance_watermark(at);
+        self.last_activity = Some(at);
         true
     }
 
@@ -203,6 +240,9 @@ impl ObservedRoot {
         if let Some(current) = self.agents.get_mut(agent_id) {
             if at > current.at || (at == current.at && !open && current.open) {
                 *current = ObservedAgent { at, open };
+                if matches!(&self.coverage, ObservedCoverage::Active(_)) {
+                    self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
+                }
                 return true;
             }
             return false;
@@ -215,6 +255,9 @@ impl ObservedRoot {
         }
         self.agents
             .insert(agent_id.to_owned(), ObservedAgent { at, open });
+        if matches!(&self.coverage, ObservedCoverage::Active(_)) {
+            self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
+        }
         true
     }
 
@@ -227,6 +270,12 @@ impl ObservedRoot {
             ObservedCoverage::Unknown | ObservedCoverage::Invalid(_) => None,
         }
     }
+}
+
+fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?.trim();
+    (!cwd.is_empty() && cwd.len() <= MAX_CWD_LEN && Path::new(cwd).is_absolute())
+        .then(|| cwd.to_owned())
 }
 
 struct ObservedSubagentRegistry {
@@ -281,10 +330,13 @@ fn observed_root_key(observation: &ObservedHookObservation) -> Option<ObservedRo
 
 impl ObservedSubagentState {
     pub(crate) fn observe(&self, observation: &ObservedHookObservation) -> bool {
-        if !matches!(
+        let lifecycle = matches!(
             observation.hook_event.as_str(),
             "SessionStart" | "SessionEnd" | "SubagentStart" | "SubagentStop"
-        ) {
+        );
+        if !lifecycle
+            && !crate::integrations::codex::is_supported_hook_event(&observation.hook_event)
+        {
             return false;
         }
         let Some(key) = observed_root_key(observation) else {
@@ -294,6 +346,19 @@ impl ObservedSubagentState {
         let mut registry = self.inner.lock();
         let accepts_observation = registry.activity_tracking_enabled
             && !registry.disabled_providers.contains(&key.provider);
+        if !lifecycle {
+            if !accepts_observation {
+                return false;
+            }
+            let Ok(at) = DateTime::parse_from_rfc3339(&observation.ts) else {
+                return false;
+            };
+            return registry
+                .roots
+                .get_mut(&key)
+                .is_some_and(|root| root.observe_activity(at.with_timezone(&Utc)));
+        }
+
         let barrier = registry.provider_barriers.get(&key.provider).cloned();
         if !registry.roots.contains_key(&key) && registry.roots.len() >= MAX_OBSERVED_ROOTS {
             return false;
@@ -312,8 +377,12 @@ impl ObservedSubagentState {
 
         match observation.hook_event.as_str() {
             "SessionStart" => match observation.source.as_deref() {
-                Some("startup" | "resume" | "clear") => root.start_epoch(at),
-                Some("compact") => root.preserve_compaction(at),
+                Some("startup" | "resume" | "clear") => {
+                    root.start_epoch(at, observed_root_cwd(observation.cwd.as_deref()))
+                }
+                Some("compact") => {
+                    root.preserve_compaction(at, observed_root_cwd(observation.cwd.as_deref()))
+                }
                 _ => root.invalidate(Some(at)),
             },
             "SessionEnd" => root.end_epoch(at),
@@ -332,6 +401,7 @@ impl ObservedSubagentState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self, provider: &str, hostname: &str, session_id: &str) -> Option<u32> {
         let hostname = normalize_observed_hostname(hostname)?;
         self.inner
@@ -345,11 +415,96 @@ impl ObservedSubagentState {
             .and_then(ObservedRoot::count)
     }
 
-    pub(crate) fn overlay(&self, rows: &mut [SessionBreakdown]) {
-        for row in rows {
-            row.observed_subagent_count =
-                self.snapshot(&row.provider, &row.hostname, &row.session_id);
+    pub(crate) fn merge(
+        &self,
+        mut rows: Vec<SessionBreakdown>,
+        range_from: &str,
+        hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+        limit: Option<i32>,
+    ) -> Vec<SessionBreakdown> {
+        let registry = self.inner.lock();
+        let mut seen = HashSet::new();
+
+        for row in &mut rows {
+            row.observed_only = false;
+            let Some(hostname) = normalize_observed_hostname(&row.hostname) else {
+                continue;
+            };
+            let key = ObservedRootKey {
+                provider: row.provider.clone(),
+                hostname,
+                session_id: row.session_id.clone(),
+            };
+            seen.insert(key.clone());
+            let Some(root) = registry.roots.get(&key) else {
+                continue;
+            };
+            row.observed_subagent_count = root.count();
+            if let Some(last_activity) = root.last_activity {
+                let stored = DateTime::parse_from_rfc3339(&row.last_active)
+                    .ok()
+                    .map(|at| at.with_timezone(&Utc));
+                if stored.is_none_or(|stored| last_activity > stored) {
+                    row.last_active = last_activity.to_rfc3339();
+                }
+            }
         }
+
+        let from = DateTime::parse_from_rfc3339(range_from)
+            .ok()
+            .map(|at| at.with_timezone(&Utc));
+        let hostname_filter = hostname.and_then(normalize_observed_hostname);
+        let provider_filter = provider.map(IntegrationProvider::as_str);
+
+        if let Some(from) = from.filter(|_| hostname.is_none() || hostname_filter.is_some()) {
+            for (key, root) in &registry.roots {
+                let ObservedCoverage::Active(started_at) = &root.coverage else {
+                    continue;
+                };
+                let (Some(cwd), Some(last_activity), Some(count)) =
+                    (root.cwd.as_ref(), root.last_activity, root.count())
+                else {
+                    continue;
+                };
+                if seen.contains(key)
+                    || provider_filter.is_some_and(|filter| key.provider != filter)
+                    || hostname_filter
+                        .as_ref()
+                        .is_some_and(|filter| key.hostname != *filter)
+                    || last_activity < from
+                {
+                    continue;
+                }
+                rows.push(SessionBreakdown {
+                    provider: key.provider.clone(),
+                    session_id: key.session_id.clone(),
+                    hostname: key.hostname.clone(),
+                    total_tokens: 0,
+                    turn_count: 0,
+                    first_seen: started_at.to_rfc3339(),
+                    last_active: last_activity.to_rfc3339(),
+                    project: Some(cwd.clone()),
+                    observed_subagent_count: Some(count),
+                    observed_only: true,
+                });
+            }
+        }
+
+        rows.sort_by(|a, b| {
+            let parse = |value: &str| {
+                DateTime::parse_from_rfc3339(value)
+                    .ok()
+                    .map(|at| at.with_timezone(&Utc))
+            };
+            parse(&b.last_active)
+                .cmp(&parse(&a.last_active))
+                .then_with(|| a.provider.cmp(&b.provider))
+                .then_with(|| a.hostname.cmp(&b.hostname))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        rows.truncate(limit.unwrap_or(10).clamp(1, 500) as usize);
+        rows
     }
 
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
@@ -2130,6 +2285,235 @@ mod observed_subagent_tests {
             hook_matcher: None,
             agent_id: agent_id.map(str::to_owned),
         }
+    }
+
+    fn root_start(
+        provider: IntegrationProvider,
+        hostname: &str,
+        session_id: &str,
+        cwd: &str,
+        ts: &str,
+    ) -> ObservedHookObservation {
+        let mut observation = hook(
+            provider,
+            Some(hostname),
+            session_id,
+            "SessionStart",
+            Some("startup"),
+            None,
+            ts,
+        );
+        observation.cwd = Some(cwd.to_owned());
+        observation
+    }
+
+    fn stored_session(session_id: &str, hostname: &str, last_active: &str) -> SessionBreakdown {
+        SessionBreakdown {
+            provider: "codex".to_owned(),
+            session_id: session_id.to_owned(),
+            hostname: hostname.to_owned(),
+            total_tokens: 42,
+            turn_count: 3,
+            first_seen: "2030-01-01T00:00:00Z".to_owned(),
+            last_active: last_active.to_owned(),
+            project: Some("/retained/project".to_owned()),
+            observed_subagent_count: None,
+            observed_only: false,
+        }
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Observed-Only Session Merge]]
+    #[test]
+    fn active_root_synthesizes_then_merges_without_duplicate() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Codex,
+            "poe-host.example.com",
+            "poe-root",
+            "/home/mamba/work/poe",
+            "2030-01-01T00:00:01Z",
+        ));
+
+        let mut compact = hook(
+            IntegrationProvider::Codex,
+            Some("poe-host"),
+            "poe-root",
+            "SessionStart",
+            Some("compact"),
+            None,
+            "2030-01-01T00:00:02Z",
+        );
+        compact.cwd = Some("/home/mamba/work/poe-after-compact".to_owned());
+        state.observe(&compact);
+
+        let mut agent = hook(
+            IntegrationProvider::Codex,
+            Some("poe-host"),
+            "poe-root",
+            "SubagentStart",
+            None,
+            Some("agent-a"),
+            "2030-01-01T00:00:03Z",
+        );
+        agent.cwd = Some("/tmp/subagent-worktree".to_owned());
+        state.observe(&agent);
+        state.observe(&hook(
+            IntegrationProvider::Codex,
+            Some("poe-host"),
+            "poe-root",
+            "UserPromptSubmit",
+            None,
+            None,
+            "2030-01-01T00:00:04Z",
+        ));
+
+        let rows = state.merge(
+            Vec::new(),
+            "2030-01-01T00:00:00Z",
+            None,
+            Some(IntegrationProvider::Codex),
+            Some(5),
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].observed_only);
+        assert_eq!(
+            rows[0].project.as_deref(),
+            Some("/home/mamba/work/poe-after-compact")
+        );
+        assert_eq!(rows[0].last_active, "2030-01-01T00:00:04+00:00");
+        assert_eq!(rows[0].observed_subagent_count, Some(1));
+        assert_eq!(
+            serde_json::to_value(&rows).expect("serialize observed-only row")[0]["observed_only"],
+            true
+        );
+
+        let rows = state.merge(
+            vec![stored_session(
+                "poe-root",
+                "poe-host.example.com",
+                "2030-01-01T00:00:01Z",
+            )],
+            "2030-01-01T00:00:00Z",
+            None,
+            None,
+            Some(5),
+        );
+        assert_eq!(rows.len(), 1, "stored and observed identity must merge");
+        assert!(!rows[0].observed_only);
+        assert_eq!(rows[0].total_tokens, 42);
+        assert_eq!(rows[0].last_active, "2030-01-01T00:00:04+00:00");
+        assert_eq!(rows[0].observed_subagent_count, Some(1));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Observed-Only Merge Boundaries]]
+    #[test]
+    fn observed_only_merge_respects_lifecycle_filters_range_and_limit() {
+        let state = ObservedSubagentState::default();
+        for (provider, host, root, cwd, ts) in [
+            (
+                IntegrationProvider::Codex,
+                "host.example.com",
+                "codex-fresh",
+                "/work/codex-fresh",
+                "2030-01-01T00:00:10Z",
+            ),
+            (
+                IntegrationProvider::Claude,
+                "host",
+                "claude-fresh",
+                "/work/claude-fresh",
+                "2030-01-01T00:00:09Z",
+            ),
+            (
+                IntegrationProvider::Codex,
+                "host",
+                "codex-old",
+                "/work/codex-old",
+                "2030-01-01T00:00:01Z",
+            ),
+            (
+                IntegrationProvider::Codex,
+                "host",
+                "codex-ended",
+                "/work/codex-ended",
+                "2030-01-01T00:00:08Z",
+            ),
+        ] {
+            state.observe(&root_start(provider, host, root, cwd, ts));
+        }
+        state.observe(&hook(
+            IntegrationProvider::Codex,
+            Some("host"),
+            "codex-ended",
+            "SessionEnd",
+            None,
+            None,
+            "2030-01-01T00:00:11Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Codex,
+            Some("host"),
+            "compact-without-root",
+            "SessionStart",
+            Some("compact"),
+            None,
+            "2030-01-01T00:00:12Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Codex,
+            Some("host"),
+            "activity-without-root",
+            "UserPromptSubmit",
+            None,
+            None,
+            "2030-01-01T00:00:13Z",
+        ));
+
+        let rows = state.merge(
+            Vec::new(),
+            "2030-01-01T00:00:05Z",
+            Some("host.example.com"),
+            None,
+            Some(1),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "codex-fresh");
+
+        let rows = state.merge(
+            Vec::new(),
+            "2030-01-01T00:00:05Z",
+            None,
+            Some(IntegrationProvider::Codex),
+            Some(5),
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["codex-fresh"]
+        );
+
+        let rows = state.merge(
+            Vec::new(),
+            "2030-01-01T00:00:00Z",
+            None,
+            Some(IntegrationProvider::Claude),
+            Some(5),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "claude-fresh");
+
+        state.set_provider_enabled(IntegrationProvider::Codex, false);
+        let rows = state.merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, Some(5));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "claude-fresh");
+
+        state.set_activity_tracking_enabled(false);
+        assert!(
+            state
+                .merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, Some(5000),)
+                .is_empty()
+        );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Lifecycle Fold And Coverage Boundaries]]

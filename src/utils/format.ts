@@ -11,6 +11,14 @@ export function formatObservedSubagentCount(count: number | null) {
 	};
 }
 
+export function resolveSessionMetrics(
+	tokens: string,
+	turns: string,
+	observedOnly: boolean,
+): { tokens: string; turns: string | null } {
+	return observedOnly ? { tokens: "—", turns: null } : { tokens, turns };
+}
+
 /** Format a byte count using binary units. */
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) {

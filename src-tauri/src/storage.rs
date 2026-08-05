@@ -1233,7 +1233,7 @@ pub(crate) fn with_pinned_query_now<T>(now: DateTime<Utc>, operation: impl FnOnc
 /// vocabulary (`1h`, `6h`, `24h`, `7d`, `30d`, `all`) and the narrowly
 /// enumerated internal comparison ranges (`2h`, `12h`, `2d`, `14d`) are
 /// honored identically instead of one command quietly answering 24h.
-fn range_from_timestamp(range: &str) -> String {
+pub(crate) fn range_from_timestamp(range: &str) -> String {
     if range == "all" {
         return "1970-01-01T00:00:00Z".to_string();
     }
@@ -13489,6 +13489,7 @@ impl Storage {
                     last_active: row.get(6)?,
                     project: row.get(7)?,
                     observed_subagent_count: None,
+                    observed_only: false,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
