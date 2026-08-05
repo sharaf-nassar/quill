@@ -99,6 +99,58 @@ it("maps PostToolUseFailure details into a post observation", () => {
     "failure metadata was lost");
 });
 
+it("builds Claude lifecycle observations with official sources and identities", () => {
+  const timestamp = "2026-08-04T12:34:56.789Z";
+  const config = { hostname: "configured-host" };
+  for (const source of ["startup", "resume", "clear", "compact"]) {
+    const payload = observe.buildLifecyclePayload({
+      hook_event_name: "SessionStart",
+      session_id: "root-session",
+      source,
+      cwd: "/project",
+    }, config, timestamp, "fallback.example.com");
+    assert(payload.provider === "claude", "lifecycle provider was lost");
+    assert(payload.session_id === "root-session", "root session was lost");
+    assert(payload.hostname === "configured-host", "configured hostname was lost");
+    assert(payload.source === source, `SessionStart source ${source} was lost`);
+    assert(payload.agent_id === null, "root lifecycle event gained an agent identity");
+    assert(payload.ts === timestamp, "producer timestamp was lost");
+  }
+
+  for (const hook_event_name of ["SubagentStart", "SubagentStop"]) {
+    const payload = observe.buildLifecyclePayload({
+      hook_event_name,
+      session_id: "root-session",
+      agent_id: "agent-7",
+    }, {}, timestamp, "fallback.example.com");
+    assert(payload.hostname === "fallback", "fallback hostname was not shortened");
+    assert(payload.agent_id === "agent-7", `${hook_event_name} agent identity was lost`);
+    assert(payload.source === null, `${hook_event_name} gained a SessionStart source`);
+  }
+
+  const end = observe.buildLifecyclePayload({
+    hook_event_name: "SessionEnd",
+    session_id: "root-session",
+  }, config, timestamp);
+  assert(end.hook_event === "SessionEnd", "SessionEnd was not observed");
+});
+
+it("rejects malformed Claude lifecycle payloads", () => {
+  const config = { hostname: "host" };
+  assert(observe.buildLifecyclePayload({
+    hook_event_name: "SessionStart",
+    session_id: "root",
+    source: "fork",
+  }, config) === null, "unsupported SessionStart source was accepted");
+  assert(observe.buildLifecyclePayload({
+    hook_event_name: "SubagentStart",
+    session_id: "root",
+  }, config) === null, "subagent lifecycle without agent identity was accepted");
+  assert(observe.buildLifecyclePayload({
+    hook_event_name: "SessionEnd",
+  }, config) === null, "lifecycle event without root session was accepted");
+});
+
 it("blocks qbuild edits by lexical and canonical containment", () => withFixture((root) => {
   const repository = path.join(root, "repository");
   const outside = path.join(root, "outside");

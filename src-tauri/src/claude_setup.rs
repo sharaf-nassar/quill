@@ -1463,6 +1463,19 @@ fn expected_hook_groups(
                 hooks: vec![observe.clone()],
             });
         }
+        for event in [
+            "SessionStart",
+            "SubagentStart",
+            "SubagentStop",
+            "SessionEnd",
+        ] {
+            groups.push(ClaudeHookGroup {
+                event,
+                matcher: None,
+                source: HOOK_MARKER,
+                hooks: vec![observe.clone()],
+            });
+        }
     }
     if features.context_preservation {
         groups.extend([
@@ -1991,6 +2004,104 @@ mod tests {
             "args": [scripts_dir().join(script).to_string_lossy()],
             "timeout": timeout,
         })
+    }
+
+    fn fixture_runtime() -> ClaudeRuntimePaths {
+        ClaudeRuntimePaths {
+            node: PathBuf::from("/usr/bin/node"),
+            git: PathBuf::from("/usr/bin/git"),
+        }
+    }
+
+    fn lifecycle_observer_count(groups: &[ClaudeHookGroup], event: &str) -> usize {
+        let observe_path = scripts_dir()
+            .join("observe.cjs")
+            .to_string_lossy()
+            .to_string();
+        groups
+            .iter()
+            .filter(|group| group.event == event)
+            .flat_map(|group| &group.hooks)
+            .filter(|hook| hook.args.first() == Some(&observe_path))
+            .count()
+    }
+
+    #[test]
+    fn lifecycle_observers_follow_activity_tracking() {
+        let runtime = fixture_runtime();
+        let enabled = expected_hook_groups(IntegrationFeatures::default(), &runtime);
+        let disabled = expected_hook_groups(
+            IntegrationFeatures {
+                activity_tracking: false,
+                ..IntegrationFeatures::default()
+            },
+            &runtime,
+        );
+
+        for event in [
+            "SessionStart",
+            "SubagentStart",
+            "SubagentStop",
+            "SessionEnd",
+        ] {
+            assert_eq!(lifecycle_observer_count(&enabled, event), 1, "{event}");
+            assert_eq!(lifecycle_observer_count(&disabled, event), 0, "{event}");
+        }
+    }
+
+    #[test]
+    fn reinstall_and_uninstall_preserve_foreign_hooks() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path().join("claude"), temp.path().join(".claude.json"));
+        let runtime = fixture_runtime();
+        let foreign = serde_json::json!({
+            "matcher": "startup",
+            "custom": { "keep": true },
+            "hooks": [{
+                "type": "command",
+                "command": "/usr/bin/foreign-hook",
+                "timeout": 2
+            }]
+        });
+        write_settings_object(
+            &paths.settings,
+            &serde_json::json!({ "hooks": { "SessionStart": [foreign.clone()] } }),
+        )
+        .unwrap();
+
+        register_hooks(IntegrationFeatures::default(), &paths, &runtime).unwrap();
+        register_hooks(IntegrationFeatures::default(), &paths, &runtime).unwrap();
+        let installed = read_settings_object(&paths.settings).unwrap();
+        verify_hook_settings(
+            &installed,
+            &paths,
+            &expected_hook_groups(IntegrationFeatures::default(), &runtime),
+        )
+        .unwrap();
+        assert_eq!(installed["hooks"]["SessionStart"][0], foreign);
+
+        cleanup_quill_hooks(&paths).unwrap();
+        let uninstalled = read_settings_object(&paths.settings).unwrap();
+        assert_eq!(
+            uninstalled,
+            serde_json::json!({
+                "hooks": { "SessionStart": [foreign] }
+            })
+        );
+    }
+
+    #[test]
+    fn failed_hook_update_preserves_last_known_good_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path().join("claude"), temp.path().join(".claude.json"));
+        let original = "{\n  \"keep\": true,\n  \"hooks\": {\"SessionStart\": {}}\n}\n";
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(&paths.settings, original).unwrap();
+
+        assert!(
+            register_hooks(IntegrationFeatures::default(), &paths, &fixture_runtime()).is_err()
+        );
+        assert_eq!(fs::read_to_string(&paths.settings).unwrap(), original);
     }
 
     #[test]
