@@ -30,6 +30,7 @@ const MCP_BLOCK_START: &str = "# quill-managed:codex:mcp:start";
 const MCP_BLOCK_END: &str = "# quill-managed:codex:mcp:end";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:codex:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
+const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 2";
 
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
@@ -401,6 +402,11 @@ fn verify_with_paths(
             missing.join(", ")
         ));
     }
+    if features.activity_tracking {
+        let observer = fs::read_to_string(scripts_dir().join("hook-observe.cjs"))
+            .map_err(|err| format!("Failed to read Codex hook observer: {err}"))?;
+        verify_hook_observer_payload(&observer)?;
+    }
 
     let config_content = fs::read_to_string(&paths.config)
         .map_err(|err| format!("Failed to read config.toml: {err}"))?;
@@ -448,6 +454,14 @@ fn verify_with_paths(
     verify_mcp(features)?;
 
     Ok(())
+}
+
+fn verify_hook_observer_payload(content: &str) -> Result<(), String> {
+    if content.contains(HOOK_OBSERVER_PAYLOAD_MARKER) {
+        Ok(())
+    } else {
+        Err("Codex hook observer payload contract is outdated".to_string())
+    }
 }
 
 fn verify_mcp(features: IntegrationFeatures) -> Result<(), String> {
@@ -2304,5 +2318,48 @@ mod tests {
             "must not block for the full sleep"
         );
         assert!(child.reaped, "the hung child must be reaped");
+    }
+
+    #[test]
+    fn hook_observer_contract_preserves_registrations_and_activity_gate() {
+        let source = include_str!("../../codex-integration/scripts/hook-observe.cjs");
+        assert!(verify_hook_observer_payload(source).is_ok());
+        assert!(verify_hook_observer_payload("#!/usr/bin/env node").is_err());
+
+        let enabled = IntegrationFeatures::default();
+        assert_eq!(
+            hook_observation_scripts_for(enabled),
+            vec!["hook-observe.cjs"]
+        );
+        let groups = build_codex_hook_groups(enabled);
+        let observer_groups: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                group
+                    .hooks
+                    .iter()
+                    .any(|hook| hook.command.contains("hook-observe.cjs"))
+            })
+            .collect();
+        assert_eq!(observer_groups.len(), CODEX_HOOK_EVENTS.len());
+        for (event, _) in CODEX_HOOK_EVENTS {
+            let group = observer_groups
+                .iter()
+                .find(|group| group.event == event)
+                .expect("every existing Codex lifecycle registration remains present");
+            assert!(group.matcher.is_none());
+            assert_eq!(group.hooks.len(), 1);
+            assert_eq!(group.hooks[0].timeout, 3);
+        }
+
+        let mut disabled = enabled;
+        disabled.activity_tracking = false;
+        assert!(hook_observation_scripts_for(disabled).is_empty());
+        assert!(build_codex_hook_groups(disabled).iter().all(|group| {
+            group
+                .hooks
+                .iter()
+                .all(|hook| !hook.command.contains("hook-observe.cjs"))
+        }));
     }
 }
