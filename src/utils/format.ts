@@ -3,6 +3,14 @@ export function formatNumber(n: number): string {
 	return n.toLocaleString("en-US");
 }
 
+export function formatObservedSubagentCount(count: number | null) {
+	if (count === null || count <= 0) return null;
+	return {
+		text: `+${count}`,
+		ariaLabel: `${count} subagent${count === 1 ? "" : "s"} observed open`,
+	};
+}
+
 /** Format a byte count using binary units. */
 export function formatBytes(bytes: number): string {
 	if (bytes < 1024) {

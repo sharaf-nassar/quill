@@ -34,7 +34,11 @@ import { useContextSavingsStats } from "../../../hooks/useContextSavingsStats";
 import { useLlmRuntimeStats } from "../../../hooks/useLlmRuntimeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
 import { openManageWindow } from "../../../lib/manageWindow";
-import { formatDurationSecs, formatNumber } from "../../../utils/format";
+import {
+  formatDurationSecs,
+  formatNumber,
+  formatObservedSubagentCount,
+} from "../../../utils/format";
 import { providerHue, providerTag } from "../../../utils/providers";
 import { formatRetentionCutoff } from "../../../utils/retention";
 import { formatTokenCount } from "../../../utils/tokens";
@@ -308,6 +312,7 @@ interface RowModel {
   chip?: { text: string; tone: string };
   /** Dim secondary count, e.g. `41 sess`. */
   meta?: string;
+  metaLabel?: string;
   value: string;
   ago: string;
   title: string;
@@ -316,11 +321,14 @@ interface RowModel {
 function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
   const lastActive = new Date(row.last_active).getTime();
   const name = projectName(row.project) ?? row.session_id.slice(0, 8);
+  const observedSubagents = formatObservedSubagentCount(row.observed_subagent_count);
   return {
-    key: row.session_id,
+    key: `${row.provider}:${row.hostname}:${row.session_id}`,
     live: Number.isFinite(lastActive) && nowMs - lastActive < LIVE_WINDOW_MS,
     name,
     chip: { text: providerTag(row.provider), tone: row.provider },
+    meta: observedSubagents?.text,
+    metaLabel: observedSubagents?.ariaLabel,
     value: formatTokenCount(row.total_tokens),
     ago: formatRecency(row.last_active, nowMs),
     title: `${name} · ${row.hostname} · ${formatNumber(row.turn_count)} turns`,
@@ -694,12 +702,16 @@ function UsageView({ range }: UsageViewProps) {
                   />
                 )}
                 <span className="wg-row-name">{row.name}</span>
+                {row.meta && (
+                  <span className="wg-row-meta wg-num" aria-label={row.metaLabel}>
+                    {row.meta}
+                  </span>
+                )}
                 {row.chip && (
                   <span className="wg-row-chip" data-tone={row.chip.tone}>
                     {row.chip.text}
                   </span>
                 )}
-                {row.meta && <span className="wg-row-meta wg-num">{row.meta}</span>}
                 <span className="wg-row-value wg-num">{row.value}</span>
                 <span className="wg-row-ago wg-num">{row.ago}</span>
               </li>

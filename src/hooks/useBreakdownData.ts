@@ -51,7 +51,7 @@ export function useBreakdownData(mode: BreakdownMode, range: RangeType, options:
       "tokens-updated",
       "sessions-index-updated",
       "transcript-analytics-updated",
-      ...(mode === "hooks" ? ["hooks-observed-updated"] : []),
+      ...(mode === "sessions" || mode === "hooks" ? ["hooks-observed-updated"] : []),
     ],
   });
 

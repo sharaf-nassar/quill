@@ -193,33 +193,8 @@ export interface SessionBreakdown {
   first_seen: string;
   last_active: string;
   project: string | null;
-  /**
-   * True when this session has at least one sub-agent chain in its
-   * transcript. Drives the disclosure + expansion affordance in the Sessions
-   * tab. Older backends may omit this; treat missing as `false`.
-   *
-   * Degrades under retention in the same mixed-horizon way as
-   * `subagent_count` below: a pre-cutoff session can still report
-   * `has_subagents: true` from its surviving token snapshots while
-   * `get_session_subagent_tree` returns nothing.
-   */
-  has_subagents?: boolean;
-  /**
-   * Distinct sub-agent count across token_snapshots ∪ response_times ∪
-   * tool_actions for this session. Older backends may omit this; treat
-   * missing as `0`.
-   *
-   * **Accepted retention limitation (feature 014).** Retention prunes only
-   * `tool_actions` of those three tables, so for a session older than the
-   * retention watermark this count is computed over *mixed horizons* and can
-   * disagree with its own drilldown — the badge says `+3`, the expanded tree
-   * says "no sub-agents". This is documented and rendered as a footnote
-   * (`RetentionBanner`, surface `sessions`), not fixed: the fix is rollup
-   * aggregates, which are a deferred follow-up. Consumers must mark
-   * pre-cutoff sessions via `retentionSpanFor` rather than present the count
-   * as exact.
-   */
-  subagent_count?: number;
+  /** Current-boot hook coverage: null when Quill cannot make an exact claim. */
+  observed_subagent_count: number | null;
 }
 
 export interface SkillBreakdown {
