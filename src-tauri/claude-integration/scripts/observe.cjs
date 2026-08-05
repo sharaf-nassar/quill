@@ -135,6 +135,7 @@ function buildLifecyclePayload(
     hook_event: event,
     source,
     agent_id: agentId,
+    model: null,
     cwd: input.cwd || null,
     ts,
   };

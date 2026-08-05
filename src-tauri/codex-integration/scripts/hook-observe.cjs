@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-// quill-managed-observer-payload: 2
+// quill-managed-observer-payload: 3
 // Feature 009 — Codex hook event observer.
 //
 // Codex rollout JSONL transcripts do not record hook executions, so the
@@ -130,6 +130,7 @@ function buildPayload(
     ts: now.toISOString(),
     hook_matcher: null,
     agent_id: input.agent_id || null,
+    model: typeof input.model === "string" ? input.model : null,
   };
 }
 

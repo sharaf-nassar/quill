@@ -3505,16 +3505,21 @@ async fn get_session_breakdown(
     let storage = get_storage()?;
     let range_from = storage::range_from_timestamp(&range);
     let observed_hostname = hostname.clone();
-    let rows = run_blocking(move || {
-        storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)
-    })?;
-    Ok(observed_subagents.merge(
-        rows,
-        &range_from,
-        observed_hostname.as_deref(),
-        provider,
-        limit,
-    ))
+    let observed_subagents = Arc::clone(&observed_subagents);
+    run_blocking(move || {
+        let rows = storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)?;
+        let mut rows = observed_subagents.merge(
+            rows,
+            &range_from,
+            observed_hostname.as_deref(),
+            provider,
+            limit,
+        );
+        observed_subagents.enrich_model_groups(&mut rows, |targets| {
+            storage.get_observed_agent_model_evidence(targets)
+        })?;
+        Ok(rows)
+    })
 }
 
 #[tauri::command]
@@ -6573,6 +6578,7 @@ mod tests {
                 .to_string(),
                 hook_matcher: None,
                 agent_id: agent_id.map(str::to_owned),
+                model: None,
             }
         };
         state.observe(&observation("SessionStart", Some("startup"), None));
@@ -6588,6 +6594,7 @@ mod tests {
             last_active: "2030-01-01T00:00:02Z".to_string(),
             project: None,
             observed_subagent_count: None,
+            observed_subagent_models: None,
             observed_only: false,
         };
         let mut rows = vec![row("covered-root"), row("storage-only-root")];

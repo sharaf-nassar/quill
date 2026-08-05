@@ -40,8 +40,8 @@ lat.md/.cache
 
 .superpowers/
 
-# Impeccable live-mode runtime journal (config.json + design.json stay tracked)
-.impeccable/live/sessions/
+# Local Impeccable design and runtime artifacts
+.impeccable/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

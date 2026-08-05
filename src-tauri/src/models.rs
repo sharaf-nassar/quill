@@ -297,10 +297,21 @@ pub struct SessionBreakdown {
     /// Current-process hook coverage: null is unknown, zero is covered with
     /// none open, and positive is the root-linked observed-open count.
     pub observed_subagent_count: Option<u32>,
+    /// Exact model groups for the observed-open agents. A null model id is an
+    /// explicit unresolved agent, never an inference from the root model.
+    pub observed_subagent_models: Option<Vec<ObservedSubagentModelGroup>>,
     /// True when current-process hook evidence supplied the row before the
     /// first retained token snapshot made its metrics available.
     pub observed_only: bool,
 }
+
+#[derive(Serialize, Clone, Debug, Eq, PartialEq)]
+pub struct ObservedSubagentModelGroup {
+    pub model_id: Option<String>,
+    pub count: u32,
+}
+
+pub(crate) type ObservedAgentModelKey = (String, String, String);
 
 #[derive(Serialize, Clone, Debug)]
 pub struct SkillBreakdown {
@@ -367,6 +378,8 @@ pub struct ObservedHookObservation {
     pub hook_matcher: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[doc(hidden)]

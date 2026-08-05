@@ -21,8 +21,9 @@ use tauri::Emitter;
 use crate::integrations::IntegrationProvider;
 use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
-    LearningRunPayload, ObservationPayload, ObservedHookObservation, SessionBreakdown,
-    SessionMessagePayload, SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
+    LearningRunPayload, ObservationPayload, ObservedAgentModelKey, ObservedHookObservation,
+    ObservedSubagentModelGroup, SessionBreakdown, SessionMessagePayload, SessionMessagesPayload,
+    SessionNotifyPayload, TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -73,6 +74,7 @@ struct ObservedRootKey {
 struct ObservedAgent {
     at: DateTime<Utc>,
     open: bool,
+    model_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -212,7 +214,13 @@ impl ObservedRoot {
         true
     }
 
-    fn observe_agent(&mut self, agent_id: &str, at: DateTime<Utc>, open: bool) -> bool {
+    fn observe_agent(
+        &mut self,
+        agent_id: &str,
+        at: DateTime<Utc>,
+        open: bool,
+        model_id: Option<String>,
+    ) -> bool {
         match &self.coverage {
             ObservedCoverage::Invalid(_) => {
                 self.advance_watermark(at);
@@ -239,7 +247,7 @@ impl ObservedRoot {
         self.advance_watermark(at);
         if let Some(current) = self.agents.get_mut(agent_id) {
             if at > current.at || (at == current.at && !open && current.open) {
-                *current = ObservedAgent { at, open };
+                *current = ObservedAgent { at, open, model_id };
                 if matches!(&self.coverage, ObservedCoverage::Active(_)) {
                     self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
                 }
@@ -254,7 +262,7 @@ impl ObservedRoot {
             return self.invalidate(Some(at));
         }
         self.agents
-            .insert(agent_id.to_owned(), ObservedAgent { at, open });
+            .insert(agent_id.to_owned(), ObservedAgent { at, open, model_id });
         if matches!(&self.coverage, ObservedCoverage::Active(_)) {
             self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
         }
@@ -270,6 +278,37 @@ impl ObservedRoot {
             ObservedCoverage::Unknown | ObservedCoverage::Invalid(_) => None,
         }
     }
+
+    fn model_groups(&self) -> Option<Vec<ObservedSubagentModelGroup>> {
+        self.count().map(|_| {
+            aggregate_observed_models(
+                self.agents
+                    .values()
+                    .filter(|agent| agent.open)
+                    .map(|agent| agent.model_id.clone()),
+            )
+        })
+    }
+}
+
+fn aggregate_observed_models(
+    models: impl IntoIterator<Item = Option<String>>,
+) -> Vec<ObservedSubagentModelGroup> {
+    let mut counts = HashMap::<Option<String>, u32>::new();
+    for model_id in models {
+        *counts.entry(model_id).or_default() += 1;
+    }
+    let mut groups = counts
+        .into_iter()
+        .map(|(model_id, count)| ObservedSubagentModelGroup { model_id, count })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| match (&left.model_id, &right.model_id) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    groups
 }
 
 fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
@@ -359,6 +398,7 @@ impl ObservedSubagentState {
                 .is_some_and(|root| root.observe_activity(at.with_timezone(&Utc)));
         }
 
+        let is_codex = key.provider == "codex";
         let barrier = registry.provider_barriers.get(&key.provider).cloned();
         if !registry.roots.contains_key(&key) && registry.roots.len() >= MAX_OBSERVED_ROOTS {
             return false;
@@ -395,7 +435,16 @@ impl ObservedSubagentState {
                 }) else {
                     return false;
                 };
-                root.observe_agent(agent_id, at, observation.hook_event == "SubagentStart")
+                let model_id = is_codex
+                    .then_some(observation.model.as_deref())
+                    .flatten()
+                    .and_then(|model| crate::model_usage::validate_model_id(model).ok());
+                root.observe_agent(
+                    agent_id,
+                    at,
+                    observation.hook_event == "SubagentStart",
+                    model_id,
+                )
             }
             _ => false,
         }
@@ -441,6 +490,7 @@ impl ObservedSubagentState {
                 continue;
             };
             row.observed_subagent_count = root.count();
+            row.observed_subagent_models = root.model_groups();
             if let Some(last_activity) = root.last_activity {
                 let stored = DateTime::parse_from_rfc3339(&row.last_active)
                     .ok()
@@ -486,6 +536,7 @@ impl ObservedSubagentState {
                     last_active: last_activity.to_rfc3339(),
                     project: Some(cwd.clone()),
                     observed_subagent_count: Some(count),
+                    observed_subagent_models: root.model_groups(),
                     observed_only: true,
                 });
             }
@@ -505,6 +556,72 @@ impl ObservedSubagentState {
         });
         rows.truncate(limit.unwrap_or(10).clamp(1, 500) as usize);
         rows
+    }
+
+    pub(crate) fn enrich_model_groups(
+        &self,
+        rows: &mut [SessionBreakdown],
+        resolve: impl FnOnce(
+            &[ObservedAgentModelKey],
+        ) -> Result<HashMap<ObservedAgentModelKey, String>, String>,
+    ) -> Result<(), String> {
+        let snapshots = {
+            let registry = self.inner.lock();
+            rows.iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    let expected = row.observed_subagent_count?;
+                    if row.provider != "claude" || expected == 0 {
+                        return None;
+                    }
+                    let hostname = normalize_observed_hostname(&row.hostname)?;
+                    let key = ObservedRootKey {
+                        provider: row.provider.clone(),
+                        hostname,
+                        session_id: row.session_id.clone(),
+                    };
+                    let root = registry.roots.get(&key)?;
+                    let agents = root
+                        .agents
+                        .iter()
+                        .filter(|(_, agent)| agent.open)
+                        .map(|(agent_id, agent)| (agent_id.clone(), agent.model_id.clone()))
+                        .collect::<Vec<_>>();
+                    (agents.len() == expected as usize).then_some((index, key, agents))
+                })
+                .collect::<Vec<_>>()
+        };
+        let targets = snapshots
+            .iter()
+            .flat_map(|(_, root, agents)| {
+                agents
+                    .iter()
+                    .filter(|(_, model_id)| model_id.is_none())
+                    .map(|(agent_id, _)| {
+                        (
+                            root.provider.clone(),
+                            root.session_id.clone(),
+                            agent_id.clone(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let evidence = resolve(&targets)?;
+        for (index, root, agents) in snapshots {
+            rows[index].observed_subagent_models = Some(aggregate_observed_models(
+                agents.into_iter().map(|(agent_id, hook_model)| {
+                    hook_model.or_else(|| {
+                        evidence
+                            .get(&(root.provider.clone(), root.session_id.clone(), agent_id))
+                            .and_then(|model| crate::model_usage::validate_model_id(model).ok())
+                    })
+                }),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
@@ -2284,6 +2401,7 @@ mod observed_subagent_tests {
             ts: ts.to_owned(),
             hook_matcher: None,
             agent_id: agent_id.map(str::to_owned),
+            model: None,
         }
     }
 
@@ -2318,6 +2436,7 @@ mod observed_subagent_tests {
             last_active: last_active.to_owned(),
             project: Some("/retained/project".to_owned()),
             observed_subagent_count: None,
+            observed_subagent_models: None,
             observed_only: false,
         }
     }
@@ -2403,6 +2522,111 @@ mod observed_subagent_tests {
         assert_eq!(rows[0].total_tokens, 42);
         assert_eq!(rows[0].last_active, "2030-01-01T00:00:04+00:00");
         assert_eq!(rows[0].observed_subagent_count, Some(1));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Observed Model Aggregation]]
+    #[test]
+    fn open_agent_models_aggregate_and_reconcile_with_unknown_last() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Codex,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:01Z",
+        ));
+        for (agent_id, model) in [
+            ("agent-a", "gpt-5.6-sol"),
+            ("agent-b", "gpt-5.6-sol"),
+            ("agent-c", "bad\nmodel"),
+            ("agent-d", "gpt-5.6-terra"),
+        ] {
+            let mut observation = hook(
+                IntegrationProvider::Codex,
+                Some("host"),
+                "root",
+                "SubagentStart",
+                None,
+                Some(agent_id),
+                "2030-01-01T00:00:02Z",
+            );
+            observation.model = Some(model.to_owned());
+            state.observe(&observation);
+        }
+        state.observe(&hook(
+            IntegrationProvider::Codex,
+            Some("host"),
+            "root",
+            "SubagentStop",
+            None,
+            Some("agent-d"),
+            "2030-01-01T00:00:03Z",
+        ));
+
+        let rows = state.merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None);
+        assert_eq!(rows[0].observed_subagent_count, Some(3));
+        assert_eq!(
+            rows[0].observed_subagent_models,
+            Some(vec![
+                ObservedSubagentModelGroup {
+                    model_id: Some("gpt-5.6-sol".to_owned()),
+                    count: 2,
+                },
+                ObservedSubagentModelGroup {
+                    model_id: None,
+                    count: 1,
+                },
+            ])
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Retained Model Resolution]]
+    #[test]
+    fn claude_model_evidence_resolves_exact_agents_without_root_inference() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:01Z",
+        ));
+        for agent_id in ["agent-a", "agent-b"] {
+            state.observe(&hook(
+                IntegrationProvider::Claude,
+                Some("host"),
+                "root",
+                "SubagentStart",
+                None,
+                Some(agent_id),
+                "2030-01-01T00:00:02Z",
+            ));
+        }
+        let mut rows = state.merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None);
+        state
+            .enrich_model_groups(&mut rows, |targets| {
+                assert_eq!(targets.len(), 2);
+                Ok(HashMap::from([(
+                    ("claude".to_owned(), "root".to_owned(), "agent-a".to_owned()),
+                    "claude-opus-4-6".to_owned(),
+                )]))
+            })
+            .expect("resolve retained model evidence");
+
+        assert_eq!(rows[0].observed_subagent_count, Some(2));
+        assert_eq!(
+            rows[0].observed_subagent_models,
+            Some(vec![
+                ObservedSubagentModelGroup {
+                    model_id: Some("claude-opus-4-6".to_owned()),
+                    count: 1,
+                },
+                ObservedSubagentModelGroup {
+                    model_id: None,
+                    count: 1,
+                },
+            ])
+        );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Observed-Only Merge Boundaries]]

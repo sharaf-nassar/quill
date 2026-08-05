@@ -30,7 +30,7 @@ const MCP_BLOCK_START: &str = "# quill-managed:codex:mcp:start";
 const MCP_BLOCK_END: &str = "# quill-managed:codex:mcp:end";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:codex:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
-const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 2";
+const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 3";
 
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";

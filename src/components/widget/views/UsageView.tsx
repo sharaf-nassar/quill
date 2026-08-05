@@ -37,7 +37,7 @@ import { openManageWindow } from "../../../lib/manageWindow";
 import {
   formatDurationSecs,
   formatNumber,
-  formatObservedSubagentCount,
+  formatObservedSubagentModels,
   resolveSessionMetrics,
 } from "../../../utils/format";
 import { providerHue, providerTag } from "../../../utils/providers";
@@ -322,7 +322,11 @@ interface RowModel {
 function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
   const lastActive = new Date(row.last_active).getTime();
   const name = projectName(row.project) ?? row.session_id.slice(0, 8);
-  const observedSubagents = formatObservedSubagentCount(row.observed_subagent_count);
+  const observedSubagents = formatObservedSubagentModels(
+    row.provider,
+    row.observed_subagent_count,
+    row.observed_subagent_models,
+  );
   const metrics = resolveSessionMetrics(
     formatTokenCount(row.total_tokens),
     `${formatNumber(row.turn_count)} turns`,
@@ -695,6 +699,7 @@ function UsageView({ range }: UsageViewProps) {
                 className="wg-row"
                 key={row.key}
                 data-idle={row.live === false ? "true" : undefined}
+                data-agents={row.metaLabel ? "true" : undefined}
                 title={row.title}
               >
                 {row.live !== undefined && (
@@ -710,6 +715,7 @@ function UsageView({ range }: UsageViewProps) {
                     className="wg-row-meta wg-num"
                     data-agent={row.metaLabel ? "true" : undefined}
                     aria-label={row.metaLabel}
+                    title={row.metaLabel}
                   >
                     {row.metaLabel && (
                       <svg
@@ -718,12 +724,16 @@ function UsageView({ range }: UsageViewProps) {
                         fill="none"
                         aria-hidden="true"
                       >
-                        <circle cx="3" cy="2.5" r="1.25" />
-                        <circle cx="9" cy="9.5" r="1.25" />
-                        <path d="M3 3.75v2A3.75 3.75 0 0 0 6.75 9.5H7.5M3 5.5h2.25A2.75 2.75 0 0 0 8 2.75V2.5" />
+                        <path d="M6 2.75V1.5" />
+                        <rect x="1.5" y="2.75" width="9" height="7.5" rx="2" />
+                        <circle cx="4.25" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
+                        <circle cx="7.75" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
                       </svg>
                     )}
-                    {row.meta}
+                    {row.metaLabel && <span className="wg-row-agent-separator" aria-hidden="true">·</span>}
+                    <span className={row.metaLabel ? "wg-row-agent-models" : undefined}>
+                      {row.meta}
+                    </span>
                   </span>
                 )}
                 {row.chip && (

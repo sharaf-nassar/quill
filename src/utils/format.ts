@@ -1,13 +1,65 @@
+import type { IntegrationProvider, ObservedSubagentModelGroup } from "../types";
+
 /** Format a number with thousand separators: 1234567 → "1,234,567" */
 export function formatNumber(n: number): string {
 	return n.toLocaleString("en-US");
 }
 
-export function formatObservedSubagentCount(count: number | null) {
+interface DisplayAgentModelGroup {
+	label: string;
+	count: number;
+	rank: number;
+}
+
+function agentModelFamily(provider: IntegrationProvider, modelId: string) {
+	const matches = (family: string) =>
+		new RegExp(`(^|[-_.])${family}($|[-_.])`, "i").test(modelId);
+	const known = provider === "claude"
+		? [["Opus", 0], ["Sonnet", 1], ["Haiku", 2]] as const
+		: provider === "codex"
+			? [["Sol", 0], ["Terra", 1], ["Luna", 2]] as const
+			: [];
+	const family = known.find(([label]) => matches(label));
+	return family ? { label: family[0], rank: family[1] } : { label: modelId, rank: 100 };
+}
+
+export function formatObservedSubagentModels(
+	provider: IntegrationProvider,
+	count: number | null,
+	groups: readonly ObservedSubagentModelGroup[] | null,
+) {
 	if (count === null || count <= 0) return null;
+	const byLabel = new Map<string, DisplayAgentModelGroup>();
+	let validTotal = 0;
+	for (const group of groups ?? []) {
+		if (!Number.isInteger(group.count) || group.count <= 0) continue;
+		validTotal += group.count;
+		const family = group.model_id === null
+			? { label: "?", rank: Number.MAX_SAFE_INTEGER }
+			: agentModelFamily(provider, group.model_id);
+		const current = byLabel.get(family.label);
+		if (current) current.count += group.count;
+		else byLabel.set(family.label, { ...family, count: group.count });
+	}
+	if (validTotal > count) {
+		byLabel.clear();
+		validTotal = 0;
+	}
+	if (validTotal < count) {
+		const unresolved = byLabel.get("?");
+		if (unresolved) unresolved.count += count - validTotal;
+		else byLabel.set("?", { label: "?", count: count - validTotal, rank: Number.MAX_SAFE_INTEGER });
+	}
+	const displayGroups = [...byLabel.values()].sort(
+		(left, right) => left.rank - right.rank || left.label.localeCompare(right.label),
+	);
+	const text = displayGroups.map((group) => `${group.count}×${group.label}`).join(" · ");
+	const breakdown = displayGroups
+		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model" : group.label} agent${group.count === 1 ? "" : "s"}`)
+		.join(", ");
 	return {
-		text: `+${count}`,
-		ariaLabel: `${count} subagent${count === 1 ? "" : "s"} observed open`,
+		text,
+		ariaLabel: `${count} subagent${count === 1 ? "" : "s"} observed open: ${breakdown}`,
 	};
 }
 

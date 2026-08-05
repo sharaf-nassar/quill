@@ -126,6 +126,7 @@ it("builds Claude lifecycle observations with official sources and identities", 
     }, {}, timestamp, "fallback.example.com");
     assert(payload.hostname === "fallback", "fallback hostname was not shortened");
     assert(payload.agent_id === "agent-7", `${hook_event_name} agent identity was lost`);
+    assert(payload.model === null, `${hook_event_name} inferred a root model`);
     assert(payload.source === null, `${hook_event_name} gained a SessionStart source`);
   }
 

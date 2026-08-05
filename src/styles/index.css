@@ -2436,11 +2436,18 @@ body {
 
 .wg-row-meta[data-agent="true"] {
   display: inline-flex;
+  align-self: stretch;
   align-items: center;
-  justify-content: center;
   gap: var(--space-2xs);
-  min-width: 27px;
+  min-width: 0;
+  max-width: 160px;
+  flex: 0 1 auto;
+  line-height: 1;
   color: var(--provider-agent);
+}
+
+.wg-row[data-agents="true"] .wg-row-name {
+  min-width: 48px;
 }
 
 .wg-row-agent-icon {
@@ -2451,6 +2458,19 @@ body {
   stroke-width: 1.25;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+.wg-row-agent-separator {
+  flex: 0 0 auto;
+  color: var(--faint);
+}
+
+.wg-row-agent-models {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .wg-row-value {

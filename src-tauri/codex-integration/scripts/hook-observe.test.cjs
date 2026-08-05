@@ -33,21 +33,29 @@ test("builds complete lifecycle payloads from official Codex fields", () => {
       ts: "2026-08-04T12:34:56.789Z",
       hook_matcher: null,
       agent_id: null,
+      model: null,
     });
   }
 
-  assert.equal(
-    buildPayload(
+  const subagent = buildPayload(
       {
         hook_event_name: "SubagentStart",
         session_id: "root-session",
         agent_id: "agent-1",
+        model: "gpt-5.6-sol",
       },
       { hostname: "configured-host" },
       now,
-    ).agent_id,
-    "agent-1",
-  );
+    );
+  assert.equal(subagent.agent_id, "agent-1");
+  assert.equal(subagent.model, "gpt-5.6-sol");
+
+  assert.equal(buildPayload({
+    hook_event_name: "SubagentStart",
+    session_id: "root-session",
+    agent_id: "agent-2",
+    model: { invalid: true },
+  }, { hostname: "configured-host" }, now).model, null);
 });
 
 test("preserves legacy session fallbacks and normalizes fallback hostname", () => {
