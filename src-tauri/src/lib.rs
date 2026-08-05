@@ -3500,11 +3500,14 @@ async fn get_session_breakdown(
     hostname: Option<String>,
     provider: Option<integrations::IntegrationProvider>,
     limit: Option<i32>,
+    observed_subagents: tauri::State<'_, Arc<server::ObservedSubagentState>>,
 ) -> Result<Vec<SessionBreakdown>, String> {
     let storage = get_storage()?;
-    run_blocking(move || {
+    let mut rows = run_blocking(move || {
         storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)
-    })
+    })?;
+    observed_subagents.overlay(&mut rows);
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -3695,9 +3698,13 @@ async fn get_integration_features() -> Result<models::IntegrationFeatures, Strin
 async fn set_activity_tracking_enabled(
     enabled: bool,
     app: tauri::AppHandle,
+    observed_subagents: tauri::State<'_, Arc<server::ObservedSubagentState>>,
 ) -> Result<models::IntegrationFeatures, String> {
     let app_handle = app.clone();
-    run_blocking(move || integrations::set_activity_tracking_enabled(&app_handle, enabled))
+    let features =
+        run_blocking(move || integrations::set_activity_tracking_enabled(&app_handle, enabled))?;
+    observed_subagents.set_activity_tracking_enabled(enabled);
+    Ok(features)
 }
 
 #[tauri::command]
@@ -3739,11 +3746,13 @@ async fn confirm_enable_provider(
     provider: integrations::IntegrationProvider,
     api_key: Option<String>,
     app: tauri::AppHandle,
+    observed_subagents: tauri::State<'_, Arc<server::ObservedSubagentState>>,
 ) -> Result<ProviderStatus, String> {
     let status = {
         let app_handle = app.clone();
         run_blocking(move || integrations::confirm_enable_with_key(&app_handle, provider, api_key))
     }?;
+    observed_subagents.set_provider_enabled(provider, true);
 
     clear_usage_cache().await;
     if let Err(error) = refresh_usage_cache(Some(&app), false).await {
@@ -3757,11 +3766,13 @@ async fn confirm_enable_provider(
 async fn confirm_disable_provider(
     provider: integrations::IntegrationProvider,
     app: tauri::AppHandle,
+    observed_subagents: tauri::State<'_, Arc<server::ObservedSubagentState>>,
 ) -> Result<ProviderStatus, String> {
     let status = {
         let app_handle = app.clone();
         run_blocking(move || integrations::confirm_disable(&app_handle, provider))
     }?;
+    observed_subagents.set_provider_enabled(provider, false);
 
     clear_usage_cache().await;
     if let Err(error) = refresh_usage_cache(Some(&app), false).await {
@@ -5947,6 +5958,13 @@ pub fn run() {
             app.manage(LearningCapability::generate());
             let model_usage_runner_state = Arc::new(RetainedSourceRunnerState::new());
             app.manage(Arc::clone(&model_usage_runner_state));
+            let observed_subagents = Arc::new(server::ObservedSubagentState::default());
+            if !integrations::load_integration_features(storage)
+                .is_ok_and(|features| features.activity_tracking)
+            {
+                observed_subagents.set_activity_tracking_enabled(false);
+            }
+            app.manage(Arc::clone(&observed_subagents));
             // Retained runtime analytics are a startup responsibility, not a
             // side effect of opening or manually syncing Session Search.
             // Blocking inventory/parsing stays off the UI thread; shared root
@@ -6017,6 +6035,7 @@ pub fn run() {
                         secret,
                         handle,
                         session_index,
+                        observed_subagents,
                     ));
                 }
 
@@ -6522,6 +6541,53 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_breakdown_command_overlay_preserves_nullable_ipc() {
+        let state = server::ObservedSubagentState::default();
+        let observation = |hook_event: &str, source: Option<&str>, agent_id: Option<&str>| {
+            models::ObservedHookObservation {
+                provider: integrations::IntegrationProvider::Claude,
+                session_id: "covered-root".to_string(),
+                hostname: Some("ipc-host.example.com".to_string()),
+                hook_event: hook_event.to_string(),
+                source: source.map(str::to_owned),
+                tool_name: None,
+                cwd: None,
+                ts: if hook_event == "SessionStart" {
+                    "2030-01-01T00:00:01Z"
+                } else {
+                    "2030-01-01T00:00:02Z"
+                }
+                .to_string(),
+                hook_matcher: None,
+                agent_id: agent_id.map(str::to_owned),
+            }
+        };
+        state.observe(&observation("SessionStart", Some("startup"), None));
+        state.observe(&observation("SubagentStart", None, Some("agent")));
+
+        let row = |session_id: &str| SessionBreakdown {
+            provider: "claude".to_string(),
+            session_id: session_id.to_string(),
+            hostname: "ipc-host".to_string(),
+            total_tokens: 1,
+            turn_count: 1,
+            first_seen: "2030-01-01T00:00:00Z".to_string(),
+            last_active: "2030-01-01T00:00:02Z".to_string(),
+            project: None,
+            observed_subagent_count: None,
+        };
+        let mut rows = vec![row("covered-root"), row("storage-only-root")];
+        state.overlay(&mut rows);
+
+        assert_eq!(rows[0].observed_subagent_count, Some(1));
+        assert_eq!(rows[1].observed_subagent_count, None);
+        assert_eq!(
+            serde_json::to_value(&rows).expect("serialize SessionBreakdown IPC")[1]["observed_subagent_count"],
+            serde_json::Value::Null
+        );
+    }
 
     #[test]
     #[serial_test::serial]

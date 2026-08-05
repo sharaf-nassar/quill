@@ -282,11 +282,8 @@ pub struct SessionStats {
 
 // Session-level token breakdown
 //
-// As of Wave 2 (sub-agent rollup) the totals here include rows from both the
-// parent transcript and any sub-agent chains (`is_sidechain=1`) belonging to
-// the same `(provider, session_id)` pair. The `has_subagents` and
-// `subagent_count` fields are additive — older TS callers ignore them; the
-// Sessions-tab tree (Wave 3) uses them to decide whether a row is expandable.
+// Totals include rows from both the parent transcript and any sub-agent chains
+// (`is_sidechain=1`) belonging to the same `(provider, session_id)` pair.
 #[derive(Serialize, Clone, Debug)]
 pub struct SessionBreakdown {
     pub provider: String,
@@ -297,19 +294,9 @@ pub struct SessionBreakdown {
     pub first_seen: String,
     pub last_active: String,
     pub project: Option<String>,
-    /// True when at least one row in token_snapshots for this session is
-    /// tagged `is_sidechain=1`. Cheapest signal — chosen because
-    /// token_snapshots is the only sub-agent-aware table that retains rows
-    /// across the Wave 1 reingest reset (response_times / tool_actions were
-    /// truncated and may be empty for older sessions until the next walk).
-    #[serde(default)]
-    pub has_subagents: bool,
-    /// COUNT(DISTINCT agent_id) across token_snapshots ∪ response_times ∪
-    /// tool_actions for this session. UNION is used because any one of the
-    /// three tables may carry the agent_id depending on which side of the
-    /// extraction emitted the row first.
-    #[serde(default)]
-    pub subagent_count: u32,
+    /// Current-process hook coverage: null is unknown, zero is covered with
+    /// none open, and positive is the root-linked observed-open count.
+    pub observed_subagent_count: Option<u32>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -353,17 +340,21 @@ pub struct HookBreakdown {
     pub last_fired_at: String,
 }
 
-/// Codex hook fire observation submitted via
+/// Provider hook fire observation submitted via
 /// `POST /api/v1/hooks/observed`. The server validates this payload,
 /// fast-acks `202 Accepted`, and persists it on a background blocking
-/// task via `Storage::store_codex_hook_observation`. Mirrors the wire
+/// task via `Storage::store_hook_observation`. Mirrors the wire
 /// contract in
 /// specs/009-hooks-breakdown-tab/contracts/hooks-observed-endpoint.md.
 #[derive(Deserialize, Clone, Debug)]
-pub struct CodexHookObservation {
+pub struct ObservedHookObservation {
     pub provider: IntegrationProvider,
     pub session_id: String,
+    #[serde(default)]
+    pub hostname: Option<String>,
     pub hook_event: String,
+    #[serde(default)]
+    pub source: Option<String>,
     #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
@@ -374,6 +365,10 @@ pub struct CodexHookObservation {
     #[serde(default)]
     pub agent_id: Option<String>,
 }
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub type CodexHookObservation = ObservedHookObservation;
 
 /// One sub-agent node inside a parent session, returned by
 /// `get_session_subagent_tree`. Multi-level nesting is supported via

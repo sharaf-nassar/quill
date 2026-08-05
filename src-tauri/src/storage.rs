@@ -608,9 +608,9 @@ pub(crate) struct LiveSessionAnalyticsRows<'a> {
 
 /// One observed lifecycle-hook fire borrowed for the `hook_invocations`
 /// ingest pipeline (feature 009). Claude rows are populated from the
-/// JSONL attachment extractor in `sessions.rs`; Codex rows arrive via
+/// JSONL attachment extractor in `sessions.rs`; live rows arrive via
 /// the HTTP endpoint and are converted into owned
-/// [`crate::models::CodexHookObservation`] before insert. See
+/// [`crate::models::ObservedHookObservation`] before insert. See
 /// specs/009-hooks-breakdown-tab/contracts/hook-invocations.md.
 // @lat: [[backend#Database#Schema#Hook Invocations]]
 #[derive(Clone)]
@@ -13384,20 +13384,9 @@ impl Storage {
         // * last_active is MAX across BOTH token_snapshots and
         //   response_times so an active sub-agent turn keeps the parent's
         //   active badge lit even if no token snapshot landed yet.
-        // * `has_subagents` reads token_snapshots (only sub-agent-aware
-        //   table that survived the Wave 1 reingest reset). Cheapest
-        //   reliable signal.
-        // * `subagent_count` is COUNT(DISTINCT agent_id) over the three raw
-        //   sub-agent-aware tables plus retained daily evidence — any source
-        //   may carry the agent first depending on extraction and pruning.
-        //
         // Rank only the cheap, range-scoped token groups plus each group's
         // indexed response-time maximum. Materializing that top-N frontier
-        // lets LIMIT prune the turn/project/sub-agent enrichment below.
-        // Raw enrichment stays inside the requested timestamp range. The
-        // retained aggregate uses its overlapping first UTC day because its
-        // daily grain cannot represent the partial boundary day without
-        // under-counting a retained sub-agent.
+        // lets LIMIT prune the turn/project enrichment below.
         // Grouping is provider/session-led for every supported filter shape.
         // Pin that access path so planner statistics cannot substitute the
         // unrelated provider/timestamp skip-scan audited on the frozen corpus.
@@ -13408,8 +13397,7 @@ impl Storage {
                             + cache_creation_input_tokens
                             + cache_read_input_tokens) AS total_tokens,
                         MIN(timestamp) AS first_seen,
-                        MAX(timestamp) AS last_active_tok,
-                        MAX(CASE WHEN is_sidechain = 1 THEN 1 ELSE 0 END) AS has_subagents
+                        MAX(timestamp) AS last_active_tok
                  FROM token_snapshots INDEXED BY idx_token_snap_provider_session_sidechain
                  WHERE timestamp >= ?1
             ",
@@ -13462,33 +13450,7 @@ impl Storage {
                       AND t.session_id = candidates.session_id
                       AND t.timestamp >= ?1
                       AND t.cwd IS NOT NULL
-                    ORDER BY t.timestamp DESC LIMIT 1) AS project,
-                 candidates.has_subagents,
-                 (SELECT COUNT(*) FROM (
-                     SELECT agent_id FROM token_snapshots
-                       WHERE provider = candidates.provider
-                         AND session_id = candidates.session_id
-                         AND timestamp >= ?1
-                         AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM response_times
-                       WHERE provider = candidates.provider
-                         AND session_id = candidates.session_id
-                         AND timestamp >= ?1
-                         AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM tool_actions
-                       WHERE provider = candidates.provider
-                         AND session_id = candidates.session_id
-                         AND timestamp >= ?1
-                         AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM retention_daily_aggregates
-                       WHERE provider = candidates.provider
-                         AND session_id = candidates.session_id
-                         AND day >= substr(?1, 1, 10)
-                         AND agent_id != ''
-                 )) AS subagent_count
+                    ORDER BY t.timestamp DESC LIMIT 1) AS project
              FROM candidates
              ORDER BY candidates.last_active DESC"
         ));
@@ -13526,8 +13488,7 @@ impl Storage {
                     first_seen: row.get(5)?,
                     last_active: row.get(6)?,
                     project: row.get(7)?,
-                    has_subagents: row.get::<_, i64>(8)? != 0,
-                    subagent_count: row.get::<_, i64>(9)?.max(0) as u32,
+                    observed_subagent_count: None,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -17863,33 +17824,35 @@ impl Storage {
         Ok(())
     }
 
-    /// Insert a single Codex hook observation submitted via
+    /// Insert one provider hook observation submitted via
     /// `POST /api/v1/hooks/observed`. The endpoint validates the
     /// payload and acknowledges synchronously; this insert runs on a
-    /// background blocking task. Identity is event-scoped (Codex does
-    /// not report per-script execution to the observer hook), with
-    /// `tool_name` appended when present so `PreToolUse:Bash` and
-    /// `PreToolUse:Read` separate cleanly in the breakdown.
+    /// background blocking task. Hook identity is event-scoped, with
+    /// `tool_name` appended when present; agent identity separately keeps
+    /// same-time root-linked lifecycle rows distinct.
     ///
     /// `cwd` is persisted verbatim — unlike `/learning/observations`
     /// which redacts free-text content, the per-cwd drilldown axis on
     /// the Hooks breakdown depends on path-accurate `cwd` values
     /// matching the same paths stored in `skill_usages.cwd` and the
     /// project-rename pipeline. The redaction boundary therefore lives
-    /// at the producer (`hook-observe.cjs`) which only forwards the
-    /// stdin `cwd` field Codex already chose to expose.
+    /// at the provider observers, which only forward their stdin `cwd`.
     // @lat: [[backend#HTTP API Server#Endpoints]]
-    pub fn store_codex_hook_observation(
+    pub fn store_hook_observation(
         &self,
-        obs: &crate::models::CodexHookObservation,
+        obs: &crate::models::ObservedHookObservation,
     ) -> Result<(), String> {
+        let agent_id = obs
+            .agent_id
+            .as_deref()
+            .filter(|agent_id| !agent_id.trim().is_empty());
         let identity = match obs.tool_name.as_deref() {
             Some(t) if !t.is_empty() => format!("{}:{}", obs.hook_event, t),
             _ => obs.hook_event.clone(),
         };
         let invocation = HookInvocationInput {
             session_id: &obs.session_id,
-            agent_id: obs.agent_id.as_deref(),
+            agent_id,
             timestamp: &obs.ts,
             hook_event: &obs.hook_event,
             hook_matcher: obs.hook_matcher.as_deref(),
@@ -17899,7 +17862,7 @@ impl Storage {
             exit_code: None,
             duration_ms: None,
             cwd: obs.cwd.as_deref(),
-            hostname: None,
+            hostname: obs.hostname.as_deref(),
             message_id: None,
         };
         crate::with_rollup_backfill_write_permit(|| {
@@ -17909,7 +17872,7 @@ impl Storage {
                 LiveAnalyticsOrigin {
                     project: None,
                     cwd: obs.cwd.as_deref().map(Path::new),
-                    hostname: None,
+                    hostname: obs.hostname.as_deref(),
                 },
                 LiveSessionAnalyticsRows {
                     messages: &[],
@@ -17918,6 +17881,15 @@ impl Storage {
                 },
             )
         })
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn store_codex_hook_observation(
+        &self,
+        observation: &crate::models::ObservedHookObservation,
+    ) -> Result<(), String> {
+        self.store_hook_observation(observation)
     }
 
     /// Atomically persist one source-less analytics batch and the exact origin
@@ -18193,8 +18165,9 @@ impl Storage {
                          script_command_raw, exit_code, duration_ms, cwd,
                          hostname, message_id
                      ) VALUES (
-                         ?1, NULL, ?2, ?2, NULL, ?3, 0, ?4, ?5, ?6, ?7,
-                         ?8, ?9, ?10, ?11, ?12, ?13, ?14
+                         ?1, NULL, ?2, COALESCE(?3, ?2),
+                         NULL, ?3, CASE WHEN ?3 IS NULL THEN 0 ELSE 1 END,
+                         ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
                      )",
                 )
                 .map_err(|e| format!("Prepare live hook invocations: {e}"))?;
@@ -21144,10 +21117,8 @@ mod tests {
         clear_env();
     }
 
-    /// Wave 2 rollup contract: get_session_breakdown must SUM tokens and
-    /// turns across the parent transcript plus every sub-agent chain, and
-    /// surface has_subagents / subagent_count for the Sessions UI to know
-    /// the row is expandable.
+    /// Session totals still roll up parent and sub-agent chains, while live
+    /// subagent coverage remains a command-layer overlay.
     #[test]
     #[serial]
     fn get_session_breakdown_rolls_up_subagent_tokens() {
@@ -21229,14 +21200,21 @@ mod tests {
             row.turn_count, 2,
             "turn_count must sum response_times rows (parent + sub-agent) = 2"
         );
-        assert!(
-            row.has_subagents,
-            "has_subagents must be true when token_snapshots has is_sidechain=1 row"
-        );
-        assert_eq!(
-            row.subagent_count, 1,
-            "subagent_count must be 1 distinct agent_id across all three tables"
-        );
+        assert_eq!(row.observed_subagent_count, None);
+        let (sql, _) =
+            Storage::session_breakdown_query(range_from_timestamp("7d"), None, None, 100);
+        for historical_source in [
+            "has_subagents",
+            "subagent_count",
+            "hook_invocations",
+            "retention_daily_aggregates",
+            "SELECT agent_id FROM tool_actions",
+        ] {
+            assert!(
+                !sql.contains(historical_source),
+                "Sessions SQL must not reconstruct live state from {historical_source}"
+            );
+        }
         // last_active reflects the most recent row across both tables.
         assert_eq!(
             row.last_active, recent,
@@ -28647,10 +28625,12 @@ mod tests {
                 .send(())
                 .expect("signal Codex hook persistence attempt");
             let result =
-                hook_storage.store_codex_hook_observation(&crate::models::CodexHookObservation {
+                hook_storage.store_hook_observation(&crate::models::ObservedHookObservation {
                     provider: IntegrationProvider::Codex,
                     session_id: "codex-hook-gate-session".to_string(),
+                    hostname: Some("hook-host".to_string()),
                     hook_event: "PreToolUse".to_string(),
+                    source: None,
                     tool_name: Some("Bash".to_string()),
                     cwd: None,
                     ts: "2026-08-04T12:00:00Z".to_string(),
@@ -28693,6 +28673,116 @@ mod tests {
             )
             .expect("count persisted Codex hook");
         assert_eq!(hook_count, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn hook_observation_preserves_same_time_agent_identity() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
+            let session_id = format!("{}-siblings", provider.as_str());
+            for agent_id in ["agent-a", "agent-b"] {
+                storage
+                    .store_hook_observation(&crate::models::ObservedHookObservation {
+                        provider,
+                        session_id: session_id.clone(),
+                        hostname: Some("host".to_string()),
+                        hook_event: "SubagentStart".to_string(),
+                        source: None,
+                        tool_name: None,
+                        cwd: Some("/work".to_string()),
+                        ts: "2030-01-01T00:00:01Z".to_string(),
+                        hook_matcher: None,
+                        agent_id: Some(agent_id.to_string()),
+                    })
+                    .expect("persist sibling hook");
+            }
+        }
+
+        let rows = storage
+            .conn
+            .lock()
+            .prepare(
+                "SELECT provider, session_id, chain_id, parent_chain_id,
+                        agent_id, is_sidechain, hostname
+                 FROM hook_invocations
+                 ORDER BY provider, agent_id",
+            )
+            .expect("prepare sibling hooks")
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .expect("query sibling hooks")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect sibling hooks");
+        assert_eq!(rows.len(), 4);
+        for (_, _session_id, chain_id, parent_chain_id, agent_id, sidechain, hostname) in rows {
+            assert_eq!(chain_id, agent_id);
+            assert_eq!(parent_chain_id, None);
+            assert_eq!(sidechain, 1);
+            assert_eq!(hostname.as_deref(), Some("host"));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn observed_state_survives_audit_persistence_failure() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let state = crate::server::ObservedSubagentState::default();
+        let observation = |hook_event: &str, source: Option<&str>, agent_id: Option<&str>| {
+            crate::models::ObservedHookObservation {
+                provider: IntegrationProvider::Codex,
+                session_id: "failed-audit-root".to_string(),
+                hostname: Some("host".to_string()),
+                hook_event: hook_event.to_string(),
+                source: source.map(str::to_owned),
+                tool_name: None,
+                cwd: None,
+                ts: if hook_event == "SessionStart" {
+                    "2030-01-01T00:00:01Z"
+                } else {
+                    "2030-01-01T00:00:02Z"
+                }
+                .to_string(),
+                hook_matcher: None,
+                agent_id: agent_id.map(str::to_owned),
+            }
+        };
+
+        state.observe(&observation("SessionStart", Some("startup"), None));
+        let agent = observation("SubagentStart", None, Some("agent"));
+        state.observe(&agent);
+        storage
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_hook_audit
+                 BEFORE INSERT ON hook_invocations
+                 BEGIN SELECT RAISE(FAIL, 'forced hook audit failure'); END;",
+            )
+            .expect("install audit failure trigger");
+
+        let error = storage
+            .store_hook_observation(&agent)
+            .expect_err("audit persistence must fail");
+        assert!(error.contains("forced hook audit failure"));
+        assert_eq!(
+            state.snapshot("codex", "host", "failed-audit-root"),
+            Some(1)
+        );
     }
 
     fn assert_rollup_wal_bound(
