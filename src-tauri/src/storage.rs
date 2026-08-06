@@ -26151,10 +26151,14 @@ mod tests {
                       'claude-chain', 0, '2026-08-01T00:00:00Z',
                       'PreToolUse', 'claude-hook');
                  INSERT INTO retention_daily_aggregates
-                     (provider, source_key, session_id, day)
+                     (provider, source_key, session_id, day,
+                      tool_action_count, session_event_count,
+                      code_change_count, lines_added, lines_removed)
                  VALUES
-                     ('codex', 'codex-source', 'codex-session', '2026-08-01'),
-                     ('claude', 'claude-source', 'claude-session', '2026-08-01');",
+                     ('codex', 'codex-source', 'codex-session', '2026-08-01',
+                      2, 3, 4, 5, 6),
+                     ('claude', 'claude-source', 'claude-session', '2026-08-01',
+                      7, 8, 9, 10, 11);",
             )
             .expect("prepare migration 39 fixture");
         }
@@ -26196,6 +26200,28 @@ mod tests {
                 "migration must preserve every row in {table}"
             );
         }
+        assert_eq!(
+            conn.query_row(
+                "SELECT tool_action_count, session_event_count,
+                        code_change_count, lines_added, lines_removed
+                 FROM retention_daily_aggregates
+                 WHERE provider = 'codex'
+                   AND source_key = 'codex-source'
+                   AND session_id = 'codex-session'
+                   AND day = '2026-08-01'",
+                [],
+                |row| Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?
+                )),
+            )
+            .expect("read preserved Codex retention aggregate"),
+            (2_i64, 3_i64, 4_i64, 5_i64, 6_i64),
+            "migration must preserve the aggregate values, not only its row"
+        );
         assert!(table_has_column(
             &conn,
             "model_observation_sources",
@@ -26232,22 +26258,146 @@ mod tests {
         let codex_dir = TempDir::new().expect("Codex tempdir");
         let rollout_dir = codex_dir.path().join("2026/08/01");
         std::fs::create_dir_all(&rollout_dir).expect("create rollout dir");
-        std::fs::write(
-            rollout_dir.join("rollout-child-1.jsonl"),
-            concat!(
-                r#"{"type":"session_meta","timestamp":"2026-08-01T00:00:00Z","payload":{"id":"child-1","thread_source":"subagent","agent_nickname":"worker","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1"}}}}}"#,
-                "\n",
-                r#"{"type":"event_msg","timestamp":"2026-08-01T00:00:01Z","payload":{"type":"agent_message","id":"event-1","message":"done"}}"#,
-                "\n",
-            ),
-        )
-        .expect("write Codex rollout");
+        let rollout = rollout_dir.join("rollout-child-1.jsonl");
+        let now = Utc::now();
+        let pre_watermark =
+            (now - TimeDelta::days(3)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let watermark =
+            (now - TimeDelta::days(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let post_watermark =
+            (now - TimeDelta::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let grown_at =
+            (now - TimeDelta::hours(12)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let initial = [
+            serde_json::json!({
+                "type": "session_meta",
+                "timestamp": pre_watermark,
+                "payload": {
+                    "id": "child-1",
+                    "thread_source": "subagent",
+                    "agent_nickname": "worker",
+                    "source": { "subagent": { "thread_spawn": {
+                        "parent_thread_id": "parent-1"
+                    } } }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "turn_context",
+                "timestamp": post_watermark,
+                "payload": { "model": "gpt-5-codex", "turn_id": "turn-1" }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": post_watermark,
+                "payload": { "type": "token_count", "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 50,
+                        "cache_creation_tokens": 0
+                    }
+                } }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": pre_watermark,
+                "payload": {
+                    "type": "agent_message", "id": "event-old", "message": "old"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "event_msg",
+                "timestamp": post_watermark,
+                "payload": {
+                    "type": "agent_message", "id": "event-new", "message": "new"
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&rollout, &initial).expect("write Codex rollout");
         // SAFETY: environment mutation; this test is serialized.
         unsafe {
             std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", claude_dir.path());
             std::env::set_var("QUILL_CODEX_SESSIONS_DIR", codex_dir.path());
         }
         let storage = init_storage_in(&data_dir);
+        storage
+            .advance_retention_watermark(&watermark)
+            .expect("seed retention watermark");
+        let retained_day = &pre_watermark[..10];
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO retention_daily_aggregates
+                     (provider, source_key, session_id, day,
+                      session_event_count)
+                 VALUES ('codex', 'codex-source', 'parent-1', ?1, 7)",
+                params![retained_day],
+            )
+            .expect("seed pre-migration retention authority");
+        }
+
+        let persist_model_parse = |contents: &str, generation: i64| {
+            let layout_hint = crate::sessions::RetainedJsonlSourceLayoutHint::CodexTranscript;
+            let context = crate::model_usage::CodexAdapterContext {
+                source_key: "codex-source",
+                layout_hint: &layout_hint,
+                hostname: Some("host-a"),
+            };
+            let mut parsed = crate::model_usage::parse_codex_model_usage_jsonl(contents, context);
+            parsed
+                .resolve_analytics_root("parent-1")
+                .expect("Codex observations keep native identity while the file grows");
+            let native = match &parsed.native_identity {
+                crate::model_usage::ProviderNativeIdentityState::Valid(native) => native,
+                state => panic!("expected valid Codex native identity, got {state:?}"),
+            };
+            let metadata = std::fs::metadata(&rollout).expect("stat Codex rollout");
+            let fast = crate::transcript_identity::model_source_fast_fingerprint(&metadata)
+                .expect("fingerprint Codex rollout");
+            let fingerprint = ModelSourceFingerprint::from_content(fast, contents.as_bytes());
+            let attempted_at_ms = Utc::now().timestamp_millis();
+            let source = NormalizedSource {
+                provider: IntegrationProvider::Codex,
+                source_root_key: "codex-root".to_string(),
+                source_key: "codex-source".to_string(),
+                path: rollout.clone(),
+                layout_hint,
+                source_session_id: Some(native.source_session_id.clone()),
+                analytics_session_id: Some(native.analytics_session_id().to_string()),
+                chain_id: Some(native.chain_id.clone()),
+                parent_chain_id: native.parent_chain_id.clone(),
+                is_sidechain: native.is_sidechain,
+                agent_id: native.agent_id.clone(),
+                agent_nickname: native.agent_nickname.clone(),
+                cwd: native.cwd.clone(),
+                hostname: native.hostname.clone(),
+                first_activity_at_ms: Some(native.first_activity_at_ms),
+                last_activity_at_ms: Some(native.last_activity_at_ms),
+                mtime_ns: None,
+                size_bytes: None,
+                content_sha256: None,
+                last_error: None,
+                suppressed_sha256: None,
+                suppressed_at_ms: None,
+                seen_generation: generation,
+                processing_status: SourceProcessingStatus::Ok,
+                observation_count: i64::try_from(parsed.observations.len())
+                    .expect("model observation count"),
+                last_attempt_at_ms: Some(attempted_at_ms),
+                last_success_at_ms: Some(attempted_at_ms),
+            };
+            storage
+                .replace_model_source(&source, &parsed.observations, &fingerprint)
+                .expect("persist Codex model source");
+        };
+        persist_model_parse(&initial, 1);
 
         let reconcile = || {
             crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
@@ -26257,7 +26407,7 @@ mod tests {
         };
         let first = reconcile();
         assert!(first.completed_all_roots);
-        let event_counts = || {
+        let analytics_counts = || {
             let conn = storage.conn.lock().unwrap();
             (
                 scalar_count(
@@ -26271,13 +26421,89 @@ mod tests {
                      WHERE provider = 'codex' AND is_sidechain = 1
                        AND agent_id IS NULL",
                 ),
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM (
+                         SELECT 1 FROM session_events
+                         WHERE provider = 'codex' AND is_sidechain = 1
+                         GROUP BY session_id, timestamp, kind
+                         HAVING COUNT(*) > 1
+                     )",
+                ),
             )
         };
-        assert_eq!(event_counts(), (1, 0));
+        assert_eq!(analytics_counts(), (1, 0, 0));
 
         let second = reconcile();
         assert!(second.completed_all_roots);
-        assert_eq!(event_counts(), (1, 0), "replay must not duplicate events");
+        assert_eq!(
+            analytics_counts(),
+            (1, 0, 0),
+            "unchanged replay must not duplicate events"
+        );
+
+        let grown = initial
+            + &serde_json::json!({
+                "type": "event_msg",
+                "timestamp": grown_at,
+                "payload": { "type": "token_count", "info": {
+                    "total_token_usage": {
+                        "input_tokens": 150,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 75,
+                        "cache_creation_tokens": 0
+                    }
+                } }
+            })
+            .to_string()
+            + "\n";
+        std::fs::write(&rollout, &grown).expect("grow Codex rollout");
+        persist_model_parse(&grown, 2);
+        let third = reconcile();
+        assert!(third.completed_all_roots);
+        assert_eq!(
+            analytics_counts(),
+            (1, 0, 0),
+            "changed replay must preserve event uniqueness and attribution"
+        );
+
+        let history = storage
+            .get_session_model_history("codex", "parent-1", ModelRange::SevenDays)
+            .expect("read Codex model history");
+        let child = history
+            .chains
+            .iter()
+            .find(|chain| chain.chain_id == "child-1")
+            .expect("Codex child chain");
+        assert!(matches!(child.kind, SessionModelChainKind::Subagent));
+        assert_eq!(child.agent_id.as_deref(), Some("child-1"));
+
+        let conn = storage.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT session_event_count
+                 FROM retention_daily_aggregates
+                 WHERE provider = 'codex' AND source_key = 'codex-source'
+                   AND session_id = 'parent-1' AND day = ?1",
+                params![retained_day],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("read retained aggregate after replays"),
+            7,
+            "reingest must not add suppressed detail to retained authority"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM session_events
+                 WHERE provider = 'codex' AND timestamp < (
+                     SELECT value FROM settings WHERE key = 'retention.watermark'
+                 )",
+            ),
+            0,
+            "watermark must block pre-cutoff Codex detail on every replay"
+        );
+        drop(conn);
 
         unsafe {
             std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");

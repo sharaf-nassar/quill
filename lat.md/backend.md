@@ -1302,9 +1302,9 @@ The version gate records one v39 row and leaves the durable reingest marker for 
 
 ##### Codex Identity Reingest Idempotence
 
-A retained spawned Codex rollout rebuilds complete agent attribution without accumulating replay duplicates.
+A retained spawned Codex rollout rebuilds complete runtime and model attribution without accumulating replay duplicates or retained-history counts.
 
-After one whole-root reconciliation every sidechain event has its native agent id; a second unchanged reconciliation leaves the same single owned event row.
+After whole-root reconciliation, every sidechain event has its native agent id and no `(session, timestamp, kind)` duplicate. Unchanged and grown reparses preserve retention aggregates, honor the watermark, and expose a non-null child id through model history.
 
 ##### Empty Legacy Archive Cleanup
 
