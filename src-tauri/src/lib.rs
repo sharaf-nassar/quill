@@ -90,6 +90,7 @@ static MAINTENANCE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static MODEL_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static RUNTIME_ROLLUP_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static ROLLUP_BACKFILL_RUN_ID: AtomicU64 = AtomicU64::new(0);
+static CLAUDE_MODEL_RESCAN_NUDGE_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LAST_POSITION: Mutex<Option<PhysicalPosition<i32>>> = Mutex::new(None);
 static RUNTIME_SETTINGS_TRANSITION_LOCK: Mutex<()> = Mutex::new(());
 const RUNTIME_SETTINGS_BUSY_ERROR: &str = "Runtime settings transition already in progress";
@@ -101,6 +102,8 @@ const MODEL_USAGE_FAILURE_RETRY_BASE_SECS: u64 = 1;
 const MODEL_USAGE_FAILURE_RETRY_CAP_SECS: u64 = 30;
 const MODEL_USAGE_LIVE_COMMIT_BATCH_SIZE: usize = 32;
 const TRANSCRIPT_ANALYTICS_LIVE_BATCH_SIZE: usize = 16;
+const CLAUDE_MODEL_RESCAN_NUDGE_INITIAL_SECS: u64 = 10;
+const CLAUDE_MODEL_RESCAN_NUDGE_RETRY_SECS: u64 = 30;
 // Shared with `server.rs`, which emits the same event from the notify path.
 pub(crate) const TRANSCRIPT_ANALYTICS_UPDATED_EVENT: &str = "transcript-analytics-updated";
 const ROLLUP_BACKFILL_PROGRESS_EVENT: &str = "rollup-backfill-progress";
@@ -817,6 +820,70 @@ fn collect_rescan_changed_sources(
         }
     }
     changed
+}
+
+async fn enqueue_changed_claude_model_sources(
+    app: &tauri::AppHandle,
+    watermark: std::time::SystemTime,
+) {
+    let changed =
+        tauri::async_runtime::spawn_blocking(move || collect_rescan_changed_sources(watermark))
+            .await;
+    let changed = match changed {
+        Ok(changed) => changed,
+        Err(error) => {
+            log::warn!("Claude model rescan nudge worker failed: {error}");
+            return;
+        }
+    };
+    for source in changed
+        .into_iter()
+        .filter(|source| source.provider == integrations::IntegrationProvider::Claude)
+    {
+        if let Err(error) = enqueue_model_usage_live_source(app, source) {
+            log::warn!("Claude model rescan nudge failed to enqueue retained source: {error}");
+        }
+    }
+}
+
+/// Nudge retained Claude model ingestion after a child starts.
+///
+/// Claude lifecycle hooks do not identify the child model. A delayed pair of
+/// changed-source scans lets the transcript provide that exact evidence while
+/// coalescing bursts of sibling starts into one task.
+pub(crate) fn schedule_claude_model_usage_rescan_nudge(app: tauri::AppHandle) {
+    if CLAUDE_MODEL_RESCAN_NUDGE_GENERATION.fetch_add(1, AtomicOrdering::AcqRel) != 0 {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let watermark = std::time::SystemTime::now();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                CLAUDE_MODEL_RESCAN_NUDGE_INITIAL_SECS,
+            ))
+            .await;
+            enqueue_changed_claude_model_sources(&app, watermark).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                CLAUDE_MODEL_RESCAN_NUDGE_RETRY_SECS - CLAUDE_MODEL_RESCAN_NUDGE_INITIAL_SECS,
+            ))
+            .await;
+
+            let covered_generation =
+                CLAUDE_MODEL_RESCAN_NUDGE_GENERATION.load(AtomicOrdering::Acquire);
+            enqueue_changed_claude_model_sources(&app, watermark).await;
+            if CLAUDE_MODEL_RESCAN_NUDGE_GENERATION
+                .compare_exchange(
+                    covered_generation,
+                    0,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+    });
 }
 
 fn spawn_transcript_analytics_live_queue_drain(

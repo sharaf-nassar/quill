@@ -20,7 +20,7 @@ Claude child-model lookup selects the latest exact derived model for the request
 
 ## Claude Retained Model Resolution
 
-Claude open agents resolve only from exact retained child evidence; missing evidence stays in the unknown group and no root model is inferred.
+Claude open agents resolve only from exact retained child evidence; delayed ingestion may refresh that evidence, while missing evidence stays unknown and no root model is inferred.
 
 ## Sessions SQL Excludes Historical Agent State
 

@@ -1579,6 +1579,10 @@ async fn post_hook_observed(
     // identifiable malformed root fails closed synchronously.
     if state.observed_subagents.observe(&payload) {
         let _ = state.app_handle.emit("hooks-observed-updated", ());
+        if payload.provider == IntegrationProvider::Claude && payload.hook_event == "SubagentStart"
+        {
+            crate::schedule_claude_model_usage_rescan_nudge(state.app_handle.clone());
+        }
     }
 
     if payload
