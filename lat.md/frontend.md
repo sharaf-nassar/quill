@@ -323,7 +323,7 @@ Sessions rows render only positive current-process lifecycle evidence; null and 
 
 The model cluster stays on one line and yields space before the project falls below 48 px; lower-priority tail groups ellipsize at narrow widths, while the cluster title and accessible label retain the full breakdown. Provider, tokens, and recency remain fixed columns.
 
-`SessionBreakdown.observed_subagent_count` is a required `number | null`; `observed_subagent_models` is the matching raw-id/count partition, with null ids for unresolved agents. Positive means Quill observed that many root-linked starts without later observed stops inside a trustworthy current-boot epoch; it does not prove process liveness. `observed_only` marks an active current-process root that lacks retained token metrics, so the row renders an em dash for tokens and makes no turns claim. Disabled or incomplete coverage stays null, and a missed stop can remain positive until parent end or restart.
+`SessionBreakdown.observed_subagent_count` is a required `number | null`; `observed_subagent_models` is the matching raw-id/count partition, with null ids for unresolved agents. Positive means Quill observed that many root-linked starts without later observed stops inside a trustworthy current-boot epoch; it does not prove process liveness. `observed_only` marks an active current-process root that lacks retained token metrics, so the row renders an em dash for tokens and makes no turns claim. Disabled or incomplete coverage stays null; identifiable authenticated observations rejected before folding invalidate the exact root, while a stop lost before reaching Quill can remain positive until parent end or restart.
 
 ### Restart Component
 

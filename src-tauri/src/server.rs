@@ -368,6 +368,18 @@ fn observed_root_key(observation: &ObservedHookObservation) -> Option<ObservedRo
 }
 
 impl ObservedSubagentState {
+    fn invalidate_root(&self, observation: &ObservedHookObservation) -> bool {
+        let Some(key) = observed_root_key(observation) else {
+            return false;
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .roots
+            .get_mut(&key)
+            .is_some_and(|root| root.invalidate(None))
+    }
+
     pub(crate) fn observe(&self, observation: &ObservedHookObservation) -> bool {
         let lifecycle = matches!(
             observation.hook_event.as_str(),
@@ -1521,23 +1533,29 @@ async fn post_hook_observed(
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
+    let reject = |status, message: String| {
+        if state.observed_subagents.invalidate_root(&payload) {
+            let _ = state.app_handle.emit("hooks-observed-updated", ());
+        }
+        (status, message)
+    };
     if !check_rate_limit_with_max(&state.obs_rate_limiter, MAX_OBS_REQUESTS) {
-        return (
+        return reject(
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
         );
     }
     if payload.session_id.is_empty() || payload.session_id.len() > MAX_SESSION_ID_LEN {
-        return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
+        return reject(StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
     }
     if !matches!(
         payload.provider,
         IntegrationProvider::Claude | IntegrationProvider::Codex
     ) {
-        return (StatusCode::BAD_REQUEST, "Invalid provider".to_string());
+        return reject(StatusCode::BAD_REQUEST, "Invalid provider".to_string());
     }
     if !crate::integrations::codex::is_supported_hook_event(&payload.hook_event) {
-        return (
+        return reject(
             StatusCode::BAD_REQUEST,
             format!("Unknown hook_event: {}", payload.hook_event),
         );
@@ -1548,31 +1566,31 @@ async fn post_hook_observed(
         .as_ref()
         .is_some_and(|t| t.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "tool_name too long".to_string());
+        return reject(StatusCode::BAD_REQUEST, "tool_name too long".to_string());
     }
     if payload.cwd.as_ref().is_some_and(|c| c.len() > MAX_CWD_LEN) {
-        return (StatusCode::BAD_REQUEST, "cwd too long".to_string());
+        return reject(StatusCode::BAD_REQUEST, "cwd too long".to_string());
     }
     if payload
         .hostname
         .as_ref()
         .is_some_and(|hostname| hostname.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "hostname too long".to_string());
+        return reject(StatusCode::BAD_REQUEST, "hostname too long".to_string());
     }
     if payload
         .hook_matcher
         .as_ref()
         .is_some_and(|m| m.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
+        return reject(StatusCode::BAD_REQUEST, "hook_matcher too long".to_string());
     }
     if payload
         .agent_id
         .as_ref()
         .is_some_and(|a| a.len() > MAX_STRING_LEN)
     {
-        return (StatusCode::BAD_REQUEST, "agent_id too long".to_string());
+        return reject(StatusCode::BAD_REQUEST, "agent_id too long".to_string());
     }
 
     // Fold before audit persistence and before ordering/source rejection so an
