@@ -3196,20 +3196,23 @@ fn project_name_from_cwd(cwd: &str) -> Option<String> {
         .map(|name| name.to_string())
 }
 
+fn codex_text_blocks<'a>(
+    payload: &'a serde_json::Value,
+    block_type: &'a str,
+) -> impl Iterator<Item = &'a str> {
+    payload
+        .get("content")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter(move |block| block.get("type").and_then(|value| value.as_str()) == Some(block_type))
+        .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+        .filter(|text| !text.trim().is_empty())
+}
+
 fn has_nonempty_codex_assistant_output(payload: &serde_json::Value) -> bool {
     payload.get("role").and_then(|value| value.as_str()) == Some("assistant")
-        && payload
-            .get("content")
-            .and_then(|value| value.as_array())
-            .is_some_and(|content| {
-                content.iter().any(|block| {
-                    block.get("type").and_then(|value| value.as_str()) == Some("output_text")
-                        && block
-                            .get("text")
-                            .and_then(|value| value.as_str())
-                            .is_some_and(|text| !text.trim().is_empty())
-                })
-            })
+        && codex_text_blocks(payload, "output_text").next().is_some()
 }
 
 fn make_tool_message(
@@ -3891,6 +3894,48 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                     .and_then(|value| value.as_str())
                     .unwrap_or("")
                 {
+                    "agent_message" => {
+                        let content = codex_text_blocks(payload, "input_text")
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if content.is_empty() {
+                            continue;
+                        }
+                        let author = payload
+                            .get("author")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let recipient = payload
+                            .get("recipient")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let mut content_parts = Vec::with_capacity(3);
+                        if !author.is_empty() {
+                            content_parts.push(format!("From: {author}"));
+                        }
+                        if !recipient.is_empty() {
+                            content_parts.push(format!("To: {recipient}"));
+                        }
+                        content_parts.push(content);
+                        messages.push(ExtractedMessage {
+                            uuid: format!("{session_id}:event:{line_idx}"),
+                            session_id: session_id.clone(),
+                            role: author.to_string(),
+                            content: content_parts.join("\n"),
+                            timestamp,
+                            git_branch: git_branch.clone(),
+                            tools_used: Vec::new(),
+                            files_modified: Vec::new(),
+                            code_changes: Vec::new(),
+                            commands_run: Vec::new(),
+                            tool_details: Vec::new(),
+                            tool_actions: Vec::new(),
+                            is_sidechain: native_identity.is_sidechain,
+                            agent_id: None,
+                            parent_uuid: None,
+                            cwd: cwd.clone(),
+                        });
+                    }
                     "function_call" => {
                         let name = payload
                             .get("name")
@@ -4130,9 +4175,14 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                             parent_uuid: None,
                         });
                     }
+                    // Other response items are either non-search reasoning or
+                    // tool data already represented by the branches above.
                     _ => {}
                 }
             }
+            // Context snapshots, compaction state, and communication metadata
+            // carry no user-facing search message. Model analytics parses its
+            // own turn_context evidence from the same retained records.
             _ => {}
         }
     }
