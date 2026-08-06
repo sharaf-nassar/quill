@@ -271,7 +271,7 @@ The shared Claude walker covers flat parents and the full `subagents/` subtree f
 
 It collects every `.jsonl` at any depth: flat `subagents/agent-*.jsonl` plus Workflow-spawned agents nested one level deeper at `subagents/workflows/wf_<id>/agent-*.jsonl` (~20% of agents on a heavy Workflow user). The walk is bounded to that subtree so unrelated nested JSONLs never sneak in.
 
-Each sub-agent file becomes a separate ingest entry. Claude uses `agentId` as native child chain and `sessionId` as parent; Codex forked rollouts use their first child `session_meta.id` and `parent_thread_id` or `forked_from_id`. Resolved-root `session_id` is stamped later without replacing either provider's child identity. Workflow-layout agent records are leaner than flat ones — their first record omits `cwd`, `entrypoint`, `gitBranch`, `promptId`, and `version` — so identity resolution reads every non-linkage field as optional and never assumes those keys exist.
+Each sub-agent file becomes a separate ingest entry. Claude uses `agentId` as native child chain and `sessionId` as parent; Session Search indexes the child chain so sibling transcripts never replace each other and context opens the matching source. Codex forked rollouts use their first child `session_meta.id` and `parent_thread_id` or `forked_from_id`. Resolved-root `session_id` is stamped later without replacing either provider's child identity. Workflow-layout agent records are leaner than flat ones — their first record omits `cwd`, `entrypoint`, `gitBranch`, `promptId`, and `version` — so identity resolution reads every non-linkage field as optional and never assumes those keys exist.
 
 ## Memory Optimization Pipeline
 

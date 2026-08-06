@@ -264,7 +264,7 @@ Full-text search across Claude Code and Codex session transcripts, powered by Ta
 
 Opening Session Search syncs transcripts using nanosecond mtime plus file size, including removal of search documents for transcripts proven absent by complete source discovery. Metadata failures remain uncached for retry.
 
-Incomplete discovery preserves indexed data. Hook endpoints can also ingest updates; indexed messages include code_changes, commands_run, tool_details, and files_modified metadata.
+Incomplete discovery preserves indexed data. Hook endpoints can also ingest updates; indexed messages include code_changes, commands_run, tool_details, and files_modified metadata. Parent and child chains keep distinct provider-native identities, so result context resolves the exact retained transcript without crossing providers or choosing an ambiguous source.
 
 ### Search Interface
 

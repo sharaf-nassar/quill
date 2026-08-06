@@ -1307,11 +1307,6 @@ impl SessionIndex {
             .unwrap_or_else(|_| "unknown".to_string())
     }
 
-    fn discover_claude_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
-        let projects_dir = crate::data_paths::resolve_claude_projects_dir();
-        Self::discover_claude_session_files_in(&projects_dir)
-    }
-
     /// Test-friendly variant: enumerate Claude transcripts (parent + sub-agent)
     /// under the supplied `projects_dir`. Two explicit passes per project:
     /// first picks up `<projectSlug>/*.jsonl` (parents), second recurses the
@@ -3375,7 +3370,7 @@ fn extract_claude_messages_from_jsonl_records(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let session_id = obj
+        let source_session_id = obj
             .get("sessionId")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -3404,6 +3399,14 @@ fn extract_claude_messages_from_jsonl_records(
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let session_id = if is_sidechain {
+            let Some(agent_id) = agent_id.clone() else {
+                continue;
+            };
+            agent_id
+        } else {
+            source_session_id
+        };
         let parent_uuid = obj
             .get("parentUuid")
             .and_then(|v| v.as_str())
@@ -4145,22 +4148,105 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
     }
 }
 
-// `pub(crate)` so the learning pipeline's Stream C can resolve a
-// session's parent transcript path (sub-agent transcripts live under a
-// separate `<session>/subagents/` dir and are never matched here).
+fn unique_session_path(
+    provider: IntegrationProvider,
+    session_id: &str,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>, String> {
+    let mut paths = paths.into_iter().collect::<HashSet<_>>();
+    if paths.len() > 1 {
+        return Err(format!(
+            "Multiple {provider} transcripts match session {session_id}"
+        ));
+    }
+    Ok(paths.drain().next())
+}
+
+fn registered_codex_session_path(session_id: &str) -> Result<Option<PathBuf>, String> {
+    let Some(storage) = crate::STORAGE.get() else {
+        return Ok(None);
+    };
+    let sources = storage.list_transcript_analytics_sources_for_root(
+        IntegrationProvider::Codex,
+        CODEX_SOURCE_ROOT_KEY,
+    )?;
+    let mut exact = Vec::new();
+    let mut rooted = Vec::new();
+    for source in sources {
+        if source.processing_status == "suppressed" || source.suppressed_sha256.is_some() {
+            continue;
+        }
+        if source.chain_id.as_deref() == Some(session_id)
+            || source.source_session_id.as_deref() == Some(session_id)
+        {
+            exact.push(source.source_path);
+        } else if source.analytics_session_id.as_deref() == Some(session_id) {
+            rooted.push(source.source_path);
+        }
+    }
+    let path = if exact.is_empty() {
+        unique_session_path(IntegrationProvider::Codex, session_id, rooted)?
+    } else {
+        unique_session_path(IntegrationProvider::Codex, session_id, exact)?
+    };
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    match validate_retained_notify_source(IntegrationProvider::Codex, &path) {
+        Ok(Some(source)) if source.provider == IntegrationProvider::Codex => {
+            Ok(Some(source.canonical_path))
+        }
+        Ok(_) | Err(_) => Ok(None),
+    }
+}
+
+fn find_claude_session_path_in(
+    projects_dir: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    let canonical_root = match std::fs::canonicalize(projects_dir) {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Canonicalize Claude projects dir: {error}")),
+    };
+    let mut matches = Vec::new();
+    for source in SessionIndex::discover_claude_session_files_in(projects_dir)? {
+        let Ok(path) = std::fs::canonicalize(&source.path) else {
+            continue;
+        };
+        if !path.starts_with(&canonical_root) {
+            continue;
+        }
+        let matches_identity = if source.is_subagent {
+            extract_messages_from_jsonl(IntegrationProvider::Claude, &path)
+                .messages
+                .iter()
+                .any(|message| message.session_id == session_id)
+        } else {
+            path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
+        };
+        if matches_identity {
+            matches.push(path);
+        }
+    }
+    unique_session_path(IntegrationProvider::Claude, session_id, matches)
+}
+
+// `pub(crate)` so the learning pipeline's Stream C can resolve parent
+// transcripts while Session Search can resolve provider-native child chains.
 pub(crate) fn find_session_path(
     provider: IntegrationProvider,
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
     match provider {
-        IntegrationProvider::Claude => Ok(SessionIndex::discover_claude_session_files()?
-            .into_iter()
-            .find(|source| {
-                !source.is_subagent
-                    && source.path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id)
-            })
-            .map(|source| source.path)),
+        IntegrationProvider::Claude => {
+            let projects_dir = crate::data_paths::resolve_claude_projects_dir();
+            find_claude_session_path_in(&projects_dir, session_id)
+        }
         IntegrationProvider::Codex => {
+            if let Some(path) = registered_codex_session_path(session_id)? {
+                return Ok(Some(path));
+            }
             let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
             find_codex_session_path_in(&sessions_dir, session_id)
         }
@@ -4173,15 +4259,19 @@ fn find_codex_session_path_in(
     session_id: &str,
 ) -> Result<Option<PathBuf>, String> {
     let expected_suffix = format!("{session_id}.jsonl");
-    Ok(SessionIndex::discover_codex_session_files_in(sessions_dir)?
-        .into_iter()
-        .find(|source| {
-            source
-                .path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().ends_with(&expected_suffix))
-        })
-        .map(|source| source.path))
+    unique_session_path(
+        IntegrationProvider::Codex,
+        session_id,
+        SessionIndex::discover_codex_session_files_in(sessions_dir)?
+            .into_iter()
+            .filter(|source| {
+                source
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(&expected_suffix))
+            })
+            .map(|source| source.path),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4362,8 +4452,8 @@ mod tests {
                 "agent_id must round-trip through extraction"
             );
             assert_eq!(
-                msg.session_id, "11111111-2222-3333-4444-555555555555",
-                "sub-agent session_id must equal the parent transcript's session_id"
+                msg.session_id, "aaaabbbbccccdddd",
+                "sub-agent session_id must use its native agent chain identity"
             );
         }
         // First message in the sub-agent chain has parentUuid=null; the second
