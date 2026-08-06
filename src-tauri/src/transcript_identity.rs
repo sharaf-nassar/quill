@@ -208,6 +208,7 @@ pub(crate) struct NativeChainIdentity {
     pub(crate) parent_chain_id: Option<String>,
     pub(crate) is_sidechain: bool,
     pub(crate) agent_id: Option<String>,
+    pub(crate) agent_nickname: Option<String>,
     pub(crate) cwd: Option<PathBuf>,
 }
 
@@ -232,7 +233,15 @@ impl std::error::Error for IdentityError {}
 struct CodexMetadata {
     source_session_id: String,
     parent_chain_id: Option<String>,
+    is_spawn: bool,
+    agent_nickname: Option<String>,
     cwd: Option<PathBuf>,
+}
+
+#[derive(PartialEq, Eq)]
+struct CodexDeclaredIdentity {
+    parent_chain_id: Option<String>,
+    is_spawn: bool,
 }
 
 fn nonempty_string(value: Option<&Value>) -> Option<String> {
@@ -257,11 +266,27 @@ fn codex_metadata(record: &JsonlRecord) -> Option<CodexMetadata> {
     }
     let payload = object.get("payload").and_then(Value::as_object)?;
     let source_session_id = nonempty_string(payload.get("id"))?;
+    let thread_spawn = payload
+        .get("source")
+        .and_then(Value::as_object)
+        .and_then(|source| source.get("subagent"))
+        .and_then(Value::as_object)
+        .and_then(|subagent| subagent.get("thread_spawn"))
+        .and_then(Value::as_object);
     let parent_thread_id = optional_nonempty_string(payload.get("parent_thread_id")).ok()?;
+    let spawn_parent_thread_id =
+        optional_nonempty_string(thread_spawn.and_then(|spawn| spawn.get("parent_thread_id")))
+            .ok()?;
     let forked_from_id = optional_nonempty_string(payload.get("forked_from_id")).ok()?;
+    let thread_source = optional_nonempty_string(payload.get("thread_source")).ok()?;
+    let agent_nickname = optional_nonempty_string(payload.get("agent_nickname")).ok()?;
     Some(CodexMetadata {
         source_session_id,
-        parent_chain_id: parent_thread_id.or(forked_from_id),
+        parent_chain_id: parent_thread_id
+            .or(spawn_parent_thread_id)
+            .or(forked_from_id),
+        is_spawn: thread_spawn.is_some() || thread_source.as_deref() == Some("subagent"),
+        agent_nickname,
         cwd: nonempty_string(payload.get("cwd")).map(PathBuf::from),
     })
 }
@@ -273,30 +298,40 @@ pub(crate) fn resolve_codex_native_identity(
 ) -> Result<NativeChainIdentity, IdentityError> {
     let mut native: Option<CodexMetadata> = None;
     let mut expected_ancestors = HashSet::<String>::new();
-    let mut declared_parents = HashMap::<String, Option<String>>::new();
+    let mut declared_identities = HashMap::<String, CodexDeclaredIdentity>::new();
 
     for metadata in records.iter().filter_map(codex_metadata) {
         let Some(child) = &mut native else {
             if let Some(parent) = &metadata.parent_chain_id {
                 expected_ancestors.insert(parent.clone());
             }
-            declared_parents.insert(
+            declared_identities.insert(
                 metadata.source_session_id.clone(),
-                metadata.parent_chain_id.clone(),
+                CodexDeclaredIdentity {
+                    parent_chain_id: metadata.parent_chain_id.clone(),
+                    is_spawn: metadata.is_spawn,
+                },
             );
-            if native_parent_cycle(&metadata.source_session_id, &declared_parents) {
+            if native_parent_cycle(&metadata.source_session_id, &declared_identities) {
                 return Err(IdentityError::ConflictingNativeIdentity);
             }
             native = Some(metadata);
             continue;
         };
 
-        if let Some(declared_parent) = declared_parents.get(&metadata.source_session_id) {
-            if declared_parent != &metadata.parent_chain_id {
+        if let Some(declared) = declared_identities.get(&metadata.source_session_id) {
+            if declared.parent_chain_id != metadata.parent_chain_id
+                || declared.is_spawn != metadata.is_spawn
+            {
                 return Err(IdentityError::ConflictingNativeIdentity);
             }
-            if child.source_session_id == metadata.source_session_id && child.cwd.is_none() {
-                child.cwd = metadata.cwd;
+            if child.source_session_id == metadata.source_session_id {
+                if child.cwd.is_none() {
+                    child.cwd = metadata.cwd;
+                }
+                if child.agent_nickname.is_none() {
+                    child.agent_nickname = metadata.agent_nickname;
+                }
             }
             continue;
         }
@@ -305,8 +340,14 @@ pub(crate) fn resolve_codex_native_identity(
             if let Some(parent) = &metadata.parent_chain_id {
                 expected_ancestors.insert(parent.clone());
             }
-            declared_parents.insert(metadata.source_session_id.clone(), metadata.parent_chain_id);
-            if native_parent_cycle(&metadata.source_session_id, &declared_parents) {
+            declared_identities.insert(
+                metadata.source_session_id.clone(),
+                CodexDeclaredIdentity {
+                    parent_chain_id: metadata.parent_chain_id,
+                    is_spawn: metadata.is_spawn,
+                },
+            );
+            if native_parent_cycle(&metadata.source_session_id, &declared_identities) {
                 return Err(IdentityError::ConflictingNativeIdentity);
             }
             continue;
@@ -316,26 +357,34 @@ pub(crate) fn resolve_codex_native_identity(
     }
 
     let native = native.ok_or(IdentityError::MissingNativeIdentity)?;
-    let is_sidechain = native.parent_chain_id.is_some();
+    let is_sidechain = native.is_spawn || native.parent_chain_id.is_some();
+    let agent_id = native.is_spawn.then(|| native.source_session_id.clone());
     Ok(NativeChainIdentity {
         provider: IntegrationProvider::Codex,
         source_session_id: native.source_session_id.clone(),
         chain_id: native.source_session_id,
         parent_chain_id: native.parent_chain_id,
         is_sidechain,
-        agent_id: None,
+        agent_id,
+        agent_nickname: native.agent_nickname,
         cwd: native.cwd,
     })
 }
 
-fn native_parent_cycle(start: &str, declared_parents: &HashMap<String, Option<String>>) -> bool {
+fn native_parent_cycle(
+    start: &str,
+    declared_identities: &HashMap<String, CodexDeclaredIdentity>,
+) -> bool {
     let mut current = start;
     let mut visited = HashSet::<&str>::new();
     loop {
         if !visited.insert(current) {
             return true;
         }
-        let Some(Some(parent)) = declared_parents.get(current) else {
+        let Some(Some(parent)) = declared_identities
+            .get(current)
+            .map(|identity| identity.parent_chain_id.as_deref())
+        else {
             return false;
         };
         current = parent;
@@ -633,5 +682,122 @@ mod tests {
             let actual = resolved.map(|identity| observed_identity(&identity));
             assert_eq!(actual, expected, "{name}");
         }
+    }
+
+    #[test]
+    fn resolve_codex_native_identity_reads_both_spawn_schema_eras() {
+        let legacy = resolve_codex_native_identity(&[record(
+            0,
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "legacy-child",
+                    "agent_nickname": "legacy-worker",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": { "parent_thread_id": "nested-parent" }
+                        }
+                    }
+                }
+            }),
+        )])
+        .expect("legacy spawn metadata");
+        assert_eq!(legacy.chain_id, "legacy-child");
+        assert_eq!(legacy.source_session_id, "legacy-child");
+        assert_eq!(legacy.parent_chain_id.as_deref(), Some("nested-parent"));
+        assert_eq!(legacy.agent_id.as_deref(), Some("legacy-child"));
+        assert_eq!(legacy.agent_nickname.as_deref(), Some("legacy-worker"));
+        assert!(legacy.is_sidechain);
+
+        let modern = resolve_codex_native_identity(&[record(
+            0,
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "modern-child",
+                    "parent_thread_id": "top-parent",
+                    "forked_from_id": "fork-parent",
+                    "thread_source": "subagent",
+                    "agent_nickname": "modern-worker",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": { "parent_thread_id": "nested-parent" }
+                        }
+                    }
+                }
+            }),
+        )])
+        .expect("modern spawn metadata");
+        assert_eq!(modern.parent_chain_id.as_deref(), Some("top-parent"));
+        assert_eq!(modern.agent_id.as_deref(), Some("modern-child"));
+        assert_eq!(modern.agent_nickname.as_deref(), Some("modern-worker"));
+        assert!(modern.is_sidechain);
+
+        for payload in [
+            json!({ "id": "user", "thread_source": "user" }),
+            json!({ "id": "no-spawn" }),
+        ] {
+            let identity = resolve_codex_native_identity(&[record(
+                0,
+                json!({ "type": "session_meta", "payload": payload }),
+            )])
+            .expect("non-spawn identity");
+            assert_eq!(identity.agent_id, None);
+            assert!(!identity.is_sidechain);
+        }
+    }
+
+    #[test]
+    fn resolve_codex_native_identity_validates_spawn_restatements() {
+        let agreeing = vec![
+            record(
+                0,
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "child",
+                        "agent_nickname": "first-label",
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": { "parent_thread_id": "parent" }
+                            }
+                        }
+                    }
+                }),
+            ),
+            record(
+                1,
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "child",
+                        "parent_thread_id": "parent",
+                        "thread_source": "subagent",
+                        "agent_nickname": "later-label"
+                    }
+                }),
+            ),
+        ];
+        let identity =
+            resolve_codex_native_identity(&agreeing).expect("agreeing spawn restatement");
+        assert_eq!(identity.agent_nickname.as_deref(), Some("first-label"));
+        assert_eq!(identity.agent_id.as_deref(), Some("child"));
+
+        let mut conflicting = agreeing;
+        conflicting[1] = record(
+            1,
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "child",
+                    "parent_thread_id": "parent",
+                    "thread_source": "user"
+                }
+            }),
+        );
+        assert!(matches!(
+            resolve_codex_native_identity(&conflicting),
+            Err(IdentityError::ConflictingNativeIdentity)
+        ));
     }
 }

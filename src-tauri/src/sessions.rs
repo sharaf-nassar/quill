@@ -2212,8 +2212,7 @@ pub struct ExtractedMessage {
     // Tool actions for SQLite storage
     #[allow(dead_code)]
     pub tool_actions: Vec<ToolAction>,
-    /// Claude Code sub-agent attribution. Always false/None for Codex (no
-    /// sub-agent concept) and for top-level Claude messages.
+    /// Provider-native sub-agent attribution. False for top-level messages.
     pub is_sidechain: bool,
     #[allow(dead_code)] // Native source identity supplies analytics attribution.
     pub agent_id: Option<String>,
@@ -4190,6 +4189,10 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
     for message in &mut messages {
         message.session_id.clone_from(&native_identity.chain_id);
         message.is_sidechain = native_identity.is_sidechain;
+        message.agent_id.clone_from(&native_identity.agent_id);
+    }
+    for event in &mut events {
+        event.agent_id.clone_from(&native_identity.agent_id);
     }
 
     ExtractedSession {
@@ -4677,5 +4680,23 @@ mod tests {
             find_codex_session_path_in(tmp.path(), session_id).expect("lookup"),
             Some(rollout)
         );
+    }
+
+    #[test]
+    fn codex_spawn_identity_reaches_messages_and_events() {
+        let records = parse_jsonl_records(concat!(
+            r#"{"type":"session_meta","payload":{"id":"child-1","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1"}}}}}"#,
+            "\n",
+            r#"{"type":"event_msg","timestamp":"2026-08-03T12:00:00Z","payload":{"type":"agent_message","message":"done"}}"#,
+        ));
+        let extracted = extract_codex_messages_from_jsonl_records(&records);
+
+        assert_eq!(extracted.session_id, "child-1");
+        assert_eq!(extracted.messages.len(), 1);
+        assert!(extracted.messages[0].is_sidechain);
+        assert_eq!(extracted.messages[0].agent_id.as_deref(), Some("child-1"));
+        assert_eq!(extracted.events.len(), 1);
+        assert!(extracted.events[0].is_sidechain);
+        assert_eq!(extracted.events[0].agent_id.as_deref(), Some("child-1"));
     }
 }

@@ -1370,9 +1370,11 @@ Committing a source whose parsed identity no longer matches the inventoried one 
 
 ##### Codex Identity Restatement And Cycles
 
-[[src-tauri/src/transcript_identity.rs#resolve_codex_native_identity]] keeps the first child identity while tolerating consistent ancestor restatements and refusing everything else.
+[[src-tauri/src/transcript_identity.rs#resolve_codex_native_identity]] keeps the first child identity while tolerating consistent ancestor and spawn restatements and refusing everything else.
 
-Thirteen cases cover root sessions, a collapsed ancestor chain, a restated child that fills a missing `cwd`, `forked_from_id` standing in for `parent_thread_id`, conflicting or dropped parents, unrelated second sessions, `A → B → A` and self-parent cycles that must terminate as conflicts rather than hang, and metadata too degenerate to yield any identity.
+Legacy `source.subagent.thread_spawn` and modern top-level `thread_source: "subagent"` both mark a Codex sidechain. Parent precedence is top-level `parent_thread_id`, nested spawn parent, then `forked_from_id`; spawned chains use their own thread id for both `chain_id` and `agent_id`.
+
+`agent_nickname` is first-non-null display metadata. It never participates in identity comparison or row keys. Tests cover both schema eras, user and no-spawn roots, agreeing and conflicting spawn restatements, ancestor chains, dropped parents, unrelated sessions, cycles, and degenerate metadata.
 
 #### Code and Runtime Metrics
 

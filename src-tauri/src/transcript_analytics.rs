@@ -274,6 +274,7 @@ fn stored_native_identity(source: &StoredTranscriptAnalyticsSource) -> Option<Na
         parent_chain_id: source.parent_chain_id.clone(),
         is_sidechain: source.is_sidechain,
         agent_id: source.agent_id.clone(),
+        agent_nickname: None,
         cwd: source.cwd.clone(),
     })
 }
@@ -672,8 +673,8 @@ struct CommittedTranscriptSource {
 
 /// Compare the identity fields that decide cross-source root membership.
 ///
-/// `cwd` is deliberately excluded: it is descriptive origin, and a last-good
-/// registry row can legitimately carry a different one than a fresh parse.
+/// `cwd` and `agent_nickname` are deliberately excluded: they are descriptive
+/// labels, and a last-good row can legitimately differ from a fresh parse.
 fn native_identity_matches(left: &NativeChainIdentity, right: &NativeChainIdentity) -> bool {
     left.provider == right.provider
         && left.source_session_id == right.source_session_id
@@ -1282,6 +1283,7 @@ fn resolve_claude_native_identity(
             parent_chain_id,
             is_sidechain: native_sidechain,
             agent_id,
+            agent_nickname: None,
             cwd: nonempty_string(object.get("cwd")).map(PathBuf::from),
         };
         let Some(current) = &mut native else {
@@ -2294,6 +2296,7 @@ mod tests {
             parent_chain_id: None,
             is_sidechain: false,
             agent_id: None,
+            agent_nickname: None,
             cwd: Some(PathBuf::from("/work/a")),
         };
         let relocated = NativeChainIdentity {
@@ -2301,6 +2304,13 @@ mod tests {
             ..base.clone()
         };
         assert!(native_identity_matches(&base, &relocated));
+        assert!(native_identity_matches(
+            &base,
+            &NativeChainIdentity {
+                agent_nickname: Some("worker".to_owned()),
+                ..base.clone()
+            }
+        ));
         assert!(native_identity_matches(
             &base,
             &NativeChainIdentity {
@@ -2378,6 +2388,7 @@ mod tests {
             parent_chain_id: None,
             is_sidechain: false,
             agent_id: None,
+            agent_nickname: None,
             cwd: Some(PathBuf::from("/work/a")),
         };
 

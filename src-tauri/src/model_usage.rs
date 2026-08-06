@@ -59,6 +59,7 @@ pub(crate) struct NormalizedSource {
     pub parent_chain_id: Option<String>,
     pub is_sidechain: bool,
     pub agent_id: Option<String>,
+    pub agent_nickname: Option<String>,
     pub cwd: Option<PathBuf>,
     pub hostname: Option<String>,
     pub first_activity_at_ms: Option<i64>,
@@ -739,6 +740,7 @@ pub(crate) struct ProviderNativeSourceMetadata {
     pub parent_chain_id: Option<String>,
     pub is_sidechain: bool,
     pub agent_id: Option<String>,
+    pub agent_nickname: Option<String>,
     pub cwd: Option<PathBuf>,
     pub hostname: Option<String>,
     pub first_activity_at_ms: i64,
@@ -1026,6 +1028,7 @@ pub(crate) fn parse_claude_model_usage_jsonl(
                 parent_chain_id: parent_chain_id.clone(),
                 is_sidechain,
                 agent_id: agent_id.clone(),
+                agent_nickname: None,
                 cwd: cwd.clone(),
                 hostname: context.hostname.map(str::to_owned),
                 first_activity_at_ms: observed_at_ms,
@@ -1410,6 +1413,7 @@ pub(crate) fn parse_codex_model_usage_jsonl(
                 parent_chain_id: native.parent_chain_id,
                 is_sidechain: native.is_sidechain,
                 agent_id: native.agent_id,
+                agent_nickname: native.agent_nickname,
                 cwd: native.cwd,
                 hostname: context.hostname.map(str::to_owned),
                 first_activity_at_ms,
@@ -1690,7 +1694,7 @@ fn codex_observation_metadata(
         chain_id: native_source.chain_id.clone(),
         parent_chain_id: native_source.parent_chain_id.clone(),
         is_sidechain: native_source.is_sidechain,
-        agent_id: None,
+        agent_id: native_source.agent_id.clone(),
         turn_id,
         observed_at_ms,
         cwd: native_source.cwd.clone(),
@@ -2161,6 +2165,7 @@ fn native_graph_metadata(native: &ProviderNativeSourceMetadata) -> NativeChainId
         parent_chain_id: native.parent_chain_id.clone(),
         is_sidechain: native.is_sidechain,
         agent_id: native.agent_id.clone(),
+        agent_nickname: native.agent_nickname.clone(),
         cwd: native.cwd.clone(),
     }
 }
@@ -2178,6 +2183,7 @@ fn stored_graph_metadata(stored: &StoredModelSource) -> Option<NativeChainIdenti
         parent_chain_id: stored.last_good.parent_chain_id.clone(),
         is_sidechain: stored.last_good.is_sidechain,
         agent_id: stored.last_good.agent_id.clone(),
+        agent_nickname: None,
         cwd: stored.last_good.cwd.clone(),
     })
 }
@@ -3796,6 +3802,7 @@ fn normalized_source_from_existing(
         parent_chain_id: last_good.and_then(|source| source.parent_chain_id.clone()),
         is_sidechain: last_good.is_some_and(|source| source.is_sidechain),
         agent_id: last_good.and_then(|source| source.agent_id.clone()),
+        agent_nickname: None,
         cwd: last_good.and_then(|source| source.cwd.clone()),
         hostname: last_good.and_then(|source| source.hostname.clone()),
         first_activity_at_ms: last_good.and_then(|source| source.first_activity_at_ms),
@@ -3837,6 +3844,7 @@ fn normalized_source_from_parse(
         parent_chain_id: native.and_then(|source| source.parent_chain_id.clone()),
         is_sidechain: native.is_some_and(|source| source.is_sidechain),
         agent_id: native.and_then(|source| source.agent_id.clone()),
+        agent_nickname: native.and_then(|source| source.agent_nickname.clone()),
         cwd: native.and_then(|source| source.cwd.clone()),
         hostname: native.and_then(|source| source.hostname.clone()),
         first_activity_at_ms: native.map(|source| source.first_activity_at_ms),
@@ -4270,6 +4278,29 @@ mod tests {
             assert_eq!(observation.metadata().source_session_id, "sess-1");
             assert_eq!(observation.metadata().analytics_session_id, "sess-1");
         }
+    }
+
+    #[test]
+    fn codex_spawn_identity_and_label_reach_model_source_metadata() {
+        let hint = RetainedJsonlSourceLayoutHint::CodexTranscript;
+        let contents = [
+            r#"{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"child-1","thread_source":"subagent","agent_nickname":"worker","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1"}}}}}"#.to_owned(),
+            codex_token_count_line("2026-01-01T00:00:01Z", 100, 0, 50, 0),
+        ]
+        .join("\n");
+
+        let result = parse_codex_model_usage_jsonl(&contents, codex_context("sk-codex", &hint));
+        let native_source = match &result.native_identity {
+            ProviderNativeIdentityState::Valid(native_source) => native_source,
+            state => panic!("expected valid native identity, got {state:?}"),
+        };
+        assert_eq!(native_source.agent_id.as_deref(), Some("child-1"));
+        assert_eq!(native_source.agent_nickname.as_deref(), Some("worker"));
+        assert_eq!(result.observations.len(), 1);
+        assert_eq!(
+            result.observations[0].metadata().agent_id.as_deref(),
+            Some("child-1")
+        );
     }
 
     #[test]
