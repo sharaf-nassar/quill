@@ -103,7 +103,7 @@ it("maps PostToolUseFailure details into a post observation", () => {
 it("builds Claude lifecycle observations with official sources and identities", () => {
   const timestamp = "2026-08-04T12:34:56.789Z";
   const config = { hostname: "configured-host" };
-  for (const source of ["startup", "resume", "clear", "compact"]) {
+  for (const source of ["startup", "resume", "clear", "compact", "fork"]) {
     const payload = observe.buildLifecyclePayload({
       hook_event_name: "SessionStart",
       session_id: "root-session",
@@ -142,7 +142,7 @@ it("rejects malformed Claude lifecycle payloads", () => {
   assert(observe.buildLifecyclePayload({
     hook_event_name: "SessionStart",
     session_id: "root",
-    source: "fork",
+    source: "unknown",
   }, config) === null, "unsupported SessionStart source was accepted");
   assert(observe.buildLifecyclePayload({
     hook_event_name: "SubagentStart",

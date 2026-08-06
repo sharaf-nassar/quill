@@ -44,7 +44,7 @@ Synthetic rows obey active coverage, normalized hostname and provider filters, s
 
 ## Claude Lifecycle Payloads
 
-Claude's observer carries official lifecycle sources and normalized identity fields, rejecting malformed evidence before transport.
+Claude's observer carries official lifecycle sources, including forked-session starts, and normalized identity fields while rejecting malformed evidence before transport.
 
 ## Claude Managed Lifecycle Hooks
 

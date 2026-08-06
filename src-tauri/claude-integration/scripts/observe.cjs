@@ -15,7 +15,7 @@ const LIFECYCLE_EVENTS = new Set([
   "SessionEnd",
 ]);
 // https://code.claude.com/docs/en/hooks#sessionstart
-const SESSION_START_SOURCES = new Set(["startup", "resume", "clear", "compact"]);
+const SESSION_START_SOURCES = new Set(["startup", "resume", "clear", "compact", "fork"]);
 
 function truncate(value, maxLen = 2048) {
   if (value === undefined || value === null) return null;

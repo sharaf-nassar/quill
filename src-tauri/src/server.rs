@@ -429,7 +429,7 @@ impl ObservedSubagentState {
 
         match observation.hook_event.as_str() {
             "SessionStart" => match observation.source.as_deref() {
-                Some("startup" | "resume" | "clear") => {
+                Some("startup" | "resume" | "clear" | "fork") => {
                     root.start_epoch(at, observed_root_cwd(observation.cwd.as_deref()))
                 }
                 Some("compact") => {
@@ -2944,7 +2944,10 @@ mod observed_subagent_tests {
     #[test]
     fn reset_sources_and_identity_boundaries_are_isolated() {
         let state = ObservedSubagentState::default();
-        for (index, source) in ["startup", "resume", "clear"].into_iter().enumerate() {
+        for (index, source) in ["startup", "resume", "clear", "fork"]
+            .into_iter()
+            .enumerate()
+        {
             let root = format!("root-{index}");
             state.observe(&hook(
                 IntegrationProvider::Claude,
