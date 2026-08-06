@@ -1430,8 +1430,8 @@ impl SessionIndex {
         // in this boot. The migration already truncated response_times /
         // tool_actions; this re-scan repopulates them with the new
         // is_sidechain / agent_id / parent_uuid columns set. The pending flag
-        // is cleared AFTER the scan loop completes successfully — if the scan
-        // errors out partway, the flag stays set so the next boot retries.
+        // is cleared only after every file succeeds and the writer commits;
+        // logged per-file failures leave it set so the next boot retries.
         let subagent_reingest_pending = storage
             .and_then(|s| s.get_setting("subagent_reingest_pending").ok().flatten())
             .is_some();
@@ -1462,11 +1462,11 @@ impl SessionIndex {
                     .flatten()
             })
             .is_some();
-        if subagent_reingest_pending
+        let force_reingest = subagent_reingest_pending
             || skill_usage_reingest_pending
             || runtime_event_reingest_pending
-            || hook_invocation_reingest_pending
-        {
+            || hook_invocation_reingest_pending;
+        if force_reingest {
             log::info!(
                 "Session derived-data migration: clearing mtime cache to force full transcript re-ingest"
             );
@@ -1491,6 +1491,7 @@ impl SessionIndex {
             }
         });
 
+        let mut reingest_failures = 0usize;
         for discovered in discovered_files {
             let file_key = discovered.path.to_string_lossy().to_string();
             let mtime = std::fs::metadata(&discovered.path)
@@ -1506,6 +1507,7 @@ impl SessionIndex {
             }
 
             let extracted = extract_messages_from_jsonl(discovered.provider, &discovered.path);
+            let mut file_failed = !extracted.extraction_succeeded;
             let project_name = extracted
                 .project_name
                 .clone()
@@ -1525,6 +1527,7 @@ impl SessionIndex {
                     &extracted.session_id,
                 ) {
                     log::warn!("Failed to delete old session docs: {e}");
+                    file_failed = true;
                 } else {
                     index_changed = true;
                 }
@@ -1539,6 +1542,7 @@ impl SessionIndex {
                     &hostname,
                 ) {
                     log::warn!("Failed to index message: {e}");
+                    file_failed = true;
                 } else {
                     index_changed = true;
                 }
@@ -1551,44 +1555,53 @@ impl SessionIndex {
                     .insert(file_key.clone(), extracted.session_id);
             }
             state.file_mtimes.insert(file_key, mtime);
+            if force_reingest && file_failed {
+                reingest_failures += 1;
+            }
         }
 
         // Commit all changes
         if index_changed {
             writer.commit().map_err(|e| format!("Commit index: {e}"))?;
         }
+        if reingest_failures > 0 {
+            log::warn!(
+                "Session derived-data migration: retaining re-ingest flags after {reingest_failures} transcript failures"
+            );
+        }
 
-        // Scan completed without bubbling an error — safe to clear the
-        // migration-20 backfill flag. If we errored above, the flag stays set
-        // so the next boot re-runs the full transcript re-ingest.
+        // The writer committed without a per-file failure — safe to clear the
+        // migration-20 backfill flag. Otherwise it stays set for the next scan.
         if subagent_reingest_pending
+            && reingest_failures == 0
             && let Some(storage) = storage
             && let Err(e) = storage.delete_setting("subagent_reingest_pending")
         {
             log::warn!("Failed to clear subagent_reingest_pending flag: {e}");
         }
         if skill_usage_reingest_pending
+            && reingest_failures == 0
             && let Some(storage) = storage
             && let Err(e) = storage.delete_setting("skill_usage_reingest_pending")
         {
             log::warn!("Failed to clear skill_usage_reingest_pending flag: {e}");
         }
         // Feature 008: clear the migration-26 backfill flag once the
-        // sweep completes successfully. If we bubbled an error above, the
-        // flag stays set so the next boot retries the catch-up scan.
+        // sweep and writer commit complete without per-file failures.
         // @lat: [[data-flow#Session Indexing Pipeline]]
         if runtime_event_reingest_pending
+            && reingest_failures == 0
             && let Some(storage) = storage
             && let Err(e) = storage.delete_setting("runtime_event_reingest_pending")
         {
             log::warn!("Failed to clear runtime_event_reingest_pending flag: {e}");
         }
         // Feature 009: clear the migration-27 backfill flag once the
-        // sweep completes successfully (same semantics as the feature
-        // 008 flag above). If the sweep aborted, the flag stays set so
-        // the next boot retries the hook-invocation catch-up scan.
+        // sweep and writer commit complete without per-file failures (same
+        // semantics as the feature 008 flag above).
         // @lat: [[backend#Database#Schema#Hook Invocations]]
         if hook_invocation_reingest_pending
+            && reingest_failures == 0
             && let Some(storage) = storage
             && let Err(e) = storage.delete_setting("hook_invocation_reingest_pending")
         {
@@ -2185,6 +2198,7 @@ pub struct ExtractedSession {
     pub session_id: String,
     pub project_name: Option<String>,
     pub messages: Vec<ExtractedMessage>,
+    extraction_succeeded: bool,
     /// Per-event timeline emitted alongside [`messages`] for the active-
     /// interval runtime pipeline (feature 008). Populated by
     /// [`extract_claude_messages_from_jsonl`] and
@@ -3274,6 +3288,7 @@ fn extract_claude_messages_from_jsonl(path: &Path) -> ExtractedSession {
                     .and_then(|name| name.to_str())
                     .map(SessionIndex::project_display_name),
                 messages: Vec::new(),
+                extraction_succeeded: false,
                 events: Vec::new(),
                 hook_invocations: Vec::new(),
             };
@@ -3686,6 +3701,7 @@ fn extract_claude_messages_from_jsonl_records(
             .and_then(|name| name.to_str())
             .map(SessionIndex::project_display_name),
         messages,
+        extraction_succeeded: true,
         events,
         hook_invocations,
     }
@@ -3700,6 +3716,7 @@ fn extract_codex_messages_from_jsonl(path: &Path) -> ExtractedSession {
                 session_id: String::new(),
                 project_name: None,
                 messages: Vec::new(),
+                extraction_succeeded: false,
                 events: Vec::new(),
                 hook_invocations: Vec::new(),
             };
@@ -3721,6 +3738,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                 session_id: String::new(),
                 project_name: None,
                 messages,
+                extraction_succeeded: false,
                 events,
                 hook_invocations: Vec::new(),
             };
@@ -4090,6 +4108,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
         session_id,
         project_name: cwd.as_deref().and_then(project_name_from_cwd),
         messages,
+        extraction_succeeded: true,
         events,
         hook_invocations: Vec::new(),
     }
