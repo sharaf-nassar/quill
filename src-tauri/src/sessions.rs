@@ -1481,6 +1481,24 @@ impl SessionIndex {
                     .flatten()
             })
             .is_some();
+        let codex_agent_identity_reingest_pending = storage
+            .and_then(|s| {
+                s.get_setting("codex_agent_identity_reingest_pending")
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+        let codex_reingest_started =
+            codex_agent_identity_reingest_pending.then(std::time::Instant::now);
+        let codex_inventory_complete = roots
+            .iter()
+            .filter(|root| root.provider == IntegrationProvider::Codex)
+            .all(|root| matches!(root.outcome, ProviderRootEnumerationOutcome::Complete));
+        let codex_reingest_files = roots
+            .iter()
+            .flat_map(|root| &root.sources)
+            .filter(|source| source.provider == IntegrationProvider::Codex)
+            .count();
         let force_reingest = subagent_reingest_pending
             || skill_usage_reingest_pending
             || runtime_event_reingest_pending
@@ -1490,6 +1508,19 @@ impl SessionIndex {
                 "Session derived-data migration: clearing mtime cache to force full transcript re-ingest"
             );
             state.file_mtimes.clear();
+        } else if codex_agent_identity_reingest_pending {
+            for source in roots
+                .iter()
+                .flat_map(|root| &root.sources)
+                .filter(|source| source.provider == IntegrationProvider::Codex)
+            {
+                state
+                    .file_mtimes
+                    .remove(&source.filesystem_path.to_string_lossy().into_owned());
+            }
+            log::info!(
+                "Codex identity migration: invalidated {codex_reingest_files} transcript mtimes"
+            );
         }
 
         let discovered_files = roots.iter().flat_map(|root| &root.sources).map(|source| {
@@ -1511,6 +1542,7 @@ impl SessionIndex {
         });
 
         let mut reingest_failures = 0usize;
+        let mut codex_reingest_failures = 0usize;
         for discovered in discovered_files {
             let file_key = discovered.path.to_string_lossy().to_string();
             let fingerprint = match std::fs::metadata(&discovered.path)
@@ -1588,6 +1620,12 @@ impl SessionIndex {
             if force_reingest && file_failed {
                 reingest_failures += 1;
             }
+            if codex_agent_identity_reingest_pending
+                && discovered.provider == IntegrationProvider::Codex
+                && file_failed
+            {
+                codex_reingest_failures += 1;
+            }
         }
 
         // Commit all changes
@@ -1636,6 +1674,20 @@ impl SessionIndex {
             && let Err(e) = storage.delete_setting("hook_invocation_reingest_pending")
         {
             log::warn!("Failed to clear hook_invocation_reingest_pending flag: {e}");
+        }
+        if codex_agent_identity_reingest_pending
+            && codex_inventory_complete
+            && codex_reingest_failures == 0
+            && let Some(storage) = storage
+            && let Err(e) = storage.delete_setting("codex_agent_identity_reingest_pending")
+        {
+            log::warn!("Failed to clear codex_agent_identity_reingest_pending flag: {e}");
+        }
+        if let Some(started) = codex_reingest_started {
+            log::info!(
+                "Codex identity re-ingest sweep: files={codex_reingest_files} failures={codex_reingest_failures} inventory_complete={codex_inventory_complete} duration_ms={}",
+                started.elapsed().as_millis(),
+            );
         }
 
         drop(writer);

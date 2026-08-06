@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 38;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 39;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -637,6 +637,7 @@ pub(crate) struct ModelSourceLastGoodMetadata {
     pub(crate) chain_id: Option<String>,
     pub(crate) parent_chain_id: Option<String>,
     pub(crate) agent_id: Option<String>,
+    pub(crate) agent_nickname: Option<String>,
     pub(crate) is_sidechain: bool,
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) hostname: Option<String>,
@@ -1667,7 +1668,7 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
 const MODEL_SOURCE_STATE_COLUMNS: &str = "
     source_key, source_root_key, source_path,
     source_session_id, analytics_session_id, chain_id,
-    parent_chain_id, agent_id, is_sidechain, cwd, hostname,
+    parent_chain_id, agent_id, agent_nickname, is_sidechain, cwd, hostname,
     first_activity_at_ms, last_activity_at_ms, mtime_ns, size_bytes,
     content_sha256, last_error, suppressed_sha256, suppressed_at_ms,
     seen_generation, processing_status, observation_count,
@@ -1698,6 +1699,7 @@ struct RawStoredModelSource {
     chain_id: Option<String>,
     parent_chain_id: Option<String>,
     agent_id: Option<String>,
+    agent_nickname: Option<String>,
     is_sidechain: i64,
     cwd: Option<String>,
     hostname: Option<String>,
@@ -1937,22 +1939,23 @@ fn read_raw_model_source(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawStoredM
         chain_id: row.get(5)?,
         parent_chain_id: row.get(6)?,
         agent_id: row.get(7)?,
-        is_sidechain: row.get(8)?,
-        cwd: row.get(9)?,
-        hostname: row.get(10)?,
-        first_activity_at_ms: row.get(11)?,
-        last_activity_at_ms: row.get(12)?,
-        mtime_ns: row.get(13)?,
-        size_bytes: row.get(14)?,
-        content_sha256: row.get(15)?,
-        last_error: row.get(16)?,
-        suppressed_sha256: row.get(17)?,
-        suppressed_at_ms: row.get(18)?,
-        seen_generation: row.get(19)?,
-        processing_status: row.get(20)?,
-        observation_count: row.get(21)?,
-        last_attempt_at_ms: row.get(22)?,
-        last_success_at_ms: row.get(23)?,
+        agent_nickname: row.get(8)?,
+        is_sidechain: row.get(9)?,
+        cwd: row.get(10)?,
+        hostname: row.get(11)?,
+        first_activity_at_ms: row.get(12)?,
+        last_activity_at_ms: row.get(13)?,
+        mtime_ns: row.get(14)?,
+        size_bytes: row.get(15)?,
+        content_sha256: row.get(16)?,
+        last_error: row.get(17)?,
+        suppressed_sha256: row.get(18)?,
+        suppressed_at_ms: row.get(19)?,
+        seen_generation: row.get(20)?,
+        processing_status: row.get(21)?,
+        observation_count: row.get(22)?,
+        last_attempt_at_ms: row.get(23)?,
+        last_success_at_ms: row.get(24)?,
     })
 }
 
@@ -2027,6 +2030,7 @@ fn stored_model_source_from_raw(
             chain_id: row.chain_id,
             parent_chain_id: row.parent_chain_id,
             agent_id: row.agent_id,
+            agent_nickname: row.agent_nickname,
             is_sidechain,
             cwd: row.cwd.map(PathBuf::from),
             hostname: row.hostname,
@@ -7820,6 +7824,44 @@ impl Storage {
                 .map_err(|e| format!("Migration 38 commit: {e}"))?;
         }
 
+        // Migration 39 rebuilds Codex transcript-derived analytics after
+        // native spawn identity became available. Only replayable Codex rows
+        // are removed; live hook evidence and compact retention aggregates
+        // are the surviving authority for data no transcript can recreate.
+        // @lat: [[backend#Backend#Database#Schema#Source-Owned Transcript Analytics]]
+        if current_version < 39 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 39 transaction: {e}"))?;
+            if !table_has_column(&tx, "model_observation_sources", "agent_nickname") {
+                tx.execute_batch(
+                    "ALTER TABLE model_observation_sources
+                         ADD COLUMN agent_nickname TEXT;",
+                )
+                .map_err(|e| format!("Migration 39 (agent nickname column): {e}"))?;
+            }
+            tx.execute_batch(
+                "DELETE FROM session_events WHERE provider = 'codex';
+                 DELETE FROM response_times WHERE provider = 'codex';
+                 DELETE FROM tool_actions WHERE provider = 'codex';
+                 DELETE FROM skill_usages WHERE provider = 'codex';
+                 DELETE FROM model_usage_observations WHERE provider = 'codex';
+                 DELETE FROM model_usage_hourly WHERE provider = 'codex';
+                 DELETE FROM model_observation_sources WHERE provider = 'codex';
+                 DELETE FROM transcript_analytics_sources WHERE provider = 'codex';",
+            )
+            .map_err(|e| format!("Migration 39 (clear Codex derived analytics): {e}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["codex_agent_identity_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 39 (set Codex reingest flag): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (39)", [])
+                .map_err(|e| format!("Failed to record migration 39: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 39 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -11208,15 +11250,15 @@ impl Storage {
             "INSERT INTO model_observation_sources (
                 provider, source_key, source_root_key, source_path,
                 source_session_id, analytics_session_id, chain_id,
-                parent_chain_id, agent_id, is_sidechain, cwd, hostname,
+                parent_chain_id, agent_id, agent_nickname, is_sidechain, cwd, hostname,
                 first_activity_at_ms, last_activity_at_ms, mtime_ns,
                 size_bytes, content_sha256, last_error, suppressed_sha256,
                 suppressed_at_ms, seen_generation, processing_status,
                 observation_count, last_attempt_at_ms, last_success_at_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, NULL, NULL, NULL, ?18, 'ok',
-                ?19, ?20, ?21
+                ?13, ?14, ?15, ?16, ?17, ?18, NULL, NULL, NULL, ?19, 'ok',
+                ?20, ?21, ?22
              )
              ON CONFLICT(provider, source_key) DO UPDATE SET
                 source_root_key = excluded.source_root_key,
@@ -11226,6 +11268,7 @@ impl Storage {
                 chain_id = excluded.chain_id,
                 parent_chain_id = excluded.parent_chain_id,
                 agent_id = excluded.agent_id,
+                agent_nickname = excluded.agent_nickname,
                 is_sidechain = excluded.is_sidechain,
                 cwd = excluded.cwd,
                 hostname = excluded.hostname,
@@ -11252,6 +11295,7 @@ impl Storage {
                 source.chain_id,
                 source.parent_chain_id,
                 source.agent_id,
+                source.agent_nickname,
                 i64::from(source.is_sidechain),
                 source_cwd,
                 source.hostname,
@@ -11315,15 +11359,15 @@ impl Storage {
             "INSERT INTO model_observation_sources (
                 provider, source_key, source_root_key, source_path,
                 source_session_id, analytics_session_id, chain_id,
-                parent_chain_id, agent_id, is_sidechain, cwd, hostname,
+                parent_chain_id, agent_id, agent_nickname, is_sidechain, cwd, hostname,
                 first_activity_at_ms, last_activity_at_ms, mtime_ns,
                 size_bytes, content_sha256, last_error, suppressed_sha256,
                 suppressed_at_ms, seen_generation, processing_status,
                 observation_count, last_attempt_at_ms, last_success_at_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, NULL, ?17, NULL, NULL, ?18, 'failed',
-                0, ?19, NULL
+                ?13, ?14, ?15, ?16, ?17, NULL, ?18, NULL, NULL, ?19, 'failed',
+                0, ?20, NULL
              )
              ON CONFLICT(provider, source_key) DO UPDATE SET
                 source_root_key = excluded.source_root_key,
@@ -11353,6 +11397,7 @@ impl Storage {
                 source.chain_id,
                 source.parent_chain_id,
                 source.agent_id,
+                source.agent_nickname,
                 i64::from(source.is_sidechain),
                 source_cwd,
                 source.hostname,
@@ -22669,6 +22714,69 @@ mod tests {
             .expect("replace model source");
     }
 
+    // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Source Nickname Persistence]]
+    #[test]
+    #[serial]
+    fn model_source_nickname_persists_without_changing_source_identity() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let path = dir.path().join("codex-source.jsonl");
+        std::fs::write(&path, "").expect("write empty source");
+        let fast = crate::transcript_identity::model_source_fast_fingerprint(
+            &std::fs::metadata(&path).expect("stat empty source"),
+        )
+        .expect("fingerprint empty source");
+        let fingerprint = ModelSourceFingerprint::from_content(fast, b"");
+        let now_ms = Utc::now().timestamp_millis();
+        let mut source = NormalizedSource {
+            provider: IntegrationProvider::Codex,
+            source_root_key: "root-codex".to_owned(),
+            source_key: "source-codex".to_owned(),
+            path,
+            layout_hint: crate::sessions::RetainedJsonlSourceLayoutHint::CodexTranscript,
+            source_session_id: Some("child-1".to_owned()),
+            analytics_session_id: Some("parent-1".to_owned()),
+            chain_id: Some("child-1".to_owned()),
+            parent_chain_id: Some("parent-1".to_owned()),
+            is_sidechain: true,
+            agent_id: Some("child-1".to_owned()),
+            agent_nickname: Some("worker-a".to_owned()),
+            cwd: None,
+            hostname: Some("host-a".to_owned()),
+            first_activity_at_ms: None,
+            last_activity_at_ms: None,
+            mtime_ns: None,
+            size_bytes: None,
+            content_sha256: None,
+            last_error: None,
+            suppressed_sha256: None,
+            suppressed_at_ms: None,
+            seen_generation: 1,
+            processing_status: SourceProcessingStatus::Ok,
+            observation_count: 0,
+            last_attempt_at_ms: Some(now_ms),
+            last_success_at_ms: Some(now_ms),
+        };
+        storage
+            .replace_model_source(&source, &[], &fingerprint)
+            .expect("persist nickname");
+        source.agent_nickname = Some("worker-b".to_owned());
+        storage
+            .replace_model_source(&source, &[], &fingerprint)
+            .expect("update display nickname");
+
+        let sources = storage
+            .list_model_sources_for_root(IntegrationProvider::Codex, "root-codex")
+            .expect("read model sources");
+        assert_eq!(sources.len(), 1, "nickname must not alter the source key");
+        assert_eq!(
+            sources[0].last_good.agent_nickname.as_deref(),
+            Some("worker-b")
+        );
+        clear_env();
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct ModelHourlyRollupRow {
         hour_utc: i64,
@@ -25941,6 +26049,240 @@ mod tests {
             "re-running migrations must not re-enter migration {migration}"
         );
         drop(storage);
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 39 Codex Backfill Scope]]
+    #[test]
+    #[serial]
+    fn migration_39_clears_only_replayable_codex_analytics() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "DELETE FROM settings
+                     WHERE key = 'codex_agent_identity_reingest_pending';
+                 DELETE FROM schema_version WHERE version = 39;
+                 ALTER TABLE model_observation_sources
+                     DROP COLUMN agent_nickname;
+
+                 INSERT INTO session_events
+                     (provider, source_key, event_key, session_id, chain_id,
+                      is_sidechain, timestamp, kind)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-event', 'codex-session',
+                      'codex-chain', 1, '2026-08-01T00:00:00Z', 'asst_text'),
+                     ('claude', 'claude-source', 'claude-event', 'claude-session',
+                      'claude-chain', 0, '2026-08-01T00:00:00Z', 'asst_text');
+                 INSERT INTO response_times
+                     (provider, source_key, session_id, chain_id, timestamp)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-session', 'codex-chain',
+                      '2026-08-01T00:00:00Z'),
+                     ('claude', 'claude-source', 'claude-session', 'claude-chain',
+                      '2026-08-01T00:00:00Z');
+                 INSERT INTO tool_actions
+                     (provider, source_key, action_key, message_id, session_id,
+                      chain_id, tool_name, category, summary, timestamp)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-action', 'codex-message',
+                      'codex-session', 'codex-chain', 'Read', 'read', 'codex',
+                      '2026-08-01T00:00:00Z'),
+                     ('claude', 'claude-source', 'claude-action', 'claude-message',
+                      'claude-session', 'claude-chain', 'Read', 'read', 'claude',
+                      '2026-08-01T00:00:00Z');
+                 INSERT INTO skill_usages
+                     (provider, source_key, session_id, chain_id, message_id,
+                      skill_name, skill_path, timestamp)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-session', 'codex-chain',
+                      'codex-message', 'skill', '/skill',
+                      '2026-08-01T00:00:00Z'),
+                     ('claude', 'claude-source', 'claude-session', 'claude-chain',
+                      'claude-message', 'skill', '/skill',
+                      '2026-08-01T00:00:00Z');
+                 INSERT INTO model_usage_observations
+                     (provider, source_key, source_record_key, source_ordinal,
+                      observation_kind, source_session_id,
+                      analytics_session_id, chain_id, is_sidechain,
+                      observed_at_ms, model_evidence, token_evidence)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-record', 0, 'turn',
+                      'codex-session', 'codex-session', 'codex-chain', 1,
+                      1785542400000, 'explicit', 'unavailable'),
+                     ('claude', 'claude-source', 'claude-record', 0, 'turn',
+                      'claude-session', 'claude-session', 'claude-chain', 0,
+                      1785542400000, 'explicit', 'unavailable');
+                 INSERT INTO model_usage_hourly
+                     (hour_utc, provider, derived_model_id, source_key,
+                      analytics_session_id, first_observed_at_ms,
+                      last_observed_at_ms)
+                 VALUES
+                     (1785542400000, 'codex', 'gpt', 'codex-source',
+                      'codex-session', 1785542400000, 1785542400000),
+                     (1785542400000, 'claude', 'opus', 'claude-source',
+                      'claude-session', 1785542400000, 1785542400000);
+                 INSERT INTO model_observation_sources
+                     (provider, source_key, source_root_key, source_path,
+                      is_sidechain, seen_generation, processing_status,
+                      observation_count)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-root', '/codex', 1, 1,
+                      'ok', 1),
+                     ('claude', 'claude-source', 'claude-root', '/claude', 0, 1,
+                      'ok', 1);
+                 INSERT INTO transcript_analytics_sources
+                     (provider, source_key, source_root_key, source_path,
+                      is_sidechain, seen_generation, processing_status)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-root', '/codex', 1, 1,
+                      'ok'),
+                     ('claude', 'claude-source', 'claude-root', '/claude', 0, 1,
+                      'ok');
+                 INSERT INTO hook_invocations
+                     (provider, source_key, session_id, chain_id, is_sidechain,
+                      timestamp, hook_event, hook_identity)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-session', 'codex-chain', 1,
+                      '2026-08-01T00:00:00Z', 'PreToolUse', 'codex-hook'),
+                     ('claude', 'claude-source', 'claude-session',
+                      'claude-chain', 0, '2026-08-01T00:00:00Z',
+                      'PreToolUse', 'claude-hook');
+                 INSERT INTO retention_daily_aggregates
+                     (provider, source_key, session_id, day)
+                 VALUES
+                     ('codex', 'codex-source', 'codex-session', '2026-08-01'),
+                     ('claude', 'claude-source', 'claude-session', '2026-08-01');",
+            )
+            .expect("prepare migration 39 fixture");
+        }
+        drop(storage);
+
+        let migrated = init_storage_in(&dir);
+        let conn = migrated.conn.lock().unwrap();
+        for table in [
+            "session_events",
+            "response_times",
+            "tool_actions",
+            "skill_usages",
+            "model_usage_observations",
+            "model_usage_hourly",
+            "model_observation_sources",
+            "transcript_analytics_sources",
+        ] {
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE provider = 'codex'")
+                ),
+                0,
+                "migration must clear replayable Codex rows from {table}"
+            );
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    &format!("SELECT COUNT(*) FROM {table} WHERE provider = 'claude'")
+                ),
+                1,
+                "migration must preserve non-Codex rows in {table}"
+            );
+        }
+        for table in ["hook_invocations", "retention_daily_aggregates"] {
+            assert_eq!(
+                scalar_count(&conn, &format!("SELECT COUNT(*) FROM {table}")),
+                2,
+                "migration must preserve every row in {table}"
+            );
+        }
+        assert!(table_has_column(
+            &conn,
+            "model_observation_sources",
+            "agent_nickname"
+        ));
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings
+                 WHERE key = 'codex_agent_identity_reingest_pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read Codex reingest flag"),
+            "1"
+        );
+        drop(conn);
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 39 Idempotence]]
+    #[test]
+    #[serial]
+    fn migration_39_is_idempotent() {
+        assert_migration_is_idempotent(39);
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Codex Identity Reingest Idempotence]]
+    #[test]
+    #[serial]
+    fn codex_identity_reingest_is_complete_and_idempotent() {
+        clear_env();
+        let data_dir = TempDir::new().expect("data tempdir");
+        let claude_dir = TempDir::new().expect("Claude tempdir");
+        let codex_dir = TempDir::new().expect("Codex tempdir");
+        let rollout_dir = codex_dir.path().join("2026/08/01");
+        std::fs::create_dir_all(&rollout_dir).expect("create rollout dir");
+        std::fs::write(
+            rollout_dir.join("rollout-child-1.jsonl"),
+            concat!(
+                r#"{"type":"session_meta","timestamp":"2026-08-01T00:00:00Z","payload":{"id":"child-1","thread_source":"subagent","agent_nickname":"worker","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1"}}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","timestamp":"2026-08-01T00:00:01Z","payload":{"type":"agent_message","id":"event-1","message":"done"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write Codex rollout");
+        // SAFETY: environment mutation; this test is serialized.
+        unsafe {
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", claude_dir.path());
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", codex_dir.path());
+        }
+        let storage = init_storage_in(&data_dir);
+
+        let reconcile = || {
+            crate::transcript_analytics::run_startup_transcript_analytics_reconciliation(
+                &storage, "host-a",
+            )
+            .expect("reconcile Codex rollout")
+        };
+        let first = reconcile();
+        assert!(first.completed_all_roots);
+        let event_counts = || {
+            let conn = storage.conn.lock().unwrap();
+            (
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE provider = 'codex' AND is_sidechain = 1",
+                ),
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE provider = 'codex' AND is_sidechain = 1
+                       AND agent_id IS NULL",
+                ),
+            )
+        };
+        assert_eq!(event_counts(), (1, 0));
+
+        let second = reconcile();
+        assert!(second.completed_all_roots);
+        assert_eq!(event_counts(), (1, 0), "replay must not duplicate events");
+
+        unsafe {
+            std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
+            std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
+        }
         clear_env();
     }
 

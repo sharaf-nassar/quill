@@ -3802,7 +3802,7 @@ fn normalized_source_from_existing(
         parent_chain_id: last_good.and_then(|source| source.parent_chain_id.clone()),
         is_sidechain: last_good.is_some_and(|source| source.is_sidechain),
         agent_id: last_good.and_then(|source| source.agent_id.clone()),
-        agent_nickname: None,
+        agent_nickname: last_good.and_then(|source| source.agent_nickname.clone()),
         cwd: last_good.and_then(|source| source.cwd.clone()),
         hostname: last_good.and_then(|source| source.hostname.clone()),
         first_activity_at_ms: last_good.and_then(|source| source.first_activity_at_ms),
