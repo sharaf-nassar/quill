@@ -12,7 +12,10 @@ use tantivy::snippet::SnippetGenerator;
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument, Term};
 
 use crate::integrations::IntegrationProvider;
-use crate::transcript_identity::{JsonlRecord, parse_jsonl_records, resolve_codex_native_identity};
+use crate::transcript_identity::{
+    JsonlRecord, ModelSourceFastFingerprint, model_source_fast_fingerprint, parse_jsonl_records,
+    resolve_codex_native_identity,
+};
 
 const CLAUDE_SOURCE_ROOT_KEY: &str = "claude:projects";
 const CODEX_SOURCE_ROOT_KEY: &str = "codex:sessions";
@@ -914,13 +917,30 @@ pub struct SessionSchema {
 }
 
 // ---------------------------------------------------------------------------
-// Index state -- tracks which files have been indexed and their mtimes
+// Index state -- tracks which files have been indexed and their fingerprints
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SessionFileFingerprint {
+    Current { mtime_ns: i64, size_bytes: i64 },
+    LegacySeconds(u64),
+}
+
+impl From<ModelSourceFastFingerprint> for SessionFileFingerprint {
+    fn from(value: ModelSourceFastFingerprint) -> Self {
+        Self::Current {
+            mtime_ns: value.mtime_ns(),
+            size_bytes: value.size_bytes(),
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct IndexState {
-    /// Map of JSONL file path -> last-modified epoch seconds
-    pub file_mtimes: HashMap<String, u64>,
+    /// Map of JSONL file path -> nanosecond mtime and file size.
+    /// Legacy numeric mtimes deserialize but never match a current fingerprint.
+    pub file_mtimes: HashMap<String, SessionFileFingerprint>,
     /// Provider-native session id last extracted from each indexed file.
     #[serde(default)]
     file_session_ids: HashMap<String, String>,
@@ -1494,20 +1514,29 @@ impl SessionIndex {
         let mut reingest_failures = 0usize;
         for discovered in discovered_files {
             let file_key = discovered.path.to_string_lossy().to_string();
-            let mtime = std::fs::metadata(&discovered.path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+            let fingerprint = match std::fs::metadata(&discovered.path)
+                .map_err(crate::transcript_identity::StableTranscriptReadError::Read)
+                .and_then(|metadata| model_source_fast_fingerprint(&metadata))
+            {
+                Ok(fingerprint) => Some(SessionFileFingerprint::from(fingerprint)),
+                Err(error) => {
+                    log::warn!(
+                        "Failed to fingerprint session transcript {}: {error}",
+                        discovered.path.display()
+                    );
+                    None
+                }
+            };
 
-            let known_mtime = state.file_mtimes.get(&file_key).copied();
-            if known_mtime == Some(mtime) {
+            if fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| state.file_mtimes.get(&file_key) == Some(fingerprint))
+            {
                 continue;
             }
 
             let extracted = extract_messages_from_jsonl(discovered.provider, &discovered.path);
-            let mut file_failed = !extracted.extraction_succeeded;
+            let mut file_failed = !extracted.extraction_succeeded || fingerprint.is_none();
             let project_name = extracted
                 .project_name
                 .clone()
@@ -1554,7 +1583,9 @@ impl SessionIndex {
                     .file_session_ids
                     .insert(file_key.clone(), extracted.session_id);
             }
-            state.file_mtimes.insert(file_key, mtime);
+            if let Some(fingerprint) = fingerprint {
+                state.file_mtimes.insert(file_key, fingerprint);
+            }
             if force_reingest && file_failed {
                 reingest_failures += 1;
             }

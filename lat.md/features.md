@@ -262,7 +262,7 @@ Full-text search across Claude Code and Codex session transcripts, powered by Ta
 
 ### Indexing
 
-Opening Session Search triggers an mtime-based transcript sync, including removal of search documents for transcripts proven absent by complete source discovery.
+Opening Session Search syncs transcripts using nanosecond mtime plus file size, including removal of search documents for transcripts proven absent by complete source discovery. Metadata failures remain uncached for retry.
 
 Incomplete discovery preserves indexed data. Hook endpoints can also ingest updates; indexed messages include code_changes, commands_run, tool_details, and files_modified metadata.
 

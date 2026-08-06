@@ -1842,7 +1842,7 @@ Most read and trigger commands accept an optional provider filter for Claude, Co
 
 `search_sessions`, `get_session_context`, `get_search_facets`, and `sync_search_index` all operate on a unified Claude-plus-Codex index. Search and context requests include provider identity so session collisions do not bleed across providers.
 
-`sync_search_index` runs an mtime-based incremental sweep — not a wipe-and-rebuild — so a true rebuild requires deleting the on-disk index dir while the app is closed (or bumping `SCHEMA_VERSION` in [[src-tauri/src/sessions.rs]]).
+`sync_search_index` runs a fingerprint-based incremental sweep — not a wipe-and-rebuild — so a true rebuild requires deleting the on-disk index dir while the app is closed (or bumping `SCHEMA_VERSION` in [[src-tauri/src/sessions.rs]]).
 
 ### Restart Commands (5)
 
@@ -1915,7 +1915,9 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 ### Indexing Strategy
 
-Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
+Session Search compares nanosecond mtime plus file size across `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
+
+Legacy second-only state forces one refresh. Metadata failures never become cached fingerprints: Quill logs them, processes the source through normal failure handling, and retries it on the next scan.
 
 A complete provider-root scan also removes Tantivy documents and mtime state for vanished supported transcripts; incomplete roots never authorize deletion.
 
