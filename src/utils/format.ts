@@ -57,7 +57,7 @@ export function formatObservedSubagentModels(
 	);
 	const text = displayGroups.map((group) => `${group.count} × ${group.label}`).join(" · ");
 	const breakdown = displayGroups
-		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model or type" : group.label} agent${group.count === 1 ? "" : "s"}`)
+		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model" : group.label} agent${group.count === 1 ? "" : "s"}`)
 		.join(", ");
 	return {
 		text,
