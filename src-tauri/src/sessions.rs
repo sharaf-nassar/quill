@@ -25,7 +25,6 @@ const ROOT_DIAGNOSTIC_MAX_CHARS: usize = 240;
 ///
 /// `resolved_root_path` records the path selected by `data_paths`, including
 /// demo overrides. Existing roots also carry their canonical filesystem path.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderSourceRoot {
     pub(crate) provider: IntegrationProvider,
@@ -40,7 +39,6 @@ pub(crate) struct ProviderSourceRoot {
 ///
 /// A failed root may still contain sources found before the filesystem error.
 /// Diagnostics are bounded and intentionally omit raw paths and OS messages.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderRootEnumerationOutcome {
     Complete,
@@ -51,7 +49,6 @@ pub(crate) enum ProviderRootEnumerationOutcome {
 ///
 /// The source key is derived from the provider-qualified root key and the
 /// canonical path, preventing Claude and Codex paths from colliding.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiscoveredRetainedJsonlSource {
     pub(crate) provider: IntegrationProvider,
@@ -63,7 +60,6 @@ pub(crate) struct DiscoveredRetainedJsonlSource {
 }
 
 /// Filesystem-layout facts available without reading transcript contents.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RetainedJsonlSourceLayoutHint {
     ClaudeParent { default_project: String },
@@ -324,7 +320,6 @@ fn is_claude_subagent_transcript(path: &Path) -> bool {
 /// This inventory is intentionally separate from Session Search discovery so
 /// one unreadable provider root cannot suppress the other provider and cannot
 /// change existing indexing behavior.
-#[allow(dead_code)] // Consumed by model analytics in upcoming tasks.
 pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot> {
     vec![
         enumerate_claude_retained_jsonl_source_root(),
@@ -1464,9 +1459,8 @@ impl SessionIndex {
             .and_then(|s| s.get_setting("skill_usage_reingest_pending").ok().flatten())
             .is_some();
         // Feature 008: migration 26 sets `runtime_event_reingest_pending`
-        // so the next mtime sweep re-runs `process_discovered_file` for
-        // every transcript and populates `session_events`. Same shape as
-        // the migration-20 / 21 backfill handlers.
+        // so the next mtime sweep reprocesses every transcript and populates
+        // `session_events`. Same shape as the migration-20 / 21 handlers.
         let runtime_event_reingest_pending = storage
             .and_then(|s| {
                 s.get_setting("runtime_event_reingest_pending")
@@ -2189,12 +2183,12 @@ impl SessionEventKind {
 /// [`ExtractedMessage`] during the same parse pass — see
 /// specs/008-runtime-redesign/contracts/session-events.md (EVT-CL-*).
 // @lat: [[data-flow#Session Indexing Pipeline#Dual Emission for Runtime Tracking]]
-#[allow(dead_code)] // Source-local identity fields are consumed in Task 3.
 pub struct ExtractedEvent {
     pub source_ordinal: u64,
     pub event_ordinal: usize,
     pub timestamp: String,
     pub kind: SessionEventKind,
+    #[allow(dead_code)] // Native source identity supplies sidechain attribution.
     pub is_sidechain: bool,
     #[allow(dead_code)] // Native source identity supplies analytics attribution.
     pub agent_id: Option<String>,
@@ -3277,7 +3271,7 @@ pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl(path),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl(path),
-        IntegrationProvider::MiniMax => extract_claude_messages_from_jsonl(path),
+        IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
     }
 }
 
@@ -3300,7 +3294,7 @@ pub(crate) fn extract_messages_from_jsonl_records(
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl_records(path, records),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl_records(records),
-        IntegrationProvider::MiniMax => extract_claude_messages_from_jsonl_records(path, records),
+        IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
     }
 }
 

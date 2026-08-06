@@ -1,5 +1,4 @@
 mod appimage_integration;
-#[allow(dead_code)] // Used by learning.rs in upcoming tasks
 mod auth;
 mod brevity;
 mod cc_client;
@@ -55,8 +54,8 @@ use models::{
     ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens,
     ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
     SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats,
-    SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
-    TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError, UsageSource,
+    SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, TokenDataPoint, TokenStats,
+    ToolCount, UsageBucket, UsageData, UsageProviderError, UsageSource,
 };
 use rand::RngCore;
 use rollup_backfill::{
@@ -4432,15 +4431,14 @@ const RETENTION_FRESH_INSTALL_REASON: &str =
 /// The capability a prune costs, in product language, pre-cutoff only.
 ///
 /// "Delete 689,441 rows" is not something anybody has an intuition for, so the
-/// consent step names surfaces rather than tables. These three are the only
-/// readers a window at the 30-day floor can starve — `get_session_breakdown`,
-/// `get_session_subagent_tree` and `get_batch_session_code_stats` — because
+/// consent step names surfaces rather than tables. These two are the only
+/// readers a window at the 30-day floor can starve — `get_session_breakdown`
+/// and `get_batch_session_code_stats` — because
 /// `range_to_duration` caps every range-based reader at 30 days. The list rides
 /// on the preview payload rather than living in the frontend so the copy and
 /// the cutoff that justifies it always arrive together.
-const RETENTION_AFFECTED_SURFACES: [&str; 3] = [
+const RETENTION_AFFECTED_SURFACES: [&str; 2] = [
     "Session drilldowns for sessions older than the cutoff",
-    "Subagent trees for pre-cutoff sessions",
     "Batch session code stats for pre-cutoff sessions",
 ];
 
@@ -5404,15 +5402,6 @@ async fn get_llm_runtime_stats(
 }
 
 #[tauri::command]
-async fn get_session_subagent_tree(
-    provider: integrations::IntegrationProvider,
-    session_id: String,
-) -> Result<Vec<SubagentNode>, String> {
-    let storage = get_storage()?;
-    run_blocking(move || storage.get_session_subagent_tree(provider, &session_id))
-}
-
-#[tauri::command]
 async fn read_rule_content(file_path: String) -> Result<String, String> {
     std::fs::read_to_string(&file_path).map_err(|e| format!("Failed to read rule file: {e}"))
 }
@@ -6249,7 +6238,6 @@ pub fn run() {
             get_hook_breakdown,
             get_skill_project_breakdown,
             get_session_breakdown,
-            get_session_subagent_tree,
             get_session_stats,
             get_project_tokens,
             get_context_savings_analytics,

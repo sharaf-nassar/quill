@@ -91,7 +91,6 @@ pub fn compress_observation(text: &str, max_len: usize) -> String {
 
 /// Returns true if the name is safe for use as a memory filename.
 /// Allows lowercase ASCII letters, digits, hyphens, and underscores.
-#[allow(dead_code)] // Used by memory_optimizer.rs in upcoming tasks
 pub fn is_safe_memory_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64

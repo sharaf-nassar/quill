@@ -73,7 +73,6 @@ fn requested_provider_scope(provider: Option<IntegrationProvider>) -> Vec<Integr
 /// Clarification Q2 = A). Rows are recency-ordered (`last_active` DESC),
 /// so selection is deterministic for SC-006 comparability. Errors are
 /// returned (not swallowed) so the caller can log a specific cause.
-#[allow(dead_code)] // wired by US1 (T005)
 fn select_sessions_for_insights(
     storage: &Storage,
     provider: Option<IntegrationProvider>,

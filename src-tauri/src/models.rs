@@ -385,26 +385,6 @@ pub struct ObservedHookObservation {
     pub model: Option<String>,
 }
 
-/// One sub-agent node inside a parent session, returned by
-/// `get_session_subagent_tree`. Multi-level nesting is supported via
-/// `parent_agent_id`; today every chain originates from the parent
-/// transcript so depth-1 sub-agents always carry `parent_agent_id = None`.
-#[derive(Serialize, Clone, Debug)]
-pub struct SubagentNode {
-    pub agent_id: String,
-    pub parent_agent_id: Option<String>,
-    pub first_seen: String,
-    pub last_active: String,
-    pub turn_count: u32,
-    pub total_tokens: i64,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_creation_tokens: i64,
-    pub cache_read_tokens: i64,
-    pub tool_call_count: u32,
-    pub label: Option<String>,
-}
-
 // --- Context savings telemetry models ---
 
 #[derive(Deserialize, Clone, Debug)]

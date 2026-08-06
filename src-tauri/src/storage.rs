@@ -91,7 +91,7 @@ use crate::models::{
     ProjectTokens, ProviderTokenSeries, ProviderTokenSeriesResponse, RunInferenceCall,
     RunInferenceConfinement, RunInferenceSummary, SessionBreakdown, SessionCodeStats,
     SessionModelChain, SessionModelChainKind, SessionModelHistoryResponse, SessionModelSegment,
-    SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown, SubagentNode, TokenDataPoint,
+    SessionRef, SessionStats, SkillBreakdown, SkillProjectBreakdown, TokenDataPoint,
     TokenReportPayload, TokenStats, ToolCount, UsageBucket, UsageSource,
 };
 
@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 37;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 38;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -509,12 +509,12 @@ impl<'a> ResponseTimeInput<'a> {
 
 /// One non-meta `user` or `assistant` JSONL line borrowed for the
 /// `session_events` ingest pipeline (feature 008). Mirrors
-/// [`ResponseTimeInput`] lifetime conventions so the
-/// `process_discovered_file` site can build both vectors in the same
-/// loop. See specs/008-runtime-redesign/contracts/session-events.md.
+/// [`ResponseTimeInput`] lifetime conventions so callers can build both
+/// vectors in the same loop. See
+/// specs/008-runtime-redesign/contracts/session-events.md.
 // @lat: [[backend#Database#Schema#Code and Runtime Metrics]]
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // Legacy attribution fields remain in test-only ingest fixtures.
+#[allow(dead_code)] // Constructed only by legacy ingest tests.
 pub struct SessionEventInput<'a> {
     pub timestamp: &'a str,
     pub kind: crate::sessions::SessionEventKind,
@@ -526,7 +526,6 @@ pub struct SessionEventInput<'a> {
 
 /// Persisted transcript analytics source state used to seed later inventory
 /// and root-resolution passes without reparsing unchanged files.
-#[allow(dead_code)] // Consumed by transcript analytics reconciliation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredTranscriptAnalyticsSource {
     pub(crate) provider: IntegrationProvider,
@@ -631,7 +630,6 @@ pub struct HookInvocationInput<'a> {
 }
 
 /// Last successfully parsed ownership and activity metadata retained on error.
-#[allow(dead_code)] // T010/T029 consume persisted source inventory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ModelSourceLastGoodMetadata {
     pub(crate) source_session_id: Option<String>,
@@ -649,7 +647,6 @@ pub(crate) struct ModelSourceLastGoodMetadata {
 }
 
 /// Root-owned persisted state for one model transcript source.
-#[allow(dead_code)] // T010/T029 consume persisted source inventory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredModelSource {
     pub(crate) provider: IntegrationProvider,
@@ -668,7 +665,6 @@ pub(crate) struct StoredModelSource {
 }
 
 /// Result of staged fast-fingerprint and content-hash comparison.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelSourceChange {
     FastUnchanged,
@@ -680,7 +676,6 @@ pub(crate) enum ModelSourceChange {
 }
 
 /// Post-commit result used by T010 to decide whether to emit an update event.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModelSourceReplacementOutcome {
     Replaced,
@@ -688,7 +683,6 @@ pub(crate) enum ModelSourceReplacementOutcome {
 }
 
 /// Post-commit result used by T010 to decide whether to emit an update event.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelSourceReplacementResult {
     pub(crate) outcome: ModelSourceReplacementOutcome,
@@ -697,7 +691,6 @@ pub(crate) struct ModelSourceReplacementResult {
 }
 
 /// Post-commit result for one completed root's absence pruning.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModelSourcePruneResult {
     pub(crate) data_changed: bool,
@@ -1893,7 +1886,6 @@ struct CurrentModelSourceSuppression {
 
 /// Classify one source in two stages: callers omit `content_sha256` before
 /// reading, then call again with the hash of those exact bytes when required.
-#[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
 pub(crate) fn classify_model_source_change(
     existing: Option<&StoredModelSource>,
     fast: ModelSourceFastFingerprint,
@@ -7813,6 +7805,21 @@ impl Storage {
                 .map_err(|e| format!("Migration 37 commit: {e}"))?;
         }
 
+        // Migration 38 removes migration 31's abandoned project rename
+        // registry. Migration 31 remains unchanged for databases that already
+        // recorded it; this follow-up applies safely to every upgrade path.
+        if current_version < 38 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 38 transaction: {e}"))?;
+            tx.execute_batch("DROP TABLE IF EXISTS project_path_renames;")
+                .map_err(|e| format!("Migration 38 (drop project path renames): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (38)", [])
+                .map_err(|e| format!("Failed to record migration 38: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 38 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -8281,7 +8288,6 @@ impl Storage {
     /// Recover a state left running by a previous process without touching
     /// committed source or observation rows. A fresh generation prevents an
     /// interrupted inventory from proving removals during the resumed pass.
-    #[allow(dead_code)] // T030 schedules the resumed retained-history worker.
     pub(crate) fn reset_interrupted_model_backfill(&self) -> Result<ModelBackfillStatus, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -8336,7 +8342,6 @@ impl Storage {
     /// a persisted `running` row is orphaned and must also advance to a fresh
     /// pending generation. Callers that cannot reserve scheduling must return
     /// the current status without invoking this mutation.
-    #[allow(dead_code)] // T030 exposes retry_model_history_backfill.
     pub(crate) fn initialize_model_backfill_retry(&self) -> Result<ModelBackfillStatus, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -8380,7 +8385,6 @@ impl Storage {
     }
 
     /// Atomically claim pending work for the single retained-history runner.
-    #[allow(dead_code)] // T029 starts the retained-history worker.
     pub(crate) fn start_model_backfill(&self) -> Result<ModelBackfillStatus, String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
@@ -8424,7 +8428,6 @@ impl Storage {
     }
 
     /// Persist absolute root-discovery progress before publishing source totals.
-    #[allow(dead_code)] // T029 records retained provider-root outcomes.
     pub(crate) fn update_model_backfill_roots(
         &self,
         total_roots: usize,
@@ -8484,7 +8487,6 @@ impl Storage {
 
     /// Publish discovered source count after every configured root has reached
     /// a complete or failed enumeration outcome.
-    #[allow(dead_code)] // T029 publishes the prepared inventory size.
     pub(crate) fn set_model_backfill_source_total(
         &self,
         total_sources: usize,
@@ -8555,7 +8557,6 @@ impl Storage {
     }
 
     /// Commit one batch of source outcomes with checked, nonnegative counters.
-    #[allow(dead_code)] // T029 records each bounded reconciliation batch.
     pub(crate) fn record_model_backfill_progress(
         &self,
         processed_sources: usize,
@@ -8639,7 +8640,6 @@ impl Storage {
 
     /// Resolve a running pass while keeping terminal status independent from
     /// inventory completeness. Complete is intentionally the strict exception.
-    #[allow(dead_code)] // T029 resolves retained-history terminal state.
     pub(crate) fn finish_model_backfill(
         &self,
         terminal_state: ModelBackfillState,
@@ -10691,7 +10691,6 @@ impl Storage {
     }
 
     /// Enumerate only sources owned by one exact provider/root pair.
-    #[allow(dead_code)] // T010/T029 consume persisted source inventory.
     pub(crate) fn list_model_sources_for_root(
         &self,
         provider: IntegrationProvider,
@@ -10723,7 +10722,6 @@ impl Storage {
 
     /// Advance root ownership/generation for an `ok` source whose fast
     /// fingerprint matched. Observations and successful metadata stay intact.
-    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
     pub(crate) fn mark_model_source_fast_unchanged(
         &self,
         source: &NormalizedSource,
@@ -10780,7 +10778,6 @@ impl Storage {
 
     /// Refresh fast metadata after a full-byte hash matches last-known-good
     /// content. This never rewrites observation rows or suppression fields.
-    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
     pub(crate) fn refresh_model_source_unchanged_content(
         &self,
         source: &NormalizedSource,
@@ -10834,7 +10831,6 @@ impl Storage {
 
     /// Keep an equal-hash suppressed source in the completed-root inventory
     /// without restoring observations or clearing its suppression hash.
-    #[allow(dead_code)] // T010/T029 consume suppression reconciliation APIs.
     pub(crate) fn mark_suppressed_model_source_unchanged(
         &self,
         source: &NormalizedSource,
@@ -10885,7 +10881,6 @@ impl Storage {
 
     /// Atomically replace one source's complete normalized observation set.
     /// Parsing and hashing are complete before this short transaction begins.
-    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
     pub(crate) fn replace_model_source(
         &self,
         source: &NormalizedSource,
@@ -11285,7 +11280,6 @@ impl Storage {
 
     /// Mark a source attempt failed while retaining last-known-good rows and
     /// preserving any durable suppression until replacement commits.
-    #[allow(dead_code)] // T010 consumes source reconciliation storage APIs.
     pub(crate) fn mark_model_source_failure(
         &self,
         source: &NormalizedSource,
@@ -11384,7 +11378,6 @@ impl Storage {
 
     /// Prune sources absent from one explicitly completed provider/root scan.
     /// Suppressed rows are eligible because completion proves physical absence.
-    #[allow(dead_code)] // T010 consumes completed-root reconciliation APIs.
     pub(crate) fn prune_model_sources_for_completed_root(
         &self,
         completed_root: &CompletedModelSourceRoot,
@@ -13191,200 +13184,6 @@ impl Storage {
             }
         }
         Ok(evidence)
-    }
-
-    /// Return one row per distinct `agent_id` that belongs to
-    /// `(provider, session_id)`. Each row aggregates the agent's own rows
-    /// across `token_snapshots`, `response_times`, and `tool_actions`. The
-    /// `parent_agent_id` field supports future depth-2+ nesting; today every
-    /// chain originates from the parent transcript so it is None for all
-    /// real-world rows.
-    ///
-    /// Parent resolution (Wave 2 chose option (b)): the chain's earliest
-    /// `parent_uuid` is matched against `tool_actions.message_id` — if the
-    /// uuid is owned by some other agent's transcript, that agent becomes
-    /// `parent_agent_id`. When the uuid lives in the parent transcript the
-    /// owning row has `agent_id IS NULL`, so the lookup correctly returns
-    /// None and the node sorts under the session root in the UI.
-    pub fn get_session_subagent_tree(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<Vec<SubagentNode>, String> {
-        let conn = self.conn.lock().unwrap();
-        let provider_str = provider.as_str();
-
-        // Discover the universe of agent_ids attached to this session across
-        // all three sub-agent-aware tables. UNION dedupes naturally.
-        let mut agents_stmt = conn
-            .prepare_cached(
-                "SELECT agent_id FROM (
-                     SELECT agent_id FROM token_snapshots
-                       WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM response_times
-                       WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM tool_actions
-                       WHERE provider = ?1 AND session_id = ?2 AND agent_id IS NOT NULL
-                     UNION
-                     SELECT agent_id FROM retention_daily_aggregates
-                       WHERE provider = ?1 AND session_id = ?2 AND agent_id != ''
-                 )",
-            )
-            .map_err(|e| format!("Prepare agent universe: {e}"))?;
-        let agent_ids: Vec<String> = agents_stmt
-            .query_map(params![provider_str, session_id], |row| row.get(0))
-            .map_err(|e| format!("Query agent universe: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Collect agent universe: {e}"))?;
-        drop(agents_stmt);
-
-        let mut nodes: Vec<SubagentNode> = Vec::with_capacity(agent_ids.len());
-
-        // Per-agent aggregate query. Pulls tokens / first_seen / last_active
-        // from token_snapshots ∪ response_times, turn_count from
-        // response_times, tool_call_count from tool_actions. The chain's
-        // earliest parent_uuid (from response_times — assistant turn close)
-        // feeds the parent_agent_id resolver. The label is a best-effort
-        // 80-char crop of the first user-side timestamp's row id, kept None
-        // here because we don't store message bodies in response_times;
-        // Wave 3 can derive a richer label from sessions when needed.
-        let mut per_agent_stmt = conn
-            .prepare_cached(
-                "SELECT
-                     (SELECT MIN(ts) FROM (
-                         SELECT MIN(timestamp) AS ts FROM token_snapshots
-                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
-                         UNION ALL
-                         SELECT MIN(timestamp) AS ts FROM response_times
-                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
-                     )) AS first_seen,
-                     (SELECT MAX(ts) FROM (
-                         SELECT MAX(timestamp) AS ts FROM token_snapshots
-                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
-                         UNION ALL
-                         SELECT MAX(timestamp) AS ts FROM response_times
-                           WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
-                     )) AS last_active,
-                     (SELECT COUNT(*) FROM response_times
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3) AS turn_count,
-                     COALESCE((SELECT SUM(input_tokens) FROM token_snapshots
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS input_tokens,
-                     COALESCE((SELECT SUM(output_tokens) FROM token_snapshots
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS output_tokens,
-                     COALESCE((SELECT SUM(cache_creation_input_tokens) FROM token_snapshots
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS cache_creation_tokens,
-                     COALESCE((SELECT SUM(cache_read_input_tokens) FROM token_snapshots
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0) AS cache_read_tokens,
-                     (SELECT COUNT(*) FROM tool_actions
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3)
-                     + COALESCE((SELECT SUM(tool_action_count)
-                        FROM retention_daily_aggregates
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3), 0)
-                     AS tool_call_count,
-                     -- Earliest parent_uuid for this agent (the chain root).
-                     (SELECT parent_uuid FROM response_times
-                        WHERE provider = ?1 AND session_id = ?2 AND agent_id = ?3
-                          AND parent_uuid IS NOT NULL
-                        ORDER BY timestamp ASC LIMIT 1) AS chain_root_parent_uuid",
-            )
-            .map_err(|e| format!("Prepare per-agent: {e}"))?;
-
-        // Per-agent parent resolver — option (b). Returns the owning
-        // agent_id when `message_id` lives in another sub-agent's
-        // transcript, NULL when it lives in the parent transcript.
-        let mut parent_stmt = conn
-            .prepare_cached(
-                "SELECT agent_id FROM tool_actions
-                   WHERE provider = ?1 AND session_id = ?2 AND message_id = ?3
-                     AND agent_id IS NOT NULL
-                   LIMIT 1",
-            )
-            .map_err(|e| format!("Prepare parent resolver: {e}"))?;
-
-        for agent_id in &agent_ids {
-            let row = per_agent_stmt
-                .query_row(params![provider_str, session_id, agent_id], |row| {
-                    let first_seen: Option<String> = row.get(0)?;
-                    let last_active: Option<String> = row.get(1)?;
-                    let turn_count: i64 = row.get(2)?;
-                    let input_tokens: i64 = row.get(3)?;
-                    let output_tokens: i64 = row.get(4)?;
-                    let cache_creation_tokens: i64 = row.get(5)?;
-                    let cache_read_tokens: i64 = row.get(6)?;
-                    let tool_call_count: i64 = row.get(7)?;
-                    let chain_root_parent_uuid: Option<String> = row.get(8)?;
-                    Ok((
-                        first_seen,
-                        last_active,
-                        turn_count,
-                        input_tokens,
-                        output_tokens,
-                        cache_creation_tokens,
-                        cache_read_tokens,
-                        tool_call_count,
-                        chain_root_parent_uuid,
-                    ))
-                })
-                .map_err(|e| format!("Per-agent query error: {e}"))?;
-
-            let (
-                first_seen,
-                last_active,
-                turn_count,
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-                tool_call_count,
-                chain_root_parent_uuid,
-            ) = row;
-
-            // Resolve parent_agent_id only when we have a chain root uuid to
-            // hand off. NULL today for every depth-1 sub-agent (the uuid
-            // belongs to the parent transcript whose rows carry
-            // agent_id IS NULL — the resolver query filters those out).
-            let parent_agent_id: Option<String> = match chain_root_parent_uuid {
-                Some(uuid) => parent_stmt
-                    .query_row(params![provider_str, session_id, &uuid], |r| r.get(0))
-                    .optional()
-                    .map_err(|e| format!("Parent resolver: {e}"))?,
-                None => None,
-            };
-
-            // Sub-agents with no token snapshots and no response_times rows
-            // shouldn't realistically appear (the agent_id surfaced only in
-            // tool_actions), but guard against missing timestamps anyway.
-            let first_seen = first_seen.unwrap_or_default();
-            let last_active = last_active.unwrap_or_else(|| first_seen.clone());
-
-            nodes.push(SubagentNode {
-                agent_id: agent_id.clone(),
-                parent_agent_id,
-                first_seen,
-                last_active,
-                turn_count: turn_count.max(0) as u32,
-                total_tokens: input_tokens
-                    + output_tokens
-                    + cache_creation_tokens
-                    + cache_read_tokens,
-                input_tokens,
-                output_tokens,
-                cache_creation_tokens,
-                cache_read_tokens,
-                tool_call_count: tool_call_count.max(0) as u32,
-                // Best-effort label deferred to Wave 3: we don't store user
-                // message bodies in any sub-agent-aware table, so a useful
-                // label would require joining sessions/transcripts. Return
-                // None so the contract is honored without a fragile peek.
-                label: None,
-            });
-        }
-
-        // Spawn order — frontend renders the tree top-to-bottom in this order.
-        nodes.sort_by(|a, b| a.first_seen.cmp(&b.first_seen));
-        Ok(nodes)
     }
 
     pub fn get_project_tokens(&self, days: i32) -> Result<Vec<ProjectTokens>, String> {
@@ -19982,119 +19781,6 @@ mod tests {
         clear_env();
     }
 
-    /// Wave 2 tree contract: get_session_subagent_tree returns one node per
-    /// distinct agent_id under the session, ordered by first_seen ASC. Today
-    /// every depth-1 sub-agent has parent_agent_id = None because the chain
-    /// root parent_uuid points into the parent transcript whose rows carry
-    /// agent_id IS NULL (filtered out by the resolver query).
-    #[test]
-    #[serial]
-    fn get_session_subagent_tree_returns_one_node_per_agent() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-
-        let now = Utc::now();
-        let t_a = (now - TimeDelta::minutes(30)).to_rfc3339();
-        let t_a_end = (now - TimeDelta::minutes(28)).to_rfc3339();
-        let t_b = (now - TimeDelta::minutes(20)).to_rfc3339();
-        let t_b_end = (now - TimeDelta::minutes(18)).to_rfc3339();
-
-        {
-            let conn = storage.conn.lock().unwrap();
-            // Agent A — earlier, two response_times, one tool_action,
-            // one token_snapshot.
-            conn.execute_batch(&format!(
-                r#"
-                INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
-                    input_tokens, output_tokens, cache_creation_input_tokens,
-                    cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', 'h', '{t_a}',
-                          10, 20, 1, 2, NULL, 1, 'a11111111111aaaa', 'pmsg-A');
-
-                INSERT INTO response_times (provider, session_id, chain_id,
-                    parent_chain_id, timestamp, response_secs, idle_secs,
-                    is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', 'a11111111111aaaa',
-                          'sess-tree', '{t_a}', 1.5, NULL, 1,
-                          'a11111111111aaaa', 'pmsg-A');
-                INSERT INTO response_times (provider, session_id, chain_id,
-                    parent_chain_id, timestamp, response_secs, idle_secs,
-                    is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', 'a11111111111aaaa',
-                          'sess-tree', '{t_a_end}', 2.5, 0.3, 1,
-                          'a11111111111aaaa', 'msg-A2');
-
-                INSERT INTO tool_actions (provider, action_key, message_id,
-                    session_id, chain_id, parent_chain_id, tool_name, category,
-                    summary, timestamp, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'msg-A2:0', 'msg-A2', 'sess-tree',
-                          'a11111111111aaaa', 'sess-tree', 'Read', 'fs',
-                          'read file', '{t_a_end}', 1,
-                          'a11111111111aaaa', 'pmsg-A');
-
-                -- Agent B — later, simpler shape.
-                INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
-                    input_tokens, output_tokens, cache_creation_input_tokens,
-                    cache_read_input_tokens, cwd, is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', 'h', '{t_b}',
-                          5, 5, 0, 0, NULL, 1, 'b22222222222bbbb', 'pmsg-B');
-
-                INSERT INTO response_times (provider, session_id, chain_id,
-                    parent_chain_id, timestamp, response_secs, idle_secs,
-                    is_sidechain, agent_id, parent_uuid)
-                  VALUES ('claude', 'sess-tree', 'b22222222222bbbb',
-                          'sess-tree', '{t_b_end}', 1.0, NULL, 1,
-                          'b22222222222bbbb', 'pmsg-B');
-                "#
-            ))
-            .expect("seed tree fixtures");
-        }
-
-        let nodes = storage
-            .get_session_subagent_tree(IntegrationProvider::Claude, "sess-tree")
-            .expect("get_session_subagent_tree");
-
-        assert_eq!(
-            nodes.len(),
-            2,
-            "two distinct agents ⇒ two nodes; got {nodes:?}"
-        );
-
-        // Ordered by first_seen ASC: Agent A first.
-        assert_eq!(nodes[0].agent_id, "a11111111111aaaa");
-        assert_eq!(nodes[1].agent_id, "b22222222222bbbb");
-
-        // Depth-1 nesting: every node's parent uuid lives in the (unseeded)
-        // parent transcript, so the resolver returns None.
-        assert!(
-            nodes[0].parent_agent_id.is_none(),
-            "depth-1 sub-agent should have parent_agent_id = None"
-        );
-        assert!(
-            nodes[1].parent_agent_id.is_none(),
-            "depth-1 sub-agent should have parent_agent_id = None"
-        );
-
-        // Agent A's aggregates.
-        assert_eq!(nodes[0].turn_count, 2);
-        assert_eq!(nodes[0].input_tokens, 10);
-        assert_eq!(nodes[0].output_tokens, 20);
-        assert_eq!(nodes[0].cache_creation_tokens, 1);
-        assert_eq!(nodes[0].cache_read_tokens, 2);
-        assert_eq!(nodes[0].total_tokens, 33);
-        assert_eq!(nodes[0].tool_call_count, 1);
-        assert_eq!(nodes[0].first_seen, t_a);
-        assert_eq!(nodes[0].last_active, t_a_end);
-
-        // Agent B's aggregates.
-        assert_eq!(nodes[1].turn_count, 1);
-        assert_eq!(nodes[1].total_tokens, 10);
-        assert_eq!(nodes[1].tool_call_count, 0);
-
-        clear_env();
-    }
-
     // Feature 005 US1 T021 — one-time redaction backfill scrubs pre-existing
     // plaintext at rest and is sentinel-guarded so a second run is a no-op.
     #[test]
@@ -26596,7 +26282,7 @@ mod tests {
                  DROP TABLE runtime_hourly;
                  DROP TABLE runtime_turn_state;
                  DROP TABLE rollup_meta;
-                 DELETE FROM schema_version WHERE version = 37;",
+                 DELETE FROM schema_version WHERE version >= 37;",
             )
             .expect("prepare v36 rollup fixture");
         }
