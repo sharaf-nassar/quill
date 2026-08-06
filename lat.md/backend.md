@@ -966,6 +966,8 @@ Migration 29 adds the `derived_model_id` column plus its index and re-arms `mode
 
 Attributed coverage uses one token-bearing observation population: rows with derived attribution form the numerator, and rows still null after carry-forward form the unattributed remainder. A zero-token denominator stays unavailable. Tokenless turns still contribute model, session, first/last-seen, primary-model, and switch evidence.
 
+Codex `turn_context.payload.model` is retained as tokenless per-turn evidence by the model adapter, not Session Search. Live model groups use it only when an unresolved Codex hook agent exactly matches a retained child `chain_id` under the same provider and analytics root; missing exact matches stay unknown.
+
 The overview and paged-session commands each open a short-lived read-only connection through [[src-tauri/src/storage.rs#Storage#open_view_reader]] and start their deferred transaction there, so neither waits on the primary storage mutex or serializes behind ingestion writes. The reader uses `SQLITE_OPEN_READ_ONLY`, in-memory temp storage, mmap, and a larger cache; it omits `query_only` because the overview needs temp tables.
 
 ##### Analytics Cache Primitive

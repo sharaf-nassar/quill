@@ -632,7 +632,7 @@ impl ObservedSubagentState {
                 .enumerate()
                 .filter_map(|(index, row)| {
                     let expected = row.observed_subagent_count?;
-                    if row.provider != "claude" || expected == 0 {
+                    if !matches!(row.provider.as_str(), "claude" | "codex") || expected == 0 {
                         return None;
                     }
                     let hostname = normalize_observed_hostname(&row.hostname)?;

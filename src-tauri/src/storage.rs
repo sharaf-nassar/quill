@@ -13145,17 +13145,25 @@ impl Storage {
         let conn = self.open_view_reader()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT agent_id, derived_model_id
+                "SELECT agent_identity, derived_model_id
                  FROM (
-                     SELECT agent_id, derived_model_id,
+                     SELECT CASE
+                                WHEN provider = 'codex' THEN chain_id
+                                ELSE agent_id
+                            END AS agent_identity,
+                            derived_model_id,
                             ROW_NUMBER() OVER (
-                                PARTITION BY agent_id
+                                PARTITION BY CASE
+                                    WHEN provider = 'codex' THEN chain_id
+                                    ELSE agent_id
+                                END
                                 ORDER BY observed_at_ms DESC, id DESC
                             ) AS evidence_rank
                      FROM model_usage_observations
                      WHERE provider = ?1
                        AND analytics_session_id = ?2
-                       AND agent_id IS NOT NULL
+                       AND (agent_id IS NOT NULL
+                            OR (provider = 'codex' AND is_sidechain = 1))
                        AND derived_model_id IS NOT NULL
                  )
                  WHERE evidence_rank = 1",
