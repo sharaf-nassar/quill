@@ -1192,16 +1192,6 @@ fn app_data_dir() -> PathBuf {
     crate::data_paths::resolve_data_dir_with_default(default)
 }
 
-fn get_hostname() -> String {
-    Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "local".to_string())
-}
-
 fn build_owned_manifest() -> OwnedAssetManifest {
     let mut files: Vec<String> = all_managed_script_files()
         .map(|name| scripts_dir().join(name).to_string_lossy().to_string())
@@ -1398,7 +1388,7 @@ fn create_local_config() -> Result<(), String> {
 
     let config = serde_json::json!({
         "url": "http://localhost:19876",
-        "hostname": get_hostname(),
+        "hostname": crate::sessions::SessionIndex::local_hostname(),
         "secret": secret,
     });
     let output = serde_json::to_string_pretty(&config)

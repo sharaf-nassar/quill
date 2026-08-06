@@ -389,7 +389,7 @@ fn normalize_observed_hostname(hostname: &str) -> Option<String> {
         return None;
     }
     let short = hostname.split('.').next().unwrap_or_default();
-    (!short.is_empty()).then(|| short.to_owned())
+    (!short.is_empty()).then(|| short.to_ascii_lowercase())
 }
 
 fn observed_root_key(observation: &ObservedHookObservation) -> Option<ObservedRootKey> {

@@ -1288,23 +1288,33 @@ impl SessionIndex {
     }
 
     pub(crate) fn local_hostname() -> String {
+        fn short(hostname: String) -> Option<String> {
+            hostname
+                .trim()
+                .split('.')
+                .next()
+                .filter(|hostname| !hostname.is_empty())
+                .map(str::to_owned)
+        }
+
         std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .or_else(|_| {
+            .ok()
+            .and_then(short)
+            .or_else(|| std::env::var("COMPUTERNAME").ok().and_then(short))
+            .or_else(|| {
                 std::fs::read_to_string("/etc/hostname")
-                    .map(|s| s.trim().to_string())
-                    .or_else(|_| {
-                        std::process::Command::new("hostname")
-                            .output()
-                            .map_err(|e| e.to_string())
-                            .and_then(|o| {
-                                String::from_utf8(o.stdout)
-                                    .map(|s| s.trim().to_string())
-                                    .map_err(|e| e.to_string())
-                            })
-                    })
+                    .ok()
+                    .and_then(short)
             })
-            .unwrap_or_else(|_| "unknown".to_string())
+            .or_else(|| {
+                std::process::Command::new("hostname")
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .and_then(short)
+            })
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     /// Test-friendly variant: enumerate Claude transcripts (parent + sub-agent)

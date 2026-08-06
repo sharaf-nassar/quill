@@ -337,17 +337,6 @@ fn install_transaction_paths(paths: &ClaudePaths) -> Vec<PathBuf> {
     transaction_paths
 }
 
-/// Get the short hostname, falling back to "local".
-fn get_hostname() -> String {
-    Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "local".to_string())
-}
-
 const MANAGED_COMMAND_FILES: [&str; 5] = [
     "qbuild.md",
     "learn.md",
@@ -1059,7 +1048,7 @@ fn create_local_config() -> Result<(), String> {
             log::info!("config.json points to remote URL — not overwriting");
         }
     } else {
-        let hostname = get_hostname();
+        let hostname = crate::sessions::SessionIndex::local_hostname();
         let config = serde_json::json!({
             "url": "http://localhost:19876",
             "hostname": hostname,
