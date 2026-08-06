@@ -22,9 +22,9 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 
 ### CPA Pool Aggregation
 
-CPA pool rows derive mean account pressure from readable account snapshots and are never persisted as independent facts.
+CPA pool rows derive mean account pressure from routing-usable account snapshots and are never persisted as independent facts.
 
-[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags; every account remains in that denominator. Each window is the arithmetic mean of accounts returning that window, so missing buckets are excluded rather than read as zero. Disabled or unavailable accounts never contribute.
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags; every account remains in the total denominator. Each window is the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. Routing-unusable accounts never contribute.
 
 The widget renders each aggregate as that provider's sole top-level row while the pool exists: fixed provider identity, inline healthy/total count, mean window cells, and reset readouts for visible canonical windows. Each reset uses only its matching aggregate window's earliest contributing timestamp; missing timestamps show a dash and elapsed timestamps show neutral `now`. A semantic disclosure reveals at most six account rows plus a remainder count.
 
@@ -34,15 +34,15 @@ Claude always projects its canonical 5-hour and 7-day schema so missing data rem
 
 CPA v7 reports usable credentials as `active`; Quill also accepts the compatible `ready` form, while every other lifecycle state and either disabled or unavailable flag remains unhealthy.
 
-#### Readable account mean
+#### Usable account mean
 
-Each normalized window averages returned utilization across non-disabled, available accounts that contain it; routing health does not affect quota math.
+Each normalized window averages returned utilization across active or ready, non-disabled, available accounts that contain it; routing-unusable accounts cannot influence quota math.
 
 Its reset is the earliest parseable contributing reset because that is when the displayed mean can first change.
 
-#### Health denominator with unreadable exclusions
+#### Health denominator with unusable exclusions
 
-Disabled and unavailable accounts count toward total but cannot influence utilization. Other routing-unhealthy accounts keep their honest health state and can contribute successfully read quota buckets.
+Every account counts toward total, but only active or ready, non-disabled, available accounts count as healthy or contribute buckets. A cooling account at 100% weekly therefore cannot dilute shorter-window utilization.
 
 #### Missing account buckets stay gaps
 

@@ -52,7 +52,7 @@ fn compute_provider_pool(
     for account in provider_accounts
         .iter()
         .copied()
-        .filter(|account| account.is_quota_readable())
+        .filter(|account| account.is_healthy())
     {
         let Some(buckets) = account.buckets.as_ref() else {
             continue;
@@ -176,7 +176,7 @@ mod tests {
         }
     }
 
-    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Readable account mean]]
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Usable account mean]]
     #[test]
     fn averages_utilization_and_uses_earliest_reset() {
         let accounts = [
@@ -203,9 +203,9 @@ mod tests {
         assert_eq!(pools[0].buckets[0].resets_at.as_deref(), Some("reset-a"));
     }
 
-    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Health denominator with unreadable exclusions]]
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Health denominator with unusable exclusions]]
     #[test]
-    fn keeps_health_count_but_aggregates_readable_unhealthy_buckets() {
+    fn keeps_health_count_but_excludes_unusable_accounts() {
         let accounts = [
             account(
                 "ready",
@@ -213,7 +213,10 @@ mod tests {
                 false,
                 false,
                 false,
-                Some(vec![bucket("ready", "5h", 25.0)]),
+                Some(vec![
+                    bucket("ready", "five_hour", 13.0),
+                    bucket("ready", "seven_day", 21.0),
+                ]),
             ),
             account(
                 "disabled",
@@ -221,7 +224,10 @@ mod tests {
                 true,
                 false,
                 false,
-                Some(vec![bucket("disabled", "5h", 99.0)]),
+                Some(vec![
+                    bucket("disabled", "five_hour", 99.0),
+                    bucket("disabled", "seven_day", 99.0),
+                ]),
             ),
             account(
                 "unavailable",
@@ -229,7 +235,10 @@ mod tests {
                 false,
                 true,
                 false,
-                Some(vec![bucket("unavailable", "5h", 98.0)]),
+                Some(vec![
+                    bucket("unavailable", "five_hour", 98.0),
+                    bucket("unavailable", "seven_day", 98.0),
+                ]),
             ),
             account(
                 "cooling",
@@ -237,13 +246,18 @@ mod tests {
                 false,
                 false,
                 false,
-                Some(vec![bucket("cooling", "5h", 97.0)]),
+                Some(vec![
+                    bucket("cooling", "five_hour", 0.0),
+                    bucket("cooling", "seven_day", 100.0),
+                ]),
             ),
         ];
 
         let pool = &compute_cpa_pools(&accounts)[0];
         assert_eq!((pool.healthy, pool.total), (1, 4));
-        assert_eq!(pool.buckets[0].utilization, 61.0);
+        assert_eq!(pool.buckets.len(), 2);
+        assert_eq!(pool.buckets[0].utilization, 13.0);
+        assert_eq!(pool.buckets[1].utilization, 21.0);
     }
 
     // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Usable lifecycle compatibility]]
