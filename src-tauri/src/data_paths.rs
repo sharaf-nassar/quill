@@ -191,13 +191,15 @@ pub fn resolve_claude_projects_dir_with_default(default: PathBuf) -> PathBuf {
     match std::env::var(CLAUDE_PROJECTS_DIR_ENV) {
         Ok(raw) if !raw.is_empty() => canonicalize_or_exit(CLAUDE_PROJECTS_DIR_ENV, &raw),
         _ => {
+            let placeholder = std::env::temp_dir().join("quill-demo-empty-claude-projects");
+            let _ = std::fs::create_dir_all(&placeholder);
             eprintln!(
-                "[quill-demo] QUILL_DEMO_MODE=1 but {CLAUDE_PROJECTS_DIR_ENV} unset; using production default"
+                "[quill-demo] QUILL_DEMO_MODE=1 but {CLAUDE_PROJECTS_DIR_ENV} unset; using empty placeholder to prevent indexing real Claude projects"
             );
             log::warn!(
-                "QUILL_DEMO_MODE=1 but {CLAUDE_PROJECTS_DIR_ENV} unset; using production default"
+                "QUILL_DEMO_MODE=1 but {CLAUDE_PROJECTS_DIR_ENV} unset; using empty placeholder"
             );
-            default
+            placeholder
         }
     }
 }
