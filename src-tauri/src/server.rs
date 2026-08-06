@@ -45,6 +45,9 @@ const MAX_TOKEN_VALUE: i64 = 100_000_000;
 const MAX_TOOL_DATA_LEN: usize = 2048;
 const MAX_OBSERVED_ROOTS: usize = 1024;
 const MAX_OBSERVED_AGENTS_PER_ROOT: usize = 256;
+// Five default three-minute usage polls tolerate transient hook loss without
+// letting a crashed CLI leave current-process evidence trusted indefinitely.
+const OBSERVED_ACTIVE_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 const MAX_OBS_REQUESTS: usize = 500;
 const MAX_CONTEXT_SAVINGS_REQUESTS: usize = 500;
@@ -269,6 +272,16 @@ impl ObservedRoot {
         true
     }
 
+    fn invalidate_if_stale(&mut self, now: DateTime<Utc>) {
+        if matches!(&self.coverage, ObservedCoverage::Active(_))
+            && self
+                .last_activity
+                .is_none_or(|last| now.signed_duration_since(last) > OBSERVED_ACTIVE_TTL)
+        {
+            self.invalidate(Some(now));
+        }
+    }
+
     fn count(&self) -> Option<u32> {
         match &self.coverage {
             ObservedCoverage::Active(_) => {
@@ -465,16 +478,14 @@ impl ObservedSubagentState {
     #[cfg(test)]
     pub(crate) fn snapshot(&self, provider: &str, hostname: &str, session_id: &str) -> Option<u32> {
         let hostname = normalize_observed_hostname(hostname)?;
-        self.inner
-            .lock()
-            .unwrap()
-            .roots
-            .get(&ObservedRootKey {
-                provider: provider.to_owned(),
-                hostname,
-                session_id: session_id.to_owned(),
-            })
-            .and_then(ObservedRoot::count)
+        let mut registry = self.inner.lock().unwrap();
+        let root = registry.roots.get_mut(&ObservedRootKey {
+            provider: provider.to_owned(),
+            hostname,
+            session_id: session_id.to_owned(),
+        })?;
+        root.invalidate_if_stale(Utc::now());
+        root.count()
     }
 
     pub(crate) fn merge(
@@ -485,7 +496,11 @@ impl ObservedSubagentState {
         provider: Option<IntegrationProvider>,
         limit: Option<i32>,
     ) -> Vec<SessionBreakdown> {
-        let registry = self.inner.lock().unwrap();
+        let mut registry = self.inner.lock().unwrap();
+        let now = Utc::now();
+        for root in registry.roots.values_mut() {
+            root.invalidate_if_stale(now);
+        }
         let mut seen = HashSet::new();
 
         for row in &mut rows {
