@@ -10,6 +10,22 @@ These authorized tests protect observed lifecycle truth, provider delivery, null
 
 The bounded process-local fold preserves null, zero, and positive states across ordering, identity, epoch, disable, and saturation boundaries for both providers.
 
+## Backdated Stop Invalidates Coverage
+
+A Stop older than a known open agent's Start invalidates live coverage, preventing retained overcounts until a newer SessionStart re-establishes the root epoch.
+
+## Equal-Time Stop Wins
+
+A Stop sharing an open agent's Start timestamp closes the agent, preserving the terminal-event tie-break.
+
+## Unknown Pre-Epoch Stop Is Ignored
+
+A Stop older than the root epoch for an unknown agent is dropped without invalidating otherwise exact live coverage.
+
+## Stale Start Does Not Reopen Agent
+
+A re-delivered Start older than a recorded Stop cannot reopen the closed agent or inflate the live count.
+
 ## Observed Model Aggregation
 
 Open Codex agents aggregate equal validated model ids, exclude stopped agents, retain malformed ids as unknown, and keep group totals equal to the exact observed-open count.

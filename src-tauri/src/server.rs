@@ -233,6 +233,19 @@ impl ObservedRoot {
                 return false;
             }
             ObservedCoverage::Active(epoch) => {
+                if !open
+                    && let Some(started_at) = self
+                        .agents
+                        .get(agent_id)
+                        .filter(|current| current.open && at < current.at)
+                        .map(|current| current.at)
+                {
+                    log::debug!(
+                        "invalidating observed subagent coverage: backdated SubagentStop for \
+                         {agent_id} ({at} < {started_at})"
+                    );
+                    return self.invalidate(Some(at));
+                }
                 if at < *epoch {
                     return false;
                 }
@@ -3133,6 +3146,140 @@ mod observed_subagent_tests {
                 Some(0)
             );
         }
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Backdated Stop Invalidates Coverage]]
+    #[test]
+    fn backdated_stop_for_open_agent_invalidates_until_next_epoch() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:02Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStart",
+            None,
+            Some("agent"),
+            "2030-01-01T00:00:04Z",
+        ));
+
+        assert!(state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStop",
+            None,
+            Some("agent"),
+            "2030-01-01T00:00:01Z",
+        )));
+        assert_eq!(state.snapshot("claude", "host", "root"), None);
+
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:05Z",
+        ));
+        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Equal-Time Stop Wins]]
+    #[test]
+    fn equal_timestamp_stop_closes_open_agent() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:01Z",
+        ));
+        for event in ["SubagentStart", "SubagentStop"] {
+            state.observe(&hook(
+                IntegrationProvider::Claude,
+                Some("host"),
+                "root",
+                event,
+                None,
+                Some("agent"),
+                "2030-01-01T00:00:02Z",
+            ));
+        }
+
+        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Unknown Pre-Epoch Stop Is Ignored]]
+    #[test]
+    fn pre_epoch_stop_for_unknown_agent_is_dropped() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:02Z",
+        ));
+
+        assert!(!state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStop",
+            None,
+            Some("unknown"),
+            "2030-01-01T00:00:01Z",
+        )));
+        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Stale Start Does Not Reopen Agent]]
+    #[test]
+    fn stale_start_cannot_reopen_closed_agent() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:01Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStart",
+            None,
+            Some("agent"),
+            "2030-01-01T00:00:02Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStop",
+            None,
+            Some("agent"),
+            "2030-01-01T00:00:03Z",
+        ));
+
+        assert!(!state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStart",
+            None,
+            Some("agent"),
+            "2030-01-01T00:00:02Z",
+        )));
+        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
     }
 
     #[test]
