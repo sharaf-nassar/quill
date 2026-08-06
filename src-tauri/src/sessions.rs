@@ -921,6 +921,9 @@ pub struct SessionSchema {
 pub struct IndexState {
     /// Map of JSONL file path -> last-modified epoch seconds
     pub file_mtimes: HashMap<String, u64>,
+    /// Provider-native session id last extracted from each indexed file.
+    #[serde(default)]
+    file_session_ids: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,12 +1287,6 @@ impl SessionIndex {
             .unwrap_or_else(|_| "unknown".to_string())
     }
 
-    fn discover_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
-        let mut files = Self::discover_claude_session_files()?;
-        files.extend(Self::discover_codex_session_files()?);
-        Ok(files)
-    }
-
     fn discover_claude_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
         let projects_dir = crate::data_paths::resolve_claude_projects_dir();
         Self::discover_claude_session_files_in(&projects_dir)
@@ -1318,11 +1315,6 @@ impl SessionIndex {
         collection
             .search_error
             .map_or_else(|| Ok(collection.candidates), Err)
-    }
-
-    fn discover_codex_session_files() -> Result<Vec<DiscoveredSessionFile>, String> {
-        let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
-        Self::discover_codex_session_files_in(&sessions_dir)
     }
 
     fn discover_codex_session_files_in(
@@ -1354,6 +1346,84 @@ impl SessionIndex {
         let mut state = self.state.lock().unwrap();
         let hostname = Self::local_hostname();
         let mut writer = self.writer.lock().unwrap();
+        let roots = enumerate_retained_jsonl_source_roots();
+        let discovered_paths = roots
+            .iter()
+            .flat_map(|root| &root.sources)
+            .map(|source| source.filesystem_path.to_string_lossy().into_owned())
+            .collect::<HashSet<_>>();
+
+        for file_key in state.file_mtimes.keys().cloned().collect::<Vec<_>>() {
+            if discovered_paths.contains(&file_key) {
+                continue;
+            }
+
+            let tracked_path = Path::new(&file_key);
+            let Some((provider, layout_hint)) = roots.iter().find_map(|root| {
+                if !matches!(root.outcome, ProviderRootEnumerationOutcome::Complete) {
+                    return None;
+                }
+                let layout_hint = retained_jsonl_source_layout_hint(
+                    root.provider,
+                    &root.resolved_root_path,
+                    tracked_path,
+                )
+                .or_else(|| {
+                    root.canonical_root_path
+                        .as_deref()
+                        .and_then(|canonical_root| {
+                            retained_jsonl_source_layout_hint(
+                                root.provider,
+                                canonical_root,
+                                tracked_path,
+                            )
+                        })
+                })?;
+                Some((root.provider, layout_hint))
+            }) else {
+                continue;
+            };
+
+            let session_id =
+                state
+                    .file_session_ids
+                    .get(&file_key)
+                    .cloned()
+                    .or_else(|| match layout_hint {
+                        RetainedJsonlSourceLayoutHint::ClaudeParent { .. } => tracked_path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .map(str::to_owned),
+                        RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. } => tracked_path
+                            .ancestors()
+                            .find(|path| path.file_name().is_some_and(|name| name == "subagents"))
+                            .and_then(Path::parent)
+                            .and_then(Path::file_name)
+                            .and_then(|name| name.to_str())
+                            .map(str::to_owned),
+                        RetainedJsonlSourceLayoutHint::CodexTranscript => tracked_path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .and_then(|stem| stem.strip_prefix("rollout-"))
+                            .and_then(|stem| stem.get(20..))
+                            .filter(|session_id| !session_id.is_empty())
+                            .map(str::to_owned),
+                    });
+            let Some(session_id) = session_id else {
+                continue;
+            };
+
+            match self.delete_session_docs_with_writer(&writer, provider, &session_id) {
+                Ok(()) => {
+                    state.file_mtimes.remove(&file_key);
+                    state.file_session_ids.remove(&file_key);
+                    index_changed = true;
+                }
+                Err(error) => {
+                    log::warn!("Failed to prune vanished session docs: {error}");
+                }
+            }
+        }
 
         // Migration 20 backfill hook: when storage signals a pending sub-agent
         // re-ingest, drop the mtime cache so every transcript is re-extracted
@@ -1403,7 +1473,25 @@ impl SessionIndex {
             state.file_mtimes.clear();
         }
 
-        for discovered in Self::discover_session_files()? {
+        let discovered_files = roots.iter().flat_map(|root| &root.sources).map(|source| {
+            let (default_project, is_subagent) = match &source.layout_hint {
+                RetainedJsonlSourceLayoutHint::ClaudeParent { default_project } => {
+                    (default_project.clone(), false)
+                }
+                RetainedJsonlSourceLayoutHint::ClaudeSubagent { default_project } => {
+                    (default_project.clone(), true)
+                }
+                RetainedJsonlSourceLayoutHint::CodexTranscript => ("unknown".to_string(), false),
+            };
+            DiscoveredSessionFile {
+                provider: source.provider,
+                path: source.filesystem_path.clone(),
+                default_project,
+                is_subagent,
+            }
+        });
+
+        for discovered in discovered_files {
             let file_key = discovered.path.to_string_lossy().to_string();
             let mtime = std::fs::metadata(&discovered.path)
                 .ok()
@@ -1457,6 +1545,11 @@ impl SessionIndex {
             }
 
             total_indexed += extracted.messages.len();
+            if !extracted.session_id.is_empty() {
+                state
+                    .file_session_ids
+                    .insert(file_key.clone(), extracted.session_id);
+            }
             state.file_mtimes.insert(file_key, mtime);
         }
 

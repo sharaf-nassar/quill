@@ -1917,6 +1917,8 @@ Fields include provider, message_id, session_id, content, role, project, host, t
 
 Session Search triggers an incremental mtime scan of `~/.claude/projects/` and `~/.codex/sessions/**` before loading facets, while hook-driven notify/message ingestion keeps the index fresh during app runtime.
 
+A complete provider-root scan also removes Tantivy documents and mtime state for vanished supported transcripts; incomplete roots never authorize deletion.
+
 When a transcript is reprocessed, Quill coalesces repeated search `notify` requests per session and applies each Tantivy rewrite under one writer lock with a single commit. One retained-source coordinator separately tracks model and transcript completion under canonical `(provider, source_key)`; transcript replacement still spans all five tables in one transaction. The mtime sweep deletes existing session docs unconditionally before reinserting, even on first sight of a file, so hook-driven indexing cannot stack duplicate copies.
 
 Skill usage is derived by [[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]], which recognizes read-like loads of a `SKILL.md` file and derives the skill name from that file's parent directory. Retained rows are owned and replayed by canonical source, and the extractor does not infer skills from assistant prose, available-skill lists, or skill-file maintenance edits. Flattened `/sessions/messages` payloads contain no tool-action detail and emit no skill rows.
