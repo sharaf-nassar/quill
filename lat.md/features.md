@@ -397,7 +397,7 @@ Graceful restart of running Claude and Codex sessions via [[src-tauri/src/restar
 
 Uses provider-specific discovery with a shared row model.
 
-Claude instances come from Quill state files in `~/.cache/quill/claude-state/` plus process scanning. The restart CJS hook writes `processing` on `UserPromptSubmit`/`PreToolUse`, `idle` on `Stop`/`StopFailure`, and `exited` on `SessionEnd`. Codex instances come from process scanning and `<Codex home>/sessions/` metadata queues per cwd so multiple same-directory sessions can still map to distinct restart rows.
+Claude instances come from Quill state files in `~/.cache/quill/claude-state/` plus process scanning. The restart CJS hook writes `processing` on `UserPromptSubmit`/`PreToolUse`, `idle` on `Stop`/`StopFailure`, and `exited` on `SessionEnd`. Codex instances come from process scanning and `<Codex home>/sessions/` metadata per cwd. Quill emits a Codex restart row only when the cwd has exactly one process and one distinct metadata candidate; ambiguous process or session mappings are omitted.
 
 ### Restart Flow
 

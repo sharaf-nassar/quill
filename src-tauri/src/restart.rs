@@ -579,30 +579,30 @@ pub fn discover_instances() -> Vec<RestartInstance> {
     }
 
     let codex_meta_by_cwd = discover_codex_session_metadata();
-    let mut codex_meta_offsets: HashMap<String, usize> = HashMap::new();
     let known_all_pids: Vec<u32> = known_pids.iter().copied().collect();
-    let mut codex_processes = scan_proc_for_provider(IntegrationProvider::Codex, &known_all_pids);
-    codex_processes.sort_by_key(|right| std::cmp::Reverse(right.0));
+    let codex_processes = scan_proc_for_provider(IntegrationProvider::Codex, &known_all_pids);
+    let mut codex_process_counts: HashMap<String, usize> = HashMap::new();
+    for (_, cwd, _) in &codex_processes {
+        *codex_process_counts.entry(cwd.clone()).or_default() += 1;
+    }
 
     for (pid, cwd, tty) in codex_processes {
+        let Some([meta]) = codex_meta_by_cwd.get(&cwd).map(Vec::as_slice) else {
+            continue;
+        };
+        if codex_process_counts.get(cwd.as_str()) != Some(&1) {
+            continue;
+        }
         known_pids.insert(pid);
-        let meta = codex_meta_by_cwd.get(&cwd).and_then(|metas| {
-            let offset = codex_meta_offsets.entry(cwd.clone()).or_insert(0);
-            let meta = metas.get(*offset).cloned();
-            if meta.is_some() {
-                *offset += 1;
-            }
-            meta
-        });
         instances.push(RestartInstance {
             provider: IntegrationProvider::Codex,
             pid,
-            session_id: meta.as_ref().map(|m| m.session_id.clone()),
+            session_id: Some(meta.session_id.clone()),
             cwd: cwd.clone(),
             tty: tty.clone(),
             terminal_type: terminal_type_from_tty(&tty, &tmux_panes),
             status: InstanceStatus::Unknown,
-            last_seen: meta.map(|m| m.last_seen).unwrap_or_default(),
+            last_seen: meta.last_seen.clone(),
         });
     }
 
