@@ -35,18 +35,16 @@ const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 3";
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
-const MANAGED_HOOK_SCRIPT_FILES: [&str; 8] = [
+const MANAGED_HOOK_SCRIPT_FILES: [&str; 7] = [
     "observe.cjs",
     "report-tokens.cjs",
-    // Legacy name kept so hook registrations from older installs are
-    // still recognized as Quill-owned and replaced on reinstall.
-    "report-tokens.sh",
     "session-sync.cjs",
     "context-router.cjs",
     "context-capture.cjs",
     "hook-observe.cjs",
     "session-end-learn.cjs",
 ];
+const LEGACY_MANAGED_HOOK_SCRIPT_FILES: [&str; 1] = ["report-tokens.sh"];
 const CODEX_HOOK_EVENTS: [(&str, &str); 11] = [
     ("PreToolUse", "pre_tool_use"),
     ("PermissionRequest", "permission_request"),
@@ -415,6 +413,9 @@ fn verify_with_paths(
     let config_content = fs::read_to_string(&paths.config)
         .map_err(|err| format!("Failed to read config.toml: {err}"))?;
     let config = parse_config_doc(&config_content)?;
+    if config_has_legacy_managed_hooks(&config) {
+        return Err("config.toml contains a legacy Quill hook command".to_string());
+    }
     if nested_config_item(&config, &["features", "hooks"]).and_then(Item::as_bool) != Some(true) {
         return Err("config.toml does not enable hooks".to_string());
     }
@@ -546,13 +547,54 @@ fn hook_state_label(event: &str) -> Option<&'static str> {
     })
 }
 
+fn command_uses_managed_script(command: &str, script: &str) -> bool {
+    command.contains(&scripts_dir().join(script).to_string_lossy().to_string())
+        || command.contains(&format!("~/.config/quill/codex/scripts/{script}"))
+}
+
 fn command_is_quill_owned(command: &str) -> bool {
     command.contains(HOOK_MARKER)
         || command.contains(CONTEXT_HOOK_MARKER)
-        || MANAGED_HOOK_SCRIPT_FILES.iter().any(|script| {
-            command.contains(&scripts_dir().join(script).to_string_lossy().to_string())
-                || command.contains(&format!("~/.config/quill/codex/scripts/{script}"))
-        })
+        || MANAGED_HOOK_SCRIPT_FILES
+            .iter()
+            .chain(LEGACY_MANAGED_HOOK_SCRIPT_FILES.iter())
+            .any(|script| command_uses_managed_script(command, script))
+}
+
+fn command_is_legacy_quill_owned(command: &str) -> bool {
+    LEGACY_MANAGED_HOOK_SCRIPT_FILES
+        .iter()
+        .any(|script| command_uses_managed_script(command, script))
+}
+
+fn config_has_hook_command(doc: &DocumentMut, predicate: fn(&str) -> bool) -> bool {
+    let Some(hooks) = doc.as_table().get("hooks").and_then(Item::as_table_like) else {
+        return false;
+    };
+    CODEX_HOOK_EVENTS.iter().any(|(event, _)| {
+        hooks
+            .get(event)
+            .and_then(Item::as_array_of_tables)
+            .is_some_and(|groups| {
+                groups.iter().any(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(Item::as_array_of_tables)
+                        .is_some_and(|handlers| {
+                            handlers.iter().any(|handler| {
+                                handler
+                                    .get("command")
+                                    .and_then(Item::as_str)
+                                    .is_some_and(predicate)
+                            })
+                        })
+                })
+            })
+    })
+}
+
+fn config_has_legacy_managed_hooks(doc: &DocumentMut) -> bool {
+    config_has_hook_command(doc, command_is_legacy_quill_owned)
 }
 
 fn hook_signature(
@@ -1114,22 +1156,7 @@ fn config_has_managed_hooks(path: &Path) -> bool {
     let Ok(doc) = parse_config_doc(&content) else {
         return false;
     };
-    let Some(hooks) = doc.as_table().get("hooks").and_then(Item::as_table_like) else {
-        return false;
-    };
-    CODEX_HOOK_EVENTS.iter().any(|(event, _)| {
-        hooks
-            .get(event)
-            .and_then(Item::as_array_of_tables)
-            .is_some_and(|groups| {
-                groups.iter().any(|group| {
-                    group
-                        .get("hooks")
-                        .and_then(Item::as_array_of_tables)
-                        .is_some_and(|handlers| handlers.iter().any(hook_command_is_managed))
-                })
-            })
-    })
+    config_has_hook_command(&doc, command_is_quill_owned)
 }
 
 fn resolve_codex_install_paths() -> Result<CodexInstallPaths, String> {

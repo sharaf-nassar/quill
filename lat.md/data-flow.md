@@ -134,7 +134,7 @@ Hook evidence has two consumers: durable SQLite audit rows feed the Hooks breakd
 
 Disabling activity tracking removes both managed observer paths and invalidates current coverage. Provider disable clears only that provider. Activity and provider mutations emit `hooks-observed-updated` after invalidation so mounted Sessions caches refresh immediately. Re-enable stays unknown until a newer qualifying root epoch; Quill restart also returns unknown.
 
-Codex config changes flow through parsed TOML: install snapshots the active custom or default Codex home, records prior feature and MCP environment values, replaces only Quill commands, then reconciles positional trust keys against pre/post `hooks/list` metadata. Verification reparses the file and checks exact enabled/trusted handlers; uninstall targets the recorded home and restores the captured user values.
+Codex config changes flow through parsed TOML: install snapshots the active custom or default Codex home, records prior feature and MCP environment values, replaces only Quill commands, then reconciles positional trust keys against pre/post `hooks/list` metadata. Verification reparses the file, rejects retired Quill shell-hook commands omitted from `hooks/list`, and checks exact enabled/trusted handlers; startup repair then migrates stale registrations. Uninstall targets the recorded home and restores the captured user values.
 
 ## Model Observation Reconciliation
 
