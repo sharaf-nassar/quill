@@ -10,11 +10,18 @@ The frontend uses Vite with the React plugin; the backend uses Cargo with Tauri.
 
 Vite serves on port 8181 in dev mode and ignores `src-tauri/**` to avoid extra frontend reloads during Rust rebuilds.
 
-Production builds target ES2020 with esbuild minification and sourcemaps. The
-uncompressed chunk warning limit is 550 kB, preserving a zero-warning gate
-with narrow headroom over the measured application chunk. TypeScript is strict
-mode with ESNext modules and bundler resolution. See `vite.config.ts` and
-`tsconfig.json`.
+Production builds use esbuild minification and generate sourcemaps only when an
+authenticated Sentry upload is configured. Other builds omit maps so native
+packages cannot expose them. The build then rejects any remaining map before
+Tauri can package it. The uncompressed chunk warning limit is 550 kB.
+TypeScript uses strict mode, ESNext modules, and bundler resolution. See
+`vite.config.ts` and `tsconfig.json`.
+
+#### Crash Transport CSP
+
+Production permits outbound frontend connections only to Tauri IPC and the exact HTTPS origin derived from the crash reporter DSN.
+
+`index.html` names `https://o1373069.ingest.us.sentry.io` in `connect-src` so the browser SDK can post envelopes without widening the policy to every Sentry tenant. The dev-only policy in `vite.config.ts` keeps the same origin alongside its localhost tooling exceptions. `scripts/csp.test.mjs` pins the production allowlist to both IPC endpoints and the DSN origin.
 
 ### Backend Build
 
@@ -35,6 +42,8 @@ Bundle targets: macOS app bundle + DMG, Windows NSIS, Linux AppImage. The Linux 
 
 GitHub Actions workflow (`.github/workflows/release.yml`) triggers on `v*` tags or manual dispatch.
 
+Manual dispatch must select an existing `v*` tag. The `create-release` job rejects branch refs before checkout or draft creation, so version injection and packaging remain tag-only.
+
 ### Backend CI Gate
 
 `.github/workflows/ci.yml` is the Rust backend gate (feature 005, FR-021 / SC-008) that also blocks release on failure.
@@ -45,7 +54,7 @@ It triggers on `pull_request`, `push` to `main`, and `workflow_call`, installs t
 
 ### Draft Release Pre-Creation
 
-A `create-release` job runs before all builds to create a single draft release. This prevents a race condition where parallel `tauri-action` instances each create their own draft, splitting assets across multiple releases and breaking the updater.
+A `create-release` job validates the `v*` tag ref, then runs before all builds to create a single draft release. This prevents branch dispatches from creating releases and prevents parallel `tauri-action` instances from racing into separate drafts.
 
 ### Build Matrix
 
@@ -62,6 +71,8 @@ Unix free-space probes normalize `statvfs` counters to `u64` before multiplicati
 Parses version from git tag (e.g., `v0.2.1` -> `0.2.1`). Updates `src-tauri/Cargo.toml` via sed and `package.json` via Node.js before build.
 
 Source builds retain the `0.0.0-injected-by-ci` sentinel. [[src-tauri/src/lib.rs#packaged_version_allows_updates]] disables their updater so newer local schema migrations cannot be replaced by an older published release; tag-injected builds keep normal version ordering.
+
+The Rust Sentry SDK prefixes Cargo's injected package version with `v`, matching `SENTRY_RELEASE`, `VITE_APP_VERSION`, and the GitHub tag on every release platform.
 
 ### macOS Code Signing
 
@@ -85,7 +96,9 @@ Asset URLs are constructed as `https://github.com/<repo>/releases/download/<tag>
 
 The Vite build uploads frontend source maps to the [[features#Crash Reporting]] Sentry project when `SENTRY_AUTH_TOKEN` is exported on the build step.
 
-`vite.config.ts` reads `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`, and `SENTRY_RELEASE` from `process.env` and instantiates `sentryVitePlugin` only when the token is set AND `NODE_ENV === "production"` (which Vite sets for `vite build`); dev runs and unconfigured CI jobs skip the upload silently. `release.yml`'s "Build and release" step exports `SENTRY_AUTH_TOKEN` conditionally on `matrix.platform == 'ubuntu-22.04'` so the four-platform build matrix uploads exactly once per release — the macOS/Windows builds see an empty token and the plugin no-ops there. `SENTRY_RELEASE` is set to `github.ref_name` (the `v*` tag) so source maps and the runtime SDK's `release` tag (`VITE_APP_VERSION`, same value) link to the same Sentry release.
+`vite.config.ts` reads `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`, `SENTRY_PROJECT`, and `SENTRY_RELEASE` from `process.env` and instantiates `sentryVitePlugin` only when the token is set AND `NODE_ENV === "production"` (which Vite sets for `vite build`); dev runs and unconfigured CI jobs skip upload and map generation. Every release matrix leg receives the token because each runner builds its own frontend and cross-platform bundle equality is not assumed. The plugin injects deterministic debug IDs, uploads that leg's exact JavaScript and maps, then requests deletion of `dist/**/*.map`. Upload and injection failures propagate through its throwing error handler. `npm run build` finally runs `scripts/verify-sentry-output.mjs`, which rejects any remaining map (including a deletion error the plugin logs but swallows) or authenticated script without a debug ID before Tauri packaging starts. A second matrix-wide workflow assertion checks the final output.
+
+All matrix plugins set `release.create`, `release.finalize`, and `release.setCommits` to false, so concurrent artifact uploads cannot race Sentry release management. The runtime event's release value can create the release on first use. The workflow's pre-build gate rejects missing auth or version drift; `SENTRY_RELEASE`, frontend `VITE_APP_VERSION`, and Rust's v-prefixed Cargo version all equal `github.ref_name`. [[crash-reporting-tests#Release matrix symbolication contract]] pins this matrix, plugin, and no-map contract without live Sentry credentials.
 
 ### Pages Workflow
 
@@ -206,9 +219,9 @@ Complete model-fixture mode writes retained sources first: [[scripts/populate_du
 
 ### Demo Launcher
 
-`scripts/run_quill_demo.sh` (POSIX) and `scripts/run_quill_demo.ps1` (Windows) launch a sandboxed Quill instance against dummy data without touching the maintainer's personal Quill state.
+`scripts/run_quill_demo.sh` (POSIX) launches a sandboxed Quill instance against dummy data without touching the maintainer's personal Quill state; the former PowerShell launcher was removed.
 
-Each launcher creates a stable per-user sandbox directory (`/tmp/quill-demo-$USER` on POSIX, `%TEMP%\quill-demo-%USERNAME%` on Windows). `scripts/run_quill_demo.sh` and `scripts/run_quill_demo.ps1` pass the selected Quill executable plus the same Claude and Codex directories to the seeder, then export the source roots with `QUILL_DEMO_MODE=1`. Runtime discovery therefore reads the exact roots whose canonical sources populated SQLite; neither production session root is read. Both also isolate data and rules, run with `--no-backup --quiet`, then execute that same Quill build. The POSIX launcher additionally isolates `HOME` to `$SANDBOX/home` and passes it as `--home-dir`, because the app resolves memory documents and its own context assets from the home directory rather than from the `QUILL_*` overrides; it launches under `dbus-run-session` when available so the demo owns a private session bus and therefore its own single-instance lock, and runs a bounded watcher that deletes `<home>/.claude/CLAUDE.md` once the app recreates it. Windows resolves the profile directory through the Known Folder API, which no environment variable overrides, so the PowerShell launcher isolates neither and passes no `--home-dir`. PowerShell uses direct array splatting so spaced paths are preserved. See [[backend#Data Paths#Demo-mode path override]] and `specs/001-marketing-site/contracts/launcher-cli.md`.
+The launcher creates a stable per-user sandbox directory (`/tmp/quill-demo-$USER`), passes the selected Quill executable plus the same Claude and Codex directories to the seeder, then exports the source roots with `QUILL_DEMO_MODE=1`. Runtime discovery therefore reads the exact roots whose canonical sources populated SQLite; neither production session root is read. It also isolates data and rules, runs with `--no-backup --quiet`, then executes that same Quill build. It additionally isolates `HOME` to `$SANDBOX/home` and passes it as `--home-dir`, because the app resolves memory documents and its own context assets from the home directory rather than from the `QUILL_*` overrides; it launches under `dbus-run-session` when available so the demo owns a private session bus and therefore its own single-instance lock, and runs a bounded watcher that deletes `<home>/.claude/CLAUDE.md` once the app recreates it. See [[backend#Data Paths#Demo-mode path override]] and `specs/001-marketing-site/contracts/launcher-cli.md`.
 
 ### macOS Bootstrap
 
@@ -224,10 +237,11 @@ variables while preserving each provider's normal runtime environment.
 
 ## Claude Integration Deployment
 
-Claude integration now has a dedicated adapter shell in
-[[src-tauri/src/integrations/claude.rs]] plus manifest-aware install/uninstall wrappers in
-[[src-tauri/src/claude_setup.rs]], while startup detection remains in
-[[src-tauri/src/integrations/manager.rs]].
+Claude integration lives directly in [[src-tauri/src/claude_setup.rs]] —
+detection plus manifest-aware install/uninstall — while startup orchestration
+remains in [[src-tauri/src/integrations/manager.rs]]. The former
+`integrations/claude.rs` adapter shim was deleted; callers use `claude_setup`
+directly.
 
 [[src-tauri/src/claude_setup.rs#ClaudePaths]] resolves a non-empty `CLAUDE_CONFIG_DIR` as Claude's user directory. Without the variable it uses `~/.claude` and legacy `~/.claude.json`; with it, settings, commands, instructions, hooks, and `.claude.json` all live inside that directory. A versioned state file pins the selected paths so repair and uninstall do not follow a later environment change. Before state exists, a detected legacy Quill install at the default paths wins over a new override so it can be repaired or removed safely.
 
@@ -285,7 +299,7 @@ Codex integration lives in [[src-tauri/src/integrations/codex.rs]] and deploys p
 
 Files and config entries created when the Codex provider is enabled.
 
-Deployment is allowlisted to token and sync scripts by default. `observe.cjs` and `hook-observe.cjs` are added when activity tracking is enabled. Context routing and continuity scripts are deployed only when context preservation is enabled, with `context-telemetry.cjs` further gated on the context telemetry flag. The Claude-only `qbuild-guard.sh` is never copied into Codex assets.
+Deployment is allowlisted to token and sync scripts by default, plus the shared `lib.cjs` helper (config load, local-only guard, and timeout-bounded HTTP POST) they and `hook-observe.cjs` require. `observe.cjs` and `hook-observe.cjs` are added when activity tracking is enabled. Context routing and continuity scripts are deployed only when context preservation is enabled, with `context-telemetry.cjs` further gated on the context telemetry flag. The Claude-only `qbuild-guard.sh` is never copied into Codex assets.
 
 | Target | Content |
 |--------|---------|
@@ -354,7 +368,7 @@ Rust crate dependencies grouped by role. Full list in `src-tauri/Cargo.toml`.
 
 **Tauri plugins**: tauri-plugin-dialog 2, tauri-plugin-single-instance 2, tauri-plugin-window-state 2, tauri-plugin-updater 2, tauri-plugin-log 2.
 
-**Utilities**: serde/serde_json, chrono, sha2, parking_lot 0.12, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
+**Utilities**: serde/serde_json, chrono, sha2, similar 2, regex, walkdir, dirs, nix (unix only), sentry 0.34 (default-features off, with `backtrace`/`contexts`/`panic`/`reqwest`/`rustls`) for the [[features#Crash Reporting]] backend half.
 
 **Dev-only**: serial_test 3 — used by [[src-tauri/src/data_paths.rs]] tests to serialize global env-var mutation across the three behavioral cases for each resolver (data dir, rules dir, Claude projects dir, Codex sessions dir) so concurrent test threads don't race.
 

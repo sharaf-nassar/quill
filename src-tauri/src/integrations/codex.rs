@@ -35,8 +35,11 @@ const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 3";
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
-const MANAGED_HOOK_SCRIPT_FILES: [&str; 7] = [
+const MANAGED_HOOK_SCRIPT_FILES: [&str; 8] = [
     "observe.cjs",
+    "report-tokens.cjs",
+    // Legacy name kept so hook registrations from older installs are
+    // still recognized as Quill-owned and replaced on reinstall.
     "report-tokens.sh",
     "session-sync.cjs",
     "context-router.cjs",
@@ -68,9 +71,10 @@ pub(crate) fn is_supported_hook_event(event: &str) -> bool {
 // entry on reinstall regardless of the active feature set so flipping a
 // feature off does not leave the corresponding script orphaned in
 // `~/.config/quill/scripts/`.
-const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
+const ALL_MANAGED_SCRIPT_FILES: [&str; 8] = [
+    "lib.cjs",
     "observe.cjs",
-    "report-tokens.sh",
+    "report-tokens.cjs",
     "session-sync.cjs",
     "context-router.cjs",
     "context-capture.cjs",
@@ -86,7 +90,7 @@ const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
 // Per-feature subsets used to decide which files to deploy for the current
 // `IntegrationFeatures`. Same logic as the Claude installer.
 fn base_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
-    let mut scripts: Vec<&'static str> = vec!["report-tokens.sh", "session-sync.cjs"];
+    let mut scripts: Vec<&'static str> = vec!["lib.cjs", "report-tokens.cjs", "session-sync.cjs"];
     if features.activity_tracking {
         scripts.push("observe.cjs");
     }
@@ -1281,18 +1285,6 @@ fn deploy_files(
         }
         validate_staged_mcp(staged_mcp.path(), features.context_preservation)?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            let token_script = staged_scripts.path().join("report-tokens.sh");
-            if token_script.exists() {
-                fs::set_permissions(&token_script, perms).map_err(|err| {
-                    format!("Failed to set permissions on report-tokens.sh: {err}")
-                })?;
-            }
-        }
-
         Ok(vec![staged_scripts, staged_templates, staged_mcp])
     })();
 
@@ -1402,7 +1394,10 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
         "node {}",
         shell_quote(&scripts_dir().join("session-sync.cjs"))
     );
-    let tokens_command = shell_quote(&scripts_dir().join("report-tokens.sh"));
+    let tokens_command = format!(
+        "node {}",
+        shell_quote(&scripts_dir().join("report-tokens.cjs"))
+    );
 
     let mut groups = vec![
         CodexHookGroup {

@@ -527,8 +527,31 @@ fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: Integrat
     }
 }
 
-pub fn uninstall() -> Result<(), String> {
+pub(crate) fn detect() -> Result<crate::integrations::ProviderStatus, String> {
+    let (detected_cli, attempts) = crate::config::detect_provider_cli("claude");
+    let detected_home = detect_claude_home();
+    let setup_state = match (detected_cli, detected_home) {
+        (true, true) => crate::integrations::types::ProviderSetupState::Installed,
+        (false, false) => crate::integrations::types::ProviderSetupState::NotInstalled,
+        _ => crate::integrations::types::ProviderSetupState::Missing,
+    };
+
+    Ok(crate::integrations::ProviderStatus {
+        provider: crate::integrations::IntegrationProvider::Claude,
+        detected_cli,
+        detected_home,
+        enabled: false,
+        setup_state,
+        user_has_made_choice: false,
+        last_error: None,
+        last_verified_at: Some(chrono::Utc::now().to_rfc3339()),
+        last_detection_attempts: if detected_cli { Vec::new() } else { attempts },
+    })
+}
+
+pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
     let paths = resolve_claude_uninstall_paths()?;
+    crate::restart::uninstall_claude_restart_assets(&paths, remove_shared_restart_assets)?;
     let state = load_integration_state()?;
     preflight_configuration(&paths)?;
 

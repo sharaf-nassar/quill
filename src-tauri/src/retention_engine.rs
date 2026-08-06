@@ -407,6 +407,7 @@ impl RetentionScanReport {
 }
 
 /// What one committed chunk did.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionChunkReport {
     pub target: RetentionTarget,
@@ -421,9 +422,8 @@ pub struct RetentionChunkReport {
 ///
 /// [`RetentionChunkControl::Interrupt`] exists so a test can stop a run
 /// between chunks the way a process kill would, and prove that committed
-/// chunks stay committed and the next run needs no special handling. Nothing
-/// in the production path installs a hook, so nothing in the production path
-/// can produce it.
+/// chunks stay committed and the next run needs no special handling.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetentionChunkControl {
     Continue,
@@ -431,9 +431,11 @@ pub enum RetentionChunkControl {
 }
 
 /// Free bytes on the filesystem holding a path.
+#[cfg(test)]
 pub type FreeSpaceProbe<'a> = &'a dyn Fn(&Path) -> Result<u64, String>;
 
 /// Decides whether the chunk loop continues after a committed chunk.
+#[cfg(test)]
 pub type ChunkHook<'a> = &'a dyn Fn(&RetentionChunkReport) -> RetentionChunkControl;
 
 /// Percentage sink for the delete phase.
@@ -456,8 +458,10 @@ pub struct RetentionDeleteControls<'a> {
     /// Chunks between free-space re-checks.
     pub free_space_recheck_chunks: u32,
     /// `None` uses `statvfs`.
+    #[cfg(test)]
     pub free_space: Option<FreeSpaceProbe<'a>>,
     /// Called after every committed chunk, before the next one starts.
+    #[cfg(test)]
     pub after_chunk: Option<ChunkHook<'a>>,
     /// Counting-phase heartbeat, 0–100. Shared with the progress handler, so
     /// it must be cheap and must not touch the database.
@@ -475,7 +479,9 @@ impl Default for RetentionDeleteControls<'_> {
         Self {
             chunk_rows: RETENTION_CHUNK_ROWS,
             free_space_recheck_chunks: RETENTION_FREE_SPACE_RECHECK_CHUNKS,
+            #[cfg(test)]
             free_space: None,
+            #[cfg(test)]
             after_chunk: None,
             scan_progress: None,
             delete_progress: None,
@@ -487,10 +493,11 @@ impl Default for RetentionDeleteControls<'_> {
 
 impl RetentionDeleteControls<'_> {
     fn probe_free_space(&self, path: &Path) -> Result<u64, String> {
-        match self.free_space {
-            Some(probe) => probe(path),
-            None => available_disk_space(path),
+        #[cfg(test)]
+        if let Some(probe) = self.free_space {
+            return probe(path);
         }
+        available_disk_space(path)
     }
 
     fn recheck_interval(&self) -> u32 {
@@ -1049,7 +1056,7 @@ fn sqlite_value_to_json(value: ValueRef<'_>) -> Result<Value, String> {
             .map_err(|error| format!("Decode retention archive text: {error}")),
         ValueRef::Blob(value) => Ok(json!({
             "encoding": "hex",
-            "data": hex::encode(value),
+            "data": crate::hex_encode(value),
         })),
     }
 }
@@ -1144,7 +1151,10 @@ pub fn preflight_delete_phase(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DrainOutcome {
     Completed,
-    Partial { error_reason: String },
+    Partial {
+        error_reason: String,
+    },
+    #[cfg(test)]
     Interrupted,
 }
 
@@ -1587,6 +1597,7 @@ fn drain_target(
             sink(pct);
         }
 
+        #[cfg(test)]
         if let Some(hook) = controls.after_chunk {
             let report = RetentionChunkReport {
                 target,
@@ -1746,6 +1757,7 @@ pub fn run_retention_delete_phase(
         DrainOutcome::Partial { error_reason } => (RetentionRunStatus::Partial, Some(error_reason)),
         // A run stopped between chunks reports what actually committed, with
         // the interruption named, exactly as a mid-run failure does.
+        #[cfg(test)]
         DrainOutcome::Interrupted => (
             RetentionRunStatus::Partial,
             Some("The retention run stopped between chunks".to_string()),

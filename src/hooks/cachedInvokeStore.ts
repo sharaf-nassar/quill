@@ -19,12 +19,6 @@ export interface CachedInvokeNotification<T> {
 	snapshot: CachedInvokeSnapshot<T>;
 }
 
-interface CachedInvokeClock {
-	now: () => number;
-	setTimer: (callback: () => void, delayMs: number) => unknown;
-	clearTimer: (timer: unknown) => void;
-}
-
 interface CachedInvokeEntry<T> {
 	key: string;
 	hasData: boolean;
@@ -38,12 +32,6 @@ interface CachedInvokeEntry<T> {
 	invalidationEvents: Set<string>;
 	subscribers: Set<(notification: CachedInvokeNotification<T>) => void>;
 }
-
-const SYSTEM_CLOCK: CachedInvokeClock = {
-	now: Date.now,
-	setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
-	clearTimer: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
-};
 
 function stableSerialize(value: unknown, seen = new Set<object>()): string {
 	if (value === null) return "null";
@@ -109,27 +97,23 @@ export class CachedInvokeStore {
 	readonly ttlMs: number;
 	readonly coalesceMs: number;
 
-	private readonly clock: CachedInvokeClock;
 	private readonly entries = new Map<string, CachedInvokeEntry<unknown>>();
 	private readonly pendingKeys = new Set<string>();
-	private fanoutTimer: unknown | null = null;
+	private fanoutTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastFanoutStartedAt = Number.NEGATIVE_INFINITY;
 
 	constructor({
 		ttlMs = CACHED_INVOKE_TTL_MS,
 		coalesceMs = CACHED_INVOKE_COALESCE_MS,
-		clock = SYSTEM_CLOCK,
 	}: {
 		ttlMs?: number;
 		coalesceMs?: number;
-		clock?: CachedInvokeClock;
 	} = {}) {
 		if (coalesceMs < 5_000) {
 			throw new RangeError("Cached invoke coalescing must be at least 5000ms");
 		}
 		this.ttlMs = ttlMs;
 		this.coalesceMs = coalesceMs;
-		this.clock = clock;
 	}
 
 	snapshot<T>(key: string): CachedInvokeSnapshot<T> {
@@ -158,8 +142,7 @@ export class CachedInvokeStore {
 		entry.subscribers.add(subscriber);
 		subscriber({ kind: "snapshot", snapshot: this.entrySnapshot(entry) });
 
-		const fresh =
-			entry.hasData && this.clock.now() - entry.acceptedAt <= this.ttlMs;
+		const fresh = entry.hasData && Date.now() - entry.acceptedAt <= this.ttlMs;
 		if (!fresh && entry.inFlight === null) {
 			if (entry.hasData) {
 				this.pendingKeys.add(key);
@@ -214,7 +197,7 @@ export class CachedInvokeStore {
 		for (const [key, entry] of this.entries) {
 			if (
 				entry.subscribers.size > 0 &&
-				this.clock.now() - entry.acceptedAt > this.ttlMs
+				Date.now() - entry.acceptedAt > this.ttlMs
 			) {
 				this.pendingKeys.add(key);
 			}
@@ -293,7 +276,7 @@ export class CachedInvokeStore {
 		}
 
 		this.pendingKeys.delete(entry.key);
-		this.lastFanoutStartedAt = this.clock.now();
+		this.lastFanoutStartedAt = Date.now();
 		entry.error = null;
 		entry.generation += 1;
 		const generation = entry.generation;
@@ -308,7 +291,7 @@ export class CachedInvokeStore {
 						entry.serialized = serialized;
 					}
 					entry.hasData = true;
-					entry.acceptedAt = this.clock.now();
+					entry.acceptedAt = Date.now();
 					entry.error = null;
 				},
 				(error: unknown) => {
@@ -329,9 +312,9 @@ export class CachedInvokeStore {
 
 	private scheduleFanout(): void {
 		if (this.fanoutTimer !== null || this.pendingKeys.size === 0) return;
-		const elapsed = this.clock.now() - this.lastFanoutStartedAt;
+		const elapsed = Date.now() - this.lastFanoutStartedAt;
 		const delay = Math.max(0, this.coalesceMs - elapsed);
-		this.fanoutTimer = this.clock.setTimer(() => {
+		this.fanoutTimer = setTimeout(() => {
 			this.fanoutTimer = null;
 			let blockedByInFlight = false;
 			for (const key of [...this.pendingKeys]) {
@@ -354,7 +337,7 @@ export class CachedInvokeStore {
 
 	private cancelUnusedFanoutTimer(): void {
 		if (this.pendingKeys.size > 0 || this.fanoutTimer === null) return;
-		this.clock.clearTimer(this.fanoutTimer);
+		clearTimeout(this.fanoutTimer);
 		this.fanoutTimer = null;
 	}
 }

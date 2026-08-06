@@ -10,9 +10,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use chrono::{DateTime, TimeDelta, Utc};
-use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 
 use crate::integrations::IntegrationProvider;
 use crate::model_usage::{
@@ -76,7 +76,7 @@ pub(crate) enum TranscriptAnalyticsReplacement {
     StaleGeneration,
 }
 use crate::models::{
-    ActivitySeriesResponse, BucketStats, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
+    ActivitySeriesResponse, CodeStats, CodeStatsHistoryPoint, ContextSavingsAnalytics,
     ContextSavingsBreakdownItem, ContextSavingsBreakdowns, ContextSavingsEvent,
     ContextSavingsEventPayload, ContextSavingsInsertResult, ContextSavingsSummary,
     ContextSavingsTimeseriesPoint, DataPoint, EvidenceRef, GitSnapshot, HostBreakdown,
@@ -290,7 +290,7 @@ where
         }
     };
 
-    if let Some(entry) = cache.lock().get(&key)
+    if let Some(entry) = cache.lock().unwrap().get(&key)
         && entry.inserted_at.elapsed() <= ANALYTICS_CACHE_TTL
         && entry.versions == versions
     {
@@ -298,7 +298,7 @@ where
     }
 
     let payload = compute()?;
-    cache.lock().insert(
+    cache.lock().unwrap().insert(
         key,
         CacheEntry {
             payload: payload.clone(),
@@ -702,30 +702,6 @@ pub(crate) struct ModelSourceReplacementResult {
 pub(crate) struct ModelSourcePruneResult {
     pub(crate) data_changed: bool,
     pub(crate) sources_pruned: usize,
-}
-
-/// Post-commit result for an existing data-management mutation that also
-/// changes model analytics. The IPC wrappers keep their historical `u64`
-/// response while using `model_data_changed` to publish a committed refresh.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DataMutationResult {
-    affected_rows: u64,
-    model_data_changed: bool,
-    transcript_data_changed: bool,
-}
-
-impl DataMutationResult {
-    pub(crate) const fn affected_rows(self) -> u64 {
-        self.affected_rows
-    }
-
-    pub(crate) const fn model_data_changed(self) -> bool {
-        self.model_data_changed
-    }
-
-    pub(crate) const fn transcript_data_changed(self) -> bool {
-        self.transcript_data_changed
-    }
 }
 
 fn wilson_lower_bound(alpha: f64, beta: f64) -> f64 {
@@ -1528,7 +1504,7 @@ fn commit_ref_resolves(conn: &Mutex<Connection>, repo_path: Option<&str>, hash: 
         }
     }
 
-    let conn = conn.lock();
+    let conn = conn.lock().unwrap();
     conn.query_row(
         "SELECT 1 FROM git_snapshots
          WHERE commit_hash GLOB ?1 || '*' OR instr(COALESCE(raw_data, ''), ?1) > 0
@@ -2090,7 +2066,7 @@ fn model_source_path_for_storage(path: &Path) -> Result<String, String> {
     {
         Ok(format!(
             "{MODEL_SOURCE_PATH_UNIX_PREFIX}{}",
-            hex::encode(path.as_os_str().as_bytes())
+            crate::hex_encode(path.as_os_str().as_bytes())
         ))
     }
 
@@ -2103,7 +2079,7 @@ fn model_source_path_for_storage(path: &Path) -> Result<String, String> {
             .collect::<Vec<_>>();
         Ok(format!(
             "{MODEL_SOURCE_PATH_WINDOWS_PREFIX}{}",
-            hex::encode(bytes)
+            crate::hex_encode(bytes)
         ))
     }
 
@@ -2120,7 +2096,7 @@ fn model_source_path_from_storage(value: &str) -> Result<PathBuf, String> {
     if let Some(encoded) = value.strip_prefix(MODEL_SOURCE_PATH_UNIX_PREFIX) {
         #[cfg(unix)]
         {
-            let bytes = hex::decode(encoded)
+            let bytes = crate::hex_decode(encoded)
                 .map_err(|error| format!("Decode Unix model source path: {error}"))?;
             return Ok(PathBuf::from(OsString::from_vec(bytes)));
         }
@@ -2134,7 +2110,7 @@ fn model_source_path_from_storage(value: &str) -> Result<PathBuf, String> {
     if let Some(encoded) = value.strip_prefix(MODEL_SOURCE_PATH_WINDOWS_PREFIX) {
         #[cfg(windows)]
         {
-            let bytes = hex::decode(encoded)
+            let bytes = crate::hex_decode(encoded)
                 .map_err(|error| format!("Decode Windows model source path: {error}"))?;
             let mut chunks = bytes.chunks_exact(2);
             let wide = chunks
@@ -3693,105 +3669,6 @@ fn delete_model_observation_sources_for_root_in_transaction(
     .map_err(|e| format!("Delete completed-root model observation parents: {e}"))
 }
 
-/// Remove every model source owned by a project context, including sources
-/// whose retained first cwd differs from a later observation cwd.
-///
-/// The matching keys are captured before any child deletion. Each selected
-/// source then loses all observation children before its retained fingerprint
-/// is suppressed, preserving source-level replacement atomicity.
-///
-/// Composes the durable-suppression `UPDATE` shared verbatim by project, host,
-/// and session deletion — the single definition of the write-side suppression
-/// invariant. Every matched `model_observation_sources` row flips to
-/// `'suppressed'` while COALESCE preserves any earlier
-/// `suppressed_sha256`/`suppressed_at_ms` fingerprint, gated by a
-/// re-suppression guard so re-running a delete neither overwrites a preserved
-/// fingerprint nor rewrites rows that are already fully suppressed.
-/// `key_predicate` (the `WHERE` key) and `ts_placeholder` (the bind slot for
-/// the suppression timestamp) MUST be compile-time constants; every runtime
-/// value stays `?N`-bound by the caller. Companion to the read-side
-/// [`ACTIVE_MODEL_SOURCE_PREDICATE`].
-fn suppress_model_sources_update_sql(key_predicate: &str, ts_placeholder: &str) -> String {
-    format!(
-        "UPDATE model_observation_sources
-                 SET processing_status = 'suppressed',
-                     suppressed_sha256 = COALESCE(
-                         suppressed_sha256, content_sha256
-                     ),
-                     suppressed_at_ms = COALESCE(suppressed_at_ms, {ts_placeholder})
-                 WHERE {key_predicate}
-                   AND (
-                       processing_status != 'suppressed'
-                       OR suppressed_at_ms IS NULL
-                       OR (suppressed_sha256 IS NULL
-                           AND content_sha256 IS NOT NULL)
-                   )"
-    )
-}
-
-fn suppress_project_model_sources_in_transaction(
-    tx: &rusqlite::Transaction<'_>,
-    cwd: &str,
-    suppressed_at_ms: i64,
-) -> Result<(usize, usize), String> {
-    let matching_sources = {
-        let mut stmt = tx
-            .prepare_cached(
-                "SELECT provider, source_key
-                 FROM model_observation_sources
-                 WHERE cwd = ?1
-                 UNION
-                 SELECT source.provider, source.source_key
-                 FROM model_usage_observations observation
-                 JOIN model_observation_sources source
-                   ON source.provider = observation.provider
-                  AND source.source_key = observation.source_key
-                 WHERE observation.cwd = ?1
-                 ORDER BY provider, source_key",
-            )
-            .map_err(|e| format!("Prepare project model source selection: {e}"))?;
-        let rows = stmt
-            .query_map(params![cwd], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| format!("Query project model source selection: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Read project model source selection: {e}"))?
-    };
-
-    let mut observations_deleted = 0_usize;
-    let mut sources_suppressed = 0_usize;
-    delete_model_rollups_for_sources_in_transaction(tx, &matching_sources)?;
-    {
-        let mut delete_observations = tx
-            .prepare_cached(
-                "DELETE FROM model_usage_observations
-                 WHERE provider = ?1 AND source_key = ?2",
-            )
-            .map_err(|e| format!("Prepare project model observation delete: {e}"))?;
-        let suppress_sql =
-            suppress_model_sources_update_sql("provider = ?1 AND source_key = ?2", "?3");
-        let mut suppress_source = tx
-            .prepare_cached(&suppress_sql)
-            .map_err(|e| format!("Prepare project model source suppression: {e}"))?;
-
-        for (provider, source_key) in matching_sources {
-            observations_deleted = observations_deleted.saturating_add(
-                delete_observations
-                    .execute(params![provider, source_key])
-                    .map_err(|e| format!("Delete project model observations: {e}"))?,
-            );
-            sources_suppressed = sources_suppressed.saturating_add(
-                suppress_source
-                    .execute(params![provider, source_key, suppressed_at_ms])
-                    .map_err(|e| format!("Suppress project model source: {e}"))?,
-            );
-        }
-    }
-
-    Ok((observations_deleted, sources_suppressed))
-}
-
 const TRANSCRIPT_ANALYTICS_TABLES: [&str; 5] = [
     "session_events",
     "response_times",
@@ -3799,121 +3676,6 @@ const TRANSCRIPT_ANALYTICS_TABLES: [&str; 5] = [
     "skill_usages",
     "hook_invocations",
 ];
-
-/// Resolve an explicit project rename inside the caller's transaction.
-/// Rename rows are collapsed when written, so one lookup is authoritative
-/// for transcript replays and later live observations.
-fn resolve_project_path_rename(
-    tx: &rusqlite::Transaction<'_>,
-    path: Option<&str>,
-) -> Result<Option<String>, String> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    tx.query_row(
-        "SELECT new_path FROM project_path_renames WHERE old_path = ?1",
-        params![path],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map(|renamed| Some(renamed.unwrap_or_else(|| path.to_string())))
-    .map_err(|e| format!("Resolve project rename: {e}"))
-}
-
-/// Delete source-owned analytics for exact registry keys and retain each
-/// registry row as a durable suppression tombstone.
-fn suppress_transcript_analytics_sources_in_transaction(
-    tx: &rusqlite::Transaction<'_>,
-    sources: &[(String, String)],
-    suppressed_at_ms: i64,
-) -> Result<usize, String> {
-    let mut deleted = 0_usize;
-    deleted = deleted.saturating_add(delete_runtime_rollups_for_sources_in_transaction(
-        tx, sources,
-    )?);
-    for table in TRANSCRIPT_ANALYTICS_TABLES {
-        let mut statement = tx
-            .prepare_cached(&format!(
-                "DELETE FROM {table} WHERE provider = ?1 AND source_key = ?2"
-            ))
-            .map_err(|e| format!("Prepare {table} source delete: {e}"))?;
-        for (provider, source_key) in sources {
-            deleted = deleted.saturating_add(
-                statement
-                    .execute(params![provider, source_key])
-                    .map_err(|e| format!("Delete {table} source rows: {e}"))?,
-            );
-        }
-    }
-    let mut aggregate_delete = tx
-        .prepare_cached(
-            "DELETE FROM retention_daily_aggregates WHERE provider = ?1 AND source_key = ?2",
-        )
-        .map_err(|e| format!("Prepare retention aggregate source delete: {e}"))?;
-    for (provider, source_key) in sources {
-        deleted = deleted.saturating_add(
-            aggregate_delete
-                .execute(params![provider, source_key])
-                .map_err(|e| format!("Delete retention aggregate source rows: {e}"))?,
-        );
-    }
-
-    let mut suppress = tx
-        .prepare_cached(
-            "UPDATE transcript_analytics_sources
-             SET processing_status = 'suppressed',
-                 suppressed_sha256 = COALESCE(
-                     suppressed_sha256, content_sha256
-                 ),
-                 suppressed_at_ms = COALESCE(suppressed_at_ms, ?3)
-             WHERE provider = ?1 AND source_key = ?2",
-        )
-        .map_err(|e| format!("Prepare transcript source suppression: {e}"))?;
-    for (provider, source_key) in sources {
-        suppress
-            .execute(params![provider, source_key, suppressed_at_ms])
-            .map_err(|e| format!("Suppress transcript analytics source: {e}"))?;
-    }
-    Ok(deleted)
-}
-
-/// Delete only source-less rows belonging to exact live-origin session pairs,
-/// then remove those mappings. Provider qualification is preserved throughout.
-fn delete_live_analytics_sessions_in_transaction(
-    tx: &rusqlite::Transaction<'_>,
-    sessions: &[(String, String)],
-) -> Result<usize, String> {
-    let mut deleted = 0_usize;
-    for table in TRANSCRIPT_ANALYTICS_TABLES {
-        let mut statement = tx
-            .prepare_cached(&format!(
-                "DELETE FROM {table}
-                 WHERE provider = ?1 AND session_id = ?2
-                   AND source_key IS NULL"
-            ))
-            .map_err(|e| format!("Prepare live {table} delete: {e}"))?;
-        for (provider, session_id) in sessions {
-            deleted = deleted.saturating_add(
-                statement
-                    .execute(params![provider, session_id])
-                    .map_err(|e| format!("Delete live {table} rows: {e}"))?,
-            );
-        }
-    }
-
-    let mut delete_mapping = tx
-        .prepare_cached(
-            "DELETE FROM live_analytics_sessions
-             WHERE provider = ?1 AND session_id = ?2",
-        )
-        .map_err(|e| format!("Prepare live analytics mapping delete: {e}"))?;
-    for (provider, session_id) in sessions {
-        delete_mapping
-            .execute(params![provider, session_id])
-            .map_err(|e| format!("Delete live analytics mapping: {e}"))?;
-    }
-    Ok(deleted)
-}
 
 fn model_backfill_millis_to_rfc3339(value: i64, field: &str) -> Result<String, String> {
     DateTime::<Utc>::from_timestamp_millis(value)
@@ -4291,8 +4053,8 @@ fn encode_model_sessions_cursor(cursor: &ModelSessionsCursorV1) -> Result<String
     let checksum = Sha256::digest(&payload);
     Ok(format!(
         "{MODEL_SESSIONS_CURSOR_PREFIX}:{}:{}",
-        hex::encode(payload),
-        hex::encode(checksum)
+        crate::hex_encode(payload),
+        crate::hex_encode(checksum)
     ))
 }
 
@@ -4321,10 +4083,10 @@ fn decode_model_sessions_cursor(
         ));
     }
 
-    let payload = hex::decode(payload_hex.unwrap_or_default()).map_err(|_| {
+    let payload = crate::hex_decode(payload_hex.unwrap_or_default()).map_err(|_| {
         invalid_model_sessions_cursor("Model sessions cursor payload is not valid hex")
     })?;
-    let expected_checksum = hex::decode(checksum.unwrap_or_default()).map_err(|_| {
+    let expected_checksum = crate::hex_decode(checksum.unwrap_or_default()).map_err(|_| {
         invalid_model_sessions_cursor("Model sessions cursor checksum is not valid hex")
     })?;
     let actual_checksum = Sha256::digest(&payload);
@@ -4947,7 +4709,6 @@ pub struct Storage {
     conn: Mutex<Connection>,
     db_path: PathBuf,
     model_usage_overview_cache: Mutex<HashMap<CacheKey, CacheEntry<ModelUsageOverviewResponse>>>,
-    bucket_stats_cache: Mutex<HashMap<CacheKey, CacheEntry<Vec<BucketStats>>>>,
     context_savings_analytics_cache: Mutex<HashMap<CacheKey, CacheEntry<ContextSavingsAnalytics>>>,
 }
 
@@ -5032,7 +4793,7 @@ impl Storage {
         provider: IntegrationProvider,
         source_root_key: &str,
     ) -> Result<Vec<StoredTranscriptAnalyticsSource>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT source_key, source_root_key, source_path,
@@ -5113,7 +4874,7 @@ impl Storage {
             return Ok(Vec::new());
         }
         let now = chrono::Utc::now().timestamp_millis();
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin unchanged transcript refresh: {error}"))?;
@@ -5197,7 +4958,7 @@ impl Storage {
     ) -> Result<(), String> {
         let bounded_error = error.chars().take(1024).collect::<String>();
         let now = chrono::Utc::now().timestamp_millis();
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO transcript_analytics_sources (
                  provider, source_key, source_root_key, source_path,
@@ -5238,7 +4999,7 @@ impl Storage {
         root: &str,
     ) -> Result<i64, String> {
         let key = transcript_analytics_generation_key(provider, root);
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin transcript generation: {error}"))?;
@@ -5277,7 +5038,7 @@ impl Storage {
         &self,
         proof: &crate::transcript_analytics::CompletedTranscriptSourceRoot,
     ) -> Result<usize, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Begin transcript prune: {e}"))?;
@@ -5375,16 +5136,15 @@ impl Storage {
         {
             return Err("Transcript analytics source identity is incomplete".into());
         }
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Begin transcript analytics replacement: {e}"))?;
-        let source_project = resolve_project_path_rename(&tx, source.project.as_deref())?;
-        let source_cwd_raw = source
+        let source_project = source.project.clone();
+        let source_cwd = source
             .cwd
             .as_ref()
             .map(|path| path.to_string_lossy().to_string());
-        let source_cwd = resolve_project_path_rename(&tx, source_cwd_raw.as_deref())?;
         let generation_key =
             transcript_analytics_generation_key(source.provider, &source.source_root_key);
         let current_generation = tx
@@ -5491,24 +5251,6 @@ impl Storage {
         let mut suppressed_tool_actions = 0_u64;
         let mut non_conforming_session_events = 0_u64;
         let mut non_conforming_tool_actions = 0_u64;
-        // `cwd` is near-constant across a source's rows, so resolve each
-        // distinct value once instead of once per skill and hook row.
-        let mut cwd_renames: HashMap<Option<&str>, Option<String>> = HashMap::new();
-        for cwd in snapshot
-            .skill_usages
-            .iter()
-            .map(|row| row.cwd.as_deref())
-            .chain(
-                snapshot
-                    .hook_invocations
-                    .iter()
-                    .map(|row| row.cwd.as_deref()),
-            )
-        {
-            if let std::collections::hash_map::Entry::Vacant(entry) = cwd_renames.entry(cwd) {
-                entry.insert(resolve_project_path_rename(&tx, cwd)?);
-            }
-        }
         {
             // Every owned identity here IS the table's dedupe key, so a
             // repeat is benign and must not roll back the whole five-table
@@ -5663,9 +5405,6 @@ impl Storage {
                 )
                 .map_err(|e| format!("Prepare owned skill usages: {e}"))?;
             for row in &snapshot.skill_usages {
-                let cwd = cwd_renames
-                    .get(&row.cwd.as_deref())
-                    .expect("resolved skill usage cwd rename");
                 skill_usage_stmt
                     .execute(params![
                         row.provider.as_str(),
@@ -5678,7 +5417,7 @@ impl Storage {
                         row.skill_path,
                         row.timestamp,
                         row.tool_name,
-                        cwd,
+                        row.cwd,
                         row.hostname,
                     ])
                     .map_err(|e| format!("Insert skill usage: {e}"))?;
@@ -5699,9 +5438,6 @@ impl Storage {
                 )
                 .map_err(|e| format!("Prepare owned hook invocations: {e}"))?;
             for row in &snapshot.hook_invocations {
-                let cwd = cwd_renames
-                    .get(&row.cwd.as_deref())
-                    .expect("resolved hook invocation cwd rename");
                 hook_invocation_stmt
                     .execute(params![
                         row.provider.as_str(),
@@ -5719,7 +5455,7 @@ impl Storage {
                         row.script_command_raw,
                         row.exit_code,
                         row.duration_ms,
-                        cwd,
+                        row.cwd,
                         row.hostname,
                         row.message_id,
                     ])
@@ -8083,7 +7819,6 @@ impl Storage {
             conn: Mutex::new(conn),
             db_path: path,
             model_usage_overview_cache: Mutex::new(HashMap::new()),
-            bucket_stats_cache: Mutex::new(HashMap::new()),
             context_savings_analytics_cache: Mutex::new(HashMap::new()),
         };
 
@@ -8130,7 +7865,7 @@ impl Storage {
     /// A dedicated writer connection lets the shared runner release the ingest
     /// gate between chunks without retaining the primary connection mutex.
     pub(crate) fn model_rollup_backfill_needed(&self) -> Result<bool, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT model_backfill_status != 'complete'
              FROM rollup_meta WHERE id = 1",
@@ -8172,7 +7907,7 @@ impl Storage {
     /// Authoritative pruned rows survive; raw-backed rows are cleared so the
     /// next chunk can rebuild from an unambiguous empty frontier.
     pub(crate) fn reset_model_rollup_backfill(&self) -> Result<u64, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("Begin model rollup rebuild reset: {error}"))?;
@@ -8253,7 +7988,7 @@ impl Storage {
     }
 
     pub(crate) fn reset_runtime_rollup_backfill(&self) -> Result<u64, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("Begin runtime rollup rebuild reset: {error}"))?;
@@ -8489,7 +8224,7 @@ impl Storage {
             .map_err(|error| format!("Count sqlite_stat1 rows after ANALYZE: {error}"))?;
 
         let writer_reload = (|| -> Result<(), String> {
-            let writer = self.conn.lock();
+            let writer = self.conn.lock().unwrap();
             writer
                 .execute_batch("ANALYZE sqlite_schema;")
                 .map_err(|error| format!("Reload writer query-planner statistics: {error}"))?;
@@ -8539,7 +8274,7 @@ impl Storage {
     /// Read the migration-28 singleton without changing backfill state.
     #[allow(dead_code)]
     pub fn get_model_backfill_status(&self) -> Result<ModelBackfillStatus, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         read_model_backfill_status(&conn)
     }
 
@@ -8548,7 +8283,7 @@ impl Storage {
     /// interrupted inventory from proving removals during the resumed pass.
     #[allow(dead_code)] // T030 schedules the resumed retained-history worker.
     pub(crate) fn reset_interrupted_model_backfill(&self) -> Result<ModelBackfillStatus, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin interrupted model backfill reset: {error}"))?;
@@ -8603,7 +8338,7 @@ impl Storage {
     /// the current status without invoking this mutation.
     #[allow(dead_code)] // T030 exposes retry_model_history_backfill.
     pub(crate) fn initialize_model_backfill_retry(&self) -> Result<ModelBackfillStatus, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model backfill retry initialization: {error}"))?;
@@ -8647,7 +8382,7 @@ impl Storage {
     /// Atomically claim pending work for the single retained-history runner.
     #[allow(dead_code)] // T029 starts the retained-history worker.
     pub(crate) fn start_model_backfill(&self) -> Result<ModelBackfillStatus, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model backfill start: {error}"))?;
@@ -8709,7 +8444,7 @@ impl Storage {
             return Err("Resolved model backfill roots exceed configured roots".to_string());
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model backfill root update: {error}"))?;
@@ -8755,7 +8490,7 @@ impl Storage {
         total_sources: usize,
     ) -> Result<ModelBackfillStatus, String> {
         let total_sources = model_backfill_count(total_sources, "total_sources")?;
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model backfill source total update: {error}"))?;
@@ -8845,7 +8580,7 @@ impl Storage {
             "attempted source count",
         )?;
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model backfill progress update: {error}"))?;
@@ -8920,7 +8655,7 @@ impl Storage {
             );
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model backfill terminal update: {error}"))?;
@@ -10701,7 +10436,7 @@ impl Storage {
             })?;
 
         (|| -> Result<SessionModelHistoryResponse, SessionModelHistoryQueryError> {
-            let mut conn = self.conn.lock();
+            let mut conn = self.conn.lock().unwrap();
             let tx = conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
                 .map_err(|error| format!("Begin model session history read snapshot: {error}"))?;
@@ -10962,7 +10697,7 @@ impl Storage {
         provider: IntegrationProvider,
         source_root_key: &str,
     ) -> Result<Vec<StoredModelSource>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let sql = format!(
             "SELECT {MODEL_SOURCE_STATE_COLUMNS}
              FROM model_observation_sources
@@ -11007,7 +10742,7 @@ impl Storage {
             return Err("Normalized source does not match fast fingerprint".to_string());
         }
         let source_path = model_source_path_for_storage(&source.path)?;
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let updated = conn
             .execute(
                 "UPDATE model_observation_sources
@@ -11057,7 +10792,7 @@ impl Storage {
         validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
         let source_path = model_source_path_for_storage(&source.path)?;
         let fast = fingerprint.fast();
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let updated = conn
             .execute(
                 "UPDATE model_observation_sources
@@ -11111,7 +10846,7 @@ impl Storage {
         validate_nonnegative_model_source_value(attempted_at_ms, "last_attempt_at_ms")?;
         let source_path = model_source_path_for_storage(&source.path)?;
         let fast = fingerprint.fast();
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let updated = conn
             .execute(
                 "UPDATE model_observation_sources
@@ -11197,7 +10932,7 @@ impl Storage {
             .transpose()?;
         let fast = fingerprint.fast();
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("Begin model source replacement: {error}"))?;
@@ -11578,7 +11313,7 @@ impl Storage {
             .transpose()?;
         let mtime_ns = fast.map(ModelSourceFastFingerprint::mtime_ns);
         let size_bytes = fast.map(ModelSourceFastFingerprint::size_bytes);
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin model source failure update: {error}"))?;
@@ -11654,7 +11389,7 @@ impl Storage {
         &self,
         completed_root: &CompletedModelSourceRoot,
     ) -> Result<ModelSourcePruneResult, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin completed model source root prune: {error}"))?;
@@ -11677,7 +11412,7 @@ impl Storage {
     }
 
     pub fn store_snapshot(&self, buckets: &[UsageBucket]) -> Result<(), String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
         let tx = conn
@@ -11715,7 +11450,7 @@ impl Storage {
     }
 
     pub fn aggregate_and_cleanup(&self) -> Result<(), String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let cutoff = (Utc::now() - TimeDelta::days(30)).to_rfc3339();
 
         let tx = conn
@@ -11763,7 +11498,7 @@ impl Storage {
         bucket_key: &str,
         range: &str,
     ) -> Result<Vec<DataPoint>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now();
 
         let (from, use_hourly) = match range {
@@ -11862,110 +11597,11 @@ impl Storage {
         }
     }
 
-    pub fn get_usage_stats(
-        &self,
-        provider: IntegrationProvider,
-        bucket_key: &str,
-        days: i32,
-    ) -> Result<BucketStats, String> {
-        let conn = self.conn.lock();
-        Self::get_usage_stats_with_conn(&conn, provider, bucket_key, days)
-    }
-
-    fn get_usage_stats_with_conn(
-        conn: &Connection,
-        provider: IntegrationProvider,
-        bucket_key: &str,
-        days: i32,
-    ) -> Result<BucketStats, String> {
-        let days = days.clamp(1, 365);
-        let from = (query_now() - TimeDelta::days(days as i64)).to_rfc3339();
-
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT
-                     MIN(bucket_label),
-                     AVG(utilization),
-                     MAX(utilization),
-                     MIN(utilization),
-                     COUNT(*),
-                     (SELECT COUNT(*) FROM usage_snapshots
-                      WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3 AND utilization >= 80.0)
-                 FROM usage_snapshots
-                 WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3",
-            )
-            .map_err(|e| format!("Prepare error: {e}"))?;
-
-        let stats = stmt
-            .query_row(params![provider.as_str(), bucket_key, from], |row| {
-                let label = row
-                    .get::<_, Option<String>>(0)?
-                    .unwrap_or_else(|| bucket_key.to_string());
-                let total: i64 = row.get(4)?;
-                let above_80: i64 = row.get(5)?;
-                let pct_above_80 = if total > 0 {
-                    (above_80 as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                };
-                Ok(BucketStats {
-                    provider,
-                    key: bucket_key.to_string(),
-                    label,
-                    current: 0.0, // filled in by caller
-                    avg: row.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                    max: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                    min: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                    time_above_80: pct_above_80,
-                    trend: String::new(), // filled in below
-                    sample_count: total,
-                })
-            })
-            .map_err(|e| format!("Query error: {e}"))?;
-
-        let trend = calc_trend(conn, provider, bucket_key)?;
-
-        Ok(BucketStats { trend, ..stats })
-    }
-
-    pub fn get_all_bucket_stats(
-        &self,
-        current_buckets: &[UsageBucket],
-        days: i32,
-    ) -> Result<Vec<BucketStats>, String> {
-        let request = serde_json::to_string(&(current_buckets, days))
-            .map_err(|error| format!("Serialize bucket stats cache key: {error}"))?;
-        let key = CacheKey::for_request("get_all_bucket_stats", request, query_now());
-        let mut conn = self.open_view_reader()?;
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|error| format!("Begin bucket stats read snapshot: {error}"))?;
-        let result = get_or_compute(
-            &self.bucket_stats_cache,
-            key,
-            &tx,
-            &[CacheTable::RowId("usage_snapshots")],
-            || {
-                let mut results = Vec::new();
-                for bucket in current_buckets {
-                    let mut stats =
-                        Self::get_usage_stats_with_conn(&tx, bucket.provider, &bucket.key, days)?;
-                    stats.current = bucket.utilization;
-                    results.push(stats);
-                }
-                Ok(results)
-            },
-        )?;
-        tx.commit()
-            .map_err(|error| format!("Commit bucket stats read snapshot: {error}"))?;
-        Ok(result)
-    }
-
     pub fn get_latest_usage_buckets(
         &self,
         provider: IntegrationProvider,
     ) -> Result<Vec<UsageBucket>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 // Avoid the correlated MAX(timestamp) subquery here. On large
@@ -12047,7 +11683,7 @@ impl Storage {
 
     #[allow(dead_code)] // Sequencing item 3 consumes the CPA cache reader.
     pub fn get_latest_cpa_usage_buckets(&self) -> Result<Vec<UsageBucket>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT snapshot.provider, snapshot.bucket_key,
@@ -12107,7 +11743,7 @@ impl Storage {
     }
 
     pub fn delete_cpa_usage_snapshots(&self) -> Result<(), String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Begin CPA usage cleanup: {e}"))?;
@@ -12124,7 +11760,7 @@ impl Storage {
         &self,
         provider: IntegrationProvider,
     ) -> Result<Option<String>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT MAX(timestamp) FROM usage_snapshots WHERE provider = ?1",
             params![provider.as_str()],
@@ -12134,13 +11770,13 @@ impl Storage {
     }
 
     pub fn get_snapshot_count(&self) -> Result<i64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.query_row("SELECT COUNT(*) FROM usage_snapshots", [], |row| row.get(0))
             .map_err(|e| format!("Count error: {e}"))
     }
 
     pub fn store_token_snapshot(&self, payload: &TokenReportPayload) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -12352,7 +11988,7 @@ impl Storage {
         session_id: Option<&str>,
         cwd: Option<&str>,
     ) -> Result<TokenStats, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let from = range_from_timestamp(range);
 
         let mut sql = String::from(
@@ -12434,7 +12070,7 @@ impl Storage {
         range: &str,
         buckets: Option<u32>,
     ) -> Result<ProviderTokenSeriesResponse, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let window = token_series_window(&conn, range, buckets)?;
 
         // Keep the provider-leading grouping index in both planner states.
@@ -12528,7 +12164,7 @@ impl Storage {
         range: &str,
         buckets: Option<u32>,
     ) -> Result<ActivitySeriesResponse, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let window = token_series_window(&conn, range, buckets)?;
 
         let mut stmt = conn
@@ -12580,7 +12216,7 @@ impl Storage {
         &self,
         events: &[ContextSavingsEventPayload],
     ) -> Result<ContextSavingsInsertResult, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Context savings transaction error: {e}"))?;
@@ -12819,7 +12455,7 @@ impl Storage {
     }
 
     pub fn has_context_savings_events(&self) -> Result<bool, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM context_savings_events LIMIT 1)",
             [],
@@ -12960,7 +12596,7 @@ impl Storage {
     }
 
     pub fn get_token_hostnames(&self) -> Result<Vec<String>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached("SELECT DISTINCT hostname FROM token_snapshots ORDER BY hostname ASC")
             .map_err(|e| format!("Prepare error: {e}"))?;
@@ -13233,7 +12869,7 @@ impl Storage {
         }
 
         let limit = limit.unwrap_or(50).clamp(1, 500);
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let from = range_from_timestamp(range);
 
         let mut sql = String::from(
@@ -13567,7 +13203,7 @@ impl Storage {
         provider: IntegrationProvider,
         session_id: &str,
     ) -> Result<Vec<SubagentNode>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let provider_str = provider.as_str();
 
         // Discover the universe of agent_ids attached to this session across
@@ -13745,7 +13381,7 @@ impl Storage {
 
     pub fn get_project_tokens(&self, days: i32) -> Result<Vec<ProjectTokens>, String> {
         let days = days.clamp(1, 365);
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let from = (Utc::now() - TimeDelta::days(days as i64)).to_rfc3339();
 
         let mut stmt = conn
@@ -13791,7 +13427,7 @@ impl Storage {
     }
 
     pub fn get_session_stats(&self, days: i32) -> Result<SessionStats, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
@@ -13831,7 +13467,7 @@ impl Storage {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached("SELECT value FROM settings WHERE key = ?1")
             .map_err(|e| format!("Prepare error: {e}"))?;
@@ -13840,7 +13476,7 @@ impl Storage {
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -13851,7 +13487,7 @@ impl Storage {
 
     /// Persist a related group of settings in one SQLite transaction.
     pub fn set_settings_atomically(&self, settings: &[(&str, &str)]) -> Result<(), String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin settings transaction: {error}"))?;
@@ -13868,14 +13504,14 @@ impl Storage {
     }
 
     pub fn delete_setting(&self, key: &str) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM settings WHERE key = ?1", params![key])
             .map_err(|e| format!("Setting delete error: {e}"))?;
         Ok(())
     }
 
     pub fn delete_settings_with_prefix(&self, prefix: &str) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM settings WHERE key LIKE ?1",
             params![format!("{prefix}%")],
@@ -13947,7 +13583,7 @@ impl Storage {
     /// Read and write share one transaction so two callers cannot interleave
     /// into a retreat, which is the one outcome the watermark may never have.
     pub fn advance_retention_watermark(&self, cutoff: &str) -> Result<String, String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin retention watermark advance: {error}"))?;
@@ -14008,9 +13644,8 @@ impl Storage {
     /// the day one of these commands starts reading `tool_actions` or
     /// `session_events`, the completion path is already right.
     pub fn clear_analytics_caches(&self) {
-        self.model_usage_overview_cache.lock().clear();
-        self.bucket_stats_cache.lock().clear();
-        self.context_savings_analytics_cache.lock().clear();
+        self.model_usage_overview_cache.lock().unwrap().clear();
+        self.context_savings_analytics_cache.lock().unwrap().clear();
     }
 }
 
@@ -14043,445 +13678,11 @@ impl Storage {
         }
     }
 
-    pub fn delete_host_data(&self, hostname: &str) -> Result<DataMutationResult, String> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Transaction error: {e}"))?;
-
-        // Model evidence follows retained source/session lifecycle, not the
-        // token-hourly rollup. Delete children explicitly, then leave the
-        // retained source fingerprint suppressed so unchanged history cannot
-        // reappear during retry.
-        let model_sources = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT provider, source_key
-                     FROM model_observation_sources
-                     WHERE hostname = ?1
-                     ORDER BY provider, source_key",
-                )
-                .map_err(|e| format!("Prepare host model source keys: {e}"))?;
-            let rows = statement
-                .query_map(params![hostname], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| format!("Query host model source keys: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read host model source keys: {e}"))?
-        };
-        delete_model_rollups_for_sources_in_transaction(&tx, &model_sources)?;
-        let model_observation_count = tx
-            .execute(
-                "DELETE FROM model_usage_observations
-                 WHERE (provider, source_key) IN (
-                     SELECT provider, source_key
-                     FROM model_observation_sources
-                     WHERE hostname = ?1
-                 )",
-                params![hostname],
-            )
-            .map_err(|e| format!("Delete host model observations error: {e}"))?;
-        let suppressed_at_ms = Utc::now().timestamp_millis();
-        let model_source_count = tx
-            .execute(
-                &suppress_model_sources_update_sql("hostname = ?1", "?2"),
-                params![hostname, suppressed_at_ms],
-            )
-            .map_err(|e| format!("Suppress host model sources error: {e}"))?;
-
-        let transcript_sources = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT source.provider, source.source_key
-                     FROM transcript_analytics_sources source
-                     JOIN (
-                         SELECT provider, analytics_session_id
-                         FROM transcript_analytics_sources
-                         WHERE hostname = ?1
-                           AND analytics_session_id IS NOT NULL
-                         GROUP BY provider, analytics_session_id
-                     ) matching_root
-                       ON matching_root.provider = source.provider
-                      AND matching_root.analytics_session_id =
-                          source.analytics_session_id
-                     ORDER BY source.provider, source.source_key",
-                )
-                .map_err(|e| format!("Prepare host transcript sources: {e}"))?;
-            let rows = statement
-                .query_map(params![hostname], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| format!("Query host transcript sources: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read host transcript sources: {e}"))?
-        };
-        let live_sessions = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT provider, session_id
-                     FROM live_analytics_sessions
-                     WHERE hostname = ?1
-                     ORDER BY provider, session_id",
-                )
-                .map_err(|e| format!("Prepare host live sessions: {e}"))?;
-            let rows = statement
-                .query_map(params![hostname], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| format!("Query host live sessions: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read host live sessions: {e}"))?
-        };
-        let analytics_count = suppress_transcript_analytics_sources_in_transaction(
-            &tx,
-            &transcript_sources,
-            suppressed_at_ms,
-        )?
-        .saturating_add(delete_live_analytics_sessions_in_transaction(
-            &tx,
-            &live_sessions,
-        )?);
-
-        let snap_count = tx
-            .execute(
-                "DELETE FROM token_snapshots WHERE hostname = ?1",
-                params![hostname],
-            )
-            .map_err(|e| format!("Delete snapshots error: {e}"))?;
-
-        let hourly_count = tx
-            .execute(
-                "DELETE FROM token_hourly WHERE hostname = ?1",
-                params![hostname],
-            )
-            .map_err(|e| format!("Delete hourly error: {e}"))?;
-
-        if model_observation_count != 0 || model_source_count != 0 {
-            bump_model_data_revision(&tx)?;
-        }
-
-        tx.commit().map_err(|e| format!("Commit error: {e}"))?;
-
-        Ok(DataMutationResult {
-            affected_rows: (snap_count + hourly_count + analytics_count) as u64,
-            model_data_changed: model_observation_count != 0 || model_source_count != 0,
-            transcript_data_changed: analytics_count != 0,
-        })
-    }
-
-    pub fn delete_session_data(
-        &self,
-        provider: IntegrationProvider,
-        session_id: &str,
-    ) -> Result<DataMutationResult, String> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Delete session transaction error: {e}"))?;
-
-        // A visible session is the resolved analytics/root session. Matching
-        // that identity removes every parent and subagent source without
-        // conflating equal native IDs reported by different providers.
-        let model_sources = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT provider, source_key
-                     FROM model_observation_sources
-                     WHERE provider = ?1 AND analytics_session_id = ?2
-                     ORDER BY source_key",
-                )
-                .map_err(|e| format!("Prepare session model source keys: {e}"))?;
-            let rows = statement
-                .query_map(params![provider.as_str(), session_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|e| format!("Query session model source keys: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read session model source keys: {e}"))?
-        };
-        delete_model_rollups_for_sources_in_transaction(&tx, &model_sources)?;
-        let model_observation_count = tx
-            .execute(
-                "DELETE FROM model_usage_observations
-                 WHERE provider = ?1
-                   AND source_key IN (
-                       SELECT source_key
-                       FROM model_observation_sources
-                       WHERE provider = ?1
-                         AND analytics_session_id = ?2
-                   )",
-                params![provider.as_str(), session_id],
-            )
-            .map_err(|e| format!("Delete session model observations error: {e}"))?;
-        let suppressed_at_ms = Utc::now().timestamp_millis();
-        let model_source_count = tx
-            .execute(
-                &suppress_model_sources_update_sql(
-                    "provider = ?1 AND analytics_session_id = ?2",
-                    "?3",
-                ),
-                params![provider.as_str(), session_id, suppressed_at_ms],
-            )
-            .map_err(|e| format!("Suppress session model sources error: {e}"))?;
-
-        let transcript_sources = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT provider, source_key
-                     FROM transcript_analytics_sources
-                     WHERE provider = ?1 AND analytics_session_id = ?2
-                     ORDER BY source_key",
-                )
-                .map_err(|e| format!("Prepare session transcript sources: {e}"))?;
-            let rows = statement
-                .query_map(params![provider.as_str(), session_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })
-                .map_err(|e| format!("Query session transcript sources: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read session transcript sources: {e}"))?
-        };
-        let analytics_count = suppress_transcript_analytics_sources_in_transaction(
-            &tx,
-            &transcript_sources,
-            suppressed_at_ms,
-        )?
-        .saturating_add(delete_live_analytics_sessions_in_transaction(
-            &tx,
-            &[(provider.as_str().to_string(), session_id.to_string())],
-        )?);
-
-        let token_count = tx
-            .execute(
-                "DELETE FROM token_snapshots WHERE provider = ?1 AND session_id = ?2",
-                params![provider.as_str(), session_id],
-            )
-            .map_err(|e| format!("Delete token snapshots error: {e}"))?;
-
-        if model_observation_count != 0 || model_source_count != 0 {
-            bump_model_data_revision(&tx)?;
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Delete session commit error: {e}"))?;
-
-        Ok(DataMutationResult {
-            affected_rows: (token_count + analytics_count) as u64,
-            model_data_changed: model_observation_count != 0 || model_source_count != 0,
-            transcript_data_changed: analytics_count != 0,
-        })
-    }
-
-    pub fn delete_project_data(&self, cwd: &str) -> Result<DataMutationResult, String> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Begin delete_project_data transaction: {e}"))?;
-
-        let suppressed_at_ms = Utc::now().timestamp_millis();
-        let (model_observation_count, model_source_count) =
-            suppress_project_model_sources_in_transaction(&tx, cwd, suppressed_at_ms)?;
-
-        let transcript_sources = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT source.provider, source.source_key
-                     FROM transcript_analytics_sources source
-                     JOIN (
-                         SELECT provider, analytics_session_id
-                         FROM transcript_analytics_sources
-                         WHERE (cwd = ?1 OR project = ?1)
-                           AND analytics_session_id IS NOT NULL
-                         GROUP BY provider, analytics_session_id
-                     ) matching_root
-                       ON matching_root.provider = source.provider
-                      AND matching_root.analytics_session_id =
-                          source.analytics_session_id
-                     ORDER BY source.provider, source.source_key",
-                )
-                .map_err(|e| format!("Prepare project transcript sources: {e}"))?;
-            let rows = statement
-                .query_map(params![cwd], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| format!("Query project transcript sources: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read project transcript sources: {e}"))?
-        };
-        let live_sessions = {
-            let mut statement = tx
-                .prepare_cached(
-                    "SELECT provider, session_id
-                     FROM live_analytics_sessions
-                     WHERE cwd = ?1 OR project = ?1
-                     ORDER BY provider, session_id",
-                )
-                .map_err(|e| format!("Prepare project live sessions: {e}"))?;
-            let rows = statement
-                .query_map(params![cwd], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| format!("Query project live sessions: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Read project live sessions: {e}"))?
-        };
-        let analytics_count = suppress_transcript_analytics_sources_in_transaction(
-            &tx,
-            &transcript_sources,
-            suppressed_at_ms,
-        )?
-        .saturating_add(delete_live_analytics_sessions_in_transaction(
-            &tx,
-            &live_sessions,
-        )?);
-
-        let token_count = tx
-            .execute("DELETE FROM token_snapshots WHERE cwd = ?1", params![cwd])
-            .map_err(|e| format!("Delete token_snapshots error: {e}"))?;
-
-        if model_observation_count != 0 || model_source_count != 0 {
-            bump_model_data_revision(&tx)?;
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Commit delete_project_data: {e}"))?;
-
-        Ok(DataMutationResult {
-            affected_rows: (token_count + analytics_count) as u64,
-            model_data_changed: model_observation_count != 0 || model_source_count != 0,
-            transcript_data_changed: analytics_count != 0,
-        })
-    }
-
-    pub fn rename_project(
-        &self,
-        old_cwd: &str,
-        new_cwd: &str,
-    ) -> Result<DataMutationResult, String> {
-        let new_cwd = new_cwd.trim();
-        if new_cwd.is_empty() {
-            return Err("New project path cannot be empty".to_string());
-        }
-        if new_cwd == old_cwd {
-            return Err("New path is the same as the current path".to_string());
-        }
-
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Transaction error: {e}"))?;
-
-        let snap_count = tx
-            .execute(
-                "UPDATE token_snapshots SET cwd = ?2 WHERE cwd = ?1",
-                params![old_cwd, new_cwd],
-            )
-            .map_err(|e| format!("Update token_snapshots error: {e}"))?;
-
-        tx.execute(
-            "UPDATE observations SET cwd = ?2 WHERE cwd = ?1",
-            params![old_cwd, new_cwd],
-        )
-        .map_err(|e| format!("Update observations error: {e}"))?;
-
-        let model_observation_count = tx
-            .execute(
-                "UPDATE model_usage_observations SET cwd = ?2 WHERE cwd = ?1",
-                params![old_cwd, new_cwd],
-            )
-            .map_err(|e| format!("Update model observations error: {e}"))?;
-        let model_source_count = tx
-            .execute(
-                "UPDATE model_observation_sources SET cwd = ?2 WHERE cwd = ?1",
-                params![old_cwd, new_cwd],
-            )
-            .map_err(|e| format!("Update model sources error: {e}"))?;
-
-        // Explicit project renames are authoritative for later transcript
-        // replay and live ingestion. Collapse predecessors onto the newest
-        // destination so resolution remains one bounded lookup, including
-        // rename chains and reversals.
-        // A reversal (`A -> B` then `B -> A`) would collapse its own
-        // predecessor onto itself, and `CHECK(old_path != new_path)` rejects
-        // that mid-statement — the trailing self-row sweep never gets to run.
-        // Retire those rows first so the collapse below only ever rewrites
-        // predecessors that still point somewhere else.
-        tx.execute(
-            "DELETE FROM project_path_renames
-             WHERE new_path = ?1 AND old_path = ?2",
-            params![old_cwd, new_cwd],
-        )
-        .map_err(|e| format!("Retire reversed project renames: {e}"))?;
-        tx.execute(
-            "UPDATE project_path_renames
-             SET new_path = ?2, updated_at = ?3
-             WHERE new_path = ?1",
-            params![old_cwd, new_cwd, Utc::now().to_rfc3339()],
-        )
-        .map_err(|e| format!("Collapse prior project renames: {e}"))?;
-        tx.execute(
-            "INSERT INTO project_path_renames(old_path, new_path, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(old_path) DO UPDATE SET
-                 new_path = excluded.new_path,
-                 updated_at = excluded.updated_at",
-            params![old_cwd, new_cwd, Utc::now().to_rfc3339()],
-        )
-        .map_err(|e| format!("Record project rename: {e}"))?;
-        tx.execute(
-            "DELETE FROM project_path_renames WHERE old_path = new_path",
-            [],
-        )
-        .map_err(|e| format!("Remove no-op project renames: {e}"))?;
-
-        let mut transcript_count = 0_usize;
-        transcript_count = transcript_count.saturating_add(
-            tx.execute(
-                "UPDATE transcript_analytics_sources
-                 SET project = CASE WHEN project = ?1 THEN ?2 ELSE project END,
-                     cwd = CASE WHEN cwd = ?1 THEN ?2 ELSE cwd END
-                 WHERE project = ?1 OR cwd = ?1",
-                params![old_cwd, new_cwd],
-            )
-            .map_err(|e| format!("Update transcript source ownership: {e}"))?,
-        );
-        transcript_count = transcript_count.saturating_add(
-            tx.execute(
-                "UPDATE live_analytics_sessions
-                 SET project = CASE WHEN project = ?1 THEN ?2 ELSE project END,
-                     cwd = CASE WHEN cwd = ?1 THEN ?2 ELSE cwd END,
-                     updated_at = ?3
-                 WHERE project = ?1 OR cwd = ?1",
-                params![old_cwd, new_cwd, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| format!("Update live analytics ownership: {e}"))?,
-        );
-        transcript_count = transcript_count.saturating_add(
-            tx.execute(
-                "UPDATE skill_usages SET cwd = ?2 WHERE cwd = ?1",
-                params![old_cwd, new_cwd],
-            )
-            .map_err(|e| format!("Update skill usage project: {e}"))?,
-        );
-        transcript_count = transcript_count.saturating_add(
-            tx.execute(
-                "UPDATE hook_invocations SET cwd = ?2 WHERE cwd = ?1",
-                params![old_cwd, new_cwd],
-            )
-            .map_err(|e| format!("Update hook invocation project: {e}"))?,
-        );
-
-        if model_observation_count != 0 || model_source_count != 0 {
-            bump_model_data_revision(&tx)?;
-        }
-
-        tx.commit().map_err(|e| format!("Commit error: {e}"))?;
-
-        Ok(DataMutationResult {
-            affected_rows: (snap_count + transcript_count) as u64,
-            model_data_changed: model_observation_count != 0 || model_source_count != 0,
-            transcript_data_changed: transcript_count != 0,
-        })
-    }
-
     pub fn get_project_provider_map(
         &self,
         provider: Option<IntegrationProvider>,
     ) -> Result<std::collections::HashMap<String, Vec<IntegrationProvider>>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
             Some(provider) => (
                 "SELECT provider, cwd FROM token_snapshots
@@ -14529,7 +13730,7 @@ impl Storage {
     // --- Learning system methods ---
 
     pub fn store_observation(&self, payload: &ObservationPayload) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
 
         // Defense-in-depth (feature 005 US1 T014, R-1 / contract
@@ -14581,7 +13782,7 @@ impl Storage {
         &self,
         provider: Option<IntegrationProvider>,
     ) -> Result<String, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         match provider {
             Some(provider) => conn
                 .query_row(
@@ -14611,7 +13812,7 @@ impl Storage {
         limit: i64,
         provider: Option<IntegrationProvider>,
     ) -> Result<Vec<serde_json::Value>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match since {
             Some(s) if provider.is_some() => (
                 "SELECT id, provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at
@@ -14687,7 +13888,7 @@ impl Storage {
         &self,
         provider: Option<IntegrationProvider>,
     ) -> Result<i64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         match provider {
             Some(provider) => conn
                 .query_row(
@@ -14707,7 +13908,7 @@ impl Storage {
         provider: Option<IntegrationProvider>,
     ) -> Result<i64, String> {
         let since = self.latest_completed_learning_run_created_at(provider)?;
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         match provider {
             Some(provider) => conn
                 .query_row(
@@ -14733,7 +13934,7 @@ impl Storage {
         days: i64,
         provider: Option<IntegrationProvider>,
     ) -> Result<Vec<ToolCount>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
             Some(provider) => (
                 "SELECT tool_name, COUNT(*) as count FROM observations
@@ -14795,7 +13996,7 @@ impl Storage {
         project: Option<&str>,
         since: &str,
     ) -> Result<Vec<ObservationSummary>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut sql = String::from(
             "SELECT period, provider, project, tool_counts, error_count, total_observations, created_at
              FROM observation_summaries
@@ -14842,7 +14043,7 @@ impl Storage {
         &self,
         provider: Option<IntegrationProvider>,
     ) -> Result<Vec<i64>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let (sql, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
             Some(provider) => (
                 "SELECT DATE(created_at) as day, COUNT(*) as count
@@ -14878,8 +14079,8 @@ impl Storage {
             day_map.insert(day, count);
         }
         // Release the connection guard before re-entering via
-        // `get_observation_summaries` — `parking_lot::Mutex` is NOT reentrant,
-        // so the nested `self.conn.lock()` would deadlock otherwise.
+        // `get_observation_summaries` — `std::sync::Mutex` is NOT reentrant,
+        // so the nested `self.conn.lock().unwrap()` would deadlock otherwise.
         drop(stmt);
         drop(conn);
 
@@ -14915,7 +14116,7 @@ impl Storage {
     }
 
     pub fn store_learning_run(&self, payload: &LearningRunPayload) -> Result<i64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, error, logs, phases, provider_scope, inference_metadata)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -14942,7 +14143,7 @@ impl Storage {
         trigger_mode: &str,
         provider_scope: &[IntegrationProvider],
     ) -> Result<i64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO learning_runs (trigger_mode, status, observations_analyzed, rules_created, rules_updated, provider_scope)
              VALUES (?1, 'running', 0, 0, 0, ?2)",
@@ -14953,7 +14154,7 @@ impl Storage {
     }
 
     pub fn update_learning_run(&self, id: i64, payload: &LearningRunPayload) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         // Feature 005 US2 T033 (FR-013, contracts/rule-governance.md "Run
         // status"): the closed enum is enforced in Rust at the persistence
         // boundary. Callers already pass only enum literals; this clamp is
@@ -14989,7 +14190,7 @@ impl Storage {
     }
 
     pub fn cleanup_interrupted_runs(&self) -> Result<u64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let count = conn
             .execute(
                 "UPDATE learning_runs SET status='interrupted' WHERE status='running'",
@@ -15004,7 +14205,7 @@ impl Storage {
         limit: i64,
         provider: Option<IntegrationProvider>,
     ) -> Result<Vec<LearningRun>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         // Feature 005 US5 T058 (R-7.1 / H-6 / FR-024): also read the existing
         // `inference_metadata` JSON (column added by feature 003 / migration
         // 24 — no new migration) and fold it into a tolerant
@@ -15066,7 +14267,7 @@ impl Storage {
     }
 
     pub fn store_learned_rule(&self, payload: &LearnedRulePayload) -> Result<bool, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         // Dynamic evidence scaling: more observations → more weight.
         // Clamped to [5, 20] so tiny batches don't over-commit and large batches
@@ -15191,7 +14392,7 @@ impl Storage {
     }
 
     pub fn reinforce_rule(&self, name: &str, strength: f64) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE learned_rules SET alpha = alpha + ?1, last_evidence_at = ?2, updated_at = datetime('now') WHERE name = ?3",
@@ -15202,7 +14403,7 @@ impl Storage {
     }
 
     pub fn contradict_rule(&self, name: &str, strength: f64) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE learned_rules SET beta_param = beta_param + ?1, last_evidence_at = ?2, updated_at = datetime('now') WHERE name = ?3",
@@ -15217,7 +14418,7 @@ impl Storage {
         provider: Option<IntegrationProvider>,
     ) -> Result<Vec<LearnedRule>, String> {
         let mut meta_map = {
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             let (sql, params_vec): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
                 Some(provider) => (
                     "SELECT name, domain, alpha, beta_param, observation_count, last_evidence_at, state, project, created_at, updated_at, is_anti_pattern, source, content, provider_scope
@@ -15446,7 +14647,7 @@ impl Storage {
     }
 
     pub fn get_git_snapshot(&self, project: &str) -> Result<Option<GitSnapshot>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT project, commit_hash, commit_count, raw_data
@@ -15470,7 +14671,7 @@ impl Storage {
     }
 
     pub fn upsert_git_snapshot(&self, snapshot: &GitSnapshot) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO git_snapshots (project, commit_hash, commit_count, raw_data)
              VALUES (?1, ?2, ?3, ?4)
@@ -15496,7 +14697,7 @@ impl Storage {
     /// (`learning::write_rule_files`) so a suppressed pattern is never
     /// re-surfaced as a fresh review candidate, and (later) by IPC.
     pub fn is_tombstone_active(&self, name: &str) -> bool {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         tombstone_blocks(&conn, name)
     }
 
@@ -15547,7 +14748,7 @@ impl Storage {
                     let Ok(obs_id) = r.id.parse::<i64>() else {
                         continue;
                     };
-                    let conn = self.conn.lock();
+                    let conn = self.conn.lock().unwrap();
                     type ObsMeta = (
                         Option<String>,
                         Option<String>,
@@ -15681,7 +14882,7 @@ impl Storage {
         resolved: &ResolvedEvidence,
         pending_changed: bool,
     ) -> Result<(), String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let Some((rule_id, current_version)): Option<(i64, i64)> = conn
             .query_row(
                 "SELECT id, current_version FROM learned_rules WHERE name = ?1",
@@ -15822,7 +15023,7 @@ impl Storage {
             })
             .unwrap_or(0.6);
 
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
 
         if tombstone_blocks(&conn, name) {
             return Ok(false);
@@ -15922,7 +15123,7 @@ impl Storage {
         if allowed_from.is_empty() {
             return Ok(());
         }
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let placeholders = std::iter::repeat_n("?", allowed_from.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -15948,7 +15149,7 @@ impl Storage {
     /// `freshness_factor` then halves, lowering the evidence-weighted score
     /// and pushing the rule toward `stale`.
     pub fn decay_rule_freshness(&self, name: &str) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let current: Option<Option<String>> = conn
             .query_row(
                 "SELECT last_evidence_at FROM learned_rules WHERE name = ?1",
@@ -16021,7 +15222,7 @@ impl Storage {
             ));
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Feedback tx begin: {e}"))?;
@@ -16108,7 +15309,7 @@ impl Storage {
         provider_scope: &[IntegrationProvider],
     ) -> Result<(), String> {
         let _ = provider_scope; // reconciliation is global by rule name/domain
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
 
         type RuleRow = (
             i64,
@@ -16303,7 +15504,7 @@ impl Storage {
         // `reactivate_rule` clears it. All DB mutations run in one tx so the
         // suppression and its tombstone land atomically.
         let (file_path, provider_scope) = {
-            let mut conn = self.conn.lock();
+            let mut conn = self.conn.lock().unwrap();
             let tx = conn
                 .transaction()
                 .map_err(|e| format!("Delete learned rule tx begin: {e}"))?;
@@ -16423,7 +15624,7 @@ impl Storage {
             String,
             i64,
         ) = {
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             if tombstone_blocks(&conn, name) {
                 return Err(format!(
                     "Rule '{name}' is tombstoned — reactivate it explicitly before promotion"
@@ -16454,31 +15655,6 @@ impl Storage {
             ));
         }
 
-        // Promotion coupling (feature 005 US4 T053, C-4/FR-020, contract
-        // evaluation-harness.md "Promotion coupling"). Consult the most
-        // recent counterfactual verdict BEFORE any `.md`/`active` write:
-        //
-        //   * latest verdict regresses the replay set AND no audited
-        //     `reviewer_overrides` row exists for that
-        //     `(rule_name, replay_set_version)` → HARD BLOCK (Err). The
-        //     maintainer must record an explicit override to approve.
-        //   * judge uncalibrated OR replay set stale, but not regressing
-        //     (or regressing-but-overridden) → DO NOT block; promotion
-        //     proceeds (the warn-not-block rule — the caller/UI surfaces
-        //     the caution). `inconclusive` is likewise non-blocking.
-        //   * no eval rows at all → DO NOT hard-block; the rule is
-        //     "unevaluated" (SC-007 expects the maintainer to run eval, but
-        //     promote must keep working so the loop is not bricked).
-        let latest_verdict = self.latest_eval_verdict(name, None)?;
-        let regresses_without_override = latest_verdict.as_ref().is_some_and(|latest| {
-            latest.regression && !self.has_reviewer_override(name, latest.replay_set_version)
-        });
-        if regresses_without_override {
-            return Err(
-                "blocked: rule regresses the replay set; record an explicit reviewer override to approve".to_string(),
-            );
-        }
-
         let rules_dir = crate::learning::learned_rules_dir_for_scope(&provider_scope);
         std::fs::create_dir_all(&rules_dir).map_err(|e| format!("Cannot create rules dir: {e}"))?;
 
@@ -16507,7 +15683,7 @@ impl Storage {
         // candidates (completed/degraded), capturing its model snapshot.
         let origin_at = Utc::now().to_rfc3339();
         let (origin_run_id, origin_model): (Option<i64>, Option<String>) = {
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             let run: Option<(i64, Option<String>)> = conn
                 .query_row(
                     "SELECT id, inference_metadata FROM learning_runs
@@ -16563,7 +15739,7 @@ impl Storage {
         // One tx: flip lifecycle + persist the sanitized body, append the
         // immutable promote version row, write the provenance citation
         // snapshot.
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Promote tx begin: {e}"))?;
@@ -16676,435 +15852,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Feature 005 US2 T031 (FR-009, contracts/rule-governance.md "Sole
-    /// writer: approval"). Roll a rule back to an earlier
-    /// `rule_versions.version`.
-    ///
-    /// Rollback is a *forward, append-only* restore — never a history
-    /// rewrite. One tx: read the target version row (Err if it does not
-    /// exist or the rule is tombstoned), append a NEW `rule_versions` row
-    /// (`change_kind='rollback'`, `rolled_back_from=<target>`), restore
-    /// `learned_rules.content/content_hash/current_version`, and rewrite the
-    /// on-disk `.md` (redact → sanitize, path-traversal-guarded) when the
-    /// rule has a `file_path`. The DB `content_hash` is set to the SHA256 of
-    /// the exact bytes written to disk so the rule-watcher's reconcile 3c
-    /// (raw-bytes hash compare) treats the rewrite as already-reconciled and
-    /// does NOT emit a spurious extra version.
-    #[allow(dead_code)] // IPC wiring is a later task
-    pub fn rollback_rule(&self, name: &str, target_version: i64) -> Result<(), String> {
-        use sha2::Digest;
-        if !crate::learning::is_safe_rule_name(name) {
-            return Err(format!(
-                "Invalid rule name: {}",
-                &name[..name.len().min(50)]
-            ));
-        }
-
-        let mut conn = self.conn.lock();
-
-        // Durable tombstone gate: a tombstoned rule cannot be rolled back
-        // (it has no live identity until an explicit reactivation).
-        if tombstone_blocks(&conn, name) {
-            return Err(format!(
-                "Rule '{name}' is tombstoned — cannot roll back a suppressed rule"
-            ));
-        }
-
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Rollback tx begin: {e}"))?;
-
-        let (rule_id, file_path, lifecycle): (i64, String, String) = tx
-            .query_row(
-                "SELECT id, file_path, lifecycle FROM learned_rules WHERE name = ?1",
-                params![name],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|e| format!("Rollback: rule not found: {e}"))?;
-
-        if lifecycle == "tombstoned" || lifecycle == "rejected" {
-            return Err(format!(
-                "Rule '{name}' is '{lifecycle}' — cannot roll back a terminally-suppressed rule"
-            ));
-        }
-
-        // Target snapshot. Err if the version does not exist.
-        let (target_content, target_domain, target_is_anti): (String, Option<String>, i64) = tx
-            .query_row(
-                "SELECT content, domain, is_anti_pattern FROM rule_versions
-                 WHERE rule_id = ?1 AND version = ?2",
-                params![rule_id, target_version],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|e| format!("Rollback: target version {target_version} not found: {e}"))?;
-
-        // The restored body is re-passed through redact → sanitize so the
-        // at-rest column and any rewritten `.md` cannot regress on
-        // injection-hardening even if an older snapshot predates it (both
-        // passes are idempotent).
-        let restored =
-            crate::learning::sanitize_rule_content(&crate::redaction::redact(&target_content));
-        let restored_hash = format!("{:x}", sha2::Sha256::digest(restored.as_bytes()));
-
-        // Next version number = max(version)+1 (append-only; the rollback is
-        // itself a new immutable row pointing back at the source).
-        let next_version: i64 = tx
-            .query_row(
-                "SELECT COALESCE(MAX(version), 0) + 1 FROM rule_versions WHERE rule_id = ?1",
-                params![rule_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Rollback: version compute error: {e}"))?;
-
-        tx.execute(
-            "INSERT INTO rule_versions
-                (rule_id, version, content, content_hash, domain, is_anti_pattern,
-                 change_kind, rolled_back_from, author, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'rollback', ?7, 'human', datetime('now'))",
-            params![
-                rule_id,
-                next_version,
-                restored,
-                restored_hash,
-                target_domain,
-                target_is_anti,
-                target_version,
-            ],
-        )
-        .map_err(|e| format!("Rollback version insert error: {e}"))?;
-
-        tx.execute(
-            "UPDATE learned_rules
-             SET content = ?1, content_hash = ?2, current_version = ?3,
-                 updated_at = datetime('now')
-             WHERE id = ?4",
-            params![restored, restored_hash, next_version, rule_id],
-        )
-        .map_err(|e| format!("Rollback restore error: {e}"))?;
-
-        // Rewrite the on-disk `.md` only if the rule has a live file. The
-        // DB `content_hash` (set above) is the SHA256 of exactly these
-        // bytes, so reconcile 3c sees no drift and will not re-version.
-        if !file_path.is_empty() {
-            let path = std::path::Path::new(&file_path);
-            if let Some(canonical_parent) = path.parent().and_then(|p| p.canonicalize().ok()) {
-                // Guard: the resolved parent must be inside a known
-                // learned-rules dir for this rule's inferred scope.
-                let scope = inferred_rule_provider_scope(path);
-                let mut allowed = false;
-                for dir in learned_rule_dirs_for_scope(&scope) {
-                    if dir
-                        .canonicalize()
-                        .is_ok_and(|cdir| canonical_parent.starts_with(&cdir))
-                    {
-                        allowed = true;
-                        break;
-                    }
-                }
-                if !allowed {
-                    return Err(format!(
-                        "Path traversal detected rewriting rule '{name}' on rollback"
-                    ));
-                }
-                std::fs::write(path, &restored)
-                    .map_err(|e| format!("Rollback file rewrite error: {e}"))?;
-            }
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Rollback tx commit: {e}"))?;
-        Ok(())
-    }
-
-    /// Feature 005 US2 T035 (storage side; FR-010,
-    /// contracts/rule-governance.md "`tombstone_blocks`"). The ONLY path
-    /// that clears a durable tombstone.
-    ///
-    /// Sets `reactivated_at`/`reactivated_by` on the name-keyed
-    /// `rule_tombstones` row so `tombstone_blocks` stops blocking, and
-    /// returns the rule's `lifecycle` to `candidate` so it must re-earn
-    /// review eligibility through the normal gated pipeline (it never
-    /// auto-activates). Err if there is no active tombstone for `name`. IPC
-    /// registration + authorization is a SEPARATE later task — this is the
-    /// storage primitive only.
-    #[allow(dead_code)] // IPC wiring is a later task
-    pub fn reactivate_rule(&self, name: &str) -> Result<(), String> {
-        if !crate::learning::is_safe_rule_name(name) {
-            return Err(format!(
-                "Invalid rule name: {}",
-                &name[..name.len().min(50)]
-            ));
-        }
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("Reactivate tx begin: {e}"))?;
-
-        let affected = tx
-            .execute(
-                "UPDATE rule_tombstones
-                 SET reactivated_at = datetime('now'), reactivated_by = 'human'
-                 WHERE rule_name = ?1 AND reactivated_at IS NULL",
-                params![name],
-            )
-            .map_err(|e| format!("Reactivate tombstone update error: {e}"))?;
-
-        if affected == 0 {
-            return Err(format!(
-                "Rule '{name}' has no active tombstone to reactivate"
-            ));
-        }
-
-        // Return the rule (if it still exists) to the review pipeline as a
-        // plain candidate — reactivation re-arms eligibility, it does NOT
-        // restore activation or rewrite any `.md`.
-        tx.execute(
-            "UPDATE learned_rules
-             SET lifecycle = 'candidate', state = 'emerging', updated_at = datetime('now')
-             WHERE name = ?1",
-            params![name],
-        )
-        .map_err(|e| format!("Reactivate lifecycle reset error: {e}"))?;
-
-        tx.commit()
-            .map_err(|e| format!("Reactivate tx commit: {e}"))?;
-        Ok(())
-    }
-
-    // -------------------------------------------------------------------
-    // Counterfactual evaluation persistence + promotion coupling
-    // (feature 005 US4 T052/T053, C-4/FR-020/FR-022, contract
-    // evaluation-harness.md "Persistence" + "Promotion coupling").
-    // Migration 25 owns the `evaluation_results` / `reviewer_overrides`
-    // DDL; these methods only read/write it.
-    // -------------------------------------------------------------------
-
-    /// Persist one counterfactual verdict (feature 005 US4 T052, FR-022).
-    ///
-    /// Inserts a fresh `evaluation_results` row linked to
-    /// `(rule_name, learning_run_id, replay_set_version)` with the scalar
-    /// projection of [`eval_harness::EvalVerdictRow`] plus `evaluated_at =
-    /// now`. A self-describing JSON snapshot of the row is stored in
-    /// `per_case_json` so the persisted record is complete even though
-    /// `EvalVerdictRow` itself carries no per-case detail. Re-evaluating a
-    /// rule simply appends a newer row; the `(rule_name, evaluated_at DESC)`
-    /// read in [`Self::latest_eval_verdict`] makes the newest row win, so
-    /// this is idempotent-friendly without an UPSERT. Returns the new row id.
-    pub fn persist_evaluation_result(
-        &self,
-        row: &crate::eval_harness::EvalVerdictRow,
-    ) -> Result<i64, String> {
-        // The `replay_set_version` column is TEXT (migration 25); store the
-        // i64 as its decimal string so it round-trips through
-        // `latest_eval_verdict`.
-        let replay_set_version = row.replay_set_version.to_string();
-        // `per_case_json` is nullable; serialize the scalar row itself as a
-        // compact, self-contained payload (best-effort — never fail the
-        // insert on a serialization hiccup).
-        let per_case_json = serde_json::to_string(row).ok();
-
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO evaluation_results
-                (rule_name, learning_run_id, replay_set_version, judge_model,
-                 verdict, delta, regression, negative_transfer,
-                 judge_uncalibrated, replay_set_stale, agreement_score,
-                 rationale, per_case_json, evaluated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                     datetime('now'))",
-            params![
-                row.rule_name,
-                row.learning_run_id,
-                replay_set_version,
-                row.judge_model,
-                row.verdict,
-                row.delta,
-                row.regression as i64,
-                row.negative_transfer as i64,
-                row.judge_uncalibrated as i64,
-                row.replay_set_stale as i64,
-                row.agreement_score,
-                None::<String>,
-                per_case_json,
-            ],
-        )
-        .map_err(|e| format!("Persist evaluation result error: {e}"))?;
-        Ok(conn.last_insert_rowid())
-    }
-
-    /// Most recent counterfactual verdict for a rule (feature 005 US4 T053,
-    /// FR-020).
-    ///
-    /// `replay_set_version = None` returns the newest row for the rule
-    /// regardless of replay-set version — this is what the promotion gate
-    /// consults ("`approve` MUST deny if `latest.regression &&
-    /// !has_override`"). `Some(v)` scopes the lookup to one replay-set
-    /// version. Newest wins via the `(rule_name, evaluated_at DESC)` index.
-    /// `None` means the rule is unevaluated (surfaced as such; never a
-    /// hard block — SC-007).
-    pub fn latest_eval_verdict(
-        &self,
-        rule_name: &str,
-        replay_set_version: Option<i64>,
-    ) -> Result<Option<crate::eval_harness::EvalVerdictRow>, String> {
-        let conn = self.conn.lock();
-        let map_row =
-            |row: &rusqlite::Row<'_>| -> rusqlite::Result<crate::eval_harness::EvalVerdictRow> {
-                let replay_set_version_str: Option<String> = row.get(2)?;
-                Ok(crate::eval_harness::EvalVerdictRow {
-                    rule_name: row.get(0)?,
-                    learning_run_id: row.get(1)?,
-                    replay_set_version: replay_set_version_str
-                        .as_deref()
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .unwrap_or(0),
-                    judge_model: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    verdict: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    delta: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                    regression: row.get::<_, i64>(6)? != 0,
-                    negative_transfer: row.get::<_, i64>(7)? != 0,
-                    judge_uncalibrated: row.get::<_, i64>(8)? != 0,
-                    replay_set_stale: row.get::<_, i64>(9)? != 0,
-                    agreement_score: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                })
-            };
-        let result = match replay_set_version {
-            Some(v) => conn
-                .query_row(
-                    "SELECT rule_name, learning_run_id, replay_set_version,
-                            judge_model, verdict, delta, regression,
-                            negative_transfer, judge_uncalibrated,
-                            replay_set_stale, agreement_score
-                     FROM evaluation_results
-                     WHERE rule_name = ?1 AND replay_set_version = ?2
-                     ORDER BY evaluated_at DESC, id DESC LIMIT 1",
-                    params![rule_name, v.to_string()],
-                    map_row,
-                )
-                .optional(),
-            None => conn
-                .query_row(
-                    "SELECT rule_name, learning_run_id, replay_set_version,
-                            judge_model, verdict, delta, regression,
-                            negative_transfer, judge_uncalibrated,
-                            replay_set_stale, agreement_score
-                     FROM evaluation_results
-                     WHERE rule_name = ?1
-                     ORDER BY evaluated_at DESC, id DESC LIMIT 1",
-                    params![rule_name],
-                    map_row,
-                )
-                .optional(),
-        };
-        result.map_err(|e| format!("Latest eval verdict error: {e}"))
-    }
-
-    /// Whether an audited reviewer override exists for
-    /// `(rule_name, replay_set_version)` (feature 005 US4 T053, FR-020).
-    /// One such row turns a regressing verdict from a hard block into an
-    /// approved promotion.
-    pub fn has_reviewer_override(&self, rule_name: &str, replay_set_version: i64) -> bool {
-        let conn = self.conn.lock();
-        conn.query_row(
-            "SELECT 1 FROM reviewer_overrides
-             WHERE rule_name = ?1 AND replay_set_version = ?2 LIMIT 1",
-            params![rule_name, replay_set_version.to_string()],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|r| r.is_some())
-        .unwrap_or(false)
-    }
-
-    /// Record an audited regression override (feature 005 US4 T053,
-    /// FR-020). The `reason` is REQUIRED and must be non-empty — the
-    /// override becomes part of the rule's provenance, so an unexplained
-    /// override is rejected. After this row exists, the promotion gate
-    /// allows approving the otherwise-regressing rule for that replay-set
-    /// version.
-    pub fn record_reviewer_override(
-        &self,
-        rule_name: &str,
-        replay_set_version: i64,
-        overridden_by: &str,
-        reason: &str,
-    ) -> Result<(), String> {
-        if !crate::learning::is_safe_rule_name(rule_name) {
-            return Err(format!(
-                "Invalid rule name: {}",
-                &rule_name[..rule_name.len().min(50)]
-            ));
-        }
-        if reason.trim().is_empty() {
-            return Err("A non-empty reason is required to record a reviewer override".to_string());
-        }
-        let conn = self.conn.lock();
-        conn.execute(
-            "INSERT INTO reviewer_overrides
-                (rule_name, replay_set_version, overridden_by, reason,
-                 overridden_at)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'))",
-            params![
-                rule_name,
-                replay_set_version.to_string(),
-                overridden_by,
-                reason.trim(),
-            ],
-        )
-        .map_err(|e| format!("Record reviewer override error: {e}"))?;
-        Ok(())
-    }
-
-    /// Assemble the [`eval_harness::RuleUnderTest`] for a stored rule plus
-    /// the originating run id to attribute the evaluation to (feature 005
-    /// US4 T053). The run id is the most recent `completed|degraded`
-    /// `learning_runs` row (mirrors `promote_learned_rule`'s provenance
-    /// choice), or `None` if no such run exists. Used by the authorized
-    /// `run_rule_evaluation` IPC so the harness — which never touches
-    /// storage — becomes reachable in-app (V5/FR-019).
-    pub fn eval_inputs_for_rule(
-        &self,
-        name: &str,
-    ) -> Result<(crate::eval_harness::RuleUnderTest, Option<i64>), String> {
-        if !crate::learning::is_safe_rule_name(name) {
-            return Err(format!(
-                "Invalid rule name: {}",
-                &name[..name.len().min(50)]
-            ));
-        }
-        let conn = self.conn.lock();
-        let (content, domain, confidence): (Option<String>, Option<String>, f64) = conn
-            .query_row(
-                "SELECT content, domain, confidence FROM learned_rules
-                 WHERE name = ?1 AND state != 'suppressed'",
-                params![name],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|e| format!("Rule not found: {e}"))?;
-        let content = content.ok_or_else(|| {
-            "No stored content for this rule — re-run analysis to capture content".to_string()
-        })?;
-        let run_id: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM learning_runs
-                 WHERE status IN ('completed', 'degraded')
-                 ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| format!("Origin run lookup error: {e}"))?;
-        Ok((
-            crate::eval_harness::RuleUnderTest {
-                name: name.to_string(),
-                content,
-                domain: domain.unwrap_or_else(|| "general".to_string()),
-                claimed_confidence: confidence,
-            },
-            run_id,
-        ))
-    }
-
     #[allow(dead_code)]
     pub fn reconcile_learned_rules(&self) -> Result<bool, String> {
         use sha2::{Digest, Sha256};
@@ -17157,7 +15904,7 @@ impl Storage {
         // never resurrects a durably suppressed rule (C-5, FR-010,
         // contracts/rule-governance.md "Reconcile cooperation").
         let db_rules: std::collections::HashMap<String, (String, Option<String>, Option<String>)> = {
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT name, file_path, content_hash, provider_scope FROM learned_rules WHERE state != 'suppressed'",
@@ -17189,7 +15936,7 @@ impl Storage {
             std::collections::HashMap<String, String>,
             std::collections::HashSet<String>,
         ) = {
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             let mut life_map = std::collections::HashMap::new();
             {
                 let mut stmt = conn
@@ -17272,7 +16019,7 @@ impl Storage {
             // `lifecycle='candidate'` — they never auto-activate
             // (contracts/rule-governance.md "Reconcile cooperation"). The
             // read-derived `state` stays 'emerging' (unchanged).
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             conn.execute(
                 "INSERT OR IGNORE INTO learned_rules (name, domain, alpha, beta_param, observation_count, state, lifecycle, file_path, provider_scope, source, content, content_hash, is_anti_pattern)
                  VALUES (?1, ?2, 1.0, 1.0, 0, 'emerging', 'candidate', ?3, ?4, 'manual', ?5, ?6, ?7)",
@@ -17300,7 +16047,7 @@ impl Storage {
             }
             let path = std::path::Path::new(file_path.as_str());
             if !path.exists() {
-                let mut conn = self.conn.lock();
+                let mut conn = self.conn.lock().unwrap();
                 let tx = conn
                     .transaction()
                     .map_err(|e| format!("Reconcile 3b tx begin: {e}"))?;
@@ -17366,7 +16113,7 @@ impl Storage {
             let (_domain, _is_anti, body) = parse_rule_frontmatter(&content_str);
             let stored_content =
                 crate::learning::sanitize_rule_content(&crate::redaction::redact(&body));
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             conn.execute(
                 "UPDATE learned_rules SET content = ?1, content_hash = ?2, updated_at = datetime('now') WHERE name = ?3",
                 params![stored_content, hash, name],
@@ -17415,7 +16162,7 @@ impl Storage {
             return Ok(());
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Redaction backfill transaction begin: {e}"))?;
@@ -17652,7 +16399,7 @@ impl Storage {
             }
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Legacy archive tx begin: {e}"))?;
@@ -17733,7 +16480,7 @@ impl Storage {
         // whole watermark→summary→DELETE sequence. The watermark `SELECT`
         // runs on `tx`, so the cutoff reflects the state at lock
         // acquisition and cannot move under us.
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
 
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -17831,7 +16578,7 @@ impl Storage {
     }
 
     pub fn aggregate_and_cleanup_tokens(&self) -> Result<(), String> {
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let cutoff = (Utc::now() - TimeDelta::days(30)).to_rfc3339();
 
         let tx = conn
@@ -17932,15 +16679,6 @@ impl Storage {
         })
     }
 
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    pub fn store_codex_hook_observation(
-        &self,
-        observation: &crate::models::ObservedHookObservation,
-    ) -> Result<(), String> {
-        self.store_hook_observation(observation)
-    }
-
     /// Atomically persist one source-less analytics batch and the exact origin
     /// fields supplied by its producer. Null origin values never erase a known
     /// value from an earlier endpoint.
@@ -18029,13 +16767,12 @@ impl Storage {
             return Err("Live hook invocation identity is incomplete".to_string());
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Begin live analytics transaction: {e}"))?;
-        let origin_project = resolve_project_path_rename(&tx, origin.project)?;
-        let origin_cwd_raw = origin.cwd.map(|cwd| cwd.to_string_lossy().to_string());
-        let origin_cwd = resolve_project_path_rename(&tx, origin_cwd_raw.as_deref())?;
+        let origin_project = origin.project.map(str::to_string);
+        let origin_cwd = origin.cwd.map(|cwd| cwd.to_string_lossy().to_string());
         let updated_at = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO live_analytics_sessions (
@@ -18221,7 +16958,6 @@ impl Storage {
                 )
                 .map_err(|e| format!("Prepare live hook invocations: {e}"))?;
             for invocation in rows.hook_invocations {
-                let cwd = resolve_project_path_rename(&tx, invocation.cwd)?;
                 statement
                     .execute(params![
                         provider.as_str(),
@@ -18235,7 +16971,7 @@ impl Storage {
                         invocation.script_command_raw,
                         invocation.exit_code,
                         invocation.duration_ms,
-                        cwd,
+                        invocation.cwd,
                         invocation.hostname,
                         invocation.message_id,
                     ])
@@ -18258,7 +16994,7 @@ impl Storage {
         trigger: &str,
         provider_scope: &[IntegrationProvider],
     ) -> Result<i64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         // Atomic: insert only if no running run exists for this project
         conn.execute(
@@ -18291,7 +17027,7 @@ impl Storage {
         error: Option<&str>,
         inference_metadata: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE optimization_runs SET memories_scanned = ?1, suggestions_created = ?2,
@@ -18320,7 +17056,7 @@ impl Storage {
         provider: Option<IntegrationProvider>,
         limit: i64,
     ) -> Result<Vec<crate::models::OptimizationRun>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let (query, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
             Some(provider) => (
                 "SELECT id, project_path, provider_scope, trigger, memories_scanned, suggestions_created,
@@ -18386,7 +17122,7 @@ impl Storage {
         diff_summary: Option<&str>,
         backup_data: Option<&str>,
     ) -> Result<i64, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         let provider_scope: String = conn
             .query_row(
@@ -18415,7 +17151,7 @@ impl Storage {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
 
         let mut query = "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
                                 proposed_content, merge_sources, status, error, resolved_at, created_at,
@@ -18484,7 +17220,7 @@ impl Storage {
         provider: Option<IntegrationProvider>,
         limit: i64,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let (query, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
             Some(provider) => (
                 "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
@@ -18555,7 +17291,7 @@ impl Storage {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE optimization_suggestions SET status = ?1, error = ?2, resolved_at = ?3 WHERE id = ?4",
@@ -18571,7 +17307,7 @@ impl Storage {
         &self,
         suggestion_id: i64,
     ) -> Result<crate::models::OptimizationSuggestion, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
                     proposed_content, merge_sources, status, error, resolved_at, created_at,
@@ -18614,7 +17350,7 @@ impl Storage {
         file_path: &str,
         content_hash: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO memory_files (project_path, file_path, content_hash, last_scanned_at)
@@ -18632,7 +17368,7 @@ impl Storage {
         &self,
         project_path: &str,
     ) -> Result<std::collections::HashMap<String, String>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT file_path, content_hash FROM memory_files WHERE project_path = ?1",
@@ -18647,59 +17383,13 @@ impl Storage {
             .map_err(|e| format!("Failed to collect memory file hashes: {e}"))
     }
 
-    /// Get all suggestions for a specific optimization run.
-    #[allow(dead_code)]
-    pub fn get_suggestions_for_run(
-        &self,
-        run_id: i64,
-    ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
-                        proposed_content, merge_sources, status, error, resolved_at, created_at,
-                        original_content, diff_summary, backup_data, group_id
-                 FROM optimization_suggestions WHERE run_id = ?1
-                 ORDER BY created_at ASC",
-            )
-            .map_err(|e| format!("Failed to prepare suggestions-for-run query: {e}"))?;
-        let rows = stmt
-            .query_map(rusqlite::params![run_id], |row| {
-                let merge_sources_json: Option<String> = row.get(8)?;
-                let merge_sources: Option<Vec<String>> =
-                    merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
-                Ok(crate::models::OptimizationSuggestion {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    project_path: row.get(2)?,
-                    provider_scope: parse_provider_scope(row.get(3)?),
-                    action_type: row.get(4)?,
-                    target_file: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    proposed_content: row.get(7)?,
-                    merge_sources,
-                    status: row.get(9)?,
-                    error: row.get(10)?,
-                    resolved_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    original_content: row.get(13)?,
-                    diff_summary: row.get(14)?,
-                    backup_data: row.get(15)?,
-                    group_id: row.get(16)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query suggestions for run: {e}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to collect suggestions for run: {e}"))
-    }
-
     /// Clean up stale optimization suggestions:
     /// - Expire pending/undone suggestions older than 14 days (set status to 'expired')
     /// - Delete denied suggestions older than 90 days
     /// - Clear original_content/backup_data from approved suggestions older than 30 days
     #[allow(dead_code)]
     pub fn cleanup_stale_suggestions(&self, project_path: &str) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         let expire_cutoff = (now - TimeDelta::days(14)).to_rfc3339();
         let delete_cutoff = (now - TimeDelta::days(90)).to_rfc3339();
@@ -18741,7 +17431,7 @@ impl Storage {
         action_type: &str,
         target_file: Option<&str>,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let count: i64 = if let Some(tf) = target_file {
             conn.query_row(
                 "SELECT COUNT(*) FROM optimization_suggestions
@@ -18769,7 +17459,7 @@ impl Storage {
         suggestion_id: i64,
         group_id: &str,
     ) -> Result<(), String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE optimization_suggestions SET group_id = ?1 WHERE id = ?2",
             rusqlite::params![group_id, suggestion_id],
@@ -18784,7 +17474,7 @@ impl Storage {
         &self,
         group_id: &str,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
@@ -19158,7 +17848,7 @@ impl Storage {
             return Ok(std::collections::HashMap::new());
         }
 
-        let conn = self.conn.lock();
+        let conn = self.conn.lock().unwrap();
         let mut seen = std::collections::HashSet::new();
         let unique_refs: Vec<&SessionRef> = session_refs
             .iter()
@@ -19291,7 +17981,7 @@ impl Storage {
 
         // Query last assistant timestamp for this session (for cross-batch continuity)
         let last_assistant_ts: Option<String> = {
-            let conn = self.conn.lock();
+            let conn = self.conn.lock().unwrap();
             conn.query_row(
                 "SELECT timestamp FROM response_times
                  WHERE provider = ?1 AND session_id = ?2 AND response_secs IS NOT NULL
@@ -19402,7 +18092,7 @@ impl Storage {
             return Ok(());
         }
 
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("Transaction error: {e}"))?;
@@ -19490,7 +18180,7 @@ impl Storage {
         sorted.sort_by(|a, b| a.timestamp.cmp(b.timestamp));
 
         // ING-3: single transaction for one (provider, session_id) batch.
-        let mut conn = self.conn.lock();
+        let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|e| format!("session_events transaction: {e}"))?;
@@ -19940,41 +18630,6 @@ fn merge_project_subdirs(mut rows: Vec<ProjectBreakdown>) -> Vec<ProjectBreakdow
     results
 }
 
-fn calc_trend(
-    conn: &Connection,
-    provider: IntegrationProvider,
-    bucket_key: &str,
-) -> Result<String, String> {
-    let now = query_now();
-    let one_hour_ago = (now - TimeDelta::hours(1)).to_rfc3339();
-    let two_hours_ago = (now - TimeDelta::hours(2)).to_rfc3339();
-
-    let recent_avg: Option<f64> = conn
-        .query_row(
-            "SELECT AVG(utilization) FROM usage_snapshots
-             WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3",
-            params![provider.as_str(), bucket_key, one_hour_ago],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Trend query error: {e}"))?;
-
-    let prev_avg: Option<f64> = conn
-        .query_row(
-            "SELECT AVG(utilization) FROM usage_snapshots
-             WHERE provider = ?1 AND bucket_key = ?2 AND timestamp >= ?3 AND timestamp < ?4",
-            params![provider.as_str(), bucket_key, two_hours_ago, one_hour_ago],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Trend query error: {e}"))?;
-
-    match (recent_avg, prev_avg) {
-        (Some(r), Some(p)) if r > p + 2.0 => Ok("up".into()),
-        (Some(r), Some(p)) if r < p - 2.0 => Ok("down".into()),
-        (Some(_), Some(_)) => Ok("flat".into()),
-        _ => Ok("unknown".into()),
-    }
-}
-
 fn downsample_tokens(points: Vec<TokenDataPoint>, max: usize) -> Vec<TokenDataPoint> {
     if points.len() <= max {
         return points;
@@ -20182,7 +18837,7 @@ mod tests {
             .expect("slow reader must complete without SQLite errors");
         let committed_writes = committed_writes.load(std::sync::atomic::Ordering::Acquire);
         let persisted_rows = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.query_row("SELECT COUNT(*) FROM token_snapshots", [], |row| {
                 row.get::<_, usize>(0)
             })
@@ -20261,7 +18916,7 @@ mod tests {
         clear_env();
     }
 
-    /// Populate all three analytics caches through their real read paths, so
+    /// Populate the analytics caches through their real read paths, so
     /// the drain is proved against entries `get_or_compute` actually stored
     /// rather than against hand-inserted ones.
     fn warm_all_analytics_caches(storage: &Storage) {
@@ -20269,19 +18924,19 @@ mod tests {
             .get_model_usage_overview(ModelRange::TwentyFourHours, None)
             .expect("warm model usage overview cache");
         storage
-            .get_all_bucket_stats(&[], 30)
-            .expect("warm bucket stats cache");
-        storage
             .get_context_savings_analytics("24h", None)
             .expect("warm context savings analytics cache");
     }
 
-    /// The three caches' current entry counts, in declaration order.
-    fn analytics_cache_lens(storage: &Storage) -> [usize; 3] {
+    /// The caches' current entry counts, in declaration order.
+    fn analytics_cache_lens(storage: &Storage) -> [usize; 2] {
         [
-            storage.model_usage_overview_cache.lock().len(),
-            storage.bucket_stats_cache.lock().len(),
-            storage.context_savings_analytics_cache.lock().len(),
+            storage.model_usage_overview_cache.lock().unwrap().len(),
+            storage
+                .context_savings_analytics_cache
+                .lock()
+                .unwrap()
+                .len(),
         ]
     }
 
@@ -20304,7 +18959,7 @@ mod tests {
 
         assert_eq!(
             analytics_cache_lens(&storage),
-            [0; 3],
+            [0; 2],
             "retention's completion path must leave no cached payload behind"
         );
         assert_eq!(emitted, vec![crate::TRANSCRIPT_ANALYTICS_UPDATED_EVENT]);
@@ -20357,7 +19012,7 @@ mod tests {
         ];
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             for index in redundant_indexes {
                 assert!(
                     !index_present(&conn, index),
@@ -20394,7 +19049,7 @@ mod tests {
         // Reopening an older database removes every legacy plain index.
         let reopened = Storage::init().expect("reopen storage");
         {
-            let conn = reopened.conn.lock();
+            let conn = reopened.conn.lock().unwrap();
             for index in redundant_indexes {
                 assert!(
                     !index_present(&conn, index),
@@ -20412,7 +19067,7 @@ mod tests {
     fn dropped_provider_source_indexes_leave_owned_deletes_on_unique_indexes() {
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
 
         // All source-owned delete sites use this exact generic table shape.
         let tables = [
@@ -20718,7 +19373,7 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         for table in ["response_times", "tool_actions", "token_snapshots"] {
             println!("\n--- {table} columns ---");
             let mut stmt = conn
@@ -20751,7 +19406,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
 
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         for table in ["response_times", "tool_actions", "token_snapshots"] {
             assert!(
                 table_has_column(&conn, table, "is_sidechain"),
@@ -20787,7 +19442,7 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
 
         // All six additive learned_rules columns are present.
         for col in [
@@ -20886,7 +19541,7 @@ mod tests {
         // First init applies migration 25.
         let storage = init_storage_in(&dir);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let v: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -20939,7 +19594,7 @@ mod tests {
         // version-gated migration loop must skip migration 25 (no error) and
         // leave at least migration 25's row in place.
         let storage2 = init_storage_in(&dir);
-        let conn = storage2.conn.lock();
+        let conn = storage2.conn.lock().unwrap();
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -20974,7 +19629,7 @@ mod tests {
         // First init applies migration 26.
         let storage = init_storage_in(&dir);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let v: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -21031,7 +19686,7 @@ mod tests {
         // version-gated migration loop must skip migration 26 (no error)
         // and leave exactly one v=26 row in `schema_version`.
         let storage2 = init_storage_in(&dir);
-        let conn = storage2.conn.lock();
+        let conn = storage2.conn.lock().unwrap();
         let version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -21139,7 +19794,7 @@ mod tests {
             .ingest_response_times(IntegrationProvider::Claude, "test-session", &inputs)
             .expect("insert response_times");
 
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT timestamp, is_sidechain, agent_id, parent_uuid
@@ -21176,6 +19831,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute_batch(
                 "INSERT INTO model_usage_observations (
                      provider, source_key, source_record_key, source_ordinal,
@@ -21228,7 +19884,7 @@ mod tests {
         let middle = (now - TimeDelta::minutes(5)).to_rfc3339();
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             // Parent row: 100 input + 50 output + 0 cache = 150 tokens.
             conn.execute(
                 "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
@@ -21337,7 +19993,7 @@ mod tests {
         let t_b_end = (now - TimeDelta::minutes(18)).to_rfc3339();
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             // Agent A — earlier, two response_times, one tool_action,
             // one token_snapshot.
             conn.execute_batch(&format!(
@@ -21446,7 +20102,7 @@ mod tests {
         // clear the sentinel so an explicit pass actually does the rewrite.
         let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO observations (provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd)
                  VALUES ('claude', 's-bf', '2026-01-01T00:00:00Z', 'PostToolUse', 'Bash',
@@ -21470,7 +20126,7 @@ mod tests {
         storage.backfill_redaction().expect("first backfill");
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let obs_input: String = conn
                 .query_row(
                     "SELECT tool_input FROM observations WHERE session_id = 's-bf'",
@@ -21520,7 +20176,7 @@ mod tests {
         // backfill leaves it untouched (proving the guard, not just
         // `redact`'s idempotence).
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO observations (provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd)
                  VALUES ('claude', 's-bf2', '2026-01-02T00:00:00Z', 'PostToolUse', 'Bash',
@@ -21535,7 +20191,7 @@ mod tests {
             .expect("second backfill (no-op)");
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let untouched: String = conn
                 .query_row(
                     "SELECT tool_input FROM observations WHERE session_id = 's-bf2'",
@@ -21582,7 +20238,7 @@ mod tests {
             .expect("store observation through the real capture path");
 
         let (ti, to, cwd): (String, String, String) = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.query_row(
                 "SELECT tool_input, tool_output, cwd FROM observations WHERE session_id = 's-cap'",
                 [],
@@ -21654,7 +20310,7 @@ mod tests {
         let rule_file = claude_dir.join("legacy-rule.md");
         std::fs::write(&rule_file, "Prefer explicit error types.\n").expect("seed legacy rule .md");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, state, lifecycle, content)
                  VALUES ('legacy-rule', 'errors', 0.9, 10, ?1, 'confirmed', 'active', 'Prefer explicit error types.')",
@@ -21710,7 +20366,7 @@ mod tests {
 
         // DB row is durably tombstoned.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (lifecycle, fp): (String, String) = conn
                 .query_row(
                     "SELECT lifecycle, file_path FROM learned_rules WHERE name = 'legacy-rule'",
@@ -21820,7 +20476,7 @@ mod tests {
             .expect("delete must tombstone");
 
         let alpha_after_delete: f64 = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             // Precondition: deletion produced the durable suppression state.
             let (lifecycle, state, fp): (String, String, String) = conn
                 .query_row(
@@ -21852,7 +20508,7 @@ mod tests {
                 .store_learned_rule(&re_extract)
                 .unwrap_or_else(|e| panic!("re-extraction cycle {cycle} must not error: {e}"));
 
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (lifecycle, state, fp, content, alpha): (
                 String,
                 String,
@@ -21924,7 +20580,7 @@ mod tests {
         // Case A: lifecycle='suppressed' (no tombstone row) — sticky purely
         // on the persisted lifecycle.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, state, lifecycle, is_anti_pattern, source, content, provider_scope)
                  VALUES ('sticky-suppressed', 'errors', 0.5, 4, '', 2.0, 2.0, 'suppressed', 'suppressed', 0, 'claude', NULL, '[\"claude\"]')",
@@ -21948,7 +20604,7 @@ mod tests {
             .store_learned_rule(&strong)
             .expect("upsert suppressed row");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (fp, content, lifecycle): (String, Option<String>, String) = conn
                 .query_row(
                     "SELECT file_path, content, lifecycle FROM learned_rules WHERE name = 'sticky-suppressed'",
@@ -21970,7 +20626,7 @@ mod tests {
         // Case B: a *tombstoned* row backed by an active rule_tombstones
         // entry — sticky via the tombstone existence clause too.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, state, lifecycle, is_anti_pattern, source, content, provider_scope)
                  VALUES ('sticky-tombstoned', 'errors', 0.5, 4, '', 2.0, 7.0, 'suppressed', 'tombstoned', 0, 'claude', NULL, '[\"claude\"]')",
@@ -21993,7 +20649,7 @@ mod tests {
             .store_learned_rule(&strong_b)
             .expect("upsert tombstoned row");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (fp, content, lifecycle): (String, Option<String>, String) = conn
                 .query_row(
                     "SELECT file_path, content, lifecycle FROM learned_rules WHERE name = 'sticky-tombstoned'",
@@ -22046,7 +20702,7 @@ mod tests {
             "tombstoned",
         ];
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             for lc in lifecycles {
                 conn.execute(
                     "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, last_evidence_at, state, lifecycle, is_anti_pattern, source, content, provider_scope)
@@ -22070,7 +20726,7 @@ mod tests {
             "a non-suppressed DB-only row must surface"
         );
 
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         for lc in lifecycles {
             let (db_lifecycle, db_state): (String, String) = conn
                 .query_row(
@@ -22093,243 +20749,6 @@ mod tests {
         }
 
         drop(conn);
-        clear_env();
-    }
-
-    /// FR-009 / SC-004: `rollback_rule` is a forward, append-only restore.
-    /// Promote-equivalent v1 content, then mutate `learned_rules` content +
-    /// bump `current_version` to a v2 row; rolling back to v1 must restore
-    /// `learned_rules.content/content_hash/current_version` to the v1
-    /// snapshot AND append a NEW `rule_versions` row with
-    /// `change_kind='rollback'` and `rolled_back_from=1`, while the existing
-    /// v1/v2 rows remain byte-for-byte intact (history is never rewritten).
-    #[test]
-    #[serial]
-    fn rollback_rule_restores_prior_version_append_only() {
-        use sha2::Digest;
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-
-        let name = "rollback-target";
-        let v1_content = "Version one: prefer explicit error types.";
-        let v2_content = "Version two: rewritten guidance that we will undo.";
-        let v1_hash = format!("{:x}", sha2::Sha256::digest(v1_content.as_bytes()));
-        let v2_hash = format!("{:x}", sha2::Sha256::digest(v2_content.as_bytes()));
-
-        let rule_id: i64 = {
-            let conn = storage.conn.lock();
-            conn.execute(
-                "INSERT INTO learned_rules (name, domain, confidence, observation_count, file_path, alpha, beta_param, state, lifecycle, current_version, content, content_hash, is_anti_pattern, source, provider_scope)
-                 VALUES (?1, 'errors', 0.9, 10, '', 8.0, 1.0, 'confirmed', 'active', 2, ?2, ?3, 0, 'claude', '[\"claude\"]')",
-                params![name, v2_content, v2_hash],
-            )
-            .expect("seed active rule at v2");
-            let id: i64 = conn
-                .query_row(
-                    "SELECT id FROM learned_rules WHERE name = ?1",
-                    params![name],
-                    |r| r.get(0),
-                )
-                .expect("rule id");
-            // Append-only history: immutable v1 then v2 snapshots.
-            conn.execute(
-                "INSERT INTO rule_versions (rule_id, version, content, content_hash, domain, is_anti_pattern, change_kind, author)
-                 VALUES (?1, 1, ?2, ?3, 'errors', 0, 'create', 'system')",
-                params![id, v1_content, v1_hash],
-            )
-            .expect("seed v1");
-            conn.execute(
-                "INSERT INTO rule_versions (rule_id, version, content, content_hash, domain, is_anti_pattern, change_kind, author)
-                 VALUES (?1, 2, ?2, ?3, 'errors', 0, 'update', 'system')",
-                params![id, v2_content, v2_hash],
-            )
-            .expect("seed v2");
-            id
-        };
-
-        // Roll back to version 1 (no file_path ⇒ DB-only restore path; the
-        // content has no fences/secrets so redact→sanitize is a fixed point
-        // and the restored bytes equal v1 exactly).
-        storage
-            .rollback_rule(name, 1)
-            .expect("rollback to v1 must succeed");
-
-        let conn = storage.conn.lock();
-        let (content, content_hash, current_version): (String, String, i64) = conn
-            .query_row(
-                "SELECT content, content_hash, current_version FROM learned_rules WHERE name = ?1",
-                params![name],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .expect("read rolled-back rule");
-        assert_eq!(content, v1_content, "content must be restored to v1");
-        assert_eq!(content_hash, v1_hash, "content_hash must match restored v1");
-        assert_eq!(
-            current_version, 3,
-            "current_version must advance to the new append-only rollback row (3)"
-        );
-
-        // A NEW rule_versions row (version 3) records the rollback forward.
-        let (rb_kind, rb_from, rb_content): (String, Option<i64>, String) = conn
-            .query_row(
-                "SELECT change_kind, rolled_back_from, content FROM rule_versions WHERE rule_id = ?1 AND version = 3",
-                params![rule_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .expect("rollback version row must exist");
-        assert_eq!(
-            rb_kind, "rollback",
-            "new row must be change_kind='rollback'"
-        );
-        assert_eq!(rb_from, Some(1), "rolled_back_from must point at v1");
-        assert_eq!(rb_content, v1_content, "rollback row content must be v1");
-
-        // History is append-only: v1/v2 untouched, total versions = 3.
-        let total: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM rule_versions WHERE rule_id = ?1",
-                params![rule_id],
-                |r| r.get(0),
-            )
-            .expect("count versions");
-        assert_eq!(total, 3, "rollback must APPEND, never rewrite history");
-        let v1_still: String = conn
-            .query_row(
-                "SELECT content FROM rule_versions WHERE rule_id = ?1 AND version = 1",
-                params![rule_id],
-                |r| r.get(0),
-            )
-            .expect("v1 still present");
-        let v2_still: String = conn
-            .query_row(
-                "SELECT content FROM rule_versions WHERE rule_id = ?1 AND version = 2",
-                params![rule_id],
-                |r| r.get(0),
-            )
-            .expect("v2 still present");
-        assert_eq!(v1_still, v1_content, "v1 snapshot must remain intact");
-        assert_eq!(v2_still, v2_content, "v2 snapshot must remain intact");
-
-        drop(conn);
-        clear_env();
-    }
-
-    /// FR-010: `reactivate_rule` is the ONLY path that clears a durable
-    /// tombstone. After delete→tombstoned, reactivation must set
-    /// `rule_tombstones.reactivated_at`/`reactivated_by`, stop
-    /// `tombstone_blocks` from blocking, and return the rule to
-    /// `lifecycle='candidate'` (NOT auto-active) so it must re-earn review
-    /// eligibility through the gated pipeline — and it must NOT write any
-    /// `.md`.
-    #[test]
-    #[serial]
-    fn reactivate_rule_is_the_sole_untombstone_path() {
-        clear_env();
-        let data_dir = TempDir::new().expect("data tempdir");
-        let rules_dir = TempDir::new().expect("rules tempdir");
-        // SAFETY: env mutation; serialized via #[serial]. Route demo-mode
-        // rule dirs into a temp dir so reactivation can be proven to write
-        // no real `.md`.
-        unsafe {
-            std::env::set_var("QUILL_DEMO_MODE", "1");
-            std::env::set_var("QUILL_DATA_DIR", data_dir.path());
-            std::env::set_var("QUILL_RULES_DIR", rules_dir.path());
-        }
-        let storage = Storage::init().expect("init storage");
-
-        let name = "reactivate-me";
-        storage
-            .store_learned_rule(&crate::models::LearnedRulePayload {
-                name: name.to_string(),
-                domain: Some("errors".to_string()),
-                confidence: 0.9,
-                observation_count: 10,
-                file_path: String::new(),
-                project: None,
-                is_anti_pattern: false,
-                source: Some("claude".to_string()),
-                content: Some("Body.".to_string()),
-                provider_scope: vec![IntegrationProvider::Claude],
-            })
-            .expect("seed rule");
-        storage.delete_learned_rule(name).expect("delete→tombstone");
-
-        // Sanity: it is actually tombstoned before reactivation.
-        {
-            let conn = storage.conn.lock();
-            assert!(
-                tombstone_blocks(&conn, name),
-                "precondition: rule must be tombstoned"
-            );
-        }
-
-        storage
-            .reactivate_rule(name)
-            .expect("reactivate must succeed on an active tombstone");
-
-        {
-            let conn = storage.conn.lock();
-            let (reactivated_at, reactivated_by): (Option<String>, Option<String>) = conn
-                .query_row(
-                    "SELECT reactivated_at, reactivated_by FROM rule_tombstones WHERE rule_name = ?1",
-                    params![name],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .expect("read tombstone after reactivate");
-            assert!(
-                reactivated_at.is_some(),
-                "reactivate must set reactivated_at"
-            );
-            assert_eq!(
-                reactivated_by.as_deref(),
-                Some("human"),
-                "reactivate must record the actor"
-            );
-            assert!(
-                !tombstone_blocks(&conn, name),
-                "a reactivated tombstone must no longer block"
-            );
-            let lifecycle: String = conn
-                .query_row(
-                    "SELECT lifecycle FROM learned_rules WHERE name = ?1",
-                    params![name],
-                    |r| r.get(0),
-                )
-                .expect("read lifecycle after reactivate");
-            assert_eq!(
-                lifecycle, "candidate",
-                "reactivation must return the rule to 'candidate', NEVER auto-active"
-            );
-            assert_ne!(
-                lifecycle, "active",
-                "reactivation must not auto-activate the rule"
-            );
-        }
-
-        // Reactivation must not have authored any `.md` in any scope dir.
-        for scope in [
-            vec![IntegrationProvider::Claude],
-            vec![IntegrationProvider::Codex],
-            vec![IntegrationProvider::Claude, IntegrationProvider::Codex],
-        ] {
-            let d = crate::learning::learned_rules_dir_for_scope(&scope);
-            let md_count = std::fs::read_dir(&d)
-                .map(|it| {
-                    it.flatten()
-                        .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
-                        .count()
-                })
-                .unwrap_or(0);
-            assert_eq!(
-                md_count, 0,
-                "reactivation must write 0 .md files (dir {d:?})"
-            );
-        }
-
-        unsafe {
-            std::env::remove_var("QUILL_RULES_DIR");
-        }
         clear_env();
     }
 
@@ -22378,7 +20797,7 @@ mod tests {
 
         // It is persisted as a DB-only `candidate` with no on-disk file.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (lifecycle, file_path, content): (String, String, Option<String>) = conn
                 .query_row(
                     "SELECT lifecycle, file_path, content FROM learned_rules WHERE name = ?1",
@@ -22445,7 +20864,7 @@ mod tests {
     /// Insert a minimal `observations` row and return its id so a
     /// `kind="observation"` ref can be made resolvable deterministically.
     fn seed_observation(storage: &Storage, session: &str, cwd: &str) -> i64 {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO observations
                 (provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd)
@@ -22611,7 +21030,7 @@ mod tests {
         // Simulate accumulated evidence across runs so the Wilson score
         // clears 0.6 — isolates the cluster threshold as the only gate.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE learned_rules SET alpha = 25.0, beta_param = 1.0 WHERE name = ?1",
                 params![bc_name],
@@ -22619,7 +21038,7 @@ mod tests {
             .expect("seed accumulated B/C evidence");
         }
         let (rule_id, cur_ver): (i64, i64) = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.query_row(
                 "SELECT id, current_version FROM learned_rules WHERE name = ?1",
                 params![bc_name],
@@ -22630,7 +21049,7 @@ mod tests {
 
         // Seed 2 session citations → cluster unmet.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             for sid in ["sess-1", "sess-2"] {
                 conn.execute(
                     "INSERT INTO rule_evidence_citations
@@ -22651,7 +21070,7 @@ mod tests {
         // Add a 3rd distinct session citation → met (3 refs; distinct
         // sources = 1 kind, 0 projects ⇒ distinct_sources = 1).
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO rule_evidence_citations
                     (rule_id, rule_version, kind, ref_id, session_id, snippet)
@@ -22703,7 +21122,7 @@ mod tests {
             .expect("store B/C rule");
 
         let (obs_count, alpha, beta): (i64, f64, f64) = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.query_row(
                 "SELECT observation_count, alpha, beta_param FROM learned_rules WHERE name = 'bc-no-obs-rows'",
                 [],
@@ -22742,7 +21161,7 @@ mod tests {
         let name = "decays-on-irrelevant";
         let start = (Utc::now() - chrono::Duration::days(5)).to_rfc3339();
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learned_rules
                     (name, domain, confidence, observation_count, file_path, alpha, beta_param,
@@ -22755,7 +21174,7 @@ mod tests {
         }
 
         let read = |s: &Storage| -> (String, f64, f64) {
-            let conn = s.conn.lock();
+            let conn = s.conn.lock().unwrap();
             conn.query_row(
                 "SELECT last_evidence_at, alpha, beta_param FROM learned_rules WHERE name = ?1",
                 params![name],
@@ -22815,7 +21234,7 @@ mod tests {
             .decay_rule_freshness("no-such-rule-xyz")
             .expect("decay on an unknown rule must be a safe Ok no-op (not a panic/silent drop)");
         let still: i64 = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.query_row(
                 "SELECT COUNT(*) FROM learned_rules WHERE name = 'no-such-rule-xyz'",
                 [],
@@ -22981,7 +21400,7 @@ mod tests {
             .expect("reconcile pass 1");
 
         let lifecycle_of = |s: &Storage, n: &str| -> (String, Option<String>) {
-            let conn = s.conn.lock();
+            let conn = s.conn.lock().unwrap();
             conn.query_row(
                 "SELECT lifecycle, superseded_by FROM learned_rules WHERE name = ?1",
                 params![n],
@@ -23063,7 +21482,7 @@ mod tests {
         let baseline_alpha = 6.0_f64;
         let baseline_beta = 4.0_f64;
         let seed_rule = |s: &Storage, name: &str| {
-            let conn = s.conn.lock();
+            let conn = s.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learned_rules
                     (name, domain, confidence, observation_count, file_path, alpha, beta_param,
@@ -23078,7 +21497,7 @@ mod tests {
         // Score of a rule WITH operator feedback folded in (mirrors
         // `eligible_for_review`'s use of `operator_feedback_delta`).
         let scored_with_feedback = |s: &Storage, name: &str| -> f64 {
-            let conn = s.conn.lock();
+            let conn = s.conn.lock().unwrap();
             let (a, b, ts): (f64, f64, Option<String>) = conn
                 .query_row(
                     "SELECT alpha, beta_param, last_evidence_at FROM learned_rules WHERE name = ?1",
@@ -23095,7 +21514,7 @@ mod tests {
         let llm_name = "fb-llm-support";
         seed_rule(&storage, llm_name);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE learned_rules SET alpha = alpha + 1.0 WHERE name = ?1",
                 params![llm_name],
@@ -23117,7 +21536,7 @@ mod tests {
         );
         // No tombstone for accept.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert!(
                 !tombstone_blocks(&conn, acc_name),
                 "accept must NOT write a tombstone"
@@ -23138,7 +21557,7 @@ mod tests {
             "operator reject ({reject_score}) must lower the score below the unrated baseline ({base_score})"
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert!(
                 !tombstone_blocks(&conn, rej_name),
                 "reject must NOT write a tombstone (it stays recoverable)"
@@ -23153,7 +21572,7 @@ mod tests {
             .submit_rule_feedback(bad_name, "bad", Some("noisy and wrong"))
             .expect("bad feedback");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert!(
                 tombstone_blocks(&conn, bad_name),
                 "bad must write an active durable tombstone"
@@ -23191,7 +21610,7 @@ mod tests {
             .store_learned_rule(&strong_reextract)
             .expect("re-extraction upsert must not error");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (lifecycle, fp): (String, String) = conn
                 .query_row(
                     "SELECT lifecycle, file_path FROM learned_rules WHERE name = ?1",
@@ -23404,7 +21823,7 @@ mod tests {
         // ⇒ compute_state override ⇒ `invalidated` regardless of the 0.99
         // raw self-rating and a healthy citation cluster.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE learned_rules SET alpha = 2.0, beta_param = 9.0,
                      last_evidence_at = ?2 WHERE name = ?1",
@@ -23416,7 +21835,7 @@ mod tests {
         // assertion below is exercising the intended early-out, not min
         // cluster). Mirrors `eligible_for_review`'s internal scoring.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let (_s, st) = evidence_weighted_score(2.0, 9.0, Some(&Utc::now().to_rfc3339()));
             drop(conn);
             assert_eq!(
@@ -23438,7 +21857,7 @@ mod tests {
         // the default 0.6 `min_eligibility` ⇒ eligible. This isolates the
         // evidence-weighted score as the sole deciding input.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE learned_rules SET alpha = 30.0, beta_param = 1.0,
                      last_evidence_at = ?2 WHERE name = ?1",
@@ -23695,7 +22114,7 @@ mod tests {
         // End-to-end through get_learning_runs: a run WITH metadata surfaces
         // the rollup; a legacy run with NULL surfaces `inference: None`.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, duration_ms, status, created_at, provider_scope, inference_metadata)
                  VALUES ('manual', 3, 1, 0, 4200, 'completed', '2026-05-10T00:00:00Z', '[\"claude\"]', ?1)",
@@ -23747,7 +22166,7 @@ mod tests {
         let storage = init_storage_in(&dir);
 
         let insert_obs = |session: &str, ts: &str, out: &str| {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO observations
                     (provider, session_id, timestamp, hook_phase, tool_name, tool_input, tool_output, cwd, created_at)
@@ -23763,7 +22182,7 @@ mod tests {
             .cleanup_old_observations()
             .expect("cleanup with zero runs");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM observations", [], |r| r.get(0))
                 .expect("count");
@@ -23775,7 +22194,7 @@ mod tests {
         // watermark, so `MIN(watermark, now-30d)` == watermark here.
         let watermark = "2024-06-01T00:00:00Z";
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO learning_runs (trigger_mode, observations_analyzed, rules_created, rules_updated, status, created_at, provider_scope)
                  VALUES ('manual', 0, 0, 0, 'completed', ?1, '[\"claude\"]')",
@@ -23798,7 +22217,7 @@ mod tests {
             .expect("cleanup with watermark");
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let surviving: Vec<String> = {
                 let mut stmt = conn
                     .prepare("SELECT session_id FROM observations ORDER BY session_id")
@@ -23850,7 +22269,7 @@ mod tests {
         let storage = init_storage_in(&dir);
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             // Benign text containing the substring "error" but NO structured
             // marker — must NOT count under the tightened predicate.
             conn.execute(
@@ -23955,7 +22374,7 @@ mod tests {
             !changed,
             "a brand-new (candidate) row must NOT signal pending_changed"
         );
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.execute(
             "UPDATE learned_rules
              SET alpha = 25.0, beta_param = 1.0, lifecycle = 'awaiting_review'
@@ -23972,7 +22391,7 @@ mod tests {
     }
 
     fn current_version_of(storage: &Storage, name: &str) -> i64 {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.query_row(
             "SELECT current_version FROM learned_rules WHERE name = ?1",
             params![name],
@@ -23982,7 +22401,7 @@ mod tests {
     }
 
     fn distinct_refs_at(storage: &Storage, rule_id: i64, version: i64) -> i64 {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.query_row(
             "SELECT COUNT(*) FROM (
                  SELECT DISTINCT kind, ref_id FROM rule_evidence_citations
@@ -24146,7 +22565,7 @@ mod tests {
         // Arm the deterministic in-tx failure: any INSERT into
         // `rule_evidence_citations` aborts.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute_batch(
                 "CREATE TRIGGER fail_citation_insert
                  BEFORE INSERT ON rule_evidence_citations
@@ -24165,7 +22584,7 @@ mod tests {
 
         // Disarm so the post-failure assertions read a clean DB.
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute_batch("DROP TRIGGER fail_citation_insert;")
                 .expect("disarm failure trigger");
         }
@@ -24610,7 +23029,7 @@ mod tests {
     }
 
     fn raw_model_hourly_rows(storage: &Storage) -> Vec<ModelHourlyRollupRow> {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         read_model_hourly_rollup_rows(
             &conn,
             "SELECT (observed_at_ms / 3600000) * 3600000,
@@ -24631,7 +23050,7 @@ mod tests {
     }
 
     fn unpruned_model_hourly_rows(storage: &Storage) -> Vec<ModelHourlyRollupRow> {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         read_model_hourly_rollup_rows(
             &conn,
             "SELECT hour_utc, provider, derived_model_id, source_key,
@@ -24697,7 +23116,7 @@ mod tests {
              WHERE provider = 'claude' AND source_key = 'rollup-source'
              ORDER BY 1, 2, 3, 4";
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let raw = read_model_hourly_rollup_rows(&conn, RAW_GROUP_BY);
             let folded = read_model_hourly_rollup_rows(&conn, FOLDED_ROWS);
             assert_eq!(folded, raw, "ingest fold must equal raw source group-by");
@@ -24732,7 +23151,7 @@ mod tests {
             .replace_model_source(&source, &observations, &fingerprint)
             .expect("replace seeded source");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert_eq!(
                 read_model_hourly_rollup_rows(&conn, FOLDED_ROWS),
                 read_model_hourly_rollup_rows(&conn, RAW_GROUP_BY),
@@ -24778,7 +23197,7 @@ mod tests {
             "forced metadata failure must abort replacement"
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert_eq!(
                 conn.query_row(
                     "SELECT COUNT(*) FROM model_usage_observations
@@ -24843,7 +23262,7 @@ mod tests {
             .expect_err("integer overflow must abort replacement");
         assert!(error.contains("integer overflow"), "{error}");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")
                 .expect("restore check constraints");
             for table in [
@@ -25104,7 +23523,7 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         assert_eq!(rusqlite::version(), "3.45.0");
 
         conn.execute_batch(
@@ -25322,7 +23741,7 @@ mod tests {
         .join("\n");
         seed_claude_model_source(&storage, &dir, "sk-hybrid-a", "sess-hybrid-a", &claude);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE model_observation_sources
                  SET cwd = '/work/fallback-latest'
@@ -25365,7 +23784,7 @@ mod tests {
             &null_prefix,
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE model_observation_sources
                  SET cwd = NULL
@@ -25401,6 +23820,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_usage_observations
                  SET source_record_key = 'same-record'
@@ -25427,6 +23847,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_observation_sources
                  SET cwd = '/work/pruned-fallback'
@@ -25465,6 +23886,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_observation_sources
                  SET processing_status = 'suppressed', suppressed_sha256 = 'suppressed'
@@ -25478,7 +23900,7 @@ mod tests {
         let (rollup_start_ms, rollup_end_ms) =
             model_rollup_closed_bounds(range_start_ms, range_end_ms);
         let (raw_scope_rows, hybrid_raw_rows, hybrid_rollup_rows) = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let raw_scope_rows = conn
                 .query_row(
                     &format!(
@@ -25566,6 +23988,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
                 [],
@@ -25611,6 +24034,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_usage_hourly
                  SET raw_pruned = 1
@@ -25622,6 +24046,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_usage_hourly
                  SET raw_pruned = 1
@@ -25637,6 +24062,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "DELETE FROM model_usage_observations
                  WHERE provider = 'claude' AND source_key = 'sk-hybrid-a'
@@ -25647,6 +24073,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "DELETE FROM model_usage_observations
                  WHERE provider = 'claude'
@@ -25679,6 +24106,7 @@ mod tests {
         empty_storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
                 [],
@@ -25718,6 +24146,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
                 [],
@@ -25736,6 +24165,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_observation_sources
                  SET processing_status = 'suppressed', suppressed_sha256 = 'suppressed'
@@ -25757,6 +24187,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "UPDATE model_observation_sources
                  SET processing_status = 'ok', suppressed_sha256 = NULL
@@ -25802,7 +24233,7 @@ mod tests {
             ),
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "DELETE FROM model_usage_observations
                  WHERE provider = 'claude'
@@ -26437,7 +24868,7 @@ mod tests {
         source_key: &str,
         table: &str,
     ) -> Vec<String> {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         let mut statement = conn
             .prepare(&format!(
                 "SELECT timestamp FROM {table}
@@ -26458,7 +24889,7 @@ mod tests {
     /// excluded from retention entirely, so the assertion is that this set is
     /// unaffected by an active watermark.
     fn live_timestamps(storage: &Storage, table: &str) -> Vec<String> {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         let mut statement = conn
             .prepare(&format!(
                 "SELECT timestamp FROM {table}
@@ -26481,7 +24912,7 @@ mod tests {
         provider: IntegrationProvider,
         source_key: &str,
     ) -> Vec<(&'static str, i64, String)> {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         OWNED_MARKER_COLUMNS
             .iter()
             .map(|(table, column)| {
@@ -26516,7 +24947,7 @@ mod tests {
         provider: IntegrationProvider,
         source_key: &str,
     ) -> i64 {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.query_row(
             "SELECT seen_generation FROM transcript_analytics_sources
              WHERE provider = ?1 AND source_key = ?2",
@@ -26527,7 +24958,7 @@ mod tests {
     }
 
     fn registry_mtime(storage: &Storage, provider: IntegrationProvider, source_key: &str) -> i64 {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.query_row(
             "SELECT mtime_ns FROM transcript_analytics_sources
              WHERE provider = ?1 AND source_key = ?2",
@@ -26693,7 +25124,7 @@ mod tests {
         );
 
         let stored: Vec<(String, Option<String>, Option<String>)> = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let mut statement = conn
                 .prepare(
                     "SELECT category, full_input, full_output
@@ -26805,7 +25236,7 @@ mod tests {
         // The source has to stay registered and reconcilable, so the registry
         // row is written exactly as an unfiltered replacement would write it.
         let registry: (String, i64, i64, String, i64) = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.query_row(
                 "SELECT processing_status, mtime_ns, size_bytes, content_sha256,
                         seen_generation
@@ -27053,7 +25484,7 @@ mod tests {
 
     /// Count rows in `table` bearing exactly `timestamp`, across every source.
     fn rows_at(storage: &Storage, table: &str, timestamp: &str) -> i64 {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         conn.query_row(
             &format!("SELECT COUNT(*) FROM {table} WHERE timestamp = ?1"),
             params![timestamp],
@@ -27108,7 +25539,7 @@ mod tests {
         }
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             for table in ["session_events", "tool_actions"] {
                 conn.execute(
                     &format!(
@@ -27595,7 +26026,7 @@ mod tests {
         }
 
         let storage = init_storage_in(&dir);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
 
         let version: i32 = conn
             .query_row(
@@ -27779,7 +26210,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
 
         let recorded_rows = |storage: &Storage| -> (i32, i64) {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let version: i32 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(version), 0) FROM schema_version",
@@ -27828,7 +26259,7 @@ mod tests {
         // then removing only migration 36's additive surface.
         let storage = init_storage_in(&dir);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute_batch(
                 "DELETE FROM schema_version WHERE version >= 36;
                  ALTER TABLE usage_snapshots DROP COLUMN source;
@@ -27847,7 +26278,7 @@ mod tests {
 
         let migrated = init_storage_in(&dir);
         {
-            let conn = migrated.conn.lock();
+            let conn = migrated.conn.lock().unwrap();
             for column in ["source", "account_id", "account_label"] {
                 assert!(
                     table_has_column(&conn, "usage_snapshots", column),
@@ -27875,7 +26306,7 @@ mod tests {
         // A normal restart must skip migration 36 and reopen cleanly.
         let reopened = init_storage_in(&dir);
         {
-            let conn = reopened.conn.lock();
+            let conn = reopened.conn.lock().unwrap();
             let migration_rows: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM schema_version WHERE version = 36",
@@ -27919,7 +26350,7 @@ mod tests {
         assert_eq!(cpa[0].account_label.as_deref(), Some("account@example.com"));
 
         {
-            let conn = reopened.conn.lock();
+            let conn = reopened.conn.lock().unwrap();
             conn.execute_batch(
                 "INSERT INTO usage_hourly
                      (hour, provider, bucket_key, bucket_label,
@@ -27947,7 +26378,7 @@ mod tests {
             .delete_settings_with_prefix("usage.cpa.")
             .expect("delete CPA usage settings");
         {
-            let conn = reopened.conn.lock();
+            let conn = reopened.conn.lock().unwrap();
             let cpa_snapshots: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM usage_snapshots WHERE source = 'cpa'",
@@ -28113,7 +26544,7 @@ mod tests {
         let fresh_dir = TempDir::new().expect("fresh tempdir");
         let fresh = init_storage_in(&fresh_dir);
         {
-            let conn = fresh.conn.lock();
+            let conn = fresh.conn.lock().unwrap();
             assert_rollup_schema(&conn);
             assert_eq!(
                 scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_hourly"),
@@ -28133,7 +26564,7 @@ mod tests {
         let existing_dir = TempDir::new().expect("existing tempdir");
         let existing = init_storage_in(&existing_dir);
         {
-            let conn = existing.conn.lock();
+            let conn = existing.conn.lock().unwrap();
             conn.execute_batch(
                 "INSERT INTO model_usage_observations (
                      provider, source_key, source_record_key, source_ordinal,
@@ -28165,7 +26596,7 @@ mod tests {
 
         let migrated = init_storage_in(&existing_dir);
         {
-            let conn = migrated.conn.lock();
+            let conn = migrated.conn.lock().unwrap();
             assert_rollup_schema(&conn);
             assert_eq!(
                 scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
@@ -28196,7 +26627,7 @@ mod tests {
         // A normal restart skips migration 37 and leaves one version record.
         let reopened = init_storage_in(&existing_dir);
         {
-            let conn = reopened.conn.lock();
+            let conn = reopened.conn.lock().unwrap();
             assert_rollup_schema(&conn);
             assert_eq!(
                 scalar_count(
@@ -28241,7 +26672,7 @@ mod tests {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         for table in TRANSCRIPT_ANALYTICS_TABLES {
             let archive = format!("{table}_legacy_v30");
             assert!(
@@ -28317,127 +26748,6 @@ mod tests {
                 );
             }
         }
-
-        clear_env();
-    }
-
-    /// One rename scenario: `(case name, renames applied in order, the
-    /// one-hop resolution each original path must end up with)`.
-    type RenameCase = (
-        &'static str,
-        &'static [(&'static str, &'static str)],
-        &'static [(&'static str, &'static str)],
-    );
-
-    /// Explicit project renames are collapsed on write so resolution stays a
-    /// single lookup: a chain `A -> B -> C` must resolve `A` straight to `C`,
-    /// and the `A -> B -> A` round trip must terminate without leaving a
-    /// self-referential row behind.
-    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Project Rename Chain Collapse]]
-    #[test]
-    #[serial]
-    fn project_rename_chains_collapse_to_a_single_hop() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-
-        // Rename sequences applied in order, then the resolution each
-        // original path must produce for later transcript replays.
-        const RENAME_CASES: &[RenameCase] = &[
-            (
-                "single-hop",
-                &[("/p/a1", "/p/b1")],
-                &[("/p/a1", "/p/b1"), ("/p/b1", "/p/b1")],
-            ),
-            (
-                "collapsed-chain",
-                &[("/p/a2", "/p/b2"), ("/p/b2", "/p/c2")],
-                &[("/p/a2", "/p/c2"), ("/p/b2", "/p/c2"), ("/p/c2", "/p/c2")],
-            ),
-            (
-                "round-trip",
-                &[("/p/a3", "/p/b3"), ("/p/b3", "/p/a3")],
-                &[("/p/a3", "/p/a3"), ("/p/b3", "/p/a3")],
-            ),
-            (
-                "three-step-cycle",
-                &[("/p/a4", "/p/b4"), ("/p/b4", "/p/c4"), ("/p/c4", "/p/a4")],
-                &[("/p/a4", "/p/a4"), ("/p/b4", "/p/a4"), ("/p/c4", "/p/a4")],
-            ),
-        ];
-
-        for (case, renames, expected) in RENAME_CASES.iter().copied() {
-            for (old_path, new_path) in renames {
-                storage
-                    .rename_project(old_path, new_path)
-                    .unwrap_or_else(|error| panic!("{case}: rename {old_path} failed: {error}"));
-            }
-
-            for (index, (project, resolved)) in expected.iter().enumerate() {
-                let source_key = format!("source-{case}-{index}");
-                let session_id = format!("session-{case}-{index}");
-                let spec = TranscriptSourceSpec {
-                    provider: IntegrationProvider::Claude,
-                    source_root_key: "root-rename",
-                    source_key: &source_key,
-                    session_id: &session_id,
-                    generation: 1,
-                    marker: "rename",
-                    rows: 0,
-                };
-                let snapshot = TranscriptAnalyticsSnapshot {
-                    source: crate::transcript_analytics::TranscriptAnalyticsSourceState {
-                        project: Some((*project).to_string()),
-                        ..spec.state()
-                    },
-                    ..spec.snapshot()
-                };
-                assert_eq!(
-                    storage
-                        .replace_transcript_analytics_snapshot(&snapshot)
-                        .expect("write renamed source"),
-                    TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts::default())
-                );
-                let stored: Option<String> = {
-                    let conn = storage.conn.lock();
-                    conn.query_row(
-                        "SELECT project FROM transcript_analytics_sources
-                         WHERE provider = 'claude' AND source_key = ?1",
-                        params![spec.source_key],
-                        |row| row.get(0),
-                    )
-                    .expect("read stored project")
-                };
-                assert_eq!(
-                    stored.as_deref(),
-                    Some(*resolved),
-                    "{case}: {project} must resolve to {resolved} in one hop"
-                );
-            }
-        }
-
-        // The CHECK plus the `old_path = new_path` sweep guarantee resolution
-        // always terminates: no row may point at itself.
-        let conn = storage.conn.lock();
-        assert_eq!(
-            scalar_count(
-                &conn,
-                "SELECT COUNT(*) FROM project_path_renames WHERE old_path = new_path"
-            ),
-            0,
-            "a self-referential rename row would make resolution non-terminating"
-        );
-        assert_eq!(
-            scalar_count(
-                &conn,
-                "SELECT COUNT(*) FROM project_path_renames AS source
-                 JOIN project_path_renames AS destination
-                   ON destination.old_path = source.new_path"
-            ),
-            0,
-            "every rename must be fully collapsed, so no destination is itself renamed"
-        );
-        drop(conn);
 
         clear_env();
     }
@@ -28671,6 +26981,7 @@ mod tests {
         let checkpoint = storage
             .conn
             .lock()
+            .unwrap()
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -28759,6 +27070,7 @@ mod tests {
         let hook_count = storage
             .conn
             .lock()
+            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM hook_invocations
                  WHERE provider = ?1 AND session_id = ?2",
@@ -28801,6 +27113,7 @@ mod tests {
         let rows = storage
             .conn
             .lock()
+            .unwrap()
             .prepare(
                 "SELECT provider, session_id, chain_id, parent_chain_id,
                         agent_id, is_sidechain, hostname
@@ -28865,6 +27178,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute_batch(
                 "CREATE TRIGGER fail_hook_audit
                  BEFORE INSERT ON hook_invocations
@@ -28928,7 +27242,7 @@ mod tests {
                     |row| row.get::<_, String>(0),
                 )
                 .expect("read committed lifecycle before progress");
-            observed_statuses.lock().push(status);
+            observed_statuses.lock().unwrap().push(status);
         };
         let controls = RollupBackfillControls {
             progress: Some(&observe),
@@ -28949,7 +27263,7 @@ mod tests {
             (report.progress.rows_done, report.progress.rows_total),
             (0, 0)
         );
-        assert_eq!(observed_statuses.into_inner(), vec!["complete"]);
+        assert_eq!(observed_statuses.into_inner().unwrap(), vec!["complete"]);
         assert!(
             elapsed < Duration::from_secs(1),
             "empty database should not pay corpus-scale startup overhead"
@@ -28994,7 +27308,7 @@ mod tests {
             &jsonl,
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO model_usage_hourly (
                      hour_utc, provider, derived_model_id, source_key,
@@ -29033,7 +27347,7 @@ mod tests {
             raw_model_hourly_rows(&storage),
             unpruned_model_hourly_rows(&storage)
         );
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM model_usage_hourly WHERE raw_pruned = 1",
@@ -29099,6 +27413,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute_batch(
                 "CREATE TRIGGER abort_model_backfill_bookmark
                  BEFORE UPDATE OF model_backfill_done_through_ms ON rollup_meta
@@ -29120,7 +27435,7 @@ mod tests {
             "{error}"
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert_eq!(
                 read_model_hourly_rollup_rows(
                     &conn,
@@ -29406,12 +27721,14 @@ mod tests {
             let before_checkpoint = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
                 before_samples
                     .lock()
+                    .unwrap()
                     .push(rollup_test_wal_bytes(&before_checkpoint_path));
             };
             let after_checkpoint_path = backfill_wal_path.clone();
             let progress = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
                 after_samples
                     .lock()
+                    .unwrap()
                     .push(rollup_test_wal_bytes(&after_checkpoint_path));
             };
             let after_chunk_calls = std::cell::Cell::new(0_usize);
@@ -29492,6 +27809,7 @@ mod tests {
             storage
                 .conn
                 .lock()
+                .unwrap()
                 .query_row(
                     "SELECT model_backfill_done_through_ms FROM rollup_meta WHERE id = 1",
                     [],
@@ -29528,6 +27846,7 @@ mod tests {
         let (live_raw, live_rolled) = storage
             .conn
             .lock()
+            .unwrap()
             .query_row(
                 "SELECT
                      (SELECT COUNT(*) FROM model_usage_observations
@@ -29547,8 +27866,8 @@ mod tests {
         let wal_bound_bytes = wal_bound_rows
             .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_WAL_BYTES_PER_ROW)
             .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_SPACE_MULTIPLIER);
-        let before_checkpoint = wal_before_checkpoint.lock().clone();
-        let after_checkpoint = wal_after_checkpoint.lock().clone();
+        let before_checkpoint = wal_before_checkpoint.lock().unwrap().clone();
+        let after_checkpoint = wal_after_checkpoint.lock().unwrap().clone();
         assert_rollup_wal_bound(
             "model",
             &before_checkpoint,
@@ -29595,7 +27914,7 @@ mod tests {
     }
 
     fn runtime_rollup_rows(storage: &Storage, source_key: &str) -> Vec<(i64, i64, f64, i64, i64)> {
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         let mut statement = conn
             .prepare(
                 "SELECT hour_utc, turn_count, runtime_secs,
@@ -29634,7 +27953,7 @@ mod tests {
         assert_eq!(report.terminal, RollupBackfillTerminal::Completed);
         assert_eq!(report.progress.rows_done, 0);
         assert_eq!(report.progress.rows_total, 0);
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT runtime_backfill_status,
@@ -29695,7 +28014,7 @@ mod tests {
             .replace_transcript_analytics_snapshot(&runtime_snapshot(&second_spec, &events))
             .expect("seed second oversized runtime source");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "INSERT INTO runtime_hourly (
                      hour_utc, provider, source_key, session_id, turn_count,
@@ -29762,7 +28081,7 @@ mod tests {
                 ),
             ]
         );
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT runtime_backfill_status FROM rollup_meta WHERE id = 1",
@@ -29968,12 +28287,14 @@ mod tests {
             let before_checkpoint = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
                 before_samples
                     .lock()
+                    .unwrap()
                     .push(rollup_test_wal_bytes(&before_checkpoint_path));
             };
             let after_checkpoint_path = backfill_wal_path.clone();
             let progress = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
                 after_samples
                     .lock()
+                    .unwrap()
                     .push(rollup_test_wal_bytes(&after_checkpoint_path));
             };
             let after_chunk_calls = std::cell::Cell::new(0_usize);
@@ -30055,6 +28376,7 @@ mod tests {
             storage
                 .conn
                 .lock()
+                .unwrap()
                 .query_row(
                     "SELECT runtime_backfill_done_through_rowid FROM rollup_meta WHERE id = 1",
                     [],
@@ -30096,6 +28418,7 @@ mod tests {
         let live_raw = storage
             .conn
             .lock()
+            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM session_events
                  WHERE source_key = 'runtime-contention-source-1'",
@@ -30109,8 +28432,8 @@ mod tests {
         let wal_bound_bytes = wal_bound_rows
             .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_WAL_BYTES_PER_ROW)
             .saturating_mul(crate::rollup_backfill::ROLLUP_BACKFILL_SPACE_MULTIPLIER);
-        let before_checkpoint = wal_before_checkpoint.lock().clone();
-        let after_checkpoint = wal_after_checkpoint.lock().clone();
+        let before_checkpoint = wal_before_checkpoint.lock().unwrap().clone();
+        let after_checkpoint = wal_after_checkpoint.lock().unwrap().clone();
         assert_rollup_wal_bound(
             "runtime",
             &before_checkpoint,
@@ -30219,7 +28542,6 @@ mod tests {
                 &tx,
                 state,
                 RollupBackfillChunkBudget {
-                    max_rows: 3,
                     deadline: Instant::now() + Duration::from_millis(250),
                 },
             )
@@ -30293,7 +28615,7 @@ mod tests {
         assert_eq!(hybrid.sparkline, reference.sparkline);
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE transcript_analytics_sources
                  SET processing_status = 'suppressed', suppressed_sha256 = 'hidden'
@@ -30311,7 +28633,7 @@ mod tests {
         assert_eq!(suppressed.session_count, 0);
         assert_eq!(suppressed.total_runtime_secs, 0.0);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE transcript_analytics_sources
                  SET processing_status = 'ok', suppressed_sha256 = NULL
@@ -30321,7 +28643,7 @@ mod tests {
             .expect("restore runtime source");
         }
 
-        let conn = storage.conn.lock();
+        let conn = storage.conn.lock().unwrap();
         let tail_rows = conn
             .query_row(
                 "SELECT COUNT(*)
@@ -30450,7 +28772,7 @@ mod tests {
         );
 
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             let finalized_rowid = conn
                 .query_row(
                     "SELECT rowid FROM session_events
@@ -30531,7 +28853,7 @@ mod tests {
             before_failed_replacement
         );
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert_eq!(
                 conn.query_row(
                     "SELECT rollup_generation FROM rollup_meta WHERE id = 1",
@@ -30559,7 +28881,7 @@ mod tests {
     // @lat: [[model-rollup-tests#Model Rollup Backfill Test Specs#Source Delete And Authoritative Re-ingest]]
     #[test]
     #[serial]
-    fn model_rollup_preserves_pruned_authority_on_reingest_and_source_delete() {
+    fn model_rollup_preserves_pruned_authority_on_reingest() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
@@ -30574,7 +28896,7 @@ mod tests {
             .replace_model_source(&source, &observations, &fingerprint)
             .expect("seed authoritative model source");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             conn.execute(
                 "UPDATE model_usage_hourly
                  SET raw_pruned = 1
@@ -30591,7 +28913,7 @@ mod tests {
             .replace_model_source(&source, &observations, &fingerprint)
             .expect("reingest partially retained source");
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert_eq!(
                 conn.query_row(
                     "SELECT obs_count, input_tokens, output_tokens, raw_pruned
@@ -30620,106 +28942,6 @@ mod tests {
                 1
             );
         }
-
-        storage
-            .delete_session_data(IntegrationProvider::Claude, "authority-session")
-            .expect("delete authoritative model session");
-        let conn = storage.conn.lock();
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM model_usage_hourly
-                 WHERE provider = 'claude' AND source_key = 'authority-source'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count deleted model rollups"),
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT COUNT(*) FROM model_usage_observations
-                 WHERE provider = 'claude' AND source_key = 'authority-source'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("count deleted model raw"),
-            0
-        );
-        drop(conn);
-        clear_env();
-    }
-
-    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Source Delete Invalidation]]
-    #[test]
-    #[serial]
-    fn runtime_source_delete_removes_rollup_state_and_retention_aggregate() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let spec = TranscriptSourceSpec {
-            provider: IntegrationProvider::Claude,
-            source_root_key: "delete-root",
-            source_key: "delete-runtime-source",
-            session_id: "delete-runtime-session",
-            generation: 1,
-            marker: "delete-runtime",
-            rows: 0,
-        };
-        let events = vec![
-            (
-                "2026-07-30T10:00:00Z".to_string(),
-                crate::sessions::SessionEventKind::UserText,
-            ),
-            (
-                "2026-07-30T10:01:00Z".to_string(),
-                crate::sessions::SessionEventKind::AsstText,
-            ),
-            (
-                "2026-07-30T10:11:00Z".to_string(),
-                crate::sessions::SessionEventKind::UserText,
-            ),
-        ];
-        storage
-            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
-            .expect("seed deleted runtime source");
-        storage
-            .conn
-            .lock()
-            .execute(
-                "INSERT INTO retention_daily_aggregates (
-                     provider, source_key, session_id, day, agent_id, file_path,
-                     tool_action_count, session_event_count, code_change_count,
-                     lines_added, lines_removed
-                 ) VALUES ('claude', ?1, ?2, '2026-07-30', '', '', 0, 2, 0, 0, 0)",
-                params![spec.source_key, spec.session_id],
-            )
-            .expect("seed runtime retention aggregate");
-
-        storage
-            .delete_session_data(IntegrationProvider::Claude, spec.session_id)
-            .expect("delete runtime session");
-        let conn = storage.conn.lock();
-        for table in [
-            "session_events",
-            "runtime_hourly",
-            "runtime_turn_state",
-            "retention_daily_aggregates",
-        ] {
-            assert_eq!(
-                conn.query_row(
-                    &format!(
-                        "SELECT COUNT(*) FROM {table}
-                         WHERE provider = 'claude' AND source_key = ?1"
-                    ),
-                    params![spec.source_key],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or_else(|error| panic!("count {table} after source delete: {error}")),
-                0,
-                "{table} retained deleted source state"
-            );
-        }
-        drop(conn);
         clear_env();
     }
 
@@ -30739,6 +28961,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "DELETE FROM model_usage_hourly
                  WHERE provider = 'claude' AND source_key = 'refusal-source'",
@@ -30772,6 +28995,7 @@ mod tests {
             storage
                 .conn
                 .lock()
+                .unwrap()
                 .query_row(
                     "SELECT COUNT(*) FROM model_usage_observations
                      WHERE provider = 'claude' AND source_key = 'refusal-source'",
@@ -30826,6 +29050,7 @@ mod tests {
         storage
             .conn
             .lock()
+            .unwrap()
             .execute(
                 "DELETE FROM runtime_hourly
                  WHERE provider = 'claude' AND source_key = ?1",
@@ -30859,6 +29084,7 @@ mod tests {
             storage
                 .conn
                 .lock()
+                .unwrap()
                 .query_row(
                     "SELECT COUNT(*) FROM session_events
                      WHERE provider = 'claude' AND source_key = ?1",
@@ -30927,6 +29153,7 @@ mod tests {
         let deleted_runtime_horizon = storage
             .conn
             .lock()
+            .unwrap()
             .query_row(
                 "SELECT MAX(rowid) FROM session_events
                  WHERE provider = 'claude' AND source_key = ?1
@@ -30938,6 +29165,7 @@ mod tests {
         let model_raw_count = storage
             .conn
             .lock()
+            .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM model_usage_observations
                  WHERE provider = 'claude' AND source_key = 'prune-model-source'",
@@ -30964,7 +29192,7 @@ mod tests {
         assert_eq!(report.deleted.model_usage_observations, model_raw_count);
         assert_eq!(report.deleted.session_events, 2);
         {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             assert_eq!(
                 conn.query_row(
                     "SELECT raw_pruned FROM model_usage_hourly
@@ -31013,7 +29241,7 @@ mod tests {
             .expect("complete runtime rollup for read");
         }
         let model_authority = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             read_model_hourly_rollup_rows(
                 &conn,
                 "SELECT hour_utc, provider, derived_model_id, source_key,
@@ -31038,7 +29266,7 @@ mod tests {
             .expect("rebuild model rollup after prune");
         assert_eq!(model_rebuild.terminal, RollupBackfillTerminal::Completed);
         let model_authority_after_rebuild = {
-            let conn = storage.conn.lock();
+            let conn = storage.conn.lock().unwrap();
             read_model_hourly_rollup_rows(
                 &conn,
                 "SELECT hour_utc, provider, derived_model_id, source_key,

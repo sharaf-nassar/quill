@@ -441,7 +441,7 @@ src-tauri/                    # Rust backend
   claude-integration/         # Resources bundled into the app for local Claude Code setup
     scripts/                  # Hook scripts deployed to ~/.config/quill/scripts/
       observe.cjs             # Captures tool observations (pre/post tool use)
-      report-tokens.sh        # Extracts tokens from transcript, POSTs to widget
+      report-tokens.cjs       # Extracts tokens from transcript, POSTs to widget
       session-sync.cjs        # Syncs session metadata and messages to widget
       context-capture.cjs     # Records continuity events, snapshots, and capture telemetry
       context-router.cjs      # Routes broad tool calls toward quill_* MCP tools (when enabled)

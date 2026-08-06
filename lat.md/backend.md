@@ -896,7 +896,7 @@ Widget analytics reads use independent, disposable SQLite connections so read IP
 
 [[src-tauri/src/storage.rs#Storage#open_view_reader]] opens the resolved database path with `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_NO_MUTEX`, intentionally omitting URI interpretation, and retains the established 5-second busy timeout plus WAL-compatible transient-memory pragmas. Each reader closes after one response so WAL checkpoints and compaction are not starved.
 
-The migrated view slice is [[src-tauri/src/storage.rs#Storage#get_all_bucket_stats]], [[src-tauri/src/storage.rs#Storage#get_context_savings_analytics]], [[src-tauri/src/storage.rs#Storage#get_token_history]], [[src-tauri/src/storage.rs#Storage#get_host_breakdown]], [[src-tauri/src/storage.rs#Storage#get_project_breakdown]], [[src-tauri/src/storage.rs#Storage#get_skill_breakdown]], [[src-tauri/src/storage.rs#Storage#get_hook_breakdown]], [[src-tauri/src/storage.rs#Storage#get_session_breakdown]], [[src-tauri/src/storage.rs#Storage#get_code_stats]], [[src-tauri/src/storage.rs#Storage#get_code_stats_history]], and [[src-tauri/src/storage.rs#Storage#get_llm_runtime_stats]]. Models aggregate, overview, history, and session reads use the same helper.
+The migrated view slice is [[src-tauri/src/storage.rs#Storage#get_context_savings_analytics]], [[src-tauri/src/storage.rs#Storage#get_token_history]], [[src-tauri/src/storage.rs#Storage#get_host_breakdown]], [[src-tauri/src/storage.rs#Storage#get_project_breakdown]], [[src-tauri/src/storage.rs#Storage#get_skill_breakdown]], [[src-tauri/src/storage.rs#Storage#get_hook_breakdown]], [[src-tauri/src/storage.rs#Storage#get_session_breakdown]], [[src-tauri/src/storage.rs#Storage#get_code_stats]], [[src-tauri/src/storage.rs#Storage#get_code_stats_history]], and [[src-tauri/src/storage.rs#Storage#get_llm_runtime_stats]]. Models aggregate, overview, history, and session reads use the same helper.
 
 Multi-statement reads run in deferred transactions, giving one response a stable WAL snapshot while ingest commits concurrently. Cache probes and cache misses share that snapshot. SQL rows are fully materialized before parsing, project merging, downsampling, runtime turn walking, or history bucketing begins, shortening reader lifetime as well as removing writer-mutex contention.
 
@@ -942,7 +942,7 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 - **token_hourly** — Hourly aggregates per provider/host (total tokens, turn_count). Unique on (hour, hostname, provider).
 - Analytics session history, compact token stats, and delete-session cleanup all treat sessions as `(provider, session_id)` pairs so Claude and Codex ids cannot collide.
 
-Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
+Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
 
 #### Model Analytics Evidence
 
@@ -1182,8 +1182,6 @@ The provider-neutral endpoint accepts the shared 11-event set and length-caps id
 
 The in-memory registry keys roots by provider, normalized hostname, and root session, then agents by `agent_id`. It retains at most 1,024 roots and 256 agent lifecycles per root. Startup/resume/clear establish coverage, compact preserves it, end clears it, and tracking/provider changes invalidate it. Missing identity, unsupported sources, ordering ambiguity, saturation, restart, or lost coverage returns null. A missed or blocked stop can leave a positive observed-open count until parent end or restart; no process-liveness claim is made.
 
-[[src-tauri/src/storage.rs#Storage#delete_session_data]] cascades direct deletion through all five analytics tables. Project and host deletion use retained registry ownership and recorded live origin instead of row-local guesses.
-
 Known limitation (Claude side): transcript extraction still sees only `hook_*` attachments for non-lifecycle Hooks-breakdown evidence. The managed live observer closes the four lifecycle groups needed by Sessions counts, not every silent Claude hook.
 
 #### Working Context Store
@@ -1224,7 +1222,7 @@ Migration 30 renames the five prior analytics tables to `*_legacy_v30` and rebui
 
 Carry-forward is limited to rows this machine can never rebuild from a local transcript. `hook_invocations` carries forward `provider = 'codex'` (Codex rollouts are never transcript-derived) or any row stamped with a hostname other than the local one, folding v29's `agent_id`-qualified duplicates onto the lowest rowid. `skill_usages` carries forward on the remote-host predicate alone. Only those two tables have a `hostname` column (migrations 22 and 27), so the other three cannot discriminate and retain everything in the archive. Every carried-forward session with a known hostname gets one `live_analytics_sessions` origin row, because project and host deletion reach source-less rows only through recorded live origin.
 
-Migration 31 adds `project_path_renames`, the authoritative old-to-new path mapping used by retained replay and live ingestion, plus `(provider, chain_id, timestamp)` runtime ordering support. Rename chains collapse to one destination, so future transcript metadata cannot revert an explicit project rename.
+Migration 31 adds `project_path_renames` plus `(provider, chain_id, timestamp)` runtime ordering support. The manage-data rename command and the ingest-side rename resolution that consulted this table were later removed, so the table persists only as inert schema history.
 
 [[src-tauri/src/lib.rs#run]] schedules whole-root transcript reconciliation during app setup, independently of Session Search or Analytics-window mounting. Blocking inventory and parsing run in the background under the same provider/root permits as live source work. An existing empty root proves an empty inventory; a missing, unreadable, or unavailable configured root is incomplete and cannot authorize pruning or marker clearance.
 
@@ -1291,12 +1289,6 @@ Retention is a recovery mechanism for existing corpora only; without this the sc
 A database written by a newer build cannot be downgraded in place, so `Storage::init` refuses it instead of starting an app that would silently record nothing.
 
 A version at [[src-tauri/src/storage.rs#MAX_SUPPORTED_SCHEMA_VERSION]] still opens; anything above it fails with the machine-readable `SCHEMA_TOO_NEW:` prefix callers match on. The refusal is a hard stop — the refused database's `schema_version` must be unchanged afterwards.
-
-##### Project Rename Chain Collapse
-
-Explicit project renames are collapsed on write so later transcript replay resolves an original path in a single lookup.
-
-A chain `A → B → C` must resolve `A` straight to `C`, and the `A → B → A` round trip must terminate without leaving a self-referential row — the case that previously hard-errored on `CHECK(old_path != new_path)` because the collapse `UPDATE` rewrote its own predecessor into a self-row mid-statement. No surviving destination may itself be renamed.
 
 ##### Batched Unchanged Source Refresh
 
@@ -1412,11 +1404,11 @@ Key-value configuration and schema migration version tracking.
 
 The Tauri commands registered in [[src-tauri/src/lib.rs]] are grouped by feature.
 
-### Usage and Token Commands (13)
+### Usage and Token Commands (14)
 
 Live usage and token analytics commands back provider quota, history, breakdown, and context-savings views.
 
-`fetch_usage_data`, `get_usage_history`, `get_usage_stats`, `get_all_bucket_stats`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_provider_token_series`, `get_activity_series`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_hook_breakdown`, `get_context_savings_analytics`.
+`fetch_usage_data`, `get_usage_history`, `get_snapshot_count`, `get_token_history`, `get_token_stats`, `get_provider_token_series`, `get_activity_series`, `get_token_hostnames`, `get_host_breakdown`, `get_session_breakdown`, `get_skill_breakdown`, `get_skill_project_breakdown`, `get_hook_breakdown`, `get_context_savings_analytics`.
 
 The live-usage commands now treat utilization history as `(provider, bucket_key)` data instead of assuming a single global Claude bucket label.
 
@@ -1466,17 +1458,17 @@ Model analytics IPC exposes overview, paged-session, session-detail, and backfil
 
 Storage and blocking-task failures stay in local logs. All four commands return only the bounded serialized model analytics error envelope, and model IDs use shared opaque Unicode validation without a catalog or version allowlist.
 
-### Indicator Commands (3)
+### Indicator Commands (2)
 
-`get_indicator_primary_provider`, `set_indicator_primary_provider`, and `get_indicator_state` keep one backend-owned indicator model shared across the tray title, tray summary rows, and the integrations menu.
+`get_indicator_primary_provider` and `set_indicator_primary_provider` keep one backend-owned indicator model shared across the tray title, tray summary rows, and the integrations menu.
 
 `set_indicator_primary_provider` persists the configured provider in the settings table, recomputes the resolved indicator state from the shared usage cache or fallback rows, and emits `indicator-updated` so the tray summary and integrations menu stay synchronized without a second polling path.
 
-### Project and Session Management (7)
+### Project and Session Management (3)
 
-`get_project_tokens`, `get_session_stats`, `get_project_breakdown`, `delete_project_data`, `rename_project`, `delete_host_data`, `delete_session_data`.
+`get_project_tokens`, `get_session_stats`, `get_project_breakdown`.
 
-`delete_session_data` deletes token snapshots and all five transcript analytics tables for the selected `(provider, session_id)` pair, plus every model source owned by that provider-qualified analytics/root session. Model observation children are removed before retained source fingerprints become suppressed, preventing a retry from resurrecting unchanged deleted evidence. Project rename updates retained/live ownership and cwd-bearing analytics in the same transaction, then preserves that choice through `project_path_renames` on future replay.
+The manage-data deletion and rename commands (`delete_host_data`, `delete_session_data`, `delete_project_data`, `rename_project`) and their storage helpers were removed; no shipped surface invoked them.
 
 ### Integration Commands (15)
 
@@ -1818,14 +1810,14 @@ the two retention modules, matching call shapes rather than words so a doc
 comment cannot trip it — because a scheduler added later is the most likely way
 this non-goal gets lost, and no behavioural test would notice.
 
-### Learning Commands (18)
+### Learning Commands (14)
 
 Commands for managing the behavioral learning pipeline settings, rules, and observations.
 Read and trigger commands accept an optional provider filter so the UI can request Claude-only, Codex-only, or combined learning views.
 
-`get_learning_settings`, `set_learning_settings`, `get_learning_capability`, `get_learned_rules`, `delete_learned_rule`, `promote_learned_rule`, `rollback_rule`, `reactivate_rule`, `submit_rule_feedback`, `record_reviewer_override`, `run_rule_evaluation`, `get_learning_runs`, `trigger_analysis`, `get_observation_count`, `get_unanalyzed_observation_count`, `get_top_tools`, `get_observation_sparkline`, `read_rule_content`.
+`get_learning_settings`, `set_learning_settings`, `get_learning_capability`, `get_learned_rules`, `delete_learned_rule`, `promote_learned_rule`, `submit_rule_feedback`, `get_learning_runs`, `trigger_analysis`, `get_observation_count`, `get_unanalyzed_observation_count`, `get_top_tools`, `get_observation_sparkline`, `read_rule_content`.
 
-State-changing learning commands are authorized (feature 005 US2 — H-4 / FR-011, see `specs/005-learning-system-hardening/contracts/ipc-and-feedback.md`). At startup the backend mints an ephemeral per-process capability token (`OsRng`, held only in Tauri managed state, never persisted). `get_learning_capability` returns it ONLY to the window whose label is `learning`. A single reusable guard runs first on every mutating command — constant-time token compare via the `subtle` crate plus a `learning`-window-label assertion — and is applied to `delete_learned_rule`, `promote_learned_rule`, `rollback_rule`, `reactivate_rule`, `submit_rule_feedback`, `record_reviewer_override`, and `run_rule_evaluation` (each gains a `token` arg). All three `submit_rule_feedback` values (`accept`/`reject`/`bad`) are guarded — `bad` writes a durable tombstone and changes active state, while `accept`/`reject` carry the same trust as promote/delete per the contract (feature 005 US3 — FR-029). `record_reviewer_override` (feature 005 US4 — FR-020) writes one audited `reviewer_overrides` row via [[src-tauri/src/storage.rs#Storage#record_reviewer_override]] (reason required, non-empty; `overridden_by` = the authorized window label) — the only way to approve a rule whose latest counterfactual verdict regresses the replay set. `run_rule_evaluation` (feature 005 US4 — V5/FR-019) is the in-app trigger for the otherwise-unreachable [[src-tauri/src/eval_harness.rs]]: it builds the [[src-tauri/src/eval_harness.rs#RuleUnderTest]] via [[src-tauri/src/storage.rs#Storage#eval_inputs_for_rule]], `await`s `eval_harness::run_evaluation` (NOT wrapped in `run_blocking`), attributes the verdict to the latest `completed|degraded` run, persists one `evaluation_results` row via [[src-tauri/src/storage.rs#Storage#persist_evaluation_result]], and returns a compact summary (verdict + warn-not-block cautions). Read commands (`get_learned_rules`, `read_rule_content`, `get_learning_runs`, …) stay unauthenticated. The HTTP `POST /api/v1/learning/rules` ingest keeps its bearer auth and is clamped to `lifecycle='candidate'` — its payload carries no lifecycle field and `store_learned_rule` is structurally incapable of producing `awaiting_review`/`active`.
+State-changing learning commands are authorized (feature 005 US2 — H-4 / FR-011, see `specs/005-learning-system-hardening/contracts/ipc-and-feedback.md`). At startup the backend mints an ephemeral per-process capability token (`OsRng`, held only in Tauri managed state, never persisted). `get_learning_capability` returns it ONLY to the window whose label is `learning`. A single reusable guard runs first on every mutating command — constant-time token compare via the `subtle` crate plus a `learning`-window-label assertion — and is applied to `delete_learned_rule`, `promote_learned_rule`, and `submit_rule_feedback` (each gains a `token` arg). All three `submit_rule_feedback` values (`accept`/`reject`/`bad`) are guarded — `bad` writes a durable tombstone and changes active state, while `accept`/`reject` carry the same trust as promote/delete per the contract (feature 005 US3 — FR-029). The counterfactual evaluation harness and its command surface (`run_rule_evaluation`, `record_reviewer_override`, `rollback_rule`, `reactivate_rule`) were removed; promotion no longer consults evaluation results. Read commands (`get_learned_rules`, `read_rule_content`, `get_learning_runs`, …) stay unauthenticated. The HTTP `POST /api/v1/learning/rules` ingest keeps its bearer auth and is clamped to `lifecycle='candidate'` — its payload carries no lifecycle field and `store_learned_rule` is structurally incapable of producing `awaiting_review`/`active`.
 
 `get_top_tools` intentionally reads exact raw-observation windows instead of reusing `observation_summaries`, because summary rows are keyed by cleanup period rather than original event timestamps. The backend relies on the covering observation indexes above to keep that exact-window query responsive.
 
@@ -1839,12 +1831,12 @@ State-changing learning commands are authorized (feature 005 US2 — H-4 / FR-01
 
 `get_session_subagent_tree(provider, session_id) -> Vec<SubagentNode>` is retained for sub-agent drilldowns; no shipped surface calls it today, because the widget's compact Sessions rows do not expand. Implementation in [[src-tauri/src/storage.rs#Storage#get_session_subagent_tree]] returns one node per `agent_id` for the requested `(provider, session_id)`, carrying `parent_agent_id` (null at depth 1; populated when Claude later spawns depth-2+ sub-agents and rebuilt at query time from `parent_uuid` chains), `first_seen`/`last_active`, `turn_count`, the input/output/cache/total token breakdown, `tool_call_count`, and a reserved `label: Option<String>` (always `None` today).
 
-### Memory Optimizer Commands (16)
+### Memory Optimizer Commands (15)
 
 Commands for managing memory files, optimization runs, and suggestion approval workflows.
 Most read and trigger commands accept an optional provider filter for Claude, Codex, or combined views.
 
-`get_memory_files`, `trigger_memory_optimization`, `get_optimization_suggestions`, `approve_suggestion`, `deny_suggestion`, `undeny_suggestion`, `undo_suggestion`, `approve_suggestion_group`, `deny_suggestion_group`, `get_suggestions_for_run`, `get_optimization_runs`, `get_known_projects`, `add_custom_project`, `remove_custom_project`, `delete_memory_file`, `delete_project_memories`.
+`get_memory_files`, `trigger_memory_optimization`, `get_optimization_suggestions`, `approve_suggestion`, `deny_suggestion`, `undeny_suggestion`, `undo_suggestion`, `approve_suggestion_group`, `deny_suggestion_group`, `get_optimization_runs`, `get_known_projects`, `add_custom_project`, `remove_custom_project`, `delete_memory_file`, `delete_project_memories`.
 
 ### Session Indexing Commands (4)
 
@@ -1852,9 +1844,9 @@ Most read and trigger commands accept an optional provider filter for Claude, Co
 
 `sync_search_index` runs an mtime-based incremental sweep — not a wipe-and-rebuild — so a true rebuild requires deleting the on-disk index dir while the app is closed (or bumping `SCHEMA_VERSION` in [[src-tauri/src/sessions.rs]]).
 
-### Restart Commands (7)
+### Restart Commands (5)
 
-`discover_restart_instances`, `discover_claude_instances` (compat alias), `request_restart`, `cancel_restart`, `get_restart_status`, `install_restart_hooks`, `check_restart_hooks_installed`.
+`request_restart`, `cancel_restart`, `get_restart_status`, `install_restart_hooks`, `check_restart_hooks_installed`.
 
 Restart commands expose a shared provider-aware row model across Claude and Codex. Hook install/check commands accept an optional provider parameter so restart setup can be applied per provider.
 
@@ -1885,7 +1877,7 @@ provider configuration.
 
 `rescan_integrations` is the explicit retry path: it calls [[src-tauri/src/integrations/manager.rs#force_rescan]] (which clears the cached login-shell PATH and dynamic-prefix cache via [[src-tauri/src/config.rs#refresh_shell_path]] and reruns `startup_refresh`), then invalidates and re-warms the usage cache so a previously-N/A provider that just flipped to detected is reflected in the tray indicator without waiting for the next polling cycle. Used by the integrations menu's "Rescan PATH" button when the user has just installed a CLI or edited shell config.
 
-Detection runs via `--version` checks for CLI providers through the shared [[src-tauri/src/config.rs#detect_provider_cli]] helper, which both `claude::detect` and `codex::detect` delegate to so a single fix to PATH augmentation, error handling, or timeouts covers both providers. The shared resolver in [[src-tauri/src/config.rs#resolve_command_path]] layers a login-shell `command -v` lookup with a static fallback list (bun, cargo, deno, volta, npm-global, n, asdf, mise, nodenv, Nix profile, yarn classic, `~/.claude/local/`, Linuxbrew, Homebrew, MacPorts, snap) and dynamic `npm config get prefix` / `bun pm bin -g` / `yarn global bin` queries — covering installs whose dirs only appear in interactive shell config (`~/.zshrc`) which `zsh -lc` does not source. Dynamic-prefix outputs are validated against a trusted-roots allow-list before being added to the candidate list so a malicious `npm config set prefix /tmp/evil` cannot trick Quill into executing an attacker-controlled binary. Failed detections record every path inspected on `ProviderStatus.lastDetectionAttempts` with `$HOME` redacted to `~/...` (and the field skipped from JSON when empty) so the integrations menu can show a per-row diagnostic tooltip without leaking the local username. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]], [[src-tauri/src/integrations/claude.rs]], [[src-tauri/src/integrations/codex.rs]], and [[src-tauri/src/config.rs]].
+Detection runs via `--version` checks for CLI providers through the shared [[src-tauri/src/config.rs#detect_provider_cli]] helper, which both `claude_setup::detect` and `codex::detect` delegate to so a single fix to PATH augmentation, error handling, or timeouts covers both providers. The shared resolver in [[src-tauri/src/config.rs#resolve_command_path]] layers a login-shell `command -v` lookup with a static fallback list (bun, cargo, deno, volta, npm-global, n, asdf, mise, nodenv, Nix profile, yarn classic, `~/.claude/local/`, Linuxbrew, Homebrew, MacPorts, snap) and dynamic `npm config get prefix` / `bun pm bin -g` / `yarn global bin` queries — covering installs whose dirs only appear in interactive shell config (`~/.zshrc`) which `zsh -lc` does not source. Dynamic-prefix outputs are validated against a trusted-roots allow-list before being added to the candidate list so a malicious `npm config set prefix /tmp/evil` cannot trick Quill into executing an attacker-controlled binary. Failed detections record every path inspected on `ProviderStatus.lastDetectionAttempts` with `$HOME` redacted to `~/...` (and the field skipped from JSON when empty) so the integrations menu can show a per-row diagnostic tooltip without leaking the local username. Service-only providers like MiniMax skip CLI detection and use API key presence instead. Implementation lives in [[src-tauri/src/integrations/mod.rs]], [[src-tauri/src/claude_setup.rs]], [[src-tauri/src/integrations/codex.rs]], and [[src-tauri/src/config.rs]].
 
 ## Event System
 
@@ -1971,18 +1963,16 @@ The backend uses Tokio for async operations with specific patterns:
 
 - `tokio::task::block_in_place()` for sync DB/file operations within async context
 - `tokio::spawn()` and `tauri::async_runtime::spawn()` for background tasks
-- `parking_lot::Mutex<T>` for fast synchronization (preferred over `std::sync::Mutex`)
-- `parking_lot::RwLock<T>` for invalidatable single-writer caches (e.g. the login-shell PATH cache in [[src-tauri/src/config.rs]]) where `std::sync::RwLock` would risk poisoning across the process on writer panic
+- `std::sync::Mutex<T>` / `std::sync::RwLock<T>` for synchronization, including invalidatable single-writer caches (e.g. the login-shell PATH cache in [[src-tauri/src/config.rs]]); the `parking_lot` dependency was removed
 - `Arc<T>` for shared ownership across task boundaries
-- `OnceLock<T>` for one-time initialization of globals (STORAGE, HTTP_CLIENT) — used only for caches that never need to be invalidated; invalidatable caches use `parking_lot::Mutex<Option<T>>` or `parking_lot::RwLock<Option<T>>` instead
+- `OnceLock<T>` for one-time initialization of globals (STORAGE, HTTP_CLIENT) — used only for caches that never need to be invalidated; invalidatable caches use `std::sync::Mutex<Option<T>>` or `std::sync::RwLock<Option<T>>` instead
 
 ## Platform-Specific Code
 
 Conditional compilation targets for Unix signal handling, macOS Keychain, and cross-platform paths.
 
 - `#[cfg(unix)]` — Process signal handling (SIGUSR1 for restart), nix crate for signal/process, `setsid` + env-var handshake for update-driven relaunch (see [[architecture#Architecture#Single Instance]])
-- `#[cfg(target_os = "linux")]` — `/proc/<pid>/exe` parent-binary detection in [[src-tauri/src/lib.rs#detect_parent_same_binary_pid]] for the one-time relaunch transition
-- `#[cfg(target_os = "macos")]` — Keychain integration for credential reading; `libc::proc_pidpath` for parent-binary detection in [[src-tauri/src/lib.rs#detect_parent_same_binary_pid]]
+- `#[cfg(target_os = "macos")]` — Keychain integration for credential reading
 - Cross-platform path resolution via `dirs` crate
 
 ## Error Handling
@@ -2011,4 +2001,4 @@ All call-sites that previously hard-coded the data dir, learned-rules dir, or Cl
 
 The override is gated by an explicit opt-in: `QUILL_DEMO_MODE=1` is required, and `QUILL_DATA_DIR` / `QUILL_RULES_DIR` / `QUILL_CLAUDE_PROJECTS_DIR` are otherwise ignored even when set. With opt-in active and a per-variable override set, paths are canonicalized via `std::fs::canonicalize` (creating the directory first if missing); a canonicalize failure exits the process with code 2 so the demo never silently falls back to the real data dir under a confused launcher. A one-time `[quill-demo] data_dir=… rules_dir=…` banner prints to stderr on first resolver call so a demo run is impossible to confuse with a real one. With `QUILL_DEMO_MODE` unset, behavior is byte-identical to the production path table above.
 
-Used by the marketing-site screenshot-capture workflow (`scripts/run_quill_demo.sh` / `.ps1`); see [[infrastructure#Scripts#Demo Launcher]].
+Used by the marketing-site screenshot-capture workflow (`scripts/run_quill_demo.sh`); see [[infrastructure#Scripts#Demo Launcher]].

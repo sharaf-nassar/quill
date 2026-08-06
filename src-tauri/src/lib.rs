@@ -10,7 +10,6 @@ mod context_category;
 mod cpa;
 mod crash_reporting;
 pub mod data_paths;
-mod eval_harness;
 mod fetcher;
 mod git_analysis;
 mod indicator;
@@ -49,17 +48,16 @@ mod tray_keepalive;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
-    ActivitySeriesResponse, BucketStats, CodeStats, CodeStatsHistoryPoint,
-    ContextPreservationStatus, ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown,
-    LearnedRule, LearningRun, LearningSettings, LlmRuntimeStats, ModelAnalyticsError,
-    ModelAnalyticsErrorCode, ModelAnalyticsUpdatedEvent, ModelBackfillState, ModelBackfillStatus,
-    ModelIdentity, ModelRange, ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown,
-    ProjectTokens, ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
+    ActivitySeriesResponse, CodeStats, CodeStatsHistoryPoint, ContextPreservationStatus,
+    ContextSavingsAnalytics, DataPoint, HookBreakdown, HostBreakdown, LearnedRule, LearningRun,
+    LearningSettings, LlmRuntimeStats, ModelAnalyticsError, ModelAnalyticsErrorCode,
+    ModelAnalyticsUpdatedEvent, ModelBackfillState, ModelBackfillStatus, ModelIdentity, ModelRange,
+    ModelSessionsResponse, ModelUsageOverviewResponse, ProjectBreakdown, ProjectTokens,
+    ProviderErrorKind, ProviderStatus, ProviderTokenSeriesResponse, RuntimeSettings,
     SessionBreakdown, SessionCodeStats, SessionModelHistoryResponse, SessionRef, SessionStats,
     SkillBreakdown, SkillProjectBreakdown, StatusIndicatorState, SubagentNode, TokenDataPoint,
     TokenStats, ToolCount, UsageBucket, UsageData, UsageProviderError, UsageSource,
 };
-use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rand::RngCore;
 use rollup_backfill::{
     RollupBackfillControls, RollupBackfillProgress, RollupBackfillTerminal,
@@ -71,6 +69,7 @@ use std::sync::{
     Arc, OnceLock, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 };
+use std::sync::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use storage::Storage;
 use subtle::ConstantTimeEq;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem};
@@ -130,7 +129,7 @@ fn rollup_backfill_write_gate() -> &'static Mutex<()> {
 }
 
 pub(crate) fn begin_ingest_quiesce() -> IngestQuiesceGuard {
-    let gate = ingest_gate().write();
+    let gate = ingest_gate().write().unwrap();
     MAINTENANCE_IN_PROGRESS.store(true, AtomicOrdering::Release);
     IngestQuiesceGuard { _gate: gate }
 }
@@ -148,7 +147,7 @@ pub(crate) fn begin_ingest_quiesce() -> IngestQuiesceGuard {
 /// cannot make the HTTP surface start returning 503s for a lease it does not
 /// hold.
 pub(crate) fn try_begin_ingest_quiesce() -> Option<IngestQuiesceGuard> {
-    let gate = ingest_gate().try_write()?;
+    let gate = ingest_gate().try_write().ok()?;
     MAINTENANCE_IN_PROGRESS.store(true, AtomicOrdering::Release);
     Some(IngestQuiesceGuard { _gate: gate })
 }
@@ -170,7 +169,7 @@ pub(crate) fn ingest_is_quiesced() -> bool {
 /// the gate is held waits until it is released, preserving the write rather
 /// than dropping it on a transient SQLite lock.
 pub(crate) fn with_ingest_write_permit<T>(operation: impl FnOnce() -> T) -> T {
-    let _gate = ingest_gate().read();
+    let _gate = ingest_gate().read().unwrap();
     operation()
 }
 
@@ -180,8 +179,33 @@ pub(crate) fn with_ingest_write_permit<T>(operation: impl FnOnce() -> T) -> T {
 /// Storage's primary connection. The ingest permit only excludes maintenance,
 /// so these two writers need this narrow gate without serializing other ingest.
 pub(crate) fn with_rollup_backfill_write_permit<T>(operation: impl FnOnce() -> T) -> T {
-    let _gate = rollup_backfill_write_gate().lock();
+    let _gate = rollup_backfill_write_gate().lock().unwrap();
     with_ingest_write_permit(operation)
+}
+
+/// Lowercase hex encoding (drop-in for the removed `hex` crate).
+pub(crate) fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Decode a hex string (drop-in for the removed `hex::decode`).
+pub(crate) fn hex_decode(input: &str) -> Result<Vec<u8>, String> {
+    if !input.is_ascii() || !input.len().is_multiple_of(2) {
+        return Err("invalid hex string".to_string());
+    }
+    (0..input.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&input[index..index + 2], 16)
+                .map_err(|error| format!("invalid hex string: {error}"))
+        })
+        .collect()
 }
 // How long the fatal-storage dialog gets to come back with an answer before
 // the watchdog terminates the process anyway. Long enough to read the dialog
@@ -413,7 +437,7 @@ impl RetainedSourceRunnerState {
         }
 
         let key = RetainedLiveSourceKey::from_source(&source);
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock().unwrap();
         let admission = if let Some(queued) = inner.live_sources.get_mut(&key) {
             if queued.source.canonical_path != source.canonical_path
                 || queued.source.source_root_key != source.source_root_key
@@ -456,7 +480,7 @@ impl RetainedSourceRunnerState {
     }
 
     fn take_ready(&self, domain: RetainedLiveDomain, limit: usize) -> Vec<RetainedDomainJob> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock().unwrap();
         let now = std::time::Instant::now();
         let mut jobs = Vec::new();
         for (key, queued) in &mut inner.live_sources {
@@ -482,7 +506,7 @@ impl RetainedSourceRunnerState {
     }
 
     fn finish(&self, domain: RetainedLiveDomain, job: &RetainedDomainJob, succeeded: bool) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock().unwrap();
         let Some(queued) = inner.live_sources.get_mut(&job.key) else {
             return;
         };
@@ -511,7 +535,7 @@ impl RetainedSourceRunnerState {
     }
 
     fn finish_or_next_delay(&self, domain: RetainedLiveDomain) -> Option<std::time::Duration> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock().unwrap();
         inner
             .live_sources
             .retain(|_, source| source.model.has_work() || source.transcript.has_work());
@@ -544,7 +568,7 @@ impl RetainedSourceRunnerState {
     fn try_reserve_retained_backfill(
         self: &Arc<Self>,
     ) -> Option<ModelHistoryBackfillScheduleReservation> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock().unwrap();
         if inner.retained_backfill_scheduled {
             return None;
         }
@@ -555,12 +579,12 @@ impl RetainedSourceRunnerState {
     }
 
     fn release_retained_backfill(&self) {
-        self.inner.lock().retained_backfill_scheduled = false;
+        self.inner.lock().unwrap().retained_backfill_scheduled = false;
         self.wake.notify_waiters();
     }
 
     fn retained_backfill_is_scheduled(&self) -> bool {
-        self.inner.lock().retained_backfill_scheduled
+        self.inner.lock().unwrap().retained_backfill_scheduled
     }
 }
 
@@ -1357,7 +1381,7 @@ struct UsageCacheEntry {
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
-        if let Some(pos) = LAST_POSITION.lock().take() {
+        if let Some(pos) = LAST_POSITION.lock().unwrap().take() {
             let _ = w.set_position(pos);
         }
         let _ = w.set_focus();
@@ -1450,13 +1474,7 @@ fn wait_for_predecessor_exit() {
         Err(_) => None,
     };
 
-    // Fallback for the one-time transition from a predecessor binary that
-    // did not yet set the env var: if our parent's executable is the same
-    // as ours, the parent is almost certainly a previous Quill instance
-    // doing an update-driven relaunch. Wait for it. Linux uses
-    // `/proc/<pid>/exe`; macOS uses `proc_pidpath`.
-    let target_pid = env_pid.or_else(detect_parent_same_binary_pid);
-    let Some(pid_value) = target_pid else {
+    let Some(pid_value) = env_pid else {
         return;
     };
 
@@ -1489,54 +1507,6 @@ fn wait_for_predecessor_exit() {
     {
         let _ = pid_value;
     }
-}
-
-fn detect_parent_same_binary_pid() -> Option<i32> {
-    #[cfg(target_os = "linux")]
-    {
-        let ppid_raw = nix::unistd::getppid().as_raw();
-        if ppid_raw <= 1 {
-            return None;
-        }
-        let parent_exe = std::fs::read_link(format!("/proc/{}/exe", ppid_raw)).ok()?;
-        let our_exe = std::fs::read_link("/proc/self/exe").ok()?;
-        if parent_exe == our_exe {
-            return Some(ppid_raw);
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let ppid_raw = nix::unistd::getppid().as_raw();
-        if ppid_raw <= 1 {
-            return None;
-        }
-        let parent_exe = macos_proc_pidpath(ppid_raw)?;
-        let our_exe = std::env::current_exe().ok()?;
-        // Canonicalize both sides so symlinks (e.g. /usr/local/bin/quill ->
-        // /Applications/Quill.app/Contents/MacOS/quill) compare correctly.
-        let parent_canon = parent_exe.canonicalize().ok()?;
-        let our_canon = our_exe.canonicalize().ok()?;
-        if parent_canon == our_canon {
-            return Some(ppid_raw);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn macos_proc_pidpath(pid: i32) -> Option<std::path::PathBuf> {
-    use std::ffi::{CStr, c_void};
-    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    // SAFETY: buf is a valid mutable buffer of the size accepted by
-    // proc_pidpath; the call writes a NUL-terminated path on success and
-    // returns the byte length written (excluding the NUL), or <= 0 on
-    // failure.
-    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
-    if len <= 0 {
-        return None;
-    }
-    let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
-    Some(std::path::PathBuf::from(cstr.to_str().ok()?))
 }
 
 fn indicator_now_text(state: &StatusIndicatorState) -> String {
@@ -1944,7 +1914,7 @@ fn load_http_auth_secret() -> String {
             log::warn!("Failed to load auth secret, generating ephemeral: {error}");
             let mut bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut bytes);
-            hex::encode(bytes)
+            hex_encode(bytes)
         }
     }
 }
@@ -2323,7 +2293,7 @@ fn provider_status_key(
         .collect::<Vec<_>>();
     if let Some(connection) = cpa_connection {
         let digest = Sha256::digest(connection.base_url.as_bytes());
-        fields.push(format!("cpa:{}", hex::encode(&digest[..8])));
+        fields.push(format!("cpa:{}", hex_encode(&digest[..8])));
     } else {
         fields.push("cpa:off".to_string());
     }
@@ -2338,6 +2308,7 @@ fn load_cpa_connection() -> Result<Option<integrations::cpa::CpaConnection>, Str
 fn current_usage_cache(provider_status_key: &str) -> Option<UsageData> {
     usage_cache()
         .lock()
+        .unwrap()
         .as_ref()
         .filter(|entry| entry.provider_status_key == provider_status_key)
         .map(|entry| entry.usage.clone())
@@ -2346,6 +2317,7 @@ fn current_usage_cache(provider_status_key: &str) -> Option<UsageData> {
 fn current_usage_context() -> Option<(Vec<ProviderStatus>, UsageData)> {
     usage_cache()
         .lock()
+        .unwrap()
         .as_ref()
         .map(|entry| (entry.statuses.clone(), entry.usage.clone()))
 }
@@ -2357,6 +2329,7 @@ fn current_recent_usage_cache(provider_status_key: &str, force: bool) -> Option<
     let recent_cutoff = Utc::now() - TimeDelta::seconds(LIVE_USAGE_REFRESH_INTERVAL_SECS);
     usage_cache()
         .lock()
+        .unwrap()
         .as_ref()
         .filter(|entry| entry.provider_status_key == provider_status_key)
         .and_then(|entry| (entry.refreshed_at >= recent_cutoff).then(|| entry.usage.clone()))
@@ -2367,7 +2340,7 @@ fn store_usage_cache(
     provider_status_key: &str,
     statuses: &[ProviderStatus],
 ) -> UsageData {
-    *usage_cache().lock() = Some(UsageCacheEntry {
+    *usage_cache().lock().unwrap() = Some(UsageCacheEntry {
         refreshed_at: Utc::now(),
         provider_status_key: provider_status_key.to_string(),
         statuses: statuses.to_vec(),
@@ -2379,7 +2352,7 @@ fn store_usage_cache(
 async fn clear_usage_cache() {
     let _refresh_guard = usage_refresh_lock().lock().await;
     USAGE_CACHE_EPOCH.fetch_add(1, AtomicOrdering::SeqCst);
-    *usage_cache().lock() = None;
+    *usage_cache().lock().unwrap() = None;
 }
 
 fn enabled_providers(statuses: &[ProviderStatus]) -> Vec<integrations::IntegrationProvider> {
@@ -3093,19 +3066,6 @@ async fn set_indicator_primary_provider(
 }
 
 #[tauri::command]
-async fn get_indicator_state() -> Result<StatusIndicatorState, String> {
-    match run_blocking(integrations::detect_all) {
-        Ok(statuses) => current_indicator_state(&statuses),
-        Err(error) => {
-            if let Some((statuses, usage)) = current_usage_context() {
-                return build_indicator_state(&statuses, &usage);
-            }
-            Err(error)
-        }
-    }
-}
-
-#[tauri::command]
 async fn get_usage_history(
     provider: integrations::IntegrationProvider,
     bucket_key: String,
@@ -3113,34 +3073,6 @@ async fn get_usage_history(
 ) -> Result<Vec<DataPoint>, String> {
     let storage = get_storage()?;
     run_blocking(move || storage.get_usage_history(provider, &bucket_key, &range))
-}
-
-#[tauri::command]
-async fn get_usage_stats(
-    provider: integrations::IntegrationProvider,
-    bucket_key: String,
-    days: i32,
-) -> Result<BucketStats, String> {
-    let storage = get_storage()?;
-    run_blocking(move || storage.get_usage_stats(provider, &bucket_key, days))
-}
-
-#[tauri::command]
-async fn get_all_bucket_stats(buckets_json: String, days: i32) -> Result<Vec<BucketStats>, String> {
-    let started_at = std::time::Instant::now();
-    let storage = get_storage()?;
-    let buckets: Vec<models::UsageBucket> =
-        serde_json::from_str(&buckets_json).map_err(|e| format!("Failed to parse buckets: {e}"))?;
-    let range_for_log = format!("{days}d");
-    let result = run_blocking(move || storage.get_all_bucket_stats(&buckets, days));
-    log_analytics_command_timing(
-        "get_all_bucket_stats",
-        &range_for_log,
-        None,
-        "miss",
-        started_at,
-    );
-    result
 }
 
 #[tauri::command]
@@ -3579,82 +3511,6 @@ async fn get_skill_project_breakdown(
     run_blocking(move || {
         storage.get_skill_project_breakdown(&skill_name, &range, provider, all_time, limit)
     })
-}
-
-#[tauri::command]
-async fn delete_project_data(cwd: String, app: tauri::AppHandle) -> Result<u64, String> {
-    let storage = get_storage()?;
-    let (event_snapshot, result) = run_blocking(move || {
-        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
-        let result = storage.delete_project_data(&cwd)?;
-        Ok((event_snapshot, result))
-    })?;
-    if result.model_data_changed() {
-        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
-    }
-    if result.transcript_data_changed() {
-        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
-    }
-    Ok(result.affected_rows())
-}
-
-#[tauri::command]
-async fn rename_project(
-    old_cwd: String,
-    new_cwd: String,
-    app: tauri::AppHandle,
-) -> Result<u64, String> {
-    let storage = get_storage()?;
-    let (event_snapshot, result) = run_blocking(move || {
-        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
-        let result = storage.rename_project(&old_cwd, &new_cwd)?;
-        Ok((event_snapshot, result))
-    })?;
-    if result.model_data_changed() {
-        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
-    }
-    if result.transcript_data_changed() {
-        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
-    }
-    Ok(result.affected_rows())
-}
-
-#[tauri::command]
-async fn delete_host_data(hostname: String, app: tauri::AppHandle) -> Result<u64, String> {
-    let storage = get_storage()?;
-    let (event_snapshot, result) = run_blocking(move || {
-        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
-        let result = storage.delete_host_data(&hostname)?;
-        Ok((event_snapshot, result))
-    })?;
-    if result.model_data_changed() {
-        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
-    }
-    if result.transcript_data_changed() {
-        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
-    }
-    Ok(result.affected_rows())
-}
-
-#[tauri::command]
-async fn delete_session_data(
-    provider: integrations::IntegrationProvider,
-    session_id: String,
-    app: tauri::AppHandle,
-) -> Result<u64, String> {
-    let storage = get_storage()?;
-    let (event_snapshot, result) = run_blocking(move || {
-        let event_snapshot = model_usage::read_model_analytics_event_snapshot(storage)?;
-        let result = storage.delete_session_data(provider, &session_id)?;
-        Ok((event_snapshot, result))
-    })?;
-    if result.model_data_changed() {
-        model_usage::emit_model_analytics_updated(&app, &event_snapshot, true);
-    }
-    if result.transcript_data_changed() {
-        let _ = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ());
-    }
-    Ok(result.affected_rows())
 }
 
 #[tauri::command]
@@ -4105,6 +3961,7 @@ fn apply_runtime_settings(
 ) -> Result<RuntimeSettings, String> {
     let _transition_guard = RUNTIME_SETTINGS_TRANSITION_LOCK
         .try_lock()
+        .ok()
         .ok_or_else(|| RUNTIME_SETTINGS_BUSY_ERROR.to_string())?;
     let previous = load_runtime_settings(storage);
     settings.live_usage_interval_seconds = settings
@@ -4341,7 +4198,7 @@ fn try_reset_rollup_rebuild(
 }
 
 fn try_admit_rollup_rebuild() -> Option<RwLockReadGuard<'static, ()>> {
-    ingest_gate().try_read()
+    ingest_gate().try_read().ok()
 }
 
 /// Clear raw-backed rollup state and schedule a resumable rebuild.
@@ -4868,8 +4725,10 @@ struct RetentionMaintenanceContext<'a> {
     /// Chunks between free-space re-checks.
     free_space_recheck_chunks: u32,
     /// `None` uses the real `statvfs`.
+    #[cfg(test)]
     free_space: Option<retention_engine::FreeSpaceProbe<'a>>,
     /// Called after every committed chunk. Nothing in production installs one.
+    #[cfg(test)]
     after_chunk: Option<retention_engine::ChunkHook<'a>>,
     /// Write a local JSONL sidecar before the first delete transaction.
     archive_before_delete: bool,
@@ -4887,7 +4746,9 @@ impl<'a> RetentionMaintenanceContext<'a> {
             emit_invalidation,
             chunk_rows: retention_engine::RETENTION_CHUNK_ROWS,
             free_space_recheck_chunks: retention_engine::RETENTION_FREE_SPACE_RECHECK_CHUNKS,
+            #[cfg(test)]
             free_space: None,
+            #[cfg(test)]
             after_chunk: None,
             archive_before_delete: false,
         }
@@ -5015,7 +4876,9 @@ fn execute_retention_maintenance(
     let controls = retention_engine::RetentionDeleteControls {
         chunk_rows: context.chunk_rows,
         free_space_recheck_chunks: context.free_space_recheck_chunks,
+        #[cfg(test)]
         free_space: context.free_space,
+        #[cfg(test)]
         after_chunk: context.after_chunk,
         scan_progress: Some(scan_progress),
         delete_progress: Some(&delete_progress),
@@ -5256,7 +5119,7 @@ impl LearningCapability {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         Self {
-            token: hex::encode(bytes),
+            token: hex_encode(bytes),
         }
     }
 }
@@ -5353,42 +5216,6 @@ async fn promote_learned_rule(
     Ok(())
 }
 
-/// Forward-restore a rule to a prior immutable `rule_versions` snapshot and
-/// rewrite its on-disk `.md` in one transaction (feature 005 US2 T035 — see
-/// contracts/ipc-and-feedback.md). Authorized via the T034 guard.
-#[tauri::command]
-async fn rollback_rule(
-    name: String,
-    target_version: i64,
-    token: String,
-    window: tauri::WebviewWindow,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    guard_learning_mutation(&app, &window, &token)?;
-    let storage = get_storage()?;
-    run_blocking(move || storage.rollback_rule(&name, target_version))?;
-    let _ = app.emit("learning-updated", ());
-    Ok(())
-}
-
-/// Clear a rule's tombstone (records `reactivated_at/by`) and reset its
-/// lifecycle to `candidate` so it must re-earn review. Only path that
-/// un-blocks a tombstoned rule (feature 005 US2 T035). Authorized via the
-/// T034 guard.
-#[tauri::command]
-async fn reactivate_rule(
-    name: String,
-    token: String,
-    window: tauri::WebviewWindow,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    guard_learning_mutation(&app, &window, &token)?;
-    let storage = get_storage()?;
-    run_blocking(move || storage.reactivate_rule(&name))?;
-    let _ = app.emit("learning-updated", ());
-    Ok(())
-}
-
 /// Upsert operator feedback for a rule (feature 005 US3 T046 — see
 /// contracts/ipc-and-feedback.md / research.md R-5). All three values are
 /// authorized via the T034 guard: `bad` writes a durable tombstone and
@@ -5420,101 +5247,6 @@ async fn submit_rule_feedback(
     run_blocking(move || storage.submit_rule_feedback(&name, &feedback, note.as_deref()))?;
     let _ = app.emit("learning-updated", ());
     Ok(())
-}
-
-/// Record an audited regression override for a rule (feature 005 US4 T053 —
-/// see contracts/evaluation-harness.md "Promotion coupling" / FR-020).
-/// `reason` is REQUIRED and validated non-empty by storage; the override
-/// becomes part of provenance and is the ONLY way to approve a rule whose
-/// latest counterfactual verdict regresses the replay set. Authorized via
-/// the T034 guard (state-changing learning mutation).
-#[tauri::command]
-async fn record_reviewer_override(
-    rule_name: String,
-    replay_set_version: i64,
-    reason: String,
-    token: String,
-    window: tauri::WebviewWindow,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    guard_learning_mutation(&app, &window, &token)?;
-    let storage = get_storage()?;
-    // `overridden_by` is the authorized learning window; the per-process
-    // capability token is never persisted, so attribute by window label.
-    let overridden_by = window.label().to_string();
-    run_blocking(move || {
-        storage.record_reviewer_override(&rule_name, replay_set_version, &overridden_by, &reason)
-    })?;
-    let _ = app.emit("learning-updated", ());
-    Ok(())
-}
-
-/// Compact summary returned to the maintainer/UI after a counterfactual
-/// evaluation (feature 005 US4 T053). Mirrors the blocking subset of
-/// `eval_harness::EvalOutcome` the promotion gate consults so the UI can
-/// show the verdict + the warn-not-block cautions.
-#[derive(serde::Serialize)]
-struct EvalRunSummary {
-    rule_name: String,
-    verdict: String,
-    regression: bool,
-    negative_transfer: bool,
-    judge_uncalibrated: bool,
-    replay_set_stale: bool,
-    replay_set_version: i64,
-    agreement_score: f64,
-    learning_run_id: Option<i64>,
-    persisted_row_id: i64,
-}
-
-/// Run the counterfactual evaluation harness for one rule and persist the
-/// verdict (feature 005 US4 T053, V5/FR-019 — see
-/// contracts/evaluation-harness.md). This is the in-app trigger that makes
-/// the otherwise-unreachable `eval_harness` usable: it loads the frozen
-/// replay set, runs the WITH/WITHOUT + judge arms, attributes the result to
-/// the latest `completed|degraded` run (or `None`), persists one
-/// `evaluation_results` row via T052, and returns a compact summary. The
-/// async harness call is NOT wrapped in `run_blocking` (it must drive the
-/// `cc_client` spawn); only the surrounding storage I/O is. Authorized via
-/// the T034 guard.
-#[tauri::command]
-async fn run_rule_evaluation(
-    name: String,
-    token: String,
-    window: tauri::WebviewWindow,
-    app: tauri::AppHandle,
-) -> Result<EvalRunSummary, String> {
-    guard_learning_mutation(&app, &window, &token)?;
-    let storage = get_storage()?;
-
-    let lookup_name = name.clone();
-    let (mut rule, run_id) = run_blocking(move || storage.eval_inputs_for_rule(&lookup_name))?;
-    // Score the candidate as-named regardless of the per-case stub names.
-    rule.name = name.clone();
-
-    let mut outcome = eval_harness::run_evaluation(rule)
-        .await
-        .map_err(|e| format!("Evaluation failed: {e}"))?;
-    // The harness runs replay-set-only and leaves `learning_run_id` None;
-    // attribute it to the originating run for the persisted row.
-    outcome.learning_run_id = run_id;
-
-    let row = outcome.to_row();
-    let persisted_row_id = run_blocking(move || storage.persist_evaluation_result(&row))?;
-
-    let _ = app.emit("learning-updated", ());
-    Ok(EvalRunSummary {
-        rule_name: outcome.rule_name,
-        verdict: outcome.verdict.as_str().to_string(),
-        regression: outcome.regression,
-        negative_transfer: outcome.negative_transfer,
-        judge_uncalibrated: outcome.calibration.judge_uncalibrated,
-        replay_set_stale: outcome.staleness.stale,
-        replay_set_version: outcome.replay_set_version,
-        agreement_score: outcome.calibration.kappa,
-        learning_run_id: outcome.learning_run_id,
-        persisted_row_id,
-    })
 }
 
 #[tauri::command]
@@ -5730,14 +5462,6 @@ async fn deny_suggestion_group(group_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn get_suggestions_for_run(
-    run_id: i64,
-) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
-    let storage = get_storage()?;
-    run_blocking(move || storage.get_suggestions_for_run(run_id))
-}
-
-#[tauri::command]
 async fn get_optimization_runs(
     project_path: String,
     provider: Option<integrations::IntegrationProvider>,
@@ -5829,7 +5553,7 @@ async fn remove_custom_project(path: String) -> Result<(), String> {
 #[tauri::command]
 async fn hide_window(window: tauri::WebviewWindow) {
     if let Ok(pos) = window.outer_position() {
-        *LAST_POSITION.lock() = Some(pos);
+        *LAST_POSITION.lock().unwrap() = Some(pos);
     }
     let _ = window.hide();
 }
@@ -6441,10 +6165,7 @@ pub fn run() {
             refresh_usage_data,
             get_indicator_primary_provider,
             set_indicator_primary_provider,
-            get_indicator_state,
             get_usage_history,
-            get_usage_stats,
-            get_all_bucket_stats,
             get_snapshot_count,
             get_model_usage_overview,
             get_model_sessions,
@@ -6464,10 +6185,6 @@ pub fn run() {
             get_session_subagent_tree,
             get_session_stats,
             get_project_tokens,
-            delete_host_data,
-            delete_project_data,
-            rename_project,
-            delete_session_data,
             get_context_savings_analytics,
             get_context_preservation_status,
             set_context_preservation_enabled,
@@ -6499,11 +6216,7 @@ pub fn run() {
             get_learned_rules,
             delete_learned_rule,
             promote_learned_rule,
-            rollback_rule,
-            reactivate_rule,
             submit_rule_feedback,
-            record_reviewer_override,
-            run_rule_evaluation,
             get_learning_runs,
             trigger_analysis,
             get_observation_count,
@@ -6520,7 +6233,6 @@ pub fn run() {
             undo_suggestion,
             approve_suggestion_group,
             deny_suggestion_group,
-            get_suggestions_for_run,
             get_optimization_runs,
             get_known_projects,
             add_custom_project,
@@ -6535,8 +6247,6 @@ pub fn run() {
             sessions::get_session_context,
             sessions::get_search_facets,
             sessions::sync_search_index,
-            restart::discover_restart_instances,
-            restart::discover_claude_instances,
             restart::request_restart,
             restart::cancel_restart,
             restart::get_restart_status,
@@ -6626,7 +6336,7 @@ mod tests {
         assert!(current_recent_usage_cache(key, false).is_some());
         assert!(current_recent_usage_cache(key, true).is_none());
 
-        *usage_cache().lock() = None;
+        *usage_cache().lock().unwrap() = None;
     }
 
     #[test]
@@ -6664,7 +6374,7 @@ mod tests {
         state.finish(RetainedLiveDomain::Model, &model[0], true);
         state.finish(RetainedLiveDomain::Transcript, &transcript[0], false);
 
-        let inner = state.inner.lock();
+        let inner = state.inner.lock().unwrap();
         let queued = inner.live_sources.values().next().expect("retry retained");
         assert!(!queued.model.has_work());
         assert!(queued.transcript.pending);
@@ -6686,7 +6396,7 @@ mod tests {
         assert_eq!(admission, RetainedLiveQueueAdmission::Coalesced);
 
         state.finish(RetainedLiveDomain::Model, &running[0], true);
-        let inner = state.inner.lock();
+        let inner = state.inner.lock().unwrap();
         let queued = inner
             .live_sources
             .values()
@@ -6716,7 +6426,7 @@ mod tests {
             );
         }
 
-        let inner = state.inner.lock();
+        let inner = state.inner.lock().unwrap();
         let failing = inner
             .live_sources
             .values()
@@ -6902,7 +6612,7 @@ mod tests {
         );
         drop(active);
 
-        let initial_reader = ingest_gate().read();
+        let initial_reader = ingest_gate().read().unwrap();
         let (attempting_tx, attempting_rx) = mpsc::channel();
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -7089,7 +6799,8 @@ mod tests {
     fn recording_scan_sink() -> (Arc<Mutex<Vec<u8>>>, retention_engine::ScanProgressSink) {
         let recorded: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let target = Arc::clone(&recorded);
-        let sink: retention_engine::ScanProgressSink = Arc::new(move |pct| target.lock().push(pct));
+        let sink: retention_engine::ScanProgressSink =
+            Arc::new(move |pct| target.lock().unwrap().push(pct));
         (recorded, sink)
     }
 
@@ -7184,7 +6895,7 @@ mod tests {
 
         // The counting phase visibly advances: it opens at zero and closes at
         // 100 through each table's third of the bar, never going backwards.
-        let recorded = progress.lock().clone();
+        let recorded = progress.lock().unwrap().clone();
         assert_eq!(Some(&0), recorded.first(), "{recorded:?}");
         assert_eq!(Some(&100), recorded.last(), "{recorded:?}");
         assert!(
@@ -7394,14 +7105,15 @@ mod tests {
     fn retention_phase_probe() -> (RetentionPhaseSink, RetentionPhaseLog) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
-        let sink: RetentionPhaseSink =
-            Arc::new(move |phase: &'static str, pct: u8| sink_log.lock().push((phase, pct)));
+        let sink: RetentionPhaseSink = Arc::new(move |phase: &'static str, pct: u8| {
+            sink_log.lock().unwrap().push((phase, pct))
+        });
         (sink, log)
     }
 
     fn retention_phase_order(log: &RetentionPhaseLog) -> Vec<&'static str> {
         let mut ordered: Vec<&'static str> = Vec::new();
-        for (phase, _) in log.lock().iter() {
+        for (phase, _) in log.lock().unwrap().iter() {
             if ordered.last() != Some(phase) {
                 ordered.push(phase);
             }
@@ -7556,7 +7268,7 @@ mod tests {
         assert_eq!(None, result.cutoff);
 
         // Nothing ran, so nothing announced itself and nothing was invalidated.
-        assert!(phases.lock().is_empty());
+        assert!(phases.lock().unwrap().is_empty());
         assert!(invalidations.borrow().is_empty());
 
         // The policy commands take no lease at all — they are settings reads —
@@ -7646,7 +7358,7 @@ mod tests {
             );
             assert_eq!(0, result.tool_actions_deleted, "{label}");
             assert_eq!(0, result.session_events_deleted, "{label}");
-            assert!(phases.lock().is_empty(), "{label}");
+            assert!(phases.lock().unwrap().is_empty(), "{label}");
             assert!(invalidations.borrow().is_empty(), "{label}");
             assert_eq!(
                 None,

@@ -5,12 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build && npm run verify:sentry-output",
     "test:cached-invoke": "node --test scripts/cached-invoke.test.mjs",
+    "test:csp": "node --test scripts/csp.test.mjs",
+    "test:sentry-build": "node --test scripts/sentry-build.test.mjs",
     "test:session-subagents": "node --test scripts/session-subagents.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
+    "verify:sentry-output": "node scripts/verify-sentry-output.mjs",
     "lint": "eslint src/",
     "knip": "knip"
   },

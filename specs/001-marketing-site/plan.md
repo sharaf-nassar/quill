@@ -81,8 +81,7 @@ src-tauri/src/
 scripts/
 ├── populate_dummy_data.py                   # MODIFIED — accepts --data-dir / --rules-dir (FR-018)
 ├── take_screenshots.sh                      # MODIFIED — captures additional views (Context tab, Settings)
-├── run_quill_demo.sh                        # NEW — POSIX launcher (Linux + macOS) (FR-018)
-└── run_quill_demo.ps1                       # NEW — Windows PowerShell launcher (FR-018)
+└── run_quill_demo.sh                        # NEW — POSIX launcher (Linux + macOS) (FR-018)
 
 CLAUDE.md                                    # MODIFIED — SPECKIT block points at this plan
 ```

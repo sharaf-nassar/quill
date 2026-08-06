@@ -183,24 +183,21 @@ body {
   background: rgba(255, 255, 255, 0.08);
 }
 
-.confirm-dialog-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(7, 7, 10, 0.68);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  z-index: 400;
-}
-
 .confirm-dialog {
-  width: min(420px, 100%);
+  /* Native <dialog>: reset UA styles (color/max-width), keep margin auto
+     centering. Width matches the old 16px backdrop padding constraint. */
+  width: min(420px, calc(100vw - 32px));
+  max-width: none;
+  color: inherit;
   background: var(--panel-raised);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 8px;
   box-shadow: 0 24px 40px rgba(0, 0, 0, 0.45);
   padding: 18px;
+}
+
+.confirm-dialog::backdrop {
+  background: rgba(7, 7, 10, 0.68);
 }
 
 .confirm-dialog-title {
@@ -2438,15 +2435,18 @@ body {
   display: inline-flex;
   align-self: stretch;
   align-items: center;
-  gap: var(--space-2xs);
+  gap: var(--space-xs);
+  margin-inline: auto;
   min-width: 0;
   max-width: 160px;
   flex: 0 1 auto;
   line-height: 1;
+  letter-spacing: 0.04em;
   color: var(--provider-agent);
 }
 
 .wg-row[data-agents="true"] .wg-row-name {
+  flex: 0 1 auto;
   min-width: 48px;
 }
 

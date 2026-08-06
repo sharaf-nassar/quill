@@ -23,7 +23,7 @@ That keeps combined analytics provider-safe while still sharing one token pipeli
 
 Analytics session drill-down uses the same provider plus session id pair when requesting token history, compact token stats, or session deletion, so identical ids from different providers stay isolated.
 
-Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (13)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the widget runtime readout needs to exclude the sub-agent traffic instead.
+Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the widget runtime readout needs to exclude the sub-agent traffic instead.
 
 ## Database Maintenance Pipeline
 
@@ -255,15 +255,11 @@ A reserved model-history backfill must gate model work only; transcript jobs rem
 
 ### Live Analytics Origin
 
-Source-less analytics retain only origin fields explicitly supplied by their live producer, so project and host deletion never guesses session membership.
+Source-less analytics retain only origin fields explicitly supplied by their live producer, so ownership is always recorded rather than guessed from row-local data.
 
 [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] commits `/sessions/messages` runtime rows with project, full cwd, hostname, and native chain identity, or `/hooks/observed` hook rows with cwd, beside one `live_analytics_sessions` mapping. The optional cwd and chain wire fields preserve older clients. Later writes merge non-null origin fields.
 
 The HTTP handler validates every flattened message before persistence: UUIDs are trimmed, non-empty, and unique; roles are `user` or `assistant`; timestamps parse as RFC3339; explicit child rows require consistent root, chain, parent, and agent IDs; supplied event kinds must be a canonical role-specific subsequence. Any malformed row rejects the whole batch with `400 Bad Request`. Message UUID plus explicit per-message event ordinal provides stable live event identity, while response timing still consumes one original message row. Storage repeats identity and contiguous-ordinal checks inside one transaction. A `2xx` response means that transaction committed, so the bridge may advance its durable cursor; storage failure returns `500`, while missing or failed Tantivy indexing cannot discard committed analytics.
-
-Explicit deletion resolves retained rows through `transcript_analytics_sources` and source-less rows through `live_analytics_sessions`, always preserving provider identity. Project and host matches first resolve provider/root pairs, then expand to every sibling source under those roots. Direct session deletion also removes legacy source-less rows lacking a mapping. Retained registry rows become durable suppression tombstones, so unchanged or changed files cannot recreate deleted analytics without an explicit restore workflow.
-
-Project rename updates both ownership registries plus cwd-bearing skill and hook rows in one transaction. Migration 31 records a collapsed authoritative path alias, which retained replacement and live writes resolve before persistence; later transcript metadata therefore cannot restore the old project. [[src-tauri/src/storage.rs#Storage#rename_project]] retires a reversed alias with an explicit `DELETE` before collapsing predecessors: a reversal (`A→B` then `B→A`) otherwise made the collapse `UPDATE` rewrite its own predecessor into a self-row mid-statement, which `CHECK(old_path != new_path)` rejected before the trailing self-row sweep could run. Rename and deletion emit `transcript-analytics-updated` only when affected analytics changed.
 
 Raw candidate paths retry only while ownership validation is unavailable; invalid candidates are dropped. A validated canonical source enters the shared coordinator in one non-fallible state mutation after managed state exists, so admission cannot partially accept one analytics domain. Session Search availability remains independent.
 

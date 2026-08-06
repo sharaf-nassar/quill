@@ -382,10 +382,6 @@ pub struct ObservedHookObservation {
     pub model: Option<String>,
 }
 
-#[doc(hidden)]
-#[allow(dead_code)]
-pub type CodexHookObservation = ObservedHookObservation;
-
 /// One sub-agent node inside a parent session, returned by
 /// `get_session_subagent_tree`. Multi-level nesting is supported via
 /// `parent_agent_id`; today every chain originates from the parent
@@ -609,20 +605,6 @@ pub struct ProjectBreakdown {
     pub turn_count: i64,
     pub session_count: i64,
     pub last_active: String,
-}
-
-#[derive(Serialize, Clone, Debug)]
-pub struct BucketStats {
-    pub provider: IntegrationProvider,
-    pub key: String,
-    pub label: String,
-    pub current: f64,
-    pub avg: f64,
-    pub max: f64,
-    pub min: f64,
-    pub time_above_80: f64,
-    pub trend: String,
-    pub sample_count: i64,
 }
 
 // --- Learning system models ---

@@ -24,8 +24,8 @@ use crate::transcript_identity::{
     parse_jsonl_records, read_stable_transcript, resolve_codex_native_identity,
 };
 use chrono::DateTime;
-use parking_lot::{Condvar, Mutex};
 use serde_json::Value;
+use std::sync::{Condvar, Mutex};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TranscriptReconciliationRootKey {
@@ -45,7 +45,7 @@ struct TranscriptReconciliationPermit {
 impl Drop for TranscriptReconciliationPermit {
     fn drop(&mut self) {
         let (active, wake) = &*ACTIVE_TRANSCRIPT_RECONCILIATION_ROOTS;
-        let mut active = active.lock();
+        let mut active = active.lock().unwrap();
         for root in &self.roots {
             active.remove(root);
         }
@@ -76,9 +76,9 @@ fn acquire_transcript_reconciliation(
     }
 
     let (active, wake) = &*ACTIVE_TRANSCRIPT_RECONCILIATION_ROOTS;
-    let mut active = active.lock();
+    let mut active = active.lock().unwrap();
     while roots.iter().any(|root| active.contains(root)) {
-        wake.wait(&mut active);
+        active = wake.wait(active).unwrap();
     }
     active.extend(roots.iter().cloned());
     Ok(TranscriptReconciliationPermit { roots })

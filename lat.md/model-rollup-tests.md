@@ -28,7 +28,7 @@ A source replaced between chunks must remain equal to the current raw group-by a
 
 ## Source Delete And Authoritative Re-ingest
 
-Re-ingest must never add retained raw into an authoritative pruned bucket, and explicit source deletion must remove both raw evidence and every hourly authority for that source.
+Re-ingest of a live source must never add retained raw into an authoritative pruned bucket; pruned-hour authority survives the replacement fold. The explicit-deletion half of this spec went with the removed manage-data delete commands.
 
 ## Live Suppression Read Time Invalidation
 

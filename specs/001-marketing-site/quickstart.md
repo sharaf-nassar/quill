@@ -6,7 +6,7 @@ How to refresh the marketing site (especially screenshots) end-to-end, without t
 
 - A working Quill installation OR a checkout you can build (`cargo build --release` from `src-tauri/`).
 - Python 3 (already required for the existing seeder).
-- POSIX shell (Linux / macOS) or PowerShell (Windows).
+- POSIX shell (Linux / macOS).
 - For Linux screenshot capture only: `xdotool` and ImageMagick (`import`) — already required by `scripts/take_screenshots.sh`.
 - A modern browser to preview the site locally (Chromium-based for Lighthouse verification).
 
@@ -17,12 +17,6 @@ How to refresh the marketing site (especially screenshots) end-to-end, without t
 scripts/run_quill_demo.sh                      # uses /tmp/quill-demo-$USER
 scripts/run_quill_demo.sh --clean              # nuke and reseed first
 scripts/run_quill_demo.sh --bin /custom/quill  # use a specific binary
-```
-
-```powershell
-# Windows
-scripts/run_quill_demo.ps1
-scripts/run_quill_demo.ps1 -Clean
 ```
 
 The launcher prints the sandbox path on start, e.g.:

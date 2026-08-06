@@ -904,10 +904,6 @@
   justify-content: center;
 }
 
-.learning-run-icon--live-text {
-  color: var(--meter-green);
-}
-
 .learning-run-live-dot {
   width: 6px;
   height: 6px;

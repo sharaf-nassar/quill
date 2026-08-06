@@ -14,3 +14,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs
+- [[crash-reporting-tests]] — Rust crash payload privacy and release identity test specs

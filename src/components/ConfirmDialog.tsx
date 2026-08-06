@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -28,45 +28,53 @@ function ConfirmDialog({
   onCancel,
   onConfirm,
 }: ConfirmDialogProps) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
   useEffect(() => {
-    if (!open) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) {
-        onCancel();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [open, busy, onCancel]);
+    const dialog = dialogRef.current;
+    if (open && dialog && !dialog.open) dialog.showModal();
+  }, [open]);
 
   if (!open) return null;
 
   return (
-    <div className="confirm-dialog-backdrop" onMouseDown={() => !busy && onCancel()}>
-      <div
-        className="confirm-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <h2 className="confirm-dialog-title">{title}</h2>
-        <p className="confirm-dialog-description">{description}</p>
-        {children}
-        <div className="confirm-dialog-actions">
-          <button className="confirm-dialog-btn" onClick={onCancel} disabled={busy}>
-            {cancelLabel}
-          </button>
-          <button
-            className={`confirm-dialog-btn confirm-dialog-btn--confirm${destructive ? " confirm-dialog-btn--destructive" : ""}`}
-            onClick={onConfirm}
-            disabled={busy || confirmDisabled}
-          >
-            {busy ? "Working..." : confirmLabel}
-          </button>
-        </div>
+    <dialog
+      ref={dialogRef}
+      className="confirm-dialog"
+      aria-label={title}
+      onCancel={(event) => {
+        // Escape while busy must not dismiss, matching the button guards.
+        if (busy) event.preventDefault();
+      }}
+      onClose={onCancel}
+      onMouseDown={(event) => {
+        // Backdrop clicks dispatch to the dialog element itself; a click
+        // inside the panel (including its padding) lands within its rect.
+        const rect = event.currentTarget.getBoundingClientRect();
+        const inside =
+          event.clientX >= rect.left &&
+          event.clientX <= rect.right &&
+          event.clientY >= rect.top &&
+          event.clientY <= rect.bottom;
+        if (!inside && !busy) onCancel();
+      }}
+    >
+      <h2 className="confirm-dialog-title">{title}</h2>
+      <p className="confirm-dialog-description">{description}</p>
+      {children}
+      <div className="confirm-dialog-actions">
+        <button className="confirm-dialog-btn" onClick={onCancel} disabled={busy}>
+          {cancelLabel}
+        </button>
+        <button
+          className={`confirm-dialog-btn confirm-dialog-btn--confirm${destructive ? " confirm-dialog-btn--destructive" : ""}`}
+          onClick={onConfirm}
+          disabled={busy || confirmDisabled}
+        >
+          {busy ? "Working..." : confirmLabel}
+        </button>
       </div>
-    </div>
+    </dialog>
   );
 }
 

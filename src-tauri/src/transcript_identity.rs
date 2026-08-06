@@ -170,7 +170,7 @@ pub(crate) fn read_stable_transcript(
 
 /// Hash the exact stable bytes consumed by either analytics parser.
 pub(crate) fn model_source_content_sha256(content: &[u8]) -> String {
-    hex::encode(Sha256::digest(content))
+    crate::hex_encode(Sha256::digest(content))
 }
 
 /// One successfully decoded JSONL record and its zero-based source ordinal.

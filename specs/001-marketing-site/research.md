@@ -63,21 +63,20 @@ All current call-sites in `src-tauri/src/lib.rs` and adjacent modules that compu
 
 ## R4. Cross-platform launcher shape
 
-**Decision**: Two parallel scripts:
+**Decision**: One launcher script:
 - `scripts/run_quill_demo.sh` — POSIX shell, used on Linux and macOS.
-- `scripts/run_quill_demo.ps1` — PowerShell, used on Windows.
 
-Both:
-1. Compute a sandbox directory under the platform's temp dir (`/tmp/quill-demo-$USER` on POSIX, `$env:TEMP\quill-demo-$env:USERNAME` on Windows). The path is stable per user so re-running the launcher reuses the same dataset; an optional `--clean` / `-Clean` flag wipes it first.
+It:
+1. Compute a sandbox directory under the platform's temp dir (`/tmp/quill-demo-$USER`). The path is stable per user so re-running the launcher reuses the same dataset; an optional `--clean` flag wipes it first.
 2. Set `QUILL_DEMO_MODE=1`, `QUILL_DATA_DIR=$SANDBOX/data`, `QUILL_RULES_DIR=$SANDBOX/rules`.
 3. Invoke the seeder: `python3 scripts/populate_dummy_data.py --data-dir "$QUILL_DATA_DIR" --rules-dir "$QUILL_RULES_DIR"`.
 4. Exec the installed Quill binary (auto-discovered: tries `quill` on `$PATH`, then `target/release/quill`, then `target/debug/quill`; configurable via `--bin` flag).
 5. Print the sandbox path and a teardown command (`rm -rf $SANDBOX`) on exit so the maintainer can clean up explicitly.
 
 **Rationale**:
-- Two scripts is the cheapest portable surface. Bash works on Linux and macOS; PowerShell ships with every Windows install.
+- A shell script is the cheapest portable surface. Bash works on Linux and macOS, the platforms the demo pipeline targets.
 - Stable sandbox path lets repeat captures share a dataset, which is desirable when iterating on screenshots.
-- `--clean` / `-Clean` opt-in gives a reset path without making destruction the default.
+- `--clean` opt-in gives a reset path without making destruction the default.
 - Auto-discovering the binary keeps the script useful both for a maintainer with Quill installed system-wide and for a developer running from a checkout.
 
 **Alternatives considered**:

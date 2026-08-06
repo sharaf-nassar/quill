@@ -88,12 +88,9 @@ fn select_sessions_for_insights(
 
 /// One bounded, redacted per-session digest — the extraction input unit
 /// for Stream C (transient; never persisted or returned to the UI).
-#[allow(dead_code)] // some fields are traceability-only
 struct SessionDigest {
-    provider: String,
     session_id: String,
     project: Option<String>,
-    last_active: String,
     /// Secret-redacted → compressed text: intent + outcome + tool/code/
     /// command/error signal. Already passed through `redaction::redact`
     /// then `compress_observation` and bounded to its per-session
@@ -151,10 +148,8 @@ fn build_session_digests(
         }
         spent += digest.len();
         digests.push(SessionDigest {
-            provider: s.provider.clone(),
             session_id: s.session_id.clone(),
             project: s.project.clone(),
-            last_active: s.last_active.clone(),
             digest,
         });
     }

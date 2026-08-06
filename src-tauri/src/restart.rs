@@ -85,18 +85,18 @@ pub enum RestartPhase {
 
 pub struct RestartState {
     pub running: AtomicBool,
-    pub phase: parking_lot::Mutex<RestartPhase>,
-    pub instances: parking_lot::Mutex<Vec<RestartInstance>>,
-    pub started_at: parking_lot::Mutex<Option<std::time::Instant>>,
+    pub phase: std::sync::Mutex<RestartPhase>,
+    pub instances: std::sync::Mutex<Vec<RestartInstance>>,
+    pub started_at: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl RestartState {
     pub fn new() -> Self {
         Self {
             running: AtomicBool::new(false),
-            phase: parking_lot::Mutex::new(RestartPhase::Idle),
-            instances: parking_lot::Mutex::new(Vec::new()),
-            started_at: parking_lot::Mutex::new(None),
+            phase: std::sync::Mutex::new(RestartPhase::Idle),
+            instances: std::sync::Mutex::new(Vec::new()),
+            started_at: std::sync::Mutex::new(None),
         }
     }
 }
@@ -1766,15 +1766,15 @@ fn should_wait_for_idle(instance: &RestartInstance) -> bool {
 pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force: bool) {
     tauri::async_runtime::spawn(async move {
         let start = std::time::Instant::now();
-        *state.started_at.lock() = Some(start);
-        *state.phase.lock() = RestartPhase::WaitingForIdle;
+        *state.started_at.lock().unwrap() = Some(start);
+        *state.phase.lock().unwrap() = RestartPhase::WaitingForIdle;
 
         // Phase 1: Wait for all instances to become idle (skip if force)
         if !force {
             loop {
                 // Check if cancelled
                 if !restart_flag_path().exists() {
-                    *state.phase.lock() = RestartPhase::Cancelled;
+                    *state.phase.lock().unwrap() = RestartPhase::Cancelled;
                     state.running.store(false, Ordering::SeqCst);
                     let _ = app.emit("restart-status-changed", ());
                     return;
@@ -1782,7 +1782,7 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
 
                 // Check timeout
                 if start.elapsed().as_secs() >= TIMEOUT_SECS {
-                    *state.phase.lock() = RestartPhase::TimedOut;
+                    *state.phase.lock().unwrap() = RestartPhase::TimedOut;
                     state.running.store(false, Ordering::SeqCst);
                     let _ = app.emit("restart-status-changed", ());
                     return;
@@ -1791,7 +1791,7 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
                 let instances = discover_instances();
                 let waiting = instances.iter().filter(|i| should_wait_for_idle(i)).count();
 
-                *state.instances.lock() = instances;
+                *state.instances.lock().unwrap() = instances;
 
                 if waiting == 0 {
                     break;
@@ -1803,7 +1803,7 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
         }
 
         // Phase 2: Kill all instances
-        *state.phase.lock() = RestartPhase::Restarting;
+        *state.phase.lock().unwrap() = RestartPhase::Restarting;
         let instances = discover_instances();
 
         // Pre-write resume files for plain terminals BEFORE killing, so the
@@ -1905,8 +1905,8 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
             final_instances.push(instance);
         }
 
-        *state.instances.lock() = final_instances;
-        *state.phase.lock() = RestartPhase::Complete;
+        *state.instances.lock().unwrap() = final_instances;
+        *state.phase.lock().unwrap() = RestartPhase::Complete;
         state.running.store(false, Ordering::SeqCst);
 
         // Clean up restart flag
@@ -1922,23 +1922,6 @@ pub fn spawn_orchestrator(state: Arc<RestartState>, app: tauri::AppHandle, force
 pub fn startup_cleanup() {}
 
 // ── Tauri Commands ──
-
-#[tauri::command]
-pub async fn discover_restart_instances() -> Vec<RestartInstance> {
-    #[cfg(unix)]
-    {
-        tokio::task::block_in_place(discover_instances)
-    }
-    #[cfg(not(unix))]
-    {
-        Vec::new()
-    }
-}
-
-#[tauri::command]
-pub async fn discover_claude_instances() -> Vec<RestartInstance> {
-    discover_restart_instances().await
-}
 
 #[tauri::command]
 pub async fn request_restart(
@@ -1978,8 +1961,8 @@ pub async fn cancel_restart(state: tauri::State<'_, Arc<RestartState>>) -> Resul
         let flag = restart_flag_path();
         let _ = fs::remove_file(&flag);
         // Reset phase to Idle so the UI is immediately usable again
-        *state.phase.lock() = RestartPhase::Idle;
-        *state.started_at.lock() = None;
+        *state.phase.lock().unwrap() = RestartPhase::Idle;
+        *state.started_at.lock().unwrap() = None;
         Ok(())
     }
     #[cfg(not(unix))]
@@ -1995,9 +1978,9 @@ pub async fn get_restart_status(
 ) -> Result<RestartStatus, String> {
     #[cfg(unix)]
     {
-        let phase = state.phase.lock().clone();
+        let phase = state.phase.lock().unwrap().clone();
         let instances = if state.running.load(Ordering::SeqCst) || phase == RestartPhase::Complete {
-            state.instances.lock().clone()
+            state.instances.lock().unwrap().clone()
         } else {
             tokio::task::block_in_place(discover_instances)
         };
@@ -2007,6 +1990,7 @@ pub async fn get_restart_status(
         let elapsed_seconds = state
             .started_at
             .lock()
+            .unwrap()
             .map(|s| s.elapsed().as_secs())
             .unwrap_or(0);
 

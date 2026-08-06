@@ -1,4 +1,3 @@
-pub mod claude;
 pub mod codex;
 pub mod cpa;
 pub(crate) mod deploy;
@@ -7,8 +6,8 @@ pub mod manifest;
 pub mod minimax;
 pub mod types;
 
-use parking_lot::{Mutex, MutexGuard};
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 
 pub use manager::{
     confirm_disable, confirm_enable_with_key, detect_all, force_rescan,
@@ -28,9 +27,9 @@ pub use types::{IntegrationProvider, ProviderStatus};
 static INTEGRATION_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn integration_mutation_guard() -> Result<MutexGuard<'static, ()>, String> {
-    let guard = INTEGRATION_MUTATION_LOCK.lock();
+    let guard = INTEGRATION_MUTATION_LOCK.lock().unwrap();
     let mut errors = Vec::new();
-    if let Err(err) = claude::recover_interrupted_install() {
+    if let Err(err) = crate::claude_setup::recover_interrupted_install() {
         errors.push(format!("Claude recovery failed: {err}"));
     }
     if let Err(err) = codex::recover_interrupted_install() {

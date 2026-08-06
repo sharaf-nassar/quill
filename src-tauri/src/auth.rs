@@ -39,7 +39,7 @@ pub fn load_or_create_secret() -> Result<String, String> {
 
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let secret = hex::encode(bytes);
+    let secret = crate::hex_encode(bytes);
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

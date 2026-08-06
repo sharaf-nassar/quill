@@ -1,16 +1,14 @@
-use parking_lot::{Mutex, RwLock};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::{Mutex, RwLock};
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static CLAUDE_VERSION: OnceLock<String> = OnceLock::new();
 // Login-shell PATH is cached but invalidatable so a "Rescan" action can pick
 // up PATH edits the user just made (e.g. installing claude/codex via a new
-// package manager) without restarting Quill. parking_lot::RwLock is used
-// instead of std::sync::RwLock so a writer panic cannot poison the lock and
-// crash later detection calls.
+// package manager) without restarting Quill.
 static SHELL_PATH: RwLock<Option<String>> = RwLock::new(None);
 // Cached output of `npm config get prefix`, `bun pm bin -g`, `yarn global bin`.
 // These calls each spawn a login shell (50-300ms with a heavy zshrc), so
@@ -58,14 +56,14 @@ pub fn claude_user_agent() -> &'static str {
 /// hard-coding bash, since macOS defaults to zsh since Catalina.
 pub fn shell_path() -> String {
     {
-        let guard = SHELL_PATH.read();
+        let guard = SHELL_PATH.read().unwrap();
         if let Some(value) = guard.as_ref() {
             return value.clone();
         }
     }
     let computed = capture_login_shell_output(r#"printf '%s\n' "$PATH""#)
         .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-    let mut guard = SHELL_PATH.write();
+    let mut guard = SHELL_PATH.write().unwrap();
     if let Some(existing) = guard.as_ref() {
         return existing.clone();
     }
@@ -79,8 +77,8 @@ pub fn shell_path() -> String {
 /// re-derives them. The Tauri "rescan integrations" command uses this to pick
 /// up PATH edits the user just made without forcing an app restart.
 pub fn refresh_shell_path() {
-    *SHELL_PATH.write() = None;
-    *DYNAMIC_PREFIXES.lock() = None;
+    *SHELL_PATH.write().unwrap() = None;
+    *DYNAMIC_PREFIXES.lock().unwrap() = None;
 }
 
 pub fn resolve_command_path(command: &str) -> Option<PathBuf> {
@@ -297,13 +295,13 @@ fn dynamic_prefix_candidates(command: &str) -> Vec<PathBuf> {
 
 fn cached_dynamic_prefix_dirs() -> Vec<PathBuf> {
     {
-        let guard = DYNAMIC_PREFIXES.lock();
+        let guard = DYNAMIC_PREFIXES.lock().unwrap();
         if let Some(value) = guard.as_ref() {
             return value.clone();
         }
     }
     let computed = compute_dynamic_prefix_dirs();
-    let mut guard = DYNAMIC_PREFIXES.lock();
+    let mut guard = DYNAMIC_PREFIXES.lock().unwrap();
     if let Some(existing) = guard.as_ref() {
         return existing.clone();
     }

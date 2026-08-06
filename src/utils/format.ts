@@ -15,7 +15,7 @@ function agentModelFamily(provider: IntegrationProvider, modelId: string) {
 	const matches = (family: string) =>
 		new RegExp(`(^|[-_.])${family}($|[-_.])`, "i").test(modelId);
 	const known = provider === "claude"
-		? [["Opus", 0], ["Sonnet", 1], ["Haiku", 2]] as const
+		? [["Opus", 0], ["Sonnet", 1], ["Haiku", 2], ["Fable", 3]] as const
 		: provider === "codex"
 			? [["Sol", 0], ["Terra", 1], ["Luna", 2]] as const
 			: [];
@@ -53,7 +53,7 @@ export function formatObservedSubagentModels(
 	const displayGroups = [...byLabel.values()].sort(
 		(left, right) => left.rank - right.rank || left.label.localeCompare(right.label),
 	);
-	const text = displayGroups.map((group) => `${group.count}×${group.label}`).join(" · ");
+	const text = displayGroups.map((group) => `${group.count} × ${group.label}`).join(" · ");
 	const breakdown = displayGroups
 		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model" : group.label} agent${group.count === 1 ? "" : "s"}`)
 		.join(", ");

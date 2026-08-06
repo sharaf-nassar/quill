@@ -1,22 +1,26 @@
-use std::ffi::{OsStr, OsString};
+//! Transactional deployment of Quill-managed assets into user config dirs.
+//!
+//! One backup directory per transaction (`.quill-deploy-backup`, created
+//! beside the deployment targets) holds copies of provider configuration
+//! files plus any target trees moved aside during publish. Commit atomically
+//! renames the backup away; a failure or crash leaves it in place so
+//! [`recover_staged_batch`] can restore every original from it. Staged trees
+//! are built in temp dirs beside their targets so publication is a
+//! same-filesystem rename per target.
+
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use tempfile::{Builder, TempDir};
 
 const STAGING_PREFIX: &str = ".quill-staging-";
-const ABSENT_BACKUP_PREFIX: &str = ".quill-absent-backup-";
-const BACKUP_SUFFIX: &str = ".quill-backup";
-const TRANSACTION_MARKER: &str = ".quill-deploy-transaction";
-const SNAPSHOT_DIRECTORY: &str = ".quill-provider-snapshots";
-const SNAPSHOT_MANIFEST: &str = "manifest.json";
-const SNAPSHOT_VERSION: u32 = 1;
-const ABSENT_TARGET_SENTINEL: &str = ".quill-target-was-absent-7d37b2f46f3a4df9a8f239e7d32cfde1";
-const QUARANTINE_PREFIX: &str = ".quill-recovery-quarantine-";
-const QUARANTINE_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const BACKUP_DIR: &str = ".quill-deploy-backup";
+const BACKUP_TARGETS_DIR: &str = "targets";
+const ABSENT_SUFFIX: &str = ".was-absent";
+const BACKUP_MANIFEST: &str = "manifest.json";
+const BACKUP_VERSION: u32 = 1;
 const DEPLOY_STAMP_FILE: &str = ".quill-deploy-stamp";
 const DEPLOY_STAMP_VERSION: u32 = 1;
 
@@ -35,87 +39,32 @@ pub(crate) struct StagedDirectory {
     staging: Option<TempDir>,
 }
 
-/// A published directory batch whose backups remain live until provider setup succeeds.
+/// A published directory batch whose backup remains live until provider setup succeeds.
 #[must_use = "published deployment batches must be committed or rolled back"]
 pub(crate) struct PublishedBatch {
-    targets: Vec<PathBuf>,
-    marker: PathBuf,
+    backup: PathBuf,
 }
 
 /// Exact pre-install snapshots of provider configuration and instruction files.
 #[must_use = "file snapshots must be retained until provider setup succeeds"]
 pub(crate) struct FileSnapshots {
     targets: Vec<PathBuf>,
-    marker: PathBuf,
-}
-
-struct FileSnapshot {
-    path: PathBuf,
-    state: FileSnapshotState,
-}
-
-enum FileSnapshotState {
-    Missing,
-    File {
-        contents: Vec<u8>,
-        permissions: PersistedPermissions,
-    },
-    Symlink {
-        target: PathBuf,
-        referent: SymlinkReferentSnapshot,
-        is_directory: bool,
-    },
-}
-
-enum SymlinkReferentSnapshot {
-    Missing,
-    File {
-        contents: Vec<u8>,
-        permissions: PersistedPermissions,
-    },
-    Directory,
+    backup: PathBuf,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedSnapshots {
+struct BackupManifest {
     version: u32,
-    files: Vec<PersistedFileSnapshot>,
+    files: Vec<BackupFile>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct PersistedFileSnapshot {
+struct BackupFile {
     path: PathBuf,
-    state: PersistedFileSnapshotState,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum PersistedFileSnapshotState {
-    Missing,
-    File {
-        contents: String,
-        permissions: PersistedPermissions,
-    },
-    Symlink {
-        target: PathBuf,
-        referent: PersistedSymlinkReferentSnapshot,
-        is_directory: bool,
-    },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum PersistedSymlinkReferentSnapshot {
-    Missing,
-    File {
-        contents: String,
-        permissions: PersistedPermissions,
-    },
-    Directory,
-}
-
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-struct PersistedPermissions {
-    readonly: bool,
-    unix_mode: Option<u32>,
+    /// Snapshot data file name inside the backup directory; `None` when the
+    /// path did not exist at capture time.
+    data: Option<String>,
+    mode: Option<u32>,
 }
 
 impl StagedDirectory {
@@ -193,24 +142,14 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 impl PublishedBatch {
-    /// Make the published trees authoritative, then clean their old backups best-effort.
+    /// Make the published trees authoritative and discard the backup.
     pub(crate) fn commit(self) -> Result<(), String> {
-        if let Err(err) = remove_existing_path(&self.marker) {
-            let primary = format!(
-                "Failed to commit deployment transaction {}: {err}",
-                self.marker.display()
-            );
-            return Err(with_rollback_error(primary, &self.targets, &self.marker));
-        }
-
-        cleanup_backups_best_effort(&self.targets);
-        cleanup_snapshots_best_effort(&self.marker);
-        Ok(())
+        commit_backup(&self.backup)
     }
 
-    /// Restore every pre-publication tree and retain the marker if rollback is incomplete.
+    /// Restore every pre-publication tree and configuration file.
     pub(crate) fn rollback(self) -> Result<(), String> {
-        rollback_transaction(&self.targets, &self.marker)
+        restore_backup(&self.backup)
     }
 
     pub(crate) fn rollback_with_error(self, primary: String) -> String {
@@ -222,7 +161,8 @@ impl PublishedBatch {
 }
 
 impl FileSnapshots {
-    /// Recover any interrupted install, persist snapshots, then open a new transaction.
+    /// Recover any interrupted install, then open a new transaction by copying
+    /// every configuration file in `paths` into a fresh backup directory.
     pub(crate) fn capture(targets: &[PathBuf], paths: &[PathBuf]) -> Result<Self, String> {
         recover_staged_batch(targets)?;
         let parent = batch_parent(targets)?;
@@ -232,51 +172,34 @@ impl FileSnapshots {
                 parent.display()
             )
         })?;
-        let marker = parent.join(TRANSACTION_MARKER);
-        let directory = parent.join(SNAPSHOT_DIRECTORY);
+        let backup = parent.join(BACKUP_DIR);
+        fs::create_dir(&backup).map_err(|err| {
+            format!(
+                "Failed to create deployment backup {}: {err}",
+                backup.display()
+            )
+        })?;
+        set_private_directory_permissions(&backup)?;
 
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
-            if files
-                .iter()
-                .any(|snapshot: &FileSnapshot| snapshot.path == *path)
-            {
-                continue;
-            }
-            files.push(capture_file_snapshot(path)?);
-        }
-
-        if let Err(err) = persist_file_snapshots(&directory, &files) {
-            return Err(match remove_path(&directory) {
+        if let Err(err) = snapshot_files(&backup, paths) {
+            return Err(match remove_path(&backup) {
                 Ok(()) => err,
-                Err(cleanup_err) => format!(
-                    "{err}; failed to remove partial provider snapshots {}: {cleanup_err}",
-                    directory.display()
+                Err(cleanup) => format!(
+                    "{err}; failed to remove partial deployment backup {}: {cleanup}",
+                    backup.display()
                 ),
-            });
-        }
-        if let Err(err) = create_transaction_marker(&marker) {
-            let cleanup = remove_path(&directory).map_err(|cleanup_err| {
-                format!(
-                    "Failed to remove unused provider snapshots {}: {cleanup_err}",
-                    directory.display()
-                )
-            });
-            return Err(match cleanup {
-                Ok(()) => err,
-                Err(cleanup_err) => format!("{err}; {cleanup_err}"),
             });
         }
 
         Ok(Self {
             targets: targets.to_vec(),
-            marker,
+            backup,
         })
     }
 
-    /// Restore the persisted snapshots and any assets published by this transaction.
+    /// Restore the captured configuration and any assets published by this transaction.
     pub(crate) fn restore(self) -> Result<(), String> {
-        rollback_transaction(&self.targets, &self.marker)
+        restore_backup(&self.backup)
     }
 
     pub(crate) fn restore_with_error(self, primary: String) -> String {
@@ -288,250 +211,58 @@ impl FileSnapshots {
 
     /// Commit a configuration-only transaction that did not publish asset trees.
     pub(crate) fn commit(self) -> Result<(), String> {
-        if let Err(err) = remove_existing_path(&self.marker) {
-            let primary = format!(
-                "Failed to commit configuration transaction {}: {err}",
-                self.marker.display()
-            );
-            return Err(with_rollback_error(primary, &self.targets, &self.marker));
-        }
-
-        cleanup_snapshots_best_effort(&self.marker);
-        Ok(())
+        commit_backup(&self.backup)
     }
 }
 
-/// Recover a prior batch before inspecting deployment sources or constructing new stages.
-///
-/// Recovery is non-destructive and converges: an unrollbackable transaction is
-/// quarantined rather than left to wedge every future guarded mutation, and
-/// leftover user-data-bearing artifacts are quarantined rather than deleted.
+/// Recover a prior interrupted transaction before opening a new one: restore
+/// everything recorded in a leftover backup directory, then sweep stale
+/// staging directories left behind by crashes.
 pub(crate) fn recover_staged_batch(targets: &[PathBuf]) -> Result<(), String> {
     let parent = batch_parent(targets)?;
-    let marker = parent.join(TRANSACTION_MARKER);
-
-    // Bound quarantine disk growth before touching the transaction; best-effort.
-    prune_stale_quarantines(&parent);
-
-    if path_exists(&marker)? {
-        // A marker means a real interrupted transaction. Roll it back; if that
-        // cannot complete, quarantine the whole transaction so the app stays
-        // usable and the un-restored data stays recoverable by hand instead of
-        // wedging every future guarded mutation behind a fail-closed guard.
-        return match rollback_transaction(targets, &marker) {
-            Ok(()) => Ok(()),
-            Err(rollback_err) => match quarantine_transaction_state(&parent, targets, &marker) {
-                Ok(Some(quarantine)) => {
-                    log::error!(
-                        "Failed to roll back interrupted deployment ({rollback_err}); quarantined transaction state at {} for manual recovery",
-                        quarantine.display()
-                    );
-                    Ok(())
-                }
-                Ok(None) => Err(format!(
-                    "Failed to recover interrupted deployment: {rollback_err}"
-                )),
-                Err(quarantine_err) => Err(format!(
-                    "Failed to recover interrupted deployment: {rollback_err}; quarantine also failed: {quarantine_err}"
-                )),
-            },
-        };
+    let backup = parent.join(BACKUP_DIR);
+    if path_exists(&backup)? {
+        // ponytail: a backup that cannot be restored (e.g. corrupt manifest)
+        // fails closed and blocks installs until the directory is removed by
+        // hand; bring back quarantine machinery if this generates support load.
+        restore_backup(&backup)
+            .map_err(|err| format!("Failed to recover interrupted deployment: {err}"))?;
     }
-
-    // No marker. Either a clean tree, a crash after the commit point, or a user
-    // who deleted the marker mid-recovery — the last two are indistinguishable.
-    // Staging trees only ever hold copies of bundled assets, so they are safe to
-    // delete; backups and snapshots may be the only remaining copy of un-restored
-    // provider configuration, so they are quarantined, never deleted.
-    let mut errors = Vec::new();
-    if let Err(err) = cleanup_stale_temporary_directories(&parent) {
-        errors.push(err);
-    }
-    match quarantine_orphaned_state(&parent, targets) {
-        Ok(Some(quarantine)) => log::error!(
-            "Quarantined orphaned deployment backups without a transaction marker at {}; delete after confirming provider configuration is intact",
-            quarantine.display()
-        ),
-        Ok(None) => {}
-        Err(err) => errors.push(err),
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
+    cleanup_stale_staging(&parent)
 }
 
-/// Move every still-present artifact of an interrupted transaction — marker,
-/// snapshots, live backups, and staging trees — into a fresh quarantine
-/// directory. Returns the quarantine path, or `None` when nothing remained.
-fn quarantine_transaction_state(
-    parent: &Path,
-    targets: &[PathBuf],
-    marker: &Path,
-) -> Result<Option<PathBuf>, String> {
-    let mut sources = vec![marker.to_path_buf(), parent.join(SNAPSHOT_DIRECTORY)];
-    for target in targets {
-        sources.push(backup_path(target)?);
-    }
-    sources.extend(list_temporary_directories(parent)?);
-    quarantine_paths(parent, &sources)
-}
-
-/// Quarantine leftover backups and snapshots found without a transaction marker.
-/// Only user-data-bearing artifacts land here; staging trees are cleaned
-/// separately so they are never mistaken for recoverable configuration.
-fn quarantine_orphaned_state(
-    parent: &Path,
-    targets: &[PathBuf],
-) -> Result<Option<PathBuf>, String> {
-    let mut sources = vec![parent.join(SNAPSHOT_DIRECTORY)];
-    for target in targets {
-        sources.push(backup_path(target)?);
-    }
-    quarantine_paths(parent, &sources)
-}
-
-/// Rename each existing source into a unique quarantine directory beside the
-/// batch parent. Non-existent sources are skipped; when none exist no directory
-/// is created. Renames stay on one filesystem so quarantine cannot partially
-/// copy a tree.
-fn quarantine_paths(parent: &Path, sources: &[PathBuf]) -> Result<Option<PathBuf>, String> {
-    let mut present = Vec::new();
-    for source in sources {
-        if path_exists(source)? {
-            present.push(source);
-        }
-    }
-    if present.is_empty() {
-        return Ok(None);
-    }
-
-    let quarantine = Builder::new()
-        .prefix(QUARANTINE_PREFIX)
-        .tempdir_in(parent)
-        .map_err(|err| {
-            format!(
-                "Failed to create recovery quarantine beside {}: {err}",
-                parent.display()
-            )
-        })?;
-    let quarantine_path = quarantine.path().to_path_buf();
-
-    let mut errors = Vec::new();
-    for source in present {
-        let Some(name) = source.file_name() else {
-            errors.push(format!(
-                "Cannot quarantine path without a file name: {}",
-                source.display()
-            ));
-            continue;
-        };
-        let destination = quarantine_path.join(name);
-        if let Err(err) = fs::rename(source, &destination) {
-            errors.push(format!(
-                "Failed to quarantine {} into {}: {err}",
-                source.display(),
-                destination.display()
-            ));
-        }
-    }
-
-    let _ = quarantine.keep();
-    if errors.is_empty() {
-        Ok(Some(quarantine_path))
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-/// Best-effort removal of quarantine directories older than the retention window
-/// so repeatedly failing recoveries cannot grow unbounded. Never fails recovery;
-/// ages by directory mtime and logs what it prunes.
-fn prune_stale_quarantines(parent: &Path) {
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    let now = SystemTime::now();
-    for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(QUARANTINE_PREFIX)
-        {
-            continue;
-        }
-        let path = entry.path();
-        let aged = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age >= QUARANTINE_MAX_AGE);
-        if aged {
-            match remove_path(&path) {
-                Ok(()) => log::info!("Pruned aged deployment quarantine {}", path.display()),
-                Err(err) => log::warn!(
-                    "Failed to prune aged deployment quarantine {}: {err}",
-                    path.display()
-                ),
-            }
-        }
-    }
-}
-
-/// Publish complete staged trees while retaining their backups for the caller to finalize.
+/// Move every staged tree into place, saving whatever each target held before
+/// into the transaction backup so failure or crash can restore it.
 pub(crate) fn publish_staged_batch(
     mut stages: Vec<StagedDirectory>,
     snapshots: FileSnapshots,
 ) -> Result<PublishedBatch, String> {
-    let targets: Vec<PathBuf> = stages.iter().map(|stage| stage.target.clone()).collect();
-    let FileSnapshots {
-        targets: transaction_targets,
-        marker,
-    } = snapshots;
-    let parent = match batch_parent(&targets) {
-        Ok(parent) => parent,
-        Err(err) => return Err(with_rollback_error(err, &transaction_targets, &marker)),
-    };
-    if transaction_targets != targets {
+    let FileSnapshots { targets, backup } = snapshots;
+    let staged_targets: Vec<PathBuf> = stages.iter().map(|stage| stage.target.clone()).collect();
+    if staged_targets != targets {
         let primary = "Staged deployment targets do not match the open transaction".to_string();
-        return Err(with_rollback_error(primary, &transaction_targets, &marker));
+        return Err(fail_with_restore(primary, &backup));
     }
-    let marker_exists = match path_exists(&marker) {
-        Ok(exists) => exists,
-        Err(err) => return Err(with_rollback_error(err, &targets, &marker)),
-    };
-    if marker.parent() != Some(parent.as_path()) || !marker_exists {
-        let primary = format!(
-            "Deployment transaction marker is missing at {}",
-            marker.display()
-        );
-        return Err(with_rollback_error(primary, &targets, &marker));
-    }
-
-    for target in &targets {
-        if let Err(err) = prepare_backup(target, &parent) {
-            let primary = format!(
-                "Failed to prepare deployment target {}: {err}",
-                target.display()
-            );
-            return Err(with_rollback_error(primary, &targets, &marker));
+    match path_exists(&backup) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "Deployment backup is missing at {}",
+                backup.display()
+            ));
         }
+        Err(err) => return Err(fail_with_restore(err, &backup)),
+    }
+    let saved = backup.join(BACKUP_TARGETS_DIR);
+    if let Err(err) = fs::create_dir_all(&saved) {
+        let primary = format!("Failed to create {}: {err}", saved.display());
+        return Err(fail_with_restore(primary, &backup));
     }
 
     for stage in &mut stages {
-        let staging_path = stage.path().to_path_buf();
-        if let Err(err) = fs::rename(&staging_path, &stage.target) {
-            let primary = format!(
-                "Failed to publish staged directory {} to {}: {err}",
-                staging_path.display(),
-                stage.target.display()
-            );
-            return Err(with_rollback_error(primary, &targets, &marker));
+        if let Err(err) = publish_stage(stage, &saved) {
+            return Err(fail_with_restore(err, &backup));
         }
-
         let staging = stage
             .staging
             .take()
@@ -539,7 +270,37 @@ pub(crate) fn publish_staged_batch(
         let _ = staging.keep();
     }
 
-    Ok(PublishedBatch { targets, marker })
+    Ok(PublishedBatch { backup })
+}
+
+/// Move the target aside into the backup (or record that it was absent),
+/// then rename the staged tree into place.
+fn publish_stage(stage: &StagedDirectory, saved: &Path) -> Result<(), String> {
+    let name = stage.target.file_name().ok_or_else(|| {
+        format!(
+            "Cannot determine file name for deployment target {}",
+            stage.target.display()
+        )
+    })?;
+    if path_exists(&stage.target)? {
+        fs::rename(&stage.target, saved.join(name))
+            .map_err(|err| format!("Failed to back up {}: {err}", stage.target.display()))?;
+    } else {
+        let mut sentinel = name.to_os_string();
+        sentinel.push(ABSENT_SUFFIX);
+        fs::write(saved.join(sentinel), b"").map_err(|err| {
+            format!(
+                "Failed to record absent deployment target {}: {err}",
+                stage.target.display()
+            )
+        })?;
+    }
+    fs::rename(stage.path(), &stage.target).map_err(|err| {
+        format!(
+            "Failed to publish staged directory to {}: {err}",
+            stage.target.display()
+        )
+    })
 }
 
 pub(crate) fn validate_staged_mcp(
@@ -563,186 +324,268 @@ fn require_staged_file(root: &Path, relative: &str) -> Result<(), String> {
     Err(format!("Staged MCP file is missing at {}", path.display()))
 }
 
-fn capture_file_snapshot(path: &Path) -> Result<FileSnapshot, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return Ok(FileSnapshot {
-                path: path.to_path_buf(),
-                state: FileSnapshotState::Missing,
-            });
-        }
-        Err(err) => return Err(format!("Failed to inspect {}: {err}", path.display())),
-    };
-    let file_type = metadata.file_type();
+/// Copy every configuration file into the backup and write the manifest last,
+/// via rename, so a crash can never leave a half-written manifest.
+fn snapshot_files(backup: &Path, paths: &[PathBuf]) -> Result<(), String> {
+    let mut files = Vec::with_capacity(paths.len());
+    for (index, path) in paths.iter().enumerate() {
+        let entry = match fs::read(path) {
+            Ok(contents) => {
+                let data = format!("data-{index:04}");
+                write_private_file(&backup.join(&data), &contents)?;
+                BackupFile {
+                    path: path.clone(),
+                    data: Some(data),
+                    mode: capture_mode(path),
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => BackupFile {
+                path: path.clone(),
+                data: None,
+                mode: None,
+            },
+            Err(err) => return Err(format!("Failed to snapshot {}: {err}", path.display())),
+        };
+        files.push(entry);
+    }
 
-    let state = if is_symbolic_link(&file_type) {
-        let target = fs::read_link(path)
-            .map_err(|err| format!("Failed to read symbolic link {}: {err}", path.display()))?;
-        let referent = capture_symlink_referent(path)?;
-        let is_directory = symlink_is_directory(&file_type, &referent);
-        FileSnapshotState::Symlink {
-            target,
-            referent,
-            is_directory,
-        }
-    } else if file_type.is_file() {
-        FileSnapshotState::File {
-            contents: fs::read(path)
-                .map_err(|err| format!("Failed to snapshot {}: {err}", path.display()))?,
-            permissions: PersistedPermissions::capture(&metadata.permissions()),
-        }
-    } else {
-        return Err(format!(
-            "Cannot snapshot non-file provider configuration at {}",
-            path.display()
-        ));
-    };
-
-    Ok(FileSnapshot {
-        path: path.to_path_buf(),
-        state,
+    let manifest = serde_json::to_vec(&BackupManifest {
+        version: BACKUP_VERSION,
+        files,
     })
+    .map_err(|err| format!("Failed to serialize deployment backup manifest: {err}"))?;
+    let scratch = backup.join("manifest.tmp");
+    write_private_file(&scratch, &manifest)?;
+    fs::rename(&scratch, backup.join(BACKUP_MANIFEST))
+        .map_err(|err| format!("Failed to finalize deployment backup manifest: {err}"))
 }
 
-fn capture_symlink_referent(path: &Path) -> Result<SymlinkReferentSnapshot, String> {
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => {
-            return Ok(SymlinkReferentSnapshot::Missing);
+fn capture_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// Restore every original recorded in `backup`: moved-aside target trees go
+/// back, targets that were absent are removed, and configuration files get
+/// their captured bytes and mode. Removes the backup directory only when
+/// everything restored, so a partial restore can be retried.
+fn restore_backup(backup: &Path) -> Result<(), String> {
+    if !path_exists(backup)? {
+        return Ok(());
+    }
+    let parent = backup.parent().ok_or_else(|| {
+        format!(
+            "Cannot determine parent for deployment backup {}",
+            backup.display()
+        )
+    })?;
+
+    let mut errors = Vec::new();
+    restore_saved_targets(backup, parent, &mut errors);
+    restore_snapshot_files(backup, &mut errors);
+
+    if errors.is_empty() {
+        remove_path(backup).map_err(|err| {
+            format!(
+                "Failed to remove deployment backup {}: {err}",
+                backup.display()
+            )
+        })
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn restore_saved_targets(backup: &Path, parent: &Path, errors: &mut Vec<String>) {
+    let saved = backup.join(BACKUP_TARGETS_DIR);
+    let entries = match fs::read_dir(&saved) {
+        Ok(entries) => entries,
+        // No target was ever moved aside: publish never ran.
+        Err(err) if err.kind() == ErrorKind::NotFound => return,
+        Err(err) => {
+            errors.push(format!(
+                "Failed to read saved targets {}: {err}",
+                saved.display()
+            ));
+            return;
         }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(original) = name.to_string_lossy().strip_suffix(ABSENT_SUFFIX) {
+            // The target did not exist before publish: remove what we installed.
+            if let Err(err) = remove_path(&parent.join(original)) {
+                errors.push(format!(
+                    "Failed to remove published target {original}: {err}"
+                ));
+            }
+        } else {
+            let target = parent.join(&name);
+            if let Err(err) = remove_path(&target) {
+                errors.push(format!(
+                    "Failed to remove published target {} before restore: {err}",
+                    target.display()
+                ));
+                continue;
+            }
+            if let Err(err) = fs::rename(entry.path(), &target) {
+                errors.push(format!("Failed to restore {}: {err}", target.display()));
+            }
+        }
+    }
+}
+
+fn restore_snapshot_files(backup: &Path, errors: &mut Vec<String>) {
+    let manifest_path = backup.join(BACKUP_MANIFEST);
+    let bytes = match fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        // Crash before the manifest was finalized: nothing was mutated yet.
+        Err(err) if err.kind() == ErrorKind::NotFound => return,
+        Err(err) => {
+            errors.push(format!(
+                "Failed to read deployment backup manifest {}: {err}",
+                manifest_path.display()
+            ));
+            return;
+        }
+    };
+    let manifest: BackupManifest = match serde_json::from_slice(&bytes) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            errors.push(format!(
+                "Failed to parse deployment backup manifest {}: {err}",
+                manifest_path.display()
+            ));
+            return;
+        }
+    };
+    if manifest.version != BACKUP_VERSION {
+        errors.push(format!(
+            "Unsupported deployment backup version {} at {}",
+            manifest.version,
+            manifest_path.display()
+        ));
+        return;
+    }
+    for file in manifest.files {
+        if let Err(err) = restore_snapshot_file(backup, &file) {
+            errors.push(err);
+        }
+    }
+}
+
+fn restore_snapshot_file(backup: &Path, file: &BackupFile) -> Result<(), String> {
+    let Some(data) = &file.data else {
+        return remove_path(&file.path).map_err(|err| {
+            format!(
+                "Failed to remove newly created {}: {err}",
+                file.path.display()
+            )
+        });
+    };
+    let contents = fs::read(backup.join(data)).map_err(|err| {
+        format!(
+            "Failed to read snapshot data for {}: {err}",
+            file.path.display()
+        )
+    })?;
+    remove_path(&file.path).map_err(|err| {
+        format!(
+            "Failed to remove current {} before restore: {err}",
+            file.path.display()
+        )
+    })?;
+    create_parent(&file.path)?;
+    fs::write(&file.path, &contents)
+        .map_err(|err| format!("Failed to restore {}: {err}", file.path.display()))?;
+    apply_mode(&file.path, file.mode)
+}
+
+fn apply_mode(path: &Path, mode: Option<u32>) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|err| format!("Failed to restore permissions on {}: {err}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+    Ok(())
+}
+
+/// Commit point: atomically rename the backup away, then delete it
+/// best-effort (a leftover carries the staging prefix and is swept by the
+/// next recovery). On failure the transaction is rolled back instead so the
+/// tree is never left half-committed.
+fn commit_backup(backup: &Path) -> Result<(), String> {
+    let result = (|| {
+        let parent = backup.parent().ok_or_else(|| {
+            format!(
+                "Cannot determine parent for deployment backup {}",
+                backup.display()
+            )
+        })?;
+        let trash = Builder::new()
+            .prefix(STAGING_PREFIX)
+            .tempdir_in(parent)
+            .map_err(|err| {
+                format!(
+                    "Failed to commit deployment transaction {}: {err}",
+                    backup.display()
+                )
+            })?;
+        fs::rename(backup, trash.path().join("committed")).map_err(|err| {
+            format!(
+                "Failed to commit deployment transaction {}: {err}",
+                backup.display()
+            )
+        })
+    })();
+    result.map_err(|err| fail_with_restore(err, backup))
+}
+
+fn fail_with_restore(primary: String, backup: &Path) -> String {
+    match restore_backup(backup) {
+        Ok(()) => primary,
+        Err(rollback) => format!("{primary}; rollback failed: {rollback}"),
+    }
+}
+
+fn cleanup_stale_staging(parent: &Path) -> Result<(), String> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => {
             return Err(format!(
-                "Failed to inspect symbolic-link target for {}: {err}",
-                path.display()
+                "Failed to inspect deployment parent {}: {err}",
+                parent.display()
             ));
         }
     };
-
-    if metadata.is_file() {
-        return Ok(SymlinkReferentSnapshot::File {
-            contents: fs::read(path).map_err(|err| {
-                format!(
-                    "Failed to snapshot symbolic-link target for {}: {err}",
-                    path.display()
-                )
-            })?,
-            permissions: PersistedPermissions::capture(&metadata.permissions()),
-        });
-    }
-    if metadata.is_dir() {
-        return Ok(SymlinkReferentSnapshot::Directory);
-    }
-
-    Err(format!(
-        "Cannot snapshot special symbolic-link target for {}",
-        path.display()
-    ))
-}
-
-fn persist_file_snapshots(directory: &Path, files: &[FileSnapshot]) -> Result<(), String> {
-    fs::create_dir(directory).map_err(|err| {
-        format!(
-            "Failed to create provider snapshot directory {}: {err}",
-            directory.display()
-        )
-    })?;
-    set_private_directory_permissions(directory)?;
-
-    let mut next_data_file = 0usize;
-    let mut persisted_files = Vec::with_capacity(files.len());
-    for snapshot in files {
-        let state = match &snapshot.state {
-            FileSnapshotState::Missing => PersistedFileSnapshotState::Missing,
-            FileSnapshotState::File {
-                contents,
-                permissions,
-            } => PersistedFileSnapshotState::File {
-                contents: persist_snapshot_contents(directory, &mut next_data_file, contents)?,
-                permissions: permissions.clone(),
-            },
-            FileSnapshotState::Symlink {
-                target,
-                referent,
-                is_directory,
-            } => PersistedFileSnapshotState::Symlink {
-                target: target.clone(),
-                referent: match referent {
-                    SymlinkReferentSnapshot::Missing => PersistedSymlinkReferentSnapshot::Missing,
-                    SymlinkReferentSnapshot::File {
-                        contents,
-                        permissions,
-                    } => PersistedSymlinkReferentSnapshot::File {
-                        contents: persist_snapshot_contents(
-                            directory,
-                            &mut next_data_file,
-                            contents,
-                        )?,
-                        permissions: permissions.clone(),
-                    },
-                    SymlinkReferentSnapshot::Directory => {
-                        PersistedSymlinkReferentSnapshot::Directory
-                    }
-                },
-                is_directory: *is_directory,
-            },
-        };
-        persisted_files.push(PersistedFileSnapshot {
-            path: snapshot.path.clone(),
-            state,
-        });
-    }
-
-    let manifest = serde_json::to_vec(&PersistedSnapshots {
-        version: SNAPSHOT_VERSION,
-        files: persisted_files,
-    })
-    .map_err(|err| format!("Failed to serialize provider snapshots: {err}"))?;
-    write_private_file(&directory.join(SNAPSHOT_MANIFEST), &manifest)
-}
-
-fn persist_snapshot_contents(
-    directory: &Path,
-    next_data_file: &mut usize,
-    contents: &[u8],
-) -> Result<String, String> {
-    let name = format!("data-{:04}.bin", *next_data_file);
-    *next_data_file += 1;
-    write_private_file(&directory.join(&name), contents)?;
-    Ok(name)
-}
-
-fn restore_persisted_snapshots(marker: &Path) -> Result<(), String> {
-    let directory = snapshot_directory(marker)?;
-    if !path_exists(&directory)? {
-        return Ok(());
-    }
-    let manifest_path = directory.join(SNAPSHOT_MANIFEST);
-    let manifest_bytes = fs::read(&manifest_path).map_err(|err| {
-        format!(
-            "Failed to read provider snapshot manifest {}: {err}",
-            manifest_path.display()
-        )
-    })?;
-    let persisted: PersistedSnapshots = serde_json::from_slice(&manifest_bytes).map_err(|err| {
-        format!(
-            "Failed to parse provider snapshot manifest {}: {err}",
-            manifest_path.display()
-        )
-    })?;
-    if persisted.version != SNAPSHOT_VERSION {
-        return Err(format!(
-            "Unsupported provider snapshot version {} at {}",
-            persisted.version,
-            manifest_path.display()
-        ));
-    }
-
     let mut errors = Vec::new();
-    for persisted_snapshot in persisted.files.into_iter().rev() {
-        match load_file_snapshot(&directory, persisted_snapshot).and_then(restore_file_snapshot) {
-            Ok(()) => {}
-            Err(err) => errors.push(err),
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX)
+        {
+            continue;
+        }
+        if let Err(err) = remove_path(&entry.path()) {
+            errors.push(format!(
+                "Failed to remove stale staging {}: {err}",
+                entry.path().display()
+            ));
         }
     }
     if errors.is_empty() {
@@ -750,444 +593,6 @@ fn restore_persisted_snapshots(marker: &Path) -> Result<(), String> {
     } else {
         Err(errors.join("; "))
     }
-}
-
-fn load_file_snapshot(
-    directory: &Path,
-    snapshot: PersistedFileSnapshot,
-) -> Result<FileSnapshot, String> {
-    let state = match snapshot.state {
-        PersistedFileSnapshotState::Missing => FileSnapshotState::Missing,
-        PersistedFileSnapshotState::File {
-            contents,
-            permissions,
-        } => FileSnapshotState::File {
-            contents: read_snapshot_contents(directory, &contents)?,
-            permissions,
-        },
-        PersistedFileSnapshotState::Symlink {
-            target,
-            referent,
-            is_directory,
-        } => FileSnapshotState::Symlink {
-            target,
-            referent: match referent {
-                PersistedSymlinkReferentSnapshot::Missing => SymlinkReferentSnapshot::Missing,
-                PersistedSymlinkReferentSnapshot::File {
-                    contents,
-                    permissions,
-                } => SymlinkReferentSnapshot::File {
-                    contents: read_snapshot_contents(directory, &contents)?,
-                    permissions,
-                },
-                PersistedSymlinkReferentSnapshot::Directory => SymlinkReferentSnapshot::Directory,
-            },
-            is_directory,
-        },
-    };
-    Ok(FileSnapshot {
-        path: snapshot.path,
-        state,
-    })
-}
-
-fn read_snapshot_contents(directory: &Path, name: &str) -> Result<Vec<u8>, String> {
-    let relative = Path::new(name);
-    if relative.components().count() != 1
-        || !matches!(relative.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(format!("Invalid provider snapshot data path: {name}"));
-    }
-    let path = directory.join(relative);
-    fs::read(&path).map_err(|err| {
-        format!(
-            "Failed to read provider snapshot data {}: {err}",
-            path.display()
-        )
-    })
-}
-
-impl PersistedPermissions {
-    fn capture(permissions: &fs::Permissions) -> Self {
-        #[cfg(unix)]
-        let unix_mode = {
-            use std::os::unix::fs::PermissionsExt;
-            Some(permissions.mode())
-        };
-        #[cfg(not(unix))]
-        let unix_mode = None;
-
-        Self {
-            readonly: permissions.readonly(),
-            unix_mode,
-        }
-    }
-
-    fn apply(&self, path: &Path) -> Result<(), String> {
-        #[cfg(unix)]
-        let permissions = {
-            use std::os::unix::fs::PermissionsExt;
-            match self.unix_mode {
-                Some(mode) => fs::Permissions::from_mode(mode),
-                None => {
-                    let mut permissions = fs::metadata(path)
-                        .map_err(|err| {
-                            format!("Failed to inspect permissions on {}: {err}", path.display())
-                        })?
-                        .permissions();
-                    permissions.set_readonly(self.readonly);
-                    permissions
-                }
-            }
-        };
-        #[cfg(not(unix))]
-        let permissions = {
-            let mut permissions = fs::metadata(path)
-                .map_err(|err| {
-                    format!("Failed to inspect permissions on {}: {err}", path.display())
-                })?
-                .permissions();
-            permissions.set_readonly(self.readonly);
-            permissions
-        };
-
-        fs::set_permissions(path, permissions)
-            .map_err(|err| format!("Failed to restore permissions on {}: {err}", path.display()))
-    }
-}
-
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|err| format!("Failed to create private file {}: {err}", path.display()))?;
-    file.write_all(contents)
-        .map_err(|err| format!("Failed to write private file {}: {err}", path.display()))
-}
-
-fn set_private_directory_permissions(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
-            format!(
-                "Failed to secure provider snapshot directory {}: {err}",
-                path.display()
-            )
-        })?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
-fn restore_file_snapshot(snapshot: FileSnapshot) -> Result<(), String> {
-    let FileSnapshot { path, state } = snapshot;
-    match state {
-        FileSnapshotState::Missing => remove_path(&path)
-            .map_err(|err| format!("Failed to remove newly created {}: {err}", path.display())),
-        FileSnapshotState::File {
-            contents,
-            permissions,
-        } => {
-            if regular_file_matches(&path, &contents, &permissions) {
-                return Ok(());
-            }
-            remove_path(&path).map_err(|err| {
-                format!(
-                    "Failed to remove current {} before restore: {err}",
-                    path.display()
-                )
-            })?;
-            create_parent(&path)?;
-            write_restored_file(&path, &contents, &permissions, true)
-        }
-        FileSnapshotState::Symlink {
-            target,
-            referent,
-            is_directory,
-        } => restore_symlink_snapshot(&path, &target, referent, is_directory),
-    }
-}
-
-fn restore_symlink_snapshot(
-    path: &Path,
-    target: &Path,
-    referent: SymlinkReferentSnapshot,
-    is_directory: bool,
-) -> Result<(), String> {
-    if !symlink_matches(path, target, is_directory)? {
-        remove_path(path).map_err(|err| {
-            format!(
-                "Failed to remove current {} before restoring symbolic link: {err}",
-                path.display()
-            )
-        })?;
-        create_parent(path)?;
-        create_symbolic_link(target, path, is_directory).map_err(|err| {
-            format!(
-                "Failed to restore symbolic link {} -> {}: {err}",
-                path.display(),
-                target.display()
-            )
-        })?;
-    }
-
-    match referent {
-        SymlinkReferentSnapshot::Missing => {
-            let resolved = resolve_link_target(path, target);
-            if lexically_normalize(&resolved) == lexically_normalize(path) {
-                return Ok(());
-            }
-            restore_absent_referent(path, &resolved)
-        }
-        SymlinkReferentSnapshot::File {
-            contents,
-            permissions,
-        } => {
-            if followed_file_matches(path, &contents, &permissions) {
-                return Ok(());
-            }
-            if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-                return Err(format!(
-                    "Cannot restore file contents through directory symbolic link {}",
-                    path.display()
-                ));
-            }
-            write_restored_file(path, &contents, &permissions, false).map_err(|err| {
-                format!(
-                    "Failed to restore symbolic-link target for {}: {err}",
-                    path.display()
-                )
-            })
-        }
-        SymlinkReferentSnapshot::Directory => {
-            if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Symbolic-link target for {} is no longer a directory",
-                    path.display()
-                ))
-            }
-        }
-    }
-}
-
-/// Restore a symbolic link whose referent was absent at capture (a dangling
-/// link) by clearing whatever the install wrote through it.
-///
-/// Invariant: recovery may run days after a crash, and the installers only ever
-/// write regular files through their managed links. A directory at the referent
-/// therefore cannot be this transaction's doing (the user may have populated the
-/// path meanwhile, e.g. cloned dotfiles); deleting it with `remove_dir_all`
-/// would destroy data the transaction never wrote, so it is left in place and
-/// the restore is treated as satisfied. A regular file or symlink is the exact
-/// shape an install writes through the link, so removing it is bounded to
-/// undoing this transaction's own effect.
-fn restore_absent_referent(path: &Path, resolved: &Path) -> Result<(), String> {
-    match fs::symlink_metadata(resolved) {
-        Ok(metadata) if metadata.file_type().is_dir() => {
-            log::warn!(
-                "Leaving directory at symbolic-link referent {} while restoring {}: refusing to delete data this deployment did not write",
-                resolved.display(),
-                path.display()
-            );
-            Ok(())
-        }
-        Ok(_) => remove_path(resolved).map_err(|err| {
-            format!(
-                "Failed to restore dangling symbolic link {}: {err}",
-                path.display()
-            )
-        }),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!(
-            "Failed to inspect symbolic-link referent {}: {err}",
-            resolved.display()
-        )),
-    }
-}
-
-fn regular_file_matches(path: &Path, contents: &[u8], permissions: &PersistedPermissions) -> bool {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    metadata.file_type().is_file()
-        && fs::read(path).is_ok_and(|current| current == contents)
-        && PersistedPermissions::capture(&metadata.permissions()) == *permissions
-}
-
-fn followed_file_matches(path: &Path, contents: &[u8], permissions: &PersistedPermissions) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    metadata.is_file()
-        && fs::read(path).is_ok_and(|current| current == contents)
-        && PersistedPermissions::capture(&metadata.permissions()) == *permissions
-}
-
-fn create_parent(path: &Path) -> Result<(), String> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    fs::create_dir_all(parent)
-        .map_err(|err| format!("Failed to create parent {}: {err}", parent.display()))
-}
-
-fn write_restored_file(
-    path: &Path,
-    contents: &[u8],
-    permissions: &PersistedPermissions,
-    create_new: bool,
-) -> Result<(), String> {
-    if !create_new && let Ok(_metadata) = fs::metadata(path) {
-        #[cfg(unix)]
-        let temporary_permissions = {
-            use std::os::unix::fs::PermissionsExt;
-            fs::Permissions::from_mode(0o200)
-        };
-        #[cfg(not(unix))]
-        let temporary_permissions = {
-            let mut temporary_permissions = _metadata.permissions();
-            temporary_permissions.set_readonly(false);
-            temporary_permissions
-        };
-        fs::set_permissions(path, temporary_permissions).map_err(|err| {
-            format!(
-                "Failed to secure {} before restoring its contents: {err}",
-                path.display()
-            )
-        })?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.write(true).truncate(true);
-    if create_new {
-        options.create_new(true);
-    } else {
-        options.create(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(permissions.unix_mode.unwrap_or(0o600) & 0o7777);
-    }
-
-    let mut file = options
-        .open(path)
-        .map_err(|err| format!("Failed to open {} for restore: {err}", path.display()))?;
-    file.write_all(contents)
-        .map_err(|err| format!("Failed to restore {}: {err}", path.display()))?;
-    drop(file);
-    permissions.apply(path)
-}
-
-fn resolve_link_target(path: &Path, target: &Path) -> PathBuf {
-    if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        path.parent().unwrap_or_else(|| Path::new("")).join(target)
-    }
-}
-
-fn lexically_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if normalized
-                    .file_name()
-                    .is_some_and(|name| name != OsStr::new(".."))
-                {
-                    normalized.pop();
-                } else if !normalized.has_root() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
-}
-
-fn symlink_matches(path: &Path, target: &Path, is_directory: bool) -> Result<bool, String> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(format!("Failed to inspect {}: {err}", path.display())),
-    };
-    let file_type = metadata.file_type();
-    if !is_symbolic_link(&file_type) {
-        return Ok(false);
-    }
-    let current_target = fs::read_link(path)
-        .map_err(|err| format!("Failed to read symbolic link {}: {err}", path.display()))?;
-    if current_target != target {
-        return Ok(false);
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileTypeExt;
-        Ok(file_type.is_symlink_dir() == is_directory)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = is_directory;
-        Ok(true)
-    }
-}
-
-#[cfg(unix)]
-fn create_symbolic_link(target: &Path, path: &Path, _is_directory: bool) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, path)
-}
-
-#[cfg(windows)]
-fn create_symbolic_link(target: &Path, path: &Path, is_directory: bool) -> std::io::Result<()> {
-    if is_directory {
-        std::os::windows::fs::symlink_dir(target, path)
-    } else {
-        std::os::windows::fs::symlink_file(target, path)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_symbolic_link(_target: &Path, _path: &Path, _is_directory: bool) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "symbolic-link restoration is unsupported on this platform",
-    ))
-}
-
-#[cfg(windows)]
-fn is_symbolic_link(file_type: &fs::FileType) -> bool {
-    use std::os::windows::fs::FileTypeExt;
-    file_type.is_symlink_dir() || file_type.is_symlink_file()
-}
-
-#[cfg(not(windows))]
-fn is_symbolic_link(file_type: &fs::FileType) -> bool {
-    file_type.is_symlink()
-}
-
-#[cfg(windows)]
-fn symlink_is_directory(file_type: &fs::FileType, _referent: &SymlinkReferentSnapshot) -> bool {
-    use std::os::windows::fs::FileTypeExt;
-    file_type.is_symlink_dir()
-}
-
-#[cfg(not(windows))]
-fn symlink_is_directory(_file_type: &fs::FileType, referent: &SymlinkReferentSnapshot) -> bool {
-    matches!(referent, SymlinkReferentSnapshot::Directory)
 }
 
 fn batch_parent(targets: &[PathBuf]) -> Result<PathBuf, String> {
@@ -1214,294 +619,43 @@ fn batch_parent(targets: &[PathBuf]) -> Result<PathBuf, String> {
     Ok(parent.to_path_buf())
 }
 
-fn create_transaction_marker(marker: &Path) -> Result<(), String> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(marker)
-        .map(|_| ())
-        .map_err(|err| {
-            format!(
-                "Failed to create deployment transaction marker {}: {err}",
-                marker.display()
-            )
-        })
+fn create_parent(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|err| format!("Failed to create parent {}: {err}", parent.display()))
 }
 
-fn prepare_backup(target: &Path, parent: &Path) -> Result<(), String> {
-    let backup = backup_path(target)?;
-    if path_exists(&backup)? {
-        return Err(format!(
-            "Deployment backup already exists at {}",
-            backup.display()
-        ));
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-
-    if path_exists(target)? {
-        return fs::rename(target, &backup).map_err(|err| {
-            format!(
-                "Failed to move {} to backup {}: {err}",
-                target.display(),
-                backup.display()
-            )
-        });
-    }
-
-    create_absent_target_backup(&backup, parent)
+    let mut file = options
+        .open(path)
+        .map_err(|err| format!("Failed to create private file {}: {err}", path.display()))?;
+    file.write_all(contents)
+        .map_err(|err| format!("Failed to write private file {}: {err}", path.display()))
 }
 
-fn create_absent_target_backup(backup: &Path, parent: &Path) -> Result<(), String> {
-    let placeholder = Builder::new()
-        .prefix(ABSENT_BACKUP_PREFIX)
-        .tempdir_in(parent)
-        .map_err(|err| {
+fn set_private_directory_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
             format!(
-                "Failed to create absent-target backup beside {}: {err}",
-                backup.display()
+                "Failed to secure deployment backup {}: {err}",
+                path.display()
             )
         })?;
-    let sentinel = placeholder.path().join(ABSENT_TARGET_SENTINEL);
-    fs::write(&sentinel, b"quill deployment target was absent\n").map_err(|err| {
-        format!(
-            "Failed to write absent-target sentinel {}: {err}",
-            sentinel.display()
-        )
-    })?;
-    fs::rename(placeholder.path(), backup).map_err(|err| {
-        format!(
-            "Failed to publish absent-target backup {}: {err}",
-            backup.display()
-        )
-    })?;
-    let _ = placeholder.keep();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
-}
-
-fn rollback_transaction(targets: &[PathBuf], marker: &Path) -> Result<(), String> {
-    let mut errors = Vec::new();
-
-    for target in targets.iter().rev() {
-        let backup = match backup_path(target) {
-            Ok(backup) => backup,
-            Err(err) => {
-                errors.push(err);
-                continue;
-            }
-        };
-
-        let backup_exists = match path_exists(&backup) {
-            Ok(exists) => exists,
-            Err(err) => {
-                errors.push(err);
-                continue;
-            }
-        };
-        if !backup_exists {
-            continue;
-        }
-
-        match is_absent_target_backup(&backup) {
-            Ok(true) => {
-                if let Err(err) = remove_path(target) {
-                    errors.push(format!(
-                        "Failed to remove newly published target {}: {err}",
-                        target.display()
-                    ));
-                    continue;
-                }
-                if let Err(err) = remove_path(&backup) {
-                    errors.push(format!(
-                        "Failed to remove absent-target backup {}: {err}",
-                        backup.display()
-                    ));
-                }
-            }
-            Ok(false) => {
-                if let Err(err) = remove_path(target) {
-                    errors.push(format!(
-                        "Failed to remove published target {} before restore: {err}",
-                        target.display()
-                    ));
-                    continue;
-                }
-                if let Err(err) = fs::rename(&backup, target) {
-                    errors.push(format!(
-                        "Failed to restore backup {} to {}: {err}",
-                        backup.display(),
-                        target.display()
-                    ));
-                }
-            }
-            Err(err) => errors.push(err),
-        }
-    }
-
-    if let Err(err) = restore_persisted_snapshots(marker) {
-        errors.push(format!("Failed to restore provider configuration: {err}"));
-    }
-
-    let snapshot_directory = snapshot_directory(marker)?;
-    if errors.is_empty()
-        && let Err(err) = remove_path(&snapshot_directory)
-    {
-        errors.push(format!(
-            "Failed to remove provider snapshots {}: {err}",
-            snapshot_directory.display()
-        ));
-    }
-
-    if errors.is_empty()
-        && let Err(err) = remove_path(marker)
-    {
-        errors.push(format!(
-            "Failed to remove deployment transaction marker {}: {err}",
-            marker.display()
-        ));
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-fn is_absent_target_backup(backup: &Path) -> Result<bool, String> {
-    let metadata = fs::symlink_metadata(backup)
-        .map_err(|err| format!("Failed to inspect backup {}: {err}", backup.display()))?;
-    if !metadata.file_type().is_dir() {
-        return Ok(false);
-    }
-
-    let mut entries = fs::read_dir(backup)
-        .map_err(|err| format!("Failed to read backup {}: {err}", backup.display()))?;
-    let Some(entry) = entries.next() else {
-        return Ok(false);
-    };
-    let entry = entry.map_err(|err| format!("Failed to read backup entry: {err}"))?;
-    if entry.file_name() != OsStr::new(ABSENT_TARGET_SENTINEL) {
-        return Ok(false);
-    }
-    let file_type = entry.file_type().map_err(|err| {
-        format!(
-            "Failed to inspect absent-target sentinel {}: {err}",
-            entry.path().display()
-        )
-    })?;
-    if !file_type.is_file() {
-        return Ok(false);
-    }
-
-    match entries.next() {
-        None => Ok(true),
-        Some(Ok(_)) => Ok(false),
-        Some(Err(err)) => Err(format!("Failed to read backup entry: {err}")),
-    }
-}
-
-fn with_rollback_error(primary: String, targets: &[PathBuf], marker: &Path) -> String {
-    match rollback_transaction(targets, marker) {
-        Ok(()) => primary,
-        Err(rollback) => format!("{primary}; rollback failed: {rollback}"),
-    }
-}
-
-fn list_temporary_directories(parent: &Path) -> Result<Vec<PathBuf>, String> {
-    let entries = match fs::read_dir(parent) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(format!(
-                "Failed to inspect deployment parent {} for stale staging directories: {err}",
-                parent.display()
-            ));
-        }
-    };
-
-    let mut paths = Vec::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|err| format!("Failed to read deployment parent entry: {err}"))?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with(STAGING_PREFIX) || name.starts_with(ABSENT_BACKUP_PREFIX) {
-            paths.push(entry.path());
-        }
-    }
-    Ok(paths)
-}
-
-fn cleanup_stale_temporary_directories(parent: &Path) -> Result<(), String> {
-    let mut errors = Vec::new();
-    for path in list_temporary_directories(parent)? {
-        if let Err(err) = remove_path(&path) {
-            errors.push(format!(
-                "Failed to remove stale deployment path {}: {err}",
-                path.display()
-            ));
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
-}
-
-fn cleanup_backups_best_effort(targets: &[PathBuf]) {
-    for target in targets {
-        match backup_path(target) {
-            Ok(backup) => {
-                if let Err(err) = remove_path(&backup) {
-                    log::warn!(
-                        "Deployment committed but backup cleanup failed for {}: {err}",
-                        backup.display()
-                    );
-                }
-            }
-            Err(err) => log::warn!("Deployment committed but backup path was invalid: {err}"),
-        }
-    }
-}
-
-fn cleanup_snapshots_best_effort(marker: &Path) {
-    match snapshot_directory(marker) {
-        Ok(directory) => {
-            if let Err(err) = remove_path(&directory) {
-                log::warn!(
-                    "Deployment committed but snapshot cleanup failed for {}: {err}",
-                    directory.display()
-                );
-            }
-        }
-        Err(err) => log::warn!("Deployment committed but snapshot path was invalid: {err}"),
-    }
-}
-
-fn snapshot_directory(marker: &Path) -> Result<PathBuf, String> {
-    marker
-        .parent()
-        .map(|parent| parent.join(SNAPSHOT_DIRECTORY))
-        .ok_or_else(|| {
-            format!(
-                "Cannot determine snapshot directory for marker {}",
-                marker.display()
-            )
-        })
-}
-
-fn backup_path(target: &Path) -> Result<PathBuf, String> {
-    let file_name = target.file_name().ok_or_else(|| {
-        format!(
-            "Cannot determine file name for deployment target {}",
-            target.display()
-        )
-    })?;
-    let mut backup_name = OsString::from(".");
-    backup_name.push(file_name);
-    backup_name.push(BACKUP_SUFFIX);
-    Ok(target.with_file_name(backup_name))
 }
 
 /// Compute the current deployment stamp for a provider: a hash of every bundled
@@ -1601,15 +755,6 @@ pub(crate) fn remove_path(path: &Path) -> std::io::Result<()> {
         Err(err) => return Err(err),
     };
 
-    remove_path_with_metadata(path, &metadata)
-}
-
-fn remove_existing_path(path: &Path) -> std::io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    remove_path_with_metadata(path, &metadata)
-}
-
-fn remove_path_with_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
     let file_type = metadata.file_type();
     #[cfg(windows)]
     {
@@ -1641,91 +786,120 @@ mod tests {
         fs::read_to_string(path).unwrap()
     }
 
-    fn find_quarantine(parent: &Path) -> Option<PathBuf> {
-        fs::read_dir(parent)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(QUARANTINE_PREFIX))
-            })
+    /// The transaction left nothing behind: no backup dir, no staging leftovers.
+    fn assert_clean(parent: &Path) {
+        assert!(!parent.join(BACKUP_DIR).exists(), "backup dir must be gone");
+        for entry in fs::read_dir(parent).unwrap().flatten() {
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(STAGING_PREFIX),
+                "staging leftover: {}",
+                entry.path().display()
+            );
+        }
     }
 
-    struct Interrupted {
+    struct Harness {
         _dir: TempDir,
         parent: PathBuf,
-        target: PathBuf,
+        existing: PathBuf,
+        absent: PathBuf,
         config: PathBuf,
-        marker: PathBuf,
+        created: PathBuf,
     }
 
-    /// Set up a transaction that published a new tree and rewrote config, then
-    /// "crashed" before commit — the marker, backup, and snapshots all remain.
-    fn stage_interrupted_transaction() -> Interrupted {
+    /// Capture a transaction over one pre-existing and one absent target plus
+    /// one config file, mutate the config, create a new config file, and
+    /// publish staged replacements for both targets.
+    fn publish_full_batch() -> (Harness, PublishedBatch) {
         let dir = TempDir::new().unwrap();
         let parent = dir.path().to_path_buf();
-        let target = parent.join("scripts");
+        let existing = parent.join("scripts");
+        let absent = parent.join("templates");
         let config = parent.join("config.toml");
+        let created = parent.join("agents.md");
 
-        write_file(&target.join("old.txt"), b"old");
+        write_file(&existing.join("old.txt"), b"old");
         write_file(&config, b"original config");
 
-        let snapshots =
-            FileSnapshots::capture(std::slice::from_ref(&target), std::slice::from_ref(&config))
-                .unwrap();
-        let marker = parent.join(TRANSACTION_MARKER);
-        assert!(marker.exists());
-
+        let snapshots = FileSnapshots::capture(
+            &[existing.clone(), absent.clone()],
+            &[config.clone(), created.clone()],
+        )
+        .unwrap();
         write_file(&config, b"new config");
-        let staged = StagedDirectory::new(target.clone()).unwrap();
-        write_file(&staged.path().join("new.txt"), b"new");
-        let published = publish_staged_batch(vec![staged], snapshots).unwrap();
-        drop(published); // crash before commit/rollback: marker + backup persist
+        write_file(&created, b"created by install");
 
-        Interrupted {
-            _dir: dir,
-            parent,
-            target,
-            config,
-            marker,
-        }
+        let staged_existing = StagedDirectory::new(existing.clone()).unwrap();
+        write_file(&staged_existing.path().join("new.txt"), b"new");
+        let staged_absent = StagedDirectory::new(absent.clone()).unwrap();
+        write_file(&staged_absent.path().join("fresh.txt"), b"fresh");
+        let published =
+            publish_staged_batch(vec![staged_existing, staged_absent], snapshots).unwrap();
+
+        (
+            Harness {
+                _dir: dir,
+                parent,
+                existing,
+                absent,
+                config,
+                created,
+            },
+            published,
+        )
+    }
+
+    fn assert_restored(harness: &Harness) {
+        assert_eq!(read_file(&harness.existing.join("old.txt")), "old");
+        assert!(!harness.existing.join("new.txt").exists());
+        assert!(!harness.absent.exists(), "absent target must be removed");
+        assert_eq!(read_file(&harness.config), "original config");
+        assert!(!harness.created.exists(), "created file must be removed");
+        assert_clean(&harness.parent);
     }
 
     #[test]
-    fn regular_file_capture_restore_roundtrips_contents_and_permissions() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        write_file(&path, b"original");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-        }
+    fn publish_and_commit_installs_all_targets_and_removes_backup() {
+        let (harness, published) = publish_full_batch();
 
-        let snapshot = capture_file_snapshot(&path).unwrap();
+        published.commit().unwrap();
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        write_file(&path, b"modified");
-
-        restore_file_snapshot(snapshot).unwrap();
-
-        assert_eq!(read_file(&path), "original");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o400, "read-only permission must be restored");
-        }
+        assert_eq!(read_file(&harness.existing.join("new.txt")), "new");
+        assert!(!harness.existing.join("old.txt").exists());
+        assert_eq!(read_file(&harness.absent.join("fresh.txt")), "fresh");
+        assert_eq!(read_file(&harness.config), "new config");
+        assert_eq!(read_file(&harness.created), "created by install");
+        assert_clean(&harness.parent);
     }
 
     #[test]
-    fn configuration_only_commit_keeps_mutation_and_clears_transaction() {
+    fn rollback_after_publish_restores_originals() {
+        let (harness, published) = publish_full_batch();
+
+        published.rollback().unwrap();
+
+        assert_restored(&harness);
+    }
+
+    #[test]
+    fn crash_before_commit_recovers_and_is_idempotent() {
+        let (harness, published) = publish_full_batch();
+        drop(published); // crash before commit/rollback: the backup dir persists
+
+        let targets = [harness.existing.clone(), harness.absent.clone()];
+        recover_staged_batch(&targets).unwrap();
+        assert_restored(&harness);
+
+        // Running recovery again converges to a clean no-op.
+        recover_staged_batch(&targets).unwrap();
+        assert_restored(&harness);
+    }
+
+    #[test]
+    fn configuration_only_commit_keeps_mutation_and_clears_backup() {
         let dir = TempDir::new().unwrap();
         let target = dir.path().join("restart-transaction");
         let config = dir.path().join("settings.json");
@@ -1738,204 +912,45 @@ mod tests {
         snapshots.commit().unwrap();
 
         assert_eq!(read_file(&config), "new");
-        assert!(!dir.path().join(TRANSACTION_MARKER).exists());
-        assert!(!dir.path().join(SNAPSHOT_DIRECTORY).exists());
+        assert_clean(dir.path());
     }
 
     #[cfg(unix)]
     #[test]
-    fn dangling_symlink_restore_preserves_directory_at_referent() {
-        use std::os::unix::fs::symlink;
+    fn config_restore_roundtrips_contents_and_mode() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = TempDir::new().unwrap();
-        let link = dir.path().join("link");
-        let referent = dir.path().join("referent");
-        symlink("referent", &link).unwrap();
+        let target = dir.path().join("scripts");
+        let config = dir.path().join("config.toml");
+        write_file(&config, b"original");
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o400)).unwrap();
 
-        let snapshot = capture_file_snapshot(&link).unwrap();
+        let snapshots =
+            FileSnapshots::capture(std::slice::from_ref(&target), std::slice::from_ref(&config))
+                .unwrap();
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        write_file(&config, b"modified");
+        snapshots.restore().unwrap();
 
-        // Days after the crash, the user populates the referent with real content.
-        write_file(&referent.join("user_data.txt"), b"precious");
-
-        restore_file_snapshot(snapshot).unwrap();
-
-        assert!(referent.is_dir(), "directory at the referent must survive");
-        assert_eq!(read_file(&referent.join("user_data.txt")), "precious");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_symlink_restore_removes_regular_file_at_referent() {
-        use std::os::unix::fs::symlink;
-        let dir = TempDir::new().unwrap();
-        let link = dir.path().join("link");
-        let referent = dir.path().join("referent");
-        symlink("referent", &link).unwrap();
-
-        let snapshot = capture_file_snapshot(&link).unwrap();
-
-        // A regular file is the exact shape an install writes through the link.
-        write_file(&referent, b"written-by-install");
-
-        restore_file_snapshot(snapshot).unwrap();
-
-        assert!(
-            !referent.exists(),
-            "regular file the install wrote is removed"
-        );
+        assert_eq!(read_file(&config), "original");
+        let mode = fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400, "read-only permission must be restored");
+        assert_clean(dir.path());
     }
 
     #[test]
-    fn marker_recovery_rolls_back_and_is_idempotent() {
-        let harness = stage_interrupted_transaction();
-
-        recover_staged_batch(std::slice::from_ref(&harness.target)).unwrap();
-
-        assert_eq!(read_file(&harness.target.join("old.txt")), "old");
-        assert!(!harness.target.join("new.txt").exists());
-        assert_eq!(read_file(&harness.config), "original config");
-        assert!(!harness.marker.exists());
-        assert!(!backup_path(&harness.target).unwrap().exists());
-        assert!(!harness.parent.join(SNAPSHOT_DIRECTORY).exists());
-        assert!(find_quarantine(&harness.parent).is_none());
-
-        // Running recovery again converges to a clean no-op.
-        recover_staged_batch(std::slice::from_ref(&harness.target)).unwrap();
-        assert_eq!(read_file(&harness.target.join("old.txt")), "old");
-        assert_eq!(read_file(&harness.config), "original config");
-        assert!(find_quarantine(&harness.parent).is_none());
-    }
-
-    #[test]
-    fn failed_rollback_quarantines_instead_of_deleting() {
-        let harness = stage_interrupted_transaction();
-
-        // Induce a persistent restore failure: corrupt the snapshot manifest so
-        // the config restore cannot parse and rollback cannot complete.
-        let manifest = harness
-            .parent
-            .join(SNAPSHOT_DIRECTORY)
-            .join(SNAPSHOT_MANIFEST);
-        write_file(&manifest, b"{ not valid json");
-
-        // Recovery converges to Ok despite the unrollbackable transaction.
-        recover_staged_batch(std::slice::from_ref(&harness.target)).unwrap();
-
-        let quarantine =
-            find_quarantine(&harness.parent).expect("transaction state must be quarantined");
-        assert!(
-            quarantine
-                .join(SNAPSHOT_DIRECTORY)
-                .join(SNAPSHOT_MANIFEST)
-                .exists(),
-            "the snapshot backup data must survive inside the quarantine"
-        );
-        assert!(quarantine.join(TRANSACTION_MARKER).exists());
-        // Nothing was deleted at the batch parent; the state moved wholesale.
-        assert!(!harness.marker.exists());
-        assert!(!harness.parent.join(SNAPSHOT_DIRECTORY).exists());
-
-        // A subsequent recovery returns Ok (the wedge is gone).
-        recover_staged_batch(std::slice::from_ref(&harness.target)).unwrap();
-    }
-
-    #[test]
-    fn orphaned_backups_are_quarantined_not_deleted() {
-        let dir = TempDir::new().unwrap();
-        let parent = dir.path().to_path_buf();
-        let target = parent.join("scripts");
-
-        // Leftover backup + snapshots with no marker — indistinguishable from a
-        // user who deleted the marker, so they must be preserved.
-        let backup = backup_path(&target).unwrap();
-        write_file(&backup.join("old.txt"), b"precious");
-        let snapshot_dir = parent.join(SNAPSHOT_DIRECTORY);
-        write_file(&snapshot_dir.join(SNAPSHOT_MANIFEST), b"{}");
-        let staging = parent.join(format!("{STAGING_PREFIX}abcd"));
-        write_file(&staging.join("scratch"), b"scratch");
-
-        recover_staged_batch(std::slice::from_ref(&target)).unwrap();
-
-        assert!(!staging.exists(), "stale staging is deleted");
-        assert!(!backup.exists(), "backup is moved out of the batch parent");
-        assert!(
-            !snapshot_dir.exists(),
-            "snapshots are moved out of the parent"
-        );
-
-        let quarantine = find_quarantine(&parent).expect("leftovers must be quarantined");
-        assert_eq!(
-            read_file(&quarantine.join(".scripts.quill-backup").join("old.txt")),
-            "precious"
-        );
-        assert!(
-            quarantine
-                .join(SNAPSHOT_DIRECTORY)
-                .join(SNAPSHOT_MANIFEST)
-                .exists()
-        );
-    }
-
-    #[test]
-    fn stale_staging_directories_are_removed_without_quarantine() {
+    fn stale_staging_directories_are_removed() {
         let dir = TempDir::new().unwrap();
         let parent = dir.path().to_path_buf();
         let target = parent.join("scripts");
         write_file(&target.join("live.txt"), b"live");
-
         let staging = parent.join(format!("{STAGING_PREFIX}xyz"));
         write_file(&staging.join("scratch"), b"scratch");
-        let absent = parent.join(format!("{ABSENT_BACKUP_PREFIX}xyz"));
-        write_file(&absent.join("scratch"), b"scratch");
 
         recover_staged_batch(std::slice::from_ref(&target)).unwrap();
 
         assert!(!staging.exists());
-        assert!(!absent.exists());
-        // No user-data-bearing leftovers, so no quarantine is created.
-        assert!(find_quarantine(&parent).is_none());
         assert_eq!(read_file(&target.join("live.txt")), "live");
-    }
-
-    #[test]
-    fn absent_target_backup_is_discriminated_from_real_backups() {
-        let dir = TempDir::new().unwrap();
-        let parent = dir.path().to_path_buf();
-
-        let sentinel_backup = parent.join(".scripts.quill-backup");
-        create_absent_target_backup(&sentinel_backup, &parent).unwrap();
-        assert!(is_absent_target_backup(&sentinel_backup).unwrap());
-
-        let real_backup = parent.join(".templates.quill-backup");
-        write_file(&real_backup.join("content.txt"), b"data");
-        assert!(!is_absent_target_backup(&real_backup).unwrap());
-
-        let decoy = parent.join(".decoy.quill-backup");
-        write_file(&decoy.join(ABSENT_TARGET_SENTINEL), b"x");
-        write_file(&decoy.join("extra.txt"), b"y");
-        assert!(!is_absent_target_backup(&decoy).unwrap());
-    }
-
-    #[test]
-    fn absent_target_publish_rolls_back_to_absent() {
-        let dir = TempDir::new().unwrap();
-        let parent = dir.path().to_path_buf();
-        let target = parent.join("scripts");
-        assert!(!target.exists());
-
-        let snapshots = FileSnapshots::capture(std::slice::from_ref(&target), &[]).unwrap();
-        let staged = StagedDirectory::new(target.clone()).unwrap();
-        write_file(&staged.path().join("new.txt"), b"new");
-        let published = publish_staged_batch(vec![staged], snapshots).unwrap();
-
-        assert!(target.join("new.txt").exists());
-        assert!(is_absent_target_backup(&backup_path(&target).unwrap()).unwrap());
-
-        published.rollback().unwrap();
-
-        assert!(!target.exists(), "absent state must be restored");
-        assert!(!backup_path(&target).unwrap().exists());
-        assert!(!parent.join(TRANSACTION_MARKER).exists());
-        assert!(!parent.join(SNAPSHOT_DIRECTORY).exists());
     }
 
     #[test]

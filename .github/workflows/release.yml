@@ -21,6 +21,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Verify release tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "::error::Release workflow requires a v* tag ref"
+            exit 1
+          fi
+
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -122,6 +130,31 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Verify Sentry release configuration
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_RELEASE: ${{ github.ref_name }}
+          VITE_APP_VERSION: ${{ github.ref_name }}
+        run: |
+          if [ -z "$SENTRY_AUTH_TOKEN" ]; then
+            echo "::error::SENTRY_AUTH_TOKEN is required for release builds"
+            exit 1
+          fi
+
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          CARGO_VERSION="$(node -e 'const fs = require("fs"); const match = fs.readFileSync("src-tauri/Cargo.toml", "utf8").match(/^version = "([^"]+)"$/m); if (!match) process.exit(1); process.stdout.write(match[1])')"
+          EXPECTED_RELEASE="v${CARGO_VERSION}"
+
+          if [ "$PACKAGE_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::package.json and Cargo.toml versions differ"
+            exit 1
+          fi
+          if [ "$SENTRY_RELEASE" != "$EXPECTED_RELEASE" ] || [ "$VITE_APP_VERSION" != "$EXPECTED_RELEASE" ]; then
+            echo "::error::Sentry release identifiers do not match ${EXPECTED_RELEASE}"
+            exit 1
+          fi
+
       - name: Build and release
         uses: tauri-apps/tauri-action@v0.6.1
         env:
@@ -129,10 +162,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
-          # Sentry source map upload runs only on the ubuntu build so identical
-          # JS maps aren't republished 4x per release. The vite plugin no-ops
-          # when SENTRY_AUTH_TOKEN is empty (macOS / Windows builds).
-          SENTRY_AUTH_TOKEN: ${{ matrix.platform == 'ubuntu-22.04' && secrets.SENTRY_AUTH_TOKEN || '' }}
+          # Every runner builds its own frontend. Each exact bundle therefore
+          # receives a debug ID and uploads its matching source map.
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_ORG: stable-tech
           SENTRY_PROJECT: quill
           SENTRY_RELEASE: ${{ github.ref_name }}
@@ -150,6 +182,9 @@ jobs:
           # otherwise-good build. The publish job rebuilds the manifest anyway.
           retryAttempts: 3
           args: ${{ matrix.args }}
+
+      - name: Verify Sentry build artifacts
+        run: npm run verify:sentry-output
 
       - name: Verify macOS updater artifacts
         if: matrix.platform == 'macos-latest'

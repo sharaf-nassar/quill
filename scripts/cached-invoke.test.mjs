@@ -12,55 +12,23 @@ import {
 	weeklyTrendQueries,
 } from "../src/hooks/widgetQueryPlan.ts";
 
-class FakeClock {
-	nowMs = 0;
-	nextId = 1;
-	timers = new Map();
-
-	now = () => this.nowMs;
-
-	setTimer = (callback, delayMs) => {
-		const id = this.nextId++;
-		this.timers.set(id, { at: this.nowMs + delayMs, callback });
-		return id;
-	};
-
-	clearTimer = (id) => {
-		this.timers.delete(id);
-	};
-
-	tick(ms) {
-		const target = this.nowMs + ms;
-		for (;;) {
-			const due = [...this.timers.entries()]
-				.filter(([, timer]) => timer.at <= target)
-				.sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
-			if (!due) break;
-			const [id, timer] = due;
-			this.timers.delete(id);
-			this.nowMs = timer.at;
-			timer.callback();
-		}
-		this.nowMs = target;
-	}
-}
-
 async function settle() {
 	for (let index = 0; index < 8; index += 1) await Promise.resolve();
 }
 
-function makeStore(clock) {
-	return new CachedInvokeStore({ clock });
+function mockClock(t) {
+	t.mock.timers.enable({ apis: ["setTimeout", "Date"] });
+	return t.mock.timers;
 }
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Fresh remount skips fan-out]]
-test("fresh remount renders cached data without another request", async () => {
-	const clock = new FakeClock();
-	const store = makeStore(clock);
+test("fresh remount renders cached data without another request", async (t) => {
+	const clock = mockClock(t);
+	const store = new CachedInvokeStore();
 	const key = cachedInvokeKey({ command: "get_token_stats", args: { range: "6h" } });
 	const queryLog = [];
 	const request = async () => {
-		queryLog.push({ atMs: clock.now(), command: "get_token_stats", range: "6h" });
+		queryLog.push({ atMs: Date.now(), command: "get_token_stats", range: "6h" });
 		return { total: 42 };
 	};
 
@@ -101,8 +69,7 @@ test("fresh remount renders cached data without another request", async () => {
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Concurrent subscribers coalesce]]
 test("concurrent subscribers share one in-flight request", async () => {
-	const clock = new FakeClock();
-	const store = makeStore(clock);
+	const store = new CachedInvokeStore();
 	const key = cachedInvokeKey({ command: "get_activity_series", args: { range: "6h" } });
 	let resolveRequest;
 	let calls = 0;
@@ -126,16 +93,16 @@ test("concurrent subscribers share one in-flight request", async () => {
 });
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Listener setup stays query-silent]]
-test("listener registration does not synthesize cache invalidations", async () => {
-	const clock = new FakeClock();
-	const store = makeStore(clock);
+test("listener registration does not synthesize cache invalidations", async (t) => {
+	const clock = mockClock(t);
+	const store = new CachedInvokeStore();
 	const key = cachedInvokeKey({ command: "get_token_stats", args: { range: "6h" } });
 	const queryLog = [];
 	const callbacks = new Map();
 	const stop = store.subscribe(
 		key,
 		async () => {
-			queryLog.push({ atMs: clock.now(), command: "get_token_stats" });
+			queryLog.push({ atMs: Date.now(), command: "get_token_stats" });
 			return { total: 42 };
 		},
 		() => {},
@@ -162,10 +129,10 @@ test("listener registration does not synthesize cache invalidations", async () =
 });
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Ingest storms keep one cadence]]
-test("continuous ingest storms refresh one mounted fan-out every 5000ms or later", async () => {
+test("continuous ingest storms refresh one mounted fan-out every 5000ms or later", async (t) => {
 	assert.ok(CACHED_INVOKE_COALESCE_MS >= 5_000);
-	const clock = new FakeClock();
-	const store = makeStore(clock);
+	const clock = mockClock(t);
+	const store = new CachedInvokeStore();
 	const queryLog = [];
 	const descriptors = [
 		{ command: "get_token_stats", args: { range: "6h" } },
@@ -176,7 +143,7 @@ test("continuous ingest storms refresh one mounted fan-out every 5000ms or later
 		return store.subscribe(
 			key,
 			async () => {
-				queryLog.push({ atMs: clock.now(), ...descriptor });
+				queryLog.push({ atMs: Date.now(), ...descriptor });
 				return { ok: true };
 			},
 			() => {},
@@ -319,9 +286,9 @@ test("breakdown transitions keep one project request and range-scope skills", ()
 });
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Errors retry without poisoning cache]]
-test("a rejected request retains stale data and immediate retry recovers", async () => {
-	const clock = new FakeClock();
-	const store = makeStore(clock);
+test("a rejected request retains stale data and immediate retry recovers", async (t) => {
+	const clock = mockClock(t);
+	const store = new CachedInvokeStore();
 	const key = cachedInvokeKey({ command: "get_context_savings_analytics", args: { range: "6h" } });
 	let attempt = 0;
 	const request = async () => {
@@ -349,8 +316,7 @@ test("a rejected request retains stale data and immediate retry recovers", async
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Strict Mode cleanup releases resources]]
 test("Strict Mode-style cleanup releases cache timers", async () => {
-	const clock = new FakeClock();
-	const store = makeStore(clock);
+	const store = new CachedInvokeStore();
 	const key = cachedInvokeKey({ command: "get_llm_runtime_stats", args: { range: "6h" } });
 	let calls = 0;
 	const request = async () => ({ calls: ++calls });

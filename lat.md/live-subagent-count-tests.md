@@ -54,18 +54,18 @@ Claude setup registers one observer for each lifecycle group only under activity
 
 Codex payload construction preserves official lifecycle sources, root and agent identity, active model slug, hostname normalization, legacy session fallbacks, and malformed-evidence safety.
 
+## Codex Subagent Stop Response
+
+Codex subagent stops forward their agent identity and return a JSON no-op so Codex applies the terminal lifecycle state.
+
 ## Codex Managed Lifecycle Hooks
 
 Codex integration verification preserves the existing event registration set and removes the observer when activity tracking is disabled.
 
 ## Positive-Only Sessions Rows
 
-Frontend formatting and fixtures omit null and zero, group model families in capability order, reconcile missing evidence into a final `?` group, and keep positive evidence visible on idle rows.
+Frontend formatting and fixtures omit null and zero, render known model families as short labels, preserve unrecognized raw ids, reconcile missing evidence into a final `?` group, and keep positive evidence visible on idle rows.
 
 ## Observed-Only Sessions Presentation
 
 Frontend provenance formatting renders unavailable synthetic tokens as an em dash and omits the false zero-turn tooltip claim while retained rows keep real metrics.
-
-## Agent Model Row Contract
-
-Sessions preserve row order while the agent cluster renders bot icon → middle dot → grouped counts, exposes the full label and title, and ellipsizes its tail before erasing project identity.

@@ -686,72 +686,27 @@ impl fmt::Display for ModelUsageDiagnostic {
 fn bound_diagnostic(message: &str) -> Cow<'static, str> {
     const FALLBACK: &str = "Model history processing encountered an error.";
 
-    let mut normalized = String::with_capacity(message.len().min(DIAGNOSTIC_MAX_SCALARS * 4));
-    let mut scalar_count = 0;
-    let mut pending_space = false;
-
-    for character in message.chars() {
-        if character.is_whitespace() || character.is_control() {
-            pending_space = !normalized.is_empty();
-            continue;
-        }
-
-        if pending_space {
-            if push_bounded_diagnostic_char(&mut normalized, &mut scalar_count, ' ') {
-                return Cow::Owned(normalized);
-            }
-            pending_space = false;
-        }
-
-        if push_bounded_diagnostic_char(&mut normalized, &mut scalar_count, character) {
-            return Cow::Owned(normalized);
-        }
-    }
-
+    let normalized = message
+        .split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     if normalized.is_empty() {
-        Cow::Borrowed(FALLBACK)
-    } else {
-        Cow::Owned(normalized)
+        return Cow::Borrowed(FALLBACK);
     }
+    if normalized.chars().count() <= DIAGNOSTIC_MAX_SCALARS {
+        return Cow::Owned(normalized);
+    }
+    let mut truncated: String = normalized
+        .chars()
+        .take(DIAGNOSTIC_MAX_SCALARS - 1)
+        .collect();
+    truncated.push('\u{2026}');
+    Cow::Owned(truncated)
 }
 
 fn is_normalized_bounded_diagnostic(message: &str) -> bool {
-    if message.is_empty() || message.chars().count() > DIAGNOSTIC_MAX_SCALARS {
-        return false;
-    }
-
-    let mut previous_was_space = true;
-    for character in message.chars() {
-        if character.is_control() {
-            return false;
-        }
-        if character.is_whitespace() {
-            if character != ' ' || previous_was_space {
-                return false;
-            }
-            previous_was_space = true;
-        } else {
-            previous_was_space = false;
-        }
-    }
-
-    !previous_was_space
-}
-
-fn push_bounded_diagnostic_char(
-    output: &mut String,
-    scalar_count: &mut usize,
-    character: char,
-) -> bool {
-    if *scalar_count < DIAGNOSTIC_MAX_SCALARS {
-        output.push(character);
-        *scalar_count += 1;
-        return false;
-    }
-
-    output.pop();
-    output.push('\u{2026}');
-    true
+    message == bound_diagnostic(message)
 }
 
 const ADAPTER_MAX_DIAGNOSTICS: usize = 64;

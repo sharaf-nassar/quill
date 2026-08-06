@@ -5,8 +5,6 @@
 //! transaction under the ingest read permit, atomic bookmark persistence,
 //! permit release between chunks, and a WAL checkpoint after every commit.
 
-#![allow(dead_code)]
-
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -31,10 +29,9 @@ pub(crate) struct RollupBackfillState {
     pub(crate) done_through: Option<i64>,
 }
 
-/// Time and row bounds a target must honor while folding one chunk.
+/// Time bound a target must honor while folding one chunk.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RollupBackfillChunkBudget {
-    pub(crate) max_rows: u64,
     pub(crate) deadline: Instant,
 }
 
@@ -128,6 +125,9 @@ pub(crate) enum RollupBackfillTerminalError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RollupBackfillTerminal {
     Completed,
+    // Produced only by the cfg(test) `after_chunk` interrupt hook; kept
+    // unconditional so prod code can keep matching it exhaustively.
+    #[allow(dead_code)]
     Interrupted,
     Error(RollupBackfillTerminalError),
 }
@@ -212,14 +212,18 @@ pub(crate) enum RollupCheckpointResult {
     },
 }
 
+#[cfg(test)]
 pub(crate) type RollupFreeSpaceProbe<'a> = &'a dyn Fn(&Path) -> Result<u64, String>;
+#[cfg(test)]
 pub(crate) type RollupCheckpoint<'a> =
     &'a dyn Fn(&Connection) -> Result<RollupCheckpointResult, String>;
 pub(crate) type RollupProgressSink<'a> = &'a dyn Fn(&RollupBackfillProgress);
+#[cfg(test)]
 pub(crate) type RollupChunkHook<'a> = &'a dyn Fn(&RollupBackfillProgress) -> RollupChunkControl;
 #[cfg(test)]
 pub(crate) type RollupPermitHook<'a> = &'a dyn Fn();
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RollupChunkControl {
     Continue,
@@ -231,9 +235,12 @@ pub(crate) struct RollupBackfillControls<'a> {
     pub(crate) max_chunk_duration: Duration,
     pub(crate) wal_bytes_per_row: u64,
     pub(crate) free_space_multiplier: u64,
-    pub(crate) free_space: Option<RollupFreeSpaceProbe<'a>>,
-    pub(crate) checkpoint: Option<RollupCheckpoint<'a>>,
     pub(crate) progress: Option<RollupProgressSink<'a>>,
+    #[cfg(test)]
+    pub(crate) free_space: Option<RollupFreeSpaceProbe<'a>>,
+    #[cfg(test)]
+    pub(crate) checkpoint: Option<RollupCheckpoint<'a>>,
+    #[cfg(test)]
     pub(crate) after_chunk: Option<RollupChunkHook<'a>>,
     #[cfg(test)]
     pub(crate) before_chunk_permit: Option<RollupPermitHook<'a>>,
@@ -250,9 +257,12 @@ impl Default for RollupBackfillControls<'_> {
             max_chunk_duration: ROLLUP_BACKFILL_CHUNK_TARGET,
             wal_bytes_per_row: ROLLUP_BACKFILL_WAL_BYTES_PER_ROW,
             free_space_multiplier: ROLLUP_BACKFILL_SPACE_MULTIPLIER,
-            free_space: None,
-            checkpoint: None,
             progress: None,
+            #[cfg(test)]
+            free_space: None,
+            #[cfg(test)]
+            checkpoint: None,
+            #[cfg(test)]
             after_chunk: None,
             #[cfg(test)]
             before_chunk_permit: None,
@@ -272,17 +282,19 @@ impl RollupBackfillControls<'_> {
     }
 
     fn probe_free_space(&self, directory: &Path) -> Result<u64, String> {
-        match self.free_space {
-            Some(probe) => probe(directory),
-            None => available_disk_space(directory),
+        #[cfg(test)]
+        if let Some(probe) = self.free_space {
+            return probe(directory);
         }
+        available_disk_space(directory)
     }
 
     fn checkpoint(&self, conn: &Connection) -> Result<RollupCheckpointResult, String> {
-        match self.checkpoint {
-            Some(checkpoint) => checkpoint(conn),
-            None => checkpoint_truncate(conn),
+        #[cfg(test)]
+        if let Some(checkpoint) = self.checkpoint {
+            return checkpoint(conn);
         }
+        checkpoint_truncate(conn)
     }
 
     fn chunk_duration(&self) -> Duration {
@@ -369,14 +381,7 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(RollupBackfillError::BeginChunk)?;
             let chunk = target
-                .fold_chunk(
-                    &tx,
-                    previous,
-                    RollupBackfillChunkBudget {
-                        max_rows: controls.chunk_rows,
-                        deadline,
-                    },
-                )
+                .fold_chunk(&tx, previous, RollupBackfillChunkBudget { deadline })
                 .map_err(RollupBackfillError::FoldChunk)?;
             validate_chunk(&target_name, previous, chunk)?;
             let rows_done = previous
@@ -438,6 +443,7 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
                 terminal: RollupBackfillTerminal::Completed,
             });
         }
+        #[cfg(test)]
         if controls
             .after_chunk
             .is_some_and(|hook| hook(&progress) == RollupChunkControl::Interrupt)
@@ -528,6 +534,7 @@ mod tests {
     struct TestTarget {
         first_chunk_started: Option<Sender<()>>,
         first_chunk_delay: Duration,
+        max_rows: u64,
     }
 
     impl TestTarget {
@@ -535,6 +542,7 @@ mod tests {
             Self {
                 first_chunk_started: None,
                 first_chunk_delay: Duration::ZERO,
+                max_rows: 0,
             }
         }
     }
@@ -561,6 +569,16 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM raw_rows", [], |row| row.get(0))
         }
 
+        fn prepare_chunk(
+            &mut self,
+            _conn: &Connection,
+            _state: RollupBackfillState,
+            max_rows: u64,
+        ) -> rusqlite::Result<()> {
+            self.max_rows = max_rows;
+            Ok(())
+        }
+
         fn fold_chunk(
             &mut self,
             tx: &Transaction<'_>,
@@ -577,7 +595,7 @@ mod tests {
                  WHERE id > ?1 ORDER BY id LIMIT ?2",
             )?;
             let rows = statement
-                .query_map(params![after, budget.max_rows], |row| {
+                .query_map(params![after, self.max_rows], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -744,6 +762,7 @@ mod tests {
             let mut target = TestTarget {
                 first_chunk_started: Some(started_tx),
                 first_chunk_delay: Duration::from_millis(100),
+                max_rows: 0,
             };
             let lease_controls = RollupBackfillControls {
                 chunk_rows: 1,

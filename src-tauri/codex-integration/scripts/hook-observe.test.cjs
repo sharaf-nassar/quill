@@ -2,6 +2,10 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { spawnSync } = require("node:child_process");
+const { mkdtempSync, rmSync } = require("node:fs");
+const { tmpdir } = require("node:os");
+const { join } = require("node:path");
 const test = require("node:test");
 
 const { buildPayload } = require("./hook-observe.cjs");
@@ -56,6 +60,33 @@ test("builds complete lifecycle payloads from official Codex fields", () => {
     agent_id: "agent-2",
     model: { invalid: true },
   }, { hostname: "configured-host" }, now).model, null);
+});
+
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Subagent Stop Response]]
+test("SubagentStop returns a valid no-op response", () => {
+  const payload = buildPayload({
+    hook_event_name: "SubagentStop",
+    session_id: "root-session",
+    agent_id: "agent-1",
+  }, { hostname: "configured-host" }, now);
+  assert.equal(payload.agent_id, "agent-1");
+
+  const home = mkdtempSync(join(tmpdir(), "quill-hook-observe-"));
+  try {
+    const result = spawnSync(process.execPath, [join(__dirname, "hook-observe.cjs")], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home, USERPROFILE: home },
+      input: JSON.stringify({
+        hook_event_name: "SubagentStop",
+        session_id: "root-session",
+        agent_id: "agent-1",
+      }),
+    });
+    assert.equal(result.status, 0);
+    assert.deepEqual(JSON.parse(result.stdout), {});
+  } finally {
+    rmSync(home, { force: true, recursive: true });
+  }
 });
 
 test("preserves legacy session fallbacks and normalizes fallback hostname", () => {

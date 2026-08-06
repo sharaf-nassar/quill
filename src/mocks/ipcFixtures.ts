@@ -6,12 +6,10 @@
 import { emit } from "@tauri-apps/api/event";
 import type {
   ActivitySeriesResponse,
-  BucketStats,
   CodeStats,
   CodeStatsHistoryPoint,
   ContextPreservationStatus,
   ContextSavingsAnalytics,
-  DataPoint,
   HookBreakdown,
   HostBreakdown,
   IntegrationFeatures,
@@ -24,11 +22,8 @@ import type {
   ModelBackfillStatus,
   ModelIdentity,
   ModelRange,
-  ModelSessionRow,
-  ModelSessionsResponse,
   ModelUsageOverviewResponse,
   ProjectBreakdown,
-  ProjectTokensRaw,
   ProviderStatus,
   ProviderTokenSeries,
   ProviderTokenSeriesResponse,
@@ -42,10 +37,6 @@ import type {
   SearchFacets,
   SearchResults,
   SessionBreakdown,
-  SessionModelChain,
-  SessionModelHistoryResponse,
-  SessionModelSegment,
-  SessionStatsRaw,
   SkillBreakdown,
   ToolCount,
   TokenDataPoint,
@@ -215,27 +206,6 @@ const usageData: UsageData = {
   error: null,
 };
 
-function usageHistory(): DataPoint[] {
-  const pts: DataPoint[] = [];
-  for (let i = 47; i >= 0; i--) {
-    pts.push({ timestamp: iso(i * H), utilization: 25 + ((i * 41) % 60) });
-  }
-  return pts;
-}
-
-const usageStats: BucketStats[] = usageData.buckets.map((b) => ({
-  provider: b.provider,
-  key: b.key,
-  label: b.label,
-  current: b.utilization,
-  avg: Math.max(10, b.utilization - 12),
-  max: Math.min(100, b.utilization + 9),
-  min: Math.max(0, b.utilization - 22),
-  time_above_80: b.utilization >= 80 ? 3 : 0,
-  trend: b.utilization >= 80 ? "up" : "flat",
-  sample_count: 96,
-}));
-
 // --- Tokens -------------------------------------------------------------------
 
 /** Point spacing per range; hour-granular ranges get sub-hour buckets. */
@@ -366,20 +336,7 @@ const hookBreakdown: HookBreakdown[] = [
   { hook_identity: "commit_message_validator.py", hook_event: "PreToolUse", tool_name: "Bash", is_quill: false, codex_count: 0, claude_count: 64, total_count: 64, last_fired_at: iso(5 * H) },
 ];
 
-const projectTokens: ProjectTokensRaw[] = projectBreakdown.map((p) => ({
-  project: p.project,
-  total_tokens: p.total_tokens,
-  session_count: p.session_count,
-}));
-
 // --- Stats --------------------------------------------------------------------
-
-const sessionStats: SessionStatsRaw = {
-  avg_duration_seconds: 2_640,
-  avg_tokens: 13_106,
-  session_count: 96,
-  total_tokens: 1_258_100,
-};
 
 /**
  * Runtime answers per range, and its sparkline always sums to the total it
@@ -521,7 +478,6 @@ interface MockModelObservation {
   cwd?: string | null;
   hostname?: string | null;
   /** Simulates deletion after the page snapshot but before lazy detail. */
-  detailMissing?: boolean;
 }
 
 const MODEL_RANGE_MS: Record<ModelRange, number> = {
@@ -858,28 +814,6 @@ const modelObservations: MockModelObservation[] = [
     cwd: "/workspace/quill",
     hostname: "glass-cockpit.local",
   },
-  // More than one default page uses the same opaque model identity as ordinary
-  // evidence. Query handlers discover these records; they never branch on it.
-  ...Array.from({ length: 23 }, (_unused, index) => {
-    const ordinal = index + 1;
-    const sessionId = `model-detail-session-${String(ordinal).padStart(2, "0")}`;
-    return {
-      provider: "claude" as const,
-      sourceKey: `claude/${sessionId}.jsonl`,
-      sessionId,
-      observedAt: now - ordinal * M,
-      modelId: "shared/model.snapshot",
-      kind: "turn" as const,
-      inputTokens: 180 + ordinal * 7,
-      outputTokens: 40 + ordinal,
-      cacheCreationTokens: ordinal % 3 === 0 ? null : 20,
-      cacheReadTokens: 90 + ordinal * 2,
-      displayName: `Paged model session ${String(ordinal).padStart(2, "0")}`,
-      cwd: ordinal % 4 === 0 ? null : `/workspace/demo-${ordinal}`,
-      hostname: ordinal % 5 === 0 ? null : `fixture-host-${ordinal}.local`,
-      detailMissing: ordinal === 23,
-    } satisfies MockModelObservation;
-  }),
 ];
 
 type ModelFixtureScenario =
@@ -1184,76 +1118,6 @@ function readModelProvider(
     );
   }
   return value as ProviderStatus["provider"];
-}
-
-function trimRustStringWhitespace(value: string): string {
-  return value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
-}
-
-function hasUnpairedUtf16Surrogate(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
-    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      if (index + 1 >= value.length) return true;
-      const trailingCodeUnit = value.charCodeAt(index + 1);
-      if (trailingCodeUnit < 0xdc00 || trailingCodeUnit > 0xdfff) return true;
-      index += 1;
-    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function readSelectedModel(
-  value: unknown,
-  providerFilter: ProviderStatus["provider"] | null,
-): ModelIdentity | null {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== "object") {
-    return rejectModelAnalytics(
-      "invalid_model_id",
-      "Selected model identifier is invalid.",
-    );
-  }
-
-  const provider = readModelProvider(Reflect.get(value, "provider"));
-  if (provider === null) {
-    return rejectModelAnalytics(
-      "invalid_provider",
-      "Selected model provider is required.",
-    );
-  }
-  if (providerFilter !== null && provider !== providerFilter) {
-    return rejectModelAnalytics(
-      "invalid_provider",
-      "Selected model provider must match the active provider filter.",
-    );
-  }
-
-  const rawModelId = Reflect.get(value, "modelId");
-  if (typeof rawModelId !== "string") {
-    return rejectModelAnalytics(
-      "invalid_model_id",
-      "Selected model identifier is invalid.",
-    );
-  }
-  const modelId = trimRustStringWhitespace(rawModelId);
-  if (modelId.length === 0 || hasUnpairedUtf16Surrogate(modelId)) {
-    return rejectModelAnalytics(
-      "invalid_model_id",
-      "Selected model identifier must contain 1-256 non-control Unicode characters.",
-    );
-  }
-  const scalarCount = Array.from(modelId).length;
-  if (scalarCount > 256 || /\p{Cc}/u.test(modelId)) {
-    return rejectModelAnalytics(
-      "invalid_model_id",
-      "Selected model identifier must contain 1-256 non-control Unicode characters.",
-    );
-  }
-
-  return { provider, modelId };
 }
 
 function compareUnicodeScalars(left: string, right: string): number {
@@ -1788,603 +1652,6 @@ function createModelUsageOverviewFixture(
   };
 }
 
-interface IndexedModelObservation {
-  observation: MockModelObservation;
-  ordinal: number;
-}
-
-interface ModelPrimaryAggregate {
-  identity: ModelIdentity;
-  attributedTokens: number;
-  turns: number;
-}
-
-interface ModelSessionsFixtureCursor {
-  version: 1;
-  range: ModelRange;
-  modelProvider: string;
-  modelId: string;
-  scenario: ModelFixtureScenario;
-  lastActivityAt: string;
-  provider: string;
-  sessionId: string;
-}
-
-const MODEL_SESSIONS_FIXTURE_CURSOR_PREFIX = "qmf1.";
-const MODEL_SESSIONS_DEFAULT_LIMIT = 20;
-const MODEL_SESSIONS_MAX_LIMIT = 100;
-
-function indexedModelObservations(
-  observations: readonly MockModelObservation[],
-): IndexedModelObservation[] {
-  return observations.map((observation, ordinal) => ({
-    observation,
-    ordinal,
-  }));
-}
-
-function compareIndexedModelObservations(
-  left: IndexedModelObservation,
-  right: IndexedModelObservation,
-): number {
-  return (
-    left.observation.observedAt - right.observation.observedAt ||
-    left.ordinal - right.ordinal
-  );
-}
-
-function observationChainId(observation: MockModelObservation): string {
-  return observation.chainId ?? observation.sessionId;
-}
-
-function getModelPrimary(
-  observations: readonly IndexedModelObservation[],
-): ModelIdentity | null {
-  const aggregates = new Map<string, ModelPrimaryAggregate>();
-  for (const { observation } of observations) {
-    if (observation.modelId === null) continue;
-    const identity = {
-      provider: observation.provider,
-      modelId: observation.modelId,
-    } satisfies ModelIdentity;
-    const key = modelIdentityFixtureKey(identity);
-    const aggregate = aggregates.get(key) ?? {
-      identity,
-      attributedTokens: 0,
-      turns: 0,
-    };
-    aggregate.attributedTokens += modelObservationTokens(observation);
-    aggregate.turns += observation.kind === "turn" ? 1 : 0;
-    aggregates.set(key, aggregate);
-  }
-
-  return (
-    Array.from(aggregates.values()).sort(
-      (left, right) =>
-        right.attributedTokens - left.attributedTokens ||
-        right.turns - left.turns ||
-        compareModelIdentities(left.identity, right.identity),
-    )[0]?.identity ?? null
-  );
-}
-
-function getWithinChainSwitchCount(
-  observations: readonly IndexedModelObservation[],
-): number {
-  const chains = new Map<string, IndexedModelObservation[]>();
-  for (const indexed of observations) {
-    if (indexed.observation.kind !== "turn") continue;
-    const chainId = observationChainId(indexed.observation);
-    const chain = chains.get(chainId) ?? [];
-    chain.push(indexed);
-    chains.set(chainId, chain);
-  }
-
-  let switchCount = 0;
-  for (const chain of chains.values()) {
-    let previousIdentityKey: string | null = null;
-    for (const { observation } of chain.sort(
-      compareIndexedModelObservations,
-    )) {
-      if (observation.modelId === null) {
-        previousIdentityKey = null;
-        continue;
-      }
-      const identityKey = modelIdentityFixtureKey({
-        provider: observation.provider,
-        modelId: observation.modelId,
-      });
-      if (
-        previousIdentityKey !== null &&
-        previousIdentityKey !== identityKey
-      ) {
-        switchCount += 1;
-      }
-      previousIdentityKey = identityKey;
-    }
-  }
-  return switchCount;
-}
-
-function firstDefinedObservationValue<T>(
-  observations: readonly IndexedModelObservation[],
-  select: (observation: MockModelObservation) => T | undefined,
-): T | undefined {
-  for (const { observation } of observations) {
-    const value = select(observation);
-    if (value !== undefined) return value;
-  }
-  return undefined;
-}
-
-function createModelSessionRow(
-  observations: readonly IndexedModelObservation[],
-  selectedModel: ModelIdentity,
-): ModelSessionRow {
-  const first = observations[0]?.observation;
-  const primaryModel = getModelPrimary(observations);
-  if (first === undefined || primaryModel === null) {
-    return rejectModelAnalytics(
-      "storage_error",
-      "Browser model session fixture could not build a session row.",
-    );
-  }
-
-  const identityKeys = new Set<string>();
-  const chainIds = new Set<string>();
-  let selectedModelTokens = 0;
-  let selectedModelTurns = 0;
-  let lastActivityAt = Number.NEGATIVE_INFINITY;
-  for (const { observation } of observations) {
-    chainIds.add(observationChainId(observation));
-    lastActivityAt = Math.max(lastActivityAt, observation.observedAt);
-    if (observation.modelId !== null) {
-      identityKeys.add(
-        modelIdentityFixtureKey({
-          provider: observation.provider,
-          modelId: observation.modelId,
-        }),
-      );
-    }
-    if (
-      observation.provider === selectedModel.provider &&
-      observation.modelId === selectedModel.modelId
-    ) {
-      selectedModelTokens += modelObservationTokens(observation);
-      selectedModelTurns += observation.kind === "turn" ? 1 : 0;
-    }
-  }
-
-  return {
-    provider: first.provider,
-    sessionId: first.sessionId,
-    displayName:
-      firstDefinedObservationValue(observations, ({ displayName }) =>
-        displayName === undefined ? undefined : displayName,
-      ) ?? first.sessionId,
-    cwd:
-      firstDefinedObservationValue(observations, ({ cwd }) => cwd) ?? null,
-    hostname:
-      firstDefinedObservationValue(observations, ({ hostname }) => hostname) ??
-      null,
-    selectedModelTokens,
-    selectedModelTurns,
-    lastActivityAt: new Date(lastActivityAt).toISOString(),
-    primaryModel,
-    distinctModels: identityKeys.size,
-    hasWithinChainSwitches: getWithinChainSwitchCount(observations) > 0,
-    chainCount: chainIds.size,
-  };
-}
-
-function readModelSessionsLimit(
-  value: unknown,
-): number {
-  if (value === null || value === undefined) {
-    return MODEL_SESSIONS_DEFAULT_LIMIT;
-  }
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    return rejectModelAnalytics(
-      "storage_error",
-      "Browser model session fixture limit must be an integer.",
-    );
-  }
-  return Math.min(MODEL_SESSIONS_MAX_LIMIT, Math.max(1, value));
-}
-
-function encodeModelSessionsFixtureCursor(
-  cursor: ModelSessionsFixtureCursor,
-): string {
-  const bytes = new TextEncoder().encode(JSON.stringify(cursor));
-  const payload = Array.from(bytes, (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
-  return `${MODEL_SESSIONS_FIXTURE_CURSOR_PREFIX}${payload}`;
-}
-
-function rejectInvalidModelSessionsFixtureCursor(): never {
-  return rejectModelAnalytics(
-    "invalid_cursor",
-    "The model session cursor is malformed, stale, or belongs to another request.",
-  );
-}
-
-function decodeModelSessionsFixtureCursor(
-  value: unknown,
-  expected: Pick<
-    ModelSessionsFixtureCursor,
-    "range" | "modelProvider" | "modelId" | "scenario"
-  >,
-): ModelSessionsFixtureCursor | null {
-  if (value === null || value === undefined) return null;
-  if (
-    typeof value !== "string" ||
-    value.length > 4_096 ||
-    !value.startsWith(MODEL_SESSIONS_FIXTURE_CURSOR_PREFIX)
-  ) {
-    return rejectInvalidModelSessionsFixtureCursor();
-  }
-
-  const encoded = value.slice(MODEL_SESSIONS_FIXTURE_CURSOR_PREFIX.length);
-  if (
-    encoded.length === 0 ||
-    encoded.length % 2 !== 0 ||
-    !/^[0-9a-f]+$/.test(encoded)
-  ) {
-    return rejectInvalidModelSessionsFixtureCursor();
-  }
-
-  try {
-    const bytes = new Uint8Array(encoded.length / 2);
-    for (let index = 0; index < bytes.length; index += 1) {
-      bytes[index] = Number.parseInt(encoded.slice(index * 2, index * 2 + 2), 16);
-    }
-    const decoded = JSON.parse(
-      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-    ) as unknown;
-    if (
-      decoded === null ||
-      typeof decoded !== "object" ||
-      Array.isArray(decoded)
-    ) {
-      return rejectInvalidModelSessionsFixtureCursor();
-    }
-    const parsed = decoded as Partial<ModelSessionsFixtureCursor>;
-    const cursorFields = new Set([
-      "version",
-      "range",
-      "modelProvider",
-      "modelId",
-      "scenario",
-      "lastActivityAt",
-      "provider",
-      "sessionId",
-    ]);
-    if (
-      Object.keys(parsed).length !== cursorFields.size ||
-      Object.keys(parsed).some((field) => !cursorFields.has(field))
-    ) {
-      return rejectInvalidModelSessionsFixtureCursor();
-    }
-    if (
-      parsed.version !== 1 ||
-      parsed.range !== expected.range ||
-      parsed.modelProvider !== expected.modelProvider ||
-      parsed.modelId !== expected.modelId ||
-      parsed.scenario !== expected.scenario ||
-      typeof parsed.lastActivityAt !== "string" ||
-      !Number.isFinite(Date.parse(parsed.lastActivityAt)) ||
-      new Date(parsed.lastActivityAt).toISOString() !== parsed.lastActivityAt ||
-      parsed.provider !== expected.modelProvider ||
-      typeof parsed.sessionId !== "string" ||
-      parsed.sessionId.length === 0
-    ) {
-      return rejectInvalidModelSessionsFixtureCursor();
-    }
-    return parsed as ModelSessionsFixtureCursor;
-  } catch {
-    return rejectInvalidModelSessionsFixtureCursor();
-  }
-}
-
-function compareModelSessionOrder(
-  left: Pick<ModelSessionRow, "lastActivityAt" | "provider" | "sessionId">,
-  right: Pick<ModelSessionRow, "lastActivityAt" | "provider" | "sessionId">,
-): number {
-  return (
-    Date.parse(right.lastActivityAt) - Date.parse(left.lastActivityAt) ||
-    compareUnicodeScalars(left.provider, right.provider) ||
-    compareUnicodeScalars(left.sessionId, right.sessionId)
-  );
-}
-
-function createModelSessionsFixture(
-  args: Record<string, unknown> | undefined,
-): ModelSessionsResponse {
-  const range = readModelRange(args);
-  const modelProvider = readModelProvider(args?.modelProvider);
-  if (modelProvider === null) {
-    return rejectModelAnalytics(
-      "invalid_provider",
-      "Selected model provider is required.",
-    );
-  }
-  const identity = readSelectedModel(
-    { provider: modelProvider, modelId: args?.modelId },
-    modelProvider,
-  );
-  if (identity === null) {
-    return rejectModelAnalytics(
-      "invalid_model_id",
-      "Selected model identifier is required.",
-    );
-  }
-
-  const scenario = readModelFixtureScenario();
-  rejectRequestedModelFixture("sessions");
-  const observations = indexedModelObservations(
-    getScopedModelObservations(
-      getModelFixtureObservations(scenario, range, modelProvider),
-      range,
-      modelProvider,
-    ),
-  );
-  const matchingSessionKeys = new Set(
-    observations
-      .filter(
-        ({ observation }) =>
-          observation.provider === identity.provider &&
-          observation.modelId === identity.modelId,
-      )
-      .map(({ observation }) => modelSessionFixtureKey(observation)),
-  );
-  const observationsBySession = new Map<string, IndexedModelObservation[]>();
-  for (const indexed of observations) {
-    const sessionKey = modelSessionFixtureKey(indexed.observation);
-    if (!matchingSessionKeys.has(sessionKey)) continue;
-    const session = observationsBySession.get(sessionKey) ?? [];
-    session.push(indexed);
-    observationsBySession.set(sessionKey, session);
-  }
-
-  const sessions = Array.from(observationsBySession.values())
-    .map((session) => createModelSessionRow(session, identity))
-    .sort(compareModelSessionOrder);
-  const expectedCursor = {
-    range,
-    modelProvider: identity.provider,
-    modelId: identity.modelId,
-    scenario,
-  } satisfies Pick<
-    ModelSessionsFixtureCursor,
-    "range" | "modelProvider" | "modelId" | "scenario"
-  >;
-  const cursor = decodeModelSessionsFixtureCursor(args?.cursor, expectedCursor);
-  if (
-    cursor !== null &&
-    !sessions.some((session) => compareModelSessionOrder(session, cursor) === 0)
-  ) {
-    return rejectInvalidModelSessionsFixtureCursor();
-  }
-  const limit = readModelSessionsLimit(args?.limit);
-  const eligibleSessions =
-    cursor === null
-      ? sessions
-      : sessions.filter(
-          (session) => compareModelSessionOrder(session, cursor) > 0,
-        );
-  const page = eligibleSessions.slice(0, limit);
-  const hasMore = eligibleSessions.length > limit;
-  const finalRow = page[page.length - 1];
-
-  return {
-    identity,
-    total: sessions.length,
-    nextCursor:
-      hasMore && finalRow !== undefined
-        ? encodeModelSessionsFixtureCursor({
-            version: 1,
-            ...expectedCursor,
-            lastActivityAt: finalRow.lastActivityAt,
-            provider: finalRow.provider,
-            sessionId: finalRow.sessionId,
-          })
-        : null,
-    sessions: page,
-  };
-}
-
-function createSessionModelSegments(
-  observations: readonly IndexedModelObservation[],
-): SessionModelSegment[] {
-  const segments: SessionModelSegment[] = [];
-  for (const { observation } of observations
-    .filter(({ observation }) => observation.kind === "turn")
-    .sort(compareIndexedModelObservations)) {
-    const observedAt = new Date(observation.observedAt).toISOString();
-    const previous = segments[segments.length - 1];
-    if (observation.modelId === null) {
-      if (previous?.kind === "modelGap") {
-        previous.endedAt = observedAt;
-        previous.turnCount += 1;
-      } else {
-        segments.push({
-          kind: "modelGap",
-          startedAt: observedAt,
-          endedAt: observedAt,
-          turnCount: 1,
-        });
-      }
-      continue;
-    }
-
-    const identity = {
-      provider: observation.provider,
-      modelId: observation.modelId,
-    } satisfies ModelIdentity;
-    if (
-      previous?.kind === "model" &&
-      modelIdentityFixtureKey(previous.identity) ===
-        modelIdentityFixtureKey(identity)
-    ) {
-      previous.endedAt = observedAt;
-      previous.turnCount += 1;
-      previous.attributedTokens += modelObservationTokens(observation);
-    } else {
-      segments.push({
-        kind: "model",
-        identity,
-        startedAt: observedAt,
-        endedAt: observedAt,
-        turnCount: 1,
-        attributedTokens: modelObservationTokens(observation),
-      });
-    }
-  }
-  return segments;
-}
-
-function createSessionModelChain(
-  observations: readonly IndexedModelObservation[],
-): SessionModelChain {
-  const sorted = [...observations].sort(compareIndexedModelObservations);
-  const first = sorted[0]?.observation;
-  if (first === undefined) {
-    return rejectModelAnalytics(
-      "storage_error",
-      "Browser model history fixture could not build a chain.",
-    );
-  }
-  const chainId = observationChainId(first);
-  const agentId =
-    firstDefinedObservationValue(sorted, ({ agentId: value }) => value) ?? null;
-  const parentChainId =
-    firstDefinedObservationValue(sorted, ({ parentChainId: value }) => value) ??
-    null;
-  let attributedTokens = 0;
-  let unattributedTokens = 0;
-  for (const { observation } of sorted) {
-    if (observation.modelId === null) {
-      unattributedTokens += modelObservationTokens(observation);
-    } else {
-      attributedTokens += modelObservationTokens(observation);
-    }
-  }
-
-  return {
-    chainId,
-    parentChainId,
-    kind:
-      chainId === first.sessionId && agentId === null
-        ? "parent"
-        : "subagent",
-    agentId,
-    switchCount: getWithinChainSwitchCount(sorted),
-    attributedTokens,
-    unattributedTokens,
-    segments: createSessionModelSegments(sorted),
-  };
-}
-
-function createSessionModelHistoryFixture(
-  args: Record<string, unknown> | undefined,
-): SessionModelHistoryResponse {
-  const provider = readModelProvider(args?.provider);
-  if (provider === null) {
-    return rejectModelAnalytics(
-      "invalid_provider",
-      "Session model history provider is required.",
-    );
-  }
-  const range = readModelRange(args);
-  const sessionId = args?.sessionId;
-  if (typeof sessionId !== "string" || sessionId.length === 0) {
-    return rejectModelAnalytics(
-      "not_found",
-      "No retained model history exists for this session in the selected range.",
-    );
-  }
-  const scenario = readModelFixtureScenario();
-  rejectRequestedModelFixture("detail");
-  const observations = indexedModelObservations(
-    getScopedModelObservations(
-      getModelFixtureObservations(scenario, range, provider),
-      range,
-      provider,
-    ).filter(
-      (observation) =>
-        observation.provider === provider &&
-        observation.sessionId === sessionId,
-    ),
-  );
-  if (
-    observations.length === 0 ||
-    observations.some(({ observation }) => observation.detailMissing === true)
-  ) {
-    return rejectModelAnalytics(
-      "not_found",
-      "No retained model history exists for this session in the selected range.",
-    );
-  }
-
-  const observationsByChain = new Map<string, IndexedModelObservation[]>();
-  for (const indexed of observations) {
-    const chainId = observationChainId(indexed.observation);
-    const chain = observationsByChain.get(chainId) ?? [];
-    chain.push(indexed);
-    observationsByChain.set(chainId, chain);
-  }
-  const chainsWithActivity = Array.from(observationsByChain.values()).map(
-    (chain) => ({
-      chain: createSessionModelChain(chain),
-      firstActivity: Math.min(
-        ...chain.map(({ observation }) => observation.observedAt),
-      ),
-    }),
-  );
-  chainsWithActivity.sort(
-    (left, right) =>
-      (left.chain.kind === "parent" ? 0 : 1) -
-        (right.chain.kind === "parent" ? 0 : 1) ||
-      left.firstActivity - right.firstActivity ||
-      compareUnicodeScalars(left.chain.chainId, right.chain.chainId),
-  );
-
-  const identityKeys = new Set<string>();
-  let attributedTokens = 0;
-  let unattributedTokens = 0;
-  for (const { observation } of observations) {
-    const tokens = modelObservationTokens(observation);
-    if (observation.modelId === null) {
-      unattributedTokens += tokens;
-    } else {
-      attributedTokens += tokens;
-      identityKeys.add(
-        modelIdentityFixtureKey({
-          provider: observation.provider,
-          modelId: observation.modelId,
-        }),
-      );
-    }
-  }
-  const chains = chainsWithActivity.map(({ chain }) => chain);
-
-  return {
-    provider,
-    sessionId,
-    displayName:
-      firstDefinedObservationValue(observations, ({ displayName }) =>
-        displayName === undefined ? undefined : displayName,
-      ) ?? sessionId,
-    primaryModel: getModelPrimary(observations),
-    distinctModels: identityKeys.size,
-    switchCount: chains.reduce((total, chain) => total + chain.switchCount, 0),
-    attributedTokens,
-    unattributedTokens,
-    chains,
-  };
-}
-
 function retryModelHistoryBackfillFixture(): ModelBackfillStatus {
   const scenario = readModelFixtureScenario();
   rejectRequestedModelFixture("retry");
@@ -2864,8 +2131,6 @@ const fixtures: Record<string, FixtureHandler> = {
   run_retention_maintenance: (args) => runRetentionMaintenanceFixture(args),
   // live usage
   fetch_usage_data: () => usageData,
-  get_usage_history: () => usageHistory(),
-  get_usage_stats: () => usageStats,
   // tokens
   get_token_history: (args) => tokenHistory(rangeArg(args)),
   get_token_stats: () => tokenStats,
@@ -2873,7 +2138,6 @@ const fixtures: Record<string, FixtureHandler> = {
     providerTokenSeries(rangeArg(args), bucketsArg(args, PROVIDER_SERIES_BUCKETS)),
   get_activity_series: (args) =>
     activitySeries(rangeArg(args), bucketsArg(args, ACTIVITY_SERIES_BUCKETS)),
-  get_token_hostnames: () => ["mbp.local", "devbox", "ci-runner-3"],
   // code
   get_code_stats: () => codeStats,
   get_code_stats_history: (args) => codeHistory(rangeArg(args)),
@@ -2884,13 +2148,8 @@ const fixtures: Record<string, FixtureHandler> = {
   get_session_breakdown: () => sessionBreakdown,
   get_skill_breakdown: () => skillBreakdown,
   get_hook_breakdown: () => hookBreakdown,
-  get_project_tokens: () => projectTokens,
-  get_skill_project_breakdown: () => [],
-  get_session_subagent_tree: () => [],
   // stats
-  get_session_stats: () => sessionStats,
   get_llm_runtime_stats: (args) => llmRuntimeStats(rangeArg(args)),
-  get_snapshot_count: () => 1_440,
   get_top_tools: () => topTools,
   get_observation_count: () => 184,
   get_unanalyzed_observation_count: () => 12,
@@ -2899,9 +2158,6 @@ const fixtures: Record<string, FixtureHandler> = {
   get_context_savings_analytics: () => contextSavings,
   // session model analytics
   get_model_usage_overview: (args) => createModelUsageOverviewFixture(args),
-  get_model_sessions: (args) => createModelSessionsFixture(args),
-  get_session_model_history: (args) =>
-    createSessionModelHistoryFixture(args),
   retry_model_history_backfill: () => retryModelHistoryBackfillFixture(),
   // learning
   get_learned_rules: () => learnedRules,

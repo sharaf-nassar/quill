@@ -11,8 +11,8 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
@@ -382,7 +382,7 @@ impl ObservedSubagentState {
             return false;
         };
 
-        let mut registry = self.inner.lock();
+        let mut registry = self.inner.lock().unwrap();
         let accepts_observation = registry.activity_tracking_enabled
             && !registry.disabled_providers.contains(&key.provider);
         if !lifecycle {
@@ -455,6 +455,7 @@ impl ObservedSubagentState {
         let hostname = normalize_observed_hostname(hostname)?;
         self.inner
             .lock()
+            .unwrap()
             .roots
             .get(&ObservedRootKey {
                 provider: provider.to_owned(),
@@ -472,7 +473,7 @@ impl ObservedSubagentState {
         provider: Option<IntegrationProvider>,
         limit: Option<i32>,
     ) -> Vec<SessionBreakdown> {
-        let registry = self.inner.lock();
+        let registry = self.inner.lock().unwrap();
         let mut seen = HashSet::new();
 
         for row in &mut rows {
@@ -566,7 +567,7 @@ impl ObservedSubagentState {
         ) -> Result<HashMap<ObservedAgentModelKey, String>, String>,
     ) -> Result<(), String> {
         let snapshots = {
-            let registry = self.inner.lock();
+            let registry = self.inner.lock().unwrap();
             rows.iter()
                 .enumerate()
                 .filter_map(|(index, row)| {
@@ -626,7 +627,7 @@ impl ObservedSubagentState {
 
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
         let barrier = Utc::now();
-        let mut registry = self.inner.lock();
+        let mut registry = self.inner.lock().unwrap();
         registry.activity_tracking_enabled = enabled;
         for provider in ["claude", "codex"] {
             registry
@@ -641,7 +642,7 @@ impl ObservedSubagentState {
     pub(crate) fn set_provider_enabled(&self, provider: IntegrationProvider, enabled: bool) {
         let provider = provider.as_str();
         let barrier = Utc::now();
-        let mut registry = self.inner.lock();
+        let mut registry = self.inner.lock().unwrap();
         if enabled {
             registry.disabled_providers.remove(provider);
         } else {
@@ -718,25 +719,6 @@ fn check_auth(headers: &HeaderMap, secret: &str) -> bool {
     // Length mismatch returns false immediately, but our secret is a
     // fixed-length hex string so length is not sensitive.
     token.as_bytes().ct_eq(secret.as_bytes()).into()
-}
-
-fn check_rate_limit(rate_limiter: &Mutex<VecDeque<Instant>>) -> bool {
-    let mut window = rate_limiter.lock();
-
-    let now = Instant::now();
-    let cutoff = now - std::time::Duration::from_secs(RATE_WINDOW_SECS);
-
-    // Remove expired entries from the front
-    while window.front().is_some_and(|t| *t < cutoff) {
-        window.pop_front();
-    }
-
-    if window.len() >= MAX_REQUESTS {
-        return false;
-    }
-
-    window.push_back(now);
-    true
 }
 
 pub async fn start_server(
@@ -823,7 +805,7 @@ async fn report_tokens(
         );
     }
 
-    if !check_rate_limit(&state.rate_limiter) {
+    if !check_rate_limit_with_max(&state.rate_limiter, MAX_REQUESTS) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
@@ -887,7 +869,7 @@ async fn report_tokens(
 // --- Learning endpoints ---
 
 fn check_rate_limit_with_max(rate_limiter: &Mutex<VecDeque<Instant>>, max: usize) -> bool {
-    let mut window = rate_limiter.lock();
+    let mut window = rate_limiter.lock().unwrap();
     let now = Instant::now();
     let cutoff = now - std::time::Duration::from_secs(RATE_WINDOW_SECS);
     while window.front().is_some_and(|t| *t < cutoff) {
@@ -948,7 +930,7 @@ fn validation_retry_source_hash(payload: &SessionNotifyPayload) -> String {
 fn queue_session_notify(state: Arc<ServerState>, payload: SessionNotifyPayload) {
     let key = session_notify_key(&payload);
     let should_spawn = {
-        let mut pending = state.pending_session_notifies.lock();
+        let mut pending = state.pending_session_notifies.lock().unwrap();
         match pending.get_mut(&key) {
             Some(entry) => {
                 entry.generation = entry.generation.saturating_add(1);
@@ -978,7 +960,7 @@ fn queue_session_notify(state: Arc<ServerState>, payload: SessionNotifyPayload) 
 fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload) {
     let key = format!("{}:{}", payload.provider.as_str(), payload.jsonl_path);
     let should_spawn = {
-        let mut retries = state.pending_validation_retries.lock();
+        let mut retries = state.pending_validation_retries.lock().unwrap();
         if let Some(entry) = retries.get_mut(&key) {
             entry.generation = entry.generation.saturating_add(1);
             entry.payload = payload;
@@ -1005,6 +987,7 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                     state
                         .pending_validation_retries
                         .lock()
+                        .unwrap()
                         .get(&key)
                         .map(|entry| {
                             (
@@ -1029,7 +1012,12 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                         validation_retry_source_hash(&payload),
                     );
                     remove_validation_retry(&state, &key, generation);
-                    if state.pending_validation_retries.lock().contains_key(&key) {
+                    if state
+                        .pending_validation_retries
+                        .lock()
+                        .unwrap()
+                        .contains_key(&key)
+                    {
                         continue;
                     }
                     return;
@@ -1045,6 +1033,7 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                     state
                         .pending_validation_retries
                         .lock()
+                        .unwrap()
                         .get(&key)
                         .map(|entry| entry.generation)
                 };
@@ -1064,7 +1053,12 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                             queue_session_notify(state.clone(), payload);
                         }
                         remove_validation_retry(&state, &key, generation);
-                        if state.pending_validation_retries.lock().contains_key(&key) {
+                        if state
+                            .pending_validation_retries
+                            .lock()
+                            .unwrap()
+                            .contains_key(&key)
+                        {
                             continue;
                         }
                         return;
@@ -1074,7 +1068,12 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                             queue_session_notify(state.clone(), payload);
                         }
                         remove_validation_retry(&state, &key, generation);
-                        if state.pending_validation_retries.lock().contains_key(&key) {
+                        if state
+                            .pending_validation_retries
+                            .lock()
+                            .unwrap()
+                            .contains_key(&key)
+                        {
                             continue;
                         }
                         return;
@@ -1084,7 +1083,12 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
                             "Dropping invalid retained transcript validation retry: {message}"
                         );
                         remove_validation_retry(&state, &key, generation);
-                        if state.pending_validation_retries.lock().contains_key(&key) {
+                        if state
+                            .pending_validation_retries
+                            .lock()
+                            .unwrap()
+                            .contains_key(&key)
+                        {
                             continue;
                         }
                         return;
@@ -1102,7 +1106,7 @@ fn queue_validation_retry(state: Arc<ServerState>, payload: SessionNotifyPayload
 }
 
 fn remove_validation_retry(state: &ServerState, key: &str, generation: u64) {
-    let mut retries = state.pending_validation_retries.lock();
+    let mut retries = state.pending_validation_retries.lock().unwrap();
     if retries
         .get(key)
         .is_some_and(|entry| entry.generation == generation)
@@ -1123,7 +1127,7 @@ fn enqueue_validated_retained_source(
 async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
     loop {
         let (generation, updated_at, payload) = {
-            let pending = state.pending_session_notifies.lock();
+            let pending = state.pending_session_notifies.lock().unwrap();
             let Some(entry) = pending.get(&key) else {
                 return;
             };
@@ -1137,7 +1141,7 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
         }
 
         {
-            let pending = state.pending_session_notifies.lock();
+            let pending = state.pending_session_notifies.lock().unwrap();
             let Some(entry) = pending.get(&key) else {
                 return;
             };
@@ -1147,7 +1151,7 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
         }
 
         let Some(idx) = state.session_index.clone() else {
-            let mut pending = state.pending_session_notifies.lock();
+            let mut pending = state.pending_session_notifies.lock().unwrap();
             pending.remove(&key);
             return;
         };
@@ -1164,7 +1168,7 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
         }
 
         let should_stop = {
-            let mut pending = state.pending_session_notifies.lock();
+            let mut pending = state.pending_session_notifies.lock().unwrap();
             match pending.get(&key) {
                 Some(entry) if entry.generation == generation => {
                     pending.remove(&key);

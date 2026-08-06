@@ -3,8 +3,8 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use tantivy::collector::{Count, FacetCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::*;
@@ -886,12 +886,7 @@ fn canonical_source_key(source_root_key: &str, canonical_path: &Path) -> String 
 
 #[cfg(any(unix, windows))]
 fn append_hex_bytes(output: &mut String, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    for byte in bytes {
-        output.push(char::from(HEX[usize::from(byte >> 4)]));
-        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
+    output.push_str(&crate::hex_encode(bytes));
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,7 +1066,7 @@ impl SessionIndex {
     /// Save the current index state to disk.
     pub fn save_state(&self) -> Result<(), String> {
         let state_path = self.index_dir.join("index_state.json");
-        let state = self.state.lock();
+        let state = self.state.lock().unwrap();
         let json =
             serde_json::to_string_pretty(&*state).map_err(|e| format!("Serialize state: {e}"))?;
         std::fs::write(&state_path, json).map_err(|e| format!("Write state: {e}"))?;
@@ -1245,7 +1240,7 @@ impl SessionIndex {
         host_facet: &str,
         messages: &[ExtractedMessage],
     ) -> Result<usize, String> {
-        let mut writer = self.writer.lock();
+        let mut writer = self.writer.lock().unwrap();
         self.delete_session_docs_with_writer(&writer, provider, session_id)?;
         for msg in messages {
             self.add_message_to_writer(&writer, provider, msg, project_facet, host_facet)?;
@@ -1261,7 +1256,7 @@ impl SessionIndex {
         host_facet: &str,
         messages: &[ExtractedMessage],
     ) -> Result<usize, String> {
-        let mut writer = self.writer.lock();
+        let mut writer = self.writer.lock().unwrap();
         for msg in messages {
             self.add_message_to_writer(&writer, provider, msg, project_facet, host_facet)?;
         }
@@ -1356,9 +1351,9 @@ impl SessionIndex {
 
         let mut total_indexed = 0usize;
         let mut index_changed = false;
-        let mut state = self.state.lock();
+        let mut state = self.state.lock().unwrap();
         let hostname = Self::local_hostname();
-        let mut writer = self.writer.lock();
+        let mut writer = self.writer.lock().unwrap();
 
         // Migration 20 backfill hook: when storage signals a pending sub-agent
         // re-ingest, drop the mtime cache so every transcript is re-extracted

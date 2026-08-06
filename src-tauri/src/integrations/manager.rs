@@ -1,4 +1,4 @@
-use super::{claude, codex, cpa, integration_mutation_guard, minimax};
+use super::{codex, cpa, integration_mutation_guard, minimax};
 use crate::brevity;
 use crate::integrations::cpa::{
     CpaConnectError, CpaConnectResult, CpaConnectionStatus, ValidatedCpaConnection,
@@ -93,7 +93,7 @@ pub fn confirm_enable_with_key(
 
     match provider {
         IntegrationProvider::Claude => {
-            claude::install(app, features)?;
+            crate::claude_setup::install_with_manifest(app, features)?;
         }
         IntegrationProvider::Codex => {
             codex::install(app, features)?;
@@ -221,7 +221,7 @@ pub fn confirm_disable(
 
     match provider {
         IntegrationProvider::Claude => {
-            claude::uninstall(remove_shared_restart_assets)?;
+            crate::claude_setup::uninstall(remove_shared_restart_assets)?;
         }
         IntegrationProvider::Codex => {
             codex::uninstall(remove_shared_restart_assets)?;
@@ -413,7 +413,7 @@ fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, Str
 
 fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, String> {
     match provider {
-        IntegrationProvider::Claude => claude::detect(),
+        IntegrationProvider::Claude => crate::claude_setup::detect(),
         IntegrationProvider::Codex => codex::detect(),
         IntegrationProvider::MiniMax => minimax::detect(),
     }
@@ -492,10 +492,10 @@ fn repair_provider(
 ) -> Result<(), String> {
     match provider {
         IntegrationProvider::Claude => {
-            if claude::deployment_is_current(app, features) {
+            if crate::claude_setup::deployment_is_current(app, features) {
                 return Ok(());
             }
-            claude::install(app, features).map(|_| ())
+            crate::claude_setup::install_with_manifest(app, features).map(|_| ())
         }
         IntegrationProvider::Codex => {
             if codex::deployment_is_current(app, features) {
@@ -519,7 +519,9 @@ fn sync_features_for_enabled_providers(
 
         let verified_at = Utc::now().to_rfc3339();
         let result = match status.provider {
-            IntegrationProvider::Claude => claude::install(app, features).map(|_| ()),
+            IntegrationProvider::Claude => {
+                crate::claude_setup::install_with_manifest(app, features).map(|_| ())
+            }
             IntegrationProvider::Codex => codex::install(app, features).map(|_| ()),
             IntegrationProvider::MiniMax => Ok(()),
         };

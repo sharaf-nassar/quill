@@ -72,11 +72,6 @@ export interface UsageData {
   error: string | null;
 }
 
-export interface DataPoint {
-  timestamp: string;
-  utilization: number;
-}
-
 export interface IndicatorMetric {
   provider: IntegrationProvider;
   key: string;
@@ -162,19 +157,6 @@ export interface ActivitySeriesResponse {
   timestamps: string[];
   session_counts: number[];
   project_counts: number[];
-}
-
-export interface BucketStats {
-  provider: IntegrationProvider;
-  key: string;
-  label: string;
-  current: number;
-  avg: number;
-  max: number;
-  min: number;
-  time_above_80: number;
-  trend: TrendType;
-  sample_count: number;
 }
 
 export interface HostBreakdown {
@@ -265,8 +247,6 @@ export interface ProjectBreakdown {
  * relabelling them would itself be a lie.
  */
 export type RangeType = "1h" | "6h" | "24h" | "7d" | "30d";
-
-export type TrendType = "up" | "down" | "flat" | "unknown";
 
 export type BreakdownMode = "hosts" | "projects" | "sessions" | "skills" | "hooks";
 
@@ -858,73 +838,6 @@ export interface RebuildRollupResult {
   hourDoneThrough: number | null;
 }
 
-export interface ModelSessionRow {
-  provider: string;
-  sessionId: string;
-  displayName: string;
-  cwd: string | null;
-  hostname: string | null;
-  selectedModelTokens: number;
-  selectedModelTurns: number;
-  lastActivityAt: string;
-  primaryModel: ModelIdentity;
-  distinctModels: number;
-  hasWithinChainSwitches: boolean;
-  chainCount: number;
-}
-
-export interface ModelSessionsResponse {
-  identity: ModelIdentity;
-  total: number;
-  nextCursor: string | null;
-  sessions: ModelSessionRow[];
-}
-
-export interface SessionModelSegmentModel {
-  kind: "model";
-  identity: ModelIdentity;
-  startedAt: string;
-  endedAt: string;
-  turnCount: number;
-  attributedTokens: number;
-}
-
-export interface SessionModelSegmentGap {
-  kind: "modelGap";
-  startedAt: string;
-  endedAt: string;
-  turnCount: number;
-}
-
-export type SessionModelSegment =
-  | SessionModelSegmentModel
-  | SessionModelSegmentGap;
-
-export type SessionModelChainKind = "parent" | "subagent";
-
-export interface SessionModelChain {
-  chainId: string;
-  parentChainId: string | null;
-  kind: SessionModelChainKind;
-  agentId: string | null;
-  switchCount: number;
-  attributedTokens: number;
-  unattributedTokens: number;
-  segments: SessionModelSegment[];
-}
-
-export interface SessionModelHistoryResponse {
-  provider: string;
-  sessionId: string;
-  displayName: string;
-  primaryModel: ModelIdentity | null;
-  distinctModels: number;
-  switchCount: number;
-  attributedTokens: number;
-  unattributedTokens: number;
-  chains: SessionModelChain[];
-}
-
 export interface ModelAnalyticsUpdatedEvent {
   generation: number;
   status: ModelBackfillState;
@@ -1081,19 +994,6 @@ export interface InsightTrend {
 
 export interface SparklinePoint {
 	value: number;
-}
-
-export interface ProjectTokensRaw {
-	project: string;
-	total_tokens: number;
-	session_count: number;
-}
-
-export interface SessionStatsRaw {
-	avg_duration_seconds: number;
-	avg_tokens: number;
-	session_count: number;
-	total_tokens: number;
 }
 
 // LLM runtime types

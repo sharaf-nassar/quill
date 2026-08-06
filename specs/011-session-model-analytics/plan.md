@@ -93,8 +93,8 @@ DESIGN.md                            # Five-tab and model-selection semantics
 
 ```text
 src-tauri/
-├── claude-integration/scripts/report-tokens.sh  # Unchanged; not model source
-├── codex-integration/scripts/report-tokens.sh   # Unchanged; not model source
+├── claude-integration/scripts/report-tokens.cjs # Unchanged; not model source
+├── codex-integration/scripts/report-tokens.cjs  # Unchanged; not model source
 └── src/
     ├── lib.rs                    # Module, commands, setup worker, registration
     ├── model_usage.rs            # New extraction and reconciliation domain
@@ -125,14 +125,13 @@ src/
 
 scripts/
 ├── populate_dummy_data.py        # Migrated database plus Claude/Codex JSONLs
-├── run_quill_demo.sh             # Isolated cross-provider demo paths
-└── run_quill_demo.ps1            # Windows isolated demo paths
+└── run_quill_demo.sh             # Isolated cross-provider demo paths
 ```
 
 **Structure Decision**: Extend Quill's existing Rust/Tauri and React analytics
 layers. Keep provider adapters and reconciliation in one new Rust domain module,
 SQLite ownership in `storage.rs`, and Models UI under the established Analytics
-component tree. Do not modify token-report shell scripts: transcript records are
+component tree. Do not modify token-report hook scripts: transcript records are
 the reliable, replayable model-evidence source.
 
 ## Implementation Phases
