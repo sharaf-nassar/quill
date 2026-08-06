@@ -177,7 +177,7 @@ export interface SessionBreakdown {
   project: string | null;
   /** Current-boot hook coverage: null when Quill cannot make an exact claim. */
   observed_subagent_count: number | null;
-  /** Exact raw-model groups; null model ids are explicitly unresolved. */
+  /** Exact raw-model groups; agent type is fallback while model is unresolved. */
   observed_subagent_models: ObservedSubagentModelGroup[] | null;
   /** True until retained token metrics arrive for a current-boot observed root. */
   observed_only: boolean;
@@ -185,6 +185,7 @@ export interface SessionBreakdown {
 
 export interface ObservedSubagentModelGroup {
   model_id: string | null;
+  agent_type: string | null;
   count: number;
 }
 

@@ -78,6 +78,7 @@ struct ObservedAgent {
     at: DateTime<Utc>,
     open: bool,
     model_id: Option<String>,
+    agent_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -223,6 +224,7 @@ impl ObservedRoot {
         at: DateTime<Utc>,
         open: bool,
         model_id: Option<String>,
+        agent_type: Option<String>,
     ) -> bool {
         match &self.coverage {
             ObservedCoverage::Invalid(_) => {
@@ -250,7 +252,12 @@ impl ObservedRoot {
         self.advance_watermark(at);
         if let Some(current) = self.agents.get_mut(agent_id) {
             if at > current.at || (at == current.at && !open && current.open) {
-                *current = ObservedAgent { at, open, model_id };
+                *current = ObservedAgent {
+                    at,
+                    open,
+                    model_id,
+                    agent_type,
+                };
                 if matches!(&self.coverage, ObservedCoverage::Active(_)) {
                     self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
                 }
@@ -264,8 +271,15 @@ impl ObservedRoot {
         if self.agents.len() >= MAX_OBSERVED_AGENTS_PER_ROOT {
             return self.invalidate(Some(at));
         }
-        self.agents
-            .insert(agent_id.to_owned(), ObservedAgent { at, open, model_id });
+        self.agents.insert(
+            agent_id.to_owned(),
+            ObservedAgent {
+                at,
+                open,
+                model_id,
+                agent_type,
+            },
+        );
         if matches!(&self.coverage, ObservedCoverage::Active(_)) {
             self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
         }
@@ -298,30 +312,45 @@ impl ObservedRoot {
                 self.agents
                     .values()
                     .filter(|agent| agent.open)
-                    .map(|agent| agent.model_id.clone()),
+                    .map(|agent| (agent.model_id.clone(), agent.agent_type.clone())),
             )
         })
     }
 }
 
 fn aggregate_observed_models(
-    models: impl IntoIterator<Item = Option<String>>,
+    models: impl IntoIterator<Item = (Option<String>, Option<String>)>,
 ) -> Vec<ObservedSubagentModelGroup> {
-    let mut counts = HashMap::<Option<String>, u32>::new();
-    for model_id in models {
-        *counts.entry(model_id).or_default() += 1;
+    let mut counts = HashMap::<(Option<String>, Option<String>), u32>::new();
+    for identity in models {
+        *counts.entry(identity).or_default() += 1;
     }
     let mut groups = counts
         .into_iter()
-        .map(|(model_id, count)| ObservedSubagentModelGroup { model_id, count })
+        .map(
+            |((model_id, agent_type), count)| ObservedSubagentModelGroup {
+                model_id,
+                agent_type,
+                count,
+            },
+        )
         .collect::<Vec<_>>();
-    groups.sort_by(|left, right| match (&left.model_id, &right.model_id) {
-        (Some(left), Some(right)) => left.cmp(right),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
+    groups.sort_by(|left, right| {
+        left.model_id
+            .is_none()
+            .cmp(&right.model_id.is_none())
+            .then_with(|| left.model_id.cmp(&right.model_id))
+            .then_with(|| left.agent_type.cmp(&right.agent_type))
     });
     groups
+}
+
+fn observed_agent_type(agent_type: Option<&str>) -> Option<String> {
+    let agent_type = agent_type?.trim();
+    (!agent_type.is_empty()
+        && agent_type.len() <= MAX_STRING_LEN
+        && !agent_type.chars().any(char::is_control))
+    .then(|| agent_type.to_owned())
 }
 
 fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
@@ -464,11 +493,15 @@ impl ObservedSubagentState {
                     .then_some(observation.model.as_deref())
                     .flatten()
                     .and_then(|model| crate::model_usage::validate_model_id(model).ok());
+                let agent_type = (!is_codex)
+                    .then(|| observed_agent_type(observation.agent_type.as_deref()))
+                    .flatten();
                 root.observe_agent(
                     agent_id,
                     at,
                     observation.hook_event == "SubagentStart",
                     model_id,
+                    agent_type,
                 )
             }
             _ => false,
@@ -613,7 +646,13 @@ impl ObservedSubagentState {
                         .agents
                         .iter()
                         .filter(|(_, agent)| agent.open)
-                        .map(|(agent_id, agent)| (agent_id.clone(), agent.model_id.clone()))
+                        .map(|(agent_id, agent)| {
+                            (
+                                agent_id.clone(),
+                                agent.model_id.clone(),
+                                agent.agent_type.clone(),
+                            )
+                        })
                         .collect::<Vec<_>>();
                     (agents.len() == expected as usize).then_some((index, key, agents))
                 })
@@ -624,8 +663,8 @@ impl ObservedSubagentState {
             .flat_map(|(_, root, agents)| {
                 agents
                     .iter()
-                    .filter(|(_, model_id)| model_id.is_none())
-                    .map(|(agent_id, _)| {
+                    .filter(|(_, model_id, _)| model_id.is_none())
+                    .map(|(agent_id, _, _)| {
                         (
                             root.provider.clone(),
                             root.session_id.clone(),
@@ -639,15 +678,25 @@ impl ObservedSubagentState {
         }
         let evidence = resolve(&targets)?;
         for (index, root, agents) in snapshots {
-            rows[index].observed_subagent_models = Some(aggregate_observed_models(
-                agents.into_iter().map(|(agent_id, hook_model)| {
-                    hook_model.or_else(|| {
-                        evidence
-                            .get(&(root.provider.clone(), root.session_id.clone(), agent_id))
-                            .and_then(|model| crate::model_usage::validate_model_id(model).ok())
-                    })
-                }),
-            ));
+            rows[index].observed_subagent_models =
+                Some(aggregate_observed_models(agents.into_iter().map(
+                    |(agent_id, hook_model, agent_type)| {
+                        (
+                            hook_model.or_else(|| {
+                                evidence
+                                    .get(&(
+                                        root.provider.clone(),
+                                        root.session_id.clone(),
+                                        agent_id,
+                                    ))
+                                    .and_then(|model| {
+                                        crate::model_usage::validate_model_id(model).ok()
+                                    })
+                            }),
+                            agent_type,
+                        )
+                    },
+                )));
         }
         Ok(())
     }
@@ -1607,6 +1656,13 @@ async fn post_hook_observed(
     {
         return reject(StatusCode::BAD_REQUEST, "agent_id too long".to_string());
     }
+    if payload.agent_type.as_ref().is_some_and(|agent_type| {
+        agent_type.trim().is_empty()
+            || agent_type.len() > MAX_STRING_LEN
+            || agent_type.chars().any(char::is_control)
+    }) {
+        return reject(StatusCode::BAD_REQUEST, "Invalid agent_type".to_string());
+    }
 
     // Fold before audit persistence and before ordering/source rejection so an
     // identifiable malformed root fails closed synchronously.
@@ -2442,6 +2498,7 @@ mod observed_subagent_tests {
             ts: ts.to_owned(),
             hook_matcher: None,
             agent_id: agent_id.map(str::to_owned),
+            agent_type: None,
             model: None,
         }
     }
@@ -2611,10 +2668,12 @@ mod observed_subagent_tests {
             Some(vec![
                 ObservedSubagentModelGroup {
                     model_id: Some("gpt-5.6-sol".to_owned()),
+                    agent_type: None,
                     count: 2,
                 },
                 ObservedSubagentModelGroup {
                     model_id: None,
+                    agent_type: None,
                     count: 1,
                 },
             ])
@@ -2660,10 +2719,12 @@ mod observed_subagent_tests {
             Some(vec![
                 ObservedSubagentModelGroup {
                     model_id: Some("claude-opus-4-6".to_owned()),
+                    agent_type: None,
                     count: 1,
                 },
                 ObservedSubagentModelGroup {
                     model_id: None,
+                    agent_type: None,
                     count: 1,
                 },
             ])

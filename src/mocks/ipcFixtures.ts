@@ -317,11 +317,11 @@ const projectBreakdown: ProjectBreakdown[] = [
 ];
 
 const sessionBreakdown: SessionBreakdown[] = [
-  { provider: "claude", session_id: "a1b2c3d4", hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), project: "instrumentation-observability-control-plane", observed_subagent_count: 3, observed_subagent_models: [{ model_id: "claude-opus-4-6", count: 2 }, { model_id: "claude-sonnet-4-6", count: 1 }], observed_only: false },
+  { provider: "claude", session_id: "a1b2c3d4", hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), project: "instrumentation-observability-control-plane", observed_subagent_count: 3, observed_subagent_models: [{ model_id: "claude-opus-4-6", agent_type: null, count: 2 }, { model_id: "claude-sonnet-4-6", agent_type: null, count: 1 }], observed_only: false },
   { provider: "codex", session_id: "e5f6a7b8", hostname: "mbp.local", total_tokens: 88_400, turn_count: 71, first_seen: iso(20 * H), last_active: iso(2 * H), project: "stable-api", observed_subagent_count: 0, observed_subagent_models: [], observed_only: false },
   { provider: "claude", session_id: "c9d0e1f2", hostname: "devbox", total_tokens: 51_200, turn_count: 44, first_seen: iso(2 * D), last_active: iso(28 * H), project: "marketing-site", observed_subagent_count: null, observed_subagent_models: null, observed_only: false },
-  { provider: "claude", session_id: "b7c8d9e0", hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), project: "quill", observed_subagent_count: 1, observed_subagent_models: [{ model_id: null, count: 1 }], observed_only: false },
-  { provider: "codex", session_id: "f1a2b3c4", hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), project: "/home/mamba/work/poe", observed_subagent_count: 2, observed_subagent_models: [{ model_id: "gpt-5.6-sol", count: 1 }, { model_id: "gpt-5.6-terra", count: 1 }], observed_only: true },
+  { provider: "claude", session_id: "b7c8d9e0", hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), project: "quill", observed_subagent_count: 1, observed_subagent_models: [{ model_id: null, agent_type: null, count: 1 }], observed_only: false },
+  { provider: "codex", session_id: "f1a2b3c4", hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), project: "/home/mamba/work/poe", observed_subagent_count: 2, observed_subagent_models: [{ model_id: "gpt-5.6-sol", agent_type: null, count: 1 }, { model_id: "gpt-5.6-terra", agent_type: null, count: 1 }], observed_only: true },
 ];
 
 const skillBreakdown: SkillBreakdown[] = [

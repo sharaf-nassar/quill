@@ -127,6 +127,9 @@ function buildLifecyclePayload(
 
   const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : null;
   if ((event === "SubagentStart" || event === "SubagentStop") && !agentId) return null;
+  const agentType = event === "SubagentStart" && typeof input.agent_type === "string"
+    ? truncate(input.agent_type.trim(), 256) || null
+    : null;
 
   return {
     provider: "claude",
@@ -135,6 +138,7 @@ function buildLifecyclePayload(
     hook_event: event,
     source,
     agent_id: agentId,
+    agent_type: agentType,
     model: null,
     cwd: input.cwd || null,
     ts,

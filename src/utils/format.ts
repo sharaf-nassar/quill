@@ -35,7 +35,9 @@ export function formatObservedSubagentModels(
 		if (!Number.isInteger(group.count) || group.count <= 0) continue;
 		validTotal += group.count;
 		const family = group.model_id === null
-			? { label: "?", rank: Number.MAX_SAFE_INTEGER }
+			? group.agent_type
+				? { label: group.agent_type, rank: 100 }
+				: { label: "?", rank: Number.MAX_SAFE_INTEGER }
 			: agentModelFamily(provider, group.model_id);
 		const current = byLabel.get(family.label);
 		if (current) current.count += group.count;
@@ -55,7 +57,7 @@ export function formatObservedSubagentModels(
 	);
 	const text = displayGroups.map((group) => `${group.count} × ${group.label}`).join(" · ");
 	const breakdown = displayGroups
-		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model" : group.label} agent${group.count === 1 ? "" : "s"}`)
+		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model or type" : group.label} agent${group.count === 1 ? "" : "s"}`)
 		.join(", ");
 	return {
 		text,

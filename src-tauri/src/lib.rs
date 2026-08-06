@@ -6355,6 +6355,7 @@ mod tests {
                 .to_string(),
                 hook_matcher: None,
                 agent_id: agent_id.map(str::to_owned),
+                agent_type: None,
                 model: None,
             }
         };

@@ -27040,6 +27040,7 @@ mod tests {
                     ts: "2026-08-04T12:00:00Z".to_string(),
                     hook_matcher: None,
                     agent_id: None,
+                    agent_type: None,
                     model: None,
                 });
             hook_done_tx
@@ -27104,6 +27105,7 @@ mod tests {
                         ts: "2030-01-01T00:00:01Z".to_string(),
                         hook_matcher: None,
                         agent_id: Some(agent_id.to_string()),
+                        agent_type: None,
                         model: None,
                     })
                     .expect("persist sibling hook");
@@ -27168,6 +27170,7 @@ mod tests {
                 .to_string(),
                 hook_matcher: None,
                 agent_id: agent_id.map(str::to_owned),
+                agent_type: None,
                 model: None,
             }
         };
