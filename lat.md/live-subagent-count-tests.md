@@ -22,6 +22,14 @@ Claude child-model lookup selects the latest exact derived model for the request
 
 Claude open agents resolve only from exact retained child evidence; delayed ingestion may refresh that evidence, while missing evidence stays unknown and no root model is inferred.
 
+## Fused Merge Snapshot Consistency
+
+A lifecycle membership swap during retained-model resolution cannot mix a lock-time count with model groups from a later registry generation.
+
+## Retained Resolution After Registry Unlock
+
+Retained-model resolution can re-enter the observed registry, proving database work starts only after the merge guard drops.
+
 ## Sessions SQL Excludes Historical Agent State
 
 The storage query keeps parent and subagent usage totals but initializes the live count as null and contains no historical agent projection or audit-table reconstruction.

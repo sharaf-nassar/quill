@@ -3506,17 +3506,14 @@ async fn get_session_breakdown(
     let observed_subagents = Arc::clone(&observed_subagents);
     run_blocking(move || {
         let rows = storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)?;
-        let mut rows = observed_subagents.merge(
+        observed_subagents.merge(
             rows,
             &range_from,
             observed_hostname.as_deref(),
             provider,
             limit,
-        );
-        observed_subagents.enrich_model_groups(&mut rows, |targets| {
-            storage.get_observed_agent_model_evidence(targets)
-        })?;
-        Ok(rows)
+            |targets| storage.get_observed_agent_model_evidence(targets),
+        )
     })
 }
 
@@ -6364,7 +6361,11 @@ mod tests {
             observed_only: false,
         };
         let mut rows = vec![row("covered-root"), row("storage-only-root")];
-        rows = state.merge(rows, "2029-01-01T00:00:00Z", None, None, None);
+        rows = state
+            .merge(rows, "2029-01-01T00:00:00Z", None, None, None, |_| {
+                Ok(HashMap::new())
+            })
+            .expect("merge observed subagent state");
 
         assert_eq!(rows[0].observed_subagent_count, Some(1));
         assert_eq!(rows[1].observed_subagent_count, None);

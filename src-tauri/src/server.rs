@@ -528,7 +528,10 @@ impl ObservedSubagentState {
         hostname: Option<&str>,
         provider: Option<IntegrationProvider>,
         limit: Option<i32>,
-    ) -> Vec<SessionBreakdown> {
+        resolve: impl FnOnce(
+            &[ObservedAgentModelKey],
+        ) -> Result<HashMap<ObservedAgentModelKey, String>, String>,
+    ) -> Result<Vec<SessionBreakdown>, String> {
         let mut registry = self.inner.lock().unwrap();
         let now = Utc::now();
         for root in registry.roots.values_mut() {
@@ -616,48 +619,39 @@ impl ObservedSubagentState {
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
         rows.truncate(limit.unwrap_or(10).clamp(1, 500) as usize);
-        rows
-    }
+        let snapshots = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                if !matches!(row.provider.as_str(), "claude" | "codex")
+                    || row.observed_subagent_count? == 0
+                {
+                    return None;
+                }
+                let hostname = normalize_observed_hostname(&row.hostname)?;
+                let key = ObservedRootKey {
+                    provider: row.provider.clone(),
+                    hostname,
+                    session_id: row.session_id.clone(),
+                };
+                let root = registry.roots.get(&key)?;
+                let agents = root
+                    .agents
+                    .iter()
+                    .filter(|(_, agent)| agent.open)
+                    .map(|(agent_id, agent)| {
+                        (
+                            agent_id.clone(),
+                            agent.model_id.clone(),
+                            agent.agent_type.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                Some((index, key, agents))
+            })
+            .collect::<Vec<_>>();
+        drop(registry);
 
-    pub(crate) fn enrich_model_groups(
-        &self,
-        rows: &mut [SessionBreakdown],
-        resolve: impl FnOnce(
-            &[ObservedAgentModelKey],
-        ) -> Result<HashMap<ObservedAgentModelKey, String>, String>,
-    ) -> Result<(), String> {
-        let snapshots = {
-            let registry = self.inner.lock().unwrap();
-            rows.iter()
-                .enumerate()
-                .filter_map(|(index, row)| {
-                    let expected = row.observed_subagent_count?;
-                    if !matches!(row.provider.as_str(), "claude" | "codex") || expected == 0 {
-                        return None;
-                    }
-                    let hostname = normalize_observed_hostname(&row.hostname)?;
-                    let key = ObservedRootKey {
-                        provider: row.provider.clone(),
-                        hostname,
-                        session_id: row.session_id.clone(),
-                    };
-                    let root = registry.roots.get(&key)?;
-                    let agents = root
-                        .agents
-                        .iter()
-                        .filter(|(_, agent)| agent.open)
-                        .map(|(agent_id, agent)| {
-                            (
-                                agent_id.clone(),
-                                agent.model_id.clone(),
-                                agent.agent_type.clone(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    (agents.len() == expected as usize).then_some((index, key, agents))
-                })
-                .collect::<Vec<_>>()
-        };
         let targets = snapshots
             .iter()
             .flat_map(|(_, root, agents)| {
@@ -674,7 +668,7 @@ impl ObservedSubagentState {
             })
             .collect::<Vec<_>>();
         if targets.is_empty() {
-            return Ok(());
+            return Ok(rows);
         }
         let evidence = resolve(&targets)?;
         for (index, root, agents) in snapshots {
@@ -698,7 +692,7 @@ impl ObservedSubagentState {
                     },
                 )));
         }
-        Ok(())
+        Ok(rows)
     }
 
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
@@ -2584,13 +2578,16 @@ mod observed_subagent_tests {
             "2030-01-01T00:00:04Z",
         ));
 
-        let rows = state.merge(
-            Vec::new(),
-            "2030-01-01T00:00:00Z",
-            None,
-            Some(IntegrationProvider::Codex),
-            Some(5),
-        );
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:00Z",
+                None,
+                Some(IntegrationProvider::Codex),
+                Some(5),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed subagent state");
         assert_eq!(rows.len(), 1);
         assert!(rows[0].observed_only);
         assert_eq!(
@@ -2604,17 +2601,20 @@ mod observed_subagent_tests {
             true
         );
 
-        let rows = state.merge(
-            vec![stored_session(
-                "poe-root",
-                "poe-host.example.com",
-                "2030-01-01T00:00:01Z",
-            )],
-            "2030-01-01T00:00:00Z",
-            None,
-            None,
-            Some(5),
-        );
+        let rows = state
+            .merge(
+                vec![stored_session(
+                    "poe-root",
+                    "poe-host.example.com",
+                    "2030-01-01T00:00:01Z",
+                )],
+                "2030-01-01T00:00:00Z",
+                None,
+                None,
+                Some(5),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed subagent state");
         assert_eq!(rows.len(), 1, "stored and observed identity must merge");
         assert!(!rows[0].observed_only);
         assert_eq!(rows[0].total_tokens, 42);
@@ -2661,7 +2661,11 @@ mod observed_subagent_tests {
             "2030-01-01T00:00:03Z",
         ));
 
-        let rows = state.merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None);
+        let rows = state
+            .merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None, |_| {
+                Ok(HashMap::new())
+            })
+            .expect("merge observed subagent state");
         assert_eq!(rows[0].observed_subagent_count, Some(3));
         assert_eq!(
             rows[0].observed_subagent_models,
@@ -2702,15 +2706,21 @@ mod observed_subagent_tests {
                 "2030-01-01T00:00:02Z",
             ));
         }
-        let mut rows = state.merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None);
-        state
-            .enrich_model_groups(&mut rows, |targets| {
-                assert_eq!(targets.len(), 2);
-                Ok(HashMap::from([(
-                    ("claude".to_owned(), "root".to_owned(), "agent-a".to_owned()),
-                    "claude-opus-4-6".to_owned(),
-                )]))
-            })
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:00Z",
+                None,
+                None,
+                None,
+                |targets| {
+                    assert_eq!(targets.len(), 2);
+                    Ok(HashMap::from([(
+                        ("claude".to_owned(), "root".to_owned(), "agent-a".to_owned()),
+                        "claude-opus-4-6".to_owned(),
+                    )]))
+                },
+            )
             .expect("resolve retained model evidence");
 
         assert_eq!(rows[0].observed_subagent_count, Some(2));
@@ -2729,6 +2739,102 @@ mod observed_subagent_tests {
                 },
             ])
         );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Fused Merge Snapshot Consistency]]
+    #[test]
+    fn fused_merge_keeps_count_and_models_on_one_registry_snapshot() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:01Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStart",
+            None,
+            Some("agent-a"),
+            "2030-01-01T00:00:02Z",
+        ));
+
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:00Z",
+                None,
+                None,
+                None,
+                |targets| {
+                    assert_eq!(targets[0].2, "agent-a");
+                    state.observe(&hook(
+                        IntegrationProvider::Claude,
+                        Some("host"),
+                        "root",
+                        "SubagentStop",
+                        None,
+                        Some("agent-a"),
+                        "2030-01-01T00:00:03Z",
+                    ));
+                    state.observe(&hook(
+                        IntegrationProvider::Claude,
+                        Some("host"),
+                        "root",
+                        "SubagentStart",
+                        None,
+                        Some("agent-b"),
+                        "2030-01-01T00:00:04Z",
+                    ));
+                    Ok(HashMap::from([(
+                        targets[0].clone(),
+                        "claude-opus-4-6".to_owned(),
+                    )]))
+                },
+            )
+            .expect("resolve lock-time model snapshot");
+
+        assert_eq!(rows[0].observed_subagent_count, Some(1));
+        assert_eq!(
+            rows[0].observed_subagent_models,
+            Some(vec![ObservedSubagentModelGroup {
+                model_id: Some("claude-opus-4-6".to_owned()),
+                agent_type: None,
+                count: 1,
+            }])
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Retained Resolution After Registry Unlock]]
+    #[test]
+    fn fused_merge_releases_registry_before_model_resolution() {
+        let state = ObservedSubagentState::default();
+        state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/root",
+            "2030-01-01T00:00:01Z",
+        ));
+        state.observe(&hook(
+            IntegrationProvider::Claude,
+            Some("host"),
+            "root",
+            "SubagentStart",
+            None,
+            Some("agent"),
+            "2030-01-01T00:00:02Z",
+        ));
+
+        state
+            .merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None, |_| {
+                assert_eq!(state.snapshot("claude", "host", "root"), Some(1));
+                Ok(HashMap::new())
+            })
+            .expect("resolve after registry unlock");
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Observed-Only Merge Boundaries]]
@@ -2795,23 +2901,29 @@ mod observed_subagent_tests {
             "2030-01-01T00:00:13Z",
         ));
 
-        let rows = state.merge(
-            Vec::new(),
-            "2030-01-01T00:00:05Z",
-            Some("host.example.com"),
-            None,
-            Some(1),
-        );
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:05Z",
+                Some("host.example.com"),
+                None,
+                Some(1),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed subagent state");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "codex-fresh");
 
-        let rows = state.merge(
-            Vec::new(),
-            "2030-01-01T00:00:05Z",
-            None,
-            Some(IntegrationProvider::Codex),
-            Some(5),
-        );
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:05Z",
+                None,
+                Some(IntegrationProvider::Codex),
+                Some(5),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed subagent state");
         assert_eq!(
             rows.iter()
                 .map(|row| row.session_id.as_str())
@@ -2819,25 +2931,45 @@ mod observed_subagent_tests {
             ["codex-fresh"]
         );
 
-        let rows = state.merge(
-            Vec::new(),
-            "2030-01-01T00:00:00Z",
-            None,
-            Some(IntegrationProvider::Claude),
-            Some(5),
-        );
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:00Z",
+                None,
+                Some(IntegrationProvider::Claude),
+                Some(5),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed subagent state");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "claude-fresh");
 
         state.set_provider_enabled(IntegrationProvider::Codex, false);
-        let rows = state.merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, Some(5));
+        let rows = state
+            .merge(
+                Vec::new(),
+                "2030-01-01T00:00:00Z",
+                None,
+                None,
+                Some(5),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed subagent state");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, "claude-fresh");
 
         state.set_activity_tracking_enabled(false);
         assert!(
             state
-                .merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, Some(5000),)
+                .merge(
+                    Vec::new(),
+                    "2030-01-01T00:00:00Z",
+                    None,
+                    None,
+                    Some(5000),
+                    |_| Ok(HashMap::new()),
+                )
+                .expect("merge observed subagent state")
                 .is_empty()
         );
     }

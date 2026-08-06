@@ -325,6 +325,8 @@ The model cluster stays on one line and yields space before the project falls be
 
 `SessionBreakdown.observed_subagent_count` is a required `number | null`; `observed_subagent_models` is the matching exact model/type/count partition. Positive means Quill observed that many root-linked starts without later observed stops inside a trustworthy current-boot epoch; it does not prove process liveness. `observed_only` marks an active current-process root that lacks retained token metrics, so the row renders an em dash for tokens and makes no turns claim. Disabled or incomplete coverage stays null; identifiable authenticated observations rejected before folding invalidate the exact root. Lost parent-end delivery can remain positive only until qualifying activity resumes or the 15-minute active-root inactivity bound expires, when reads fail closed to null rather than reporting ended zero.
 
+Count and exact open-agent membership come from one registry snapshot. Retained model resolution runs after unlocking against that snapshot, so count and model groups cannot mix lifecycle generations.
+
 ### Restart Component
 
 Controls for restarting Claude Code and Codex instances from Manage → Instances.
