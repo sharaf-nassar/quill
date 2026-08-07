@@ -10,105 +10,30 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 
 ## Features
 
-### Live usage — the LIMITS band
-- One always-visible row per enabled provider (Claude, Codex, MiniMax), pinned above everything else in the widget
-- One cell per rate-limit window: rounded percentage, compressed window label, and a 4px severity bar
-- Severity is reserved for real thresholds — green below 50%, amber from 50%, red from 80%
-- A window whose reset has already elapsed renders neutral instead of carrying a bygone utilization as a live alarm
-- Right-aligned countdown to each row's nearest upcoming reset
-- A provider with no live buckets still states why: `SETUP` when the failure is actionable, `UNAVAILABLE` otherwise
-- Degraded reads (offline / paused / showing cached data) surface on the titlebar's sync pill, never as a false severity
-- The whole band is absent when no provider is enabled
+A one-line tour. Each item links to its full description in [Features in depth](#features-in-depth).
 
-### Widget views
-Everything below LIMITS is one swappable view region. The view name and a shared 1H/6H/24H/7D range strip sit in the region's header, so switching views keeps the selected window. Every chart is drawn by an internal SVG kit — Quill ships no charting dependency.
-
-- **Usage** (default) — a per-provider stacked area chart with the range's total tokens and an in-range momentum delta overlaid, a hover-only legend chip, one computed insight line, a 3×2 readout grid (LLM runtime, tokens per LOC, LOC per hour, sessions, projects, net lines) where each metric carries its own sparkline, a switchable breakdown (Sessions, Projects, Hosts, Skills, Hooks), and an In / Out / Cache footer
-- **Trends** — three week-over-week rows (tokens, velocity, cache efficiency) with a delta and paired mini-bars each; fixed to the last seven days against the seven before them, so the view declares itself unranged rather than offering a control that would do nothing
-- **Charts** — token flow, code changes, and cache efficiency stacked on one time axis under one shared crosshair, so the three can be read against each other
-- **Models** — a running-now strip per provider plus the session-ranked model list; raw model ids exactly as observed, qualified by a provider swatch, with attributed tokens beside each
-- **Context** — preserved and retrieved token totals with a split bar, the shared cache-savings line, and the routing cost
-- Honesty disclosures keep the home that matches their data: the Hooks breakdown carries the Claude/Codex tracking-asymmetry note, and a condensed retention line appears wherever pruning affects what is drawn
-
-### Manage workspace
-- One rail-navigated window for everything that is not live monitoring, opened from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator
-- Four sections — **Sessions** (search), **Learning** (rules, memory, runs), **Instances** (restart), and **Settings**
-- ⌘K / Ctrl+K opens a command palette over the sections plus Back-to-Live and Close-Tools actions
-- **Settings** tabs: General, Integrations, Context, Learning, and Performance
-
-### Session search
-- Full-text search across all Claude Code and Codex sessions (powered by Tantivy)
-- Filter by provider, project, host, role, and date range; sort by relevance or recency
-- Snippet highlighting with expandable message context and a session detail panel
-- Lives in the **Sessions** section of the Manage workspace
-
-### Token tracking
-- Per-turn input/output/cache token counts via the bundled Claude Code and Codex hooks
-- Feeds the Usage view's provider chart, the readout sparklines, and the In / Out / Cache footer
-
-### Learning
-- The Manage workspace's **Learning** section shows learned usage rules, observation stats, and analysis history
-- Trigger modes: on-demand, or periodic once enough new observations have accumulated
-- Rule lifecycle tracking (candidate → awaiting review → active, plus rejected, suppressed, superseded, and conflict-flagged states)
-- Domain-grouped rules with confidence scores
-- Run history with real-time analysis logs, opened as a docked panel beside the rules
-- Git history integration for cross-source pattern synthesis
-
-### Memory optimizer
-- Scans your Claude Code memory files and suggests improvements (merge duplicates, update stale content, remove obsolete entries)
-- Approval-based workflow — review each suggestion with a diff preview before applying
-- Undo any applied change to restore the original file
-- Batched "optimize all" to review and apply suggestions across an entire project
-- Optional **Compress prose** pre-pass — rewrites every eligible memory file in caveman style via Anthropic Haiku before the optimizer runs. Skips instruction files, files over 500 KB, files on the secrets denylist, and files that already have an `.original.md` backup. Validates that headings, code blocks, URLs, file paths, and bullets are preserved; on failure restores the original. Successful rewrites leave a `<file>.original.md` backup next to the compressed file so the change is reversible.
-
-### Brevity profile
-- Toggled from **Settings → Context** in the Manage workspace, and applied to whichever providers (Claude Code, Codex) are enabled
-- Injects a managed "Quill Brevity Profile" instruction block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex), asking the assistant to write in a compressed caveman style for its own prose responses while preserving code blocks, file paths, URLs, library names, command names, numbers, env vars, and markdown structure exactly
-- Symlink-aware — when `AGENTS.md` is a symlink to `CLAUDE.md`, only one block is written so the same instructions are not duplicated
-- Toggling off strips just the managed block; the rest of the agent file is left untouched
-- MiniMax does not have a managed agent file, so brevity is unavailable for it
-
-### Working context preservation
-- Optional, default-off feature toggled from **Settings → Context** — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
-- **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
-- **Routing hooks** — block raw `WebFetch` and noisy `curl`/`wget` dumps, nudge broad `Bash`/`Read`/`Grep`/build/test output toward `quill_*` tools, and use per-session marker files to avoid repeating guidance
-- **Continuity capture** — small task and decision hints recorded across sessions so a new session can resume context without writing to provider memory paths
-- **Telemetry** — every preservation event reports compact byte and token estimates to the widget's Context view; large content stays in the local context store and never enters the analytics database
-- Toggling the feature deploys or removes context scripts, the context MCP tool, instruction templates, and hooks for currently enabled providers; historical context stores and analytics rows are preserved on disable
-- Available for both Claude Code and Codex via their respective integrations
-
-### MCP server
-- Gives Claude Code (and Codex) direct access to your indexed session history and — when context preservation is enabled — the working context store
-- Session-history tool:
-  - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use (filter by project, git branch, role, date)
-- Context tools (only when context preservation is enabled): see the Working context preservation section above
-- Automatically configured when the app starts — no manual setup needed
-
-### Restart orchestrator
-- Monitor and restart Claude Code instances from within Quill
-- Detects terminal type (Tmux, Plain) and tracks instance status
-- Lives in the **Instances** section of the Manage workspace
-
-### Code stats
-- Lines of code added/removed tracked per session, grouped by language
-- Net lines, tokens per LOC, and LOC per hour sit in the Usage view's readout grid, each with its own sparkline
-- The code-changes timeline shares the Charts view's axis and crosshair, and velocity is one of the Trends view's week-over-week rows
-
-### Desktop integration
-- **System tray** with Show Widget / Always on Top / Check for Update / Quit
-- **In-app updater** — checks on startup and every 4 hours; a cyan "Update" button then appears centered in the widget titlebar
-- Always-on-top toggle in the widget titlebar, sharing one persisted setting with the tray checkitem and Settings
-- Frameless, transparent, near-black flat surface with a drag-to-move titlebar
-- Fixed 360px width with a content-derived height (clamped to 200–900px); window position is remembered across restarts, size is deliberately not stored
-- Closing from the titlebar hides the widget to the tray rather than quitting
-- Refreshes usage every 3 minutes while the widget is open; an optional background refresh (60–600s, Settings → Performance) keeps the tray indicator current while it is hidden
-- Read-only OAuth — reads Claude Code's token, never refreshes it
-- **Zoom controls** — Ctrl+/- to zoom, Ctrl+0 to reset, persisted per window
+- **[Live usage](#live-usage)** — a LIMITS band pinned above everything else, one row per enabled provider (Claude, Codex, MiniMax), with per-window utilization bars and reset countdowns
+- **[Widget views](#widget-views)** — Usage, Trends, Charts, Models, and Context swap in one region under a shared 1H/6H/24H/7D range strip; every chart comes from an internal SVG kit, so Quill ships no charting dependency
+- **[Agent visibility](#agent-visibility)** — sessions show the subagents Quill actually observed running, grouped by model (`2×Opus · 3×Sonnet`)
+- **[Multi-account pools](#multi-account-pools)** — connect a local CLI Proxy API instance and LIMITS reports mean pool pressure instead of a single account
+- **[Manage workspace](#manage-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, Instances, and Settings
+- **[Session search](#session-search)** — Tantivy-backed full-text search across every Claude Code and Codex session, with filters and snippet highlighting
+- **[Token tracking](#token-tracking)** — per-turn input/output/cache counts collected by the bundled hooks
+- **[Code stats](#code-stats)** — lines added and removed per session by language, plus tokens per LOC and LOC per hour
+- **[Learning](#learning)** — observes tool-use patterns across sessions and extracts reusable rules with confidence scores
+- **[Memory optimizer](#memory-optimizer)** — suggests merges, updates, and removals for your memory files; every change is diff-reviewed and undoable
+- **[Brevity profile](#brevity-profile)** — a managed instruction block that compresses assistant prose while leaving code, paths, and commands untouched
+- **[Working context preservation](#working-context-preservation)** — routes large transient output into a local searchable store instead of the LLM transcript
+- **[MCP server](#mcp-server)** — hands Claude Code and Codex `search_history`, plus the context tools when preservation is on
+- **[Restart orchestrator](#restart-orchestrator)** — gracefully restart running Claude Code and Codex sessions from inside Quill
+- **[Desktop integration](#desktop-integration)** — tray menu, in-app updater, always-on-top, a frameless resizable window, and per-window zoom
+- **[Crash reporting](#crash-reporting)** — default-on and opt-out, sending stack frames with every dynamic field stripped locally first
 
 ## Screenshots
 
-The main window is a 360px always-on-top widget: a LIMITS band that never
-leaves the frame, and one view below it that the header's dropdown swaps.
+The main window is an always-on-top widget, 360px wide by default: a LIMITS
+band that never leaves the frame, and one view below it that the header's
+dropdown swaps.
 
 <table>
   <tr>
@@ -338,7 +263,7 @@ cargo tauri dev
 
 ## Controls
 
-- **Drag the titlebar** to move the widget — the width is fixed at 360px and the height follows the content, so there is nothing to resize
+- **Drag the titlebar** to move the widget; **drag any edge or corner** to resize it (floor 320×200, no ceiling) — both position and size are remembered
 - **Pin key** in the titlebar toggles always-on-top
 - **Settings key** in the titlebar opens the Manage workspace at its Settings section
 - **Close key** in the titlebar hides the widget to the tray; Quill keeps running
@@ -350,129 +275,163 @@ cargo tauri dev
 - **System tray menu** — Show Widget, Always on Top, Check for Update, and Quit
 - **Ctrl+/- (or Cmd+/-)** to zoom and **Ctrl+0** to reset, remembered per window
 
-## Project structure
+## Features in depth
 
-```
-src/                          # React frontend
-  main.tsx                    # Window routing, per-window zoom, ⌘M accelerator
-  App.tsx                     # The 360px widget shell (polling, updater, close-to-tray, height)
-  types.ts                    # Shared TypeScript interfaces
-  components/
-    widget/
-      WidgetTitleBar.tsx      # Brand, update button, sync pill, pin/settings/close keys
-      LimitsSection.tsx       # LIMITS band: one row per enabled provider
-      ViewRegion.tsx          # View + range header; hosts the active view
-      ViewSwitcher.tsx        # Listbox that swaps the view region
-      views/
-        UsageView.tsx         # Chart, insight line, readout grid, breakdown, totals footer
-        TrendsView.tsx        # Week-over-week tokens, velocity, cache efficiency
-        ChartsView.tsx        # Three series on one axis under one crosshair
-        ModelsView.tsx        # Running-now strip + session-ranked model list
-        ContextView.tsx       # Preserved/retrieved totals and routing cost
-        insightLine.ts        # Priority rule behind the Usage insight line
-      viz/                    # Internal SVG kit (AreaChart, Sparkline, Bars, geometry)
-    settings/                 # General, Integrations, Context, Learning, Performance tabs
-    learning/                 # Status strip, rule cards, memory optimizer, run history
-    sessions/                 # Search bar, filters, result cards, detail panel
-    restart/RestartPanel.tsx  # Claude Code instance restart panel
-    CommandPalette.tsx        # Manage's ⌘K section navigator
-    ConfirmDialog.tsx         # Shared confirmation modal
-    RetentionBanner.tsx       # Retention degradation disclosure
-  windows/
-    ManageWindowView.tsx      # Rail-navigated Manage workspace hosting the four sections
-    SessionsWindowView.tsx    # Sessions section (session search)
-    LearningWindow.tsx        # Learning section (Rules / Memory / Runs)
-    SettingsWindowView.tsx    # Settings section
-    ReleaseNotesWindow.tsx    # Release notes viewer window
-  hooks/                      # IPC data hooks
-    useWidgetSeries.ts        # Provider token series and activity series for the widget
-    useBreakdownData.ts       # Session/project/host/skill/hook breakdowns
-    useWeeklyTrends.ts        # Week-over-week figures behind the Trends view
-    useCodeInsights.ts        # Tokens per LOC, LOC per hour, net lines
-    useLlmRuntimeStats.ts     # Active LLM runtime and its sparkline
-    useModelAnalytics.ts      # Model attribution behind the Models view
-    useContextSavingsStats.ts # Context preservation telemetry aggregates
-    useLearningData.ts        # Learning rules, runs, observations
-    useMemoryData.ts          # Memory files, optimization runs, suggestions
-    useIntegrations.ts        # Provider detection, enablement, and feature toggles
-    useRuntimeSettings.ts     # Persisted runtime settings (always-on-top, polling, …)
-  lib/
-    manageWindow.ts           # Single entry point that focuses or creates Manage
-    crashReporting.ts         # Opt-in crash reporting
-  mocks/                      # Browser-mode IPC fixtures (dev only, no Tauri runtime)
-  utils/                      # Time, token, provider, retention, and format helpers
-  styles/
-    index.css                 # Global styles, widget tokens, and every widget band
-    manage.css                # Manage workspace chrome and section embedding
-    settings.css              # Settings tab styles
-    learning.css              # Learning section styles
-    sessions.css              # Session search styles
-    restart.css               # Instance restart styles
-src-tauri/                    # Rust backend
-  src/
-    main.rs                   # Tauri entry point
-    lib.rs                    # IPC commands, tray icon, updater, server startup
-    integrations/             # Provider detection, deployment, and manifests
-      claude.rs, codex.rs, minimax.rs, deploy.rs, manager.rs, manifest.rs
-    claude_setup.rs           # Auto-configures Claude Code on app startup (hooks, MCP, config)
-    auth.rs                   # OAuth token management
-    config.rs                 # Credential loading (read-only) and the shared HTTP client
-    fetcher.rs                # Usage API calls
-    cc_client.rs              # Claude Code subprocess surface for inference calls
-    indicator.rs              # Tray indicator summary state
-    storage.rs                # SQLite storage with aggregation
-    models.rs                 # Data models (usage buckets, tokens, learning types)
-    model_usage.rs            # Model attribution behind the Models view
-    sessions.rs               # Tantivy full-text session search and indexing
-    transcript_analytics.rs   # Analytics snapshots parsed from retained transcripts
-    transcript_identity.rs    # Provider-native transcript identity resolution
-    server.rs                 # axum HTTP server for token reporting
-    learning.rs               # Learning analysis spawner
-    git_analysis.rs           # Git history analysis for learning
-    memory_optimizer.rs       # Memory file scanning, LLM analysis, suggestion execution
-    compress_prose.rs         # Caveman pre-pass (detect / prompt / validate submodules)
-    brevity.rs                # Managed brevity block in provider agent files
-    context_category.rs       # Context-savings event taxonomy
-    retention*.rs             # Retention policy, test fixture, and pruning engine
-    restart.rs                # Claude Code instance restart management
-    releases.rs               # GitHub release notes
-    appimage_integration.rs   # Linux applications-menu install
-    crash_reporting.rs        # Opt-in crash report plumbing
-  claude-integration/         # Resources bundled into the app for local Claude Code setup
-    scripts/                  # Hook scripts deployed to ~/.config/quill/scripts/
-      observe.cjs             # Captures tool observations (pre/post tool use)
-      report-tokens.cjs       # Extracts tokens from transcript, POSTs to widget
-      session-sync.cjs        # Syncs session metadata and messages to widget
-      context-capture.cjs     # Records continuity events, snapshots, and capture telemetry
-      context-router.cjs      # Routes broad tool calls toward quill_* MCP tools (when enabled)
-      context-telemetry.cjs   # Builds and posts context-savings events to the widget
-    templates/                # Managed CLAUDE.md instruction blocks
-    mcp/                      # MCP server deployed to ~/.config/quill/mcp/
-      server.py               # FastMCP server for session history (and context) tools
-      dependencies.py         # Lifespan and shared state
-      tools/
-        search.py             # search_history
-        context.py            # quill_index_context, quill_search_context, quill_execute, fetch_and_index, etc.
-  codex-integration/          # Parallel resources for Codex CLI (scripts, templates, hook observer)
-  tauri.conf.json             # Tauri window and build configuration
-```
+Every entry in the [Features](#features) list above, in full.
 
-## Releasing
+### Live usage
 
-Releases are driven by git tags via `release.sh`. The CI workflow (`.github/workflows/release.yml`) builds and publishes automatically.
+The LIMITS band is the one region that never scrolls away — provider rate-limit
+pressure, read as an instrument.
 
-```bash
-./release.sh bump patch    # v0.3.1 -> v0.3.2
-./release.sh bump minor    # v0.3.1 -> v0.4.0
-./release.sh retag          # Re-point latest tag to current HEAD
-./release.sh latest         # Show current version
-```
+- One identity row per enabled provider (Claude, Codex, MiniMax); the whole band is absent when no provider is enabled
+- One cell per rate-limit window: rounded percentage, compressed window label, and a 4px severity bar. Cells divide the row's meter region evenly and reflow at their legible minimum
+- Severity is reserved for real thresholds — green below 50%, amber from 50%, red from 80%
+- A window whose reset has already elapsed renders stale (muted percentage, neutral bar) instead of carrying bygone utilization as a live alarm, and it is excluded from the row's nearest-reset countdown
+- Right-aligned countdown to each row's nearest upcoming reset
+- A provider with no live buckets still states why: `SETUP` in amber when the failure is actionable (auth, config, an unfinished install), `UNAVAILABLE` in slate otherwise
+- Degraded reads surface on the LIMITS header's sync control — "Showing cached data", "Paused" for a stale token, "Offline — showing cached data" — never as a false severity. The same control takes a manual refresh that bypasses freshness guards while still honoring rate-limit and network cooldowns
+- Sources: Claude via the Anthropic OAuth usage API, Codex via `codex app-server` rate limits (transcript token counts as fallback), MiniMax via its coding-plan API. MiniMax is service-only — an API key, no local CLI
 
-`bump` and `retag` generate user-facing release notes via Claude, commit them as `release_notes.md`, then tag and push. The CI picks up the notes and applies them to the GitHub release.
+### Widget views
 
-The `tauri-action` patches the version in `tauri.conf.json` at build time using the tag — you do not need to update version numbers manually. The workflow builds for all platforms (Linux AppImage, macOS dmg for Intel + ARM, Windows nsis), then publishes the release.
+Everything below LIMITS is one swappable view region. The view name and a shared
+1H/6H/24H/7D range strip sit in the region's header, so switching views keeps the
+selected window. Every chart is drawn by an internal SVG kit — Quill ships no
+charting dependency.
 
-The in-app updater checks `latest.json` on GitHub Releases on startup and every 4 hours. When an update is found, a cyan "Update" button appears centered in the widget titlebar.
+- **Usage** (default) — a per-provider stacked area chart with the range's total tokens and an in-range momentum delta overlaid, a hover-only legend chip, one computed insight line, a 3×2 readout grid (LLM runtime, tokens per LOC, LOC per hour, sessions, projects, net lines) where each metric carries its own sparkline, a switchable breakdown (Sessions, Projects, Hosts, Skills, Hooks), and an In / Out / Cache footer
+- **Trends** — three week-over-week rows (tokens, velocity, cache efficiency) with a delta and paired mini-bars each; fixed to the last seven days against the seven before them, so the view declares itself unranged rather than offering a control that would do nothing
+- **Charts** — token flow, code changes, and cache efficiency stacked on one time axis under one shared crosshair, so the three can be read against each other
+- **Models** — a running-now strip per provider plus the session-ranked model list; raw model ids exactly as observed, qualified by a provider swatch, with attributed tokens beside each
+- **Context** — preserved and retrieved token totals with a split bar, the shared cache-savings line, and the routing cost
+- Honesty disclosures keep the home that matches their data: the Hooks breakdown carries the Claude/Codex tracking-asymmetry note, and a condensed retention line appears wherever pruning affects what is drawn
+
+### Agent visibility
+
+Sessions in the Usage breakdown report the subagents Quill observed for that
+session, so a row shows the work fanned out beneath it rather than just its own
+turns.
+
+- A row with positive lifecycle evidence renders an agent icon and a tabular model breakdown such as `2×Opus · 3×Sonnet`; Claude tiers sort Opus → Sonnet → Haiku → Fable and Codex tiers sort Sol → Terra → Luna
+- Counts come from observed starts without matching stops inside a trustworthy current-boot epoch — evidence of observed agents, not a liveness probe
+- Anything less than positive evidence renders nothing at all: zero, disabled coverage, and incomplete coverage make no numeric claim. Lost parent-end delivery falls back to no claim once the 15-minute inactivity bound expires
+- An active session with no retained token metrics shows an em dash for tokens rather than implying zero usage
+- Models resolve from retained transcripts where available, with a validated start-time type as the interim label
+
+### Multi-account pools
+
+If you route several accounts through a local [CLI Proxy API](https://github.com/router-for-me/CLIProxyAPI)
+instance, Quill can read the whole pool instead of one account. Configured from
+**Settings → Integrations**.
+
+- The form takes a loopback URL (default `http://127.0.0.1:8317`) and the plaintext management key; a bcrypt hash pasted from CPA's config is rejected up front, since it cannot authenticate
+- Connecting validates the management endpoint and runs one Claude and one Codex quota smoke check; a provider whose check fails stays in health-only mode rather than blocking the connection
+- Each pool row aggregates routing-usable accounts: mean utilization per window across healthy accounts, an inline healthy/total count, and a per-window reset taken from the earliest contributing account. Missing buckets are excluded, never read as zero
+- A pool row replaces that provider's direct row while it exists, so a provider never appears twice; the direct row returns when the pool does not
+- Disconnecting purges the saved URL, key, CPA runtime rows, and CPA-derived snapshots, and advances the usage cache epoch so an in-flight refresh cannot resurrect them. Direct provider data is untouched
+
+### Manage workspace
+
+One rail-navigated window for everything that is not live monitoring, opened
+from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
+
+- Four sections — **Sessions** (search), **Learning** (rules, memory, runs), **Instances** (restart), and **Settings**
+- ⌘K / Ctrl+K opens a command palette over the sections plus Back-to-Live and Close-Tools actions
+- **Settings** tabs: General, Integrations, Context, Learning, and Performance
+
+### Session search
+
+- Full-text search across all Claude Code and Codex sessions (powered by Tantivy)
+- Filter by provider, project, host, role, and date range; sort by relevance or recency
+- Snippet highlighting with expandable message context and a session detail panel
+- Indexes subagent transcripts and Codex inter-agent messages alongside root sessions
+- Lives in the **Sessions** section of the Manage workspace
+
+### Token tracking
+
+- Per-turn input/output/cache token counts via the bundled Claude Code and Codex hooks
+- Feeds the Usage view's provider chart, the readout sparklines, and the In / Out / Cache footer
+- Delivered over a local HTTP server with bearer-token auth — see [Token Tracking, Learning & Session Search](#token-tracking-learning--session-search)
+
+### Code stats
+
+- Lines of code added/removed tracked per session, grouped by language
+- Net lines, tokens per LOC, and LOC per hour sit in the Usage view's readout grid, each with its own sparkline
+- The code-changes timeline shares the Charts view's axis and crosshair, and velocity is one of the Trends view's week-over-week rows
+
+### Learning
+
+- The Manage workspace's **Learning** section shows learned usage rules, observation stats, and analysis history
+- Trigger modes: on-demand, or periodic once enough new observations have accumulated
+- Rule lifecycle tracking (candidate → awaiting review → active, plus rejected, suppressed, superseded, and conflict-flagged states)
+- Domain-grouped rules with confidence scores, written to `~/.claude/rules/learned/`
+- Run history with real-time analysis logs, opened as a docked panel beside the rules
+- Git history integration for cross-source pattern synthesis
+
+### Memory optimizer
+
+- Scans your Claude Code memory files and suggests improvements (merge duplicates, update stale content, remove obsolete entries)
+- Approval-based workflow — review each suggestion with a diff preview before applying
+- Undo any applied change to restore the original file
+- Batched "optimize all" to review and apply suggestions across an entire project
+- Optional **Compress prose** pre-pass — rewrites every eligible memory file in caveman style via Anthropic Haiku before the optimizer runs. Skips instruction files, files over 500 KB, files on the secrets denylist, and files that already have an `.original.md` backup. Validates that headings, code blocks, URLs, file paths, and bullets are preserved; on failure restores the original. Successful rewrites leave a `<file>.original.md` backup next to the compressed file so the change is reversible
+
+### Brevity profile
+
+- Toggled from **Settings → Context** in the Manage workspace, and applied to whichever providers (Claude Code, Codex) are enabled
+- Injects a managed "Quill Brevity Profile" instruction block into the provider's primary agent file (`~/.claude/CLAUDE.md` for Claude Code, `~/.codex/AGENTS.md` for Codex), asking the assistant to write in a compressed caveman style for its own prose responses while preserving code blocks, file paths, URLs, library names, command names, numbers, env vars, and markdown structure exactly
+- Symlink-aware — when `AGENTS.md` is a symlink to `CLAUDE.md`, only one block is written so the same instructions are not duplicated
+- Toggling off strips just the managed block; the rest of the agent file is left untouched
+- MiniMax does not have a managed agent file, so brevity is unavailable for it
+
+### Working context preservation
+
+- Optional, default-off feature toggled from **Settings → Context** — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
+- **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
+- **Routing hooks** — block raw `WebFetch` and noisy `curl`/`wget` dumps, nudge broad `Bash`/`Read`/`Grep`/build/test output toward `quill_*` tools, and use per-session marker files to avoid repeating guidance
+- **Continuity capture** — small task and decision hints recorded across sessions so a new session can resume context without writing to provider memory paths
+- **Telemetry** — every preservation event reports compact byte and token estimates to the widget's Context view; large content stays in the local context store and never enters the analytics database
+- Toggling the feature deploys or removes context scripts, the context MCP tool, instruction templates, and hooks for currently enabled providers; historical context stores and analytics rows are preserved on disable
+- Available for both Claude Code and Codex via their respective integrations
+
+### MCP server
+
+- Gives Claude Code (and Codex) direct access to your indexed session history and — when context preservation is enabled — the working context store
+- Session-history tool:
+  - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use (filter by project, git branch, role, date)
+- Context tools (only when context preservation is enabled): see [Working context preservation](#working-context-preservation)
+- Automatically configured when the app starts — no manual setup needed
+
+### Restart orchestrator
+
+- Discovers running Claude and Codex sessions — Claude from Quill's hook-written state files plus process scanning, Codex from process scanning and session metadata per working directory
+- Restarts in four phases with live status events: discover, wait for idle where the provider exposes one, SIGTERM and wait for exit, then resume (`claude --resume`, `codex resume`). Force restart skips the idle wait
+- Codex has no reliable idle signal, so its rows stay `Unknown` rather than claiming an idle transition Quill never observed; ambiguous Codex process or session mappings are omitted instead of guessed
+- Per-instance status — Idle, Processing, Unknown, Restarting, Exited, RestartFailed — with cancel support
+- Lives in the **Instances** section of the Manage workspace
+
+### Desktop integration
+
+- **System tray** with Show Widget / Always on Top / Check for Update / Quit
+- **In-app updater** — checks on startup and every 4 hours; a cyan "Update" button then appears centered in the widget titlebar
+- Always-on-top toggle in the widget titlebar, sharing one persisted setting with the tray checkitem and Settings
+- Frameless, transparent, near-black flat surface with a drag-to-move titlebar and a resize border on all four edges and corners
+- Geometry belongs to you: the window resizes freely above a 320×200 floor with no ceiling, and both size and position are restored across restarts. Only the column below the titlebar scrolls, so the widget stays usable when dragged shorter than its content
+- Closing from the titlebar hides the widget to the tray rather than quitting
+- Refreshes usage every 3 minutes while the widget is open; an optional background refresh (60–600s, Settings → Performance) keeps the tray indicator current while it is hidden
+- Read-only OAuth — reads Claude Code's token, never refreshes it
+- On Linux, a first-launch prompt (re-runnable from **Settings → General**) adds Quill to the applications menu
+- **Zoom controls** — Ctrl+/- to zoom, Ctrl+0 to reset, persisted per window
+
+### Crash reporting
+
+Default-on and opt-out, toggled by the "Help improve Quill" row at the bottom of
+**Settings → General**. It reports crashes without reporting your work.
+
+- Both the Rust and frontend surfaces run a deny-by-default scrubber before anything leaves the process: messages, exception values, breadcrumbs, request data, user context, extras, and absolute file paths are all stripped. Only stack-frame structure plus release, environment, and runtime tags survive
+- Session replay, browser tracing, session tracking, and HTTP context capture are disabled — the reporter is a crash handler, not analytics
+- Toggling applies immediately on both surfaces: opting out flushes pending events and closes the transport, opting back in re-initializes it
 
 ## License
 

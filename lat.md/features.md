@@ -551,9 +551,15 @@ It shows a native `tauri-plugin-dialog` confirmation. **Add** runs the shared in
 
 [[src-tauri/src/appimage_integration.rs#integrate]] backs both the prompt and the Settings control, doing all work in user space (no privilege escalation).
 
-It copies `$APPIMAGE` to `~/Applications/Quill.AppImage` (executable), writes `~/.local/share/applications/quill.desktop`, installs an icon extracted from the running AppImage's `$APPDIR` to `~/.local/share/icons/hicolor/256x256/apps/quill.png`, and best-effort refreshes the desktop/icon caches. It is copy-not-move (the running session stays valid, no relaunch) and idempotent. State (`appimage.integration` = `done`/`declined`, plus `appimage.integration_path`) is persisted only after the filesystem work succeeds, so any failure is non-fatal and retryable.
+It copies `$APPIMAGE` to `~/Applications/Quill.AppImage` (executable), writes `~/.local/share/applications/quill.desktop`, installs an icon extracted from the running AppImage's `$APPDIR` to `~/.local/share/icons/hicolor/256x256/apps/quill.png`, and best-effort refreshes the desktop/icon caches. It is copy-not-move (the running session stays valid, no relaunch), idempotent, and replaces the AppImage through a same-directory temporary file plus atomic rename. State (`appimage.integration` = `done`/`declined` and `appimage.integration_path`) is persisted only after the filesystem work succeeds; a hidden `.Quill.AppImage.version` sidecar beside the integrated copy records its semantic version.
 
 The module is compiled on every target (its two IPC commands are always registered), so the one platform-specific call — setting the executable bit — is `#[cfg(unix)]`-gated to keep the Windows build compiling; integration itself only ever runs on Linux.
+
+### Automatic version refresh
+
+[[src-tauri/src/appimage_integration.rs#refresh_integrated_appimage]] keeps an existing applications-menu install on the newest AppImage the user launches.
+
+Before single-instance handoff, an integrated AppImage records its running package version when `$APPIMAGE` resolves to `~/Applications/Quill.AppImage`. A loose AppImage replaces that target only when its semantic version is newer; equal or older versions do nothing. This ordering also works while an older Quill process is already running: atomic rename changes the next launcher target without changing that process. The first release carrying the sidecar treats a differing legacy target with no version as predating the feature and refreshes it once; byte-identical legacy copies only seed metadata. Malformed or unreadable metadata fails closed.
 
 ### Settings control
 
@@ -565,7 +571,7 @@ The hook calls [[src-tauri/src/appimage_integration.rs#get_appimage_integration_
 
 The `install.sh` script (repo root) is a `curl | sh` one-liner that handles the *pre-launch* step the app cannot — browsers save downloads non-executable.
 
-It resolves the latest `*_linux_amd64.AppImage` from the GitHub releases API, downloads it to `~/Applications/Quill.AppImage`, marks it executable, and launches it; first-run integration then adds the menu entry. Because it lands the AppImage directly at the integration target, [[src-tauri/src/appimage_integration.rs#copy_appimage]] skips the copy when the source already resolves to the destination (otherwise `std::fs::copy` would truncate the file onto itself).
+It resolves the latest `*_linux_amd64.AppImage` from the GitHub releases API, downloads it to `~/Applications/Quill.AppImage`, marks it executable, and launches it; first-run integration then adds the menu entry. Because it lands the AppImage directly at the integration target, [[src-tauri/src/appimage_integration.rs#copy_appimage]] skips the copy when the source already resolves to the destination; other installs use an atomic replacement.
 
 ### Updater interaction
 

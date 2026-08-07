@@ -5683,6 +5683,11 @@ pub fn run() {
     // does not race the dying predecessor for the single-instance lock.
     wait_for_predecessor_exit();
 
+    let context = tauri::generate_context!();
+    if let Err(error) = appimage_integration::refresh_integrated_appimage(context.package_info()) {
+        eprintln!("Could not refresh integrated AppImage: {error}");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
@@ -6311,7 +6316,7 @@ pub fn run() {
             appimage_integration::get_appimage_integration_status,
             appimage_integration::integrate_appimage,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
 

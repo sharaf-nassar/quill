@@ -6,6 +6,7 @@
 //! entirely in user space:
 //!
 //! - copies `$APPIMAGE` to `~/Applications/Quill.AppImage` (executable),
+//! - records the installed semantic version beside that copy,
 //! - writes a launcher to `~/.local/share/applications/quill.desktop`,
 //! - installs an icon to `~/.local/share/icons/hicolor/256x256/apps/quill.png`,
 //! - best-effort refreshes the desktop/icon caches,
@@ -25,6 +26,7 @@
 //! Design references: `specs/010-appimage-first-run-integration/` (R-A..R-I,
 //! FR-001..FR-010).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -127,6 +129,8 @@ struct TargetPaths {
     desktop: PathBuf,
     /// `~/.local/share/icons/hicolor/256x256/apps/quill.png`
     icon: PathBuf,
+    /// `~/Applications/.Quill.AppImage.version`
+    version: PathBuf,
 }
 
 /// Compute the integration target paths under `home` (research R-C). Pure: no
@@ -134,6 +138,7 @@ struct TargetPaths {
 fn target_paths(home: &Path) -> TargetPaths {
     TargetPaths {
         appimage: home.join("Applications").join("Quill.AppImage"),
+        version: home.join("Applications").join(".Quill.AppImage.version"),
         desktop: home
             .join(".local")
             .join("share")
@@ -321,13 +326,36 @@ fn copy_appimage(src: &Path, dest: &Path) -> Result<(), String> {
         .map(|(resolved_src, resolved_dest)| resolved_src == resolved_dest)
         .unwrap_or(false);
     if !already_in_place {
-        std::fs::copy(src, dest).map_err(|e| {
+        let temp =
+            tempfile::NamedTempFile::new_in(dest.parent().ok_or_else(|| {
+                format!("AppImage destination has no parent: {}", dest.display())
+            })?)
+            .map_err(|e| format!("Failed to create temporary AppImage: {e}"))?;
+        std::fs::copy(src, temp.path()).map_err(|e| {
             format!(
                 "Failed to copy AppImage {} -> {}: {e}",
                 src.display(),
-                dest.display()
+                temp.path().display()
             )
         })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755)).map_err(
+                |e| {
+                    format!(
+                        "Failed to set executable bit on {}: {e}",
+                        temp.path().display()
+                    )
+                },
+            )?;
+        }
+        temp.as_file()
+            .sync_all()
+            .map_err(|e| format!("Failed to sync temporary AppImage: {e}"))?;
+        temp.persist(dest)
+            .map_err(|e| format!("Failed to install AppImage {}: {}", dest.display(), e.error))?;
     }
     // The executable bit only exists on Unix; Windows has no equivalent (and
     // integrate() never reaches here on Windows anyway, since $APPIMAGE is
@@ -342,6 +370,145 @@ fn copy_appimage(src: &Path, dest: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to set executable bit on {}: {e}", dest.display()))?;
     }
     Ok(())
+}
+
+/// Compare two regular files without loading an AppImage-sized payload in memory.
+fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool, String> {
+    let left_meta = std::fs::symlink_metadata(left_path)
+        .map_err(|e| format!("Failed to stat {}: {e}", left_path.display()))?;
+    let right_meta = match std::fs::symlink_metadata(right_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!("Failed to stat {}: {error}", right_path.display()));
+        }
+    };
+    if !left_meta.file_type().is_file()
+        || !right_meta.file_type().is_file()
+        || left_meta.len() != right_meta.len()
+    {
+        return Ok(false);
+    }
+
+    let mut left = std::fs::File::open(left_path)
+        .map_err(|e| format!("Failed to read {}: {e}", left_path.display()))?;
+    let mut right = std::fs::File::open(right_path)
+        .map_err(|e| format!("Failed to read {}: {e}", right_path.display()))?;
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    let mut remaining = left_meta.len();
+    while remaining > 0 {
+        let chunk = remaining.min(left_buffer.len() as u64) as usize;
+        left.read_exact(&mut left_buffer[..chunk])
+            .map_err(|e| format!("Failed to read {}: {e}", left_path.display()))?;
+        right
+            .read_exact(&mut right_buffer[..chunk])
+            .map_err(|e| format!("Failed to read {}: {e}", right_path.display()))?;
+        if left_buffer[..chunk] != right_buffer[..chunk] {
+            return Ok(false);
+        }
+        remaining -= chunk as u64;
+    }
+    Ok(true)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshResult {
+    Unchanged,
+    RecordVersion,
+    Replaced,
+}
+
+/// Refresh the integrated copy only when the running AppImage is newer.
+fn refresh_integrated_copy(
+    src: &Path,
+    dest: &Path,
+    package_info: &tauri::utils::PackageInfo,
+    installed_version: Option<&str>,
+) -> Result<RefreshResult, String> {
+    let same_path = std::fs::canonicalize(src)
+        .ok()
+        .zip(std::fs::canonicalize(dest).ok())
+        .map(|(src, dest)| src == dest)
+        .unwrap_or(false);
+    let running_version = package_info.version.to_string();
+
+    if same_path {
+        return Ok(if installed_version == Some(&running_version) {
+            RefreshResult::Unchanged
+        } else {
+            RefreshResult::RecordVersion
+        });
+    }
+
+    if let Some(installed_version) = installed_version {
+        let installed_version = installed_version
+            .parse()
+            .map_err(|e| format!("Invalid integrated AppImage version: {e}"))?;
+        if package_info.version <= installed_version {
+            return Ok(RefreshResult::Unchanged);
+        }
+    } else if files_equal(src, dest)? {
+        return Ok(RefreshResult::RecordVersion);
+    }
+
+    copy_appimage(src, dest)?;
+    Ok(RefreshResult::Replaced)
+}
+
+fn refresh_integrated_appimage_at(
+    appimage_src: &Path,
+    targets: &TargetPaths,
+    package_info: &tauri::utils::PackageInfo,
+) -> Result<bool, String> {
+    if !is_regular_file_nofollow(&targets.appimage) {
+        return Ok(false);
+    }
+
+    let installed_version = match std::fs::read_to_string(&targets.version) {
+        Ok(version) => Some(version),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(format!(
+                "Failed to read {}: {error}",
+                targets.version.display()
+            ));
+        }
+    };
+    let result = refresh_integrated_copy(
+        appimage_src,
+        &targets.appimage,
+        package_info,
+        installed_version.as_deref().map(str::trim),
+    )?;
+
+    if result != RefreshResult::Unchanged {
+        write_file(
+            &targets.version,
+            package_info.version.to_string().as_bytes(),
+        )?;
+    }
+    if result == RefreshResult::Replaced {
+        log::info!(
+            "Updated integrated AppImage at {} to {}",
+            targets.appimage.display(),
+            package_info.version
+        );
+    }
+    Ok(result == RefreshResult::Replaced)
+}
+
+/// Keep an existing applications-menu install on the newest launched version.
+pub fn refresh_integrated_appimage(
+    package_info: &tauri::utils::PackageInfo,
+) -> Result<bool, String> {
+    if !running_as_appimage() {
+        return Ok(false);
+    }
+
+    let home = dirs::home_dir().ok_or_else(|| "Could not determine home directory".to_string())?;
+    let (appimage_src, _) = resolve_sources()?;
+    refresh_integrated_appimage_at(&appimage_src, &target_paths(&home), package_info)
 }
 
 /// Write `contents` to `dest`, creating parent dirs first.
@@ -421,8 +588,9 @@ fn resolve_sources() -> Result<(PathBuf, Option<PathBuf>), String> {
 ///
 /// Shared by the first-run prompt and the [`integrate_appimage`] command. Steps:
 /// resolve `$APPIMAGE`/`$APPDIR`; ensure `~/Applications`; copy + chmod; write
-/// the `.desktop`; install the icon; best-effort refresh caches; then persist
-/// the integrated path followed by `appimage.integration=done`.
+/// the `.desktop`; install the icon and version sidecar; best-effort refresh
+/// caches; then persist the integrated path followed by
+/// `appimage.integration=done`.
 ///
 /// Idempotent (every write overwrites). On **any** error it returns `Err` and
 /// does **not** persist state, so the decision stays unrecorded and a later
@@ -437,6 +605,7 @@ pub fn integrate() -> Result<(), String> {
     let targets = target_paths(&home);
 
     perform_integration(&appimage_src, icon_src.as_deref(), &targets)?;
+    write_file(&targets.version, env!("CARGO_PKG_VERSION").as_bytes())?;
 
     // Cache refresh is best-effort and must not gate success.
     let icon_theme_root = home
@@ -527,6 +696,10 @@ mod tests {
             t.icon,
             Path::new("/home/tester/.local/share/icons/hicolor/256x256/apps/quill.png")
         );
+        assert_eq!(
+            t.version,
+            Path::new("/home/tester/Applications/.Quill.AppImage.version")
+        );
     }
 
     #[test]
@@ -602,6 +775,63 @@ mod tests {
         let src = dir.join("Quill-download.AppImage");
         std::fs::write(&src, b"AI\x02fake-appimage-bytes").unwrap();
         src
+    }
+
+    fn package_info(version: &str) -> tauri::utils::PackageInfo {
+        tauri::utils::PackageInfo {
+            name: PRODUCT_NAME.to_string(),
+            version: version.parse().unwrap(),
+            authors: "",
+            description: "",
+            crate_name: "quill",
+        }
+    }
+
+    // @lat: [[appimage-integration-tests#AppImage Integration Tests#Automatic Refresh#Keeps Newest Installed Version]]
+    #[test]
+    fn automatic_refresh_keeps_newest_installed_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = fake_appimage(tmp.path());
+        let targets = target_paths(&tmp.path().join("home"));
+        std::fs::create_dir_all(targets.appimage.parent().unwrap()).unwrap();
+
+        std::fs::write(&targets.appimage, b"older-installed").unwrap();
+        std::fs::write(&targets.version, b"0.3.39").unwrap();
+        assert!(refresh_integrated_appimage_at(&src, &targets, &package_info("0.3.40")).unwrap());
+        assert_eq!(
+            std::fs::read(&targets.appimage).unwrap(),
+            std::fs::read(&src).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&targets.version).unwrap(), "0.3.40");
+
+        std::fs::write(&targets.appimage, b"keep-equal").unwrap();
+        assert!(!refresh_integrated_appimage_at(&src, &targets, &package_info("0.3.40")).unwrap());
+        assert_eq!(std::fs::read(&targets.appimage).unwrap(), b"keep-equal");
+
+        std::fs::write(&targets.version, b"0.3.41").unwrap();
+        assert!(!refresh_integrated_appimage_at(&src, &targets, &package_info("0.3.40")).unwrap());
+        assert_eq!(std::fs::read(&targets.appimage).unwrap(), b"keep-equal");
+
+        std::fs::write(&targets.version, b"0.3.39").unwrap();
+        assert!(
+            !refresh_integrated_appimage_at(&targets.appimage, &targets, &package_info("0.3.40"))
+                .unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&targets.version).unwrap(), "0.3.40");
+
+        std::fs::write(&targets.appimage, b"legacy-older-installed").unwrap();
+        std::fs::remove_file(&targets.version).unwrap();
+        assert!(refresh_integrated_appimage_at(&src, &targets, &package_info("0.3.40")).unwrap());
+        assert_eq!(
+            std::fs::read(&targets.appimage).unwrap(),
+            std::fs::read(&src).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&targets.version).unwrap(), "0.3.40");
+
+        std::fs::write(&targets.appimage, std::fs::read(&src).unwrap()).unwrap();
+        std::fs::remove_file(&targets.version).unwrap();
+        assert!(!refresh_integrated_appimage_at(&src, &targets, &package_info("0.3.40")).unwrap());
+        assert_eq!(std::fs::read_to_string(&targets.version).unwrap(), "0.3.40");
     }
 
     // integrate writes copy + .desktop + icon under the target home.
