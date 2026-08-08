@@ -21,7 +21,9 @@ use tauri::Manager;
 /// while holding the process-wide mutation lock, so a hung child must not be
 /// able to block every guarded operation indefinitely.
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, value};
+use toml_edit::{
+    Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value,
+};
 
 const HOOK_MARKER: &str = "quill-codex-setup";
 const CONTEXT_HOOK_MARKER: &str = "quill-codex-context-preservation";
@@ -1817,6 +1819,33 @@ fn config_string(doc: &DocumentMut, keys: &[&str]) -> Result<Option<String>, Str
         .ok_or_else(|| format!("config.toml {} must be a string", keys.join(".")))
 }
 
+/// Ownership of `mcp_servers.quill` is inferred structurally, the same way
+/// [`command_uses_managed_script`] does for hooks: an entry whose command or
+/// args point into the managed MCP directory is ours no matter how it got
+/// there. Marker comments cannot answer this — they are stripped from every
+/// config Quill writes, so a capture that ran without prior state would adopt
+/// Quill's own entry and leave it dangling at uninstall.
+fn mcp_entry_is_quill_owned(entry: &Item) -> bool {
+    let Some(entry) = entry.as_table_like() else {
+        return false;
+    };
+    let managed = mcp_dir().to_string_lossy().to_string();
+    let points_at_managed_dir =
+        |text: &str| text.contains(&managed) || text.contains("~/.config/quill/codex/mcp");
+    entry
+        .get("command")
+        .and_then(Item::as_str)
+        .is_some_and(points_at_managed_dir)
+        || entry
+            .get("args")
+            .and_then(Item::as_array)
+            .is_some_and(|args| {
+                args.iter()
+                    .filter_map(Value::as_str)
+                    .any(points_at_managed_dir)
+            })
+}
+
 fn capture_integration_state(
     doc: &DocumentMut,
     original: &str,
@@ -1833,7 +1862,8 @@ fn capture_integration_state(
             .transpose()?
     };
     let mcp_server_was_present = !original.contains(MCP_BLOCK_START)
-        && nested_config_item(doc, &["mcp_servers", "quill"]).is_some();
+        && nested_config_item(doc, &["mcp_servers", "quill"])
+            .is_some_and(|entry| !mcp_entry_is_quill_owned(entry));
 
     Ok(CodexIntegrationState {
         version: 1,
@@ -2459,5 +2489,44 @@ mod tests {
                 .iter()
                 .all(|hook| !hook.command.contains("hook-observe.cjs"))
         }));
+    }
+
+    // @lat: [[infrastructure#Infrastructure#Codex Integration Deployment]]
+    #[test]
+    fn capture_claims_marker_less_quill_mcp_entry() {
+        let managed = mcp_dir().to_string_lossy().to_string();
+        let quill_owned = format!(
+            "[mcp_servers.quill]\ncommand = \"uv\"\nargs = [\"run\", \"--directory\", \"{managed}\", \"python\", \"server.py\"]\nenabled = true\n\n[mcp_servers.quill.env]\nQUILL_PROVIDER = \"codex\"\nQUILL_CONTEXT_PRESERVATION = \"1\"\n"
+        );
+        let state = capture_integration_state(
+            &parse_config_doc(&quill_owned).expect("parse quill-owned config"),
+            &quill_owned,
+            Path::new("/tmp/codex-home"),
+        )
+        .expect("capture quill-owned config");
+        assert!(
+            !state.mcp_server_was_present,
+            "a marker-less entry pointing into {managed} is Quill's own"
+        );
+        assert!(state.prior_mcp_provider.is_none());
+        assert!(state.prior_mcp_context_preservation.is_none());
+        assert!(restore_removes_quill_server(&state, &quill_owned));
+
+        let user_owned = "[mcp_servers.quill]\ncommand = \"python\"\nargs = [\"/home/me/my-quill/server.py\"]\n\n[mcp_servers.quill.env]\nQUILL_PROVIDER = \"mine\"\n";
+        let state = capture_integration_state(
+            &parse_config_doc(user_owned).expect("parse user-owned config"),
+            user_owned,
+            Path::new("/tmp/codex-home"),
+        )
+        .expect("capture user-owned config");
+        assert!(state.mcp_server_was_present);
+        assert_eq!(state.prior_mcp_provider.as_deref(), Some("mine"));
+        assert!(!restore_removes_quill_server(&state, user_owned));
+    }
+
+    fn restore_removes_quill_server(state: &CodexIntegrationState, original: &str) -> bool {
+        let mut doc = parse_config_doc(original).expect("parse config");
+        restore_owned_config(&mut doc, Some(state), original).expect("restore owned config");
+        nested_config_item(&doc, &["mcp_servers", "quill"]).is_none()
     }
 }
