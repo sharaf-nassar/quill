@@ -2,13 +2,17 @@ use crate::config::{claude_user_agent, http_client, read_access_token};
 use crate::integrations::IntegrationProvider;
 use crate::models::{ProviderCredits, UsageBucket};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::time::Duration;
+
+/// Hard cap on the Codex usage request. The child round-trips to the ChatGPT
+/// backend, so this sits well above the shared HTTP client's 15s ceiling — it
+/// exists to bound a hung app-server, not to police a slow network.
+const CODEX_USAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MINIMAX_USAGE_URL: &str = "https://api.minimax.io/v1/api/openplatform/coding_plan/remains";
@@ -249,19 +253,6 @@ fn codex_window_label(window_minutes: i64) -> String {
 }
 
 #[derive(Debug, Deserialize)]
-struct AppServerEnvelope {
-    id: Option<u64>,
-    result: Option<serde_json::Value>,
-    error: Option<AppServerError>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AppServerError {
-    code: i64,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexRateLimitsResponse {
     rate_limits: CodexRateLimitSnapshot,
@@ -298,125 +289,6 @@ fn codex_window_resets_at(resets_at: Option<i64>) -> Option<String> {
     resets_at
         .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
         .map(|timestamp| timestamp.to_rfc3339())
-}
-
-fn run_codex_app_server_request<T: DeserializeOwned>(
-    request_id: u64,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<T, String> {
-    let codex_path = crate::config::resolve_command_path("codex")
-        .ok_or_else(|| "Codex CLI was not found in PATH".to_string())?;
-    let codex_env_path = crate::config::path_for_resolved_command(&codex_path);
-    let mut child = Command::new(&codex_path)
-        .args(["app-server", "--enable", "apps", "--listen", "stdio://"])
-        .env("PATH", codex_env_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start codex app-server: {e}"))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "Failed to open codex app-server stdin".to_string())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to open codex app-server stdout".to_string())?;
-
-    let messages = [
-        json!({
-            "method": "initialize",
-            "id": 1,
-            "params": {
-                "clientInfo": {
-                    "name": "quill_usage",
-                    "title": "Quill Usage",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                },
-            },
-        }),
-        json!({
-            "method": "initialized",
-            "params": {},
-        }),
-        json!({
-            "method": method,
-            "id": request_id,
-            "params": params,
-        }),
-    ];
-
-    for message in messages {
-        stdin
-            .write_all(message.to_string().as_bytes())
-            .map_err(|e| format!("Failed to write to codex app-server: {e}"))?;
-        stdin
-            .write_all(b"\n")
-            .map_err(|e| format!("Failed to write newline to codex app-server: {e}"))?;
-    }
-    stdin
-        .flush()
-        .map_err(|e| format!("Failed to flush codex app-server stdin: {e}"))?;
-
-    let mut stderr = child.stderr.take();
-    let reader = BufReader::new(stdout);
-    let mut response = None;
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("Failed to read codex app-server output: {e}"))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let envelope: AppServerEnvelope = serde_json::from_str(&line)
-            .map_err(|e| format!("Failed to parse codex app-server message: {e}"))?;
-        if envelope.id != Some(request_id) {
-            continue;
-        }
-
-        if let Some(error) = envelope.error {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
-                "Codex app-server {method} failed (code {}): {}",
-                error.code, error.message
-            ));
-        }
-
-        if let Some(result) = envelope.result {
-            let parsed = serde_json::from_value::<T>(result)
-                .map_err(|e| format!("Failed to parse codex app-server {method} response: {e}"))?;
-            response = Some(parsed);
-            break;
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    if let Some(result) = response {
-        return Ok(result);
-    }
-
-    let mut stderr_text = String::new();
-    if let Some(mut handle) = stderr.take() {
-        let _ = handle.read_to_string(&mut stderr_text);
-    }
-
-    if stderr_text.trim().is_empty() {
-        Err(format!("Codex app-server {method} returned no response"))
-    } else {
-        Err(format!(
-            "Codex app-server {method} returned no response: {}",
-            stderr_text.trim()
-        ))
-    }
 }
 
 fn parse_codex_rate_limit_snapshot(
@@ -617,8 +489,17 @@ fn latest_codex_usage_in_file(path: &Path) -> Option<(DateTime<Utc>, Vec<UsageBu
 }
 
 fn fetch_codex_usage_direct() -> Result<(Vec<UsageBucket>, Option<ProviderCredits>), String> {
-    let response: CodexRateLimitsResponse =
-        run_codex_app_server_request(2, "account/rateLimits/read", json!({}))?;
+    let response: CodexRateLimitsResponse = crate::integrations::codex::run_app_server_request(
+        crate::integrations::codex::AppServerRequest {
+            feature: "apps",
+            client_name: "quill_usage",
+            client_title: "Quill Usage",
+            codex_home: None,
+            timeout: CODEX_USAGE_TIMEOUT,
+        },
+        "account/rateLimits/read",
+        json!({}),
+    )?;
     let (buckets, credits) = parse_codex_app_server_rate_limits(response);
     if buckets.is_empty() {
         Err("Codex app-server returned no usage buckets.".to_string())

@@ -202,16 +202,35 @@ struct ReapedChild {
 }
 
 impl ReapedChild {
-    fn new(child: Child) -> Self {
-        Self {
-            child,
-            reaped: false,
+    /// Spawns the child into its own process group. The `codex` entry point is
+    /// usually an npm wrapper that re-execs the platform binary as a
+    /// grandchild, and `Child::kill` signals only the direct child — the
+    /// orphan would keep our stdout pipe open forever. Owning the group is
+    /// what lets `terminate` close it, so spawning any other way is a bug.
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
         }
+        Ok(Self {
+            child: command.spawn()?,
+            reaped: false,
+        })
     }
 
     fn terminate(&mut self) {
         if self.reaped {
             return;
+        }
+        // Signal the group before reaping: `wait` frees the pid for reuse, and
+        // the pgid would no longer be ours to kill.
+        #[cfg(unix)]
+        if let Ok(pgid) = i32::try_from(self.child.id()) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
         let _ = self.child.kill();
         if self.child.wait().is_ok() {
@@ -523,8 +542,17 @@ fn list_codex_hooks(paths: &CodexInstallPaths) -> Result<Vec<CodexHookMetadata>,
         .ok()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let response: CodexHooksListResponse =
-        run_codex_app_server_request(2, "hooks/list", serde_json::json!({ "cwds": [cwd] }), paths)?;
+    let response: CodexHooksListResponse = run_app_server_request(
+        AppServerRequest {
+            feature: "hooks",
+            client_name: "quill_codex_hooks",
+            client_title: "Quill Codex Hooks",
+            codex_home: Some(&paths.home),
+            timeout: CODEX_APP_SERVER_TIMEOUT,
+        },
+        "hooks/list",
+        serde_json::json!({ "cwds": [cwd] }),
+    )?;
     Ok(response
         .data
         .into_iter()
@@ -858,25 +886,50 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
-    request_id: u64,
+/// One `codex app-server` invocation. `initialize` claims id 1, so the request
+/// this call actually cares about is always id 2 and the response match stays
+/// unambiguous.
+const APP_SERVER_REQUEST_ID: u64 = 2;
+
+/// Per-caller shape of an app-server invocation. Every field varies between the
+/// hook-registration and usage-fetch callers; the spawn, teardown, and deadline
+/// around them must not.
+pub(crate) struct AppServerRequest<'a> {
+    /// `--enable` feature the request needs (`hooks`, `apps`).
+    pub feature: &'a str,
+    pub client_name: &'a str,
+    pub client_title: &'a str,
+    /// `CODEX_HOME` override; `None` leaves the child on the inherited value.
+    pub codex_home: Option<&'a Path>,
+    pub timeout: Duration,
+}
+
+pub(crate) fn run_app_server_request<T: serde::de::DeserializeOwned>(
+    request: AppServerRequest<'_>,
     method: &str,
     params: serde_json::Value,
-    paths: &CodexInstallPaths,
 ) -> Result<T, String> {
     let codex_path = crate::config::resolve_command_path("codex")
         .ok_or_else(|| "Codex CLI was not found in PATH".to_string())?;
     let codex_env_path = crate::config::path_for_resolved_command(&codex_path);
-    let child = Command::new(&codex_path)
-        .args(["app-server", "--enable", "hooks", "--listen", "stdio://"])
+    let mut command = Command::new(&codex_path);
+    command
+        .args([
+            "app-server",
+            "--enable",
+            request.feature,
+            "--listen",
+            "stdio://",
+        ])
         .env("PATH", codex_env_path)
-        .env("CODEX_HOME", &paths.home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    if let Some(home) = request.codex_home {
+        command.env("CODEX_HOME", home);
+    }
+    let mut child = ReapedChild::spawn(&mut command)
         .map_err(|err| format!("Failed to start codex app-server: {err}"))?;
-    let mut child = ReapedChild::new(child);
 
     let mut stdin = child
         .child
@@ -895,8 +948,8 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
             "id": 1,
             "params": {
                 "clientInfo": {
-                    "name": "quill_codex_hooks",
-                    "title": "Quill Codex Hooks",
+                    "name": request.client_name,
+                    "title": request.client_title,
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": {
@@ -910,7 +963,7 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
         }),
         serde_json::json!({
             "method": method,
-            "id": request_id,
+            "id": APP_SERVER_REQUEST_ID,
             "params": params,
         }),
     ];
@@ -932,9 +985,9 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
     let response: Option<T> = collect_app_server_response(
         stdout,
         &mut child,
-        request_id,
+        APP_SERVER_REQUEST_ID,
         method,
-        CODEX_APP_SERVER_TIMEOUT,
+        request.timeout,
     )?;
 
     drop(stdin);
@@ -963,6 +1016,11 @@ fn run_codex_app_server_request<T: serde::de::DeserializeOwned>(
 /// child cannot block the caller (and the process-wide mutation lock it holds)
 /// forever; on timeout the child is killed via its RAII wrapper and a clear
 /// error is returned. Returns `Ok(None)` on clean EOF with no matching response.
+///
+/// The reader is never joined. Killing the process group closes the pipe, so it
+/// exits on its own; the only case a join would cover is a child that escaped
+/// the group, and that is exactly the case where joining hangs this caller
+/// forever instead of returning the timeout it already computed.
 fn collect_app_server_response<T: serde::de::DeserializeOwned>(
     stdout: ChildStdout,
     child: &mut ReapedChild,
@@ -1023,11 +1081,9 @@ fn collect_app_server_response<T: serde::de::DeserializeOwned>(
         }
     };
 
-    // Killing the child closes stdout so the reader thread observes EOF; the join
-    // then cannot deadlock and guarantees no reader outlives this call.
     child.terminate();
     drop(receiver);
-    let _ = reader.join();
+    drop(reader);
     outcome
 }
 
@@ -2305,12 +2361,9 @@ mod tests {
     fn app_server_read_times_out_and_reaps_child() {
         use std::process::{Command, Stdio};
 
-        let child = Command::new("sleep")
-            .arg("30")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("spawn sleep");
-        let mut child = ReapedChild::new(child);
+        let mut command = Command::new("sleep");
+        command.arg("30").stdout(Stdio::piped());
+        let mut child = ReapedChild::spawn(&mut command).expect("spawn sleep");
         let stdout = child.child.stdout.take().unwrap();
 
         let started = Instant::now();
@@ -2330,6 +2383,38 @@ mod tests {
             "must not block for the full sleep"
         );
         assert!(child.reaped, "the hung child must be reaped");
+    }
+
+    // `codex` is usually an npm wrapper that re-execs the platform binary, so
+    // reaping only the direct child leaves a grandchild holding our stdout pipe
+    // open: the read never sees EOF and the caller wedges forever. Terminating
+    // the whole process group is what closes the pipe.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_reaps_the_grandchild_a_wrapper_leaves_behind() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(Stdio::piped());
+        let mut child = ReapedChild::spawn(&mut command).expect("spawn sh");
+        let mut line = String::new();
+        BufReader::new(child.child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .expect("read grandchild pid");
+        let grandchild =
+            nix::unistd::Pid::from_raw(line.trim().parse().expect("grandchild pid is numeric"));
+
+        child.terminate();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && nix::sys::signal::kill(grandchild, None).is_ok() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            nix::sys::signal::kill(grandchild, None).is_err(),
+            "grandchild {grandchild} survived terminate()"
+        );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Managed Lifecycle Hooks]]

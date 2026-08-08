@@ -316,11 +316,23 @@ Codex installs SessionStart, UserPromptSubmit, and Stop hooks unconditionally; t
 
 Codex has shipped hooks default-enabled since Codex 0.124.0, but Quill sets semantic `features.hooks = true` while its managed hooks are installed and restores the prior explicit value or absence on uninstall. The deployed `.cjs` bridges resolve a stable session id through a `session_id || conversation_id || id` fallback chain (`hook-observe.cjs` falls back further to `""`; `session-sync.cjs` still requires both an id and a `transcript_path` before it syncs). `hook-observe.cjs` forwards optional `agent_id` attribution supplied on subagent lifecycle events and sends `hook_matcher: null` because Codex command-hook stdin does not expose the configured matcher.
 
-The installer calls Codex `hooks/list` before and after hook mutation. It remaps opaque third-party `hooks.state` records by source, event, current hash, and duplicate order; removes stale Quill state; then writes each live Quill key with Codex's returned hash. Verification parses the resulting TOML and requires the exact expected Quill handlers to be enabled and trusted in a fresh `hooks/list` response. The app-server pipe stays open and each request has a ten-second kill-and-reap deadline.
+The installer calls Codex `hooks/list` before and after hook mutation. It remaps opaque third-party `hooks.state` records by source, event, current hash, and duplicate order; removes stale Quill state; then writes each live Quill key with Codex's returned hash. Verification parses the resulting TOML and requires the exact expected Quill handlers to be enabled and trusted in a fresh `hooks/list` response.
 
 Initial install honors a non-empty `$CODEX_HOME` and otherwise uses `~/.codex`; an empty value or a path occupied by a non-directory is rejected. The selected home is persisted in `integration-state.json`, so reinstall, verification, and uninstall keep targeting the original configuration even if the environment later changes. Legacy installs without state uninstall from `~/.codex`. Every spawned app-server receives the selected home through `CODEX_HOME`.
 
 Quill resolves the Codex CLI before running provider checks or `codex app-server`, then augments the child process `PATH` with launcher and symlink-target directories so Homebrew and npm installs work from macOS app launches with stripped inherited environments.
+
+### App-Server Request Contract
+
+[[src-tauri/src/integrations/codex.rs#run_app_server_request]] is the single one-shot `codex app-server` path. Hook registration and Codex usage polling differ only in feature flag, client identity, `CODEX_HOME`, and deadline.
+
+Each call spawns the CLI, sends `initialize`, `initialized`, and one request at id 2, then reads stdout until that id answers or the caller's deadline expires. Hook work uses ten seconds because it runs at startup holding the process-wide mutation guard; usage polling uses thirty because the child round-trips to the ChatGPT backend.
+
+Teardown is the load-bearing part. The `codex` entry point is typically an npm wrapper that re-execs the platform binary as a grandchild, so signalling only the direct child orphans a process that still holds the stdout pipe open. [[src-tauri/src/integrations/codex.rs#ReapedChild#spawn]] therefore puts the child in its own process group and [[src-tauri/src/integrations/codex.rs#ReapedChild#terminate]] signals that group before reaping — signalling first, because `wait` frees the pid for reuse.
+
+The reader thread is deliberately never joined. Group termination closes the pipe, so it ends on its own; the only case a join would cover is a child that escaped the group, and that is precisely the case where joining blocks the caller — and the mutation guard it holds — instead of returning the timeout already computed. A leaked reader is bounded; a wedged startup repair silently freezes every later provider mutation.
+
+Process groups are a `#[cfg(unix)]` mechanism. Windows is not a supported target, and the unconditional deadline plus non-blocking teardown keep the failure there bounded to a leaked child rather than a wedge.
 
 ## Provider CLI Detection
 
