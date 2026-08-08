@@ -18,6 +18,34 @@ A Stop older than a known open agent's Start describes state the snapshot alread
 
 The reconciler drops snapshots past the staleness cutoff and refuses a write older than the one it already holds for that session, so reads fail closed to null and memory stays bounded by sessions still producing evidence.
 
+## Transcript Source Precedence
+
+A transcript-derived snapshot outranks any later observed-event snapshot for the same session, because file evidence covers spawns a hook stream that started mid-session never saw.
+
+## Transcript Spawn Resolution
+
+A tool-spawned agent is open until its spawning call has a result anywhere in the session tree, including the depth-2 case whose result lands in the parent agent's transcript rather than the root, and its metadata supplies the agent type.
+
+## Workflow Journal Resolution
+
+Workflow-spawned agents carry no spawning tool call, so their journal's `started` and `result` records are the only closure evidence and each agent id resolves against its own file.
+
+## Transcript Tail Parsing
+
+Steady-state passes consume only the bytes appended since the previous pass, and a record still mid-write is left whole rather than parsed in half, so a closure lands exactly once and only when complete.
+
+## Transcript Idle Cutoff
+
+An unresolved spawn whose own transcript went silent past the cutoff is an abandoned agent rather than a slow one, and a whole tree that goes quiet leaves the scan and releases its parse state.
+
+## Transcript Session Activity
+
+A session takes its origin and project from the first record it ever parses and advances its activity from later appends, so re-reading the start record is never required to keep either.
+
+## Transcript Scan Throttle
+
+Several Sessions readers inside one interval cost a single directory walk; the throttled reads return nothing to apply and leave the reconciler holding the previous pass's state.
+
 ## Equal-Time Stop Wins
 
 A Stop sharing an open agent's Start timestamp closes the agent, preserving the terminal-event tie-break.

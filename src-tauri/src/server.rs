@@ -106,6 +106,10 @@ struct SessionSnapshot {
     /// Wall-clock instant this snapshot was derived; the reconciler's
     /// last-write-wins ordering key.
     observed_at: DateTime<Utc>,
+    /// True when the transcript scanner derived this snapshot from files on
+    /// disk. Transcripts carry retroactive evidence a hook stream cannot, so
+    /// they outrank observed events for the sessions they cover.
+    from_transcript: bool,
     agents: Vec<SnapshotAgent>,
 }
 
@@ -118,6 +122,7 @@ impl SessionSnapshot {
             ended_at: None,
             last_activity: None,
             observed_at: Utc::now(),
+            from_transcript: false,
             agents: Vec::new(),
         }
     }
@@ -314,12 +319,16 @@ impl SnapshotReconciler {
     /// Last-write-wins by observation time: a snapshot older than the one
     /// already held for that session is discarded, so out-of-order or
     /// duplicated deliveries converge instead of accumulating.
+    ///
+    /// Source rank breaks the tie the clock cannot: once a session's state is
+    /// derived from its transcripts, an observed-event snapshot for that
+    /// session is a strictly weaker view and never overwrites it.
     fn apply(&mut self, snapshot: SessionSnapshot) -> bool {
         if !self.accepts(&snapshot.key.provider)
-            || self
-                .sessions
-                .get(&snapshot.key)
-                .is_some_and(|current| snapshot.observed_at < current.observed_at)
+            || self.sessions.get(&snapshot.key).is_some_and(|current| {
+                snapshot.observed_at < current.observed_at
+                    || (current.from_transcript && !snapshot.from_transcript)
+            })
         {
             return false;
         }
@@ -343,6 +352,59 @@ impl SnapshotReconciler {
 #[derive(Default)]
 pub(crate) struct ObservedSubagentState {
     inner: Mutex<SnapshotReconciler>,
+    scanner: Mutex<crate::transcript_scan::TranscriptScanner>,
+}
+
+/// The local host every transcript-derived session belongs to.
+///
+/// Resolution can shell out, so it is done once per process rather than on
+/// every Sessions read.
+fn local_observed_host() -> Option<&'static str> {
+    static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        normalize_observed_hostname(&crate::sessions::SessionIndex::local_hostname())
+    })
+    .as_deref()
+}
+
+fn transcript_snapshot(
+    session: crate::transcript_scan::TranscriptSession,
+    host: &str,
+    observed_at: DateTime<Utc>,
+) -> SessionSnapshot {
+    let last_activity = session.last_activity;
+    SessionSnapshot {
+        key: SessionKey {
+            provider: session.provider.as_str().to_owned(),
+            host: host.to_owned(),
+            session_id: session.session_id,
+        },
+        cwd: observed_root_cwd(session.cwd.as_deref()),
+        started_at: Some(session.started_at),
+        // Transcripts record no session terminator; a finished session simply
+        // stops producing bytes and ages out through the staleness cutoff.
+        ended_at: None,
+        last_activity: Some(last_activity),
+        observed_at,
+        from_transcript: true,
+        agents: session
+            .agents
+            .into_iter()
+            .map(|agent| SnapshotAgent {
+                agent_id: agent.agent_id,
+                // Parentage is recoverable from the tree but nothing reads it
+                // yet; spawn depth comes free from the agent's own metadata.
+                parent_agent_id: None,
+                spawn_depth: agent.spawn_depth,
+                agent_type: observed_agent_type(agent.agent_type.as_deref()),
+                // Model stays unresolved here so open agents keep using the
+                // retained child evidence the merge already looks up.
+                model: None,
+                open: agent.open,
+                at: last_activity,
+            })
+            .collect(),
+    }
 }
 
 fn normalize_observed_hostname(hostname: &str) -> Option<String> {
@@ -413,6 +475,10 @@ impl ObservedSubagentState {
             .get(&key)
             .cloned()
             .unwrap_or_else(|| SessionSnapshot::new(key.clone()));
+        // This source observes events, not files: it may build on whatever
+        // state is held, but it never inherits the transcript rank that state
+        // carries, so the reconciler can still refuse the weaker view.
+        snapshot.from_transcript = false;
         let changed = match observation.hook_event.as_str() {
             "SessionStart" => match observation.source.as_deref() {
                 Some("startup" | "resume" | "clear" | "fork") => {
@@ -456,6 +522,36 @@ impl ObservedSubagentState {
         }
         snapshot.observed_at = Utc::now();
         reconciler.apply(snapshot)
+    }
+
+    /// Re-derive live session and agent state from Claude transcripts.
+    ///
+    /// The evidence is file content rather than observed events, so a session
+    /// that started before Quill launched reports correct agent counts on the
+    /// first scan. Callers run this on a blocking thread immediately before a
+    /// Sessions read, which is also its refresh cadence.
+    ///
+    /// ponytail: Claude only. Codex rollouts carry no measured spawn/result
+    /// pairing, so Codex keeps its observed-event source until that evidence
+    /// exists (quill-cr3.4).
+    pub(crate) fn refresh_from_transcripts(&self) {
+        if !self
+            .inner
+            .lock()
+            .unwrap()
+            .accepts(IntegrationProvider::Claude.as_str())
+        {
+            return;
+        }
+        let Some(host) = local_observed_host() else {
+            return;
+        };
+        let observed_at = Utc::now();
+        let sessions = self.scanner.lock().unwrap().scan(observed_at);
+        let mut reconciler = self.inner.lock().unwrap();
+        for session in sessions {
+            reconciler.apply(transcript_snapshot(session, host, observed_at));
+        }
     }
 
     #[cfg(test)]
@@ -3427,6 +3523,53 @@ mod observed_subagent_tests {
         assert!(reconciler.apply(newer));
         drop(reconciler);
         assert_eq!(state.live_count("codex", "host", "live-root"), Some(1));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Transcript Source Precedence]]
+    #[test]
+    fn transcript_snapshots_outrank_later_hook_snapshots() {
+        let state = ObservedSubagentState::default();
+        let now = Utc::now();
+        let session = crate::transcript_scan::TranscriptSession {
+            provider: IntegrationProvider::Claude,
+            session_id: "root".to_owned(),
+            cwd: Some("/work/project".to_owned()),
+            started_at: now - chrono::TimeDelta::minutes(1),
+            last_activity: now,
+            agents: vec![
+                crate::transcript_scan::TranscriptAgent {
+                    agent_id: "agent-a".to_owned(),
+                    agent_type: Some("general-purpose".to_owned()),
+                    spawn_depth: Some(1),
+                    open: true,
+                },
+                crate::transcript_scan::TranscriptAgent {
+                    agent_id: "agent-b".to_owned(),
+                    agent_type: None,
+                    spawn_depth: Some(2),
+                    open: false,
+                },
+            ],
+        };
+        assert!(
+            state
+                .inner
+                .lock()
+                .unwrap()
+                .apply(transcript_snapshot(session, "host", now))
+        );
+        assert_eq!(state.live_count("claude", "host", "root"), Some(1));
+
+        // A hook stream that never saw the pre-launch spawns would report a
+        // fresh, emptier session; transcripts already proved otherwise.
+        assert!(!state.observe(&root_start(
+            IntegrationProvider::Claude,
+            "host",
+            "root",
+            "/work/project",
+            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(1));
     }
 
     #[test]

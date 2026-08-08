@@ -727,6 +727,24 @@ fn collect_codex_jsonl_candidates(
     collection
 }
 
+/// Enumerate every Claude transcript under `projects_dir`, flagging sub-agent
+/// files.
+///
+/// Live snapshot scanning shares this walker with retained inventory so the
+/// project tree is only ever traversed one way, and both see the same flat
+/// parents plus the whole `subagents/` subtree.
+pub(crate) fn discover_claude_transcripts_in(projects_dir: &Path) -> Vec<(PathBuf, bool)> {
+    if !projects_dir.exists() {
+        return Vec::new();
+    }
+    let mut diagnostic = None;
+    collect_claude_jsonl_candidates(projects_dir, IntegrationProvider::Claude, &mut diagnostic)
+        .candidates
+        .into_iter()
+        .map(|candidate| (candidate.path, candidate.is_subagent))
+        .collect()
+}
+
 fn read_directory_entries(
     directory: &Path,
     provider: IntegrationProvider,
@@ -2167,9 +2185,9 @@ struct DiscoveredSessionFile {
     /// True when this file lives under `<session>/subagents/agent-*.jsonl`.
     /// Hints the extractor to expect every record to carry isSidechain=true
     /// and lets the indexer treat sub-agent rows as part of the parent
-    /// session_id while still tagging them for tree roll-ups. Currently
-    /// informational — the per-record `isSidechain` field drives DB writes.
-    #[allow(dead_code)]
+    /// session_id while still tagging them for tree roll-ups. The per-record
+    /// `isSidechain` field drives DB writes; live transcript scanning uses this
+    /// flag to tell a root transcript from an agent one.
     is_subagent: bool,
 }
 

@@ -132,9 +132,23 @@ Hook evidence has two consumers: durable SQLite audit rows feed the Hooks breakd
 4. The handler fast-acks `202 Accepted` and writes [[backend#Backend#Database#Schema#Hook Invocations]] on a blocking worker through [[src-tauri/src/storage.rs#Storage#store_hook_observation]]. SQLite remains audit-only: retention or old rows never reconstruct the process-local count, and audit failure does not roll it back.
 5. [[src/hooks/useBreakdownData.ts#useBreakdownData]] declares `hooks-observed-updated` for Sessions and Hooks. Mounted keys join the shared five-second fan-out. Sessions IPC merges exact retained rows, advances their activity from valid current-process evidence, and synthesizes range-scoped active roots before their first token snapshot without scanning audit history.
 
+The hook path never inherits the transcript rank of the state it builds on, so for any session [[data-flow#Data Flow#Transcript-Derived Session Snapshots|the scanner]] already covers, the reconciler refuses the observed-event view as strictly weaker.
+
 Disabling activity tracking removes both managed observer paths and clears every snapshot. Provider disable clears only that provider. Activity and provider mutations emit `hooks-observed-updated` after the clear so mounted Sessions caches refresh immediately. Re-enable stays unknown until a newer qualifying root start; Quill restart also returns unknown. Snapshots past the 15-minute staleness cutoff are removed rather than kept as distrusted state, so reads fail closed to null and memory stays bounded by sessions still producing evidence.
 
 Codex config changes flow through parsed TOML: install snapshots the active custom or default Codex home, records prior feature and MCP environment values, replaces only Quill commands, then reconciles positional trust keys against pre/post `hooks/list` metadata. Verification reparses the file, rejects retired Quill shell-hook commands omitted from `hooks/list`, and checks exact enabled/trusted handlers; startup repair then migrates stale registrations. Uninstall targets the recorded home and restores the captured user values.
+
+## Transcript-Derived Session Snapshots
+
+[[src-tauri/src/transcript_scan.rs#TranscriptScanner]] derives live Claude session and agent state from transcripts on disk, so a session that started before Quill launched reports correct agent counts on the first scan rather than staying unknown.
+
+Each pass runs two stages. Stage one calls [[src-tauri/src/sessions.rs#discover_claude_transcripts_in]] — the same walker retained inventory uses, so the project tree is never traversed a second way — stats every enumerated file, groups them by root session, and keeps only sessions whose newest byte landed inside the 15-minute idle window. Stage two parses those sessions, and because transcripts are append-only it holds a byte offset per file and reads only the tail; a trailing line without its newline is a record still being written and is left for the next pass.
+
+Open-agent rules apply in precedence order. A workflow-spawned agent under `subagents/workflows/wf_*/` is open until its `journal.jsonl` records a `result` for that `agentId`; the journal's ids are exactly the `agent-<id>.jsonl` filenames. Any other agent is open until the `toolUseId` in its `.meta.json` has a matching `tool_result` anywhere in the session tree — every transcript in the tree is read because a depth≥2 spawn's result lands in the parent agent's transcript, not the root. An unresolved spawn whose own transcript has been silent past the idle window is the crash backstop: abandoned, not slow. Terminal `stop_reason` is never a closure signal (only 53% of finished agent transcripts end on `assistant`/`end_turn`), and a tight mtime cutoff is never the primary one (inter-record gaps reach p99.9 ≈ 309s).
+
+[[src-tauri/src/server.rs#ObservedSubagentState#refresh_from_transcripts]] runs the pass on the blocking thread `get_session_breakdown` already owns, immediately before the merge, so live state costs nothing while nobody is reading Sessions. Stage one is the budget: 50ms of directory walk plus 10ms of stat over 38 projects / 3640 files, with steady-state parsing near zero, so passes are throttled to one per three seconds and a burst of widget reads shares a single walk. Snapshots record no session end — a finished session simply stops producing bytes and ages out through the staleness cutoff.
+
+Claude only. Codex rollouts carry no measured spawn/result pairing, so Codex keeps its observed-event source until that evidence exists.
 
 ## Model Observation Reconciliation
 

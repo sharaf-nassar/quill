@@ -43,6 +43,7 @@ pub(crate) mod sessions;
 mod storage;
 mod transcript_analytics;
 mod transcript_identity;
+mod transcript_scan;
 mod tray_keepalive;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -3506,6 +3507,10 @@ async fn get_session_breakdown(
     let observed_subagents = Arc::clone(&observed_subagents);
     run_blocking(move || {
         let rows = storage.get_session_breakdown(&range, hostname.as_deref(), provider, limit)?;
+        // Transcripts are scanned on the read path so live state costs nothing
+        // while nobody is looking at Sessions, and so a session that predates
+        // this process is already correct the first time it is read.
+        observed_subagents.refresh_from_transcripts();
         observed_subagents.merge(
             rows,
             &range_from,
