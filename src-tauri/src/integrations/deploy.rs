@@ -24,6 +24,18 @@ const BACKUP_VERSION: u32 = 1;
 const DEPLOY_STAMP_FILE: &str = ".quill-deploy-stamp";
 const DEPLOY_STAMP_VERSION: u32 = 1;
 
+/// Leftovers from the retired per-target backup format. Upgraded installs can
+/// carry hundreds of megabytes of them (`.mcp.quill-backup` is a full copy of
+/// the Python MCP venv), and nothing reads them. Matched by exact name so the
+/// live `BACKUP_DIR` open-transaction signal can never be swept.
+const RETIRED_LEFTOVERS: [&str; 5] = [
+    ".mcp.quill-backup",
+    ".scripts.quill-backup",
+    ".templates.quill-backup",
+    ".quill-provider-snapshots",
+    ".quill-deploy-transaction",
+];
+
 const REQUIRED_MCP_FILES: [&str; 6] = [
     "server.py",
     "dependencies.py",
@@ -217,7 +229,8 @@ impl FileSnapshots {
 
 /// Recover a prior interrupted transaction before opening a new one: restore
 /// everything recorded in a leftover backup directory, then sweep stale
-/// staging directories left behind by crashes.
+/// staging directories left behind by crashes and prune retired-format
+/// leftovers.
 pub(crate) fn recover_staged_batch(targets: &[PathBuf]) -> Result<(), String> {
     let parent = batch_parent(targets)?;
     let backup = parent.join(BACKUP_DIR);
@@ -228,7 +241,7 @@ pub(crate) fn recover_staged_batch(targets: &[PathBuf]) -> Result<(), String> {
         restore_backup(&backup)
             .map_err(|err| format!("Failed to recover interrupted deployment: {err}"))?;
     }
-    cleanup_stale_staging(&parent)
+    sweep_deployment_parent(&parent)
 }
 
 /// Move every staged tree into place, saving whatever each target held before
@@ -561,7 +574,10 @@ fn fail_with_restore(primary: String, backup: &Path) -> String {
     }
 }
 
-fn cleanup_stale_staging(parent: &Path) -> Result<(), String> {
+/// Sweep the deployment parent: remove staging directories left by crashes,
+/// and prune leftovers from the retired backup format. The prune is
+/// best-effort — reclaiming disk is never worth failing an install over.
+fn sweep_deployment_parent(parent: &Path) -> Result<(), String> {
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -574,11 +590,12 @@ fn cleanup_stale_staging(parent: &Path) -> Result<(), String> {
     };
     let mut errors = Vec::new();
     for entry in entries.flatten() {
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(STAGING_PREFIX)
-        {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if RETIRED_LEFTOVERS.contains(&name.as_str()) {
+            let _ = remove_path(&entry.path());
+            continue;
+        }
+        if !name.starts_with(STAGING_PREFIX) {
             continue;
         }
         if let Err(err) = remove_path(&entry.path()) {
@@ -951,6 +968,42 @@ mod tests {
 
         assert!(!staging.exists());
         assert_eq!(read_file(&target.join("live.txt")), "live");
+    }
+
+    #[test]
+    fn retired_format_leftovers_are_pruned_and_live_state_survives() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().to_path_buf();
+        let target = parent.join("scripts");
+        write_file(&target.join("live.txt"), b"live");
+        for name in RETIRED_LEFTOVERS {
+            write_file(&parent.join(name).join("junk"), b"junk");
+        }
+        let stamp = parent.join(DEPLOY_STAMP_FILE);
+        write_file(&stamp, b"stamp");
+        let state = parent.join("integration-state.json");
+        write_file(&state, b"{}");
+
+        recover_staged_batch(std::slice::from_ref(&target)).unwrap();
+
+        for name in RETIRED_LEFTOVERS {
+            assert!(
+                !parent.join(name).exists(),
+                "retired leftover must be pruned: {name}"
+            );
+        }
+        assert_eq!(read_file(&stamp), "stamp");
+        assert_eq!(read_file(&state), "{}");
+        assert_eq!(read_file(&target.join("live.txt")), "live");
+
+        // The sweep is idempotent and never touches an open transaction: the
+        // backup directory is the signal recovery still needs to restore from.
+        let backup = parent.join(BACKUP_DIR);
+        write_file(&backup.join(BACKUP_MANIFEST), b"{}");
+        sweep_deployment_parent(&parent).unwrap();
+        assert!(backup.exists(), "open transaction backup must survive");
+        assert_eq!(read_file(&stamp), "stamp");
+        assert_eq!(read_file(&state), "{}");
     }
 
     #[test]
