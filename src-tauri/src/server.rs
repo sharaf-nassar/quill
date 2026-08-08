@@ -43,11 +43,9 @@ const MAX_CWD_LEN: usize = 4096;
 const MAX_SESSION_ID_LEN: usize = 128;
 const MAX_TOKEN_VALUE: i64 = 100_000_000;
 const MAX_TOOL_DATA_LEN: usize = 2048;
-const MAX_OBSERVED_ROOTS: usize = 1024;
-const MAX_OBSERVED_AGENTS_PER_ROOT: usize = 256;
 // Five default three-minute usage polls tolerate transient hook loss without
 // letting a crashed CLI leave current-process evidence trusted indefinitely.
-const OBSERVED_ACTIVE_TTL: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
+const SNAPSHOT_STALE_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 const MAX_OBS_REQUESTS: usize = 500;
 const MAX_CONTEXT_SAVINGS_REQUESTS: usize = 500;
@@ -67,79 +65,127 @@ const SESSION_NOTIFY_DEBOUNCE_MS: u64 = 250;
 const RETAINED_VALIDATE_RETRY_CAP: u32 = 5;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ObservedRootKey {
+struct SessionKey {
     provider: String,
-    hostname: String,
+    host: String,
     session_id: String,
 }
 
+/// One agent inside a [`SessionSnapshot`].
+///
+/// `open` is the agent's lifecycle state as of `at`, the observation time of
+/// the transition that produced it. Carrying that time lets a source re-emit
+/// the same agent in any order without inventing a newer state.
 #[derive(Clone, Debug)]
-struct ObservedAgent {
-    at: DateTime<Utc>,
-    open: bool,
-    model_id: Option<String>,
+struct SnapshotAgent {
+    agent_id: String,
+    /// Parentage and spawn depth are transcript-derived. The hook source
+    /// observes neither, so it leaves both gaps explicit.
+    #[allow(dead_code)]
+    parent_agent_id: Option<String>,
+    #[allow(dead_code)]
+    spawn_depth: Option<u32>,
     agent_type: Option<String>,
+    model: Option<String>,
+    open: bool,
+    at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Default)]
-enum ObservedCoverage {
-    #[default]
-    Unknown,
-    Active(DateTime<Utc>),
-    Ended(DateTime<Utc>),
-    Invalid(Option<DateTime<Utc>>),
-}
-
-#[derive(Default)]
-struct ObservedRoot {
-    coverage: ObservedCoverage,
-    agents: HashMap<String, ObservedAgent>,
-    watermark: Option<DateTime<Utc>>,
+/// Complete session state as one source last observed it.
+///
+/// Snapshots are idempotent and order-independent: a source re-emits the whole
+/// session rather than a delta, so a dropped or reordered observation
+/// self-corrects on the next pass instead of poisoning a folded state.
+#[derive(Clone, Debug)]
+struct SessionSnapshot {
+    key: SessionKey,
     cwd: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
     last_activity: Option<DateTime<Utc>>,
+    /// Wall-clock instant this snapshot was derived; the reconciler's
+    /// last-write-wins ordering key.
+    observed_at: DateTime<Utc>,
+    agents: Vec<SnapshotAgent>,
 }
 
-impl ObservedRoot {
-    fn new(barrier: Option<DateTime<Utc>>) -> Self {
+impl SessionSnapshot {
+    fn new(key: SessionKey) -> Self {
         Self {
-            coverage: barrier.map_or(ObservedCoverage::Unknown, |at| {
-                ObservedCoverage::Invalid(Some(at))
-            }),
-            agents: HashMap::new(),
-            watermark: barrier,
+            key,
             cwd: None,
+            started_at: None,
+            ended_at: None,
             last_activity: None,
+            observed_at: Utc::now(),
+            agents: Vec::new(),
         }
     }
 
-    fn advance_watermark(&mut self, at: DateTime<Utc>) {
-        if self.watermark.as_ref().is_none_or(|current| at > *current) {
-            self.watermark = Some(at);
-        }
+    /// The session's extent is unknown until a root start is observed, so the
+    /// live count stays null rather than claiming zero open agents.
+    fn count(&self) -> Option<u32> {
+        self.started_at
+            .map(|_| self.agents.iter().filter(|agent| agent.open).count() as u32)
     }
 
-    fn invalidate(&mut self, at: Option<DateTime<Utc>>) -> bool {
-        if let Some(at) = at {
-            self.advance_watermark(at);
+    fn model_groups(&self) -> Option<Vec<ObservedSubagentModelGroup>> {
+        self.count().map(|_| {
+            aggregate_observed_models(
+                self.agents
+                    .iter()
+                    .filter(|agent| agent.open)
+                    .map(|agent| (agent.model.clone(), agent.agent_type.clone())),
+            )
+        })
+    }
+
+    /// Age from the newest evidence the snapshot carries, falling back to when
+    /// it was observed while no activity time exists yet.
+    fn is_stale(&self, now: DateTime<Utc>) -> bool {
+        now.signed_duration_since(self.last_activity.unwrap_or(self.observed_at))
+            > SNAPSHOT_STALE_AFTER
+    }
+
+    fn touch(&mut self, at: DateTime<Utc>) -> bool {
+        let Some(started_at) = self.started_at else {
+            return false;
+        };
+        if at < started_at || self.last_activity.is_some_and(|last| at <= last) {
+            return false;
         }
-        self.agents.clear();
-        self.cwd = None;
-        self.last_activity = None;
-        self.coverage = ObservedCoverage::Invalid(self.watermark);
+        self.last_activity = Some(at);
         true
     }
 
-    fn preserve_compaction(&mut self, at: DateTime<Utc>, cwd: Option<String>) -> bool {
-        self.advance_watermark(at);
-        if matches!(&self.coverage, ObservedCoverage::Invalid(_)) {
-            self.coverage = ObservedCoverage::Invalid(self.watermark);
-        }
-        if !matches!(&self.coverage, ObservedCoverage::Active(epoch) if at >= *epoch) {
+    /// A root start replaces the session. Agents observed at or before it
+    /// belong to the previous epoch; strictly newer agent evidence is
+    /// out-of-order delivery for the epoch being opened, so it survives.
+    fn start_epoch(&mut self, at: DateTime<Utc>, cwd: Option<String>) -> bool {
+        if self.started_at.is_some_and(|started_at| at <= started_at) {
             return false;
         }
+        self.agents.retain(|agent| agent.at > at);
+        self.started_at = Some(at);
+        self.ended_at = None;
+        self.cwd = cwd;
+        self.last_activity = Some(
+            self.agents
+                .iter()
+                .map(|agent| agent.at)
+                .fold(at, DateTime::max),
+        );
+        true
+    }
 
+    /// Compaction continues the current epoch and never opens one. Only root
+    /// cwd reaches here; subagent cwd is filtered by the caller.
+    fn preserve_compaction(&mut self, at: DateTime<Utc>, cwd: Option<String>) -> bool {
+        if self.started_at.is_none_or(|started_at| at < started_at) {
+            return false;
+        }
         let can_update_cwd = self.last_activity.is_none_or(|last| at >= last);
-        let mut changed = self.observe_activity(at);
+        let mut changed = self.touch(at);
         if can_update_cwd && cwd.is_some() && self.cwd != cwd {
             self.cwd = cwd;
             changed = true;
@@ -147,74 +193,17 @@ impl ObservedRoot {
         changed
     }
 
-    fn start_epoch(&mut self, at: DateTime<Utc>, cwd: Option<String>) -> bool {
-        match &self.coverage {
-            ObservedCoverage::Invalid(Some(blocked)) if at <= *blocked => return false,
-            ObservedCoverage::Active(current) | ObservedCoverage::Ended(current) => {
-                if at < *current {
-                    return false;
-                }
-                if at == *current {
-                    return self.invalidate(Some(at));
-                }
-            }
-            ObservedCoverage::Unknown | ObservedCoverage::Invalid(_) => {}
-        }
-
-        if self.agents.values().any(|agent| agent.at == at) {
-            return self.invalidate(Some(at));
-        }
-        self.agents.retain(|_, agent| agent.at > at);
-        self.advance_watermark(at);
-        self.coverage = ObservedCoverage::Active(at);
-        self.cwd = cwd;
-        self.last_activity = Some(
-            self.agents
-                .values()
-                .map(|agent| agent.at)
-                .max()
-                .map_or(at, |agent_at| agent_at.max(at)),
-        );
-        true
-    }
-
+    /// A session end closes every agent open as of `at`; strictly newer agent
+    /// evidence survives as the next epoch's.
     fn end_epoch(&mut self, at: DateTime<Utc>) -> bool {
-        match &self.coverage {
-            ObservedCoverage::Invalid(_) => {
-                self.advance_watermark(at);
-                self.coverage = ObservedCoverage::Invalid(self.watermark);
-                return false;
-            }
-            ObservedCoverage::Active(current) | ObservedCoverage::Ended(current) => {
-                if at < *current {
-                    return false;
-                }
-                if at == *current {
-                    return self.invalidate(Some(at));
-                }
-            }
-            ObservedCoverage::Unknown => {}
+        if self.started_at.is_none_or(|started_at| at < started_at)
+            || self.ended_at.is_some_and(|ended_at| at <= ended_at)
+        {
+            return false;
         }
-
-        if self.agents.values().any(|agent| agent.at >= at) {
-            return self.invalidate(Some(at));
-        }
-        self.agents.clear();
-        self.advance_watermark(at);
-        self.coverage = ObservedCoverage::Ended(at);
+        self.agents.retain(|agent| agent.at > at);
+        self.ended_at = Some(at);
         self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
-        true
-    }
-
-    fn observe_activity(&mut self, at: DateTime<Utc>) -> bool {
-        let ObservedCoverage::Active(epoch) = &self.coverage else {
-            return false;
-        };
-        if at < *epoch || self.last_activity.as_ref().is_some_and(|last| at <= *last) {
-            return false;
-        }
-        self.advance_watermark(at);
-        self.last_activity = Some(at);
         true
     }
 
@@ -223,111 +212,38 @@ impl ObservedRoot {
         agent_id: &str,
         at: DateTime<Utc>,
         open: bool,
-        model_id: Option<String>,
+        model: Option<String>,
         agent_type: Option<String>,
     ) -> bool {
-        match &self.coverage {
-            ObservedCoverage::Invalid(_) => {
-                self.advance_watermark(at);
-                self.coverage = ObservedCoverage::Invalid(self.watermark);
-                return false;
-            }
-            ObservedCoverage::Active(epoch) => {
-                if !open
-                    && let Some(started_at) = self
-                        .agents
-                        .get(agent_id)
-                        .filter(|current| current.open && at < current.at)
-                        .map(|current| current.at)
-                {
-                    log::debug!(
-                        "invalidating observed subagent coverage: backdated SubagentStop for \
-                         {agent_id} ({at} < {started_at})"
-                    );
-                    return self.invalidate(Some(at));
-                }
-                if at < *epoch {
-                    return false;
-                }
-                if at == *epoch {
-                    return self.invalidate(Some(at));
-                }
-            }
-            ObservedCoverage::Ended(end) => {
-                if at < *end {
-                    return false;
-                }
-                return self.invalidate(Some(at));
-            }
-            ObservedCoverage::Unknown => {}
-        }
-
-        self.advance_watermark(at);
-        if let Some(current) = self.agents.get_mut(agent_id) {
-            if at > current.at || (at == current.at && !open && current.open) {
-                *current = ObservedAgent {
-                    at,
-                    open,
-                    model_id,
-                    agent_type,
-                };
-                if matches!(&self.coverage, ObservedCoverage::Active(_)) {
-                    self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
-                }
-                return true;
-            }
-            return false;
-        }
-
-        // ponytail: fixed cap; replace with measured eviction policy only if
-        // real workloads saturate it without a newer root epoch.
-        if self.agents.len() >= MAX_OBSERVED_AGENTS_PER_ROOT {
-            return self.invalidate(Some(at));
-        }
-        self.agents.insert(
-            agent_id.to_owned(),
-            ObservedAgent {
-                at,
-                open,
-                model_id,
-                agent_type,
-            },
-        );
-        if matches!(&self.coverage, ObservedCoverage::Active(_)) {
-            self.last_activity = Some(self.last_activity.map_or(at, |last| last.max(at)));
-        }
-        true
-    }
-
-    fn invalidate_if_stale(&mut self, now: DateTime<Utc>) {
-        if matches!(&self.coverage, ObservedCoverage::Active(_))
-            && self
-                .last_activity
-                .is_none_or(|last| now.signed_duration_since(last) > OBSERVED_ACTIVE_TTL)
+        let observed = SnapshotAgent {
+            agent_id: agent_id.to_owned(),
+            parent_agent_id: None,
+            spawn_depth: None,
+            agent_type,
+            model,
+            open,
+            at,
+        };
+        match self
+            .agents
+            .iter()
+            .position(|current| current.agent_id == agent_id)
         {
-            self.invalidate(Some(now));
-        }
-    }
-
-    fn count(&self) -> Option<u32> {
-        match &self.coverage {
-            ObservedCoverage::Active(_) => {
-                Some(self.agents.values().filter(|agent| agent.open).count() as u32)
+            Some(index) => {
+                let current = &self.agents[index];
+                // Older evidence never reopens a closed agent, and a terminal
+                // state wins a timestamp tie.
+                if at < current.at || (at == current.at && (open || !current.open)) {
+                    return false;
+                }
+                self.agents[index] = observed;
             }
-            ObservedCoverage::Ended(_) => Some(0),
-            ObservedCoverage::Unknown | ObservedCoverage::Invalid(_) => None,
+            // A stop for an agent this snapshot never saw closes nothing.
+            None if !open => return false,
+            None => self.agents.push(observed),
         }
-    }
-
-    fn model_groups(&self) -> Option<Vec<ObservedSubagentModelGroup>> {
-        self.count().map(|_| {
-            aggregate_observed_models(
-                self.agents
-                    .values()
-                    .filter(|agent| agent.open)
-                    .map(|agent| (agent.model_id.clone(), agent.agent_type.clone())),
-            )
-        })
+        self.touch(at);
+        true
     }
 }
 
@@ -372,28 +288,61 @@ fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
         .then(|| cwd.to_owned())
 }
 
-struct ObservedSubagentRegistry {
-    roots: HashMap<ObservedRootKey, ObservedRoot>,
-    provider_barriers: HashMap<String, DateTime<Utc>>,
+/// Reconciles per-source session snapshots: last-write-wins per session key by
+/// observation time, plus a staleness cutoff.
+struct SnapshotReconciler {
+    sessions: HashMap<SessionKey, SessionSnapshot>,
     activity_tracking_enabled: bool,
     disabled_providers: HashSet<String>,
 }
 
-impl Default for ObservedSubagentRegistry {
+impl Default for SnapshotReconciler {
     fn default() -> Self {
         Self {
-            roots: HashMap::new(),
-            provider_barriers: HashMap::new(),
+            sessions: HashMap::new(),
             activity_tracking_enabled: true,
             disabled_providers: HashSet::new(),
         }
     }
 }
 
-/// Bounded current-process fold of root-linked subagent lifecycle evidence.
+impl SnapshotReconciler {
+    fn accepts(&self, provider: &str) -> bool {
+        self.activity_tracking_enabled && !self.disabled_providers.contains(provider)
+    }
+
+    /// Last-write-wins by observation time: a snapshot older than the one
+    /// already held for that session is discarded, so out-of-order or
+    /// duplicated deliveries converge instead of accumulating.
+    fn apply(&mut self, snapshot: SessionSnapshot) -> bool {
+        if !self.accepts(&snapshot.key.provider)
+            || self
+                .sessions
+                .get(&snapshot.key)
+                .is_some_and(|current| snapshot.observed_at < current.observed_at)
+        {
+            return false;
+        }
+        self.sessions.insert(snapshot.key.clone(), snapshot);
+        true
+    }
+
+    /// Snapshots past the staleness cutoff are removed rather than retained as
+    /// a distrusted husk: reads fail closed to null and memory stays bounded by
+    /// sessions that are still producing evidence.
+    fn prune_stale(&mut self, now: DateTime<Utc>) {
+        self.sessions.retain(|_, snapshot| !snapshot.is_stale(now));
+    }
+
+    fn forget(&mut self, key: &SessionKey) -> bool {
+        self.sessions.remove(key).is_some()
+    }
+}
+
+/// Reconciled snapshot view of live session and agent state.
 #[derive(Default)]
 pub(crate) struct ObservedSubagentState {
-    inner: Mutex<ObservedSubagentRegistry>,
+    inner: Mutex<SnapshotReconciler>,
 }
 
 fn normalize_observed_hostname(hostname: &str) -> Option<String> {
@@ -405,7 +354,7 @@ fn normalize_observed_hostname(hostname: &str) -> Option<String> {
     (!short.is_empty()).then(|| short.to_ascii_lowercase())
 }
 
-fn observed_root_key(observation: &ObservedHookObservation) -> Option<ObservedRootKey> {
+fn observed_session_key(observation: &ObservedHookObservation) -> Option<SessionKey> {
     if !matches!(
         observation.provider,
         IntegrationProvider::Claude | IntegrationProvider::Codex
@@ -415,26 +364,27 @@ fn observed_root_key(observation: &ObservedHookObservation) -> Option<ObservedRo
     {
         return None;
     }
-    Some(ObservedRootKey {
+    Some(SessionKey {
         provider: observation.provider.as_str().to_owned(),
-        hostname: normalize_observed_hostname(observation.hostname.as_deref()?)?,
+        host: normalize_observed_hostname(observation.hostname.as_deref()?)?,
         session_id: observation.session_id.clone(),
     })
 }
 
 impl ObservedSubagentState {
-    fn invalidate_root(&self, observation: &ObservedHookObservation) -> bool {
-        let Some(key) = observed_root_key(observation) else {
+    /// An identifiable observation rejected before reconciliation means the
+    /// session's state can no longer be trusted, so the snapshot is dropped and
+    /// reads fail closed to null.
+    pub(crate) fn drop_session(&self, observation: &ObservedHookObservation) -> bool {
+        let Some(key) = observed_session_key(observation) else {
             return false;
         };
-        self.inner
-            .lock()
-            .unwrap()
-            .roots
-            .get_mut(&key)
-            .is_some_and(|root| root.invalidate(None))
+        self.inner.lock().unwrap().forget(&key)
     }
 
+    /// Derives the session's next snapshot from the hook observation and hands
+    /// it to the reconciler. Sources emit whole sessions; the reconciler owns
+    /// ordering and staleness.
     pub(crate) fn observe(&self, observation: &ObservedHookObservation) -> bool {
         let lifecycle = matches!(
             observation.hook_event.as_str(),
@@ -445,54 +395,35 @@ impl ObservedSubagentState {
         {
             return false;
         }
-        let Some(key) = observed_root_key(observation) else {
+        let Some(key) = observed_session_key(observation) else {
             return false;
         };
 
-        let mut registry = self.inner.lock().unwrap();
-        let accepts_observation = registry.activity_tracking_enabled
-            && !registry.disabled_providers.contains(&key.provider);
-        if !lifecycle {
-            if !accepts_observation {
-                return false;
-            }
-            let Ok(at) = DateTime::parse_from_rfc3339(&observation.ts) else {
-                return false;
-            };
-            return registry
-                .roots
-                .get_mut(&key)
-                .is_some_and(|root| root.observe_activity(at.with_timezone(&Utc)));
-        }
-
-        let is_codex = key.provider == "codex";
-        let barrier = registry.provider_barriers.get(&key.provider).cloned();
-        if !registry.roots.contains_key(&key) && registry.roots.len() >= MAX_OBSERVED_ROOTS {
+        let mut reconciler = self.inner.lock().unwrap();
+        if !reconciler.accepts(&key.provider) {
             return false;
         }
-        let root = registry
-            .roots
-            .entry(key)
-            .or_insert_with(|| ObservedRoot::new(barrier));
         let at = match DateTime::parse_from_rfc3339(&observation.ts) {
             Ok(at) => at.with_timezone(&Utc),
-            Err(_) => return root.invalidate(None),
+            Err(_) => return lifecycle && reconciler.forget(&key),
         };
-        if !accepts_observation {
-            return root.invalidate(Some(at));
-        }
 
-        match observation.hook_event.as_str() {
+        let mut snapshot = reconciler
+            .sessions
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| SessionSnapshot::new(key.clone()));
+        let changed = match observation.hook_event.as_str() {
             "SessionStart" => match observation.source.as_deref() {
                 Some("startup" | "resume" | "clear" | "fork") => {
-                    root.start_epoch(at, observed_root_cwd(observation.cwd.as_deref()))
+                    snapshot.start_epoch(at, observed_root_cwd(observation.cwd.as_deref()))
                 }
                 Some("compact") => {
-                    root.preserve_compaction(at, observed_root_cwd(observation.cwd.as_deref()))
+                    snapshot.preserve_compaction(at, observed_root_cwd(observation.cwd.as_deref()))
                 }
-                _ => root.invalidate(Some(at)),
+                _ => return reconciler.forget(&key),
             },
-            "SessionEnd" => root.end_epoch(at),
+            "SessionEnd" => snapshot.end_epoch(at),
             "SubagentStart" | "SubagentStop" => {
                 let Some(agent_id) = observation.agent_id.as_deref().filter(|agent_id| {
                     !agent_id.is_empty()
@@ -502,36 +433,44 @@ impl ObservedSubagentState {
                 }) else {
                     return false;
                 };
-                let model_id = is_codex
+                let is_codex = key.provider == "codex";
+                let model = is_codex
                     .then_some(observation.model.as_deref())
                     .flatten()
                     .and_then(|model| crate::model_usage::validate_model_id(model).ok());
                 let agent_type = (!is_codex)
                     .then(|| observed_agent_type(observation.agent_type.as_deref()))
                     .flatten();
-                root.observe_agent(
+                snapshot.observe_agent(
                     agent_id,
                     at,
                     observation.hook_event == "SubagentStart",
-                    model_id,
+                    model,
                     agent_type,
                 )
             }
-            _ => false,
+            _ => snapshot.touch(at),
+        };
+        if !changed {
+            return false;
         }
+        snapshot.observed_at = Utc::now();
+        reconciler.apply(snapshot)
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot(&self, provider: &str, hostname: &str, session_id: &str) -> Option<u32> {
-        let hostname = normalize_observed_hostname(hostname)?;
-        let mut registry = self.inner.lock().unwrap();
-        let root = registry.roots.get_mut(&ObservedRootKey {
-            provider: provider.to_owned(),
-            hostname,
-            session_id: session_id.to_owned(),
-        })?;
-        root.invalidate_if_stale(Utc::now());
-        root.count()
+    pub(crate) fn live_count(&self, provider: &str, host: &str, session_id: &str) -> Option<u32> {
+        let host = normalize_observed_hostname(host)?;
+        let mut reconciler = self.inner.lock().unwrap();
+        reconciler.prune_stale(Utc::now());
+        reconciler
+            .sessions
+            .get(&SessionKey {
+                provider: provider.to_owned(),
+                host,
+                session_id: session_id.to_owned(),
+            })
+            .and_then(SessionSnapshot::count)
     }
 
     pub(crate) fn merge(
@@ -545,30 +484,27 @@ impl ObservedSubagentState {
             &[ObservedAgentModelKey],
         ) -> Result<HashMap<ObservedAgentModelKey, String>, String>,
     ) -> Result<Vec<SessionBreakdown>, String> {
-        let mut registry = self.inner.lock().unwrap();
-        let now = Utc::now();
-        for root in registry.roots.values_mut() {
-            root.invalidate_if_stale(now);
-        }
+        let mut reconciler = self.inner.lock().unwrap();
+        reconciler.prune_stale(Utc::now());
         let mut seen = HashSet::new();
 
         for row in &mut rows {
             row.observed_only = false;
-            let Some(hostname) = normalize_observed_hostname(&row.hostname) else {
+            let Some(host) = normalize_observed_hostname(&row.hostname) else {
                 continue;
             };
-            let key = ObservedRootKey {
+            let key = SessionKey {
                 provider: row.provider.clone(),
-                hostname,
+                host,
                 session_id: row.session_id.clone(),
             };
             seen.insert(key.clone());
-            let Some(root) = registry.roots.get(&key) else {
+            let Some(snapshot) = reconciler.sessions.get(&key) else {
                 continue;
             };
-            row.observed_subagent_count = root.count();
-            row.observed_subagent_models = root.model_groups();
-            if let Some(last_activity) = root.last_activity {
+            row.observed_subagent_count = snapshot.count();
+            row.observed_subagent_models = snapshot.model_groups();
+            if let Some(last_activity) = snapshot.last_activity {
                 let stored = DateTime::parse_from_rfc3339(&row.last_active)
                     .ok()
                     .map(|at| at.with_timezone(&Utc));
@@ -585,20 +521,25 @@ impl ObservedSubagentState {
         let provider_filter = provider.map(IntegrationProvider::as_str);
 
         if let Some(from) = from.filter(|_| hostname.is_none() || hostname_filter.is_some()) {
-            for (key, root) in &registry.roots {
-                let ObservedCoverage::Active(started_at) = &root.coverage else {
+            for (key, snapshot) in &reconciler.sessions {
+                // A session already ended has nothing live to synthesize, and a
+                // session without a validated root cwd has no project to name.
+                if snapshot.ended_at.is_some() {
                     continue;
-                };
-                let (Some(cwd), Some(last_activity), Some(count)) =
-                    (root.cwd.as_ref(), root.last_activity, root.count())
-                else {
+                }
+                let (Some(started_at), Some(cwd), Some(last_activity), Some(count)) = (
+                    snapshot.started_at,
+                    snapshot.cwd.as_ref(),
+                    snapshot.last_activity,
+                    snapshot.count(),
+                ) else {
                     continue;
                 };
                 if seen.contains(key)
                     || provider_filter.is_some_and(|filter| key.provider != filter)
                     || hostname_filter
                         .as_ref()
-                        .is_some_and(|filter| key.hostname != *filter)
+                        .is_some_and(|filter| key.host != *filter)
                     || last_activity < from
                 {
                     continue;
@@ -606,14 +547,14 @@ impl ObservedSubagentState {
                 rows.push(SessionBreakdown {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
-                    hostname: key.hostname.clone(),
+                    hostname: key.host.clone(),
                     total_tokens: 0,
                     turn_count: 0,
                     first_seen: started_at.to_rfc3339(),
                     last_active: last_activity.to_rfc3339(),
                     project: Some(cwd.clone()),
                     observed_subagent_count: Some(count),
-                    observed_subagent_models: root.model_groups(),
+                    observed_subagent_models: snapshot.model_groups(),
                     observed_only: true,
                 });
             }
@@ -632,7 +573,7 @@ impl ObservedSubagentState {
                 .then_with(|| a.session_id.cmp(&b.session_id))
         });
         rows.truncate(limit.unwrap_or(10).clamp(1, 500) as usize);
-        let snapshots = rows
+        let open_agents = rows
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
@@ -641,21 +582,21 @@ impl ObservedSubagentState {
                 {
                     return None;
                 }
-                let hostname = normalize_observed_hostname(&row.hostname)?;
-                let key = ObservedRootKey {
+                let host = normalize_observed_hostname(&row.hostname)?;
+                let key = SessionKey {
                     provider: row.provider.clone(),
-                    hostname,
+                    host,
                     session_id: row.session_id.clone(),
                 };
-                let root = registry.roots.get(&key)?;
-                let agents = root
+                let snapshot = reconciler.sessions.get(&key)?;
+                let agents = snapshot
                     .agents
                     .iter()
-                    .filter(|(_, agent)| agent.open)
-                    .map(|(agent_id, agent)| {
+                    .filter(|agent| agent.open)
+                    .map(|agent| {
                         (
-                            agent_id.clone(),
-                            agent.model_id.clone(),
+                            agent.agent_id.clone(),
+                            agent.model.clone(),
                             agent.agent_type.clone(),
                         )
                     })
@@ -663,18 +604,18 @@ impl ObservedSubagentState {
                 Some((index, key, agents))
             })
             .collect::<Vec<_>>();
-        drop(registry);
+        drop(reconciler);
 
-        let targets = snapshots
+        let targets = open_agents
             .iter()
-            .flat_map(|(_, root, agents)| {
+            .flat_map(|(_, key, agents)| {
                 agents
                     .iter()
-                    .filter(|(_, model_id, _)| model_id.is_none())
+                    .filter(|(_, model, _)| model.is_none())
                     .map(|(agent_id, _, _)| {
                         (
-                            root.provider.clone(),
-                            root.session_id.clone(),
+                            key.provider.clone(),
+                            key.session_id.clone(),
                             agent_id.clone(),
                         )
                     })
@@ -684,18 +625,14 @@ impl ObservedSubagentState {
             return Ok(rows);
         }
         let evidence = resolve(&targets)?;
-        for (index, root, agents) in snapshots {
+        for (index, key, agents) in open_agents {
             rows[index].observed_subagent_models =
                 Some(aggregate_observed_models(agents.into_iter().map(
                     |(agent_id, hook_model, agent_type)| {
                         (
                             hook_model.or_else(|| {
                                 evidence
-                                    .get(&(
-                                        root.provider.clone(),
-                                        root.session_id.clone(),
-                                        agent_id,
-                                    ))
+                                    .get(&(key.provider.clone(), key.session_id.clone(), agent_id))
                                     .and_then(|model| {
                                         crate::model_usage::validate_model_id(model).ok()
                                     })
@@ -708,37 +645,25 @@ impl ObservedSubagentState {
         Ok(rows)
     }
 
+    /// Disabling or re-enabling tracking clears every snapshot: coverage stays
+    /// unknown until a newer qualifying root start rebuilds it.
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
-        let barrier = Utc::now();
-        let mut registry = self.inner.lock().unwrap();
-        registry.activity_tracking_enabled = enabled;
-        for provider in ["claude", "codex"] {
-            registry
-                .provider_barriers
-                .insert(provider.to_owned(), barrier);
-        }
-        for root in registry.roots.values_mut() {
-            root.invalidate(Some(barrier));
-        }
+        let mut reconciler = self.inner.lock().unwrap();
+        reconciler.activity_tracking_enabled = enabled;
+        reconciler.sessions.clear();
     }
 
     pub(crate) fn set_provider_enabled(&self, provider: IntegrationProvider, enabled: bool) {
         let provider = provider.as_str();
-        let barrier = Utc::now();
-        let mut registry = self.inner.lock().unwrap();
+        let mut reconciler = self.inner.lock().unwrap();
         if enabled {
-            registry.disabled_providers.remove(provider);
+            reconciler.disabled_providers.remove(provider);
         } else {
-            registry.disabled_providers.insert(provider.to_owned());
+            reconciler.disabled_providers.insert(provider.to_owned());
         }
-        registry
-            .provider_barriers
-            .insert(provider.to_owned(), barrier);
-        for (key, root) in &mut registry.roots {
-            if key.provider == provider {
-                root.invalidate(Some(barrier));
-            }
-        }
+        reconciler
+            .sessions
+            .retain(|key, _| key.provider != provider);
     }
 }
 
@@ -1605,7 +1530,7 @@ async fn post_hook_observed(
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
     let reject = |status, message: String| {
-        if state.observed_subagents.invalidate_root(&payload) {
+        if state.observed_subagents.drop_session(&payload) {
             let _ = state.app_handle.emit("hooks-observed-updated", ());
         }
         (status, message)
@@ -2844,7 +2769,7 @@ mod observed_subagent_tests {
 
         state
             .merge(Vec::new(), "2030-01-01T00:00:00Z", None, None, None, |_| {
-                assert_eq!(state.snapshot("claude", "host", "root"), Some(1));
+                assert_eq!(state.live_count("claude", "host", "root"), Some(1));
                 Ok(HashMap::new())
             })
             .expect("resolve after registry unlock");
@@ -3001,7 +2926,7 @@ mod observed_subagent_tests {
             let state = ObservedSubagentState::default();
             let root = format!("{}-root", provider.as_str());
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 None
             );
 
@@ -3015,7 +2940,7 @@ mod observed_subagent_tests {
                 T2,
             ));
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 None
             );
 
@@ -3029,7 +2954,7 @@ mod observed_subagent_tests {
                 T1,
             ));
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 Some(1)
             );
 
@@ -3045,7 +2970,7 @@ mod observed_subagent_tests {
                 ));
             }
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 Some(2)
             );
 
@@ -3068,7 +2993,7 @@ mod observed_subagent_tests {
                 T2,
             ));
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 Some(1)
             );
 
@@ -3091,7 +3016,7 @@ mod observed_subagent_tests {
                 T3,
             ));
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 Some(2)
             );
 
@@ -3105,7 +3030,7 @@ mod observed_subagent_tests {
                 T4,
             ));
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 Some(0)
             );
 
@@ -3118,9 +3043,11 @@ mod observed_subagent_tests {
                 Some("late-agent"),
                 T5,
             ));
+            // Agent evidence newer than the session end is the next epoch's,
+            // not a contradiction that has to void the whole session.
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
-                None
+                state.live_count(provider.as_str(), "workstation", &root),
+                Some(1)
             );
 
             state.observe(&hook(
@@ -3142,15 +3069,15 @@ mod observed_subagent_tests {
                 "2030-01-01T00:00:07Z",
             ));
             assert_eq!(
-                state.snapshot(provider.as_str(), "workstation", &root),
+                state.live_count(provider.as_str(), "workstation", &root),
                 Some(0)
             );
         }
     }
 
-    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Backdated Stop Invalidates Coverage]]
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Backdated Stop Is Ignored]]
     #[test]
-    fn backdated_stop_for_open_agent_invalidates_until_next_epoch() {
+    fn backdated_stop_for_open_agent_is_ignored() {
         let state = ObservedSubagentState::default();
         state.observe(&root_start(
             IntegrationProvider::Claude,
@@ -3169,7 +3096,9 @@ mod observed_subagent_tests {
             "2030-01-01T00:00:04Z",
         ));
 
-        assert!(state.observe(&hook(
+        // Older than the agent's own start, so it describes a state the
+        // snapshot already superseded and changes nothing.
+        assert!(!state.observe(&hook(
             IntegrationProvider::Claude,
             Some("host"),
             "root",
@@ -3178,7 +3107,7 @@ mod observed_subagent_tests {
             Some("agent"),
             "2030-01-01T00:00:01Z",
         )));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), Some(1));
 
         state.observe(&root_start(
             IntegrationProvider::Claude,
@@ -3187,7 +3116,7 @@ mod observed_subagent_tests {
             "/work/root",
             "2030-01-01T00:00:05Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Equal-Time Stop Wins]]
@@ -3213,7 +3142,7 @@ mod observed_subagent_tests {
             ));
         }
 
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Unknown Pre-Epoch Stop Is Ignored]]
@@ -3237,7 +3166,7 @@ mod observed_subagent_tests {
             Some("unknown"),
             "2030-01-01T00:00:01Z",
         )));
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Stale Start Does Not Reopen Agent]]
@@ -3279,7 +3208,7 @@ mod observed_subagent_tests {
             Some("agent"),
             "2030-01-01T00:00:02Z",
         )));
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
     }
 
     #[test]
@@ -3293,7 +3222,7 @@ mod observed_subagent_tests {
         .expect("deserialize legacy observation");
         let state = ObservedSubagentState::default();
         assert!(!state.observe(&observation));
-        assert_eq!(state.snapshot("codex", "host", "legacy-root"), None);
+        assert_eq!(state.live_count("codex", "host", "legacy-root"), None);
     }
 
     #[test]
@@ -3313,7 +3242,7 @@ mod observed_subagent_tests {
                 None,
                 "2030-01-01T00:00:01Z",
             ));
-            assert_eq!(state.snapshot("claude", "host-a", &root), Some(0));
+            assert_eq!(state.live_count("claude", "host-a", &root), Some(0));
         }
 
         for (provider, host, root, agents) in [
@@ -3343,7 +3272,7 @@ mod observed_subagent_tests {
                 ));
             }
             assert_eq!(
-                state.snapshot(provider.as_str(), host, root),
+                state.live_count(provider.as_str(), host, root),
                 Some(agents),
                 "provider/host/root collision"
             );
@@ -3351,7 +3280,7 @@ mod observed_subagent_tests {
     }
 
     #[test]
-    fn malformed_ordering_and_root_ties_fail_closed() {
+    fn malformed_evidence_fails_closed_and_ties_are_idempotent() {
         let state = ObservedSubagentState::default();
         let base = |event, source, agent, ts| {
             hook(
@@ -3372,7 +3301,7 @@ mod observed_subagent_tests {
             "2030-01-01T00:00:01Z",
         ));
         state.observe(&base("SessionEnd", None, None, "not-a-timestamp"));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), None);
 
         state.observe(&base(
             "SessionStart",
@@ -3380,7 +3309,7 @@ mod observed_subagent_tests {
             None,
             "2030-01-01T00:00:02Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
 
         state.observe(&base("SubagentStart", None, None, "2030-01-01T00:00:03Z"));
         state.observe(&hook(
@@ -3392,7 +3321,7 @@ mod observed_subagent_tests {
             None,
             "2030-01-01T00:00:03Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
 
         state.observe(&base(
             "SessionStart",
@@ -3400,20 +3329,22 @@ mod observed_subagent_tests {
             None,
             "2030-01-01T00:00:04Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), None);
+        // A re-delivered root start is the same observation, so replaying it
+        // leaves the snapshot exactly as it was.
         state.observe(&base(
             "SessionStart",
             Some("clear"),
             None,
             "2030-01-01T00:00:05Z",
         ));
-        state.observe(&base(
+        assert!(!state.observe(&base(
             "SessionStart",
             Some("clear"),
             None,
             "2030-01-01T00:00:05Z",
-        ));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        )));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
 
         state.observe(&base(
             "SessionStart",
@@ -3422,7 +3353,7 @@ mod observed_subagent_tests {
             "2030-01-01T00:00:06Z",
         ));
         state.observe(&base("SessionEnd", None, None, "2030-01-01T00:00:06Z"));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
 
         state.observe(&base(
             "SessionStart",
@@ -3436,77 +3367,66 @@ mod observed_subagent_tests {
             Some("agent"),
             "2030-01-01T00:00:07Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), Some(1));
     }
 
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Snapshot Reconciliation Bounds]]
     #[test]
-    fn bounded_registry_and_agent_overflow_fail_closed() {
+    fn stale_snapshots_expire_and_older_writes_lose() {
         let state = ObservedSubagentState::default();
-        for index in 0..MAX_OBSERVED_ROOTS {
-            state.observe(&hook(
-                IntegrationProvider::Codex,
-                Some("host"),
-                &format!("root-{index}"),
-                "SessionStart",
-                Some("startup"),
-                None,
-                "2030-01-01T00:00:01Z",
-            ));
-        }
-        state.observe(&hook(
+        let stale_at = (Utc::now() - SNAPSHOT_STALE_AFTER - chrono::TimeDelta::seconds(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        state.observe(&root_start(
             IntegrationProvider::Codex,
-            Some("host"),
-            "saturated-root",
-            "SessionStart",
-            Some("startup"),
-            None,
-            "2030-01-01T00:00:02Z",
+            "host",
+            "stale-root",
+            "/work/stale",
+            &stale_at,
         ));
-        assert_eq!(state.snapshot("codex", "host", "root-0"), Some(0));
-        assert_eq!(state.snapshot("codex", "host", "saturated-root"), None);
+        state.observe(&root_start(
+            IntegrationProvider::Codex,
+            "host",
+            "live-root",
+            "/work/live",
+            &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ));
+        assert_eq!(state.live_count("codex", "host", "stale-root"), None);
+        assert_eq!(state.live_count("codex", "host", "live-root"), Some(0));
 
-        let state = ObservedSubagentState::default();
-        state.observe(&hook(
-            IntegrationProvider::Codex,
-            Some("host"),
-            "root",
-            "SessionStart",
-            Some("startup"),
-            None,
-            "2030-01-01T00:00:01Z",
-        ));
-        for index in 0..=MAX_OBSERVED_AGENTS_PER_ROOT {
-            state.observe(&hook(
-                IntegrationProvider::Codex,
-                Some("host"),
-                "root",
-                "SubagentStart",
-                None,
-                Some(&format!("agent-{index}")),
-                "2030-01-01T00:00:02Z",
-            ));
-        }
-        assert_eq!(state.snapshot("codex", "host", "root"), None);
-        state.observe(&hook(
-            IntegrationProvider::Codex,
-            Some("host"),
-            "root",
-            "SessionStart",
-            Some("resume"),
-            None,
-            "2030-01-01T00:00:02Z",
-        ));
-        assert_eq!(state.snapshot("codex", "host", "root"), None);
-        state.observe(&hook(
-            IntegrationProvider::Codex,
-            Some("host"),
-            "root",
-            "SessionStart",
-            Some("resume"),
-            None,
-            "2030-01-01T00:00:03Z",
-        ));
-        assert_eq!(state.snapshot("codex", "host", "root"), Some(0));
+        let mut reconciler = state.inner.lock().unwrap();
+        let key = SessionKey {
+            provider: "codex".to_owned(),
+            host: "host".to_owned(),
+            session_id: "live-root".to_owned(),
+        };
+        let current = reconciler.sessions.get(&key).cloned().expect("live root");
+        let mut older = current.clone();
+        older.observed_at = current.observed_at - chrono::TimeDelta::seconds(1);
+        older.agents.push(SnapshotAgent {
+            agent_id: "ghost".to_owned(),
+            parent_agent_id: None,
+            spawn_depth: None,
+            agent_type: None,
+            model: None,
+            open: true,
+            at: current.observed_at,
+        });
+        assert!(!reconciler.apply(older));
+
+        let mut newer = current.clone();
+        newer.observed_at = current.observed_at + chrono::TimeDelta::seconds(1);
+        newer.agents.push(SnapshotAgent {
+            agent_id: "agent-a".to_owned(),
+            parent_agent_id: Some("live-root".to_owned()),
+            spawn_depth: Some(1),
+            agent_type: None,
+            model: None,
+            open: true,
+            at: current.observed_at,
+        });
+        assert!(reconciler.apply(newer));
+        drop(reconciler);
+        assert_eq!(state.live_count("codex", "host", "live-root"), Some(1));
     }
 
     #[test]
@@ -3525,8 +3445,8 @@ mod observed_subagent_tests {
         }
 
         state.set_provider_enabled(IntegrationProvider::Claude, false);
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
-        assert_eq!(state.snapshot("codex", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), None);
+        assert_eq!(state.live_count("codex", "host", "root"), Some(0));
         state.observe(&hook(
             IntegrationProvider::Claude,
             Some("host"),
@@ -3536,7 +3456,7 @@ mod observed_subagent_tests {
             None,
             "2090-01-01T00:00:01Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), None);
         state.set_provider_enabled(IntegrationProvider::Claude, true);
         state.observe(&hook(
             IntegrationProvider::Claude,
@@ -3547,11 +3467,11 @@ mod observed_subagent_tests {
             None,
             "2090-01-01T00:00:02Z",
         ));
-        assert_eq!(state.snapshot("claude", "host", "root"), Some(0));
+        assert_eq!(state.live_count("claude", "host", "root"), Some(0));
 
         state.set_activity_tracking_enabled(false);
-        assert_eq!(state.snapshot("claude", "host", "root"), None);
-        assert_eq!(state.snapshot("codex", "host", "root"), None);
+        assert_eq!(state.live_count("claude", "host", "root"), None);
+        assert_eq!(state.live_count("codex", "host", "root"), None);
         state.observe(&hook(
             IntegrationProvider::Codex,
             Some("host"),
@@ -3561,7 +3481,7 @@ mod observed_subagent_tests {
             None,
             "2090-01-01T00:00:03Z",
         ));
-        assert_eq!(state.snapshot("codex", "host", "root"), None);
+        assert_eq!(state.live_count("codex", "host", "root"), None);
         state.set_activity_tracking_enabled(true);
         state.observe(&hook(
             IntegrationProvider::Codex,
@@ -3572,6 +3492,6 @@ mod observed_subagent_tests {
             None,
             "2090-01-01T00:00:04Z",
         ));
-        assert_eq!(state.snapshot("codex", "host", "root"), Some(0));
+        assert_eq!(state.live_count("codex", "host", "root"), Some(0));
     }
 }

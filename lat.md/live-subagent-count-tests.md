@@ -8,11 +8,15 @@ These authorized tests protect observed lifecycle truth, provider delivery, null
 
 ## Lifecycle Fold And Coverage Boundaries
 
-The bounded process-local fold preserves null, zero, and positive states across ordering, identity, epoch, disable, and saturation boundaries for both providers.
+The snapshot fold preserves null, zero, and positive states across ordering, identity, epoch, and disable boundaries for both providers. A session with no observed start stays null; agent evidence newer than a session end carries into the next epoch.
 
-## Backdated Stop Invalidates Coverage
+## Backdated Stop Is Ignored
 
-A Stop older than a known open agent's Start invalidates live coverage, preventing retained overcounts until a newer SessionStart re-establishes the root epoch.
+A Stop older than a known open agent's Start describes state the snapshot already superseded, so it is dropped without disturbing the live count.
+
+## Snapshot Reconciliation Bounds
+
+The reconciler drops snapshots past the staleness cutoff and refuses a write older than the one it already holds for that session, so reads fail closed to null and memory stays bounded by sessions still producing evidence.
 
 ## Equal-Time Stop Wins
 

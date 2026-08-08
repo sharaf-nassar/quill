@@ -27458,7 +27458,7 @@ mod tests {
             .expect_err("audit persistence must fail");
         assert!(error.contains("forced hook audit failure"));
         assert_eq!(
-            state.snapshot("codex", "host", "failed-audit-root"),
+            state.live_count("codex", "host", "failed-audit-root"),
             Some(1)
         );
     }
