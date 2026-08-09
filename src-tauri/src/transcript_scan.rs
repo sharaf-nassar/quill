@@ -32,7 +32,11 @@ use crate::integrations::IntegrationProvider;
 /// merely quiet: measured inter-record gaps reach p99.9 ≈ 309s, an order of
 /// magnitude below it. It skips whole idle sessions in stage one and serves as
 /// the per-agent crash backstop for a spawn whose result never arrived.
-const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
+///
+/// The reconciler expires snapshots on the same cutoff. Two values would drift:
+/// a shorter one there would drop sessions this scanner still reports, and a
+/// longer one would retain husks of sessions it has already released.
+pub(crate) const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
 
 /// Minimum spacing between passes. Sessions reads arrive in bursts whenever
 /// several widgets invalidate at once, and stage one costs one directory walk
@@ -44,8 +48,6 @@ const AGENT_FILE_PREFIX: &str = "agent-";
 const WORKFLOW_DIR_PREFIX: &str = "wf_";
 const WORKFLOW_JOURNAL: &str = "journal.jsonl";
 
-const CODEX_ROLLOUT_PREFIX: &str = "rollout-";
-const CODEX_THREAD_ID_LEN: usize = 36;
 /// Guard against a malformed parent chain walking forever. Measured Codex spawn
 /// depth across 4487 spawned rollouts reaches 3 (4175 at 1, 297 at 2, 15 at 3).
 const MAX_CODEX_SPAWN_DEPTH: u32 = 16;
@@ -67,10 +69,13 @@ pub(crate) struct TranscriptSession {
 }
 
 /// One agent inside a [`TranscriptSession`].
+///
+/// The reconciler holds these directly, so it carries the derives a snapshot
+/// needs rather than being projected into a second near-identical type.
+#[derive(Clone, Debug)]
 pub(crate) struct TranscriptAgent {
     pub(crate) agent_id: String,
     pub(crate) agent_type: Option<String>,
-    pub(crate) spawn_depth: Option<u32>,
     pub(crate) open: bool,
 }
 
@@ -133,7 +138,6 @@ struct AgentFile {
 struct AgentMeta {
     tool_use_id: Option<String>,
     agent_type: Option<String>,
-    spawn_depth: Option<u32>,
 }
 
 /// The fields of a transcript record this scanner reads. `content` stays an
@@ -178,7 +182,6 @@ impl Default for CodexGroup {
 struct CodexAgentFile {
     agent_id: String,
     agent_type: Option<String>,
-    spawn_depth: u32,
     path: PathBuf,
 }
 
@@ -283,7 +286,7 @@ impl TranscriptScanner {
             let Some(head) = codex_head(id, &index, &mut heads) else {
                 continue;
             };
-            let Some((root_id, spawn_depth)) = codex_root(&head, &index, &mut heads) else {
+            let Some(root_id) = codex_root(&head, &index, &mut heads) else {
                 continue;
             };
             let group = groups.entry(root_id).or_default();
@@ -292,7 +295,6 @@ impl TranscriptScanner {
                 group.agents.push(CodexAgentFile {
                     agent_id: head.session_id,
                     agent_type: head.agent_role,
-                    spawn_depth,
                     path: path.clone(),
                 });
             }
@@ -399,7 +401,6 @@ impl TranscriptScanner {
                 TranscriptAgent {
                     agent_id: agent.agent_id,
                     agent_type: meta.as_ref().and_then(|meta| meta.agent_type.clone()),
-                    spawn_depth: meta.as_ref().and_then(|meta| meta.spawn_depth),
                     open: !closed && !abandoned,
                 }
             })
@@ -427,7 +428,7 @@ fn collect_active_sessions(
         let Ok(modified) = std::fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
             continue;
         };
-        let Some(session_id) = claude_root_session_id(&path, is_subagent) else {
+        let Some(session_id) = crate::sessions::claude_root_session_id(&path, is_subagent) else {
             continue;
         };
         let files = sessions.entry(session_id).or_default();
@@ -459,20 +460,6 @@ fn collect_active_sessions(
     sessions
 }
 
-/// Root session id for a transcript: the file stem for a parent, and the
-/// directory holding `subagents/` for a sub-agent at any depth.
-fn claude_root_session_id(path: &Path, is_subagent: bool) -> Option<String> {
-    let directory = if is_subagent {
-        path.ancestors()
-            .find(|ancestor| ancestor.file_name() == Some(OsStr::new("subagents")))?
-            .parent()?
-            .file_name()?
-    } else {
-        path.file_stem()?
-    };
-    directory.to_str().map(str::to_owned)
-}
-
 /// `agent-<id>.jsonl` carries the same id the workflow journal records use.
 fn claude_agent_id(path: &Path) -> Option<String> {
     path.file_stem()?
@@ -493,7 +480,7 @@ fn claude_agent_id(path: &Path) -> Option<String> {
 fn codex_rollout_index(sessions_dir: &Path) -> HashMap<String, (PathBuf, SystemTime)> {
     let mut index = HashMap::new();
     for path in crate::sessions::discover_codex_transcripts_in(sessions_dir) {
-        let Some(thread_id) = codex_rollout_id(&path) else {
+        let Some(thread_id) = crate::sessions::codex_thread_id(&path) else {
             continue;
         };
         let Ok(modified) = std::fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
@@ -502,16 +489,6 @@ fn codex_rollout_index(sessions_dir: &Path) -> HashMap<String, (PathBuf, SystemT
         index.insert(thread_id, (path, modified));
     }
     index
-}
-
-fn codex_rollout_id(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
-    let rest = stem.strip_prefix(CODEX_ROLLOUT_PREFIX)?;
-    let thread_id = rest.get(rest.len().checked_sub(CODEX_THREAD_ID_LEN)?..)?;
-    thread_id
-        .chars()
-        .all(|character| character.is_ascii_hexdigit() || character == '-')
-        .then(|| thread_id.to_owned())
 }
 
 /// Read one rollout's `session_meta`, memoised for the pass because the root of
@@ -542,41 +519,40 @@ fn read_codex_head(path: &Path) -> Option<CodexHead> {
         .ok()?;
     let record = serde_json::from_str::<serde_json::Value>(&line).ok()?;
     let metadata = crate::transcript_identity::codex_metadata(&record)?;
-    let payload = record.get("payload");
-    let string = |owner: Option<&serde_json::Value>, field: &str| {
+    // The head's identity fields — including the `source.subagent.thread_spawn`
+    // walk behind `agent_role` — are read by `codex_metadata`. Only the turn
+    // timestamp is read here, and only because it may sit on either level.
+    let timestamp = |owner: Option<&serde_json::Value>| {
         owner
-            .and_then(|owner| owner.get(field))
+            .and_then(|owner| owner.get("timestamp"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
     };
-    // `source` is a bare string on a user thread and an object naming the spawn
-    // on an older sub-agent thread, so it stays untyped.
-    let thread_spawn = payload
-        .and_then(|payload| payload.get("source"))
-        .and_then(|source| source.get("subagent"))
-        .and_then(|subagent| subagent.get("thread_spawn"));
     Some(CodexHead {
         session_id: metadata.source_session_id,
         parent_id: metadata.parent_chain_id,
         subagent: metadata.is_spawn,
-        agent_role: string(payload, "agent_role").or_else(|| string(thread_spawn, "agent_role")),
+        agent_role: metadata.agent_role,
         cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
-        started_at: string(payload, "timestamp")
-            .or_else(|| string(Some(&record), "timestamp"))
+        started_at: timestamp(record.get("payload"))
+            .or_else(|| timestamp(Some(&record)))
             .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
             .map(|timestamp| timestamp.with_timezone(&Utc)),
     })
 }
 
-/// Walk a rollout's parent chain to the user thread that owns it, counting the
-/// hops as spawn depth. Codex records only the immediate parent, and nesting is
-/// real: measured depths run 1–3 across 4487 spawned rollouts, every one of
-/// which resolves to a root thread the same corpus still holds.
+/// Walk a rollout's parent chain to the user thread that owns it. Codex records
+/// only the immediate parent, and nesting is real: measured depths run 1–3
+/// across 4487 spawned rollouts, every one of which resolves to a root thread
+/// the same corpus still holds.
+///
+/// The hop count bounds the walk but is not reported: which root a sub-agent
+/// belongs to is observable, how many hops away it sits is not.
 fn codex_root(
     head: &CodexHead,
     index: &HashMap<String, (PathBuf, SystemTime)>,
     heads: &mut HashMap<String, Option<CodexHead>>,
-) -> Option<(String, u32)> {
+) -> Option<String> {
     let mut current = head.clone();
     let mut depth = 0;
     let mut seen = HashSet::from([current.session_id.clone()]);
@@ -588,7 +564,7 @@ fn codex_root(
         depth += 1;
         current = codex_head(&parent_id, index, heads)?;
     }
-    Some((current.session_id, depth))
+    Some(current.session_id)
 }
 
 fn codex_session(
@@ -615,7 +591,6 @@ fn codex_session(
                 open: codex_agent_running(&agent.path),
                 agent_id: agent.agent_id,
                 agent_type: agent.agent_type,
-                spawn_depth: Some(agent.spawn_depth),
             })
             .collect(),
     })
@@ -1213,13 +1188,10 @@ mod tests {
         let session = &sessions[0];
         assert_eq!(session.session_id, root);
         assert_eq!(open_agents(session), vec![child, grandchild]);
-        let depths = session
-            .agents
-            .iter()
-            .map(|agent| (agent.agent_id.as_str(), agent.spawn_depth))
-            .collect::<HashMap<_, _>>();
-        assert_eq!(depths[child], Some(1));
-        assert_eq!(depths[grandchild], Some(2));
+        // The grandchild reaches the root only by hopping through the child, so
+        // a walk that stopped at the first parent would have produced a second
+        // root session rather than one session holding both agents.
+        assert_eq!(session.agents.len(), 2);
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Turn Tail Parsing]]

@@ -43,9 +43,6 @@ const MAX_CWD_LEN: usize = 4096;
 const MAX_SESSION_ID_LEN: usize = 128;
 const MAX_TOKEN_VALUE: i64 = 100_000_000;
 const MAX_TOOL_DATA_LEN: usize = 2048;
-// Five default three-minute usage polls tolerate transient hook loss without
-// letting a crashed CLI leave current-process evidence trusted indefinitely.
-const SNAPSHOT_STALE_AFTER: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 const MAX_OBS_REQUESTS: usize = 500;
 const MAX_CONTEXT_SAVINGS_REQUESTS: usize = 500;
@@ -71,20 +68,6 @@ struct SessionKey {
     session_id: String,
 }
 
-/// One agent inside a [`SessionSnapshot`].
-#[derive(Clone, Debug)]
-struct SnapshotAgent {
-    agent_id: String,
-    /// Parentage is recoverable from the transcript tree but nothing reads it
-    /// yet; spawn depth comes free from the agent's own metadata.
-    #[allow(dead_code)]
-    parent_agent_id: Option<String>,
-    #[allow(dead_code)]
-    spawn_depth: Option<u32>,
-    agent_type: Option<String>,
-    open: bool,
-}
-
 /// Complete session state as the transcript scanner last derived it.
 ///
 /// Snapshots are idempotent and order-independent: the scanner re-derives the
@@ -99,7 +82,9 @@ struct SessionSnapshot {
     /// Wall-clock instant this snapshot was derived; the reconciler's
     /// last-write-wins ordering key.
     observed_at: DateTime<Utc>,
-    agents: Vec<SnapshotAgent>,
+    /// Held as the scanner produced them: with one source there is nothing to
+    /// project into a second shape.
+    agents: Vec<crate::transcript_scan::TranscriptAgent>,
 }
 
 impl SessionSnapshot {
@@ -109,20 +94,10 @@ impl SessionSnapshot {
         self.agents.iter().filter(|agent| agent.open).count() as u32
     }
 
-    /// Models are resolved from retained child evidence after the merge drops
-    /// the registry guard, so the snapshot itself only partitions agent types.
-    fn model_groups(&self) -> Vec<ObservedSubagentModelGroup> {
-        aggregate_observed_models(
-            self.agents
-                .iter()
-                .filter(|agent| agent.open)
-                .map(|agent| (None, agent.agent_type.clone())),
-        )
-    }
-
-    /// Age from the newest evidence the snapshot carries.
+    /// Age from the newest evidence the snapshot carries, on the same cutoff the
+    /// scanner uses to release a session.
     fn is_stale(&self, now: DateTime<Utc>) -> bool {
-        now.signed_duration_since(self.last_activity) > SNAPSHOT_STALE_AFTER
+        now.signed_duration_since(self.last_activity) > crate::transcript_scan::IDLE_AFTER
     }
 }
 
@@ -233,6 +208,16 @@ fn local_observed_host() -> Option<&'static str> {
     .as_deref()
 }
 
+/// Reconciler key for a Sessions row, or `None` when the row's hostname does not
+/// normalize and so can never match a snapshot.
+fn row_key(row: &SessionBreakdown) -> Option<SessionKey> {
+    Some(SessionKey {
+        provider: row.provider.clone(),
+        host: normalize_observed_hostname(&row.hostname)?,
+        session_id: row.session_id.clone(),
+    })
+}
+
 fn transcript_snapshot(
     session: crate::transcript_scan::TranscriptSession,
     host: &str,
@@ -253,12 +238,9 @@ fn transcript_snapshot(
         agents: session
             .agents
             .into_iter()
-            .map(|agent| SnapshotAgent {
-                agent_id: agent.agent_id,
-                parent_agent_id: None,
-                spawn_depth: agent.spawn_depth,
+            .map(|agent| crate::transcript_scan::TranscriptAgent {
                 agent_type: observed_agent_type(agent.agent_type.as_deref()),
-                open: agent.open,
+                ..agent
             })
             .collect(),
     }
@@ -353,20 +335,17 @@ impl ObservedSubagentState {
 
         for row in &mut rows {
             row.observed_only = false;
-            let Some(host) = normalize_observed_hostname(&row.hostname) else {
+            let Some(key) = row_key(row) else {
                 continue;
-            };
-            let key = SessionKey {
-                provider: row.provider.clone(),
-                host,
-                session_id: row.session_id.clone(),
             };
             seen.insert(key.clone());
             let Some(snapshot) = reconciler.sessions.get(&key) else {
                 continue;
             };
             row.observed_subagent_count = Some(snapshot.count());
-            row.observed_subagent_models = Some(snapshot.model_groups());
+            // The resolve pass below fills models for every row with an open
+            // agent; a row without one has no model to name.
+            row.observed_subagent_models = Some(Vec::new());
             let stored = DateTime::parse_from_rfc3339(&row.last_active)
                 .ok()
                 .map(|at| at.with_timezone(&Utc));
@@ -406,7 +385,7 @@ impl ObservedSubagentState {
                     last_active: snapshot.last_activity.to_rfc3339(),
                     project: Some(cwd.clone()),
                     observed_subagent_count: Some(snapshot.count()),
-                    observed_subagent_models: Some(snapshot.model_groups()),
+                    observed_subagent_models: Some(Vec::new()),
                     observed_only: true,
                 });
             }
@@ -434,12 +413,7 @@ impl ObservedSubagentState {
                 {
                     return None;
                 }
-                let host = normalize_observed_hostname(&row.hostname)?;
-                let key = SessionKey {
-                    provider: row.provider.clone(),
-                    host,
-                    session_id: row.session_id.clone(),
-                };
+                let key = row_key(row)?;
                 let snapshot = reconciler.sessions.get(&key)?;
                 let agents = snapshot
                     .agents
@@ -2215,11 +2189,9 @@ async fn get_session_facets(
 mod observed_subagent_tests {
     use super::*;
 
-    fn agent(agent_id: &str, open: bool) -> SnapshotAgent {
-        SnapshotAgent {
+    fn agent(agent_id: &str, open: bool) -> crate::transcript_scan::TranscriptAgent {
+        crate::transcript_scan::TranscriptAgent {
             agent_id: agent_id.to_owned(),
-            parent_agent_id: None,
-            spawn_depth: Some(1),
             agent_type: None,
             open,
         }
@@ -2237,7 +2209,7 @@ mod observed_subagent_tests {
         session_id: &str,
         cwd: Option<&str>,
         last_activity: DateTime<Utc>,
-        agents: Vec<SnapshotAgent>,
+        agents: Vec<crate::transcript_scan::TranscriptAgent>,
     ) -> SessionSnapshot {
         SessionSnapshot {
             key: SessionKey {
@@ -2653,7 +2625,7 @@ mod observed_subagent_tests {
             "host",
             "stale-root",
             Some("/work/stale"),
-            Utc::now() - SNAPSHOT_STALE_AFTER - chrono::TimeDelta::seconds(1),
+            Utc::now() - crate::transcript_scan::IDLE_AFTER - chrono::TimeDelta::seconds(1),
             Vec::new(),
         );
         stale.started_at = stale.last_activity;

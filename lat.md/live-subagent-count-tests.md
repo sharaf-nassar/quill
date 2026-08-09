@@ -109,3 +109,9 @@ Frontend formatting and fixtures omit null and zero, render known model families
 ## Observed-Only Sessions Presentation
 
 Frontend provenance formatting renders unavailable synthetic tokens as an em dash and omits the false zero-turn tooltip claim while retained rows keep real metrics.
+
+## Shared Root Session Id
+
+Retained inventory and live scanning derive a transcript's root session id through one helper per provider, so the two consumers cannot drift apart on layout rules.
+
+Claude parents resolve to the file stem and sub-agents to the directory holding `subagents/` at any nesting depth, including the Workflow layout. Codex takes the trailing uuid of a `rollout-<timestamp>-<thread id>` name and rejects a malformed one outright rather than returning a truncated id.

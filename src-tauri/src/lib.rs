@@ -6364,7 +6364,6 @@ mod tests {
                 agents: vec![transcript_scan::TranscriptAgent {
                     agent_id: "agent".to_string(),
                     agent_type: None,
-                    spawn_depth: Some(1),
                     open: true,
                 }],
             },

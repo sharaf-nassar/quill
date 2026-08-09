@@ -238,6 +238,9 @@ pub(crate) struct CodexMetadata {
     pub(crate) parent_chain_id: Option<String>,
     pub(crate) is_spawn: bool,
     pub(crate) agent_nickname: Option<String>,
+    /// Declared either directly on the payload or inside the spawn record. Both
+    /// are read here so the `source.subagent.thread_spawn` path is walked once.
+    pub(crate) agent_role: Option<String>,
     pub(crate) cwd: Option<PathBuf>,
 }
 
@@ -290,6 +293,8 @@ pub(crate) fn codex_metadata(record: &Value) -> Option<CodexMetadata> {
             .or(forked_from_id),
         is_spawn: thread_spawn.is_some() || thread_source.as_deref() == Some("subagent"),
         agent_nickname,
+        agent_role: nonempty_string(payload.get("agent_role"))
+            .or_else(|| nonempty_string(thread_spawn.and_then(|spawn| spawn.get("agent_role")))),
         cwd: nonempty_string(payload.get("cwd")).map(PathBuf::from),
     })
 }

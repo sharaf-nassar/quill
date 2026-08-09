@@ -761,6 +761,42 @@ pub(crate) fn discover_codex_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf>
         .collect()
 }
 
+/// A Codex rollout filename ends with the 36-character thread uuid.
+const CODEX_THREAD_ID_LEN: usize = 36;
+
+/// Root session id for a Claude transcript: the file stem for a parent, and the
+/// directory holding `subagents/` for a sub-agent at any depth.
+///
+/// Retained inventory and live snapshot scanning both need this rule, so it
+/// lives beside the walker that classifies the layout rather than being
+/// restated by each consumer.
+pub(crate) fn claude_root_session_id(path: &Path, is_subagent: bool) -> Option<String> {
+    let name = if is_subagent {
+        path.ancestors()
+            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "subagents"))?
+            .parent()?
+            .file_name()?
+    } else {
+        path.file_stem()?
+    };
+    name.to_str().map(str::to_owned)
+}
+
+/// Thread id from a `rollout-<timestamp>-<thread id>.jsonl` filename.
+///
+/// Taking the trailing uuid rather than skipping a fixed timestamp width means a
+/// malformed name is rejected instead of yielding a truncated id. The id is only
+/// a locator: identity always comes from the rollout's own `session_meta`.
+pub(crate) fn codex_thread_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("rollout-")?;
+    let thread_id = rest.get(rest.len().checked_sub(CODEX_THREAD_ID_LEN)?..)?;
+    thread_id
+        .chars()
+        .all(|character| character.is_ascii_hexdigit() || character == '-')
+        .then(|| thread_id.to_owned())
+}
+
 fn read_directory_entries(
     directory: &Path,
     provider: IntegrationProvider,
@@ -1444,24 +1480,15 @@ impl SessionIndex {
                     .get(&file_key)
                     .cloned()
                     .or_else(|| match layout_hint {
-                        RetainedJsonlSourceLayoutHint::ClaudeParent { .. } => tracked_path
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .map(str::to_owned),
-                        RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. } => tracked_path
-                            .ancestors()
-                            .find(|path| path.file_name().is_some_and(|name| name == "subagents"))
-                            .and_then(Path::parent)
-                            .and_then(Path::file_name)
-                            .and_then(|name| name.to_str())
-                            .map(str::to_owned),
-                        RetainedJsonlSourceLayoutHint::CodexTranscript => tracked_path
-                            .file_stem()
-                            .and_then(|stem| stem.to_str())
-                            .and_then(|stem| stem.strip_prefix("rollout-"))
-                            .and_then(|stem| stem.get(20..))
-                            .filter(|session_id| !session_id.is_empty())
-                            .map(str::to_owned),
+                        RetainedJsonlSourceLayoutHint::ClaudeParent { .. } => {
+                            claude_root_session_id(tracked_path, false)
+                        }
+                        RetainedJsonlSourceLayoutHint::ClaudeSubagent { .. } => {
+                            claude_root_session_id(tracked_path, true)
+                        }
+                        RetainedJsonlSourceLayoutHint::CodexTranscript => {
+                            codex_thread_id(tracked_path)
+                        }
                     });
             let Some(session_id) = session_id else {
                 continue;
@@ -4474,6 +4501,49 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Shared Root Session Id]]
+    #[test]
+    fn root_session_ids_are_derived_by_one_rule_per_provider() {
+        let parent = Path::new("/p/-home-proj/9f1c.jsonl");
+        assert_eq!(
+            claude_root_session_id(parent, false).as_deref(),
+            Some("9f1c")
+        );
+
+        // A sub-agent names its root by directory, at any nesting depth.
+        let flat = Path::new("/p/-home-proj/9f1c/subagents/agent-a1.jsonl");
+        let nested = Path::new("/p/-home-proj/9f1c/subagents/workflows/wf_7/agent-a2.jsonl");
+        assert_eq!(claude_root_session_id(flat, true).as_deref(), Some("9f1c"));
+        assert_eq!(
+            claude_root_session_id(nested, true).as_deref(),
+            Some("9f1c")
+        );
+        // Reading a sub-agent path as a parent yields the file stem, not the root.
+        assert_eq!(
+            claude_root_session_id(flat, false).as_deref(),
+            Some("agent-a1")
+        );
+
+        let rollout = Path::new(
+            "/s/2026/08/07/rollout-2026-08-07T20-22-02-019fdf64-542d-7560-9891-bc73a7097da3.jsonl",
+        );
+        assert_eq!(
+            codex_thread_id(rollout).as_deref(),
+            Some("019fdf64-542d-7560-9891-bc73a7097da3"),
+            "the trailing uuid is the thread id"
+        );
+
+        // Malformed names are rejected rather than yielding a truncated id.
+        for bad in [
+            "/s/rollout-2026-08-07T20-22-02.jsonl",
+            "/s/rollout-.jsonl",
+            "/s/2026-08-07T20-22-02-019fdf64-542d-7560-9891-bc73a7097da3.jsonl",
+            "/s/rollout-2026-08-07T20-22-02-not*a*uuid*here*aaaaaaaaaaaaaaaaaaaa.jsonl",
+        ] {
+            assert_eq!(codex_thread_id(Path::new(bad)), None, "rejects {bad}");
+        }
+    }
 
     /// Build a synthetic projects directory that mirrors Claude Code 2.x's
     /// per-session layout: one parent transcript and one sub-agent transcript
