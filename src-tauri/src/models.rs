@@ -369,8 +369,6 @@ pub struct ObservedHookObservation {
     pub hostname: Option<String>,
     pub hook_event: String,
     #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
     pub cwd: Option<String>,
@@ -379,10 +377,6 @@ pub struct ObservedHookObservation {
     pub hook_matcher: Option<String>,
     #[serde(default)]
     pub agent_id: Option<String>,
-    #[serde(default)]
-    pub agent_type: Option<String>,
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 // --- Context savings telemetry models ---

@@ -32,7 +32,7 @@ const MCP_BLOCK_START: &str = "# quill-managed:codex:mcp:start";
 const MCP_BLOCK_END: &str = "# quill-managed:codex:mcp:end";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:codex:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
-const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 3";
+const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 4";
 
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
@@ -47,6 +47,10 @@ const MANAGED_HOOK_SCRIPT_FILES: [&str; 7] = [
     "session-end-learn.cjs",
 ];
 const LEGACY_MANAGED_HOOK_SCRIPT_FILES: [&str; 1] = ["report-tokens.sh"];
+/// Every Codex hook event Quill knows about. Registration is a subset (see
+/// [`CODEX_OBSERVED_HOOK_EVENTS`]); this full list still drives cleanup,
+/// verification, and hook-state remapping so a config written by an older
+/// Quill is pruned on repair instead of left orphaned.
 const CODEX_HOOK_EVENTS: [(&str, &str); 11] = [
     ("PreToolUse", "pre_tool_use"),
     ("PermissionRequest", "permission_request"),
@@ -59,6 +63,20 @@ const CODEX_HOOK_EVENTS: [(&str, &str); 11] = [
     ("SubagentStop", "subagent_stop"),
     ("SessionEnd", "session_end"),
     ("Stop", "stop"),
+];
+
+/// Events the hook observer is registered on. Session and subagent lifecycle
+/// events are deliberately absent: live session and agent state is derived
+/// from rollout transcripts, so registering them would deploy hooks into user
+/// config for evidence Quill already has on disk.
+const CODEX_OBSERVED_HOOK_EVENTS: [&str; 7] = [
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "UserPromptSubmit",
+    "Stop",
 ];
 
 pub(crate) fn is_supported_hook_event(event: &str) -> bool {
@@ -1574,8 +1592,8 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
         ]);
     }
 
-    // Feature 009: register the generic hook observer on every Codex
-    // hook event when activity tracking is enabled. Each event gets its
+    // Feature 009: register the generic hook observer on the observed Codex
+    // hook events when activity tracking is enabled. Each event gets its
     // own [[hooks.<Event>]] block with no matcher so the observer fires
     // on every event firing, independent of which user / third-party
     // scripts are also registered for that event.
@@ -1584,7 +1602,7 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
             "node {}",
             shell_quote(&scripts_dir().join("hook-observe.cjs"))
         );
-        for (event, _) in CODEX_HOOK_EVENTS {
+        for event in CODEX_OBSERVED_HOOK_EVENTS {
             groups.push(CodexHookGroup {
                 event,
                 matcher: None,
@@ -2447,7 +2465,7 @@ mod tests {
         );
     }
 
-    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Managed Lifecycle Hooks]]
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Managed Observer Hooks]]
     #[test]
     fn hook_observer_contract_preserves_registrations_and_activity_gate() {
         let source = include_str!("../../codex-integration/scripts/hook-observe.cjs");
@@ -2469,15 +2487,26 @@ mod tests {
                     .any(|hook| hook.command.contains("hook-observe.cjs"))
             })
             .collect();
-        assert_eq!(observer_groups.len(), CODEX_HOOK_EVENTS.len());
-        for (event, _) in CODEX_HOOK_EVENTS {
+        assert_eq!(observer_groups.len(), CODEX_OBSERVED_HOOK_EVENTS.len());
+        for event in CODEX_OBSERVED_HOOK_EVENTS {
             let group = observer_groups
                 .iter()
                 .find(|group| group.event == event)
-                .expect("every existing Codex lifecycle registration remains present");
+                .expect("every observed Codex registration remains present");
             assert!(group.matcher.is_none());
             assert_eq!(group.hooks.len(), 1);
             assert_eq!(group.hooks[0].timeout, 3);
+        }
+        for event in [
+            "SessionStart",
+            "SubagentStart",
+            "SubagentStop",
+            "SessionEnd",
+        ] {
+            assert!(
+                !observer_groups.iter().any(|group| group.event == event),
+                "{event} lifecycle hook must not be deployed to user config"
+            );
         }
 
         let mut disabled = enabled;

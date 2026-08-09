@@ -2,20 +2,11 @@
 "use strict";
 
 const fs = require("fs");
-const os = require("os");
 const path = require("path");
 const https = require("https");
 const http = require("http");
 const LOCAL_TIMEOUT_MS = 1500;
 const REMOTE_TIMEOUT_MS = 2000;
-const LIFECYCLE_EVENTS = new Set([
-  "SessionStart",
-  "SubagentStart",
-  "SubagentStop",
-  "SessionEnd",
-]);
-// https://code.claude.com/docs/en/hooks#sessionstart
-const SESSION_START_SOURCES = new Set(["startup", "resume", "clear", "compact", "fork"]);
 
 function truncate(value, maxLen = 2048) {
   if (value === undefined || value === null) return null;
@@ -111,40 +102,6 @@ function buildPayload(input) {
   };
 }
 
-function buildLifecyclePayload(
-  input,
-  config,
-  ts = new Date().toISOString(),
-  systemHostname = os.hostname(),
-) {
-  const event = input?.hook_event_name;
-  if (!LIFECYCLE_EVENTS.has(event) || typeof input.session_id !== "string" || !input.session_id) {
-    return null;
-  }
-
-  const source = event === "SessionStart" ? input.source : null;
-  if (event === "SessionStart" && !SESSION_START_SOURCES.has(source)) return null;
-
-  const agentId = typeof input.agent_id === "string" && input.agent_id ? input.agent_id : null;
-  if ((event === "SubagentStart" || event === "SubagentStop") && !agentId) return null;
-  const agentType = event === "SubagentStart" && typeof input.agent_type === "string"
-    ? truncate(input.agent_type.trim(), 256) || null
-    : null;
-
-  return {
-    provider: "claude",
-    session_id: input.session_id,
-    hostname: config.hostname || systemHostname.split(".")[0] || "local",
-    hook_event: event,
-    source,
-    agent_id: agentId,
-    agent_type: agentType,
-    model: null,
-    cwd: input.cwd || null,
-    ts,
-  };
-}
-
 function loadConfig() {
   const configPath = path.join(
     process.env.HOME || process.env.USERPROFILE,
@@ -160,15 +117,6 @@ function main() {
     const raw = fs.readFileSync(0, "utf8");
     const input = JSON.parse(raw);
 
-    if (LIFECYCLE_EVENTS.has(input?.hook_event_name)) {
-      const config = loadConfig();
-      const payload = buildLifecyclePayload(input, config);
-      if (payload !== null) {
-        postJSON(config, "/api/v1/hooks/observed", payload, "observe");
-      }
-      return;
-    }
-
     const payload = buildPayload(input);
     if (payload === null) return;
 
@@ -181,4 +129,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { buildLifecyclePayload, buildPayload, truncate };
+module.exports = { buildPayload, truncate };

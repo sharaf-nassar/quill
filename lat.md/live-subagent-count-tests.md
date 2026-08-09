@@ -4,23 +4,11 @@ lat:
 ---
 # Live Subagent Count Tests
 
-These authorized tests protect observed lifecycle truth, provider delivery, nullable IPC, audit separation, and positive-only Sessions rows.
-
-## Lifecycle Fold And Coverage Boundaries
-
-The snapshot fold preserves null, zero, and positive states across ordering, identity, epoch, and disable boundaries for both providers. A session with no observed start stays null; agent evidence newer than a session end carries into the next epoch.
-
-## Backdated Stop Is Ignored
-
-A Stop older than a known open agent's Start describes state the snapshot already superseded, so it is dropped without disturbing the live count.
+These authorized tests protect transcript-derived session truth, provider delivery, nullable IPC, audit separation, and positive-only Sessions rows.
 
 ## Snapshot Reconciliation Bounds
 
 The reconciler drops snapshots past the staleness cutoff and refuses a write older than the one it already holds for that session, so reads fail closed to null and memory stays bounded by sessions still producing evidence.
-
-## Transcript Source Precedence
-
-A transcript-derived snapshot outranks any later observed-event snapshot for the same session, because file evidence covers spawns a hook stream that started mid-session never saw.
 
 ## Transcript Spawn Resolution
 
@@ -62,21 +50,9 @@ A turn's own records can push its `task_started` out of the scan window, and a w
 
 A rollout that died mid-turn leaves an unmatched `task_started` forever, so silence past the cutoff is the only evidence it is gone; a whole thread tree that goes quiet leaves the scan entirely.
 
-## Equal-Time Stop Wins
-
-A Stop sharing an open agent's Start timestamp closes the agent, preserving the terminal-event tie-break.
-
-## Unknown Pre-Epoch Stop Is Ignored
-
-A Stop older than the root epoch for an unknown agent is dropped without invalidating otherwise exact live coverage.
-
-## Stale Start Does Not Reopen Agent
-
-A re-delivered Start older than a recorded Stop cannot reopen the closed agent or inflate the live count.
-
 ## Observed Model Aggregation
 
-Open Codex agents aggregate equal validated model ids, exclude stopped agents, retain malformed ids as unknown, and keep group totals equal to the exact observed-open count.
+Open agents aggregate equal validated model ids, exclude closed agents from both the count and the model lookup, retain malformed ids as unknown, and keep group totals equal to the exact open count.
 
 ## Retained Agent Model Lookup
 
@@ -88,7 +64,7 @@ Claude open agents resolve only from exact retained child evidence; delayed inge
 
 ## Fused Merge Snapshot Consistency
 
-A lifecycle membership swap during retained-model resolution cannot mix a lock-time count with model groups from a later registry generation.
+A scan that swaps open membership during retained-model resolution cannot mix a lock-time count with model groups from a later registry generation.
 
 ## Retained Resolution After Registry Unlock
 
@@ -100,7 +76,7 @@ The storage query keeps parent and subagent usage totals but initializes the liv
 
 ## Audit Persistence Is Non-Authoritative
 
-Sibling lifecycle rows retain distinct audit identities, while a failed SQLite audit write cannot change the already-folded process-local count.
+Sibling hook fires sharing one timestamp retain distinct audit identities, confirming the audit table records fires rather than reconstructing any live count.
 
 ## Nullable Sessions IPC Overlay
 
@@ -108,31 +84,23 @@ Command-layer enrichment overlays exact provider, host, and root matches while u
 
 ## Observed-Only Session Merge
 
-An active root with validated root cwd synthesizes before token storage, advances from later activity without accepting subagent cwd, and merges into a later retained row without duplication.
+An active root with validated root cwd synthesizes before token storage, advances a retained row's activity from the scan, and merges into that row without duplication.
 
 ## Observed-Only Merge Boundaries
 
-Synthetic rows obey active coverage, normalized hostname and provider filters, selected range, deterministic limit, provider disable, and global tracking disable.
+Synthetic rows require a validated root cwd and obey normalized hostname and provider filters, selected range, deterministic limit, provider disable, and global tracking disable.
 
-## Claude Lifecycle Payloads
+## Claude Managed Observer Hooks
 
-Claude's observer carries official lifecycle sources, including forked-session starts, and normalized identity fields while rejecting malformed evidence before transport.
+Claude setup registers the tool-phase observer only under activity tracking and registers no session or subagent lifecycle group at all, so none is ever written to user settings.
 
-## Claude Managed Lifecycle Hooks
+## Codex Audit Payloads
 
-Claude setup registers one observer for each lifecycle group only under activity tracking and preserves foreign or last-known-good configuration.
+Codex payload construction preserves event, tool, root and agent identity, hostname normalization, legacy session fallbacks, and malformed-evidence safety, carrying no field the audit row does not store.
 
-## Codex Lifecycle Payloads
+## Codex Managed Observer Hooks
 
-Codex payload construction preserves official lifecycle sources, root and agent identity, active model slug, hostname normalization, legacy session fallbacks, and malformed-evidence safety.
-
-## Codex Subagent Stop Response
-
-Codex subagent stops forward their agent identity and return a JSON no-op so Codex applies the terminal lifecycle state.
-
-## Codex Managed Lifecycle Hooks
-
-Codex integration verification preserves the existing event registration set and removes the observer when activity tracking is disabled.
+Codex integration verification registers the observer on exactly the seven observed events, never on a lifecycle event, and removes it when activity tracking is disabled.
 
 ## Positive-Only Sessions Rows
 

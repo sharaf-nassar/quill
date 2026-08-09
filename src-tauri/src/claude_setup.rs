@@ -1475,19 +1475,6 @@ fn expected_hook_groups(
                 hooks: vec![observe.clone()],
             });
         }
-        for event in [
-            "SessionStart",
-            "SubagentStart",
-            "SubagentStop",
-            "SessionEnd",
-        ] {
-            groups.push(ClaudeHookGroup {
-                event,
-                matcher: None,
-                source: HOOK_MARKER,
-                hooks: vec![observe.clone()],
-            });
-        }
     }
     if features.context_preservation {
         groups.extend([
@@ -2025,7 +2012,7 @@ mod tests {
         }
     }
 
-    fn lifecycle_observer_count(groups: &[ClaudeHookGroup], event: &str) -> usize {
+    fn observer_count(groups: &[ClaudeHookGroup], event: &str) -> usize {
         let observe_path = scripts_dir()
             .join("observe.cjs")
             .to_string_lossy()
@@ -2038,9 +2025,9 @@ mod tests {
             .count()
     }
 
-    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Managed Lifecycle Hooks]]
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Managed Observer Hooks]]
     #[test]
-    fn lifecycle_observers_follow_activity_tracking() {
+    fn observers_cover_tool_events_only_under_activity_tracking() {
         let runtime = fixture_runtime();
         let enabled = expected_hook_groups(IntegrationFeatures::default(), &runtime);
         let disabled = expected_hook_groups(
@@ -2051,14 +2038,17 @@ mod tests {
             &runtime,
         );
 
+        for event in ["PreToolUse", "PostToolUse", "PostToolUseFailure"] {
+            assert_eq!(observer_count(&enabled, event), 1, "{event}");
+            assert_eq!(observer_count(&disabled, event), 0, "{event}");
+        }
         for event in [
             "SessionStart",
             "SubagentStart",
             "SubagentStop",
             "SessionEnd",
         ] {
-            assert_eq!(lifecycle_observer_count(&enabled, event), 1, "{event}");
-            assert_eq!(lifecycle_observer_count(&disabled, event), 0, "{event}");
+            assert_eq!(observer_count(&enabled, event), 0, "{event}");
         }
     }
 

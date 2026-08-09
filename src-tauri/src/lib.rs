@@ -846,11 +846,23 @@ async fn enqueue_changed_claude_model_sources(
     }
 }
 
-/// Nudge retained Claude model ingestion after a child starts.
+/// True when a Sessions row has an open Claude agent whose model is still
+/// unresolved, which is the signal that retained ingestion has not yet reached
+/// that child's transcript.
+fn claude_row_awaits_child_model(row: &SessionBreakdown) -> bool {
+    row.provider == "claude"
+        && row
+            .observed_subagent_models
+            .as_ref()
+            .is_some_and(|groups| groups.iter().any(|group| group.model_id.is_none()))
+}
+
+/// Nudge retained Claude model ingestion for open children.
 ///
-/// Claude lifecycle hooks do not identify the child model. A delayed pair of
-/// changed-source scans lets the transcript provide that exact evidence while
-/// coalescing bursts of sibling starts into one task.
+/// A transcript scan identifies an open Claude agent before retained ingestion
+/// has read the model out of that agent's own transcript. A delayed pair of
+/// changed-source scans supplies that exact evidence while coalescing repeated
+/// Sessions reads into one task.
 pub(crate) fn schedule_claude_model_usage_rescan_nudge(app: tauri::AppHandle) {
     if CLAUDE_MODEL_RESCAN_NUDGE_GENERATION.fetch_add(1, AtomicOrdering::AcqRel) != 0 {
         return;
@@ -3499,6 +3511,7 @@ async fn get_session_breakdown(
     hostname: Option<String>,
     provider: Option<integrations::IntegrationProvider>,
     limit: Option<i32>,
+    app: tauri::AppHandle,
     observed_subagents: tauri::State<'_, Arc<server::ObservedSubagentState>>,
 ) -> Result<Vec<SessionBreakdown>, String> {
     let storage = get_storage()?;
@@ -3511,14 +3524,18 @@ async fn get_session_breakdown(
         // while nobody is looking at Sessions, and so a session that predates
         // this process is already correct the first time it is read.
         observed_subagents.refresh_from_transcripts();
-        observed_subagents.merge(
+        let rows = observed_subagents.merge(
             rows,
             &range_from,
             observed_hostname.as_deref(),
             provider,
             limit,
             |targets| storage.get_observed_agent_model_evidence(targets),
-        )
+        )?;
+        if rows.iter().any(claude_row_awaits_child_model) {
+            schedule_claude_model_usage_rescan_nudge(app);
+        }
+        Ok(rows)
     })
 }
 
@@ -5837,7 +5854,6 @@ pub fn run() {
                         secret,
                         handle,
                         session_index,
-                        observed_subagents,
                     ));
                 }
 
@@ -6333,29 +6349,27 @@ mod tests {
     #[test]
     fn session_breakdown_command_overlay_preserves_nullable_ipc() {
         let state = server::ObservedSubagentState::default();
-        let observation = |hook_event: &str, source: Option<&str>, agent_id: Option<&str>| {
-            models::ObservedHookObservation {
+        let parse = |value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .expect("fixture timestamp")
+                .with_timezone(&chrono::Utc)
+        };
+        assert!(state.record_scanned_session(
+            transcript_scan::TranscriptSession {
                 provider: integrations::IntegrationProvider::Claude,
                 session_id: "covered-root".to_string(),
-                hostname: Some("ipc-host.example.com".to_string()),
-                hook_event: hook_event.to_string(),
-                source: source.map(str::to_owned),
-                tool_name: None,
                 cwd: None,
-                ts: if hook_event == "SessionStart" {
-                    "2030-01-01T00:00:01Z"
-                } else {
-                    "2030-01-01T00:00:02Z"
-                }
-                .to_string(),
-                hook_matcher: None,
-                agent_id: agent_id.map(str::to_owned),
-                agent_type: None,
-                model: None,
-            }
-        };
-        state.observe(&observation("SessionStart", Some("startup"), None));
-        state.observe(&observation("SubagentStart", None, Some("agent")));
+                started_at: parse("2030-01-01T00:00:01Z"),
+                last_activity: parse("2030-01-01T00:00:02Z"),
+                agents: vec![transcript_scan::TranscriptAgent {
+                    agent_id: "agent".to_string(),
+                    agent_type: None,
+                    spawn_depth: Some(1),
+                    open: true,
+                }],
+            },
+            "ipc-host.example.com",
+        ));
 
         let row = |session_id: &str| SessionBreakdown {
             provider: "claude".to_string(),

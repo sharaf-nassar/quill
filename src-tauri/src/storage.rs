@@ -27298,14 +27298,11 @@ mod tests {
                     session_id: "codex-hook-gate-session".to_string(),
                     hostname: Some("hook-host".to_string()),
                     hook_event: "PreToolUse".to_string(),
-                    source: None,
                     tool_name: Some("Bash".to_string()),
                     cwd: None,
                     ts: "2026-08-04T12:00:00Z".to_string(),
                     hook_matcher: None,
                     agent_id: None,
-                    agent_type: None,
-                    model: None,
                 });
             hook_done_tx
                 .send(result)
@@ -27362,15 +27359,12 @@ mod tests {
                         provider,
                         session_id: session_id.clone(),
                         hostname: Some("host".to_string()),
-                        hook_event: "SubagentStart".to_string(),
-                        source: None,
-                        tool_name: None,
+                        hook_event: "PostToolUse".to_string(),
+                        tool_name: Some("Bash".to_string()),
                         cwd: Some("/work".to_string()),
                         ts: "2030-01-01T00:00:01Z".to_string(),
                         hook_matcher: None,
                         agent_id: Some(agent_id.to_string()),
-                        agent_type: None,
-                        model: None,
                     })
                     .expect("persist sibling hook");
             }
@@ -27408,59 +27402,6 @@ mod tests {
             assert_eq!(sidechain, 1);
             assert_eq!(hostname.as_deref(), Some("host"));
         }
-    }
-
-    #[test]
-    #[serial]
-    fn observed_state_survives_audit_persistence_failure() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let state = crate::server::ObservedSubagentState::default();
-        let observation = |hook_event: &str, source: Option<&str>, agent_id: Option<&str>| {
-            crate::models::ObservedHookObservation {
-                provider: IntegrationProvider::Codex,
-                session_id: "failed-audit-root".to_string(),
-                hostname: Some("host".to_string()),
-                hook_event: hook_event.to_string(),
-                source: source.map(str::to_owned),
-                tool_name: None,
-                cwd: None,
-                ts: if hook_event == "SessionStart" {
-                    "2030-01-01T00:00:01Z"
-                } else {
-                    "2030-01-01T00:00:02Z"
-                }
-                .to_string(),
-                hook_matcher: None,
-                agent_id: agent_id.map(str::to_owned),
-                agent_type: None,
-                model: None,
-            }
-        };
-
-        state.observe(&observation("SessionStart", Some("startup"), None));
-        let agent = observation("SubagentStart", None, Some("agent"));
-        state.observe(&agent);
-        storage
-            .conn
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "CREATE TRIGGER fail_hook_audit
-                 BEFORE INSERT ON hook_invocations
-                 BEGIN SELECT RAISE(FAIL, 'forced hook audit failure'); END;",
-            )
-            .expect("install audit failure trigger");
-
-        let error = storage
-            .store_hook_observation(&agent)
-            .expect_err("audit persistence must fail");
-        assert!(error.contains("forced hook audit failure"));
-        assert_eq!(
-            state.live_count("codex", "host", "failed-audit-root"),
-            Some(1)
-        );
     }
 
     fn assert_rollup_wal_bound(
