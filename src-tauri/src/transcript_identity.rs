@@ -229,13 +229,16 @@ impl fmt::Display for IdentityError {
 
 impl std::error::Error for IdentityError {}
 
+/// The identity a Codex `session_meta` record declares. Retained ingest and the
+/// live transcript scanner both read it, so the rule for which field names the
+/// spawning parent lives here alone.
 #[derive(Clone, Debug)]
-struct CodexMetadata {
-    source_session_id: String,
-    parent_chain_id: Option<String>,
-    is_spawn: bool,
-    agent_nickname: Option<String>,
-    cwd: Option<PathBuf>,
+pub(crate) struct CodexMetadata {
+    pub(crate) source_session_id: String,
+    pub(crate) parent_chain_id: Option<String>,
+    pub(crate) is_spawn: bool,
+    pub(crate) agent_nickname: Option<String>,
+    pub(crate) cwd: Option<PathBuf>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -259,8 +262,8 @@ fn optional_nonempty_string(value: Option<&Value>) -> Result<Option<String>, ()>
     }
 }
 
-fn codex_metadata(record: &JsonlRecord) -> Option<CodexMetadata> {
-    let object = record.value.as_object()?;
+pub(crate) fn codex_metadata(record: &Value) -> Option<CodexMetadata> {
+    let object = record.as_object()?;
     if object.get("type").and_then(Value::as_str) != Some("session_meta") {
         return None;
     }
@@ -300,7 +303,10 @@ pub(crate) fn resolve_codex_native_identity(
     let mut expected_ancestors = HashSet::<String>::new();
     let mut declared_identities = HashMap::<String, CodexDeclaredIdentity>::new();
 
-    for metadata in records.iter().filter_map(codex_metadata) {
+    for metadata in records
+        .iter()
+        .filter_map(|record| codex_metadata(&record.value))
+    {
         let Some(child) = &mut native else {
             if let Some(parent) = &metadata.parent_chain_id {
                 expected_ancestors.insert(parent.clone());

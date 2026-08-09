@@ -46,6 +46,22 @@ A session takes its origin and project from the first record it ever parses and 
 
 Several Sessions readers inside one interval cost a single directory walk; the throttled reads return nothing to apply and leave the reconciler holding the previous pass's state.
 
+## Codex Rollout Turn Resolution
+
+A Codex sub-agent is open only while its own rollout's newest turn boundary is a `task_started`, so a thread that completed or aborted its turn stops counting while still being listed with the role its head declared.
+
+## Codex Spawn Chain Grouping
+
+Every spawn in a chain belongs to the one user thread at its root rather than to its immediate parent, across both spawn schema eras, and each agent reports the number of hops back to that root as its spawn depth.
+
+## Codex Turn Tail Parsing
+
+A turn's own records can push its `task_started` out of the scan window, and a window holding no boundary means the tail is still inside a turn; a record still mid-write is skipped rather than read as half a boundary.
+
+## Codex Idle Cutoff
+
+A rollout that died mid-turn leaves an unmatched `task_started` forever, so silence past the cutoff is the only evidence it is gone; a whole thread tree that goes quiet leaves the scan entirely.
+
 ## Equal-Time Stop Wins
 
 A Stop sharing an open agent's Start timestamp closes the agent, preserving the terminal-event tie-break.

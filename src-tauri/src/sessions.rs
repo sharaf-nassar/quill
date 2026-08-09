@@ -745,6 +745,22 @@ pub(crate) fn discover_claude_transcripts_in(projects_dir: &Path) -> Vec<(PathBu
         .collect()
 }
 
+/// Enumerate every Codex rollout under `sessions_dir`.
+///
+/// Live snapshot scanning shares this walker with retained inventory so the
+/// date-partitioned session tree is only ever traversed one way.
+pub(crate) fn discover_codex_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf> {
+    if !sessions_dir.exists() {
+        return Vec::new();
+    }
+    let mut diagnostic = None;
+    collect_codex_jsonl_candidates(sessions_dir, IntegrationProvider::Codex, &mut diagnostic)
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
+}
+
 fn read_directory_entries(
     directory: &Path,
     provider: IntegrationProvider,

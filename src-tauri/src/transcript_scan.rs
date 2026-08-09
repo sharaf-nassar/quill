@@ -1,4 +1,4 @@
-//! Derives live session and agent state by scanning Claude transcripts.
+//! Derives live session and agent state by scanning provider transcripts.
 //!
 //! Provider transcripts already carry exact, retroactive lifecycle evidence, so
 //! a session that started before Quill launched reports correct agent counts on
@@ -8,11 +8,18 @@
 //! inventory walker already enumerates and keeps only sessions whose newest
 //! byte is recent. Stage two parses those sessions, and because transcripts are
 //! append-only it keeps a byte offset per file and reads only the tail.
+//!
+//! The two providers record different evidence. Claude pairs a spawning tool
+//! call with its result; Codex gives every sub-agent its own rollout whose
+//! `session_meta` names the parent thread, and marks that rollout's turns with
+//! `task_started` / `task_complete` event records. Open therefore means the
+//! same thing on both — this agent is working now — but a Codex sub-agent
+//! thread survives its turn and reopens when its parent triggers the next one.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -37,6 +44,18 @@ const AGENT_FILE_PREFIX: &str = "agent-";
 const WORKFLOW_DIR_PREFIX: &str = "wf_";
 const WORKFLOW_JOURNAL: &str = "journal.jsonl";
 
+const CODEX_ROLLOUT_PREFIX: &str = "rollout-";
+const CODEX_THREAD_ID_LEN: usize = 36;
+/// Guard against a malformed parent chain walking forever. Measured Codex spawn
+/// depth across 4487 spawned rollouts reaches 3 (4175 at 1, 297 at 2, 15 at 3).
+const MAX_CODEX_SPAWN_DEPTH: u32 = 16;
+
+/// How far back a rollout is scanned for its newest turn boundary. Every one of
+/// the 4487 spawned rollouts measured has a boundary inside a window this long,
+/// and a window without one is itself the answer: a rollout only accumulates
+/// records inside a turn, so the tail is still in an open one.
+const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
+
 /// One transcript-derived session, shaped for the snapshot reconciler.
 pub(crate) struct TranscriptSession {
     pub(crate) provider: IntegrationProvider,
@@ -55,12 +74,14 @@ pub(crate) struct TranscriptAgent {
     pub(crate) open: bool,
 }
 
-/// Incremental scanner over the Claude transcript root.
+/// Incremental scanner over the provider transcript roots.
 ///
 /// State is per session and lives only while that session keeps producing
 /// evidence, so memory is bounded by live sessions rather than by history.
 #[derive(Default)]
 pub(crate) struct TranscriptScanner {
+    /// Claude only. A Codex pass reads each live rollout's head and turn tail
+    /// afresh, so it carries nothing between passes.
     sessions: HashMap<String, ScannedSession>,
     last_scan: Option<DateTime<Utc>>,
 }
@@ -137,21 +158,81 @@ struct JournalRecord {
     agent_id: Option<String>,
 }
 
+/// Rollouts belonging to one Codex root thread, collected by the stage-one
+/// sweep. Only rollouts inside the idle window are collected, so a sub-agent
+/// listed here is one whose file is still being written.
+struct CodexGroup {
+    newest: SystemTime,
+    agents: Vec<CodexAgentFile>,
+}
+
+impl Default for CodexGroup {
+    fn default() -> Self {
+        Self {
+            newest: SystemTime::UNIX_EPOCH,
+            agents: Vec::new(),
+        }
+    }
+}
+
+struct CodexAgentFile {
+    agent_id: String,
+    agent_type: Option<String>,
+    spawn_depth: u32,
+    path: PathBuf,
+}
+
+/// The `session_meta` record every Codex rollout opens with. It is written once
+/// at thread creation, so a re-read always yields the same answer.
+#[derive(Clone)]
+struct CodexHead {
+    session_id: String,
+    parent_id: Option<String>,
+    subagent: bool,
+    agent_role: Option<String>,
+    cwd: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+}
+
+const CODEX_EVENT_RECORD: &str = "event_msg";
+const CODEX_TURN_STARTED: &str = "task_started";
+const CODEX_TURN_COMPLETE: &str = "task_complete";
+const CODEX_TURN_ABORTED: &str = "turn_aborted";
+
+#[derive(Deserialize)]
+struct CodexEventRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Option<CodexEventPayload>,
+}
+
+#[derive(Deserialize)]
+struct CodexEventPayload {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+}
+
 impl TranscriptScanner {
-    /// Scan the configured Claude transcript root and return one session per
-    /// root transcript that is still producing evidence.
+    /// Scan the configured transcript roots and return one session per root
+    /// transcript that is still producing evidence.
     pub(crate) fn scan(&mut self, now: DateTime<Utc>) -> Vec<TranscriptSession> {
-        self.scan_claude_in(&crate::data_paths::resolve_claude_projects_dir(), now)
+        self.scan_in(
+            &crate::data_paths::resolve_claude_projects_dir(),
+            &crate::data_paths::resolve_codex_sessions_dir(),
+            now,
+        )
     }
 
-    fn scan_claude_in(
+    fn scan_in(
         &mut self,
         projects_dir: &Path,
+        codex_sessions_dir: &Path,
         now: DateTime<Utc>,
     ) -> Vec<TranscriptSession> {
         // A throttled pass returns nothing rather than stale work: the
         // reconciler still holds the previous pass's snapshots until they age
-        // out, so the reader sees the same state either way.
+        // out, so the reader sees the same state either way. One throttle
+        // covers both providers so a burst of reads costs one walk each.
         if self
             .last_scan
             .is_some_and(|last| now.signed_duration_since(last) < MIN_SCAN_INTERVAL)
@@ -159,6 +240,16 @@ impl TranscriptScanner {
             return Vec::new();
         }
         self.last_scan = Some(now);
+        let mut sessions = self.scan_claude_in(projects_dir, now);
+        sessions.extend(self.scan_codex_in(codex_sessions_dir, now));
+        sessions
+    }
+
+    fn scan_claude_in(
+        &mut self,
+        projects_dir: &Path,
+        now: DateTime<Utc>,
+    ) -> Vec<TranscriptSession> {
         let active = collect_active_sessions(projects_dir, now);
         // Idle sessions release their offsets and resolved ids; a later revival
         // simply re-reads from zero.
@@ -167,6 +258,49 @@ impl TranscriptScanner {
         active
             .into_iter()
             .filter_map(|(session_id, files)| self.session(session_id, files, now))
+            .collect()
+    }
+
+    /// Codex records no spawn/result pair. Every sub-agent instead gets its own
+    /// rollout whose `session_meta` names the thread that spawned it, and that
+    /// rollout's own turn records say whether it is still working: measured
+    /// across 4487 spawned rollouts, 4448 end on `task_complete` or
+    /// `turn_aborted` and the 39 left open all died mid-turn months ago, which
+    /// the idle window catches. `inter_agent_communication_metadata` carries
+    /// only `{trigger_turn}` — no agent identity — so it is not a lifecycle
+    /// source.
+    fn scan_codex_in(&mut self, sessions_dir: &Path, now: DateTime<Utc>) -> Vec<TranscriptSession> {
+        let index = codex_rollout_index(sessions_dir);
+        let mut heads = HashMap::<String, Option<CodexHead>>::new();
+        let mut groups = HashMap::<String, CodexGroup>::new();
+        // Only a rollout that is still being written can hold an open agent, so
+        // stage two reads the head of the fresh files and of the ancestors they
+        // name, never of the whole corpus.
+        for (id, (path, modified)) in &index {
+            if elapsed(now, *modified) > IDLE_AFTER {
+                continue;
+            }
+            let Some(head) = codex_head(id, &index, &mut heads) else {
+                continue;
+            };
+            let Some((root_id, spawn_depth)) = codex_root(&head, &index, &mut heads) else {
+                continue;
+            };
+            let group = groups.entry(root_id).or_default();
+            group.newest = group.newest.max(*modified);
+            if head.subagent {
+                group.agents.push(CodexAgentFile {
+                    agent_id: head.session_id,
+                    agent_type: head.agent_role,
+                    spawn_depth,
+                    path: path.clone(),
+                });
+            }
+        }
+
+        groups
+            .into_iter()
+            .filter_map(|(root_id, group)| codex_session(root_id, group, &index, &mut heads))
             .collect()
     }
 
@@ -348,6 +482,212 @@ fn claude_agent_id(path: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Stage one for Codex: stat every enumerated rollout and key it by the thread
+/// id its filename ends with.
+///
+/// `rollout-<timestamp>-<thread id>.jsonl` restates the file's own
+/// `session_meta` id — exact on all 5501 of 5502 rollouts measured, the odd one
+/// out having an unreadable head — so locating the ancestor a sub-agent names
+/// costs a map lookup rather than a second walk. The id is only a locator:
+/// identity always comes from the head record itself.
+fn codex_rollout_index(sessions_dir: &Path) -> HashMap<String, (PathBuf, SystemTime)> {
+    let mut index = HashMap::new();
+    for path in crate::sessions::discover_codex_transcripts_in(sessions_dir) {
+        let Some(thread_id) = codex_rollout_id(&path) else {
+            continue;
+        };
+        let Ok(modified) = std::fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        index.insert(thread_id, (path, modified));
+    }
+    index
+}
+
+fn codex_rollout_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix(CODEX_ROLLOUT_PREFIX)?;
+    let thread_id = rest.get(rest.len().checked_sub(CODEX_THREAD_ID_LEN)?..)?;
+    thread_id
+        .chars()
+        .all(|character| character.is_ascii_hexdigit() || character == '-')
+        .then(|| thread_id.to_owned())
+}
+
+/// Read one rollout's `session_meta`, memoised for the pass because the root of
+/// a deep chain is reached again from every sub-agent under it.
+fn codex_head(
+    thread_id: &str,
+    index: &HashMap<String, (PathBuf, SystemTime)>,
+    heads: &mut HashMap<String, Option<CodexHead>>,
+) -> Option<CodexHead> {
+    if let Some(cached) = heads.get(thread_id) {
+        return cached.clone();
+    }
+    let head = index
+        .get(thread_id)
+        .and_then(|(path, _)| read_codex_head(path));
+    heads.insert(thread_id.to_owned(), head.clone());
+    head
+}
+
+/// Identity comes from [`crate::transcript_identity::codex_metadata`], the same
+/// parser retained ingest uses, so which field names the spawning parent is
+/// decided in one place. Only the two fields that parser has no use for — the
+/// thread's own clock and its declared role — are read from the record here.
+fn read_codex_head(path: &Path) -> Option<CodexHead> {
+    let mut line = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .read_line(&mut line)
+        .ok()?;
+    let record = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    let metadata = crate::transcript_identity::codex_metadata(&record)?;
+    let payload = record.get("payload");
+    let string = |owner: Option<&serde_json::Value>, field: &str| {
+        owner
+            .and_then(|owner| owner.get(field))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    // `source` is a bare string on a user thread and an object naming the spawn
+    // on an older sub-agent thread, so it stays untyped.
+    let thread_spawn = payload
+        .and_then(|payload| payload.get("source"))
+        .and_then(|source| source.get("subagent"))
+        .and_then(|subagent| subagent.get("thread_spawn"));
+    Some(CodexHead {
+        session_id: metadata.source_session_id,
+        parent_id: metadata.parent_chain_id,
+        subagent: metadata.is_spawn,
+        agent_role: string(payload, "agent_role").or_else(|| string(thread_spawn, "agent_role")),
+        cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
+        started_at: string(payload, "timestamp")
+            .or_else(|| string(Some(&record), "timestamp"))
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc)),
+    })
+}
+
+/// Walk a rollout's parent chain to the user thread that owns it, counting the
+/// hops as spawn depth. Codex records only the immediate parent, and nesting is
+/// real: measured depths run 1–3 across 4487 spawned rollouts, every one of
+/// which resolves to a root thread the same corpus still holds.
+fn codex_root(
+    head: &CodexHead,
+    index: &HashMap<String, (PathBuf, SystemTime)>,
+    heads: &mut HashMap<String, Option<CodexHead>>,
+) -> Option<(String, u32)> {
+    let mut current = head.clone();
+    let mut depth = 0;
+    let mut seen = HashSet::from([current.session_id.clone()]);
+    while current.subagent {
+        let parent_id = current.parent_id.clone()?;
+        if !seen.insert(parent_id.clone()) || depth >= MAX_CODEX_SPAWN_DEPTH {
+            return None;
+        }
+        depth += 1;
+        current = codex_head(&parent_id, index, heads)?;
+    }
+    Some((current.session_id, depth))
+}
+
+fn codex_session(
+    root_id: String,
+    group: CodexGroup,
+    index: &HashMap<String, (PathBuf, SystemTime)>,
+    heads: &mut HashMap<String, Option<CodexHead>>,
+) -> Option<TranscriptSession> {
+    let root = codex_head(&root_id, index, heads)?;
+    let started_at = root.started_at?;
+    let last_activity = index
+        .get(&root_id)
+        .map_or(group.newest, |(_, modified)| group.newest.max(*modified));
+    Some(TranscriptSession {
+        provider: IntegrationProvider::Codex,
+        session_id: root_id,
+        cwd: root.cwd,
+        started_at,
+        last_activity: last_activity.into(),
+        agents: group
+            .agents
+            .into_iter()
+            .map(|agent| TranscriptAgent {
+                open: codex_agent_running(&agent.path),
+                agent_id: agent.agent_id,
+                agent_type: agent.agent_type,
+                spawn_depth: Some(agent.spawn_depth),
+            })
+            .collect(),
+    })
+}
+
+/// Whether a Codex rollout's newest turn boundary is a `task_started`.
+///
+/// A sub-agent thread outlives one turn — the parent re-triggers it through
+/// `inter_agent_communication_metadata`, and measured turns per spawned rollout
+/// reach 138 — so this is the newest boundary, never a count. Counting would be
+/// wrong anyway: starts exceed `task_complete` plus `turn_aborted` in most
+/// multi-turn rollouts, so an interrupted turn leaves a permanent imbalance
+/// while the last boundary stays exact.
+///
+/// A turn's own records sit between its start and its end, so the scan runs
+/// backwards from the end of the file: a forward pass would cost the whole
+/// rollout (measured 269MB across ten live sub-agents) to learn one bit, and
+/// would have to be remembered between passes. A rollout only accumulates
+/// records inside a turn, so a window this long with no boundary in it means
+/// the tail is still inside one.
+fn codex_agent_running(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    let start = length.saturating_sub(CODEX_TAIL_SCAN_BYTES);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return false;
+    }
+    let mut window = Vec::new();
+    if file.read_to_end(&mut window).is_err() {
+        return false;
+    }
+    // A truncated window starts mid-record; drop that fragment so every line
+    // scanned is a whole one.
+    let body = if start == 0 {
+        window.as_slice()
+    } else {
+        match window.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => &window[newline + 1..],
+            None => return true,
+        }
+    };
+    String::from_utf8_lossy(body)
+        .lines()
+        .rev()
+        .find_map(codex_turn_event)
+        .map_or(start > 0, |event| event == CODEX_TURN_STARTED)
+}
+
+/// The turn-lifecycle event a rollout line carries, if any.
+///
+/// Rollouts also carry whole-file `world_state` snapshots, so the cheap
+/// substring test keeps those megabytes out of the JSON parser.
+fn codex_turn_event(line: &str) -> Option<&'static str> {
+    if !line.contains(CODEX_EVENT_RECORD) {
+        return None;
+    }
+    let record = serde_json::from_str::<CodexEventRecord>(line).ok()?;
+    if record.kind != CODEX_EVENT_RECORD {
+        return None;
+    }
+    match record.payload?.kind?.as_str() {
+        CODEX_TURN_STARTED => Some(CODEX_TURN_STARTED),
+        CODEX_TURN_COMPLETE => Some(CODEX_TURN_COMPLETE),
+        CODEX_TURN_ABORTED => Some(CODEX_TURN_ABORTED),
+        _ => None,
+    }
+}
+
 fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
     let stem = transcript.file_stem()?.to_str()?;
     let meta = transcript.with_file_name(format!("{stem}.meta.json"));
@@ -485,8 +825,83 @@ mod tests {
         /// the way real reads spaced across a session do.
         fn scan(&self, scanner: &mut TranscriptScanner) -> Vec<TranscriptSession> {
             let pass = self.pass.replace(self.pass.get() + 1);
-            scanner.scan_claude_in(self.root.path(), Utc::now() + TimeDelta::seconds(pass * 5))
+            scanner.scan_in(
+                self.root.path(),
+                &self.root.path().join("absent-codex-root"),
+                Utc::now() + TimeDelta::seconds(pass * 5),
+            )
         }
+    }
+
+    /// A Codex sessions root holding hand-written rollouts.
+    struct CodexFixture {
+        root: tempfile::TempDir,
+        pass: std::cell::Cell<i64>,
+    }
+
+    impl CodexFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().expect("create codex fixture root");
+            fs::create_dir_all(root.path().join("2026/08/08")).expect("create codex day tree");
+            Self {
+                root,
+                pass: std::cell::Cell::new(0),
+            }
+        }
+
+        fn path(&self, thread_id: &str) -> PathBuf {
+            self.root
+                .path()
+                .join("2026/08/08")
+                .join(format!("rollout-2026-08-08T00-00-00-{thread_id}.jsonl"))
+        }
+
+        /// Write a rollout opening with `session_meta` plus the turn records
+        /// that follow it.
+        fn write(&self, thread_id: &str, meta: &str, records: &[&str]) {
+            let mut body = format!(
+                "{{\"timestamp\":\"2026-08-08T00:00:00Z\",\"type\":\"session_meta\",\
+                 \"payload\":{{\"id\":\"{thread_id}\",\"timestamp\":\"2026-08-08T00:00:00Z\",\
+                 \"cwd\":\"/home/user/project\"{meta}}}}}\n"
+            );
+            for record in records {
+                body.push_str(record);
+                body.push('\n');
+            }
+            fs::write(self.path(thread_id), body).expect("write rollout");
+        }
+
+        fn scan(&self, scanner: &mut TranscriptScanner) -> Vec<TranscriptSession> {
+            let pass = self.pass.replace(self.pass.get() + 1);
+            scanner.scan_in(
+                &self.root.path().join("absent-claude-root"),
+                self.root.path(),
+                Utc::now() + TimeDelta::seconds(pass * 5),
+            )
+        }
+    }
+
+    /// The modern flat spawn marker: `thread_source` plus `parent_thread_id`.
+    fn spawned_by(parent: &str, role: &str) -> String {
+        format!(
+            ",\"thread_source\":\"subagent\",\"parent_thread_id\":\"{parent}\",\
+             \"agent_role\":\"{role}\""
+        )
+    }
+
+    fn turn(kind: &str) -> String {
+        format!("{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{kind}\"}}}}")
+    }
+
+    fn open_agents(session: &TranscriptSession) -> Vec<&str> {
+        let mut open = session
+            .agents
+            .iter()
+            .filter(|agent| agent.open)
+            .map(|agent| agent.agent_id.as_str())
+            .collect::<Vec<_>>();
+        open.sort_unstable();
+        open
     }
 
     fn start_record() -> String {
@@ -708,19 +1123,168 @@ mod tests {
         let mut scanner = TranscriptScanner::default();
         let now = Utc::now();
 
-        assert_eq!(scanner.scan_claude_in(fixture.root.path(), now).len(), 1);
+        let absent = fixture.root.path().join("absent-codex-root");
+        assert_eq!(scanner.scan_in(fixture.root.path(), &absent, now).len(), 1);
         // A second reader inside the same window gets nothing new to apply; the
         // reconciler keeps what the first pass produced.
         assert!(
             scanner
-                .scan_claude_in(fixture.root.path(), now + TimeDelta::seconds(1))
+                .scan_in(fixture.root.path(), &absent, now + TimeDelta::seconds(1))
                 .is_empty()
         );
         assert_eq!(
             scanner
-                .scan_claude_in(fixture.root.path(), now + MIN_SCAN_INTERVAL)
+                .scan_in(fixture.root.path(), &absent, now + MIN_SCAN_INTERVAL)
                 .len(),
             1
         );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Rollout Turn Resolution]]
+    #[test]
+    fn codex_agents_resolve_from_their_own_turn_records() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let working = "019fe372-6824-70e3-8fcd-000000000001";
+        let finished = "019fe372-6824-70e3-8fcd-000000000002";
+        let aborted = "019fe372-6824-70e3-8fcd-000000000003";
+        fixture.write(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[&turn("task_started")],
+        );
+        fixture.write(
+            working,
+            &spawned_by(root, "explorer"),
+            &[&turn("task_started")],
+        );
+        fixture.write(
+            finished,
+            &spawned_by(root, "worker"),
+            &[&turn("task_started"), &turn("task_complete")],
+        );
+        fixture.write(
+            aborted,
+            &spawned_by(root, "worker"),
+            &[&turn("task_started"), &turn("turn_aborted")],
+        );
+
+        let mut scanner = TranscriptScanner::default();
+        let sessions = fixture.scan(&mut scanner);
+        let session = sessions.first().expect("one scanned session");
+        assert_eq!(session.provider, IntegrationProvider::Codex);
+        // The root thread is the session, never one of its own agents.
+        assert_eq!(session.session_id, root);
+        assert_eq!(session.agents.len(), 3);
+        assert_eq!(session.cwd.as_deref(), Some("/home/user/project"));
+        assert_eq!(open_agents(session), vec![working]);
+        assert_eq!(
+            session
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == working)
+                .and_then(|agent| agent.agent_type.as_deref()),
+            Some("explorer")
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Spawn Chain Grouping]]
+    #[test]
+    fn nested_codex_spawns_group_under_the_user_thread() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let child = "019fe372-6824-70e3-8fcd-000000000001";
+        let grandchild = "019fe372-6824-70e3-8fcd-000000000002";
+        fixture.write(root, "", &[]);
+        fixture.write(child, &spawned_by(root, "worker"), &[&turn("task_started")]);
+        // The legacy nested spawn marker carries the same parentage.
+        fixture.write(
+            grandchild,
+            &format!(
+                ",\"source\":{{\"subagent\":{{\"thread_spawn\":{{\
+                 \"parent_thread_id\":\"{child}\",\"agent_role\":\"explorer\"}}}}}}"
+            ),
+            &[&turn("task_started")],
+        );
+
+        let mut scanner = TranscriptScanner::default();
+        let sessions = fixture.scan(&mut scanner);
+        assert_eq!(sessions.len(), 1, "every spawn belongs to one root session");
+        let session = &sessions[0];
+        assert_eq!(session.session_id, root);
+        assert_eq!(open_agents(session), vec![child, grandchild]);
+        let depths = session
+            .agents
+            .iter()
+            .map(|agent| (agent.agent_id.as_str(), agent.spawn_depth))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(depths[child], Some(1));
+        assert_eq!(depths[grandchild], Some(2));
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Turn Tail Parsing]]
+    #[test]
+    fn codex_turn_state_is_read_backwards_from_the_end() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let agent = "019fe372-6824-70e3-8fcd-000000000001";
+        fixture.write(root, "", &[]);
+        // A turn's own records push its `task_started` out of the scan window,
+        // and a window with no boundary in it is itself the answer: still
+        // inside a turn.
+        let filler = format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"text\":\"{}\"}}}}",
+            "x".repeat(4096)
+        );
+        let mut records = vec![turn("task_started")];
+        records.resize(records.len() + 512, filler);
+        fixture.write(
+            agent,
+            &spawned_by(root, "worker"),
+            &records.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert!(
+            fs::metadata(fixture.path(agent)).expect("stat agent").len() > CODEX_TAIL_SCAN_BYTES
+        );
+
+        let mut scanner = TranscriptScanner::default();
+        let first = fixture.scan(&mut scanner);
+        assert_eq!(open_agents(&first[0]), vec![agent]);
+
+        // A record still mid-write has no terminating newline; the scan skips
+        // the fragment rather than reading half a record as a boundary.
+        append_raw(&fixture.path(agent), &turn("task_complete")[..12]);
+        let second = fixture.scan(&mut scanner);
+        assert_eq!(open_agents(&second[0]), vec![agent]);
+
+        append_raw(
+            &fixture.path(agent),
+            &format!("{}\n", &turn("task_complete")[12..]),
+        );
+        let third = fixture.scan(&mut scanner);
+        assert!(open_agents(&third[0]).is_empty());
+        assert!(third[0].last_activity >= first[0].last_activity);
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Idle Cutoff]]
+    #[test]
+    fn quiet_codex_rollouts_leave_the_scan() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let agent = "019fe372-6824-70e3-8fcd-000000000001";
+        fixture.write(root, "", &[]);
+        fixture.write(agent, &spawned_by(root, "worker"), &[&turn("task_started")]);
+
+        // A thread that died mid-turn leaves an unmatched `task_started`, so
+        // silence past the cutoff is the only evidence that it is gone.
+        touch(&fixture.path(agent), Duration::from_secs(3600));
+        let mut scanner = TranscriptScanner::default();
+        let sessions = fixture.scan(&mut scanner);
+        assert!(open_agents(&sessions[0]).is_empty());
+        assert!(sessions[0].agents.is_empty());
+
+        touch(&fixture.path(root), Duration::from_secs(3600));
+        assert!(fixture.scan(&mut scanner).is_empty());
+        assert!(scanner.sessions.is_empty());
     }
 }

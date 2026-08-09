@@ -524,23 +524,24 @@ impl ObservedSubagentState {
         reconciler.apply(snapshot)
     }
 
-    /// Re-derive live session and agent state from Claude transcripts.
+    /// Re-derive live session and agent state from Claude and Codex
+    /// transcripts.
     ///
     /// The evidence is file content rather than observed events, so a session
     /// that started before Quill launched reports correct agent counts on the
     /// first scan. Callers run this on a blocking thread immediately before a
     /// Sessions read, which is also its refresh cadence.
     ///
-    /// ponytail: Claude only. Codex rollouts carry no measured spawn/result
-    /// pairing, so Codex keeps its observed-event source until that evidence
-    /// exists (quill-cr3.4).
+    /// A disabled provider still costs nothing: the reconciler refuses its
+    /// snapshots, so the pass only runs while at least one provider accepts.
     pub(crate) fn refresh_from_transcripts(&self) {
-        if !self
-            .inner
-            .lock()
-            .unwrap()
-            .accepts(IntegrationProvider::Claude.as_str())
-        {
+        let accepted = {
+            let reconciler = self.inner.lock().unwrap();
+            [IntegrationProvider::Claude, IntegrationProvider::Codex]
+                .into_iter()
+                .any(|provider| reconciler.accepts(provider.as_str()))
+        };
+        if !accepted {
             return;
         }
         let Some(host) = local_observed_host() else {
