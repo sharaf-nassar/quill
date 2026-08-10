@@ -2,67 +2,140 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { handleInvoke } from "../src/mocks/ipcFixtures.ts";
 import {
-	formatObservedSubagentModels,
+	formatAdaptiveClockDurationSecs,
+	formatClockDurationSecs,
+	formatExtrapolatedRuntime,
+	formatObservedSessionAgents,
+	isSessionLive,
 	resolveSessionMetrics,
 } from "../src/utils/format.ts";
 
-// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Positive-Only Sessions Rows]]
-test("formats exact model groups with tier order and an honest unknown tail", () => {
-	assert.equal(formatObservedSubagentModels("claude", null, null), null);
-	assert.equal(formatObservedSubagentModels("codex", 0, []), null);
-	assert.deepEqual(formatObservedSubagentModels("claude", 5, [
-		{ model_id: "claude-sonnet-4-6", count: 3 },
-		{ model_id: "claude-opus-4-6", count: 2 },
-	]), {
-		text: "2 × Opus · 3 × Sonnet",
-		ariaLabel: "5 subagents observed open: 2 Opus agents, 3 Sonnet agents",
-	});
-	assert.deepEqual(formatObservedSubagentModels("codex", 6, [
-		{ model_id: "gpt-5.6-luna", count: 2 },
-		{ model_id: "gpt-5.6-sol", count: 2 },
-		{ model_id: "gpt-5.6-sol-20260805", count: 1 },
-		{ model_id: "gpt-5.6-terra", count: 1 },
-	]), {
-		text: "3 × Sol · 1 × Terra · 2 × Luna",
-		ariaLabel: "6 subagents observed open: 3 Sol agents, 1 Terra agent, 2 Luna agents",
-	});
-	assert.deepEqual(formatObservedSubagentModels("claude", 3, [
-		{ model_id: "claude-opus-4-6", count: 1 },
-	]), {
-		text: "1 × Opus · 2 × ?",
-		ariaLabel: "3 subagents observed open: 1 Opus agent, 2 unresolved model agents",
-	});
-	assert.deepEqual(formatObservedSubagentModels("claude", 3, [
-		{ model_id: "claude-fable-5", count: 1 },
-		{ model_id: "future-claude", count: 2 },
-	]), {
-		text: "1 × Fable · 2 × future-claude",
-		ariaLabel: "3 subagents observed open: 1 Fable agent, 2 future-claude agents",
-	});
-	assert.deepEqual(formatObservedSubagentModels("codex", 1, [
-		{ model_id: "future-model", count: 2 },
-	]), {
-		text: "1 × ?",
-		ariaLabel: "1 subagent observed open: 1 unresolved model agent",
-	});
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Terminal Hook Liveness]]
+test("terminal hooks win ties while newer activity reopens", () => {
+	const now = new Date("2030-01-01T00:04:00Z").getTime();
+	assert.equal(isSessionLive("2030-01-01T00:00:00Z", null, now), true);
+	assert.equal(isSessionLive(
+		"2030-01-01T00:00:00Z",
+		null,
+		new Date("2030-01-01T00:05:00Z").getTime(),
+	), false);
+	assert.equal(isSessionLive(
+		"2030-01-01T00:00:00Z",
+		"2030-01-01T00:00:00Z",
+		now,
+	), false);
+	assert.equal(isSessionLive(
+		"2030-01-01T00:00:01Z",
+		"2030-01-01T00:00:00Z",
+		now,
+	), true);
+	assert.equal(isSessionLive("2030-01-01T00:00:00Z", "invalid", now), true);
 });
 
-test("Sessions fixtures preserve null, zero, singular, and plural states", () => {
-	const rows = handleInvoke("get_session_breakdown");
-	assert.ok(rows.every((row) => "observed_subagent_count" in row));
-	assert.ok(rows.every((row) => "observed_only" in row));
-	assert.ok(rows.every((row) => !("subagent_count" in row) && !("has_subagents" in row)));
-	assert.deepEqual(
-		rows.map((row) => row.observed_subagent_count),
-		[3, 0, null, 1, 2],
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Runtime Extrapolation]]
+test("extrapolates runtime from producer time without running backward", () => {
+	assert.equal(formatExtrapolatedRuntime(null, 1_000, 2, 3_500), "—");
+	assert.equal(formatExtrapolatedRuntime(10, 1_000, 2, 3_500), "15s");
+	assert.equal(formatExtrapolatedRuntime(10, 4_000, 2, 3_500), "10s");
+	assert.equal(formatExtrapolatedRuntime(10, null, 2, 3_500), "10s");
+	assert.equal(formatClockDurationSecs(null), "—");
+	assert.equal(formatClockDurationSecs(0), "0 m");
+	assert.equal(formatClockDurationSecs(420), "7 m");
+	assert.equal(formatClockDurationSecs(12_179), "3:22");
+	assert.equal(formatClockDurationSecs(101_279), "1:04:07");
+	assert.equal(formatClockDurationSecs(8_640_000), "100:00:00");
+	assert.equal(formatAdaptiveClockDurationSecs(null), "—");
+	assert.equal(formatAdaptiveClockDurationSecs(0.9), "0s");
+	assert.equal(formatAdaptiveClockDurationSecs(45.9), "45s");
+	assert.equal(formatAdaptiveClockDurationSecs(202.9), "3:22");
+	assert.equal(formatAdaptiveClockDurationSecs(3_847.9), "1:04:07");
+	assert.equal(formatAdaptiveClockDurationSecs(101_229.9), "1:04:07:09");
+	assert.equal(
+		formatExtrapolatedRuntime(12_120, 1_000, 2, 30_500, formatClockDurationSecs),
+		"3:22",
 	);
-	const idlePositive = rows.find((row) => row.observed_subagent_count === 1);
-	assert.ok(Date.now() - new Date(idlePositive.last_active).getTime() > 5 * 60_000);
-	assert.notEqual(formatObservedSubagentModels(
-		idlePositive.provider,
-		idlePositive.observed_subagent_count,
-		idlePositive.observed_subagent_models,
-	), null);
+	assert.equal(
+		formatExtrapolatedRuntime(180, 1_000, 1, 23_900, formatAdaptiveClockDurationSecs),
+		"3:22",
+	);
+});
+
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Sessions Agent Runtime Rows]]
+test("formats every open agent with ordered model and runtime identity", () => {
+	assert.deepEqual(formatObservedSessionAgents("claude", null, 1_000, 3_000), []);
+	assert.deepEqual(formatObservedSessionAgents("claude", [
+		{ agent_id: "sonnet", model_id: "claude-sonnet-4-6", agent_type: null, runtime_secs: null, runtime_active: true },
+		{ agent_id: "opus-b", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 272, runtime_active: false },
+		{ agent_id: "opus-a", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 3_840, runtime_active: true },
+	], 1_000, 3_000), [
+		{
+			agentId: "opus-a",
+			model: "Opus",
+			runtime: "1h 4m",
+			ariaLabel: "claude-opus-4-6, agent opus-a, 1h 4m active runtime",
+		},
+		{
+			agentId: "opus-b",
+			model: "Opus",
+			runtime: "4m 32s",
+			ariaLabel: "claude-opus-4-6, agent opus-b, 4m 32s active runtime",
+		},
+		{
+			agentId: "sonnet",
+			model: "Sonnet",
+			runtime: "—",
+			ariaLabel: "claude-sonnet-4-6, agent sonnet, runtime unavailable",
+		},
+	]);
+	assert.deepEqual(
+		formatObservedSessionAgents("codex", [
+			{ agent_id: "luna", model_id: "gpt-5.6-luna", agent_type: null, runtime_secs: 1, runtime_active: true },
+			{ agent_id: "unknown", model_id: null, agent_type: null, runtime_secs: 2, runtime_active: false },
+			{ agent_id: "terra", model_id: "gpt-5.6-terra", agent_type: null, runtime_secs: 3, runtime_active: false },
+			{ agent_id: "sol", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 4, runtime_active: true },
+		], 1_000, 3_000).map(({ agentId, model, runtime }) => ({ agentId, model, runtime })),
+		[
+			{ agentId: "sol", model: "Sol", runtime: "6s" },
+			{ agentId: "terra", model: "Terra", runtime: "3s" },
+			{ agentId: "luna", model: "Luna", runtime: "3s" },
+			{ agentId: "unknown", model: "?", runtime: "2s" },
+		],
+	);
+});
+
+test("Sessions fixtures expose lifetime and current-turn runtime evidence", () => {
+	const rows = handleInvoke("get_session_breakdown");
+	assert.ok(rows.every((row) => "active_runtime_secs" in row));
+	assert.ok(rows.every((row) => "runtime_as_of_ms" in row));
+	assert.ok(rows.every((row) => "active_runtime_rate" in row));
+	assert.ok(rows.every((row) => "observed_agents" in row));
+	assert.ok(rows.every((row) => "observed_only" in row));
+	assert.ok(rows.every((row) => "ended_at" in row));
+	assert.ok(rows.every((row) => !("observed_subagent_count" in row) && !("observed_subagent_models" in row)));
+	assert.deepEqual(
+		rows.map((row) => row.observed_agents?.length ?? row.observed_agents),
+		[3, 0, null, 0, 2],
+	);
+	assert.deepEqual(rows.map((row) => row.agent_count), [5, 3, null, 0, null]);
+	const now = Date.now();
+	for (const row of rows) {
+		const liveRoot = row.current_turn_runtime_active ? 1 : 0;
+		const activeAgents = (row.observed_agents ?? []).filter(
+			(agent) => agent.runtime_secs !== null && agent.runtime_active,
+		).length;
+		assert.equal(row.active_runtime_rate, liveRoot + activeAgents);
+	}
+	const liveAgents = rows.find((row) => row.observed_agents?.length === 3);
+	assert.equal(liveAgents.active_runtime_secs, 4_823);
+	assert.equal(liveAgents.current_turn_runtime_secs, 41);
+	assert.equal(liveAgents.current_turn_runtime_active, true);
+	assert.equal(liveAgents.agent_runtime_secs, 4_212);
+	assert.equal(formatObservedSessionAgents(
+		liveAgents.provider,
+		liveAgents.observed_agents,
+		liveAgents.runtime_as_of_ms,
+		Date.now(),
+	).length, 3);
 });
 
 // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Observed-Only Sessions Presentation]]

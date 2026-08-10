@@ -1,14 +1,23 @@
-import type { IntegrationProvider, ObservedSubagentModelGroup } from "../types";
+import type { IntegrationProvider, ObservedSessionAgent } from "../types";
+
+/** Five minutes covers a long turn while bounding missing-hook crash fallback. */
+const SESSION_LIVE_WINDOW_MS = 5 * 60_000;
+
+export function isSessionLive(
+	lastActive: string,
+	endedAt: string | null,
+	nowMs: number,
+): boolean {
+	const activity = new Date(lastActive).getTime();
+	if (!Number.isFinite(activity)) return false;
+	const ended = endedAt === null ? Number.NaN : new Date(endedAt).getTime();
+	return !(Number.isFinite(ended) && ended >= activity)
+		&& nowMs - activity < SESSION_LIVE_WINDOW_MS;
+}
 
 /** Format a number with thousand separators: 1234567 → "1,234,567" */
 export function formatNumber(n: number): string {
 	return n.toLocaleString("en-US");
-}
-
-interface DisplayAgentModelGroup {
-	label: string;
-	count: number;
-	rank: number;
 }
 
 function agentModelFamily(provider: IntegrationProvider, modelId: string) {
@@ -23,46 +32,51 @@ function agentModelFamily(provider: IntegrationProvider, modelId: string) {
 	return family ? { label: family[0], rank: family[1] } : { label: modelId, rank: 100 };
 }
 
-export function formatObservedSubagentModels(
+export function formatExtrapolatedRuntime(
+	runtimeSecs: number | null,
+	runtimeAsOfMs: number | null,
+	rate: number,
+	nowMs: number,
+	format: (secs: number | null) => string = formatDurationSecs,
+): string {
+	if (runtimeSecs === null) return "—";
+	const elapsedSecs = runtimeAsOfMs === null
+		? 0
+		: Math.max(0, nowMs - runtimeAsOfMs) / 1_000;
+	return format(runtimeSecs + elapsedSecs * rate);
+}
+
+export function formatObservedSessionAgents(
 	provider: IntegrationProvider,
-	count: number | null,
-	groups: readonly ObservedSubagentModelGroup[] | null,
+	agents: readonly ObservedSessionAgent[] | null,
+	runtimeAsOfMs: number | null,
+	nowMs: number,
 ) {
-	if (count === null || count <= 0) return null;
-	const byLabel = new Map<string, DisplayAgentModelGroup>();
-	let validTotal = 0;
-	for (const group of groups ?? []) {
-		if (!Number.isInteger(group.count) || group.count <= 0) continue;
-		validTotal += group.count;
-		const family = group.model_id === null
-			? group.agent_type
-				? { label: group.agent_type, rank: 100 }
+	return (agents ?? []).map((agent) => {
+		const family = agent.model_id === null
+			? agent.agent_type
+				? { label: agent.agent_type, rank: 100 }
 				: { label: "?", rank: Number.MAX_SAFE_INTEGER }
-			: agentModelFamily(provider, group.model_id);
-		const current = byLabel.get(family.label);
-		if (current) current.count += group.count;
-		else byLabel.set(family.label, { ...family, count: group.count });
-	}
-	if (validTotal > count) {
-		byLabel.clear();
-		validTotal = 0;
-	}
-	if (validTotal < count) {
-		const unresolved = byLabel.get("?");
-		if (unresolved) unresolved.count += count - validTotal;
-		else byLabel.set("?", { label: "?", count: count - validTotal, rank: Number.MAX_SAFE_INTEGER });
-	}
-	const displayGroups = [...byLabel.values()].sort(
-		(left, right) => left.rank - right.rank || left.label.localeCompare(right.label),
-	);
-	const text = displayGroups.map((group) => `${group.count} × ${group.label}`).join(" · ");
-	const breakdown = displayGroups
-		.map((group) => `${group.count} ${group.label === "?" ? "unresolved model" : group.label} agent${group.count === 1 ? "" : "s"}`)
-		.join(", ");
-	return {
-		text,
-		ariaLabel: `${count} subagent${count === 1 ? "" : "s"} observed open: ${breakdown}`,
-	};
+			: agentModelFamily(provider, agent.model_id);
+		const runtime = formatExtrapolatedRuntime(
+			agent.runtime_secs,
+			runtimeAsOfMs,
+			agent.runtime_active ? 1 : 0,
+			nowMs,
+		);
+		const identity = agent.model_id ?? agent.agent_type ?? "Unknown model";
+		return {
+			agentId: agent.agent_id,
+			model: family.label,
+			runtime,
+			ariaLabel: `${identity}, agent ${agent.agent_id}, ${runtime === "—" ? "runtime unavailable" : `${runtime} active runtime`}`,
+			rank: family.rank,
+		};
+	}).sort((left, right) =>
+		left.rank - right.rank
+		|| left.model.localeCompare(right.model)
+		|| left.agentId.localeCompare(right.agentId)
+	).map(({ rank: _, ...agent }) => agent);
 }
 
 export function resolveSessionMetrics(
@@ -105,4 +119,35 @@ export function formatDurationSecs(secs: number | null): string {
 	const d = Math.floor(secs / 86400);
 	const h = Math.round((secs % 86400) / 3600);
 	return h === 0 ? `${d}d` : `${d}d ${h}h`;
+}
+
+/** Format seconds as compact days:hours:minutes, flooring partial minutes. */
+export function formatClockDurationSecs(secs: number | null): string {
+	if (secs === null) return "—";
+	const { days, hours, minutes } = clockParts(secs);
+	if (days > 0) return `${days}:${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
+	if (hours > 0) return `${hours}:${String(minutes).padStart(2, "0")}`;
+	return `${minutes} m`;
+}
+
+/** Format seconds as an adaptive clock, flooring partial seconds. */
+export function formatAdaptiveClockDurationSecs(secs: number | null): string {
+	if (secs === null) return "—";
+	const { days, hours, minutes, seconds } = clockParts(secs);
+	const mm = String(minutes).padStart(2, "0");
+	const ss = String(seconds).padStart(2, "0");
+	if (days > 0) return `${days}:${String(hours).padStart(2, "0")}:${mm}:${ss}`;
+	if (hours > 0) return `${hours}:${mm}:${ss}`;
+	if (minutes > 0) return `${minutes}:${ss}`;
+	return `${seconds}s`;
+}
+
+function clockParts(secs: number) {
+	const totalSeconds = Math.floor(secs);
+	return {
+		days: Math.floor(totalSeconds / 86_400),
+		hours: Math.floor(totalSeconds / 3_600) % 24,
+		minutes: Math.floor(totalSeconds / 60) % 60,
+		seconds: totalSeconds % 60,
+	};
 }

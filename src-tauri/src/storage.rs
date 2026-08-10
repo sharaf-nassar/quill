@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 39;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 40;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -362,7 +362,6 @@ CREATE TABLE IF NOT EXISTS context_savings_events (
     estimate_method TEXT,
     estimate_confidence REAL,
     source_ref TEXT,
-    snapshot_ref TEXT,
     metadata_json TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -385,9 +384,8 @@ CREATE INDEX IF NOT EXISTS idx_context_savings_cwd_timestamp
 // Aggregate fragment shared by summary, timeseries, and breakdowns.
 //
 // Byte and token-indexed/returned columns sum every event so breakdown rows
-// still surface router/telemetry traffic accurately.  The saved and preserved
-// token columns are filtered to `category IN ('preservation', 'retrieval')`
-// so capture-hook telemetry no longer pollutes the headline metric — rows
+// still surface routing traffic accurately. The saved and preserved token
+// columns are filtered to `category IN ('preservation', 'retrieval')` so rows
 // outside that scope contribute zero to those two columns.
 const CONTEXT_SAVINGS_AGGREGATES_SQL: &str = r#"
 COUNT(*),
@@ -427,12 +425,11 @@ COALESCE(SUM(
 
 // Category-scoped totals returned alongside the legacy aggregate.  Each
 // token CASE picks from exactly one category, so the three numbers partition
-// the active range cleanly without double-counting.  Routing and telemetry
-// also expose their own event counts because the `routerEventCount` field
-// derived from the breakdown only sees `router.*` event-type strings, while
-// the routing *category* additionally includes `mcp.search`, bounded
-// `mcp.execute` results, and `capture.guidance` — so the headline token
-// total and the supporting subtitle stay aligned.
+// the active range cleanly without double-counting. Routing also exposes its
+// own event count because the `routerEventCount` field derived from the
+// breakdown only sees `router.*` event-type strings, while the routing
+// category additionally includes `mcp.search` and bounded `mcp.execute`
+// results. This keeps the headline token total and subtitle aligned.
 const CONTEXT_SAVINGS_CATEGORY_TOTALS_SQL: &str = r#"
 COALESCE(SUM(
     CASE WHEN category = 'preservation'
@@ -452,7 +449,6 @@ COALESCE(SUM(
         ELSE 0
     END
 ), 0),
-COALESCE(SUM(CASE WHEN category = 'telemetry' THEN 1 ELSE 0 END), 0),
 COALESCE(SUM(CASE WHEN category = 'routing' THEN 1 ELSE 0 END), 0)
 "#;
 
@@ -1334,7 +1330,6 @@ fn context_savings_summary_from_row_at(
         tokens_preserved: 0,
         tokens_retrieved: 0,
         tokens_routing: 0,
-        telemetry_event_count: 0,
         routing_event_count: 0,
         sources_preserved: 0,
         sources_retrieved: 0,
@@ -1352,21 +1347,19 @@ fn apply_category_totals(
          FROM context_savings_events
          WHERE timestamp >= ?1"
     );
-    let (preserved, retrieved, routing, telemetry, routing_events) = conn
+    let (preserved, retrieved, routing, routing_events) = conn
         .query_row(&sql, params![from], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|e| format!("Query context savings category totals error: {e}"))?;
     summary.tokens_preserved = preserved;
     summary.tokens_retrieved = retrieved;
     summary.tokens_routing = routing;
-    summary.telemetry_event_count = telemetry;
     summary.routing_event_count = routing_events;
     Ok(())
 }
@@ -5629,7 +5622,6 @@ impl Storage {
                 estimate_method TEXT,
                 estimate_confidence REAL,
                 source_ref TEXT,
-                snapshot_ref TEXT,
                 metadata_json TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -7860,6 +7852,35 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 39: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 39 commit: {e}"))?;
+        }
+
+        // Migration 40 retires continuity telemetry and its snapshot-only
+        // reference. The row purge and schema change commit together so an
+        // interrupted upgrade cannot leave a partially retired contract.
+        if current_version < 40 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 40 transaction: {e}"))?;
+            tx.execute(
+                "DELETE FROM context_savings_events
+                 WHERE event_type IN (
+                     'capture.event',
+                     'capture.snapshot',
+                     'capture.guidance',
+                     'mcp.continuity',
+                     'mcp.snapshot'
+                 )",
+                [],
+            )
+            .map_err(|e| format!("Migration 40 (delete continuity telemetry): {e}"))?;
+            if table_has_column(&tx, "context_savings_events", "snapshot_ref") {
+                tx.execute_batch("ALTER TABLE context_savings_events DROP COLUMN snapshot_ref;")
+                    .map_err(|e| format!("Migration 40 (drop snapshot reference): {e}"))?;
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (40)", [])
+                .map_err(|e| format!("Failed to record migration 40: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 40 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -12288,10 +12309,9 @@ impl Storage {
                          estimate_method,
                          estimate_confidence,
                          source_ref,
-                         snapshot_ref,
                          metadata_json
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 )
                 .map_err(|e| format!("Prepare context savings insert error: {e}"))?;
 
@@ -12349,7 +12369,6 @@ impl Storage {
                         event.estimate_method.as_deref(),
                         event.estimate_confidence,
                         event.source_ref.as_deref(),
-                        event.snapshot_ref.as_deref(),
                         metadata_json,
                     ])
                     .map_err(|e| format!("Insert context savings event error: {e}"))?;
@@ -12583,7 +12602,6 @@ impl Storage {
                      estimate_method,
                      estimate_confidence,
                      source_ref,
-                     snapshot_ref,
                      metadata_json,
                      created_at
                  FROM context_savings_events
@@ -12619,9 +12637,8 @@ impl Storage {
                     estimate_method: row.get(20)?,
                     estimate_confidence: row.get(21)?,
                     source_ref: row.get(22)?,
-                    snapshot_ref: row.get(23)?,
-                    metadata_json: parse_context_savings_metadata(row.get(24)?),
-                    created_at: row.get(25)?,
+                    metadata_json: parse_context_savings_metadata(row.get(23)?),
+                    created_at: row.get(24)?,
                 })
             })
             .map_err(|e| format!("Query recent context savings events error: {e}"))?;
@@ -13052,12 +13069,13 @@ impl Storage {
         //
         // * tokens / first_seen / last_active come from `token_snapshots`
         //   (the only source of per-row token amounts).
-        // * turn_count comes from `response_times` because each sub-agent
-        //   turn produces its own user/assistant pair there — counting
-        //   token_snapshots rows would double-count snapshot heartbeats.
-        // * last_active is MAX across BOTH token_snapshots and
-        //   response_times so an active sub-agent turn keeps the parent's
-        //   active badge lit even if no token snapshot landed yet.
+        // * turn_count is the lifetime count of completed root prompt/response
+        //   pairs. Sub-agent turns and the selected token range do not change
+        //   this session-lifetime fact.
+        // * last_active is MAX across semantic response activity and token
+        //   snapshots, except token bookkeeping after a terminal hook is
+        //   clamped to that hook. A newer response or transcript scan still
+        //   reopens the session.
         // Rank only the cheap, range-scoped token groups plus each group's
         // indexed response-time maximum. Materializing that top-N frontier
         // lets LIMIT prune the turn/project enrichment below.
@@ -13094,14 +13112,40 @@ impl Storage {
              ), rankable AS MATERIALIZED (
                  SELECT tok.*,
                         (SELECT MAX(rt.timestamp) FROM response_times rt
+                          LEFT JOIN transcript_analytics_sources AS source
+                            ON source.provider = rt.provider
+                           AND source.source_key = rt.source_key
+                          LEFT JOIN live_analytics_sessions AS live
+                            ON rt.source_key IS NULL
+                           AND live.provider = rt.provider
+                           AND live.session_id = rt.session_id
                           WHERE rt.provider = tok.provider
                             AND rt.session_id = tok.session_id
-                            AND rt.timestamp >= ?1) AS last_active_rt
+                            AND COALESCE(source.hostname, live.hostname) = tok.hostname
+                            AND rt.timestamp >= ?1) AS last_active_rt,
+                        (SELECT h.timestamp FROM hook_invocations h
+                          WHERE h.provider = tok.provider
+                            AND h.session_id = tok.session_id
+                            AND h.hostname = tok.hostname
+                            AND h.is_sidechain = 0
+                            AND h.hook_event IN ('Stop', 'StopFailure', 'SessionEnd')
+                            AND julianday(h.timestamp) IS NOT NULL
+                            AND julianday(h.timestamp) >= julianday(?1)
+                          ORDER BY julianday(h.timestamp) DESC, h.timestamp DESC
+                          LIMIT 1) AS ended_at
                  FROM tok
              ), candidates AS MATERIALIZED (
                  SELECT rankable.*,
                         CASE
-                            WHEN last_active_rt > last_active_tok THEN last_active_rt
+                            WHEN julianday(last_active_rt) >
+                                 CASE
+                                     WHEN julianday(last_active_tok) > julianday(ended_at)
+                                         THEN julianday(ended_at)
+                                     ELSE julianday(last_active_tok)
+                                 END
+                                THEN last_active_rt
+                            WHEN julianday(last_active_tok) > julianday(ended_at)
+                                THEN ended_at
                             ELSE last_active_tok
                         END AS last_active
                  FROM rankable
@@ -13114,9 +13158,19 @@ impl Storage {
                  candidates.hostname,
                  candidates.total_tokens,
                  COALESCE((SELECT COUNT(*) FROM response_times rt
+                           LEFT JOIN transcript_analytics_sources AS source
+                             ON source.provider = rt.provider
+                            AND source.source_key = rt.source_key
+                           LEFT JOIN live_analytics_sessions AS live
+                             ON rt.source_key IS NULL
+                            AND live.provider = rt.provider
+                            AND live.session_id = rt.session_id
                            WHERE rt.provider = candidates.provider
                              AND rt.session_id = candidates.session_id
-                             AND rt.timestamp >= ?1), 0) AS turn_count,
+                             AND rt.is_sidechain = 0
+                             AND COALESCE(source.hostname, live.hostname) = candidates.hostname
+                             AND (rt.source_key IS NULL
+                                  OR ({ACTIVE_RUNTIME_SOURCE_PREDICATE}))), 0) AS turn_count,
                  candidates.first_seen,
                  candidates.last_active,
                  (SELECT t.cwd FROM token_snapshots t
@@ -13161,9 +13215,16 @@ impl Storage {
                     turn_count: row.get(4)?,
                     first_seen: row.get(5)?,
                     last_active: row.get(6)?,
+                    ended_at: None,
                     project: row.get(7)?,
-                    observed_subagent_count: None,
-                    observed_subagent_models: None,
+                    active_runtime_secs: None,
+                    agent_count: None,
+                    agent_runtime_secs: None,
+                    current_turn_runtime_secs: None,
+                    current_turn_runtime_active: false,
+                    runtime_as_of_ms: None,
+                    active_runtime_rate: 0.0,
+                    observed_agents: None,
                     observed_only: false,
                 })
             })
@@ -13174,6 +13235,342 @@ impl Storage {
             results.push(row.map_err(|e| format!("Row error: {e}"))?);
         }
         Ok(results)
+    }
+
+    pub(crate) fn populate_session_terminal_evidence(
+        &self,
+        rows: &mut [SessionBreakdown],
+        range: &str,
+        hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let conn = self.open_view_reader()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT provider, session_id, hostname, timestamp
+                 FROM (
+                     SELECT provider, session_id, hostname, timestamp,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY provider, session_id, hostname
+                                ORDER BY julianday(timestamp) DESC, timestamp DESC
+                            ) AS end_rank
+                     FROM hook_invocations
+                     WHERE hook_event IN ('Stop', 'StopFailure', 'SessionEnd')
+                       AND is_sidechain = 0
+                       AND hostname IS NOT NULL
+                       AND julianday(timestamp) IS NOT NULL
+                       AND julianday(timestamp) >= julianday(?1)
+                       AND (?2 IS NULL OR provider = ?2)
+                       AND (?3 IS NULL OR hostname = ?3)
+                 )
+                 WHERE end_rank = 1",
+            )
+            .map_err(|e| format!("Prepare session terminals error: {e}"))?;
+        let provider = provider.map(|value| value.as_str().to_owned());
+        let ends = stmt
+            .query_map(
+                params![range_from_timestamp(range), provider, hostname],
+                |row| {
+                    Ok((
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ),
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| format!("Query session terminals error: {e}"))?
+            .collect::<Result<HashMap<_, _>, _>>()
+            .map_err(|e| format!("Session terminal row error: {e}"))?;
+
+        for row in rows {
+            row.ended_at = ends
+                .get(&(
+                    row.provider.clone(),
+                    row.session_id.clone(),
+                    row.hostname.clone(),
+                ))
+                .cloned();
+        }
+        Ok(())
+    }
+
+    /// Project lifetime runtime onto Sessions rows and their observed native
+    /// agents. Only the listed session families are read. Lifetime totals stay
+    /// unknown until the runtime backfill is complete; root current-turn
+    /// evidence may still come from an indexed open tail. Live roots and
+    /// observed-open sidechains materialize through one query clock under the
+    /// 5m/6h caps.
+    pub(crate) fn populate_session_runtime_evidence(
+        &self,
+        rows: &mut [SessionBreakdown],
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        type ChainKey = (String, String, String, String);
+        #[derive(Default)]
+        struct ChainRuntime {
+            finalized_secs: f64,
+            is_sidechain: bool,
+            open_tail: Option<(i64, i64, String)>,
+        }
+        let now = query_now();
+        let now_ms = now.timestamp_millis();
+        let mut by_chain = HashMap::<ChainKey, ChainRuntime>::new();
+        let mut conn = self.open_view_reader()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|error| format!("Begin session runtime read snapshot: {error}"))?;
+        let runtime_complete = tx
+            .query_row(
+                "SELECT runtime_backfill_status = 'complete'
+                 FROM rollup_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| format!("Read session runtime backfill status: {error}"))?;
+        let placeholders = (0..rows.len())
+            .map(|_| "(?, ?, ?)")
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut candidate_params = Vec::with_capacity(rows.len() * 3);
+        for row in rows.iter() {
+            candidate_params.push(row.provider.clone());
+            candidate_params.push(row.session_id.clone());
+            candidate_params.push(row.hostname.clone());
+        }
+        let sql = format!(
+            "WITH candidates(provider, session_id, hostname) AS (
+                 VALUES {placeholders}
+             ), sources AS MATERIALIZED (
+                 SELECT candidates.provider, candidates.session_id,
+                        candidates.hostname, source.source_key,
+                        source.chain_id, source.is_sidechain
+                 FROM candidates
+                 JOIN transcript_analytics_sources AS source
+                      INDEXED BY idx_tas_session
+                   ON source.provider = candidates.provider
+                  AND source.analytics_session_id = candidates.session_id
+                  AND source.hostname = candidates.hostname
+                 WHERE source.chain_id IS NOT NULL
+                   AND {ACTIVE_RUNTIME_SOURCE_PREDICATE}
+             )
+             SELECT sources.provider, sources.session_id, sources.chain_id,
+                    sources.hostname, sources.is_sidechain,
+                    COALESCE(SUM(rollup.runtime_secs), 0),
+                    state.open_turn_started_ms,
+                    CASE WHEN state.open_turn_started_ms IS NULL THEN NULL ELSE (
+                        SELECT event.timestamp || char(31) || event.kind
+                        FROM session_events AS event
+                             INDEXED BY idx_se_provider_chain_timestamp
+                        WHERE event.provider = sources.provider
+                          AND event.chain_id = sources.chain_id
+                          AND event.source_key = sources.source_key
+                          AND event.rowid > state.finalized_through_rowid
+                        ORDER BY event.timestamp DESC, event.rowid DESC
+                        LIMIT 1
+                    ) END
+             FROM sources
+             LEFT JOIN runtime_hourly AS rollup
+                  INDEXED BY idx_runtime_hourly_source
+               ON rollup.provider = sources.provider
+              AND rollup.source_key = sources.source_key
+             LEFT JOIN runtime_turn_state AS state
+               ON state.provider = sources.provider
+              AND state.source_key = sources.source_key
+             GROUP BY sources.provider, sources.session_id, sources.chain_id,
+                      sources.hostname, sources.is_sidechain,
+                      sources.source_key, state.open_turn_started_ms,
+                      state.finalized_through_rowid"
+        );
+        {
+            let mut statement = tx
+                .prepare(&sql)
+                .map_err(|error| format!("Prepare session lifetime runtime: {error}"))?;
+            let runtime_rows = statement
+                .query_map(rusqlite::params_from_iter(candidate_params.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                })
+                .map_err(|error| format!("Query session lifetime runtime: {error}"))?;
+            for runtime_row in runtime_rows {
+                let (
+                    provider,
+                    session_id,
+                    chain_id,
+                    hostname,
+                    is_sidechain,
+                    finalized_secs,
+                    open_turn_started_ms,
+                    packed_last_event,
+                ) = runtime_row
+                    .map_err(|error| format!("Read session lifetime runtime: {error}"))?;
+                let open_tail = match (open_turn_started_ms, packed_last_event) {
+                    (Some(start_ms), Some(packed)) => {
+                        let Some((timestamp, kind)) = packed.split_once('\u{1f}') else {
+                            return Err("Session runtime open-tail row is invalid".to_string());
+                        };
+                        let last_event_ms = DateTime::parse_from_rfc3339(timestamp)
+                            .map_err(|error| format!("Parse session runtime tail: {error}"))?
+                            .timestamp_millis();
+                        Some((start_ms, last_event_ms, kind.to_string()))
+                    }
+                    _ => None,
+                };
+                by_chain.insert(
+                    (provider, session_id, chain_id, hostname),
+                    ChainRuntime {
+                        finalized_secs: finalized_secs.max(0.0),
+                        is_sidechain,
+                        open_tail,
+                    },
+                );
+            }
+        }
+        tx.commit()
+            .map_err(|error| format!("Commit session runtime read snapshot: {error}"))?;
+
+        for row in rows {
+            let last_active = DateTime::parse_from_rfc3339(&row.last_active)
+                .ok()
+                .map(|timestamp| timestamp.timestamp_millis());
+            let ended_at = row.ended_at.as_deref().and_then(|timestamp| {
+                DateTime::parse_from_rfc3339(timestamp)
+                    .ok()
+                    .map(|timestamp| timestamp.timestamp_millis())
+            });
+            let terminal_at = last_active
+                .zip(ended_at)
+                .and_then(|(last_active, ended_at)| (ended_at >= last_active).then_some(ended_at));
+            let session_live = last_active.is_some_and(|last_active| {
+                now_ms.saturating_sub(last_active) < RUNTIME_IDLE_THRESHOLD_MS
+                    && ended_at.is_none_or(|ended_at| ended_at < last_active)
+            });
+            let open_agents = row
+                .observed_agents
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|agent| agent.agent_id.as_str())
+                .collect::<HashSet<_>>();
+            let mut session_runtime = 0.0_f64;
+            let mut session_rate = 0.0_f64;
+            let mut agent_count = 0_i64;
+            let mut agent_runtime = 0.0_f64;
+            let mut covered = false;
+            let mut current_root_turn = None::<(i64, f64, bool)>;
+            let materialize = |chain: &ChainRuntime, through_ms: Option<i64>, accruing: bool| {
+                let mut seconds = chain.finalized_secs;
+                let mut rate = 0.0_f64;
+                if let Some((start_ms, last_ms, kind)) = &chain.open_tail {
+                    let ceiling_ms = last_ms.saturating_add(if kind == "asst_tool_use" {
+                        RUNTIME_TOOL_WAIT_MAX_MS
+                    } else {
+                        RUNTIME_IDLE_THRESHOLD_MS
+                    });
+                    let end_ms = through_ms
+                        .map(|through_ms| through_ms.min(ceiling_ms))
+                        .unwrap_or(*last_ms);
+                    seconds += end_ms.saturating_sub(*start_ms) as f64 / 1_000.0;
+                    if accruing && now_ms < ceiling_ms {
+                        rate = 1.0;
+                    }
+                }
+                (seconds, rate)
+            };
+            for ((provider, session_id, chain_id, hostname), chain) in &by_chain {
+                if provider != &row.provider
+                    || session_id != &row.session_id
+                    || hostname != &row.hostname
+                {
+                    continue;
+                }
+                covered |= runtime_complete;
+                let candidate = if chain.is_sidechain {
+                    open_agents.contains(chain_id.as_str())
+                } else {
+                    true
+                };
+                let accruing = session_live && candidate;
+                let through_ms = if accruing {
+                    Some(now_ms)
+                } else if candidate {
+                    terminal_at
+                } else {
+                    None
+                };
+                let (seconds, rate) = materialize(chain, through_ms, accruing);
+                if runtime_complete {
+                    session_runtime += seconds;
+                    if chain.is_sidechain {
+                        agent_count += 1;
+                        agent_runtime += seconds;
+                    }
+                }
+                session_rate += rate;
+                if !chain.is_sidechain
+                    && let Some((_, last_ms, _)) = &chain.open_tail
+                {
+                    let current = (
+                        *last_ms,
+                        (seconds - chain.finalized_secs).max(0.0),
+                        rate > 0.0,
+                    );
+                    if current_root_turn
+                        .as_ref()
+                        .is_none_or(|(current_last_ms, _, _)| last_ms > current_last_ms)
+                    {
+                        current_root_turn = Some(current);
+                    }
+                }
+            }
+            row.active_runtime_secs = covered.then_some(session_runtime);
+            row.agent_count = covered.then_some(agent_count);
+            row.agent_runtime_secs = covered.then_some(agent_runtime);
+            row.current_turn_runtime_secs = current_root_turn.map(|(_, seconds, _)| seconds);
+            row.current_turn_runtime_active =
+                current_root_turn.is_some_and(|(_, _, runtime_active)| runtime_active);
+            row.runtime_as_of_ms = (covered || current_root_turn.is_some()).then_some(now_ms);
+            row.active_runtime_rate = session_rate;
+            if let Some(agents) = &mut row.observed_agents {
+                for agent in agents {
+                    let runtime = by_chain.get(&(
+                        row.provider.clone(),
+                        row.session_id.clone(),
+                        agent.agent_id.clone(),
+                        row.hostname.clone(),
+                    ));
+                    if let Some(runtime) = runtime.filter(|_| runtime_complete) {
+                        let through_ms = if session_live {
+                            Some(now_ms)
+                        } else {
+                            terminal_at
+                        };
+                        let (seconds, rate) = materialize(runtime, through_ms, session_live);
+                        agent.runtime_secs = Some(seconds);
+                        agent.runtime_active = rate > 0.0;
+                    } else {
+                        agent.runtime_secs = None;
+                        agent.runtime_active = false;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn get_observed_agent_model_evidence(
@@ -19719,10 +20116,10 @@ mod tests {
 
     /// Session totals still roll up parent and sub-agent chains, while live
     /// subagent coverage remains a command-layer overlay.
-    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Sessions SQL Excludes Historical Agent State]]
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Sessions Terminal Evidence Projection]]
     #[test]
     #[serial]
-    fn get_session_breakdown_rolls_up_subagent_tokens() {
+    fn get_session_breakdown_rolls_up_tokens_and_projects_terminal_evidence() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
@@ -19734,9 +20131,30 @@ mod tests {
         let recent = now.to_rfc3339();
         let earlier = (now - TimeDelta::minutes(10)).to_rfc3339();
         let middle = (now - TimeDelta::minutes(5)).to_rfc3339();
+        let after_stop = (now - TimeDelta::minutes(2)).to_rfc3339();
+        let historical = (now - TimeDelta::days(10)).to_rfc3339();
 
         {
             let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO live_analytics_sessions (
+                     provider, session_id, hostname, updated_at
+                 ) VALUES ('claude', 'sess-rollup', 'host1', ?1)",
+                params![&recent],
+            )
+            .expect("insert live session origin");
+            conn.execute_batch(
+                "INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     analytics_session_id, chain_id, is_sidechain, hostname,
+                     seen_generation, processing_status
+                 ) VALUES
+                     ('claude', 'root-source', 'root-source', '/root-source',
+                      'sess-rollup', 'sess-rollup', 0, 'host1', 1, 'ok'),
+                     ('claude', 'agent-source', 'root-source', '/agent-source',
+                      'sess-rollup', 'aaaabbbbccccdddd', 1, 'host1', 1, 'ok');",
+            )
+            .expect("insert retained session origins");
             // Parent row: 100 input + 50 output + 0 cache = 150 tokens.
             conn.execute(
                 "INSERT INTO token_snapshots (provider, session_id, hostname, timestamp,
@@ -19757,14 +20175,15 @@ mod tests {
                 params![&recent],
             )
             .expect("insert sub-agent snapshot");
-
-            // One parent turn + one sub-agent turn ⇒ rolled-up turn_count = 2.
+            // Two lifetime parent turns plus one range-local sub-agent turn.
+            // The session row must report only the two completed root turns,
+            // including the one outside the selected seven-day token range.
             conn.execute(
                 "INSERT INTO response_times (
-                     provider, session_id, chain_id, timestamp, response_secs,
-                     idle_secs, is_sidechain, agent_id, parent_uuid
+                     provider, source_key, session_id, chain_id, timestamp,
+                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid
                  ) VALUES (
-                     'claude', 'sess-rollup', 'sess-rollup', ?1,
+                     'claude', 'root-source', 'sess-rollup', 'sess-rollup', ?1,
                      5.0, NULL, 0, NULL, NULL
                  )",
                 params![&earlier],
@@ -19772,11 +20191,22 @@ mod tests {
             .expect("insert parent response_time");
             conn.execute(
                 "INSERT INTO response_times (
-                     provider, session_id, chain_id, parent_chain_id,
+                     provider, source_key, session_id, chain_id, timestamp,
+                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid
+                 ) VALUES (
+                     'claude', 'root-source', 'sess-rollup', 'sess-rollup', ?1,
+                     3.0, NULL, 0, NULL, NULL
+                 )",
+                params![&historical],
+            )
+            .expect("insert historical parent response_time");
+            conn.execute(
+                "INSERT INTO response_times (
+                     provider, source_key, session_id, chain_id, parent_chain_id,
                      timestamp, response_secs, idle_secs, is_sidechain,
                      agent_id, parent_uuid
                  ) VALUES (
-                     'claude', 'sess-rollup', 'aaaabbbbccccdddd',
+                     'claude', 'agent-source', 'sess-rollup', 'aaaabbbbccccdddd',
                      'sess-rollup', ?1, 4.5, NULL, 1,
                      'aaaabbbbccccdddd', 'pmsg1'
                  )",
@@ -19785,9 +20215,113 @@ mod tests {
             .expect("insert sub-agent response_time");
         }
 
-        let rows = storage
+        let persist_terminal = |provider,
+                                session_id: &str,
+                                hostname: &str,
+                                event: &str,
+                                ts: &str,
+                                agent_id: Option<&str>| {
+            storage
+                .store_hook_observation(&crate::models::ObservedHookObservation {
+                    provider,
+                    session_id: session_id.to_string(),
+                    hostname: Some(hostname.to_string()),
+                    hook_event: event.to_string(),
+                    tool_name: None,
+                    cwd: Some("/some/cwd".to_string()),
+                    ts: ts.to_string(),
+                    hook_matcher: None,
+                    agent_id: agent_id.map(str::to_owned),
+                })
+                .expect("persist terminal evidence");
+        };
+        persist_terminal(
+            IntegrationProvider::Claude,
+            "sess-rollup",
+            "host1",
+            "SessionEnd",
+            &middle,
+            None,
+        );
+        persist_terminal(
+            IntegrationProvider::Claude,
+            "sess-rollup",
+            "host1",
+            "Stop",
+            &middle,
+            None,
+        );
+        for (provider, session_id, event) in [
+            (IntegrationProvider::Claude, "observed-only", "SessionEnd"),
+            (IntegrationProvider::Claude, "claude-error", "StopFailure"),
+            (IntegrationProvider::Codex, "codex-stop", "Stop"),
+            (IntegrationProvider::Codex, "codex-end", "SessionEnd"),
+        ] {
+            persist_terminal(provider, session_id, "host1", event, &recent, None);
+        }
+        persist_terminal(
+            IntegrationProvider::Codex,
+            "codex-reopen",
+            "host1",
+            "Stop",
+            &middle,
+            None,
+        );
+        let foreign_end = (now + TimeDelta::minutes(1)).to_rfc3339();
+        persist_terminal(
+            IntegrationProvider::Claude,
+            "sess-rollup",
+            "host1",
+            "StopFailure",
+            &foreign_end,
+            Some("sidechain-agent"),
+        );
+        for (provider, hostname) in [
+            (IntegrationProvider::Codex, "host1"),
+            (IntegrationProvider::Claude, "host2"),
+        ] {
+            persist_terminal(
+                provider,
+                "sess-rollup",
+                hostname,
+                "SessionEnd",
+                &foreign_end,
+                None,
+            );
+        }
+
+        let mut rows = storage
             .get_session_breakdown("7d", None, None, Some(100))
             .expect("get_session_breakdown");
+        let template = rows[0].clone();
+        for (provider, session_id) in [
+            ("claude", "observed-only"),
+            ("claude", "claude-error"),
+            ("codex", "codex-stop"),
+            ("codex", "codex-end"),
+            ("codex", "codex-reopen"),
+        ] {
+            let mut observed_only = template.clone();
+            observed_only.provider = provider.to_string();
+            observed_only.session_id = session_id.to_string();
+            observed_only.ended_at = None;
+            observed_only.observed_only = true;
+            rows.push(observed_only);
+        }
+        let order_before = rows
+            .iter()
+            .map(|row| row.session_id.clone())
+            .collect::<Vec<_>>();
+        storage
+            .populate_session_terminal_evidence(&mut rows, "7d", None, None)
+            .expect("project session terminals");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.clone())
+                .collect::<Vec<_>>(),
+            order_before,
+            "terminal evidence must not change activity ordering"
+        );
         let row = rows
             .iter()
             .find(|r| r.session_id == "sess-rollup")
@@ -19799,15 +20333,31 @@ mod tests {
         );
         assert_eq!(
             row.turn_count, 2,
-            "turn_count must sum response_times rows (parent + sub-agent) = 2"
+            "turn_count must be lifetime completed root turns only"
         );
-        assert_eq!(row.observed_subagent_count, None);
+        assert_eq!(row.observed_agents, None);
+        assert_eq!(row.ended_at.as_deref(), Some(middle.as_str()));
+        for session_id in ["observed-only", "claude-error", "codex-stop", "codex-end"] {
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.session_id == session_id)
+                    .and_then(|row| row.ended_at.as_deref()),
+                Some(recent.as_str()),
+                "{session_id} terminal event was not projected"
+            );
+        }
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "codex-reopen")
+                .and_then(|row| row.ended_at.as_deref()),
+            Some(middle.as_str()),
+            "later transcript activity must remain newer than terminal evidence"
+        );
         let (sql, _) =
             Storage::session_breakdown_query(range_from_timestamp("7d"), None, None, 100);
         for historical_source in [
             "has_subagents",
             "subagent_count",
-            "hook_invocations",
             "retention_daily_aggregates",
             "SELECT agent_id FROM tool_actions",
         ] {
@@ -19816,13 +20366,93 @@ mod tests {
                 "Sessions SQL must not reconstruct live state from {historical_source}"
             );
         }
-        // last_active reflects the most recent row across both tables.
+        // The observed production ordering is Stop followed by token
+        // bookkeeping. That snapshot must not reopen the session.
         assert_eq!(
-            row.last_active, recent,
-            "last_active must equal MAX timestamp"
+            row.last_active, middle,
+            "terminal evidence must clamp its later token snapshot"
         );
 
         drop(rows);
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     analytics_session_id, chain_id, hostname,
+                     seen_generation, processing_status
+                 ) VALUES (
+                     'claude', 'foreign-source', 'foreign-root', '/foreign',
+                     'sess-rollup', 'sess-rollup', 'host2', 1, 'ok'
+                 )",
+                [],
+            )
+            .expect("insert foreign transcript origin");
+            conn.execute(
+                "INSERT INTO response_times (
+                     provider, source_key, session_id, chain_id, timestamp,
+                     response_secs, idle_secs, is_sidechain, agent_id, parent_uuid
+                 ) VALUES (
+                     'claude', 'foreign-source', 'sess-rollup', 'sess-rollup', ?1,
+                     5.0, NULL, 0, NULL, NULL
+                 )",
+                params![&after_stop],
+            )
+            .expect("insert foreign-host response activity");
+        }
+        let mut foreign_response = storage
+            .get_session_breakdown("7d", None, None, Some(100))
+            .expect("get foreign-response session breakdown");
+        storage
+            .populate_session_terminal_evidence(&mut foreign_response, "7d", None, None)
+            .expect("project foreign-response session terminals");
+        let foreign_response = foreign_response
+            .iter()
+            .find(|row| row.session_id == "sess-rollup")
+            .expect("foreign-response session present");
+        assert_eq!(foreign_response.ended_at.as_deref(), Some(middle.as_str()));
+        assert_eq!(foreign_response.turn_count, 2);
+        assert_eq!(
+            foreign_response.last_active, middle,
+            "a response from another host must not reopen this host's session"
+        );
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE live_analytics_sessions
+                 SET hostname = 'host1', updated_at = ?1
+                 WHERE provider = 'claude' AND session_id = 'sess-rollup'",
+                params![&after_stop],
+            )
+            .expect("restore same-host live session origin");
+            conn.execute(
+                "INSERT INTO response_times (
+                     provider, session_id, chain_id, timestamp, response_secs,
+                     idle_secs, is_sidechain, agent_id, parent_uuid
+                 ) VALUES (
+                     'claude', 'sess-rollup', 'sess-rollup', ?1,
+                     5.0, NULL, 0, NULL, NULL
+                 )",
+                params![&after_stop],
+            )
+            .expect("insert post-terminal response activity");
+        }
+        let mut reopened = storage
+            .get_session_breakdown("7d", None, None, Some(100))
+            .expect("get reopened session breakdown");
+        storage
+            .populate_session_terminal_evidence(&mut reopened, "7d", None, None)
+            .expect("project reopened session terminals");
+        let reopened = reopened
+            .iter()
+            .find(|row| row.session_id == "sess-rollup")
+            .expect("reopened session present");
+        assert_eq!(reopened.ended_at.as_deref(), Some(middle.as_str()));
+        assert_eq!(reopened.last_active, after_stop);
+        assert_eq!(reopened.turn_count, 3);
+
         clear_env();
     }
 
@@ -26064,7 +26694,7 @@ mod tests {
             conn.execute_batch(
                 "DELETE FROM settings
                      WHERE key = 'codex_agent_identity_reingest_pending';
-                 DELETE FROM schema_version WHERE version = 39;
+                 DELETE FROM schema_version WHERE version >= 39;
                  ALTER TABLE model_observation_sources
                      DROP COLUMN agent_nickname;
 
@@ -26246,6 +26876,105 @@ mod tests {
     #[serial]
     fn migration_39_is_idempotent() {
         assert_migration_is_idempotent(39);
+    }
+
+    #[test]
+    #[serial]
+    fn migration_40_removes_continuity_contract_and_preserves_other_events() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "DELETE FROM schema_version WHERE version = 40;
+                 ALTER TABLE context_savings_events ADD COLUMN snapshot_ref TEXT;
+                 INSERT INTO context_savings_events (
+                     event_id, schema_version, provider, hostname, timestamp,
+                     event_type, source, decision, category, delivered,
+                     source_ref, snapshot_ref
+                 ) VALUES
+                     ('retired-capture-event', 1, 'claude', 'host',
+                      '2026-08-01T00:00:00Z', 'capture.event', 'capture',
+                      'recorded', 'telemetry', 1, NULL, NULL),
+                     ('retired-capture-snapshot', 1, 'claude', 'host',
+                      '2026-08-01T00:00:00Z', 'capture.snapshot', 'capture',
+                      'recorded', 'telemetry', 1, NULL, 'snapshot:1'),
+                     ('retired-capture-guidance', 1, 'claude', 'host',
+                      '2026-08-01T00:00:00Z', 'capture.guidance', 'capture',
+                      'injected', 'routing', 1, NULL, NULL),
+                     ('retired-continuity', 1, 'claude', 'host',
+                      '2026-08-01T00:00:00Z', 'mcp.continuity', 'context',
+                      'recorded', 'telemetry', 1, NULL, NULL),
+                     ('retired-snapshot', 1, 'claude', 'host',
+                      '2026-08-01T00:00:00Z', 'mcp.snapshot', 'context',
+                      'returned', 'retrieval', 1, NULL, 'snapshot:2'),
+                     ('preserved-index', 1, 'codex', 'host',
+                      '2026-08-01T00:00:00Z', 'mcp.index', 'context',
+                      'indexed', 'preservation', 1, 'source:1', 'snapshot:3');",
+            )
+            .expect("prepare migration 40 fixture");
+        }
+        drop(storage);
+
+        let migrated = init_storage_in(&dir);
+        {
+            let conn = migrated.conn.lock().unwrap();
+            assert_eq!(
+                scalar_count(&conn, "SELECT COUNT(*) FROM context_savings_events"),
+                1,
+                "only the unrelated context event must survive"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT event_id, event_type, source_ref
+                     FROM context_savings_events",
+                    [],
+                    |row| Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    )),
+                )
+                .expect("read surviving event"),
+                (
+                    "preserved-index".to_string(),
+                    "mcp.index".to_string(),
+                    Some("source:1".to_string()),
+                )
+            );
+            assert!(!table_has_column(
+                &conn,
+                "context_savings_events",
+                "snapshot_ref"
+            ));
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM schema_version WHERE version = 40"
+                ),
+                1
+            );
+        }
+        drop(migrated);
+
+        let reopened = init_storage_in(&dir);
+        let conn = reopened.conn.lock().unwrap();
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM context_savings_events"),
+            1,
+            "reopening must not alter the surviving event"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM schema_version WHERE version = 40"
+            ),
+            1,
+            "migration 40 must not run twice"
+        );
+        drop(conn);
+        clear_env();
     }
 
     // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Codex Identity Reingest Idempotence]]
@@ -29519,8 +30248,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
 
-        // Anchored to now so the fixture never ages out of the query window.
-        let base = Utc::now() - chrono::Duration::hours(1);
+        let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .expect("runtime base")
+            .with_timezone(&Utc);
+        let pinned_now = base + chrono::Duration::seconds(60);
         let at = |secs: i64| (base + chrono::Duration::seconds(secs)).to_rfc3339();
         let user = crate::sessions::SessionEventKind::UserText;
         let asst = crate::sessions::SessionEventKind::AsstText;
@@ -29566,10 +30297,34 @@ mod tests {
         for (chain, events, _) in &chains {
             seed_owned_chain(&storage, chain, events);
         }
+        seed_owned_chain(
+            &storage,
+            &OwnedChainSpec {
+                source_key: "source-agent-zero",
+                session_id: "session-runtime",
+                chain_id: "chain-agent-zero",
+                parent_chain_id: Some("chain-parent"),
+                is_sidechain: true,
+            },
+            &[(at(55), user)],
+        );
+        seed_owned_chain(
+            &storage,
+            &OwnedChainSpec {
+                source_key: "source-agent-stale",
+                session_id: "session-runtime",
+                chain_id: "chain-agent-stale",
+                parent_chain_id: Some("chain-parent"),
+                is_sidechain: true,
+            },
+            &[(at(-600), user)],
+        );
 
-        let all = storage
-            .get_llm_runtime_stats("30d", None)
-            .expect("runtime stats");
+        let all = with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("runtime stats")
+        });
         assert!(
             (all.total_runtime_secs - expected_total).abs() < 1e-6,
             "runtime must sum each native chain exactly once: expected {expected_total}, got {}",
@@ -29592,9 +30347,11 @@ mod tests {
             "the sparkline must account for the same total"
         );
 
-        let parent = storage
-            .get_llm_runtime_stats("30d", Some("parent_only"))
-            .expect("parent-only runtime stats");
+        let parent = with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", Some("parent_only"))
+                .expect("parent-only runtime stats")
+        });
         assert!(
             (parent.total_runtime_secs - 30.0).abs() < 1e-6,
             "parent_only must drop both sub-agent chains, got {}",
@@ -29602,6 +30359,172 @@ mod tests {
         );
         assert_eq!(parent.turn_count, 1);
         assert_eq!(parent.session_count, 1);
+
+        let session_row = || SessionBreakdown {
+            provider: "claude".to_string(),
+            session_id: "session-runtime".to_string(),
+            hostname: "fixture-host".to_string(),
+            total_tokens: 1,
+            turn_count: 1,
+            first_seen: base.to_rfc3339(),
+            last_active: at(60),
+            ended_at: None,
+            project: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: Some(vec![
+                crate::models::ObservedSessionAgent {
+                    agent_id: "chain-agent-a".to_string(),
+                    model_id: Some("claude-opus-4-6".to_string()),
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+                crate::models::ObservedSessionAgent {
+                    agent_id: "chain-agent-b".to_string(),
+                    model_id: Some("claude-sonnet-4-6".to_string()),
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+                crate::models::ObservedSessionAgent {
+                    agent_id: "chain-agent-stale".to_string(),
+                    model_id: Some("claude-haiku-4-5".to_string()),
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+                crate::models::ObservedSessionAgent {
+                    agent_id: "missing-chain".to_string(),
+                    model_id: None,
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+            ]),
+            observed_only: false,
+        };
+        let assert_live = |row: &SessionBreakdown| {
+            assert_eq!(row.active_runtime_secs, Some(465.0));
+            assert_eq!(row.agent_count, Some(4));
+            assert_eq!(row.agent_runtime_secs, Some(405.0));
+            assert_eq!(row.current_turn_runtime_secs, Some(60.0));
+            assert!(row.current_turn_runtime_active);
+            assert_eq!(row.runtime_as_of_ms, Some(pinned_now.timestamp_millis()));
+            assert_eq!(row.active_runtime_rate, 3.0);
+            let agents = row.observed_agents.as_ref().expect("agent coverage");
+            assert_eq!(agents[0].runtime_secs, Some(55.0));
+            assert!(agents[0].runtime_active);
+            assert_eq!(agents[1].runtime_secs, Some(50.0));
+            assert!(agents[1].runtime_active);
+            assert_eq!(agents[2].runtime_secs, Some(300.0));
+            assert!(
+                !agents[2].runtime_active,
+                "stale open chain reached its cap"
+            );
+            assert_eq!(agents[3].runtime_secs, None, "missing is unknown, not zero");
+            assert!(!agents[3].runtime_active);
+        };
+
+        let mut wrong_host = session_row();
+        wrong_host.hostname = "other-host".to_string();
+        let mut wrong_provider = session_row();
+        wrong_provider.provider = "codex".to_string();
+        let mut terminal = session_row();
+        terminal.ended_at = Some(at(60));
+        let mut inactive = session_row();
+        inactive.last_active = (base - chrono::Duration::minutes(10)).to_rfc3339();
+        inactive
+            .observed_agents
+            .as_mut()
+            .expect("agent coverage")
+            .push(crate::models::ObservedSessionAgent {
+                agent_id: "chain-agent-zero".to_string(),
+                model_id: Some("claude-haiku-4-5".to_string()),
+                agent_type: None,
+                runtime_secs: None,
+                runtime_active: false,
+            });
+        let projection_rows = vec![
+            session_row(),
+            wrong_host,
+            wrong_provider,
+            terminal,
+            inactive,
+        ];
+        let mut raw = projection_rows.clone();
+        with_pinned_query_now(pinned_now, || {
+            storage
+                .populate_session_runtime_evidence(&mut raw)
+                .expect("raw session runtime projection")
+        });
+        assert!(raw.iter().all(|row| row.active_runtime_secs.is_none()));
+        assert!(raw.iter().all(|row| row.agent_count.is_none()));
+        assert!(raw.iter().all(|row| row.agent_runtime_secs.is_none()));
+        assert_eq!(raw[0].current_turn_runtime_secs, Some(60.0));
+        assert!(raw[0].current_turn_runtime_active);
+        assert_eq!(raw[0].active_runtime_rate, 3.0);
+        assert_eq!(raw[0].runtime_as_of_ms, Some(pinned_now.timestamp_millis()));
+        assert_eq!(raw[1].current_turn_runtime_secs, None);
+        assert_eq!(raw[1].runtime_as_of_ms, None);
+        assert_eq!(raw[2].current_turn_runtime_secs, None);
+        assert_eq!(raw[2].runtime_as_of_ms, None);
+        assert_eq!(raw[3].current_turn_runtime_secs, Some(60.0));
+        assert!(!raw[3].current_turn_runtime_active);
+        assert_eq!(raw[4].current_turn_runtime_secs, Some(30.0));
+        assert!(!raw[4].current_turn_runtime_active);
+        assert!(raw.iter().all(|row| {
+            row.observed_agents
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .all(|agent| agent.runtime_secs.is_none())
+        }));
+
+        storage
+            .run_runtime_rollup_backfill()
+            .expect("complete runtime backfill");
+        let mut hybrid = projection_rows.clone();
+        with_pinned_query_now(pinned_now, || {
+            storage
+                .populate_session_runtime_evidence(&mut hybrid)
+                .expect("hybrid session runtime projection")
+        });
+        assert_live(&hybrid[0]);
+        assert_eq!(hybrid[1].active_runtime_secs, None);
+        assert_eq!(hybrid[1].runtime_as_of_ms, None);
+        assert_eq!(hybrid[2].active_runtime_secs, None);
+        assert_eq!(hybrid[2].runtime_as_of_ms, None);
+        assert_eq!(hybrid[3].active_runtime_secs, Some(465.0));
+        assert_eq!(hybrid[3].agent_count, Some(4));
+        assert_eq!(hybrid[3].agent_runtime_secs, Some(405.0));
+        assert_eq!(hybrid[3].current_turn_runtime_secs, Some(60.0));
+        assert!(!hybrid[3].current_turn_runtime_active);
+        assert_eq!(hybrid[3].active_runtime_rate, 0.0);
+        assert!(
+            hybrid[3]
+                .observed_agents
+                .as_ref()
+                .expect("terminal agents")
+                .iter()
+                .all(|agent| !agent.runtime_active)
+        );
+        assert_eq!(hybrid[4].active_runtime_secs, Some(expected_total));
+        assert_eq!(hybrid[4].agent_count, Some(4));
+        assert_eq!(hybrid[4].agent_runtime_secs, Some(75.0));
+        assert_eq!(hybrid[4].current_turn_runtime_secs, Some(30.0));
+        assert!(!hybrid[4].current_turn_runtime_active);
+        assert_eq!(hybrid[4].active_runtime_rate, 0.0);
+        assert_eq!(
+            hybrid[4].observed_agents.as_ref().expect("inactive agents")[4].runtime_secs,
+            Some(0.0),
+            "covered zero-duration chain must not become unknown"
+        );
 
         clear_env();
     }

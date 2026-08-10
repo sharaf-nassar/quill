@@ -7,16 +7,15 @@
 // Codex rollout JSONL transcripts do not record hook executions, so the
 // Quill installer registers this single-purpose script on the observed
 // Codex hook events (PreToolUse, PermissionRequest, PostToolUse,
-// PreCompact, PostCompact, UserPromptSubmit, Stop). On each invocation the
+// PreCompact, PostCompact, UserPromptSubmit, SessionEnd, Stop). On each invocation the
 // script POSTs one event record to /api/v1/hooks/observed, then
 // exits with code 0 so it never blocks the hook chain. The endpoint
 // fast-acks 202 ACCEPTED, persists in the background, and emits a
 // `hooks-observed-updated` Tauri event so the Now-tab Hooks breakdown
 // refreshes within a couple of seconds.
 //
-// Session and subagent lifecycle events are deliberately not registered:
-// live session and agent state comes from rollout transcripts, so this
-// path is audit history only.
+// SessionEnd is advisory terminal evidence. Positive session and agent state
+// still comes from rollout transcripts.
 //
 // Deployment is gated on the IntegrationFeatures.activity_tracking
 // flag in src-tauri/src/integrations/codex.rs.

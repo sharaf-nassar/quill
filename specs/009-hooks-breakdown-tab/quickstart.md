@@ -61,8 +61,8 @@ In the running app:
 2. Confirm the breakdown selector now shows: Sessions, Projects, Hosts,
    Skills, **Hooks**.
 3. Click **Hooks**.
-4. Expect at least one row to appear (the `quill:context-capture.cjs`
-   hook fires on every SessionStart of the running Quill itself).
+4. Expect at least one row to appear (for example, `quill:observe.cjs`
+   after a tool call or `quill:session-sync.cjs` after session sync).
 5. Verify rows starting with `quill:` display that prefix in the identity
    text without an additional QUILL badge.
 6. Verify the All / Codex / Claude filter strip and the `∞ ALL TIME` chip
@@ -95,9 +95,8 @@ PY
 
 Now open the Hooks breakdown filtered to **Claude**. The total fire
 counts for each canonicalized identity must match the per-script counts
-returned by the script (`quill:context-capture.cjs` should equal the
-total of all `node /...quill/scripts/context-capture.cjs` plus
-`node /...quill/scripts/context-capture.cjs` records; plugin entries
+returned by the script (`quill:observe.cjs` should equal the total of all
+`node /...quill/scripts/observe.cjs` records; plugin entries
 should equal the `${CLAUDE_PLUGIN_ROOT}/...` records verbatim).
 
 ## Step 5 — Verify Codex hook ingestion live

@@ -48,3 +48,4 @@ lat.md/.cache
 *.db
 .beads-credential-key
 .beads/proxieddb/
+.beads.gate.lock

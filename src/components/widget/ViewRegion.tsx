@@ -9,30 +9,20 @@
 //
 // See specs/018-widget-ui-redesign/plan.md#Affected Components.
 
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { RangeType } from "../../types";
 import { useCachedInvokeEvents } from "../../hooks/useCachedInvokeEvents";
+import {
+  readStoredWidgetRange,
+  storeWidgetRange,
+  WIDGET_RANGES,
+} from "./rangePreference";
 import ViewSwitcher, { type ViewOption, type WidgetView } from "./ViewSwitcher";
 import ChartsView from "./views/ChartsView";
 import ContextView from "./views/ContextView";
 import ModelsView from "./views/ModelsView";
 import TrendsView from "./views/TrendsView";
 import UsageView from "./views/UsageView";
-
-/** The widget's range vocabulary. `30d` stays out — it is not a widget scope. */
-const RANGES: ReadonlyArray<{ id: RangeType; label: string }> = [
-  { id: "1h", label: "1H" },
-  { id: "6h", label: "6H" },
-  { id: "24h", label: "24H" },
-  { id: "7d", label: "7D" },
-];
-
-/**
- * Six hours is the widget's default because it is the shortest range that
- * still spans a working session — 1H reads as noise on a chart glanced at from
- * the corner of an editor.
- */
-const DEFAULT_RANGE: RangeType = "6h";
 
 interface ViewDefinition extends ViewOption {
   render: (range: RangeType) => ReactNode;
@@ -81,7 +71,9 @@ const VIEWS: readonly ViewDefinition[] = [
 function ViewRegion() {
   useCachedInvokeEvents();
   const [view, setView] = useState<WidgetView>("usage");
-  const [range, setRange] = useState<RangeType>(DEFAULT_RANGE);
+  const [range, setRange] = useState<RangeType>(() => readStoredWidgetRange());
+
+  useEffect(() => storeWidgetRange(range), [range]);
 
   const active = VIEWS.find((entry) => entry.id === view) ?? VIEWS[0];
 
@@ -95,7 +87,7 @@ function ViewRegion() {
           <span />
         ) : (
           <div className="wg-toggles wg-num" role="group" aria-label="Time range">
-            {RANGES.map((entry) => (
+            {WIDGET_RANGES.map((entry) => (
               <button
                 key={entry.id}
                 type="button"

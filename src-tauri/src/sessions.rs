@@ -2914,10 +2914,10 @@ mod hook_identity_tests {
     #[test]
     fn quill_path_becomes_namespaced_basename() {
         let id = canonicalize_hook_identity(
-            Some("node \"/home/me/.config/quill/scripts/context-capture.cjs\""),
+            Some("node \"/home/me/.config/quill/scripts/session-sync.cjs\""),
             "SessionStart:startup",
         );
-        assert_eq!(id, "quill:context-capture.cjs");
+        assert_eq!(id, "quill:session-sync.cjs");
     }
 
     #[test]
@@ -3098,7 +3098,7 @@ mod hook_attachment_tests {
                 "type": "hook_success",
                 "hookName": "SessionStart:startup",
                 "hookEvent": "SessionStart",
-                "command": "node \"/home/me/.config/quill/scripts/context-capture.cjs\"",
+                "command": "node \"/home/me/.config/quill/scripts/session-sync.cjs\"",
                 "durationMs": 145,
                 "exitCode": 0
             }
@@ -3106,7 +3106,7 @@ mod hook_attachment_tests {
         let inv = extract_hook_invocation_from_attachment(&record).expect("Some");
         assert_eq!(inv.hook_event, "SessionStart");
         assert_eq!(inv.hook_matcher.as_deref(), Some("startup"));
-        assert_eq!(inv.hook_identity, "quill:context-capture.cjs");
+        assert_eq!(inv.hook_identity, "quill:session-sync.cjs");
         assert_eq!(inv.duration_ms, Some(145));
         assert_eq!(inv.exit_code, Some(0));
         assert_eq!(inv.cwd.as_deref(), Some("/home/me/work/quill"));
@@ -3308,7 +3308,7 @@ fn project_name_from_cwd(cwd: &str) -> Option<String> {
         .map(|name| name.to_string())
 }
 
-fn codex_text_blocks<'a>(
+pub(crate) fn codex_text_blocks<'a>(
     payload: &'a serde_json::Value,
     block_type: &'a str,
 ) -> impl Iterator<Item = &'a str> {
@@ -3322,7 +3322,7 @@ fn codex_text_blocks<'a>(
         .filter(|text| !text.trim().is_empty())
 }
 
-fn has_nonempty_codex_assistant_output(payload: &serde_json::Value) -> bool {
+pub(crate) fn has_nonempty_codex_assistant_output(payload: &serde_json::Value) -> bool {
     payload.get("role").and_then(|value| value.as_str()) == Some("assistant")
         && codex_text_blocks(payload, "output_text").next().is_some()
 }

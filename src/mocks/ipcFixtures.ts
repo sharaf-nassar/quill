@@ -317,11 +317,11 @@ const projectBreakdown: ProjectBreakdown[] = [
 ];
 
 const sessionBreakdown: SessionBreakdown[] = [
-  { provider: "claude", session_id: "a1b2c3d4", hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), project: "instrumentation-observability-control-plane", observed_subagent_count: 3, observed_subagent_models: [{ model_id: "claude-opus-4-6", agent_type: null, count: 2 }, { model_id: "claude-sonnet-4-6", agent_type: null, count: 1 }], observed_only: false },
-  { provider: "codex", session_id: "e5f6a7b8", hostname: "mbp.local", total_tokens: 88_400, turn_count: 71, first_seen: iso(20 * H), last_active: iso(2 * H), project: "stable-api", observed_subagent_count: 0, observed_subagent_models: [], observed_only: false },
-  { provider: "claude", session_id: "c9d0e1f2", hostname: "devbox", total_tokens: 51_200, turn_count: 44, first_seen: iso(2 * D), last_active: iso(28 * H), project: "marketing-site", observed_subagent_count: null, observed_subagent_models: null, observed_only: false },
-  { provider: "claude", session_id: "b7c8d9e0", hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), project: "quill", observed_subagent_count: 1, observed_subagent_models: [{ model_id: null, agent_type: null, count: 1 }], observed_only: false },
-  { provider: "codex", session_id: "f1a2b3c4", hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), project: "/home/mamba/work/poe", observed_subagent_count: 2, observed_subagent_models: [{ model_id: "gpt-5.6-sol", agent_type: null, count: 1 }, { model_id: "gpt-5.6-terra", agent_type: null, count: 1 }], observed_only: true },
+  { provider: "claude", session_id: "a1b2c3d4", hostname: "mbp.local", total_tokens: 142_900, turn_count: 96, first_seen: iso(23 * H), last_active: iso(4 * M), ended_at: null, project: "instrumentation-observability-control-plane", active_runtime_secs: 4_823, agent_count: 5, agent_runtime_secs: 4_212, current_turn_runtime_secs: 41, current_turn_runtime_active: true, runtime_as_of_ms: now - 500, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-opus-a", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 3_840, runtime_active: true }, { agent_id: "agent-opus-b", model_id: "claude-opus-4-6", agent_type: null, runtime_secs: 272, runtime_active: false }, { agent_id: "agent-sonnet", model_id: "claude-sonnet-4-6", agent_type: null, runtime_secs: null, runtime_active: true }], observed_only: false },
+  { provider: "codex", session_id: "e5f6a7b8", hostname: "mbp.local", total_tokens: 88_400, turn_count: 71, first_seen: iso(20 * H), last_active: iso(2 * H), ended_at: null, project: "stable-api", active_runtime_secs: 7_260, agent_count: 3, agent_runtime_secs: 5_400, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now - 2 * H, active_runtime_rate: 0, observed_agents: [], observed_only: false },
+  { provider: "claude", session_id: "c9d0e1f2", hostname: "devbox", total_tokens: 51_200, turn_count: 44, first_seen: iso(2 * D), last_active: iso(28 * H), ended_at: null, project: "marketing-site", active_runtime_secs: null, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: null, active_runtime_rate: 0, observed_agents: null, observed_only: false },
+  { provider: "claude", session_id: "b7c8d9e0", hostname: "mbp.local", total_tokens: 33_800, turn_count: 29, first_seen: iso(130 * D), last_active: iso(128 * D), ended_at: null, project: "quill", active_runtime_secs: 8_400, agent_count: 0, agent_runtime_secs: 0, current_turn_runtime_secs: null, current_turn_runtime_active: false, runtime_as_of_ms: now - 128 * D, active_runtime_rate: 0, observed_agents: [], observed_only: false },
+  { provider: "codex", session_id: "f1a2b3c4", hostname: "mbp.local", total_tokens: 0, turn_count: 0, first_seen: iso(3 * M), last_active: iso(M), ended_at: null, project: "/home/mamba/work/poe", active_runtime_secs: 155, agent_count: null, agent_runtime_secs: null, current_turn_runtime_secs: 51, current_turn_runtime_active: true, runtime_as_of_ms: now - 250, active_runtime_rate: 2, observed_agents: [{ agent_id: "agent-sol", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 86, runtime_active: true }, { agent_id: "agent-terra", model_id: "gpt-5.6-terra", agent_type: null, runtime_secs: 31, runtime_active: false }], observed_only: true },
 ];
 
 const skillBreakdown: SkillBreakdown[] = [
@@ -332,7 +332,7 @@ const skillBreakdown: SkillBreakdown[] = [
 
 const hookBreakdown: HookBreakdown[] = [
   { hook_identity: "quill:context-router", hook_event: "PreToolUse", tool_name: "Bash", is_quill: true, codex_count: 41, claude_count: 380, total_count: 421, last_fired_at: iso(3 * M) },
-  { hook_identity: "quill:continuity", hook_event: "SessionStart", tool_name: null, is_quill: true, codex_count: 12, claude_count: 96, total_count: 108, last_fired_at: iso(45 * M) },
+  { hook_identity: "quill:observe.cjs", hook_event: "PreToolUse", tool_name: "Bash", is_quill: true, codex_count: 12, claude_count: 96, total_count: 108, last_fired_at: iso(45 * M) },
   { hook_identity: "commit_message_validator.py", hook_event: "PreToolUse", tool_name: "Bash", is_quill: false, codex_count: 0, claude_count: 64, total_count: 64, last_fired_at: iso(5 * H) },
 ];
 
@@ -382,7 +382,6 @@ const contextSavings: ContextSavingsAnalytics = {
   summary: {
     eventCount: 312,
     routerEventCount: 188,
-    continuityEventCount: 124,
     indexedBytes: 4_812_000,
     returnedBytes: 1_204_000,
     inputBytes: 6_120_000,
@@ -397,7 +396,6 @@ const contextSavings: ContextSavingsAnalytics = {
     // view renders the same coherent story in browser mode that a real
     // backend produces: 103/412 sources reused is the 0.25 ratio below.
     routingEventCount: 188,
-    telemetryEventCount: 124,
     sourcesPreserved: 412,
     sourcesRetrieved: 103,
     retentionRatio: 0.25,
@@ -410,7 +408,6 @@ const contextSavings: ContextSavingsAnalytics = {
       timestamp: iso(i * H),
       eventCount: 8 + ((i * 13) % 12),
       routerEventCount: 5 + ((i * 7) % 8),
-      continuityEventCount: 3 + ((i * 5) % 6),
       indexedBytes: indexed * 4,
       returnedBytes: returned * 4,
       inputBytes: indexed * 5,
@@ -421,14 +418,14 @@ const contextSavings: ContextSavingsAnalytics = {
     };
   }),
   breakdowns: [
-    { provider: "claude", eventType: "capture.index", source: "web_fetch", eventCount: 96, indexedBytes: 2_410_000, returnedBytes: 0, inputBytes: 2_410_000, tokensIndexedEst: 602_000, tokensReturnedEst: 0, tokensSavedEst: 602_000, tokensPreservedEst: 410_000, estimateConfidence: "high" },
-    { provider: "claude", eventType: "router.deny", source: "bash", eventCount: 142, indexedBytes: 1_802_000, returnedBytes: 980_000, inputBytes: 2_900_000, tokensIndexedEst: 451_000, tokensReturnedEst: 245_000, tokensSavedEst: 206_000, tokensPreservedEst: 132_000, estimateConfidence: "medium" },
-    { provider: "codex", eventType: "source.return", source: "context_store", eventCount: 74, indexedBytes: 600_000, returnedBytes: 224_000, inputBytes: 810_000, tokensIndexedEst: 150_000, tokensReturnedEst: 56_000, tokensSavedEst: 94_000, tokensPreservedEst: 46_000, estimateConfidence: "exact" },
+    { provider: "claude", eventType: "mcp.index", source: "web_fetch", eventCount: 96, indexedBytes: 2_410_000, returnedBytes: 0, inputBytes: 2_410_000, tokensIndexedEst: 602_000, tokensReturnedEst: 0, tokensSavedEst: 602_000, tokensPreservedEst: 410_000, estimateConfidence: "high" },
+    { provider: "claude", eventType: "router.denial", source: "bash", eventCount: 142, indexedBytes: 1_802_000, returnedBytes: 980_000, inputBytes: 2_900_000, tokensIndexedEst: 451_000, tokensReturnedEst: 245_000, tokensSavedEst: 206_000, tokensPreservedEst: 132_000, estimateConfidence: "medium" },
+    { provider: "codex", eventType: "mcp.source_read", source: "context_store", eventCount: 74, indexedBytes: 600_000, returnedBytes: 224_000, inputBytes: 810_000, tokensIndexedEst: 150_000, tokensReturnedEst: 56_000, tokensSavedEst: 94_000, tokensPreservedEst: 46_000, estimateConfidence: "exact" },
   ],
   recentEvents: [
-    { eventId: "ev1", provider: "claude", sessionId: "a1b2c3d4", hostname: "mbp.local", cwd: "/home/mamba/work/quill", timestamp: iso(3 * M), eventType: "capture.index", source: "web_fetch", decision: null, category: "capture", reason: null, delivered: true, indexedBytes: 184_000, returnedBytes: null, inputBytes: 184_000, tokensIndexedEst: 46_000, tokensReturnedEst: null, tokensSavedEst: 46_000, tokensPreservedEst: 31_000, estimateMethod: "tiktoken", estimateConfidence: "high", sourceRef: "src://web/abc", snapshotRef: null, createdAt: iso(3 * M) },
-    { eventId: "ev2", provider: "claude", sessionId: "a1b2c3d4", hostname: "mbp.local", cwd: "/home/mamba/work/quill", timestamp: iso(11 * M), eventType: "source.return", source: "context_store", decision: "return", category: "source", reason: null, delivered: true, indexedBytes: null, returnedBytes: 42_000, inputBytes: 42_000, tokensIndexedEst: null, tokensReturnedEst: 10_500, tokensSavedEst: null, tokensPreservedEst: null, estimateMethod: "tiktoken", estimateConfidence: "exact", sourceRef: "src://web/abc", snapshotRef: "snap://1", createdAt: iso(11 * M) },
-    { eventId: "ev3", provider: "codex", sessionId: "e5f6a7b8", hostname: "mbp.local", cwd: "/home/mamba/work/stable-api", timestamp: iso(38 * M), eventType: "router.deny", source: "bash", decision: "deny", category: "router", reason: "large_output", delivered: false, indexedBytes: 96_000, returnedBytes: null, inputBytes: 96_000, tokensIndexedEst: 24_000, tokensReturnedEst: null, tokensSavedEst: 24_000, tokensPreservedEst: 16_000, estimateMethod: "bytes/4", estimateConfidence: "medium", sourceRef: null, snapshotRef: null, createdAt: iso(38 * M) },
+    { eventId: "ev1", provider: "claude", sessionId: "a1b2c3d4", hostname: "mbp.local", cwd: "/home/mamba/work/quill", timestamp: iso(3 * M), eventType: "mcp.index", source: "web_fetch", decision: "indexed", category: "preservation", reason: null, delivered: true, indexedBytes: 184_000, returnedBytes: null, inputBytes: 184_000, tokensIndexedEst: 46_000, tokensReturnedEst: null, tokensSavedEst: 46_000, tokensPreservedEst: 31_000, estimateMethod: "tiktoken", estimateConfidence: "high", sourceRef: "src://web/abc", createdAt: iso(3 * M) },
+    { eventId: "ev2", provider: "claude", sessionId: "a1b2c3d4", hostname: "mbp.local", cwd: "/home/mamba/work/quill", timestamp: iso(11 * M), eventType: "mcp.source_read", source: "context_store", decision: "returned", category: "retrieval", reason: null, delivered: true, indexedBytes: null, returnedBytes: 42_000, inputBytes: 42_000, tokensIndexedEst: null, tokensReturnedEst: 10_500, tokensSavedEst: null, tokensPreservedEst: null, estimateMethod: "tiktoken", estimateConfidence: "exact", sourceRef: "src://web/abc", createdAt: iso(11 * M) },
+    { eventId: "ev3", provider: "codex", sessionId: "e5f6a7b8", hostname: "mbp.local", cwd: "/home/mamba/work/stable-api", timestamp: iso(38 * M), eventType: "router.denial", source: "bash", decision: "deny", category: "routing", reason: "large_output", delivered: false, indexedBytes: 96_000, returnedBytes: null, inputBytes: 96_000, tokensIndexedEst: 24_000, tokensReturnedEst: null, tokensSavedEst: 0, tokensPreservedEst: 0, estimateMethod: "bytes/4", estimateConfidence: "medium", sourceRef: null, createdAt: iso(38 * M) },
   ],
 };
 

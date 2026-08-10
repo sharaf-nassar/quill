@@ -852,9 +852,9 @@ async fn enqueue_changed_claude_model_sources(
 fn claude_row_awaits_child_model(row: &SessionBreakdown) -> bool {
     row.provider == "claude"
         && row
-            .observed_subagent_models
+            .observed_agents
             .as_ref()
-            .is_some_and(|groups| groups.iter().any(|group| group.model_id.is_none()))
+            .is_some_and(|agents| agents.iter().any(|agent| agent.model_id.is_none()))
 }
 
 /// Nudge retained Claude model ingestion for open children.
@@ -2442,6 +2442,17 @@ fn enabled_providers(statuses: &[ProviderStatus]) -> Vec<integrations::Integrati
         .collect()
 }
 
+fn native_usage_providers(
+    statuses: &[ProviderStatus],
+    cpa_configured: bool,
+) -> Vec<integrations::IntegrationProvider> {
+    if cpa_configured {
+        Vec::new()
+    } else {
+        enabled_providers(statuses)
+    }
+}
+
 fn sort_and_dedup_usage_buckets(buckets: &mut Vec<UsageBucket>) {
     buckets.sort_by(|left, right| {
         left.provider
@@ -2703,7 +2714,7 @@ async fn refresh_usage_cache(
         }
 
         let refresh_epoch = USAGE_CACHE_EPOCH.load(AtomicOrdering::SeqCst);
-        let enabled_providers = enabled_providers(&statuses);
+        let enabled_providers = native_usage_providers(&statuses, cpa_connection.is_some());
 
         if enabled_providers.is_empty() && cpa_connection.is_none() {
             let usage = UsageData {
@@ -2936,9 +2947,8 @@ async fn refresh_usage_cache(
             }
         }
 
-        // CPA runs after every native provider. A dead local proxy therefore
-        // cannot postpone native snapshots, even through its shared 15s HTTP
-        // timeout or bounded per-account fan-out.
+        // A configured CPA connection is the exclusive live usage source;
+        // native provider polling resumes after CPA is disconnected.
         if let Some(connection) = cpa_connection {
             let phase_started = std::time::Instant::now();
             let now = Utc::now();
@@ -3524,7 +3534,7 @@ async fn get_session_breakdown(
         // while nobody is looking at Sessions, and so a session that predates
         // this process is already correct the first time it is read.
         observed_subagents.refresh_from_transcripts();
-        let rows = observed_subagents.merge(
+        let mut rows = observed_subagents.merge(
             rows,
             &range_from,
             observed_hostname.as_deref(),
@@ -3532,6 +3542,13 @@ async fn get_session_breakdown(
             limit,
             |targets| storage.get_observed_agent_model_evidence(targets),
         )?;
+        storage.populate_session_terminal_evidence(
+            &mut rows,
+            &range,
+            observed_hostname.as_deref(),
+            provider,
+        )?;
+        storage.populate_session_runtime_evidence(&mut rows)?;
         if rows.iter().any(claude_row_awaits_child_model) {
             schedule_claude_model_usage_rescan_nudge(app);
         }
@@ -6364,6 +6381,7 @@ mod tests {
                 agents: vec![transcript_scan::TranscriptAgent {
                     agent_id: "agent".to_string(),
                     agent_type: None,
+                    model: None,
                     open: true,
                 }],
             },
@@ -6378,24 +6396,37 @@ mod tests {
             turn_count: 1,
             first_seen: "2030-01-01T00:00:00Z".to_string(),
             last_active: "2030-01-01T00:00:02Z".to_string(),
+            ended_at: None,
             project: None,
-            observed_subagent_count: None,
-            observed_subagent_models: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
             observed_only: false,
         };
         let mut rows = vec![row("covered-root"), row("storage-only-root")];
+        rows[1].ended_at = Some("2030-01-01T00:00:02Z".to_string());
         rows = state
             .merge(rows, "2029-01-01T00:00:00Z", None, None, None, |_| {
                 Ok(HashMap::new())
             })
             .expect("merge observed subagent state");
 
-        assert_eq!(rows[0].observed_subagent_count, Some(1));
-        assert_eq!(rows[1].observed_subagent_count, None);
+        assert_eq!(rows[0].observed_agents.as_ref().map(Vec::len), Some(1));
+        assert_eq!(rows[1].observed_agents, None);
         assert!(!rows[0].observed_only && !rows[1].observed_only);
+        assert_eq!(rows[1].ended_at.as_deref(), Some("2030-01-01T00:00:02Z"));
         assert_eq!(
-            serde_json::to_value(&rows).expect("serialize SessionBreakdown IPC")[1]["observed_subagent_count"],
+            serde_json::to_value(&rows).expect("serialize SessionBreakdown IPC")[1]["observed_agents"],
             serde_json::Value::Null
+        );
+        assert_eq!(
+            serde_json::to_value(&rows).expect("serialize SessionBreakdown IPC")[1]["ended_at"],
+            "2030-01-01T00:00:02Z"
         );
     }
 
@@ -6569,6 +6600,30 @@ mod tests {
         assert_eq!(first_key, second_key);
         assert!(!first_key.contains("first-secret"));
         assert!(!second_key.contains("second-secret"));
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Poll Scheduling#Native source exclusivity]]
+    #[test]
+    fn configured_cpa_suppresses_native_usage_polling() {
+        let providers = [
+            integrations::IntegrationProvider::Claude,
+            integrations::IntegrationProvider::Codex,
+            integrations::IntegrationProvider::MiniMax,
+        ];
+        let statuses = providers.map(|provider| ProviderStatus {
+            provider,
+            detected_cli: true,
+            detected_home: true,
+            enabled: true,
+            setup_state: integrations::types::ProviderSetupState::Installed,
+            user_has_made_choice: true,
+            last_error: None,
+            last_verified_at: None,
+            last_detection_attempts: Vec::new(),
+        });
+
+        assert!(native_usage_providers(&statuses, true).is_empty());
+        assert_eq!(native_usage_providers(&statuses, false), providers);
     }
 
     // Compute the deterministic upper/lower bounds for the half-jitter window

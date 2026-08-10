@@ -18,15 +18,6 @@ function isRouterEvent(key: string): boolean {
 	return key.startsWith("router.");
 }
 
-function isContinuityEvent(key: string): boolean {
-	return (
-		key.startsWith("capture.") ||
-		key.startsWith("continuity.") ||
-		key === "mcp.continuity" ||
-		key === "mcp.snapshot"
-	);
-}
-
 function derivedEventCount(
 	breakdowns: ContextSavingsBreakdownsResponse | undefined,
 	predicate: (key: string) => boolean,
@@ -49,15 +40,12 @@ function normalizeSummary(
 		...summary,
 		routerEventCount:
 			summary.routerEventCount ?? derivedEventCount(breakdowns, isRouterEvent),
-		continuityEventCount:
-			summary.continuityEventCount ?? derivedEventCount(breakdowns, isContinuityEvent),
 		// Old backends do not categorize events.  Fall back to 0 — never to
 		// tokensPreservedEst — so a stale backend does not silently re-surface
 		// the pre-fix inflated headline.
 		tokensPreserved: summary.tokensPreserved ?? 0,
 		tokensRetrieved: summary.tokensRetrieved ?? 0,
 		tokensRouting: summary.tokensRouting ?? 0,
-		telemetryEventCount: summary.telemetryEventCount ?? 0,
 		routingEventCount: summary.routingEventCount ?? 0,
 		sourcesPreserved,
 		sourcesRetrieved,
@@ -71,7 +59,6 @@ function normalizeTimeSeries(
 	return points.map((point) => ({
 		...point,
 		routerEventCount: point.routerEventCount ?? 0,
-		continuityEventCount: point.continuityEventCount ?? 0,
 	}));
 }
 

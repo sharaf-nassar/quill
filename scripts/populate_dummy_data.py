@@ -1355,13 +1355,12 @@ def populate_response_times(
 # ── 17. context_savings_events ────────────────────────────────────────────────
 
 def populate_context_savings_events(conn: sqlite3.Connection) -> None:
-	"""Populate the four context-savings categories so the Context tab renders.
+	"""Populate the context-savings categories so the Context tab renders.
 
 	Categories (closed taxonomy):
 	  - preservation: large content kept out of the LLM transcript via MCP store
 	  - retrieval: LLM pulled preserved content back via quill_get_context_source
-	  - routing: router/capture guidance text injected into the transcript
-	  - telemetry: hook observations recording session activity (no transcript cost)
+	  - routing: router guidance text injected into the transcript
 
 	PRESERVED ("X% reused · A/B sources") comes from CONTEXT_SAVINGS_RETENTION_SQL,
 	which links preservation and retrieval rows by a SHARED `source_ref` (the
@@ -1428,7 +1427,7 @@ def populate_context_savings_events(conn: sqlite3.Connection) -> None:
 			tok_saved = tok_indexed
 			tok_preserved = tok_indexed
 		elif category == "retrieval":
-			event_type = random.choice(["context.get_source", "compaction.snapshot.read"])
+			event_type = "mcp.source_read"
 			decision = "returned"
 			indexed_b = 0
 			returned_b = random.randint(2_000, 60_000)
@@ -1453,22 +1452,8 @@ def populate_context_savings_events(conn: sqlite3.Connection) -> None:
 			tok_returned = returned_b // 4
 			tok_saved = 0
 			tok_preserved = 0
-		else:  # telemetry
-			event_type = random.choice(["capture.event", "capture.snapshot"])
-			decision = "observed"
-			indexed_b = 0
-			returned_b = 0
-			input_b = 0
-			tok_indexed = 0
-			tok_returned = 0
-			tok_saved = 0
-			tok_preserved = 0
-
 		source_label = source_pair[0] if source_pair else random.choice(source_labels)
 		source_ref = source_pair[1] if source_pair else None
-		snapshot_ref = (
-			f"snapshot:{rand_hex(8)}" if event_type == "compaction.snapshot.read" else None
-		)
 		rows.append((
 			str(uuid.UUID(int=random.getrandbits(128))),
 			1,
@@ -1493,7 +1478,6 @@ def populate_context_savings_events(conn: sqlite3.Connection) -> None:
 			"byte_div_4",
 			0.92,
 			source_ref,
-			snapshot_ref,
 			None,
 		))
 
@@ -1514,18 +1498,14 @@ def populate_context_savings_events(conn: sqlite3.Connection) -> None:
 	# A (reused) ~= 10 -> ~40% reused.
 	for source_pair in reusable_pool:
 		make_row("retrieval", recent_when(), source_pair)
-	# Recent routing + telemetry so ROUTING COST and telemetry counts are live.
+	# Recent routing keeps ROUTING COST live.
 	for _ in range(12):
 		make_row("routing", recent_when(), None)
-	for _ in range(4):
-		make_row("telemetry", recent_when(), None)
 
-	# --- Historical spread to ~300 total, distribution ~60/20/15/5. ---
+	# --- Historical spread to ~300 total, distribution ~65/20/15. ---
 	TOTAL = 300
 	remaining = TOTAL - len(rows)
-	weighted = (
-		["preservation"] * 60 + ["retrieval"] * 20 + ["routing"] * 15 + ["telemetry"] * 5
-	)
+	weighted = ["preservation"] * 65 + ["retrieval"] * 20 + ["routing"] * 15
 	for _ in range(max(0, remaining)):
 		category = random.choice(weighted)
 		if category == "preservation":
@@ -1543,8 +1523,8 @@ def populate_context_savings_events(conn: sqlite3.Connection) -> None:
 		"event_type, source, decision, category, reason, delivered, "
 		"indexed_bytes, returned_bytes, input_bytes, "
 		"tokens_indexed_est, tokens_returned_est, tokens_saved_est, tokens_preserved_est, "
-		"estimate_method, estimate_confidence, source_ref, snapshot_ref, metadata_json"
-		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		"estimate_method, estimate_confidence, source_ref, metadata_json"
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		rows,
 	)
 	print(

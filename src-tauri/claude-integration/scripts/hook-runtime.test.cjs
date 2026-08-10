@@ -99,6 +99,25 @@ it("maps PostToolUseFailure details into a post observation", () => {
     "failure metadata was lost");
 });
 
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Terminal Payloads]]
+it("builds Claude terminal observations for the hook endpoint", () => {
+  for (const hookEvent of ["Stop", "StopFailure", "SessionEnd"]) {
+    const payload = observe.buildTerminalPayload({
+      hook_event_name: hookEvent,
+      session_id: "root-session",
+      cwd: "/project",
+    }, { hostname: "configured-host" }, "2026-08-04T12:34:56.789Z");
+
+    assert(payload.provider === "claude", "provider was lost");
+    assert(payload.session_id === "root-session", "session was lost");
+    assert(payload.hostname === "configured-host", "hostname was lost");
+    assert(payload.hook_event === hookEvent, `${hookEvent} was lost`);
+    assert(payload.ts === "2026-08-04T12:34:56.789Z", "timestamp was lost");
+  }
+  assert(observe.buildTerminalPayload({ hook_event_name: "SubagentStop" }) === null,
+    "non-root terminal event was accepted");
+});
+
 it("blocks qbuild edits by lexical and canonical containment", () => withFixture((root) => {
   const repository = path.join(root, "repository");
   const outside = path.join(root, "outside");

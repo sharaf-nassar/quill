@@ -1,5 +1,11 @@
 ## What's New
 
+**Session continuity removed**
+
+Quill no longer captures or injects cross-session task hints. The next update
+automatically removes its old hooks, local files, tables, and feature telemetry
+while preserving working-context data and third-party hooks.
+
 **The main window is now a widget**
 
 The split Live/Analytics dashboard has been replaced by a single 360px

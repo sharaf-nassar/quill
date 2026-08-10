@@ -11,7 +11,7 @@ Extend the Now tab analytics breakdown with a Hooks selector — a fifth breakdo
 mode alongside Sessions, Projects, Hosts, and Skills — that reports how often
 lifecycle hooks fire across Claude Code and Codex sessions. Hook usage is a
 first-class observability axis for users who run telemetry hooks (Quill's own
-session-sync, context-capture, observe), plugin-provided hooks (such as
+session-sync and observe scripts), plugin-provided hooks (such as
 superpowers skill loaders), and personal hooks (commit validators, format
 guards). Today users have no way to see which hooks are actually firing, how
 often, against which projects, or how much overhead Quill's own telemetry

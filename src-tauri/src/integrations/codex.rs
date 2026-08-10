@@ -37,15 +37,6 @@ const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 4";
 const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
-const MANAGED_HOOK_SCRIPT_FILES: [&str; 7] = [
-    "observe.cjs",
-    "report-tokens.cjs",
-    "session-sync.cjs",
-    "context-router.cjs",
-    "context-capture.cjs",
-    "hook-observe.cjs",
-    "session-end-learn.cjs",
-];
 const LEGACY_MANAGED_HOOK_SCRIPT_FILES: [&str; 1] = ["report-tokens.sh"];
 /// Every Codex hook event Quill knows about. Registration is a subset (see
 /// [`CODEX_OBSERVED_HOOK_EVENTS`]); this full list still drives cleanup,
@@ -65,17 +56,16 @@ const CODEX_HOOK_EVENTS: [(&str, &str); 11] = [
     ("Stop", "stop"),
 ];
 
-/// Events the hook observer is registered on. Session and subagent lifecycle
-/// events are deliberately absent: live session and agent state is derived
-/// from rollout transcripts, so registering them would deploy hooks into user
-/// config for evidence Quill already has on disk.
-const CODEX_OBSERVED_HOOK_EVENTS: [&str; 7] = [
+/// Events the hook observer is registered on. Stop and SessionEnd are advisory
+/// terminal evidence; positive session and agent state still comes from transcripts.
+const CODEX_OBSERVED_HOOK_EVENTS: [&str; 8] = [
     "PreToolUse",
     "PermissionRequest",
     "PostToolUse",
     "PreCompact",
     "PostCompact",
     "UserPromptSubmit",
+    "SessionEnd",
     "Stop",
 ];
 
@@ -89,13 +79,12 @@ pub(crate) fn is_supported_hook_event(event: &str) -> bool {
 // entry on reinstall regardless of the active feature set so flipping a
 // feature off does not leave the corresponding script orphaned in
 // `~/.config/quill/scripts/`.
-const ALL_MANAGED_SCRIPT_FILES: [&str; 8] = [
+const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
     "lib.cjs",
     "observe.cjs",
     "report-tokens.cjs",
     "session-sync.cjs",
     "context-router.cjs",
-    "context-capture.cjs",
     "context-telemetry.cjs",
     // Feature 009: tiny event-observer that POSTs every Codex hook fire
     // to /api/v1/hooks/observed. Deployed when `activity_tracking` is on
@@ -130,7 +119,7 @@ fn context_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
     if !features.context_preservation {
         return Vec::new();
     }
-    let mut scripts: Vec<&'static str> = vec!["context-router.cjs", "context-capture.cjs"];
+    let mut scripts: Vec<&'static str> = vec!["context-router.cjs"];
     if features.context_telemetry {
         scripts.push("context-telemetry.cjs");
     }
@@ -595,18 +584,54 @@ fn hook_state_label(event: &str) -> Option<&'static str> {
     })
 }
 
+fn command_script_path(command: &str) -> Option<&str> {
+    let path = command
+        .strip_prefix("node ")
+        .or_else(|| command.strip_prefix("bash "))
+        .unwrap_or(command);
+    if let Some(path) = path.strip_prefix('"') {
+        return path.strip_suffix('"');
+    }
+    (!path.chars().any(char::is_whitespace)).then_some(path)
+}
+
+fn path_is_quill_script_at(path: &str, script_dir: &Path) -> bool {
+    let parent = Path::new(path).parent();
+    parent.is_some_and(|parent| parent == script_dir)
+        || (script_dir == scripts_dir()
+            && parent == Some(Path::new("~/.config/quill/codex/scripts")))
+}
+
+fn path_is_quill_script(path: &str) -> bool {
+    path_is_quill_script_at(path, &scripts_dir())
+}
+
+fn command_uses_quill_script_directory(command: &str) -> bool {
+    command_script_path(command).is_some_and(path_is_quill_script)
+}
+
+fn command_is_retired_continuity_at(command: &str, script_dir: &Path) -> bool {
+    command_script_path(command).is_some_and(|path| {
+        path_is_quill_script_at(path, script_dir)
+            && Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == "context-capture.cjs")
+    })
+}
+
 fn command_uses_managed_script(command: &str, script: &str) -> bool {
-    command.contains(&scripts_dir().join(script).to_string_lossy().to_string())
-        || command.contains(&format!("~/.config/quill/codex/scripts/{script}"))
+    command_script_path(command).is_some_and(|path| {
+        path_is_quill_script(path)
+            && Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == script)
+    })
 }
 
 fn command_is_quill_owned(command: &str) -> bool {
     command.contains(HOOK_MARKER)
         || command.contains(CONTEXT_HOOK_MARKER)
-        || MANAGED_HOOK_SCRIPT_FILES
-            .iter()
-            .chain(LEGACY_MANAGED_HOOK_SCRIPT_FILES.iter())
-            .any(|script| command_uses_managed_script(command, script))
+        || command_uses_quill_script_directory(command)
 }
 
 fn command_is_legacy_quill_owned(command: &str) -> bool {
@@ -1479,10 +1504,6 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
         "node {}",
         shell_quote(&scripts_dir().join("context-router.cjs"))
     );
-    let context_capture_command = format!(
-        "node {}",
-        shell_quote(&scripts_dir().join("context-capture.cjs"))
-    );
     let sync_command = format!(
         "node {}",
         shell_quote(&scripts_dir().join("session-sync.cjs"))
@@ -1548,48 +1569,14 @@ fn build_codex_hook_groups(features: IntegrationFeatures) -> Vec<CodexHookGroup>
     });
 
     if features.context_preservation {
-        groups.extend([
-            CodexHookGroup {
-                event: "SessionStart",
-                matcher: None,
-                hooks: vec![CodexHookCommand {
-                    command: context_capture_command.clone(),
-                    timeout: 5,
-                }],
-            },
-            CodexHookGroup {
-                event: "UserPromptSubmit",
-                matcher: None,
-                hooks: vec![CodexHookCommand {
-                    command: context_capture_command.clone(),
-                    timeout: 5,
-                }],
-            },
-            CodexHookGroup {
-                event: "PreToolUse",
-                matcher: None,
-                hooks: vec![CodexHookCommand {
-                    command: context_router_command,
-                    timeout: 5,
-                }],
-            },
-            CodexHookGroup {
-                event: "PreCompact",
-                matcher: None,
-                hooks: vec![CodexHookCommand {
-                    command: context_capture_command.clone(),
-                    timeout: 5,
-                }],
-            },
-            CodexHookGroup {
-                event: "Stop",
-                matcher: None,
-                hooks: vec![CodexHookCommand {
-                    command: context_capture_command,
-                    timeout: 5,
-                }],
-            },
-        ]);
+        groups.push(CodexHookGroup {
+            event: "PreToolUse",
+            matcher: None,
+            hooks: vec![CodexHookCommand {
+                command: context_router_command,
+                timeout: 5,
+            }],
+        });
     }
 
     // Feature 009: register the generic hook observer on the observed Codex
@@ -1703,6 +1690,13 @@ fn remove_codex_inline_hooks_from_doc(
     doc: &mut DocumentMut,
     _config_path: &Path,
 ) -> Result<(), String> {
+    remove_matching_codex_inline_hooks(doc, command_is_quill_owned)
+}
+
+fn remove_matching_codex_inline_hooks<F>(doc: &mut DocumentMut, mut remove: F) -> Result<(), String>
+where
+    F: FnMut(&str) -> bool,
+{
     if let Some(hooks_table) = doc
         .as_table_mut()
         .get_mut("hooks")
@@ -1715,7 +1709,18 @@ fn remove_codex_inline_hooks_from_doc(
                     continue;
                 };
                 for group in array.iter_mut() {
-                    remove_codex_hook_commands_from_group(group);
+                    let Some(hooks) = group
+                        .get_mut("hooks")
+                        .and_then(Item::as_array_of_tables_mut)
+                    else {
+                        continue;
+                    };
+                    hooks.retain(|handler| {
+                        !handler
+                            .get("command")
+                            .and_then(Item::as_str)
+                            .is_some_and(&mut remove)
+                    });
                 }
                 array.retain(|group| {
                     group
@@ -1745,21 +1750,229 @@ fn remove_codex_inline_hooks_from_doc(
     Ok(())
 }
 
-fn remove_codex_hook_commands_from_group(group: &mut Table) {
-    let Some(hooks) = group
-        .get_mut("hooks")
-        .and_then(Item::as_array_of_tables_mut)
-    else {
-        return;
-    };
-    hooks.retain(|handler| !hook_command_is_managed(handler));
+#[derive(Default)]
+struct HookStateRemap {
+    covered_events: HashSet<String>,
+    positions: HashMap<(String, usize, usize), (usize, usize)>,
 }
 
-fn hook_command_is_managed(handler: &Table) -> bool {
-    handler
-        .get("command")
-        .and_then(Item::as_str)
-        .is_some_and(command_is_quill_owned)
+fn toml_hook_positions<F>(doc: &DocumentMut, mut keep: F) -> HashMap<String, Vec<(usize, usize)>>
+where
+    F: FnMut(Option<&str>) -> bool,
+{
+    let mut positions = HashMap::new();
+    let Some(hooks) = doc.as_table().get("hooks").and_then(Item::as_table_like) else {
+        return positions;
+    };
+    for (event, state_label) in CODEX_HOOK_EVENTS {
+        let Some(groups) = hooks.get(event).and_then(Item::as_array_of_tables) else {
+            continue;
+        };
+        let entries = positions
+            .entry(state_label.to_string())
+            .or_insert_with(Vec::new);
+        for (group_index, group) in groups.iter().enumerate() {
+            let Some(handlers) = group.get("hooks").and_then(Item::as_array_of_tables) else {
+                continue;
+            };
+            for (handler_index, handler) in handlers.iter().enumerate() {
+                if keep(handler.get("command").and_then(Item::as_str)) {
+                    entries.push((group_index, handler_index));
+                }
+            }
+        }
+    }
+    positions
+}
+
+fn json_hook_positions<F>(
+    root: &serde_json::Value,
+    mut keep: F,
+) -> HashMap<String, Vec<(usize, usize)>>
+where
+    F: FnMut(Option<&str>) -> bool,
+{
+    let mut positions = HashMap::new();
+    let Some(hooks) = root.get("hooks").and_then(serde_json::Value::as_object) else {
+        return positions;
+    };
+    for (event, state_label) in CODEX_HOOK_EVENTS {
+        let Some(groups) = hooks.get(event).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let entries = positions
+            .entry(state_label.to_string())
+            .or_insert_with(Vec::new);
+        for (group_index, group) in groups.iter().enumerate() {
+            let Some(handlers) = group.get("hooks").and_then(serde_json::Value::as_array) else {
+                if let Some(command) = group.get("command").and_then(serde_json::Value::as_str)
+                    && keep(Some(command))
+                {
+                    entries.push((group_index, 0));
+                }
+                continue;
+            };
+            for (handler_index, handler) in handlers.iter().enumerate() {
+                if keep(handler.get("command").and_then(serde_json::Value::as_str)) {
+                    entries.push((group_index, handler_index));
+                }
+            }
+        }
+    }
+    positions
+}
+
+fn position_remap(
+    retained_before: HashMap<String, Vec<(usize, usize)>>,
+    after: HashMap<String, Vec<(usize, usize)>>,
+) -> Result<HookStateRemap, String> {
+    let mut remap = HookStateRemap::default();
+    for (event, new_positions) in after {
+        let old_positions = retained_before.get(&event).cloned().unwrap_or_default();
+        if old_positions.len() != new_positions.len() {
+            return Err(format!(
+                "Codex hook positions changed ambiguously for {event}"
+            ));
+        }
+        remap.covered_events.insert(event.clone());
+        for (old, new) in old_positions.into_iter().zip(new_positions) {
+            remap.positions.insert((event.clone(), old.0, old.1), new);
+        }
+    }
+    for event in retained_before.keys() {
+        remap.covered_events.insert(event.clone());
+    }
+    Ok(remap)
+}
+
+fn parse_hook_state_key(key: &str) -> Option<(&str, &str, usize, usize)> {
+    let mut parts = key.rsplitn(4, ':');
+    let handler = parts.next()?.parse().ok()?;
+    let group = parts.next()?.parse().ok()?;
+    let event = parts.next()?;
+    let source = parts.next()?;
+    Some((source, event, group, handler))
+}
+
+fn remap_config_hook_state(
+    doc: &mut DocumentMut,
+    sources: &[(&Path, HookStateRemap)],
+) -> Result<bool, String> {
+    let original = cloned_hook_state(doc)?;
+    if original.is_empty() {
+        return Ok(false);
+    }
+    let mut rebuilt = Vec::with_capacity(original.len());
+    let mut modified = false;
+    for (key, item) in original {
+        let Some((raw_source, event, group, handler)) = parse_hook_state_key(&key) else {
+            rebuilt.push((key, item));
+            continue;
+        };
+        let Some((_, remap)) = sources.iter().find(|(source, remap)| {
+            paths_equivalent(Path::new(raw_source), source) && remap.covered_events.contains(event)
+        }) else {
+            rebuilt.push((key, item));
+            continue;
+        };
+        if let Some((new_group, new_handler)) =
+            remap.positions.get(&(event.to_string(), group, handler))
+        {
+            let new_key = format!("{raw_source}:{event}:{new_group}:{new_handler}");
+            modified |= new_key != key;
+            rebuilt.push((new_key, item));
+        } else {
+            modified = true;
+        }
+    }
+    if !modified {
+        return Ok(false);
+    }
+    let hooks = hooks_table_mut(doc)?;
+    if rebuilt.is_empty() {
+        hooks.remove("state");
+    } else {
+        let mut state = Table::new();
+        for (key, item) in rebuilt {
+            if state.insert(&key, item).is_some() {
+                return Err(format!("Codex hook state remap collided at {key}"));
+            }
+        }
+        hooks.insert("state", Item::Table(state));
+    }
+    if hooks.is_empty() {
+        doc.as_table_mut().remove("hooks");
+    }
+    Ok(true)
+}
+
+fn remove_retired_json_hooks_at(
+    root: &mut serde_json::Value,
+    script_dir: &Path,
+) -> Result<bool, String> {
+    let Some(root_object) = root.as_object_mut() else {
+        return Err("hooks.json root is not an object".to_string());
+    };
+    let Some(hooks) = root_object
+        .get_mut("hooks")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(false);
+    };
+    let mut modified = false;
+    let mut empty_events = Vec::new();
+    for (event, groups_value) in hooks.iter_mut() {
+        let Some(groups) = groups_value.as_array_mut() else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            let marked = legacy_group_marker(group);
+            let (removed, empty) = {
+                let Some(handlers) = group
+                    .get_mut("hooks")
+                    .and_then(serde_json::Value::as_array_mut)
+                else {
+                    let removed = group
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|command| {
+                            command_is_retired_continuity_at(command, script_dir)
+                        });
+                    modified |= removed;
+                    return !removed;
+                };
+                let before = handlers.len();
+                handlers.retain(|handler| {
+                    !handler
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|command| {
+                            command_is_retired_continuity_at(command, script_dir)
+                        })
+                });
+                (handlers.len() != before, handlers.is_empty())
+            };
+            modified |= removed;
+            if removed
+                && marked
+                && !empty
+                && let Some(object) = group.as_object_mut()
+            {
+                object.remove("_source");
+            }
+            !empty
+        });
+        if groups.is_empty() {
+            empty_events.push(event.clone());
+        }
+    }
+    for event in empty_events {
+        hooks.remove(&event);
+    }
+    if hooks.is_empty() {
+        root_object.remove("hooks");
+    }
+    Ok(modified)
 }
 
 fn update_config_toml(
@@ -1838,7 +2051,7 @@ fn config_string(doc: &DocumentMut, keys: &[&str]) -> Result<Option<String>, Str
 }
 
 /// Ownership of `mcp_servers.quill` is inferred structurally, the same way
-/// [`command_uses_managed_script`] does for hooks: an entry whose command or
+/// [`command_uses_quill_script_directory`] does for hooks: an entry whose command or
 /// args point into the managed MCP directory is ours no matter how it got
 /// there. Marker comments cannot answer this — they are stripped from every
 /// config Quill writes, so a capture that ran without prior state would adopt
@@ -2211,6 +2424,90 @@ fn json_hook_handler_is_managed(handler: &serde_json::Value) -> bool {
         .is_some_and(command_is_quill_owned)
 }
 
+fn hook_position_count(positions: &HashMap<String, Vec<(usize, usize)>>) -> usize {
+    positions.values().map(Vec::len).sum()
+}
+
+fn retire_continuity_hooks_at(paths: &CodexInstallPaths, script_dir: &Path) -> Result<(), String> {
+    let original_config = read_optional_text(&paths.config, "config.toml")?;
+    let original_hooks = read_optional_text(&paths.hooks, "hooks.json")?;
+    let result = (|| {
+        let mut doc = parse_config_doc(original_config.as_deref().unwrap_or_default())?;
+        let mut hooks_root = original_hooks
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|err| format!("Failed to parse hooks.json: {err}"))?
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let inline_all = toml_hook_positions(&doc, |_| true);
+        let inline_retained = toml_hook_positions(&doc, |command| {
+            command.is_none_or(|command| !command_is_retired_continuity_at(command, script_dir))
+        });
+        let json_retained = json_hook_positions(&hooks_root, |command| {
+            command.is_none_or(|command| !command_is_retired_continuity_at(command, script_dir))
+        });
+
+        remove_matching_codex_inline_hooks(&mut doc, |command| {
+            command_is_retired_continuity_at(command, script_dir)
+        })?;
+        let hooks_modified = remove_retired_json_hooks_at(&mut hooks_root, script_dir)?;
+        let inline_remap = position_remap(inline_retained, toml_hook_positions(&doc, |_| true))?;
+        let json_remap = position_remap(json_retained, json_hook_positions(&hooks_root, |_| true))?;
+        let state_modified = remap_config_hook_state(
+            &mut doc,
+            &[
+                (paths.config.as_path(), inline_remap),
+                (paths.hooks.as_path(), json_remap),
+            ],
+        )?;
+        let inline_modified = hook_position_count(&inline_all)
+            != hook_position_count(&toml_hook_positions(&doc, |_| true));
+
+        if original_config.is_some() && (inline_modified || state_modified) {
+            write_config_doc(&paths.config, doc)?;
+        }
+        if original_hooks.is_some() && hooks_modified {
+            if hooks_root
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                remove_path(&paths.hooks)
+                    .map_err(|err| format!("Failed to remove hooks.json: {err}"))?;
+            } else {
+                let output = serde_json::to_string_pretty(&hooks_root)
+                    .map_err(|err| format!("Failed to serialize hooks.json: {err}"))?;
+                fs::write(&paths.hooks, output)
+                    .map_err(|err| format!("Failed to write hooks.json: {err}"))?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        let mut rollback_errors = Vec::new();
+        if let Err(rollback) = restore_optional_text(&paths.config, original_config.as_deref()) {
+            rollback_errors.push(rollback);
+        }
+        if let Err(rollback) = restore_optional_text(&paths.hooks, original_hooks.as_deref()) {
+            rollback_errors.push(rollback);
+        }
+        return if rollback_errors.is_empty() {
+            Err(err)
+        } else {
+            Err(format!(
+                "{err}; continuity hook rollback failed: {}",
+                rollback_errors.join("; ")
+            ))
+        };
+    }
+    Ok(())
+}
+
+pub(crate) fn retire_continuity_hooks() -> Result<(), String> {
+    retire_continuity_hooks_at(&resolve_codex_install_paths()?, &scripts_dir())
+}
+
 fn remove_managed_config_entries(paths: &CodexInstallPaths) -> Result<(), String> {
     let original_config = read_optional_text(&paths.config, "config.toml")?;
     let original_hooks = read_optional_text(&paths.hooks, "hooks.json")?;
@@ -2497,12 +2794,7 @@ mod tests {
             assert_eq!(group.hooks.len(), 1);
             assert_eq!(group.hooks[0].timeout, 3);
         }
-        for event in [
-            "SessionStart",
-            "SubagentStart",
-            "SubagentStop",
-            "SessionEnd",
-        ] {
+        for event in ["SessionStart", "SubagentStart", "SubagentStop"] {
             assert!(
                 !observer_groups.iter().any(|group| group.event == event),
                 "{event} lifecycle hook must not be deployed to user config"
@@ -2518,6 +2810,257 @@ mod tests {
                 .iter()
                 .all(|hook| !hook.command.contains("hook-observe.cjs"))
         }));
+    }
+
+    #[test]
+    fn continuity_upgrade_prunes_capture_and_preserves_foreign_hooks_and_state() {
+        let capture_command = format!(
+            "node {}",
+            shell_quote(&scripts_dir().join("context-capture.cjs"))
+        );
+        let foreign_command = "node \"/opt/foreign/context-capture.cjs\"";
+
+        let mut doc = DocumentMut::new();
+        append_codex_inline_hooks(
+            &mut doc,
+            &[CodexHookGroup {
+                event: "SessionStart",
+                matcher: None,
+                hooks: vec![
+                    CodexHookCommand {
+                        command: capture_command.clone(),
+                        timeout: 5,
+                    },
+                    CodexHookCommand {
+                        command: foreign_command.to_string(),
+                        timeout: 2,
+                    },
+                ],
+            }],
+        )
+        .unwrap();
+        doc["hooks"]["SessionStart"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .get_mut(0)
+            .unwrap()
+            .insert("custom", value("keep"));
+        remove_codex_inline_hooks_from_doc(&mut doc, Path::new("/tmp/config.toml")).unwrap();
+        let inline_group = doc["hooks"]["SessionStart"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(inline_group["custom"].as_str(), Some("keep"));
+        let inline_hooks = inline_group["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(inline_hooks.len(), 1);
+        assert_eq!(
+            inline_hooks.get(0).unwrap()["command"].as_str(),
+            Some(foreign_command)
+        );
+
+        let mut legacy_group = serde_json::json!({
+            "_source": CONTEXT_HOOK_MARKER,
+            "custom": { "keep": true },
+            "hooks": [
+                { "type": "command", "command": capture_command, "timeout": 5 },
+                { "type": "command", "command": foreign_command, "timeout": 2 }
+            ]
+        });
+        assert!(prune_legacy_hook_group(&mut legacy_group));
+        assert!(legacy_group.get("_source").is_none());
+        assert_eq!(legacy_group["custom"]["keep"], true);
+        assert_eq!(legacy_group["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(legacy_group["hooks"][0]["command"], foreign_command);
+
+        let source = PathBuf::from("/tmp/codex/config.toml");
+        let capture = CodexHookMetadata {
+            key: "/tmp/codex/config.toml:session_start:0:0".to_string(),
+            event_name: "SessionStart".to_string(),
+            matcher: None,
+            command: Some(format!(
+                "node {}",
+                shell_quote(&scripts_dir().join("context-capture.cjs"))
+            )),
+            timeout_sec: Some(5),
+            source_path: source.clone(),
+            current_hash: "capture".to_string(),
+            enabled: true,
+            trust_status: "trusted".to_string(),
+        };
+        let foreign_before = CodexHookMetadata {
+            key: "/tmp/codex/config.toml:session_start:0:1".to_string(),
+            event_name: "SessionStart".to_string(),
+            matcher: None,
+            command: Some(foreign_command.to_string()),
+            timeout_sec: Some(2),
+            source_path: source.clone(),
+            current_hash: "foreign".to_string(),
+            enabled: false,
+            trust_status: "untrusted".to_string(),
+        };
+        let foreign_after = CodexHookMetadata {
+            key: "/tmp/codex/config.toml:session_start:0:0".to_string(),
+            ..foreign_before.clone()
+        };
+        let mut capture_state = Table::new();
+        capture_state.insert("enabled", value(true));
+        let mut foreign_state = Table::new();
+        foreign_state.insert("enabled", value(false));
+        foreign_state.insert("note", value("keep"));
+        let foreign_state = Item::Table(foreign_state);
+        let original_state = vec![
+            (capture.key.clone(), Item::Table(capture_state)),
+            (foreign_before.key.clone(), foreign_state.clone()),
+        ];
+        let mut state_doc = DocumentMut::new();
+        reconcile_hook_state(
+            &mut state_doc,
+            &[capture, foreign_before],
+            std::slice::from_ref(&foreign_after),
+            &original_state,
+            std::slice::from_ref(&source),
+        )
+        .unwrap();
+        let state = state_doc["hooks"]["state"].as_table().unwrap();
+        assert_eq!(state.len(), 1);
+        let remapped = state.get(&foreign_after.key).unwrap().as_table().unwrap();
+        assert_eq!(remapped["enabled"].as_bool(), Some(false));
+        assert_eq!(remapped["note"].as_str(), Some("keep"));
+
+        let features = IntegrationFeatures::default();
+        assert!(
+            context_scripts_for(features)
+                .iter()
+                .all(|script| *script != "context-capture.cjs")
+        );
+        assert!(!ALL_MANAGED_SCRIPT_FILES.contains(&"context-capture.cjs"));
+        assert!(build_codex_hook_groups(features).iter().all(|group| {
+            group
+                .hooks
+                .iter()
+                .all(|hook| !hook.command.contains("context-capture.cjs"))
+        }));
+    }
+
+    #[test]
+    fn retirement_without_cli_remaps_foreign_hook_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let paths = codex_paths(home.clone());
+        let script_dir = temp.path().join("quill-scripts");
+        fs::create_dir_all(&home).unwrap();
+        let capture = format!(
+            "node {}",
+            shell_quote(&script_dir.join("context-capture.cjs"))
+        );
+        let foreign = "node \"/opt/foreign/context-capture.cjs\"";
+
+        let mut doc = DocumentMut::new();
+        append_codex_inline_hooks(
+            &mut doc,
+            &[CodexHookGroup {
+                event: "SessionStart",
+                matcher: None,
+                hooks: vec![
+                    CodexHookCommand {
+                        command: capture.clone(),
+                        timeout: 5,
+                    },
+                    CodexHookCommand {
+                        command: foreign.to_string(),
+                        timeout: 2,
+                    },
+                ],
+            }],
+        )
+        .unwrap();
+        doc["hooks"]["SessionStart"]
+            .as_array_of_tables_mut()
+            .unwrap()
+            .get_mut(0)
+            .unwrap()
+            .insert("custom", value("keep"));
+        let mut state = Table::new();
+        let capture_key = format!("{}:session_start:0:0", paths.config.display());
+        let foreign_key = format!("{}:session_start:0:1", paths.config.display());
+        state.insert(&capture_key, value("drop"));
+        let mut foreign_state = Table::new();
+        foreign_state.insert("enabled", value(false));
+        foreign_state.insert("note", value("keep"));
+        state.insert(&foreign_key, Item::Table(foreign_state));
+        hooks_table_mut(&mut doc)
+            .unwrap()
+            .insert("state", Item::Table(state));
+        write_config_doc(&paths.config, doc).unwrap();
+
+        let hooks_key = format!("{}:session_start:0:1", paths.hooks.display());
+        let existing = fs::read_to_string(&paths.config).unwrap();
+        let mut doc = parse_config_doc(&existing).unwrap();
+        let mut hooks_state = Table::new();
+        hooks_state.insert("enabled", value(false));
+        hooks_state.insert("note", value("legacy-keep"));
+        doc["hooks"]["state"]
+            .as_table_mut()
+            .unwrap()
+            .insert(&hooks_key, Item::Table(hooks_state));
+        write_config_doc(&paths.config, doc).unwrap();
+        fs::write(
+            &paths.hooks,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "custom": { "keep": true },
+                "hooks": {
+                    "SessionStart": [{
+                        "_source": CONTEXT_HOOK_MARKER,
+                        "custom": { "keep": true },
+                        "hooks": [
+                            { "command": capture, "timeout": 5 },
+                            { "command": foreign, "timeout": 2 }
+                        ]
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        retire_continuity_hooks_at(&paths, &script_dir).unwrap();
+        let once_config = fs::read_to_string(&paths.config).unwrap();
+        let once_hooks = fs::read_to_string(&paths.hooks).unwrap();
+        retire_continuity_hooks_at(&paths, &script_dir).unwrap();
+        assert_eq!(fs::read_to_string(&paths.config).unwrap(), once_config);
+        assert_eq!(fs::read_to_string(&paths.hooks).unwrap(), once_hooks);
+
+        let doc = parse_config_doc(&fs::read_to_string(&paths.config).unwrap()).unwrap();
+        let group = doc["hooks"]["SessionStart"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(group["custom"].as_str(), Some("keep"));
+        let handlers = group["hooks"].as_array_of_tables().unwrap();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers.get(0).unwrap()["command"].as_str(), Some(foreign));
+        let state = doc["hooks"]["state"].as_table().unwrap();
+        assert_eq!(state.len(), 2);
+        for (source, note) in [
+            (paths.config.as_path(), "keep"),
+            (paths.hooks.as_path(), "legacy-keep"),
+        ] {
+            let key = format!("{}:session_start:0:0", source.display());
+            let entry = state.get(&key).unwrap().as_table().unwrap();
+            assert_eq!(entry["enabled"].as_bool(), Some(false));
+            assert_eq!(entry["note"].as_str(), Some(note));
+        }
+
+        let hooks: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&paths.hooks).unwrap()).unwrap();
+        assert_eq!(hooks["custom"]["keep"], true);
+        let group = &hooks["hooks"]["SessionStart"][0];
+        assert_eq!(group["custom"]["keep"], true);
+        assert!(group.get("_source").is_none());
+        assert_eq!(group["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(group["hooks"][0]["command"], foreign);
     }
 
     // @lat: [[infrastructure#Infrastructure#Codex Integration Deployment]]

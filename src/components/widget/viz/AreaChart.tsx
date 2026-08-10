@@ -3,9 +3,25 @@
 // until the chart is hovered or focused (the providers are already named in
 // the LIMITS section, so a permanent legend would be redundant ink).
 
-import { useId, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { formatTokenCount } from "../../../utils/tokens";
-import { areaPath, scalePoints, seriesMax, seriesTotal, smoothPath } from "./geometry";
+import {
+  areaPath,
+  bucketIndexAtPosition,
+  legendPositionAtPosition,
+  scalePoints,
+  seriesMax,
+  seriesTotal,
+  smoothPath,
+  type LegendPosition,
+} from "./geometry";
 
 const DEFAULT_WIDTH = 332;
 const DEFAULT_HEIGHT = 118;
@@ -78,6 +94,92 @@ function AreaChart({
   const classes = className ? `viz-chart ${className}` : "viz-chart";
   const baseline = height - AXIS_HEIGHT;
   const max = seriesMax(series.map((entry) => entry.values));
+  const buckets = series.reduce((count, entry) => Math.max(count, entry.values.length), 0);
+  const [scrub, setScrub] = useState<{
+    bucket: number;
+    legend: LegendPosition | null;
+  } | null>(null);
+  const legendRef = useRef<HTMLDivElement>(null);
+  const helpId = `${gradientPrefix}-help`;
+  const plotted = series.map((entry) => ({
+    entry,
+    points: scalePoints(entry.values, {
+      width,
+      baseline: baseline - BASELINE_GAP,
+      plotHeight: baseline * headroom,
+      max,
+    }),
+  }));
+
+  useEffect(() => setScrub(null), [xLabels]);
+
+  const handlePointer = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const legendRect = legendRef.current?.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const bucket = bucketIndexAtPosition(x, rect.width, buckets);
+      setScrub(
+        bucket === null
+          ? null
+          : {
+              bucket,
+              legend: legendRect
+                ? legendPositionAtPosition(
+                    x,
+                    event.clientY - rect.top,
+                    rect.width,
+                    rect.height,
+                    legendRect.width,
+                    legendRect.height,
+                  )
+                : null,
+            },
+      );
+    },
+    [buckets],
+  );
+
+  const handleKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (buckets === 0) return;
+      const current = scrub?.bucket ?? buckets - 1;
+      let next: number | null = null;
+      if (event.key === "ArrowRight") {
+        next = Math.min(current + 1, buckets - 1);
+      } else if (event.key === "ArrowLeft") {
+        next = Math.max(current - 1, 0);
+      } else if (event.key === "Home") {
+        next = 0;
+      } else if (event.key === "End") {
+        next = buckets - 1;
+      } else if (event.key === "Escape") {
+        setScrub(null);
+      }
+
+      if (next !== null) {
+        event.preventDefault();
+        const rect = event.currentTarget.getBoundingClientRect();
+        const legendRect = legendRef.current?.getBoundingClientRect();
+        const point = plotted.find(({ points }) => points[next])?.points[next];
+        setScrub({
+          bucket: next,
+          legend:
+            legendRect && point
+              ? legendPositionAtPosition(
+                  (point.x / width) * rect.width,
+                  (point.y / height) * rect.height,
+                  rect.width,
+                  rect.height,
+                  legendRect.width,
+                  legendRect.height,
+                )
+              : null,
+        });
+      }
+    },
+    [buckets, height, plotted, scrub, width],
+  );
 
   if (max <= 0) {
     return (
@@ -90,29 +192,58 @@ function AreaChart({
     );
   }
 
-  const plotted = series.map((entry) => ({
-    entry,
-    points: scalePoints(entry.values, {
-      width,
-      baseline: baseline - BASELINE_GAP,
-      plotHeight: baseline * headroom,
-      max,
-    }),
-  }));
+  const active = scrub !== null && scrub.bucket < buckets ? scrub.bucket : null;
+  const crossX =
+    active === null
+      ? null
+      : (plotted.find(({ points }) => points[active])?.points[active]?.x ?? 0);
+  const legendPosition = active === null ? null : scrub?.legend;
+  const announcement =
+    active === null
+      ? ""
+      : `${xLabels?.[active] || `Bucket ${active + 1}`} — ${series
+          .map((entry) => `${entry.label} ${formatTotal(entry.values[active] ?? 0)}`)
+          .join(", ")}`;
 
   return (
-    <div className={classes}>
+    <div
+      className={classes}
+      role="group"
+      aria-label={ariaLabel}
+      aria-describedby={helpId}
+      tabIndex={0}
+      onPointerMove={handlePointer}
+      onPointerLeave={() => setScrub(null)}
+      onBlur={() => setScrub(null)}
+      onKeyDown={handleKeyDown}
+    >
+      <p className="wg-sr" id={helpId}>
+        Move the pointer across the chart, or use the left and right arrow keys, to read each
+        time bucket. Escape clears the reading.
+      </p>
       {overlay && (
         <div className="viz-chart-overlay">
           <div className="viz-chart-overlay-inner">{overlay}</div>
         </div>
       )}
-      <div className="viz-chart-legend" data-visible={legendVisible ? "true" : undefined}>
+      <div
+        ref={legendRef}
+        className="viz-chart-legend"
+        data-side={legendPosition?.side}
+        data-visible={legendVisible ? "true" : undefined}
+        style={
+          legendPosition
+            ? { left: `${legendPosition.left}px`, top: `${legendPosition.top}px` }
+            : undefined
+        }
+      >
         {series.map((entry) => (
           <span className="viz-chart-legend-row" key={entry.id}>
             <i className="viz-chart-legend-swatch" style={{ background: entry.color }} />
             {entry.label}
-            <b className="viz-chart-legend-value">{formatTotal(seriesTotal(entry.values))}</b>
+            <b className="viz-chart-legend-value">
+              {formatTotal(active === null ? seriesTotal(entry.values) : (entry.values[active] ?? 0))}
+            </b>
           </span>
         ))}
       </div>
@@ -156,9 +287,9 @@ function AreaChart({
             x={((index + 1) * width) / (xLabels.length + 1)}
             y={height - 4}
             textAnchor="middle"
-            fill="var(--faint)"
+            fill={index === active ? "var(--text)" : "var(--faint)"}
             fontSize={7.5}
-            fontWeight={500}
+            fontWeight={index === active ? 700 : 500}
           >
             {label}
           </text>
@@ -180,14 +311,24 @@ function AreaChart({
             strokeLinecap="round"
           />
         ))}
+        {crossX !== null && (
+          <line
+            x1={crossX}
+            y1={0}
+            x2={crossX}
+            y2={baseline}
+            stroke="rgba(255,255,255,0.16)"
+            strokeWidth={1}
+          />
+        )}
         {plotted.map(({ entry, points }) => {
-          const endpoint = points.length > 0 ? points[points.length - 1] : null;
-          if (!endpoint) return null;
+          const point = active === null ? points[points.length - 1] : points[active];
+          if (!point) return null;
           return (
             <circle
-              key={`${entry.id}-endpoint`}
-              cx={endpoint.x - 1.5}
-              cy={endpoint.y}
+              key={`${entry.id}-${active === null ? "endpoint" : "active"}`}
+              cx={active === null ? point.x - 1.5 : point.x}
+              cy={point.y}
               r={2.4}
               fill={entry.color}
               stroke="var(--surface)"
@@ -196,6 +337,9 @@ function AreaChart({
           );
         })}
       </svg>
+      <p className="wg-sr" role="status" aria-live="polite">
+        {announcement}
+      </p>
     </div>
   );
 }

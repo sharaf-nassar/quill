@@ -1,19 +1,17 @@
 //! Canonical taxonomy for context_savings_events.
 //!
 //! Producers (JS hooks, Python MCP tools) set `category` explicitly per call
-//! site. The server uses [`derive_category`] only as a fallback for legacy
-//! callers that omit the field, and migration 18 backfills historical rows
-//! with the same mapping. The same logic is mirrored in the JS and Python
-//! producers — keep them in sync when adding new event types.
+//! site. The server uses [`derive_category`] when callers omit the field, and
+//! migration 18 backfills historical rows with the same mapping. JS and Python
+//! producers mirror it; keep them in sync when adding new event types.
 
 pub const PRESERVATION: &str = "preservation";
 pub const RETRIEVAL: &str = "retrieval";
 pub const ROUTING: &str = "routing";
-pub const TELEMETRY: &str = "telemetry";
 pub const UNKNOWN: &str = "unknown";
 
 pub fn is_known(category: &str) -> bool {
-    matches!(category, PRESERVATION | RETRIEVAL | ROUTING | TELEMETRY)
+    matches!(category, PRESERVATION | RETRIEVAL | ROUTING)
 }
 
 /// Derive the category for a `(event_type, decision)` pair when the producer
@@ -30,14 +28,7 @@ pub fn derive_category(event_type: &str, decision: &str) -> &'static str {
         },
         "mcp.search" => ROUTING,
         "mcp.source_read" => RETRIEVAL,
-        "mcp.snapshot" => match decision {
-            "created" => PRESERVATION,
-            _ => RETRIEVAL,
-        },
-        "mcp.continuity" => TELEMETRY,
         "router.guidance" | "router.denial" => ROUTING,
-        "capture.event" | "capture.snapshot" => TELEMETRY,
-        "capture.guidance" => ROUTING,
         _ => UNKNOWN,
     }
 }
@@ -54,12 +45,7 @@ CASE
     WHEN event_type = 'mcp.execute' THEN 'routing'
     WHEN event_type = 'mcp.search' THEN 'routing'
     WHEN event_type = 'mcp.source_read' THEN 'retrieval'
-    WHEN event_type = 'mcp.snapshot' AND decision = 'created' THEN 'preservation'
-    WHEN event_type = 'mcp.snapshot' THEN 'retrieval'
-    WHEN event_type = 'mcp.continuity' THEN 'telemetry'
     WHEN event_type IN ('router.guidance', 'router.denial') THEN 'routing'
-    WHEN event_type IN ('capture.event', 'capture.snapshot') THEN 'telemetry'
-    WHEN event_type = 'capture.guidance' THEN 'routing'
     ELSE 'unknown'
 END
 ";
@@ -74,14 +60,12 @@ mod tests {
         assert_eq!(derive_category("mcp.fetch", "indexed"), PRESERVATION);
         assert_eq!(derive_category("mcp.fetch", "cache_hit"), PRESERVATION);
         assert_eq!(derive_category("mcp.execute", "indexed"), PRESERVATION);
-        assert_eq!(derive_category("mcp.snapshot", "created"), PRESERVATION);
     }
 
     #[test]
     fn maps_retrieval_reads() {
         assert_eq!(derive_category("mcp.source_read", "chunk"), RETRIEVAL);
         assert_eq!(derive_category("mcp.source_read", "source"), RETRIEVAL);
-        assert_eq!(derive_category("mcp.snapshot", "returned"), RETRIEVAL);
     }
 
     #[test]
@@ -90,17 +74,6 @@ mod tests {
         assert_eq!(derive_category("mcp.execute", "returned"), ROUTING);
         assert_eq!(derive_category("router.guidance", "guide"), ROUTING);
         assert_eq!(derive_category("router.denial", "deny"), ROUTING);
-        assert_eq!(
-            derive_category("capture.guidance", "session-start-directive"),
-            ROUTING
-        );
-    }
-
-    #[test]
-    fn maps_telemetry_observations() {
-        assert_eq!(derive_category("capture.event", "recorded"), TELEMETRY);
-        assert_eq!(derive_category("capture.snapshot", "recorded"), TELEMETRY);
-        assert_eq!(derive_category("mcp.continuity", "recorded"), TELEMETRY);
     }
 
     #[test]
@@ -121,14 +94,8 @@ mod tests {
         ("mcp.search", "returned", ROUTING),
         ("mcp.source_read", "chunk", RETRIEVAL),
         ("mcp.source_read", "source", RETRIEVAL),
-        ("mcp.snapshot", "created", PRESERVATION),
-        ("mcp.snapshot", "returned", RETRIEVAL),
-        ("mcp.continuity", "recorded", TELEMETRY),
         ("router.guidance", "guide", ROUTING),
         ("router.denial", "deny", ROUTING),
-        ("capture.event", "recorded", TELEMETRY),
-        ("capture.snapshot", "recorded", TELEMETRY),
-        ("capture.guidance", "session-start-directive", ROUTING),
         ("future.event", "x", UNKNOWN),
     ];
 

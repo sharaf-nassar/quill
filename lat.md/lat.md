@@ -12,6 +12,8 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[frontend-cache-tests]] — Frontend invoke cache, refresh cadence, and lifecycle test specs
 - [[live-subagent-count-tests]] — Observed subagent lifecycle, IPC, provider, audit, and Sessions-row test specs
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
+- [[widget-viz-tests]] — Pointer-to-bucket interaction test specs for widget charts
+- [[widget-view-tests]] — Persistence test specs for widget view controls
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs
 - [[crash-reporting-tests]] — Rust crash payload privacy and release identity test specs

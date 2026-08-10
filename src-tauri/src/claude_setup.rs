@@ -349,13 +349,12 @@ const MANAGED_COMMAND_FILES: [&str; 5] = [
 // reinstall regardless of which features are currently enabled so a user who
 // flips activity-tracking or context-telemetry off does not leave the script
 // orphaned in `~/.config/quill/scripts/`.
-const ALL_MANAGED_SCRIPT_FILES: [&str; 7] = [
+const ALL_MANAGED_SCRIPT_FILES: [&str; 6] = [
     "observe.cjs",
     "qbuild-guard.cjs",
     "session-sync.cjs",
     "report-tokens.cjs",
     "context-router.cjs",
-    "context-capture.cjs",
     "context-telemetry.cjs",
 ];
 
@@ -376,7 +375,7 @@ fn context_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
     if !features.context_preservation {
         return Vec::new();
     }
-    let mut scripts: Vec<&'static str> = vec!["context-router.cjs", "context-capture.cjs"];
+    let mut scripts: Vec<&'static str> = vec!["context-router.cjs"];
     if features.context_telemetry {
         scripts.push("context-telemetry.cjs");
     }
@@ -779,7 +778,11 @@ where
     Ok(modified)
 }
 
-fn strip_orphaned_main_sources(settings: &mut serde_json::Value, paths: &ClaudePaths) -> bool {
+fn strip_orphaned_main_sources_at(
+    settings: &mut serde_json::Value,
+    paths: &ClaudePaths,
+    script_dir: &Path,
+) -> bool {
     let Some(hooks) = settings
         .get_mut("hooks")
         .and_then(serde_json::Value::as_object_mut)
@@ -802,7 +805,7 @@ fn strip_orphaned_main_sources(settings: &mut serde_json::Value, paths: &ClaudeP
                 .is_some_and(|handlers| {
                     handlers
                         .iter()
-                        .any(|handler| hook_handler_is_managed(handler, paths))
+                        .any(|handler| hook_handler_is_managed_at(handler, paths, script_dir))
                 });
             if marked && !has_managed {
                 group
@@ -814,6 +817,29 @@ fn strip_orphaned_main_sources(settings: &mut serde_json::Value, paths: &ClaudeP
         }
     }
     modified
+}
+
+fn strip_orphaned_main_sources(settings: &mut serde_json::Value, paths: &ClaudePaths) -> bool {
+    strip_orphaned_main_sources_at(settings, paths, &scripts_dir())
+}
+
+fn retire_continuity_hooks_at(paths: &ClaudePaths, script_dir: &Path) -> Result<(), String> {
+    if !paths.settings.exists() {
+        return Ok(());
+    }
+    let mut settings = read_settings_object(&paths.settings)?;
+    let mut modified = remove_matching_hook_handlers(&mut settings, |handler| {
+        hook_handler_is_retired_continuity(handler, script_dir)
+    })?;
+    modified |= strip_orphaned_main_sources_at(&mut settings, paths, script_dir);
+    if modified {
+        write_settings_object(&paths.settings, &settings)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn retire_continuity_hooks() -> Result<(), String> {
+    retire_continuity_hooks_at(&resolve_claude_install_paths()?, &scripts_dir())
 }
 
 fn cleanup_quill_hooks(paths: &ClaudePaths) -> Result<(), String> {
@@ -1437,9 +1463,14 @@ fn expected_hook_groups(
 ) -> Vec<ClaudeHookGroup> {
     let observe = cjs_command(runtime, "observe.cjs", 3);
     let sync = cjs_command(runtime, "session-sync.cjs", 10);
-    let capture = cjs_command(runtime, "context-capture.cjs", 5);
     let mut qbuild = cjs_command(runtime, "qbuild-guard.cjs", 5);
     qbuild.args.push(runtime.git.to_string_lossy().to_string());
+    let mut stop_hooks = vec![cjs_command(runtime, "report-tokens.cjs", 5), sync.clone()];
+    let mut stop_failure_hooks = vec![sync.clone()];
+    if features.activity_tracking {
+        stop_hooks.push(observe.clone());
+        stop_failure_hooks.push(observe.clone());
+    }
     let mut groups = vec![
         ClaudeHookGroup {
             event: "PreToolUse",
@@ -1451,19 +1482,23 @@ fn expected_hook_groups(
             event: "Stop",
             matcher: None,
             source: HOOK_MARKER,
-            hooks: vec![cjs_command(runtime, "report-tokens.cjs", 5), sync.clone()],
+            hooks: stop_hooks,
         },
         ClaudeHookGroup {
             event: "StopFailure",
             matcher: None,
             source: HOOK_MARKER,
-            hooks: vec![sync.clone()],
+            hooks: stop_failure_hooks,
         },
         ClaudeHookGroup {
             event: "SessionEnd",
             matcher: None,
             source: HOOK_MARKER,
-            hooks: vec![sync],
+            hooks: if features.activity_tracking {
+                vec![sync, observe.clone()]
+            } else {
+                vec![sync]
+            },
         },
     ];
     if features.activity_tracking {
@@ -1477,38 +1512,12 @@ fn expected_hook_groups(
         }
     }
     if features.context_preservation {
-        groups.extend([
-            ClaudeHookGroup {
-                event: "SessionStart",
-                matcher: None,
-                source: CONTEXT_HOOK_MARKER,
-                hooks: vec![capture.clone()],
-            },
-            ClaudeHookGroup {
-                event: "PreToolUse",
-                matcher: Some("*"),
-                source: CONTEXT_HOOK_MARKER,
-                hooks: vec![cjs_command(runtime, "context-router.cjs", 5)],
-            },
-            ClaudeHookGroup {
-                event: "UserPromptSubmit",
-                matcher: None,
-                source: CONTEXT_HOOK_MARKER,
-                hooks: vec![capture.clone()],
-            },
-            ClaudeHookGroup {
-                event: "PreCompact",
-                matcher: None,
-                source: CONTEXT_HOOK_MARKER,
-                hooks: vec![capture.clone()],
-            },
-            ClaudeHookGroup {
-                event: "Stop",
-                matcher: None,
-                source: CONTEXT_HOOK_MARKER,
-                hooks: vec![capture],
-            },
-        ]);
+        groups.push(ClaudeHookGroup {
+            event: "PreToolUse",
+            matcher: Some("*"),
+            source: CONTEXT_HOOK_MARKER,
+            hooks: vec![cjs_command(runtime, "context-router.cjs", 5)],
+        });
     }
     groups
 }
@@ -1537,27 +1546,41 @@ fn legacy_quote(path: &Path) -> String {
     format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
 }
 
-fn hook_handler_is_managed(handler: &serde_json::Value, paths: &ClaudePaths) -> bool {
+fn command_script_path(command: &str) -> Option<&str> {
+    let path = command
+        .strip_prefix("node ")
+        .or_else(|| command.strip_prefix("bash "))
+        .unwrap_or(command);
+    if let Some(path) = path.strip_prefix('"') {
+        return path.strip_suffix('"');
+    }
+    (!path.chars().any(char::is_whitespace)).then_some(path)
+}
+
+fn path_is_quill_script_at(path: &str, script_dir: &Path) -> bool {
+    Path::new(path)
+        .parent()
+        .is_some_and(|parent| parent == script_dir)
+}
+
+fn hook_handler_is_managed_at(
+    handler: &serde_json::Value,
+    paths: &ClaudePaths,
+    script_dir: &Path,
+) -> bool {
     let Some(command) = handler.get("command").and_then(serde_json::Value::as_str) else {
         return false;
     };
-    let managed_scripts = ALL_MANAGED_SCRIPT_FILES
-        .into_iter()
-        .chain(["qbuild-guard.sh", "report-tokens.sh"])
-        .map(|name| scripts_dir().join(name))
-        .collect::<Vec<_>>();
     if handler
         .get("args")
         .and_then(serde_json::Value::as_array)
         .and_then(|args| args.first())
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|arg| managed_scripts.iter().any(|path| path == Path::new(arg)))
+        .is_some_and(|path| path_is_quill_script_at(path, script_dir))
     {
         return true;
     }
-    if managed_scripts.iter().any(|path| {
-        command == format!("node {}", legacy_quote(path)) || command == legacy_quote(path)
-    }) {
+    if command_script_path(command).is_some_and(|path| path_is_quill_script_at(path, script_dir)) {
         return true;
     }
     [
@@ -1573,6 +1596,30 @@ fn hook_handler_is_managed(handler: &serde_json::Value, paths: &ClaudePaths) -> 
                 legacy_quote(&paths.legacy_hooks.join(name))
             )
     })
+}
+
+fn hook_handler_is_managed(handler: &serde_json::Value, paths: &ClaudePaths) -> bool {
+    hook_handler_is_managed_at(handler, paths, &scripts_dir())
+}
+
+fn hook_handler_is_retired_continuity(handler: &serde_json::Value, script_dir: &Path) -> bool {
+    let is_retired_path = |path: &str| {
+        path_is_quill_script_at(path, script_dir)
+            && Path::new(path)
+                .file_name()
+                .is_some_and(|name| name == "context-capture.cjs")
+    };
+    handler
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|args| args.first())
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(is_retired_path)
+        || handler
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .and_then(command_script_path)
+            .is_some_and(is_retired_path)
 }
 
 fn has_managed_install(paths: &ClaudePaths) -> bool {
@@ -2042,14 +2089,73 @@ mod tests {
             assert_eq!(observer_count(&enabled, event), 1, "{event}");
             assert_eq!(observer_count(&disabled, event), 0, "{event}");
         }
-        for event in [
-            "SessionStart",
-            "SubagentStart",
-            "SubagentStop",
-            "SessionEnd",
-        ] {
+        for event in ["Stop", "StopFailure", "SessionEnd"] {
+            assert_eq!(observer_count(&enabled, event), 1, "{event}");
+            assert_eq!(observer_count(&disabled, event), 0, "{event}");
+        }
+        for event in ["SessionStart", "SubagentStart", "SubagentStop"] {
             assert_eq!(observer_count(&enabled, event), 0, "{event}");
         }
+    }
+
+    #[test]
+    fn continuity_upgrade_prunes_capture_and_preserves_foreign_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths_for(temp.path().join("claude"), temp.path().join(".claude.json"));
+        let script_dir = temp.path().join("quill-scripts");
+        let capture = serde_json::json!({
+            "type": "command",
+            "command": "/usr/bin/node",
+            "args": [script_dir.join("context-capture.cjs")],
+            "timeout": 5
+        });
+        let foreign = serde_json::json!({
+            "type": "command",
+            "command": "/usr/bin/foreign-hook",
+            "args": ["/opt/foreign/context-capture.cjs"],
+            "timeout": 2
+        });
+        write_settings_object(
+            &paths.settings,
+            &serde_json::json!({
+                "hooks": {
+                    "SessionStart": [{
+                        "_source": CONTEXT_HOOK_MARKER,
+                        "custom": { "keep": true },
+                        "hooks": [capture, foreign.clone()]
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+
+        let features = IntegrationFeatures::default();
+        retire_continuity_hooks_at(&paths, &script_dir).unwrap();
+        let once = fs::read_to_string(&paths.settings).unwrap();
+        retire_continuity_hooks_at(&paths, &script_dir).unwrap();
+        assert_eq!(fs::read_to_string(&paths.settings).unwrap(), once);
+        let installed = read_settings_object(&paths.settings).unwrap();
+        let preserved = &installed["hooks"]["SessionStart"][0];
+        assert_eq!(preserved["custom"]["keep"], true);
+        assert!(preserved.get("_source").is_none());
+        assert_eq!(preserved["hooks"], serde_json::json!([foreign]));
+        assert!(
+            context_scripts_for(features)
+                .iter()
+                .all(|script| *script != "context-capture.cjs")
+        );
+        assert!(!ALL_MANAGED_SCRIPT_FILES.contains(&"context-capture.cjs"));
+        assert!(
+            expected_hook_groups(features, &fixture_runtime())
+                .iter()
+                .all(|group| {
+                    group.hooks.iter().all(|hook| {
+                        hook.args
+                            .first()
+                            .is_none_or(|arg| !arg.ends_with("context-capture.cjs"))
+                    })
+                })
+        );
     }
 
     #[test]

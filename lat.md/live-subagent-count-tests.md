@@ -28,7 +28,7 @@ An unresolved spawn whose own transcript went silent past the cutoff is an aband
 
 ## Transcript Session Activity
 
-A session takes its origin and project from the first record it ever parses and advances its activity from later appends, so re-reading the start record is never required to keep either.
+A session takes origin and project from its first record, advances activity from later timestamped content, and ignores hook-result attachments so terminal bookkeeping cannot reopen it.
 
 ## Transcript Scan Throttle
 
@@ -37,6 +37,18 @@ Several Sessions readers inside one interval cost a single directory walk; the t
 ## Codex Rollout Turn Resolution
 
 A Codex sub-agent is open only while its own rollout's newest turn boundary is a `task_started`, so a thread that completed or aborted its turn stops counting while still being listed with the role its head declared.
+
+## Codex Session Activity
+
+Codex root activity uses substantive rollout content rather than filesystem writes so terminal evidence stays authoritative until real work resumes.
+
+### Stop Bookkeeping Filtering
+
+Newer mtime, lifecycle, empty items, and token bookkeeping after Stop do not advance activity, while a later valid user, assistant, reasoning, or tool record does.
+
+### Bounded Initialization and Rewrite
+
+Initial activity reads only the bounded rollout tail, incremental scans parse appended bytes, and truncating the file clears cached activity before parsing its replacement.
 
 ## Codex Spawn Chain Grouping
 
@@ -50,9 +62,17 @@ A turn's own records can push its `task_started` out of the scan window, and a w
 
 A rollout that died mid-turn leaves an unmatched `task_started` forever, so silence past the cutoff is the only evidence it is gone; a whole thread tree that goes quiet leaves the scan entirely.
 
+## Codex Head Model
+
+A Codex agent takes the first model its own rollout names, keeps that answer when a later record restates a different one, and stays unlabelled rather than borrowing a sibling's when its rollout names none or names one that fails validation.
+
 ## Observed Model Aggregation
 
 Open agents aggregate equal validated model ids, exclude closed agents from both the count and the model lookup, retain malformed ids as unknown, and keep group totals equal to the exact open count.
+
+## Transcript Model Stands In
+
+Retained evidence outranks the transcript's own model wherever it reaches, and the transcript answers only for agents it has not, so a lagging ingest narrows the unknown group instead of splitting one model across two labels.
 
 ## Retained Agent Model Lookup
 
@@ -64,23 +84,23 @@ Claude open agents resolve only from exact retained child evidence; delayed inge
 
 ## Fused Merge Snapshot Consistency
 
-A scan that swaps open membership during retained-model resolution cannot mix a lock-time count with model groups from a later registry generation.
+A scan that swaps open membership during retained-model resolution cannot mix captured agents with model evidence from a later registry generation.
 
 ## Retained Resolution After Registry Unlock
 
 Retained-model resolution can re-enter the observed registry, proving database work starts only after the merge guard drops.
 
-## Sessions SQL Excludes Historical Agent State
+## Sessions Terminal Evidence Projection
 
-The storage query keeps parent and subagent usage totals but initializes the live count as null and contains no historical agent projection or audit-table reconstruction.
+Storage clamps post-terminal token bookkeeping to the newest valid root Stop, StopFailure, or SessionEnd, while a strictly newer response reopens the provider-, host-, and root-matched row.
 
 ## Audit Persistence Is Non-Authoritative
 
-Sibling hook fires sharing one timestamp retain distinct audit identities, confirming the audit table records fires rather than reconstructing any live count.
+Sibling hook fires sharing one timestamp retain distinct audit identities, confirming the audit table records fires rather than reconstructing open-agent membership or runtime.
 
 ## Nullable Sessions IPC Overlay
 
-Command-layer enrichment overlays exact provider, host, and root matches while unmatched storage rows serialize count and model groups as null.
+Command-layer enrichment overlays exact provider, host, and root matches while unmatched storage rows serialize active runtime and observed agents as null.
 
 ## Observed-Only Session Merge
 
@@ -92,7 +112,11 @@ Synthetic rows require a validated root cwd and obey normalized hostname and pro
 
 ## Claude Managed Observer Hooks
 
-Claude setup registers the tool-phase observer only under activity tracking and registers no session or subagent lifecycle group at all, so none is ever written to user settings.
+Claude setup adds the observer to existing Stop, StopFailure, and SessionEnd groups only under activity tracking, without duplicate groups or subagent lifecycle handlers.
+
+## Claude Terminal Payloads
+
+Claude's observer sends provider, root session, host, cwd, producer time, and exact event for Stop, StopFailure, and SessionEnd while rejecting unrelated lifecycle events.
 
 ## Codex Audit Payloads
 
@@ -100,11 +124,21 @@ Codex payload construction preserves event, tool, root and agent identity, hostn
 
 ## Codex Managed Observer Hooks
 
-Codex integration verification registers the observer on exactly the seven observed events, never on a lifecycle event, and removes it when activity tracking is disabled.
+Codex integration verification registers the observer on exactly eight events including SessionEnd, excludes all other lifecycle events, and removes it when activity tracking is disabled.
 
-## Positive-Only Sessions Rows
+## Terminal Hook Liveness
 
-Frontend formatting and fixtures omit null and zero, render known model families as short labels, preserve unrecognized raw ids, reconcile missing evidence into a final `?` group, and keep positive evidence visible on idle rows.
+The Sessions indicator treats a terminal hook tied with or newer than activity as stopped, reopens on strictly newer activity, and keeps recency fallback for missing or invalid markers.
+
+## Live Runtime Extrapolation
+
+Runtime extrapolation preserves unavailable values and selects precision per datum. Lifetime values floor minutes; visible current turns floor seconds into adaptive clocks, while ARIA and agent runtimes remain human-readable.
+
+## Sessions Agent Runtime Rows
+
+Frontend contracts keep retained agent count, bot icon, and runtime before root turns and family runtime on the main row, and accrue known totals only for runtime-known active observed agents.
+
+Positive historical totals remain visible without adding a second row, while empty zero/unknown groups disappear. Only open agents create a wrapping second rail; unknown totals stay unknown beside them, and instant tooltips plus accessible labels distinguish lifetime totals from green live names and neutral runtimes.
 
 ## Observed-Only Sessions Presentation
 

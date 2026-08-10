@@ -58,6 +58,17 @@ const MAX_CODEX_SPAWN_DEPTH: u32 = 16;
 /// records inside a turn, so the tail is still in an open one.
 const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
 
+/// How far into a rollout the head read looks for the thread's model.
+///
+/// `turn_context` is head-clustered rather than tail-resident: a spawned
+/// rollout replays its parent's history first and emits its own turn records
+/// after it, so the tail of a long turn holds none. Across 900 sampled spawned
+/// rollouts every one names a model, at p50 line 6 / 94KiB and p90 line 8 /
+/// 131KiB; a window this long covers 97%. It is deliberately the same budget
+/// the turn tail already spends, so a rollout costs a bounded read at each end
+/// rather than an unbounded one at either.
+const CODEX_HEAD_SCAN_BYTES: u64 = 1 << 20;
+
 /// One transcript-derived session, shaped for the snapshot reconciler.
 pub(crate) struct TranscriptSession {
     pub(crate) provider: IntegrationProvider,
@@ -76,6 +87,14 @@ pub(crate) struct TranscriptSession {
 pub(crate) struct TranscriptAgent {
     pub(crate) agent_id: String,
     pub(crate) agent_type: Option<String>,
+    /// The model this agent's own transcript names, when it names one.
+    ///
+    /// Provisional, and only ever consulted while retained evidence is still
+    /// missing: ingest carries a model forward per chain and so stays exact
+    /// across a thread that switches models mid-life, which a single read
+    /// cannot. Claude leaves this unset — a Claude sub-agent transcript states
+    /// no model of its own.
+    pub(crate) model: Option<String>,
     pub(crate) open: bool,
 }
 
@@ -85,9 +104,11 @@ pub(crate) struct TranscriptAgent {
 /// evidence, so memory is bounded by live sessions rather than by history.
 #[derive(Default)]
 pub(crate) struct TranscriptScanner {
-    /// Claude only. A Codex pass reads each live rollout's head and turn tail
-    /// afresh, so it carries nothing between passes.
+    /// Claude transcript parse state.
     sessions: HashMap<String, ScannedSession>,
+    /// Codex root activity parse state. Agent head and turn-tail reads remain
+    /// stateless because only root activity needs an append offset.
+    codex_sessions: HashMap<String, ScannedSession>,
     last_scan: Option<DateTime<Utc>>,
 }
 
@@ -101,6 +122,9 @@ struct ScannedSession {
     /// Both are bounded by the session's agent count, not by transcript length.
     resolved: HashSet<String>,
     started_at: Option<DateTime<Utc>>,
+    /// Newest timestamp from transcript content, excluding hook result
+    /// attachments whose post-hook write must not reopen a finished session.
+    last_activity: Option<DateTime<Utc>>,
     cwd: Option<String>,
 }
 
@@ -144,6 +168,8 @@ struct AgentMeta {
 /// untyped value because Claude writes it as either a string or a block array.
 #[derive(Deserialize)]
 struct ScanRecord {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     timestamp: Option<String>,
     cwd: Option<String>,
     message: Option<ScanMessage>,
@@ -165,23 +191,15 @@ struct JournalRecord {
 /// Rollouts belonging to one Codex root thread, collected by the stage-one
 /// sweep. Only rollouts inside the idle window are collected, so a sub-agent
 /// listed here is one whose file is still being written.
+#[derive(Default)]
 struct CodexGroup {
-    newest: SystemTime,
     agents: Vec<CodexAgentFile>,
-}
-
-impl Default for CodexGroup {
-    fn default() -> Self {
-        Self {
-            newest: SystemTime::UNIX_EPOCH,
-            agents: Vec::new(),
-        }
-    }
 }
 
 struct CodexAgentFile {
     agent_id: String,
     agent_type: Option<String>,
+    model: Option<String>,
     path: PathBuf,
 }
 
@@ -193,6 +211,7 @@ struct CodexHead {
     parent_id: Option<String>,
     subagent: bool,
     agent_role: Option<String>,
+    model: Option<String>,
     cwd: Option<String>,
     started_at: Option<DateTime<Utc>>,
 }
@@ -201,18 +220,27 @@ const CODEX_EVENT_RECORD: &str = "event_msg";
 const CODEX_TURN_STARTED: &str = "task_started";
 const CODEX_TURN_COMPLETE: &str = "task_complete";
 const CODEX_TURN_ABORTED: &str = "turn_aborted";
+const CODEX_TURN_CONTEXT_RECORD: &str = "turn_context";
+const CODEX_RESPONSE_ITEM_RECORD: &str = "response_item";
 
 #[derive(Deserialize)]
 struct CodexEventRecord {
     #[serde(rename = "type")]
     kind: String,
-    payload: Option<CodexEventPayload>,
+    timestamp: Option<String>,
+    payload: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
-struct CodexEventPayload {
+struct CodexTurnContextRecord {
     #[serde(rename = "type")]
-    kind: Option<String>,
+    kind: String,
+    payload: Option<CodexTurnContextPayload>,
+}
+
+#[derive(Deserialize)]
+struct CodexTurnContextPayload {
+    model: Option<String>,
 }
 
 impl TranscriptScanner {
@@ -290,19 +318,24 @@ impl TranscriptScanner {
                 continue;
             };
             let group = groups.entry(root_id).or_default();
-            group.newest = group.newest.max(*modified);
             if head.subagent {
                 group.agents.push(CodexAgentFile {
                     agent_id: head.session_id,
                     agent_type: head.agent_role,
+                    model: head.model,
                     path: path.clone(),
                 });
             }
         }
 
+        self.codex_sessions
+            .retain(|session_id, _| groups.contains_key(session_id));
         groups
             .into_iter()
-            .filter_map(|(root_id, group)| codex_session(root_id, group, &index, &mut heads))
+            .filter_map(|(root_id, group)| {
+                let state = self.codex_sessions.entry(root_id.clone()).or_default();
+                codex_session(root_id, group, &index, &mut heads, state)
+            })
             .collect()
     }
 
@@ -335,6 +368,7 @@ impl TranscriptScanner {
         let offsets = &mut state.offsets;
         let resolved = &mut state.resolved;
         let started_at = &mut state.started_at;
+        let last_activity = &mut state.last_activity;
         let cwd = &mut state.cwd;
 
         // A depth>=2 spawn's `tool_result` lands in the parent agent's
@@ -346,15 +380,24 @@ impl TranscriptScanner {
                 let Ok(record) = serde_json::from_str::<ScanRecord>(line) else {
                     return;
                 };
-                if is_root && started_at.is_none() {
-                    let parsed = record
-                        .timestamp
-                        .as_deref()
-                        .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok());
-                    if let Some(parsed) = parsed {
-                        *started_at = Some(parsed.with_timezone(&Utc));
-                        *cwd = record.cwd.clone();
-                    }
+                let timestamp = record
+                    .timestamp
+                    .as_deref()
+                    .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map(|timestamp| timestamp.with_timezone(&Utc));
+                if record.kind.as_deref() != Some("attachment")
+                    && timestamp.is_some_and(|timestamp| {
+                        last_activity.is_none_or(|current| timestamp > current)
+                    })
+                {
+                    *last_activity = timestamp;
+                }
+                if is_root
+                    && started_at.is_none()
+                    && let Some(timestamp) = timestamp
+                {
+                    *started_at = Some(timestamp);
+                    *cwd = record.cwd.clone();
                 }
                 for tool_use_id in tool_result_ids(&record) {
                     if spawn_ids.contains(tool_use_id) {
@@ -401,6 +444,7 @@ impl TranscriptScanner {
                 TranscriptAgent {
                     agent_id: agent.agent_id,
                     agent_type: meta.as_ref().and_then(|meta| meta.agent_type.clone()),
+                    model: None,
                     open: !closed && !abandoned,
                 }
             })
@@ -411,7 +455,7 @@ impl TranscriptScanner {
             session_id,
             cwd: cwd.clone(),
             started_at,
-            last_activity: files.newest.into(),
+            last_activity: (*last_activity).unwrap_or_else(|| files.newest.into()),
             agents,
         })
     }
@@ -513,10 +557,9 @@ fn codex_head(
 /// decided in one place. Only the two fields that parser has no use for — the
 /// thread's own clock and its declared role — are read from the record here.
 fn read_codex_head(path: &Path) -> Option<CodexHead> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
     let mut line = String::new();
-    BufReader::new(File::open(path).ok()?)
-        .read_line(&mut line)
-        .ok()?;
+    reader.read_line(&mut line).ok()?;
     let record = serde_json::from_str::<serde_json::Value>(&line).ok()?;
     let metadata = crate::transcript_identity::codex_metadata(&record)?;
     // The head's identity fields — including the `source.subagent.thread_spawn`
@@ -533,12 +576,48 @@ fn read_codex_head(path: &Path) -> Option<CodexHead> {
         parent_id: metadata.parent_chain_id,
         subagent: metadata.is_spawn,
         agent_role: metadata.agent_role,
+        model: read_codex_model(reader),
         cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
         started_at: timestamp(record.get("payload"))
             .or_else(|| timestamp(Some(&record)))
             .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
             .map(|timestamp| timestamp.with_timezone(&Utc)),
     })
+}
+
+/// The first model a rollout's `turn_context` records name, read from the same
+/// open handle the head parse already holds.
+///
+/// A spawned rollout opens with its parent's replayed history, so the first
+/// `turn_context` may be the parent's rather than the thread's own. That is
+/// deliberate: across the spawned rollouts measured, no thread's own model
+/// differed from the first one its file names, and 591 of 600 name exactly one
+/// model for their whole life. The read stops at the first hit, so the common
+/// case costs the handful of lines before it rather than the whole window.
+fn read_codex_model(reader: impl BufRead) -> Option<String> {
+    let mut line = String::new();
+    let mut reader = reader.take(CODEX_HEAD_SCAN_BYTES);
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        // Rollouts carry whole-file `world_state` snapshots, so the cheap
+        // substring test keeps those megabytes out of the JSON parser.
+        if !line.contains(CODEX_TURN_CONTEXT_RECORD) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<CodexTurnContextRecord>(&line) else {
+            continue;
+        };
+        if record.kind != CODEX_TURN_CONTEXT_RECORD {
+            continue;
+        }
+        if let Some(model) = record.payload.and_then(|payload| payload.model) {
+            return crate::model_usage::validate_model_id(&model).ok();
+        }
+    }
 }
 
 /// Walk a rollout's parent chain to the user thread that owns it. Codex records
@@ -572,18 +651,48 @@ fn codex_session(
     group: CodexGroup,
     index: &HashMap<String, (PathBuf, SystemTime)>,
     heads: &mut HashMap<String, Option<CodexHead>>,
+    state: &mut ScannedSession,
 ) -> Option<TranscriptSession> {
     let root = codex_head(&root_id, index, heads)?;
     let started_at = root.started_at?;
-    let last_activity = index
-        .get(&root_id)
-        .map_or(group.newest, |(_, modified)| group.newest.max(*modified));
+    let root_path = &index.get(&root_id)?.0;
+    let offsets = &mut state.offsets;
+    let last_activity = &mut state.last_activity;
+    let initialized = offsets.contains_key(root_path);
+    let truncated = initialized
+        && std::fs::metadata(root_path).is_ok_and(|metadata| {
+            metadata.len() < offsets.get(root_path).copied().unwrap_or_default()
+        });
+    if truncated {
+        *last_activity = None;
+    }
+    let mut observe = |line: &str| {
+        if let Some(timestamp) = codex_activity_timestamp(line)
+            && last_activity.is_none_or(|current| timestamp > current)
+        {
+            *last_activity = Some(timestamp);
+        }
+    };
+    if initialized && !truncated {
+        let offset = offsets.get_mut(root_path)?;
+        read_appended(root_path, offset, &mut observe);
+    } else {
+        let (tail, tail_offset, _) = read_codex_tail(root_path)?;
+        let complete = tail
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |newline| newline + 1);
+        String::from_utf8_lossy(&tail[..complete])
+            .lines()
+            .for_each(&mut observe);
+        offsets.insert(root_path.clone(), tail_offset + complete as u64);
+    }
     Some(TranscriptSession {
         provider: IntegrationProvider::Codex,
         session_id: root_id,
         cwd: root.cwd,
         started_at,
-        last_activity: last_activity.into(),
+        last_activity: state.last_activity.unwrap_or(started_at),
         agents: group
             .agents
             .into_iter()
@@ -591,9 +700,43 @@ fn codex_session(
                 open: codex_agent_running(&agent.path),
                 agent_id: agent.agent_id,
                 agent_type: agent.agent_type,
+                model: agent.model,
             })
             .collect(),
     })
+}
+
+/// Timestamp carried by user, assistant, reasoning, or tool content.
+///
+/// Turn boundaries, context snapshots, token counts, and other bookkeeping can
+/// be appended after Stop, so neither they nor the file mtime are activity.
+fn codex_activity_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    if !line.contains(CODEX_EVENT_RECORD) && !line.contains(CODEX_RESPONSE_ITEM_RECORD) {
+        return None;
+    }
+    let record = serde_json::from_str::<CodexEventRecord>(line).ok()?;
+    let payload = record.payload?;
+    let payload_kind = payload.get("type")?.as_str()?;
+    let substantive = match record.kind.as_str() {
+        CODEX_EVENT_RECORD => matches!(payload_kind, "user_message" | "agent_message"),
+        CODEX_RESPONSE_ITEM_RECORD => match payload_kind {
+            "agent_message" => crate::sessions::codex_text_blocks(&payload, "input_text")
+                .next()
+                .is_some(),
+            "message" => crate::sessions::has_nonempty_codex_assistant_output(&payload),
+            "function_call" | "custom_tool_call" => payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| !name.is_empty()),
+            "reasoning" | "function_call_output" | "custom_tool_call_output" => true,
+            _ => false,
+        },
+        _ => false,
+    };
+    substantive
+        .then_some(record.timestamp?)
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
 }
 
 /// Whether a Codex rollout's newest turn boundary is a `task_started`.
@@ -612,35 +755,36 @@ fn codex_session(
 /// records inside a turn, so a window this long with no boundary in it means
 /// the tail is still inside one.
 fn codex_agent_running(path: &Path) -> bool {
-    let Ok(mut file) = File::open(path) else {
+    let Some((window, _, truncated)) = read_codex_tail(path) else {
         return false;
     };
-    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
-        return false;
-    };
-    let start = length.saturating_sub(CODEX_TAIL_SCAN_BYTES);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return false;
-    }
-    let mut window = Vec::new();
-    if file.read_to_end(&mut window).is_err() {
-        return false;
-    }
-    // A truncated window starts mid-record; drop that fragment so every line
-    // scanned is a whole one.
-    let body = if start == 0 {
-        window.as_slice()
-    } else {
-        match window.iter().position(|byte| *byte == b'\n') {
-            Some(newline) => &window[newline + 1..],
-            None => return true,
-        }
-    };
-    String::from_utf8_lossy(body)
+    String::from_utf8_lossy(&window)
         .lines()
         .rev()
         .find_map(codex_turn_event)
-        .map_or(start > 0, |event| event == CODEX_TURN_STARTED)
+        .map_or(truncated, |event| event == CODEX_TURN_STARTED)
+}
+
+/// Read a bounded rollout tail and discard its first partial record.
+fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(CODEX_TAIL_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut window = Vec::new();
+    file.read_to_end(&mut window).ok()?;
+    let truncated = start > 0;
+    let mut body_offset = start;
+    if truncated {
+        if let Some(newline) = window.iter().position(|byte| *byte == b'\n') {
+            window.drain(..=newline);
+            body_offset += newline as u64 + 1;
+        } else {
+            window.clear();
+            body_offset = length;
+        }
+    }
+    Some((window, body_offset, truncated))
 }
 
 /// The turn-lifecycle event a rollout line carries, if any.
@@ -655,7 +799,7 @@ fn codex_turn_event(line: &str) -> Option<&'static str> {
     if record.kind != CODEX_EVENT_RECORD {
         return None;
     }
-    match record.payload?.kind?.as_str() {
+    match record.payload?.get("type")?.as_str()? {
         CODEX_TURN_STARTED => Some(CODEX_TURN_STARTED),
         CODEX_TURN_COMPLETE => Some(CODEX_TURN_COMPLETE),
         CODEX_TURN_ABORTED => Some(CODEX_TURN_ABORTED),
@@ -868,6 +1012,10 @@ mod tests {
         format!("{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"{kind}\"}}}}")
     }
 
+    fn turn_context(model: &str) -> String {
+        format!("{{\"type\":\"turn_context\",\"payload\":{{\"model\":\"{model}\"}}}}")
+    }
+
     fn open_agents(session: &TranscriptSession) -> Vec<&str> {
         let mut open = session
             .agents
@@ -1067,7 +1215,7 @@ mod tests {
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Transcript Session Activity]]
     #[test]
-    fn appended_root_activity_advances_without_reparsing() {
+    fn hook_bookkeeping_does_not_reopen_before_substantive_activity() {
         let fixture = Fixture::new();
         fixture.write_root(&[&start_record()]);
         let mut scanner = TranscriptScanner::default();
@@ -1080,14 +1228,19 @@ mod tests {
                 .with_timezone(&Utc)
         );
 
-        std::thread::sleep(Duration::from_millis(20));
-        fixture.append_root("{\"type\":\"assistant\",\"timestamp\":\"2026-08-08T00:01:00Z\"}");
+        fixture.append_root(
+            "{\"type\":\"attachment\",\"timestamp\":\"2026-08-08T00:01:00Z\",\"attachment\":{\"type\":\"hook_success\",\"hookEvent\":\"SessionEnd\"}}",
+        );
         let second = fixture.scan(&mut scanner);
-        assert!(second[0].last_activity > first_activity);
+        assert_eq!(second[0].last_activity, first_activity);
+
+        fixture.append_root("{\"type\":\"assistant\",\"timestamp\":\"2026-08-08T00:02:00Z\"}");
+        let third = fixture.scan(&mut scanner);
+        assert!(third[0].last_activity > first_activity);
         // The start record is never re-read, so the session keeps the origin it
         // established on the first pass.
-        assert_eq!(second[0].started_at, first[0].started_at);
-        assert_eq!(second[0].cwd.as_deref(), Some("/home/user/project"));
+        assert_eq!(third[0].started_at, first[0].started_at);
+        assert_eq!(third[0].cwd.as_deref(), Some("/home/user/project"));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Transcript Scan Throttle]]
@@ -1161,6 +1314,166 @@ mod tests {
                 .and_then(|agent| agent.agent_type.as_deref()),
             Some("explorer")
         );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Session Activity#Stop Bookkeeping Filtering]]
+    #[test]
+    fn codex_activity_ignores_post_stop_bookkeeping_and_mtime() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        fixture.write(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:01:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}",
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:02:00Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"hello\"}}",
+            ],
+        );
+
+        let mut scanner = TranscriptScanner::default();
+        let first = fixture.scan(&mut scanner);
+        assert_eq!(
+            first[0].last_activity,
+            DateTime::parse_from_rfc3339("2026-08-08T00:02:00Z")
+                .expect("parse assistant activity")
+                .with_timezone(&Utc)
+        );
+
+        append_raw(
+            &fixture.path(root),
+            concat!(
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:03:00Z\",\"payload\":{\"type\":\"task_complete\"}}\n",
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:04:00Z\",\"payload\":{\"type\":\"token_count\"}}\n",
+                "{\"type\":\"response_item\",\"timestamp\":\"2026-08-08T00:05:00Z\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n",
+                "{\"type\":\"response_item\",\"timestamp\":\"2026-08-08T00:05:01Z\",\"payload\":{\"type\":\"agent_message\",\"content\":[]}}\n",
+                "{\"type\":\"response_item\",\"timestamp\":\"2026-08-08T00:05:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"\"}}\n",
+            ),
+        );
+        let second = fixture.scan(&mut scanner);
+        assert_eq!(second[0].last_activity, first[0].last_activity);
+
+        append_raw(
+            &fixture.path(root),
+            "{\"type\":\"response_item\",\"timestamp\":\"2026-08-08T00:06:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{}\",\"call_id\":\"call-1\"}}\n",
+        );
+        let third = fixture.scan(&mut scanner);
+        assert_eq!(
+            third[0].last_activity,
+            DateTime::parse_from_rfc3339("2026-08-08T00:06:00Z")
+                .expect("parse tool activity")
+                .with_timezone(&Utc)
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Session Activity#Bounded Initialization and Rewrite]]
+    #[test]
+    fn codex_activity_initialization_is_bounded_and_truncation_resets_it() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let filler = format!(
+            "{{\"type\":\"world_state\",\"payload\":{{\"text\":\"{}\"}}}}",
+            "x".repeat(CODEX_TAIL_SCAN_BYTES as usize)
+        );
+        fixture.write(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:01:00Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"outside tail\"}}",
+                &filler,
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:02:00Z\",\"payload\":{\"type\":\"token_count\"}}",
+            ],
+        );
+
+        let mut scanner = TranscriptScanner::default();
+        let first = fixture.scan(&mut scanner);
+        assert_eq!(first[0].last_activity, first[0].started_at);
+
+        append_raw(
+            &fixture.path(root),
+            "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:03:00Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"cached\"}}\n",
+        );
+        let appended = fixture.scan(&mut scanner);
+        assert_eq!(
+            appended[0].last_activity,
+            DateTime::parse_from_rfc3339("2026-08-08T00:03:00Z")
+                .expect("parse appended activity")
+                .with_timezone(&Utc)
+        );
+
+        fixture.write(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:00:30Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"outside rewritten tail\"}}",
+                &filler,
+                "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:04:00Z\",\"payload\":{\"type\":\"token_count\"}}",
+            ],
+        );
+        assert!(
+            fs::metadata(fixture.path(root))
+                .expect("stat rewritten root")
+                .len()
+                < scanner.codex_sessions[root].offsets[&fixture.path(root)]
+        );
+        let second = fixture.scan(&mut scanner);
+        assert_eq!(second[0].last_activity, second[0].started_at);
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Head Model]]
+    #[test]
+    fn codex_agents_take_the_first_model_their_rollout_names() {
+        let fixture = CodexFixture::new();
+        let root = "019fe372-6824-70e3-8fcd-0000000000a0";
+        let named = "019fe372-6824-70e3-8fcd-0000000000a1";
+        let silent = "019fe372-6824-70e3-8fcd-0000000000a2";
+        let malformed = "019fe372-6824-70e3-8fcd-0000000000a3";
+        fixture.write(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[&turn("task_started")],
+        );
+        // The first `turn_context` wins even when a later one restates the
+        // model: a switch mid-life is retained evidence's job, not this read's.
+        fixture.write(
+            named,
+            &spawned_by(root, "worker"),
+            &[
+                &turn_context("gpt-5.6-sol"),
+                &turn("task_started"),
+                &turn_context("gpt-5.6-terra"),
+            ],
+        );
+        // A `turn_context` naming no model leaves the agent unlabelled rather
+        // than inheriting a sibling's.
+        fixture.write(
+            silent,
+            &spawned_by(root, "worker"),
+            &[
+                "{\"type\":\"turn_context\",\"payload\":{}}",
+                &turn("task_started"),
+            ],
+        );
+        fixture.write(
+            malformed,
+            &spawned_by(root, "worker"),
+            &[&turn_context("bad\u{7}model"), &turn("task_started")],
+        );
+
+        let mut scanner = TranscriptScanner::default();
+        let sessions = fixture.scan(&mut scanner);
+        let session = sessions.first().expect("one scanned session");
+        let model = |agent_id: &str| {
+            session
+                .agents
+                .iter()
+                .find(|agent| agent.agent_id == agent_id)
+                .and_then(|agent| agent.model.clone())
+        };
+        assert_eq!(model(named).as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(model(silent), None);
+        // A control character never reaches the label; validation is the same
+        // gate retained evidence passes through.
+        assert_eq!(model(malformed), None);
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Spawn Chain Grouping]]

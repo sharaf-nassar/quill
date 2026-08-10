@@ -293,23 +293,45 @@ pub struct SessionBreakdown {
     pub turn_count: i64,
     pub first_seen: String,
     pub last_active: String,
+    /// Newest valid root Stop, Claude StopFailure, or SessionEnd hook.
+    /// Activity newer than this terminal marker reopens the session.
+    pub ended_at: Option<String>,
     pub project: Option<String>,
-    /// Current-process hook coverage: null is unknown, zero is covered with
-    /// none open, and positive is the root-linked observed-open count.
-    pub observed_subagent_count: Option<u32>,
-    /// Exact model groups for the observed-open agents. Agent type is retained
-    /// only as display fallback while a model id remains unresolved.
-    pub observed_subagent_models: Option<Vec<ObservedSubagentModelGroup>>,
+    /// Lifetime active runtime summed across every native chain. Null means
+    /// retained runtime coverage cannot support a claim.
+    pub active_runtime_secs: Option<f64>,
+    /// Distinct retained sidechain chains in this session family. Null means
+    /// retained runtime coverage cannot support a lifetime count.
+    pub agent_count: Option<i64>,
+    /// Lifetime active runtime summed across sidechain chains only. Null means
+    /// retained runtime coverage cannot support a claim.
+    pub agent_runtime_secs: Option<f64>,
+    /// Active runtime of the root session's current open turn. Null means no
+    /// covered root open-tail evidence exists.
+    pub current_turn_runtime_secs: Option<f64>,
+    /// Whether the covered root current turn is still accruing.
+    pub current_turn_runtime_active: bool,
+    /// Backend clock used to materialize active runtime and extrapolate it
+    /// until the next Sessions refresh.
+    pub runtime_as_of_ms: Option<i64>,
+    /// Seconds added per wall-clock second by covered, currently accruing
+    /// native chains. Concurrent chains intentionally sum.
+    pub active_runtime_rate: f64,
+    /// Current transcript snapshot's open native agents. Null is unknown;
+    /// an empty vector is covered with none open.
+    pub observed_agents: Option<Vec<ObservedSessionAgent>>,
     /// True when current-process hook evidence supplied the row before the
     /// first retained token snapshot made its metrics available.
     pub observed_only: bool,
 }
 
-#[derive(Serialize, Clone, Debug, Eq, PartialEq)]
-pub struct ObservedSubagentModelGroup {
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ObservedSessionAgent {
+    pub agent_id: String,
     pub model_id: Option<String>,
     pub agent_type: Option<String>,
-    pub count: u32,
+    pub runtime_secs: Option<f64>,
+    pub runtime_active: bool,
 }
 
 pub(crate) type ObservedAgentModelKey = (String, String, String);
@@ -421,8 +443,6 @@ pub struct ContextSavingsEventPayload {
     pub estimate_confidence: Option<f64>,
     #[serde(default)]
     pub source_ref: Option<String>,
-    #[serde(default)]
-    pub snapshot_ref: Option<String>,
     #[serde(default, alias = "metadata")]
     pub metadata_json: Option<serde_json::Value>,
 }
@@ -459,19 +479,13 @@ pub struct ContextSavingsSummary {
     /// Tokens pulled back into the transcript via `quill_get_context_source`.
     #[serde(default)]
     pub tokens_retrieved: i64,
-    /// Transcript-cost tokens injected by router/capture guidance and search
-    /// snippets — the overhead the preservation feature pays.
+    /// Transcript-cost tokens injected by router guidance and search snippets.
     #[serde(default)]
     pub tokens_routing: i64,
-    /// Count of telemetry observations (capture.event, capture.snapshot,
-    /// mcp.continuity).  Not a token metric.
-    #[serde(default)]
-    pub telemetry_event_count: i64,
     /// Count of events whose `category` is `routing` (router guidance,
-    /// router denials, capture-time session-start directives, search
-    /// snippets, bounded `mcp.execute` results).  Distinct from
-    /// `routerEventCount`, which the frontend derives by string-matching
-    /// `router.*` event-type names and therefore undercounts categories.
+    /// router denials, search snippets, bounded `mcp.execute` results).
+    /// Distinct from `routerEventCount`, which the frontend derives by
+    /// string-matching `router.*` event types and therefore undercounts.
     #[serde(default)]
     pub routing_event_count: i64,
     /// Distinct `source_ref` values written by preservation events in the range.
@@ -552,7 +566,6 @@ pub struct ContextSavingsEvent {
     pub estimate_method: Option<String>,
     pub estimate_confidence: Option<f64>,
     pub source_ref: Option<String>,
-    pub snapshot_ref: Option<String>,
     pub metadata_json: Option<serde_json::Value>,
     pub created_at: String,
 }

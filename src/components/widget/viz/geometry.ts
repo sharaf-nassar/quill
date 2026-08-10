@@ -27,6 +27,59 @@ export interface ScaleOptions {
   readonly max?: number;
 }
 
+export interface LegendPosition {
+  readonly left: number;
+  readonly top: number;
+  readonly side: "before" | "after";
+}
+
+/** Select the equal-width bucket containing a horizontal pointer position. */
+export function bucketIndexAtPosition(
+  position: number,
+  width: number,
+  buckets: number,
+): number | null {
+  if (
+    !Number.isFinite(position) ||
+    !Number.isFinite(width) ||
+    width <= 0 ||
+    buckets <= 0
+  ) {
+    return null;
+  }
+  return Math.min(buckets - 1, Math.floor((Math.max(0, position) / width) * buckets));
+}
+
+/** Offset a floating legend from the pointer and clamp it inside the chart. */
+export function legendPositionAtPosition(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  legendWidth: number,
+  legendHeight: number,
+): LegendPosition | null {
+  if (
+    ![x, y, width, height, legendWidth, legendHeight].every(Number.isFinite) ||
+    width <= 0 ||
+    height <= 0 ||
+    legendWidth < 0 ||
+    legendHeight < 0
+  ) {
+    return null;
+  }
+  const gap = 8;
+  const pointerX = Math.min(width, Math.max(0, x));
+  const side = pointerX + gap + legendWidth <= width ? "after" : "before";
+  const desiredLeft =
+    side === "after" ? pointerX + gap : pointerX - gap - legendWidth;
+  return {
+    left: Math.min(Math.max(0, width - legendWidth), Math.max(0, desiredLeft)),
+    top: Math.min(Math.max(0, height - legendHeight), Math.max(0, y + gap)),
+    side,
+  };
+}
+
 /** Trim coordinate noise so the emitted path stays small and diffable. */
 function round(n: number): number {
   return Math.round(n * 100) / 100;

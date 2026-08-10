@@ -35,9 +35,13 @@ import { useLlmRuntimeStats } from "../../../hooks/useLlmRuntimeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
 import { openManageWindow } from "../../../lib/manageWindow";
 import {
+  formatAdaptiveClockDurationSecs,
+  formatClockDurationSecs,
   formatDurationSecs,
+  formatExtrapolatedRuntime,
   formatNumber,
-  formatObservedSubagentModels,
+  formatObservedSessionAgents,
+  isSessionLive,
   resolveSessionMetrics,
 } from "../../../utils/format";
 import { providerHue, providerTag } from "../../../utils/providers";
@@ -60,12 +64,6 @@ const CHART_HEIGHT = 118;
 const REFRESH_INTERVAL_MS = 60_000;
 /** Rows the breakdown shows before it would start dominating the widget. */
 const BREAKDOWN_LIMIT = 5;
-/**
- * A session counts as live when it was active inside this window. Five minutes
- * is a turn's worth of thinking — long enough that a model still composing a
- * reply reads live, short enough that an abandoned terminal does not.
- */
-const LIVE_WINDOW_MS = 5 * 60_000;
 
 const MODES: ReadonlyArray<{ id: BreakdownMode; label: string }> = [
   { id: "sessions", label: "Sessions" },
@@ -309,38 +307,149 @@ interface RowModel {
   key: string;
   /** Present only for modes with a liveness notion (Sessions). */
   live?: boolean;
+  /** True only when the live runtime value is known and may use status green. */
+  liveActivity?: boolean;
   name: string;
   chip?: { text: string; tone: string };
   /** Dim secondary count, e.g. `41 sess`. */
   meta?: string;
-  metaLabel?: string;
+  sessionStats?: {
+    runtime: string;
+    runtimeLabel: string;
+    turns: string;
+    turnsLabel: string;
+  };
+  nameLabel?: string;
+  chipLabel?: string;
+  agentSummary?: {
+    count: string;
+    countLabel: string;
+    runtime: string;
+    runtimeLabel: string;
+  };
+  agents?: ReturnType<typeof formatObservedSessionAgents>;
   value: string;
-  ago: string;
+  valueLabel?: string;
+  activity: string;
+  activityLabel?: string;
   title: string;
 }
 
 function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
-  const lastActive = new Date(row.last_active).getTime();
   const name = projectName(row.project) ?? row.session_id.slice(0, 8);
-  const observedSubagents = formatObservedSubagentModels(
-    row.provider,
-    row.observed_subagent_count,
-    row.observed_subagent_models,
-  );
+  const live = isSessionLive(row.last_active, row.ended_at, nowMs);
   const metrics = resolveSessionMetrics(
     formatTokenCount(row.total_tokens),
     `${formatNumber(row.turn_count)} turns`,
     row.observed_only,
   );
+  const totalRuntime = formatExtrapolatedRuntime(
+    row.active_runtime_secs,
+    row.runtime_as_of_ms,
+    row.active_runtime_rate,
+    nowMs,
+  );
+  const totalRuntimeClock = formatExtrapolatedRuntime(
+    row.active_runtime_secs,
+    row.runtime_as_of_ms,
+    row.active_runtime_rate,
+    nowMs,
+    formatClockDurationSecs,
+  );
+  const turnCount = metrics.turns === null ? "—" : formatNumber(row.turn_count);
+  const runtimeLabel =
+    totalRuntime === "—"
+      ? "Total session runtime unavailable"
+      : `Total session runtime ${totalRuntime}`;
+  const turnsLabel =
+    metrics.turns === null
+      ? "Main-session turn count unavailable"
+      : `${formatNumber(row.turn_count)} completed main-session turns`;
+  const currentTurnRuntime = live
+    ? formatExtrapolatedRuntime(
+        row.current_turn_runtime_secs,
+        row.runtime_as_of_ms,
+        row.current_turn_runtime_active ? 1 : 0,
+        nowMs,
+      )
+    : "—";
+  const activity = live
+    ? formatExtrapolatedRuntime(
+        row.current_turn_runtime_secs,
+        row.runtime_as_of_ms,
+        row.current_turn_runtime_active ? 1 : 0,
+        nowMs,
+        formatAdaptiveClockDurationSecs,
+      )
+    : formatRecency(row.last_active, nowMs);
+  const activityLabel = live
+    ? currentTurnRuntime === "—"
+      ? "Current-turn runtime unavailable"
+      : `${row.current_turn_runtime_active ? "Current-turn active runtime" : "Current-turn runtime"} ${currentTurnRuntime}`
+    : `Last active ${activity}`;
+  const agents = live
+    ? formatObservedSessionAgents(
+        row.provider,
+        row.observed_agents,
+        row.runtime_as_of_ms,
+        nowMs,
+      )
+    : [];
+  const hasAgentTotals =
+    (row.agent_count !== null && row.agent_count > 0) ||
+    (row.agent_runtime_secs !== null && row.agent_runtime_secs > 0);
+  const activeAgentRuntimeRate = (row.observed_agents ?? []).filter(
+    (agent) => agent.runtime_secs !== null && agent.runtime_active,
+  ).length;
+  const agentRuntime = formatExtrapolatedRuntime(
+    row.agent_runtime_secs,
+    row.runtime_as_of_ms,
+    activeAgentRuntimeRate,
+    nowMs,
+  );
   return {
     key: `${row.provider}:${row.hostname}:${row.session_id}`,
-    live: Number.isFinite(lastActive) && nowMs - lastActive < LIVE_WINDOW_MS,
+    live,
+    liveActivity: live && row.current_turn_runtime_active,
     name,
+    nameLabel: `Session ${name} on ${row.hostname}`,
+    sessionStats: {
+      runtime: totalRuntimeClock,
+      runtimeLabel,
+      turns: turnCount,
+      turnsLabel,
+    },
     chip: { text: providerTag(row.provider), tone: row.provider },
-    meta: observedSubagents?.text,
-    metaLabel: observedSubagents?.ariaLabel,
+    chipLabel: `Provider ${providerTag(row.provider)}`,
+    agentSummary:
+      hasAgentTotals || agents.length > 0
+        ? {
+            count: row.agent_count === null ? "—" : formatNumber(row.agent_count),
+            countLabel:
+              row.agent_count === null
+                ? "Total agent count unavailable"
+                : `${formatNumber(row.agent_count)} total agents run during this session`,
+            runtime: formatExtrapolatedRuntime(
+              row.agent_runtime_secs,
+              row.runtime_as_of_ms,
+              activeAgentRuntimeRate,
+              nowMs,
+              formatClockDurationSecs,
+            ),
+            runtimeLabel:
+              agentRuntime === "—"
+                ? "Total agent runtime unavailable"
+                : `Total agent active runtime ${agentRuntime}`,
+          }
+        : undefined,
+    agents,
     value: metrics.tokens,
-    ago: formatRecency(row.last_active, nowMs),
+    valueLabel:
+      metrics.tokens === "—"
+        ? "Total session tokens unavailable"
+        : `Total session tokens ${metrics.tokens}`,
+    activity,
+    activityLabel,
     title: [name, row.hostname, metrics.turns].filter(Boolean).join(" · "),
   };
 }
@@ -357,7 +466,7 @@ function buildRows(
         key: row.skill_name,
         name: row.skill_name,
         value: `${formatCount(row.total_count)} uses`,
-        ago: formatRecency(row.last_used, nowMs),
+        activity: formatRecency(row.last_used, nowMs),
         title: `${row.skill_name} · ${formatNumber(row.project_count)} projects`,
       };
     }
@@ -367,7 +476,7 @@ function buildRows(
         name: row.hook_identity,
         chip: row.is_quill ? { text: "QUILL", tone: "quill" } : undefined,
         value: `${formatCount(row.total_count)} fires`,
-        ago: formatRecency(row.last_fired_at, nowMs),
+        activity: formatRecency(row.last_fired_at, nowMs),
         title: `${row.hook_identity} · ${row.hook_event}`,
       };
     }
@@ -378,7 +487,7 @@ function buildRows(
         name,
         meta: `${formatCount(row.session_count)} sess`,
         value: formatTokenCount(row.total_tokens),
-        ago: formatRecency(row.last_active, nowMs),
+        activity: formatRecency(row.last_active, nowMs),
         title: `${row.project} · ${row.hostname}`,
       };
     }
@@ -387,7 +496,7 @@ function buildRows(
       name: row.hostname,
       meta: `${formatCount(row.turn_count)} turns`,
       value: formatTokenCount(row.total_tokens),
-      ago: formatRecency(row.last_active, nowMs),
+      activity: formatRecency(row.last_active, nowMs),
       title: row.hostname,
     };
   });
@@ -431,10 +540,9 @@ function UsageView({ range }: UsageViewProps) {
   });
   const projects = mode === "projects" ? breakdown : secondaryProjects;
 
-  // Recency labels are relative, so they age on their own clock rather than
-  // waiting for the next data refresh.
+  // Recency and live runtime labels advance without polling the backend.
   useEffect(() => {
-    const interval = setInterval(() => setNowMs(Date.now()), 30_000);
+    const interval = setInterval(() => setNowMs(Date.now()), 1_000);
     return () => clearInterval(interval);
   }, []);
 
@@ -475,8 +583,7 @@ function UsageView({ range }: UsageViewProps) {
       mode === "sessions"
         ? breakdown.data.filter((row) => {
             if (!("session_id" in row)) return false;
-            const lastActive = new Date(row.last_active).getTime();
-            return Number.isFinite(lastActive) && nowMs - lastActive < LIVE_WINDOW_MS;
+            return isSessionLive(row.last_active, row.ended_at, nowMs);
           }).length
         : 0,
     [mode, breakdown.data, nowMs],
@@ -699,50 +806,135 @@ function UsageView({ range }: UsageViewProps) {
                 className="wg-row"
                 key={row.key}
                 data-idle={row.live === false ? "true" : undefined}
-                data-agents={row.metaLabel ? "true" : undefined}
-                title={row.title}
+                data-session={row.sessionStats ? "true" : undefined}
+                title={row.sessionStats ? undefined : row.title}
               >
-                {row.live !== undefined && (
-                  <span
-                    className="wg-row-dot"
-                    data-live={row.live ? "true" : "false"}
-                    aria-hidden="true"
-                  />
-                )}
-                <span className="wg-row-name">{row.name}</span>
-                {row.meta && (
-                  <span
-                    className="wg-row-meta wg-num"
-                    data-agent={row.metaLabel ? "true" : undefined}
-                    aria-label={row.metaLabel}
-                    title={row.metaLabel}
-                  >
-                    {row.metaLabel && (
-                      <svg
-                        className="wg-row-agent-icon"
-                        viewBox="0 0 12 12"
-                        fill="none"
-                        aria-hidden="true"
-                      >
-                        <path d="M6 2.75V1.5" />
-                        <rect x="1.5" y="2.75" width="9" height="7.5" rx="2" />
-                        <circle cx="4.25" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
-                        <circle cx="7.75" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
-                      </svg>
-                    )}
-                    {row.metaLabel && <span className="wg-row-agent-separator" aria-hidden="true">·</span>}
-                    <span className={row.metaLabel ? "wg-row-agent-models" : undefined}>
-                      {row.meta}
+                <div className="wg-row-main">
+                  {row.live !== undefined && (
+                    <span
+                      className="wg-row-dot"
+                      data-live={row.live ? "true" : "false"}
+                      aria-hidden="true"
+                    />
+                  )}
+                  {row.nameLabel ? (
+                    <span
+                      className="wg-row-name-tip wg-row-datum"
+                      data-tooltip="Session"
+                      aria-label={row.nameLabel}
+                    >
+                      <span className="wg-row-name" aria-hidden="true">
+                        {row.name}
+                      </span>
                     </span>
+                  ) : (
+                    <span className="wg-row-name">{row.name}</span>
+                  )}
+                  {row.meta && <span className="wg-row-meta wg-num">{row.meta}</span>}
+                  {row.sessionStats && (
+                    <span className="wg-row-session-stats wg-num">
+                      {row.agentSummary && (
+                        <span className="wg-row-agent-summary">
+                          <span
+                            className="wg-row-datum"
+                            data-tooltip="Total agents"
+                            aria-label={row.agentSummary.countLabel}
+                          >
+                            {row.agentSummary.count}
+                          </span>
+                          <svg
+                            className="wg-row-agent-icon"
+                            viewBox="0 0 12 12"
+                            fill="none"
+                            aria-hidden="true"
+                          >
+                            <path d="M6 2.75V1.5" />
+                            <rect x="1.5" y="2.75" width="9" height="7.5" rx="2" />
+                            <circle cx="4.25" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
+                            <circle cx="7.75" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
+                          </svg>
+                          <span
+                            className="wg-row-agent-total-time wg-row-datum"
+                            data-tooltip="Total agent runtime"
+                            aria-label={row.agentSummary.runtimeLabel}
+                          >
+                            {row.agentSummary.runtime}
+                          </span>
+                        </span>
+                      )}
+                      <span
+                        className="wg-row-session-turns wg-row-datum"
+                        data-tooltip="Main-session turns"
+                        aria-label={row.sessionStats.turnsLabel}
+                      >
+                        <svg
+                          className="wg-row-turn-icon"
+                          viewBox="0 0 10 10"
+                          fill="none"
+                          aria-hidden="true"
+                          focusable="false"
+                        >
+                          <path d="M1.5 1.5h7v5h-4L2 8V6.5h-.5z" />
+                        </svg>
+                        {row.sessionStats.turns}
+                      </span>
+                      <span
+                        className="wg-row-datum"
+                        data-tooltip="Total runtime"
+                        aria-label={row.sessionStats.runtimeLabel}
+                      >
+                        {row.sessionStats.runtime}
+                      </span>
+                    </span>
+                  )}
+                  {row.chip && (
+                    <span
+                      className={`wg-row-chip${row.chipLabel ? " wg-row-datum" : ""}`}
+                      data-tone={row.chip.tone}
+                      data-tooltip={row.chipLabel ? "Provider" : undefined}
+                      aria-label={row.chipLabel}
+                    >
+                      {row.chip.text}
+                    </span>
+                  )}
+                  <span
+                    className={`wg-row-value wg-num${row.valueLabel ? " wg-row-datum" : ""}`}
+                    data-tooltip={row.valueLabel ? "Tokens" : undefined}
+                    aria-label={row.valueLabel}
+                  >
+                    {row.value}
                   </span>
-                )}
-                {row.chip && (
-                  <span className="wg-row-chip" data-tone={row.chip.tone}>
-                    {row.chip.text}
+                  <span
+                    className={`wg-row-time wg-num${row.activityLabel ? " wg-row-datum" : ""}`}
+                    data-live={row.liveActivity ? "true" : undefined}
+                    data-tooltip={
+                      row.activityLabel
+                        ? row.live
+                          ? "Current-turn runtime"
+                          : "Last active"
+                        : undefined
+                    }
+                    aria-label={row.activityLabel}
+                  >
+                    {row.activity}
                   </span>
+                </div>
+                {row.agents && row.agents.length > 0 && (
+                  <div className="wg-row-agent-rail" role="list" aria-label="Currently open agents">
+                    {row.agents.map((agent) => (
+                      <span
+                        className="wg-row-agent wg-row-datum"
+                        key={agent.agentId}
+                        role="listitem"
+                        aria-label={`Currently open agent: ${agent.ariaLabel}`}
+                        data-tooltip={agent.ariaLabel}
+                      >
+                        <span className="wg-row-agent-model" aria-hidden="true">{agent.model}</span>
+                        <span className="wg-row-agent-time wg-num" aria-hidden="true">{agent.runtime}</span>
+                      </span>
+                    ))}
+                  </div>
                 )}
-                <span className="wg-row-value wg-num">{row.value}</span>
-                <span className="wg-row-ago wg-num">{row.ago}</span>
               </li>
             ))}
           </ul>

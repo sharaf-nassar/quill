@@ -86,17 +86,8 @@ function deriveCategory(eventType, decision) {
       return "routing";
     case "mcp.source_read":
       return "retrieval";
-    case "mcp.snapshot":
-      return decision === "created" ? "preservation" : "retrieval";
-    case "mcp.continuity":
-      return "telemetry";
     case "router.guidance":
     case "router.denial":
-      return "routing";
-    case "capture.event":
-    case "capture.snapshot":
-      return "telemetry";
-    case "capture.guidance":
       return "routing";
     default:
       return "unknown";
@@ -111,8 +102,8 @@ function buildContextSavingsEvent(input, fields) {
   const hasByteEstimate = indexedBytes !== null || returnedBytes !== null || inputBytes !== null;
   const category = fields.category || deriveCategory(fields.eventType, fields.decision || "recorded");
   // Only preservation/retrieval events default tokensSaved/tokensPreserved from indexedBytes.
-  // Routing and telemetry events default to 0 unless the caller passes explicit values, so
-  // hook payloads (capture.event, router.guidance, etc.) no longer inflate the savings metric.
+  // Routing events default to 0 unless the caller passes explicit values, so
+  // router hook payloads no longer inflate the savings metric.
   const tokenScope = category === "preservation" || category === "retrieval";
   const savedBaseline = indexedBytes !== null ? indexedBytes : inputBytes;
   const savedBytes = tokenScope && savedBaseline !== null
@@ -143,7 +134,6 @@ function buildContextSavingsEvent(input, fields) {
     estimateMethod: fields.estimateMethod || (hasByteEstimate ? "ceil_bytes_div_4" : "none"),
     estimateConfidence: fields.estimateConfidence ?? (hasByteEstimate ? 1 : 0),
     sourceRef: fields.sourceRef || null,
-    snapshotRef: fields.snapshotRef || null,
     metadata: fields.metadata || {},
   };
   event.eventId = fields.eventId || stableEventId(event);

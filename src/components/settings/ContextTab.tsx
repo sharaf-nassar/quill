@@ -59,7 +59,7 @@ function ContextTab({ integrations, features }: ContextTabProps) {
         label="Context savings telemetry"
         description={
           contextPreservation.enabled
-            ? "Records local-only metadata (event type, byte counts, refs — never the actual content) into the Quill database to power the Analytics → Context dashboard. In-session continuity keeps working when this is off; you just lose dashboard data for new sessions."
+            ? "Records local-only metadata (event type, byte counts, refs — never the actual content) into the Quill database to power the Analytics → Context dashboard. When this is off, routing still works but new dashboard data is not recorded."
             : "Enable Working Context Preservation first. Telemetry rides with context preservation — without it there is nothing to record."
         }
         control={
@@ -96,7 +96,7 @@ function ContextTab({ integrations, features }: ContextTabProps) {
         <p>
           When ON, Quill installs context-routing hooks, the <code>quill_*</code> MCP
           tools (index_context, search_context, execute, fetch_and_index, etc.),
-          continuity capture, and context-savings telemetry into every enabled provider.
+          and context-savings telemetry into every enabled provider.
         </p>
         <p>
           Hooks block raw WebFetch and noisy <code>curl</code>/<code>wget</code> dumps and route Bash, Read, Grep, build,

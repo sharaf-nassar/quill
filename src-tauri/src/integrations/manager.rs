@@ -270,12 +270,28 @@ fn startup_refresh_unlocked(
     let mut statuses = detect_all_with_storage(&storage)?;
     if should_repair_enabled_providers {
         repair_enabled_providers(app, &storage, &mut statuses);
+        retire_continuity(&storage)?;
     }
     save_statuses(&storage, &statuses)?;
     log_statuses(&statuses);
     emit_statuses(app, &statuses);
 
     Ok(statuses)
+}
+
+fn retire_continuity(storage: &Storage) -> Result<(), String> {
+    let mut errors = Vec::new();
+    if let Err(err) = crate::claude_setup::retire_continuity_hooks() {
+        errors.push(format!("Claude hook cleanup failed: {err}"));
+    }
+    if let Err(err) = codex::retire_continuity_hooks() {
+        errors.push(format!("Codex hook cleanup failed: {err}"));
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    let config_dir = super::retirement::default_config_dir()?;
+    super::retirement::purge_continuity_artifacts_at(&config_dir, storage.database_path())
 }
 
 /// Drop the cached login-shell PATH and re-run provider detection. Triggered

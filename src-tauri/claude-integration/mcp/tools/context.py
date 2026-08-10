@@ -165,15 +165,7 @@ def _derive_category(event_type: str, decision: str) -> str:
         return "routing"
     if event_type == "mcp.source_read":
         return "retrieval"
-    if event_type == "mcp.snapshot":
-        return "preservation" if decision == "created" else "retrieval"
-    if event_type == "mcp.continuity":
-        return "telemetry"
     if event_type in ("router.guidance", "router.denial"):
-        return "routing"
-    if event_type in ("capture.event", "capture.snapshot"):
-        return "telemetry"
-    if event_type == "capture.guidance":
         return "routing"
     return "unknown"
 
@@ -190,7 +182,6 @@ def _context_savings_event(
     returned_bytes: int | None = None,
     input_bytes: int | None = None,
     source_ref: str | None = None,
-    snapshot_ref: str | None = None,
     metadata: dict | None = None,
     session_id: str | None = None,
     cwd: str | None = None,
@@ -204,7 +195,7 @@ def _context_savings_event(
     decision_value = decision or "recorded"
     resolved_category = category or _derive_category(event_type, decision_value)
     # Only preservation/retrieval events default tokensSaved/tokensPreserved from indexed_bytes.
-    # Routing and telemetry events default to 0 unless the caller passes explicit values.
+    # Routing events default to 0 unless the caller passes explicit values.
     token_scope = resolved_category in ("preservation", "retrieval")
     saved_baseline = indexed_bytes if indexed_bytes is not None else input_bytes
     saved_bytes = (
@@ -245,7 +236,6 @@ def _context_savings_event(
         "estimateMethod": "ceil_bytes_div_4" if has_byte_estimate else "none",
         "estimateConfidence": 1 if has_byte_estimate else 0,
         "sourceRef": source_ref,
-        "snapshotRef": snapshot_ref,
         "metadata": metadata or {},
     }
     event["eventId"] = _context_savings_event_id(event)
@@ -267,7 +257,6 @@ def _context_savings_summary(event: dict) -> dict:
         "estimateMethod",
         "estimateConfidence",
         "sourceRef",
-        "snapshotRef",
     )
     return {key: event.get(key) for key in keys}
 
@@ -330,7 +319,7 @@ def _attach_context_savings(response: dict, **event_kwargs: Any) -> dict:
         event["returnedBytes"] = returned_bytes
         event["tokensReturnedEst"] = _tokens_from_bytes(returned_bytes)
         # Recompute tokensSavedEst only when the event represents preservation
-        # or retrieval; for routing and telemetry the saved metric is always 0.
+        # or retrieval; for routing the saved metric is always 0.
         if token_scope:
             baseline = (
                 event.get("indexedBytes")
@@ -423,33 +412,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             output_source_id INTEGER REFERENCES sources(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL
         );
-
-        CREATE TABLE IF NOT EXISTS continuity_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            details TEXT,
-            source_refs_json TEXT,
-            priority INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_continuity_session
-            ON continuity_events(session_id, priority DESC, created_at DESC);
-
-        CREATE TABLE IF NOT EXISTS compaction_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            snapshot TEXT NOT NULL,
-            event_count INTEGER NOT NULL DEFAULT 0,
-            source_refs_json TEXT,
-            created_at TEXT NOT NULL,
-            metadata_json TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_snapshots_session
-            ON compaction_snapshots(session_id, created_at DESC);
 
         CREATE TABLE IF NOT EXISTS fetch_cache (
             url TEXT PRIMARY KEY,
@@ -1307,18 +1269,15 @@ async def _fetch_public_url(url: str, max_bytes: int) -> dict:
                 }
 
 
-def _purge_context_files() -> list[str]:
-    removed: list[str] = []
-    for name in ("continuity", "markers"):
-        target = CONTEXT_DIR / name
-        if not target.exists():
-            continue
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        removed.append(str(target))
-    return removed
+def _purge_marker_files() -> list[str]:
+    target = CONTEXT_DIR / "markers"
+    if not target.exists():
+        return []
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return [str(target)]
 
 
 @mcp.tool(annotations=WRITE_ANNOTATIONS)
@@ -1887,8 +1846,6 @@ def _context_stats() -> dict:
     source_count = conn.execute("SELECT COUNT(*) AS c FROM sources").fetchone()["c"]
     chunk_count = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
     execution_count = conn.execute("SELECT COUNT(*) AS c FROM executions").fetchone()["c"]
-    event_count = conn.execute("SELECT COUNT(*) AS c FROM continuity_events").fetchone()["c"]
-    snapshot_count = conn.execute("SELECT COUNT(*) AS c FROM compaction_snapshots").fetchone()["c"]
     cache_count = conn.execute("SELECT COUNT(*) AS c FROM fetch_cache").fetchone()["c"]
     bytes_row = conn.execute("SELECT COALESCE(SUM(content_bytes), 0) AS b FROM sources").fetchone()
     return {
@@ -1897,8 +1854,6 @@ def _context_stats() -> dict:
         "sources": source_count,
         "chunks": chunk_count,
         "executions": execution_count,
-        "continuity_events": event_count,
-        "compaction_snapshots": snapshot_count,
         "fetch_cache_entries": cache_count,
         "indexed_bytes": bytes_row["b"],
     }
@@ -1932,14 +1887,12 @@ def quill_purge_context(
         for table in (
             "fetch_cache",
             "executions",
-            "continuity_events",
-            "compaction_snapshots",
             "chunks",
             "sources",
         ):
             conn.execute(f"DELETE FROM {table}")
         conn.commit()
-    removed_files = _purge_context_files()
+    removed_files = _purge_marker_files()
     return {
         "purged": True,
         "scope": "all",

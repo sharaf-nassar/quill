@@ -174,19 +174,35 @@ export interface SessionBreakdown {
   turn_count: number;
   first_seen: string;
   last_active: string;
+  /** Newest observed graceful end; newer activity reopens the session. */
+  ended_at: string | null;
   project: string | null;
-  /** Current-boot hook coverage: null when Quill cannot make an exact claim. */
-  observed_subagent_count: number | null;
-  /** Exact raw-model groups; agent type is fallback while model is unresolved. */
-  observed_subagent_models: ObservedSubagentModelGroup[] | null;
+  /** Lifetime active runtime across every native chain; null is unknown. */
+  active_runtime_secs: number | null;
+  /** Distinct retained sidechain chains across the session lifetime. */
+  agent_count: number | null;
+  /** Lifetime active runtime across sidechain chains only. */
+  agent_runtime_secs: number | null;
+  /** Root session's current open-turn runtime; null is unknown. */
+  current_turn_runtime_secs: number | null;
+  /** Whether the root current-turn runtime is still accruing. */
+  current_turn_runtime_active: boolean;
+  /** Producer time for runtime extrapolation; null disables extrapolation. */
+  runtime_as_of_ms: number | null;
+  /** Aggregate active seconds accrued per wall-clock second after runtime_as_of_ms. */
+  active_runtime_rate: number;
+  /** Current open native agents; null means transcript coverage is unknown. */
+  observed_agents: ObservedSessionAgent[] | null;
   /** True until retained token metrics arrive for a current-boot observed root. */
   observed_only: boolean;
 }
 
-export interface ObservedSubagentModelGroup {
+export interface ObservedSessionAgent {
+  agent_id: string;
   model_id: string | null;
   agent_type: string | null;
-  count: number;
+  runtime_secs: number | null;
+  runtime_active: boolean;
 }
 
 export interface SkillBreakdown {
@@ -871,7 +887,6 @@ export type ContextSavingsEstimateConfidence =
 export interface ContextSavingsSummary {
 	eventCount: number;
 	routerEventCount: number;
-	continuityEventCount: number;
 	indexedBytes: number;
 	returnedBytes: number;
 	inputBytes: number;
@@ -886,7 +901,6 @@ export interface ContextSavingsSummary {
 	tokensPreserved?: number;
 	tokensRetrieved?: number;
 	tokensRouting?: number;
-	telemetryEventCount?: number;
 	routingEventCount?: number;
 	sourcesPreserved?: number;
 	sourcesRetrieved?: number;
@@ -897,7 +911,6 @@ export interface ContextSavingsTimeSeriesPoint {
 	timestamp: string;
 	eventCount: number;
 	routerEventCount: number;
-	continuityEventCount: number;
 	indexedBytes: number;
 	returnedBytes: number;
 	inputBytes: number;
@@ -966,7 +979,6 @@ export interface ContextSavingsEvent {
 	estimateMethod: string | null;
 	estimateConfidence: ContextSavingsEstimateConfidence | null;
 	sourceRef: string | null;
-	snapshotRef: string | null;
 	createdAt: string;
 }
 

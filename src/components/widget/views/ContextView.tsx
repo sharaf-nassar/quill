@@ -48,8 +48,8 @@ function routingTokens(summary: ContextSavingsSummary): number {
 }
 
 /**
- * The count that matches `routingTokens` — router decisions plus capture
- * guidance, search snippets and bounded results.
+ * The count that matches `routingTokens` — router decisions, search snippets
+ * and bounded results.
  *
  * The hook normalizes an absent category count to 0, so "not reported" and
  * "genuinely none" arrive here indistinguishable. A zero alongside non-zero
@@ -254,9 +254,8 @@ function ContextView({ range }: ContextViewProps) {
           {routing.label}
         </span>
         <p className="wg-ctx-note">
-          Transcript tokens spent on router nudges, capture guidance and bounded
-          results — the overhead Quill adds to keep larger payloads out of the
-          prompt.
+          Transcript tokens spent on router nudges and bounded results — the
+          overhead Quill adds to keep larger payloads out of the prompt.
         </p>
       </section>
     </>

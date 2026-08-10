@@ -2,6 +2,7 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const https = require("https");
 const http = require("http");
@@ -102,6 +103,34 @@ function buildPayload(input) {
   };
 }
 
+const TERMINAL_EVENTS = new Set(["Stop", "StopFailure", "SessionEnd"]);
+
+function buildTerminalPayload(
+  input,
+  config = {},
+  ts = new Date().toISOString(),
+  systemHostname = os.hostname(),
+) {
+  const hookEvent = input?.hook_event_name;
+  if (!TERMINAL_EVENTS.has(hookEvent) || !input.session_id) return null;
+  const configuredHostname =
+    typeof config.hostname === "string" ? config.hostname.trim() : "";
+  return {
+    provider: "claude",
+    session_id: input.session_id,
+    hostname:
+      configuredHostname ||
+      String(systemHostname || "").split(".")[0] ||
+      "local",
+    hook_event: hookEvent,
+    tool_name: null,
+    cwd: input.cwd || null,
+    ts,
+    hook_matcher: null,
+    agent_id: null,
+  };
+}
+
 function loadConfig() {
   const configPath = path.join(
     process.env.HOME || process.env.USERPROFILE,
@@ -117,6 +146,15 @@ function main() {
     const raw = fs.readFileSync(0, "utf8");
     const input = JSON.parse(raw);
 
+    if (TERMINAL_EVENTS.has(input?.hook_event_name)) {
+      const config = loadConfig();
+      const payload = buildTerminalPayload(input, config);
+      if (payload !== null) {
+        postJSON(config, "/api/v1/hooks/observed", payload, "observe");
+      }
+      return;
+    }
+
     const payload = buildPayload(input);
     if (payload === null) return;
 
@@ -129,4 +167,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { buildPayload, truncate };
+module.exports = { buildPayload, buildTerminalPayload, truncate };

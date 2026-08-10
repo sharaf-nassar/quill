@@ -299,9 +299,8 @@ function CpaConnectionSettings() {
       ) : null}
 
       <p className="cpa-settings-overlap">
-        Direct Claude and Codex integrations remain active. In LIMITS, a CPA
-        pool replaces the matching direct row; the direct row returns when
-        that provider has no CPA pool.
+        While CPA is configured, LIMITS uses CPA exclusively and pauses direct
+        provider usage polling. Disconnect CPA to resume direct usage polling.
       </p>
 
       {confirmDisconnect ? (

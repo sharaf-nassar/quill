@@ -68,3 +68,17 @@ test("malformed evidence stays identifiable without inventing fields", () => {
   assert.equal(payload.hostname, "local");
   assert.equal(payload.agent_id, null);
 });
+
+test("preserves Codex root terminal evidence", () => {
+  for (const hookEvent of ["Stop", "SessionEnd"]) {
+    const payload = buildPayload(
+      { hook_event_name: hookEvent, session_id: "root-session" },
+      { hostname: "worker" },
+      now,
+    );
+    assert.equal(payload.hook_event, hookEvent);
+    assert.equal(payload.session_id, "root-session");
+    assert.equal(payload.hostname, "worker");
+    assert.equal(payload.ts, now.toISOString());
+  }
+});
