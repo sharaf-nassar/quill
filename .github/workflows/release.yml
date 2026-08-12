@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+env:
+  NODE_USE_SYSTEM_CA: '1'
+
 jobs:
   # Feature 005 / SC-008: a failing learning-logic suite must block release.
   # Reuses the same fmt/clippy(-D warnings)/test gate enforced on PRs and main
@@ -80,7 +83,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: lts/*
+          node-version: 24
           cache: npm
 
       - name: Install Rust toolchain

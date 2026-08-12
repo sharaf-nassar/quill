@@ -292,6 +292,24 @@ impl ObservedSubagentState {
             .map(SessionSnapshot::count)
     }
 
+    /// Retained identities that must survive storage's provisional limit so
+    /// their transcript activity can participate in final ranking.
+    pub(crate) fn session_ranking_keys(&self) -> Vec<(String, String, String)> {
+        let mut reconciler = self.inner.lock().unwrap();
+        reconciler.prune_stale(Utc::now());
+        reconciler
+            .sessions
+            .values()
+            .map(|snapshot| {
+                (
+                    snapshot.key.provider.clone(),
+                    snapshot.key.session_id.clone(),
+                    snapshot.key.host.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn merge(
         &self,
         mut rows: Vec<SessionBreakdown>,

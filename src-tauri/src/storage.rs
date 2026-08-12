@@ -13059,6 +13059,7 @@ impl Storage {
         hostname: Option<&str>,
         provider: Option<IntegrationProvider>,
         limit: i32,
+        observed_keys: &[(String, String, String)],
     ) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
         // Sub-agent rollup (Wave 2). Each output row is keyed by
         // `(provider, session_id, hostname)` — the same natural key as
@@ -13075,15 +13076,43 @@ impl Storage {
         // * last_active is MAX across semantic response activity and token
         //   snapshots, except token bookkeeping after a terminal hook is
         //   clamped to that hook. A newer response or transcript scan still
-        //   reopens the session.
+        //   reopens the session after this retained identity is merged.
         // Rank only the cheap, range-scoped token groups plus each group's
-        // indexed response-time maximum. Materializing that top-N frontier
-        // lets LIMIT prune the turn/project enrichment below.
+        // indexed response-time maximum. The top-N frontier plus any retained
+        // identities visible to the transcript scanner proceed to enrichment.
         // Grouping is provider/session-led for every supported filter shape.
         // Pin that access path so planner statistics cannot substitute the
         // unrelated provider/timestamp skip-scan audited on the frozen corpus.
-        let mut sql = String::from(
-            "WITH tok AS MATERIALIZED (
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from)];
+        let hostname_param = if provider.is_some() { 3 } else { 2 };
+        let provider_filter = provider.map(|provider| provider.as_str().to_string());
+        if let Some(provider) = &provider_filter {
+            params_vec.push(Box::new(provider.clone()));
+        }
+        if let Some(host) = hostname {
+            params_vec.push(Box::new(host.to_string()));
+        }
+        let observed_values = observed_keys
+            .iter()
+            .map(|(provider, session_id, host)| {
+                let first = params_vec.len() + 1;
+                params_vec.push(Box::new(provider.clone()));
+                params_vec.push(Box::new(session_id.clone()));
+                params_vec.push(Box::new(host.clone()));
+                format!("(?{first}, ?{}, ?{})", first + 1, first + 2)
+            })
+            .collect::<Vec<_>>();
+        let observed = if observed_values.is_empty() {
+            "SELECT NULL AS provider, NULL AS session_id, NULL AS hostname \
+             WHERE FALSE"
+                .to_owned()
+        } else {
+            format!("VALUES {}", observed_values.join(", "))
+        };
+        let mut sql = format!(
+            "WITH observed(provider, session_id, hostname) AS (
+                 {observed}
+             ), tok AS MATERIALIZED (
                  SELECT provider, session_id, hostname,
                         SUM(input_tokens + output_tokens
                             + cache_creation_input_tokens
@@ -13092,19 +13121,15 @@ impl Storage {
                         MAX(timestamp) AS last_active_tok
                  FROM token_snapshots INDEXED BY idx_token_snap_provider_session_sidechain
                  WHERE timestamp >= ?1
-            ",
+            "
         );
-        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(from)];
-        let hostname_param = if provider.is_some() { 3 } else { 2 };
 
-        if let Some(provider) = provider {
+        if provider_filter.is_some() {
             sql.push_str(" AND provider = ?2");
-            params_vec.push(Box::new(provider.as_str().to_string()));
         }
 
-        if let Some(host) = hostname {
+        if hostname.is_some() {
             sql.push_str(&format!(" AND hostname = ?{hostname_param}"));
-            params_vec.push(Box::new(host.to_string()));
         }
 
         sql.push_str(&format!(
@@ -13134,7 +13159,7 @@ impl Storage {
                           ORDER BY julianday(h.timestamp) DESC, h.timestamp DESC
                           LIMIT 1) AS ended_at
                  FROM tok
-             ), candidates AS MATERIALIZED (
+             ), stored_activity AS NOT MATERIALIZED (
                  SELECT rankable.*,
                         CASE
                             WHEN julianday(last_active_rt) >
@@ -13149,8 +13174,24 @@ impl Storage {
                             ELSE last_active_tok
                         END AS last_active
                  FROM rankable
-                 ORDER BY last_active DESC
+             ), ranked AS MATERIALIZED (
+                 SELECT * FROM stored_activity
+                 ORDER BY last_active DESC, provider ASC, hostname ASC,
+                          session_id ASC
                  LIMIT {limit}
+             ), candidates AS MATERIALIZED (
+                 SELECT * FROM ranked
+                 UNION
+                 SELECT stored_activity.* FROM stored_activity
+                 JOIN observed
+                   ON observed.provider = stored_activity.provider
+                  AND observed.session_id = stored_activity.session_id
+                  AND observed.hostname = lower(CASE
+                        WHEN instr(trim(stored_activity.hostname), '.') > 0
+                        THEN substr(trim(stored_activity.hostname), 1,
+                                    instr(trim(stored_activity.hostname), '.') - 1)
+                        ELSE trim(stored_activity.hostname)
+                      END)
              )
              SELECT
                  candidates.provider,
@@ -13180,7 +13221,8 @@ impl Storage {
                       AND t.cwd IS NOT NULL
                     ORDER BY t.timestamp DESC LIMIT 1) AS project
              FROM candidates
-             ORDER BY candidates.last_active DESC"
+             ORDER BY candidates.last_active DESC, candidates.provider ASC,
+                      candidates.hostname ASC, candidates.session_id ASC"
         ));
 
         (sql, params_vec)
@@ -13193,10 +13235,26 @@ impl Storage {
         provider: Option<IntegrationProvider>,
         limit: Option<i32>,
     ) -> Result<Vec<SessionBreakdown>, String> {
+        self.get_session_breakdown_with_observed(range, hostname, provider, limit, &[])
+    }
+
+    pub(crate) fn get_session_breakdown_with_observed(
+        &self,
+        range: &str,
+        hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+        limit: Option<i32>,
+        observed_keys: &[(String, String, String)],
+    ) -> Result<Vec<SessionBreakdown>, String> {
         let limit = limit.unwrap_or(10).clamp(1, 500);
         let conn = self.open_view_reader()?;
-        let (sql, params_vec) =
-            Self::session_breakdown_query(range_from_timestamp(range), hostname, provider, limit);
+        let (sql, params_vec) = Self::session_breakdown_query(
+            range_from_timestamp(range),
+            hostname,
+            provider,
+            limit,
+            observed_keys,
+        );
 
         let mut stmt = conn
             .prepare(&sql)
@@ -20354,7 +20412,7 @@ mod tests {
             "later transcript activity must remain newer than terminal evidence"
         );
         let (sql, _) =
-            Storage::session_breakdown_query(range_from_timestamp("7d"), None, None, 100);
+            Storage::session_breakdown_query(range_from_timestamp("7d"), None, None, 100, &[]);
         for historical_source in [
             "has_subagents",
             "subagent_count",
@@ -20452,6 +20510,117 @@ mod tests {
         assert_eq!(reopened.ended_at.as_deref(), Some(middle.as_str()));
         assert_eq!(reopened.last_active, after_stop);
         assert_eq!(reopened.turn_count, 3);
+
+        clear_env();
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Limited Stored Session Reopening]]
+    #[test]
+    #[serial]
+    fn observed_activity_reopens_limited_stored_session_with_metrics() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = Utc::now();
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO token_snapshots (
+                     provider, session_id, hostname, timestamp, input_tokens,
+                     output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, cwd, is_sidechain
+                 ) VALUES
+                     ('codex', 'target', 'host.example.com',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 minutes'),
+                      30, 12, 0, 0, NULL, 0),
+                     ('codex', 'leader', 'host.example.com',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 minute'),
+                      1, 0, 0, 0, '/leader', 0);
+                 INSERT INTO live_analytics_sessions (
+                     provider, session_id, hostname, updated_at
+                 ) VALUES (
+                     'codex', 'target', 'host.example.com',
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 );
+                 INSERT INTO response_times (
+                     provider, session_id, chain_id, timestamp, response_secs,
+                     is_sidechain
+                 ) VALUES
+                     ('codex', 'target', 'target',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-9 minutes'),
+                      1.0, 0),
+                     ('codex', 'target', 'target',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 minutes'),
+                      1.0, 0);",
+            )
+            .expect("seed limited session rows");
+        }
+        storage
+            .store_hook_observation(&crate::models::ObservedHookObservation {
+                provider: IntegrationProvider::Codex,
+                session_id: "target".to_owned(),
+                hostname: Some("host.example.com".to_owned()),
+                hook_event: "Stop".to_owned(),
+                tool_name: None,
+                cwd: None,
+                ts: (now - TimeDelta::minutes(5)).to_rfc3339(),
+                hook_matcher: None,
+                agent_id: None,
+            })
+            .expect("seed target terminal evidence");
+
+        let baseline = storage
+            .get_session_breakdown("1h", None, None, Some(1))
+            .expect("read SQL frontier");
+        assert_eq!(baseline[0].session_id, "leader");
+
+        let state = crate::server::ObservedSubagentState::default();
+        assert!(state.record_scanned_session(
+            crate::transcript_scan::TranscriptSession {
+                provider: IntegrationProvider::Codex,
+                session_id: "target".to_owned(),
+                cwd: None,
+                started_at: now - TimeDelta::minutes(20),
+                last_activity: now,
+                agents: Vec::new(),
+            },
+            "host",
+        ));
+        let rows = storage
+            .get_session_breakdown_with_observed(
+                "1h",
+                None,
+                None,
+                Some(1),
+                &state.session_ranking_keys(),
+            )
+            .expect("read observed retained candidates");
+        let mut rows = state
+            .merge(
+                rows,
+                &range_from_timestamp("1h"),
+                None,
+                None,
+                Some(1),
+                |_| Ok(HashMap::new()),
+            )
+            .expect("merge observed activity");
+        storage
+            .populate_session_terminal_evidence(&mut rows, "1h", None, None)
+            .expect("project terminal evidence");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "target");
+        assert_eq!(rows[0].total_tokens, 42);
+        assert_eq!(rows[0].turn_count, 2);
+        assert_eq!(rows[0].project, None);
+        assert!(!rows[0].observed_only);
+        assert_eq!(rows[0].last_active, now.to_rfc3339());
+        assert_eq!(
+            rows[0].ended_at,
+            Some((now - TimeDelta::minutes(5)).to_rfc3339())
+        );
 
         clear_env();
     }

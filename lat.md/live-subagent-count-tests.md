@@ -106,6 +106,10 @@ Command-layer enrichment overlays exact provider, host, and root matches while u
 
 An active root with validated root cwd synthesizes before token storage, advances a retained row's activity from the scan, and merges into that row without duplication.
 
+## Limited Stored Session Reopening
+
+A retained row outside the SQL limit rejoins transcript reconciliation by provider, session, and normalized host, preserving token and turn metrics even when neither stored nor scanned evidence supplies cwd.
+
 ## Observed-Only Merge Boundaries
 
 Synthetic rows require a validated root cwd and obey normalized hostname and provider filters, selected range, deterministic limit, provider disable, and global tracking disable.

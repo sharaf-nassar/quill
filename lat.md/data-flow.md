@@ -25,7 +25,7 @@ Analytics session drill-down uses the same provider plus session id pair when re
 
 Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the widget runtime readout needs to exclude the sub-agent traffic instead.
 
-Sessions ranking clamps token snapshots newer than the latest matching root terminal hook to that hook. Stop-cycle token bookkeeping cannot reopen a row; strictly newer transcript or response activity can.
+Sessions ranking clamps token snapshots newer than the latest matching root terminal hook to that hook. Fresh transcript identities join retained candidates before the final limit, preserving stored metrics when newer transcript activity reopens them. Stop-cycle token bookkeeping cannot reopen a row; strictly newer transcript or response activity can.
 
 ## Database Maintenance Pipeline
 

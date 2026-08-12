@@ -62,7 +62,7 @@ Four parallel builds (fail-fast disabled), all depending on `create-release` so 
 
 `tauri-action` runs with `retryAttempts: 3` because its per-build `latest.json` uploads race on the shared release asset (tauri-action#1270); the publish job rebuilds that manifest deterministically regardless (see Release Publishing below).
 
-Platforms: Linux (Ubuntu 22.04, AppImage), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS, runner pinned to `windows-2025`). Each installs Node.js LTS, the pinned Rust toolchain, and platform-specific system dependencies.
+Platforms: Linux (Ubuntu 22.04, AppImage), macOS Intel (x86_64), macOS ARM (aarch64), Windows (NSIS, runner pinned to `windows-2025`). Each installs Node.js 24 without an LTS-alias manifest lookup, trusts the runner system CA store for Node-based release clients, and installs the pinned Rust toolchain plus platform-specific system dependencies.
 
 Unix free-space probes normalize `statvfs` counters to `u64` before multiplication because Apple exposes the fields with mixed integer widths; this keeps both macOS release targets compilable without changing overflow checks.
 
