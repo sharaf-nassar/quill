@@ -182,6 +182,72 @@ test("continuous ingest storms refresh one mounted fan-out every 5000ms or later
 	stops[1]();
 });
 
+// @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Transcript runtime refresh is immediate]]
+test("transcript runtime refresh bypasses fan-out only for session breakdown", async (t) => {
+	const clock = mockClock(t);
+	const store = new CachedInvokeStore();
+	const queryLog = [];
+	let sessionCalls = 0;
+	let resolveSession;
+	const subscribe = (command) =>
+		store.subscribe(
+			cachedInvokeKey({ command, args: { range: "6h" } }),
+			async () => {
+				queryLog.push({ atMs: Date.now(), command });
+				if (command === "get_session_breakdown" && ++sessionCalls > 1) {
+					return new Promise((resolve) => {
+						resolveSession = resolve;
+					});
+				}
+				return { ok: true };
+			},
+			() => {},
+			["transcript-analytics-updated"],
+		);
+	const stopSessions = subscribe("get_session_breakdown");
+	const stopProjects = subscribe("get_project_breakdown");
+	await settle();
+
+	clock.tick(1_000);
+	store.invalidateEvent(
+		"transcript-analytics-updated",
+		true,
+		"get_session_breakdown",
+	);
+	await settle();
+	assert.deepEqual(queryLog, [
+		{ atMs: 0, command: "get_session_breakdown" },
+		{ atMs: 0, command: "get_project_breakdown" },
+		{ atMs: 1_000, command: "get_session_breakdown" },
+	]);
+	store.invalidateEvent(
+		"transcript-analytics-updated",
+		true,
+		"get_session_breakdown",
+	);
+	store.invalidateEvent(
+		"transcript-analytics-updated",
+		true,
+		"get_session_breakdown",
+	);
+	await settle();
+	assert.equal(sessionCalls, 2);
+	resolveSession({ ok: true });
+	await settle();
+	assert.equal(sessionCalls, 3);
+	resolveSession({ ok: true });
+	await settle();
+
+	clock.tick(4_000);
+	await settle();
+	assert.deepEqual(queryLog.at(-1), {
+		atMs: 5_000,
+		command: "get_project_breakdown",
+	});
+	stopSessions();
+	stopProjects();
+});
+
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Arguments isolate cache entries]]
 test("stable argument keys coalesce object order but isolate changed ranges", async () => {
 	const sixHourA = cachedInvokeKey({

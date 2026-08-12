@@ -30,7 +30,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useModelAnalytics } from "../../../hooks/useModelAnalytics";
 import { useRollupBackfill } from "../../../hooks/useRollupBackfill";
-import { formatNumber } from "../../../utils/format";
+import { formatNumber, formatRecency } from "../../../utils/format";
 import { providerTag } from "../../../utils/providers";
 import { formatTokenCount } from "../../../utils/tokens";
 import { modelIdentityKey } from "../../../types";
@@ -150,18 +150,6 @@ function chipTone(provider: string): string {
     return provider;
   }
   return "other";
-}
-
-/** Compact recency for a 38px column: `now`, `42m`, `3h`, `2d`. */
-function formatRecency(timestamp: string, nowMs: number): string {
-  const then = new Date(timestamp).getTime();
-  if (!Number.isFinite(then)) return "—";
-  const minutes = Math.floor((nowMs - then) / 60_000);
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.floor(hours / 24)}d`;
 }
 
 /** `16:49 today` while the takeover is same-day, else `Jul 18, 22:14`. */

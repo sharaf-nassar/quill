@@ -10,7 +10,7 @@ All owning-layer tests passed in attempt 3.
 
 | Gate | Result |
 |---|---|
-| `npm run test:session-subagents` | Pass: 2 tests |
+| `node --test scripts/session-subagents.test.mjs` | Pass: 2 tests |
 | `node --test src-tauri/claude-integration/scripts/hook-runtime.test.cjs` | Pass: 7 tests |
 | `node --test src-tauri/codex-integration/scripts/hook-observe.test.cjs` | Pass: 3 tests |
 | `cargo test lifecycle_truth_table_covers_both_providers` | Pass |
@@ -33,7 +33,7 @@ Repository Rust, frontend, release, formatting, and static-analysis gates passed
 | `npm run typecheck` | Pass |
 | `npm run build` | Pass |
 | `npm run knip` | Pass |
-| `npm run test:cached-invoke` | Pass: 9 tests |
+| `node --test scripts/cached-invoke.test.mjs` | Pass: 9 tests |
 | `npm run tauri -- build --ci --no-sign` | Pass: optimized binary and Linux AppImage/updater bundle |
 | `git diff --check` | Pass |
 | `pre-commit run --all-files` | Pass |

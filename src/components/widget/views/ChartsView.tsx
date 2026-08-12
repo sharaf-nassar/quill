@@ -33,7 +33,14 @@
 
 import { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { areaPath, scalePoints, seriesMax, smoothPath, type VizPoint } from "../viz";
+import {
+  areaPath,
+  bucketTotals,
+  scalePoints,
+  seriesMax,
+  smoothPath,
+  type VizPoint,
+} from "../viz";
 import { useCachedInvoke } from "../../../hooks/useCachedInvoke";
 import { useCodeStats } from "../../../hooks/useCodeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
@@ -238,18 +245,6 @@ function coveredRuns(covered: readonly boolean[]): ReadonlyArray<[number, number
   });
   if (start >= 0) runs.push([start, covered.length - 1]);
   return runs;
-}
-
-/** Per-bucket sum across every provider series. */
-function bucketTotals(series: ReadonlyArray<{ values: number[] }>): number[] {
-  const length = series.reduce((max, entry) => Math.max(max, entry.values.length), 0);
-  const totals = new Array<number>(length).fill(0);
-  for (const entry of series) {
-    entry.values.forEach((value, index) => {
-      totals[index] += value;
-    });
-  }
-  return totals;
 }
 
 /** Signed line counts with a typographic minus: `+1,923 / −412`. */

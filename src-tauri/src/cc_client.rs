@@ -19,6 +19,8 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::prompt_utils::safe_truncate as truncate;
+
 /// Per-type JSON Schema cache. `schemars::schema_for!(T)` plus
 /// serialization is pure and deterministic for a given `T`, so it is
 /// computed once per concrete type and reused. Keyed by
@@ -44,7 +46,6 @@ const INVOCATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// own local session index and extracts via this client like Stream A/B,
 /// so `stream_c` entries now appear in the metadata array. (Feature 004
 /// replaced the former `claude /insights --print` subprocess.)
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -1291,17 +1292,6 @@ fn state_dir() -> Option<PathBuf> {
     // unavailable. If neither is available we omit `current_dir` and
     // the subprocess inherits ours.
     dirs::data_local_dir().or_else(dirs::home_dir)
-}
-
-fn truncate(input: &str, max_bytes: usize) -> &str {
-    if input.len() <= max_bytes {
-        return input;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !input.is_char_boundary(end) {
-        end -= 1;
-    }
-    &input[..end]
 }
 
 fn classify_error(

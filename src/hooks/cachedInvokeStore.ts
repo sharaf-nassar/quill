@@ -99,6 +99,7 @@ export class CachedInvokeStore {
 
 	private readonly entries = new Map<string, CachedInvokeEntry<unknown>>();
 	private readonly pendingKeys = new Set<string>();
+	private readonly immediateKeys = new Set<string>();
 	private fanoutTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastFanoutStartedAt = Number.NEGATIVE_INFINITY;
 
@@ -161,6 +162,7 @@ export class CachedInvokeStore {
 
 			entry.request = null;
 			this.pendingKeys.delete(key);
+			this.immediateKeys.delete(key);
 			this.cancelUnusedFanoutTimer();
 		};
 	}
@@ -181,16 +183,30 @@ export class CachedInvokeStore {
 		this.start(entry);
 	}
 
-	invalidateEvent(eventName: string, refreshMounted = true): void {
+	invalidateEvent(
+		eventName: string,
+		refreshMounted = true,
+		immediateCommand: string | null = null,
+	): void {
 		for (const [key, entry] of this.entries) {
 			if (!entry.invalidationEvents.has(eventName)) continue;
 			entry.acceptedAt = Number.NEGATIVE_INFINITY;
 			entry.error = null;
 			if (refreshMounted && entry.subscribers.size > 0) {
 				this.pendingKeys.add(key);
+				if (
+					immediateCommand !== null &&
+					key.startsWith(`${JSON.stringify(immediateCommand)}:`)
+				) {
+					this.immediateKeys.add(key);
+					if (entry.inFlight === null) this.start(entry, false);
+				}
 			}
 		}
-		if (refreshMounted) this.scheduleFanout();
+		if (refreshMounted) {
+			this.cancelUnusedFanoutTimer();
+			this.scheduleFanout();
+		}
 	}
 
 	refreshStaleSubscribers(): void {
@@ -265,7 +281,7 @@ export class CachedInvokeStore {
 		for (const subscriber of entry.subscribers) subscriber(notification);
 	}
 
-	private start<T>(entry: CachedInvokeEntry<T>): boolean {
+	private start<T>(entry: CachedInvokeEntry<T>, countsAsFanout = true): boolean {
 		const request = entry.request;
 		if (
 			request === null ||
@@ -276,7 +292,8 @@ export class CachedInvokeStore {
 		}
 
 		this.pendingKeys.delete(entry.key);
-		this.lastFanoutStartedAt = Date.now();
+		this.immediateKeys.delete(entry.key);
+		if (countsAsFanout) this.lastFanoutStartedAt = Date.now();
 		entry.error = null;
 		entry.generation += 1;
 		const generation = entry.generation;
@@ -303,7 +320,11 @@ export class CachedInvokeStore {
 				if (entry.generation !== generation) return;
 				entry.inFlight = null;
 				this.notify(entry, entry.error === null ? "accepted" : "error");
-				if (this.pendingKeys.has(entry.key)) this.scheduleFanout();
+				if (this.immediateKeys.has(entry.key)) {
+					this.start(entry, false);
+				} else if (this.pendingKeys.has(entry.key)) {
+					this.scheduleFanout();
+				}
 			});
 		entry.inFlight = inFlight;
 		this.notify(entry, "loading");

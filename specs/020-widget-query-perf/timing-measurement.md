@@ -891,7 +891,7 @@ store. It mounts two command-and-range keys, emits an invalidation every second,
 then removes one subscriber while the next shared fan-out is pending.
 
 ```text
-npm run test:cached-invoke
+node --test scripts/cached-invoke.test.mjs
 [query-window] [{"atMs":0,"command":"get_token_stats","args":{"range":"6h"}},{"atMs":0,"command":"get_project_breakdown","args":{"range":"6h"}},{"atMs":5000,"command":"get_token_stats","args":{"range":"6h"}},{"atMs":5000,"command":"get_project_breakdown","args":{"range":"6h"}},{"atMs":10000,"command":"get_token_stats","args":{"range":"6h"}},{"atMs":10000,"command":"get_project_breakdown","args":{"range":"6h"}},{"atMs":15000,"command":"get_project_breakdown","args":{"range":"6h"}}]
 ```
 

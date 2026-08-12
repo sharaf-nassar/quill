@@ -1,7 +1,7 @@
-// WindowResizeHandles — the resize border of a decorationless window.
+// WindowResizeHandles — the Linux/Windows resize border.
 //
-// Every window in the app paints its own surface on a `decorations: false`
-// window, so the window manager has no native frame to hit-test.
+// Linux and Windows paint every app window on `decorations: false`, so the
+// window manager has no native frame to hit-test. macOS uses AppKit instead.
 // `resizable: true` is inert on its own; these eight zones are the entire
 // resize affordance. Each one hands the gesture straight to the compositor
 // through `startResizeDragging`, so the drag is native — React never sees a
@@ -18,6 +18,7 @@
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { MouseEventHandler } from "react";
+import { IS_MACOS } from "../lib/windowChrome";
 
 /**
  * Which window's chrome the border geometry is tuned to. `widget` is the
@@ -73,6 +74,8 @@ function startResize(
 }
 
 function WindowResizeHandles({ variant = "widget" }: WindowResizeHandlesProps) {
+  if (IS_MACOS) return null;
+
   // The base class carries the widget geometry, so the main window renders
   // byte-identical markup to the single-window version; only `roomy` adds a
   // modifier that retunes the custom properties the zones read.

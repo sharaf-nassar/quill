@@ -24,7 +24,15 @@ An empty runtime source set must complete in one terminal shared-runner chunk an
 
 ## Runtime Backfill Chunk Resume
 
-A source larger than the row target must prepare outside the permit, commit compact state within the transaction deadline, resume by source-end bookmark, and preserve pruned authority exactly.
+A source larger than the row target must prepare outside the permit, commit atomically by source, resume by source-end bookmark, and preserve pruned authority exactly.
+
+## Runtime Backfill Atomic Deadline Overrun
+
+A source whose compact commit outlasts the advisory deadline must finish atomically, publish its bookmark with the full fold, and release the permit before another source.
+
+## Runtime Backfill Failed Startup Resume
+
+A later startup run must resume a durable failed status from its committed source bookmark and publish complete exact totals without a manual rebuild.
 
 ## Runtime Backfill Live Replacement Handoff
 
@@ -41,3 +49,7 @@ A source changed after off-permit preparation must fail revalidation and roll ba
 ## Hybrid Runtime Read And Indexed Open Tail
 
 Completed reads must match the time-invariant raw reference while seeking each active source's open tail through the provider-and-chain-leading timestamp index.
+
+## Observed Agent Runtime During Failed Backfill
+
+A successfully reconciled open child's source-local runtime must publish when global historical backfill has failed, while failed sources, lifetime aggregates, and agents without a retained chain remain unknown.

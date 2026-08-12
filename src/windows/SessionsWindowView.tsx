@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from "react";
+import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import SearchBar from "../components/sessions/SearchBar";
 import FilterBar from "../components/sessions/FilterBar";
@@ -56,6 +56,7 @@ function SessionsWindowView() {
 	const [loading, setLoading] = useState(false);
 	const [page, setPage] = useState(0);
 	const [query, setQuery] = useState("");
+	const searchRequestRef = useRef(0);
 	const hitKey = useCallback(
 		(hit: Pick<SearchHit, "provider" | "message_id">) =>
 			`${hit.provider}:${hit.message_id}`,
@@ -100,58 +101,71 @@ function SessionsWindowView() {
 		};
 	}, []);
 
-	const handleSearch = useCallback(
-		async (value: string) => {
-			setQuery(value);
-			setPage(0);
-			setSelectedHit(null);
-			if (!value.trim()) {
+	const runSearch = useCallback(
+		async (
+			nextQuery: string,
+			nextFilters: SearchFilters,
+			nextSort: SortMode,
+			nextPage: number,
+		) => {
+			const requestId = ++searchRequestRef.current;
+			if (!nextQuery.trim()) {
 				setResults([]);
 				setTotalHits(0);
 				setQueryTimeMs(0);
+				setLoading(false);
 				return;
 			}
+
 			setLoading(true);
 			try {
 				const res = await invoke<SearchResults>("search_sessions", {
-					query: value,
-					filters,
-					sortBy,
-					page: 0,
+					query: nextQuery,
+					filters: nextFilters,
+					sortBy: nextSort,
+					page: nextPage,
 					pageSize: PAGE_SIZE,
 				});
-				setResults(res.hits);
+				if (searchRequestRef.current !== requestId) return;
+				setResults((previous) =>
+					nextPage === 0 ? res.hits : [...previous, ...res.hits],
+				);
 				setTotalHits(res.total_hits);
 				setQueryTimeMs(res.query_time_ms);
+				setPage(nextPage);
 			} catch {
-				setResults([]);
-				setTotalHits(0);
+				if (searchRequestRef.current === requestId && nextPage === 0) {
+					setResults([]);
+					setTotalHits(0);
+				}
 			} finally {
-				setLoading(false);
+				if (searchRequestRef.current === requestId) setLoading(false);
 			}
 		},
-		[filters, sortBy],
+		[],
 	);
 
-	const handleLoadMore = useCallback(async () => {
+	useEffect(
+		() => () => {
+			searchRequestRef.current += 1;
+		},
+		[],
+	);
+
+	const handleSearch = useCallback(
+		(value: string) => {
+			setQuery(value);
+			setPage(0);
+			setSelectedHit(null);
+			void runSearch(value, filters, sortBy, 0);
+		},
+		[filters, runSearch, sortBy],
+	);
+
+	const handleLoadMore = useCallback(() => {
 		const nextPage = page + 1;
-		setLoading(true);
-		try {
-			const res = await invoke<SearchResults>("search_sessions", {
-				query,
-				filters,
-				sortBy,
-				page: nextPage,
-				pageSize: PAGE_SIZE,
-			});
-			setResults((prev) => [...prev, ...res.hits]);
-			setPage(nextPage);
-		} catch {
-			/* no-op */
-		} finally {
-			setLoading(false);
-		}
-	}, [query, filters, sortBy, page]);
+		void runSearch(query, filters, sortBy, nextPage);
+	}, [filters, page, query, runSearch, sortBy]);
 
 	const handleSelect = useCallback(
 		async (hit: SearchHit) => {
@@ -180,27 +194,10 @@ function SessionsWindowView() {
 			if (query.trim()) {
 				setPage(0);
 				setSelectedHit(null);
-				setLoading(true);
-				invoke<SearchResults>("search_sessions", {
-					query,
-					filters: newFilters,
-					sortBy,
-					page: 0,
-					pageSize: PAGE_SIZE,
-				})
-					.then((res) => {
-						setResults(res.hits);
-						setTotalHits(res.total_hits);
-						setQueryTimeMs(res.query_time_ms);
-					})
-					.catch(() => {
-						setResults([]);
-						setTotalHits(0);
-					})
-					.finally(() => setLoading(false));
+				void runSearch(query, newFilters, sortBy, 0);
 			}
 		},
-		[query, sortBy],
+		[query, runSearch, sortBy],
 	);
 
 	const handleSortChange = useCallback(
@@ -209,27 +206,10 @@ function SessionsWindowView() {
 			if (query.trim()) {
 				setPage(0);
 				setSelectedHit(null);
-				setLoading(true);
-				invoke<SearchResults>("search_sessions", {
-					query,
-					filters,
-					sortBy: newSort,
-					page: 0,
-					pageSize: PAGE_SIZE,
-				})
-					.then((res) => {
-						setResults(res.hits);
-						setTotalHits(res.total_hits);
-						setQueryTimeMs(res.query_time_ms);
-					})
-					.catch(() => {
-						setResults([]);
-						setTotalHits(0);
-					})
-					.finally(() => setLoading(false));
+				void runSearch(query, filters, newSort, 0);
 			}
 		},
-		[query, filters],
+		[filters, query, runSearch],
 	);
 
 	return (
@@ -254,10 +234,7 @@ function SessionsWindowView() {
 										Session index refresh failed. Results may be stale.
 									</div>
 								)}
-								<RetentionBanner
-									cutoff={retentionCutoff}
-									surface="session-search"
-								/>
+								<RetentionBanner cutoff={retentionCutoff} />
 								{query.trim() && !loading && (
 									<div className="sessions-results-header">
 										{totalHits} result{totalHits !== 1 ? "s" : ""} in {queryTimeMs}ms

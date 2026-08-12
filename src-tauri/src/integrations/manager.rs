@@ -93,7 +93,7 @@ pub fn confirm_enable_with_key(
 
     match provider {
         IntegrationProvider::Claude => {
-            crate::claude_setup::install_with_manifest(app, features)?;
+            crate::claude_setup::install(app, features)?;
         }
         IntegrationProvider::Codex => {
             codex::install(app, features)?;
@@ -511,13 +511,13 @@ fn repair_provider(
             if crate::claude_setup::deployment_is_current(app, features) {
                 return Ok(());
             }
-            crate::claude_setup::install_with_manifest(app, features).map(|_| ())
+            crate::claude_setup::install(app, features)
         }
         IntegrationProvider::Codex => {
             if codex::deployment_is_current(app, features) {
                 return Ok(());
             }
-            codex::install(app, features).map(|_| ())
+            codex::install(app, features)
         }
         IntegrationProvider::MiniMax => Ok(()),
     }
@@ -535,10 +535,8 @@ fn sync_features_for_enabled_providers(
 
         let verified_at = Utc::now().to_rfc3339();
         let result = match status.provider {
-            IntegrationProvider::Claude => {
-                crate::claude_setup::install_with_manifest(app, features).map(|_| ())
-            }
-            IntegrationProvider::Codex => codex::install(app, features).map(|_| ()),
+            IntegrationProvider::Claude => crate::claude_setup::install(app, features),
+            IntegrationProvider::Codex => codex::install(app, features),
             IntegrationProvider::MiniMax => Ok(()),
         };
 

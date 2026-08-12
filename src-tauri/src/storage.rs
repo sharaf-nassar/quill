@@ -25,6 +25,7 @@ use crate::retention::{
     parse_audit_record_setting, parse_watermark_setting, parse_window_days_setting,
     retention_insert_verdict, window_days_setting_value,
 };
+use crate::retention_engine::available_disk_space;
 use crate::rollup_backfill::{
     RollupBackfillChunk, RollupBackfillChunkBudget, RollupBackfillControls, RollupBackfillReport,
     RollupBackfillState, RollupBackfillTarget, RollupBackfillTerminal, run_rollup_backfill,
@@ -68,7 +69,6 @@ impl RetentionInsertFilterCounts {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TranscriptAnalyticsReplacement {
     Replaced(RetentionInsertFilterCounts),
@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 40;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 41;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -111,7 +111,6 @@ const MODEL_DATA_REVISION_SETTINGS_KEY: &str = "model_analytics.data_revision.v1
 const MODEL_SOURCE_PATH_UNIX_PREFIX: &str = "\0quill-source-path-unix-v1:";
 const MODEL_SOURCE_PATH_WINDOWS_PREFIX: &str = "\0quill-source-path-windows-v1:";
 const MODEL_SOURCE_PATH_UNICODE_PREFIX: &str = "\0quill-source-path-unicode-v1:";
-#[allow(dead_code)]
 const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
 
 // @lat: [[backend#Backend#Database#tool_detail payload carve-out]]
@@ -131,14 +130,11 @@ const OBSERVATION_RETENTION_FLOOR: &str = "-30 days";
 // @lat: [[backend#Database#Schema#Model Analytics Evidence#Analytics Cache Primitive]]
 /// Upper bound on how long an analytics result can survive when an ingest
 /// writer changes data without changing a source table's observed version.
-#[allow(dead_code)] // Command-specific cache maps are wired by follow-on work.
 pub(crate) const ANALYTICS_CACHE_TTL: Duration = Duration::from_secs(45);
-#[allow(dead_code)]
 const ANALYTICS_CACHE_BUCKET_SECS: i64 = 30;
 
 /// Identity for one cacheable analytics request. The bucket prevents a
 /// sliding `Utc::now()` range from being served past its next wall-clock step.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct CacheKey {
     command: &'static str,
@@ -147,7 +143,6 @@ pub(crate) struct CacheKey {
     time_bucket: i64,
 }
 
-#[allow(dead_code)]
 impl CacheKey {
     pub(crate) fn new(
         command: &'static str,
@@ -180,11 +175,9 @@ impl CacheKey {
 /// A max-only probe stays index-backed on the large append-only analytics
 /// tables. Deletes do not advance a high-water marker, so the TTL bounds how
 /// long a deleted row can remain reflected in a cached result.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TableVersions(BTreeMap<&'static str, TableVersion>);
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableVersion {
     high_water: i64,
@@ -192,7 +185,6 @@ struct TableVersion {
 
 /// A fixed, trusted source-table probe. `rowid` is suitable for append-only
 /// tables; a monotonic ingest column is used where that is the cheaper index.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CacheTable {
     RowId(&'static str),
@@ -202,7 +194,6 @@ pub(crate) enum CacheTable {
     },
 }
 
-#[allow(dead_code)]
 impl CacheTable {
     const fn table_name(self) -> &'static str {
         match self {
@@ -238,7 +229,6 @@ const MODEL_USAGE_OVERVIEW_CACHE_TABLES: [CacheTable; 4] = [
     ROLLUP_GENERATION_CACHE_TABLE,
 ];
 
-#[allow(dead_code)]
 impl TableVersions {
     fn read(conn: &Connection, tables: &[CacheTable]) -> Result<Self, String> {
         let mut versions = BTreeMap::new();
@@ -258,7 +248,6 @@ impl TableVersions {
 }
 
 /// One typed payload retained with the source-table state that produced it.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct CacheEntry<T> {
     payload: T,
@@ -270,7 +259,6 @@ pub(crate) struct CacheEntry<T> {
 ///
 /// Probe failures deliberately bypass the cache: callers receive a fresh
 /// result, and a stale payload is never served when SQLite cannot verify it.
-#[allow(dead_code)]
 pub(crate) fn get_or_compute<T, F>(
     cache: &Mutex<HashMap<CacheKey, CacheEntry<T>>>,
     key: CacheKey,
@@ -920,6 +908,37 @@ fn provider_scope_contains_json(provider: IntegrationProvider) -> String {
     format!("\"{}\"", provider.as_str())
 }
 
+const OPTIMIZATION_SUGGESTION_COLUMNS: &str = "id, run_id, project_path, provider_scope, action_type, target_file, reasoning, \
+     proposed_content, merge_sources, status, error, resolved_at, created_at, \
+     original_content, diff_summary, backup_data, group_id";
+
+fn decode_optimization_suggestion(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::models::OptimizationSuggestion> {
+    let merge_sources = row
+        .get::<_, Option<String>>(8)?
+        .and_then(|json| serde_json::from_str(&json).ok());
+    Ok(crate::models::OptimizationSuggestion {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        project_path: row.get(2)?,
+        provider_scope: parse_provider_scope(row.get(3)?),
+        action_type: row.get(4)?,
+        target_file: row.get(5)?,
+        reasoning: row.get(6)?,
+        proposed_content: row.get(7)?,
+        merge_sources,
+        status: row.get(9)?,
+        error: row.get(10)?,
+        resolved_at: row.get(11)?,
+        created_at: row.get(12)?,
+        original_content: row.get(13)?,
+        diff_summary: row.get(14)?,
+        backup_data: row.get(15)?,
+        group_id: row.get(16)?,
+    })
+}
+
 // Feature 005 US5 T058 (R-7.1 / H-6 / FR-024). Decode struct mirroring the
 // *serialized* shape of `cc_client::InferenceCallMetadata` (which serializes
 // with `skip_serializing_if` on several fields, so every field here is
@@ -1108,7 +1127,6 @@ fn inferred_rule_provider_scope(path: &std::path::Path) -> Vec<IntegrationProvid
     vec![IntegrationProvider::Claude]
 }
 
-#[allow(dead_code)]
 fn parse_rule_frontmatter(content: &str) -> (Option<String>, bool, String) {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
@@ -3274,12 +3292,6 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
                     rollup.last_turn_end_ms,
                 ],
             )?;
-            if budget.should_yield() {
-                return Err(runtime_backfill_sql_error(format!(
-                    "Runtime source {}/{} compact commit exceeded 250 ms",
-                    prepared.provider, prepared.source_key
-                )));
-            }
         }
         if let Some(open_turn_started_ms) = prepared.open_turn_started_ms {
             tx.execute(
@@ -3306,12 +3318,6 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
                 "Runtime rollup metadata singleton is missing",
             ));
         }
-        if budget.should_yield() {
-            return Err(runtime_backfill_sql_error(format!(
-                "Runtime source {}/{} compact commit exceeded 250 ms",
-                prepared.provider, prepared.source_key
-            )));
-        }
         let completed = !tx.query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM session_events
@@ -3320,6 +3326,14 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
             params![prepared.last_rowid],
             |row| row.get::<_, bool>(0),
         )?;
+        if budget.should_yield() {
+            log::warn!(
+                "Runtime source {}/{} compact commit exceeded the advisory deadline; \
+                 finishing its atomic fold before yielding",
+                prepared.provider,
+                prepared.source_key
+            );
+        }
         Ok(RollupBackfillChunk {
             rows_processed: prepared.row_count,
             done_through: Some(prepared.last_rowid),
@@ -4735,34 +4749,6 @@ fn skipped_database_compaction(
         bytes_before,
         bytes_after: bytes_before,
     }
-}
-
-#[cfg(unix)]
-fn available_disk_space(path: &Path) -> Result<u64, String> {
-    use std::ffi::CString;
-
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "Database directory contains an unsupported NUL byte".to_string())?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `stats` points to writable storage.
-    let result = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
-    if result != 0 {
-        return Err(format!(
-            "Read free disk space for database compaction: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let stats = unsafe { stats.assume_init() };
-    #[allow(clippy::useless_conversion)] // `f_bavail` is u32 on Apple, u64 on Linux.
-    let available_blocks = u64::from(stats.f_bavail);
-    available_blocks
-        .checked_mul(stats.f_frsize)
-        .ok_or_else(|| "Free disk space value overflowed during compaction preflight".to_string())
-}
-
-#[cfg(not(unix))]
-fn available_disk_space(_path: &Path) -> Result<u64, String> {
-    Err("Database compaction preflight is unavailable on this platform".to_string())
 }
 
 fn transcript_analytics_generation_key(provider: IntegrationProvider, root: &str) -> String {
@@ -7883,6 +7869,32 @@ impl Storage {
                 .map_err(|e| format!("Migration 40 commit: {e}"))?;
         }
 
+        // Migration 41 replays active Codex transcripts through the modern
+        // response-item message extractor without discarding last-good rows.
+        if current_version < 41 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 41 transaction: {e}"))?;
+            tx.execute(
+                "UPDATE transcript_analytics_sources
+                 SET processing_status = 'stale'
+                 WHERE provider = 'codex'
+                   AND processing_status = 'ok'
+                   AND suppressed_sha256 IS NULL",
+                [],
+            )
+            .map_err(|e| format!("Migration 41 (rearm Codex analytics): {e}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params!["codex_agent_identity_reingest_pending", "1"],
+            )
+            .map_err(|e| format!("Migration 41 (rearm Codex search): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (41)", [])
+                .map_err(|e| format!("Failed to record migration 41: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 41 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -8342,7 +8354,6 @@ impl Storage {
     }
 
     /// Read the migration-28 singleton without changing backfill state.
-    #[allow(dead_code)]
     pub fn get_model_backfill_status(&self) -> Result<ModelBackfillStatus, String> {
         let conn = self.conn.lock().unwrap();
         read_model_backfill_status(&conn)
@@ -13360,10 +13371,10 @@ impl Storage {
 
     /// Project lifetime runtime onto Sessions rows and their observed native
     /// agents. Only the listed session families are read. Lifetime totals stay
-    /// unknown until the runtime backfill is complete; root current-turn
-    /// evidence may still come from an indexed open tail. Live roots and
-    /// observed-open sidechains materialize through one query clock under the
-    /// 5m/6h caps.
+    /// unknown until the runtime backfill is complete; root current-turn and
+    /// exact observed-agent evidence may still come from reconciled indexed
+    /// open tails. Live roots and observed-open sidechains materialize through
+    /// one query clock under the 5m/6h caps.
     pub(crate) fn populate_session_runtime_evidence(
         &self,
         rows: &mut [SessionBreakdown],
@@ -13376,6 +13387,7 @@ impl Storage {
         struct ChainRuntime {
             finalized_secs: f64,
             is_sidechain: bool,
+            source_ok: bool,
             open_tail: Option<(i64, i64, String)>,
         }
         let now = query_now();
@@ -13409,7 +13421,8 @@ impl Storage {
              ), sources AS MATERIALIZED (
                  SELECT candidates.provider, candidates.session_id,
                         candidates.hostname, source.source_key,
-                        source.chain_id, source.is_sidechain
+                        source.chain_id, source.is_sidechain,
+                        source.processing_status = 'ok' AS source_ok
                  FROM candidates
                  JOIN transcript_analytics_sources AS source
                       INDEXED BY idx_tas_session
@@ -13420,7 +13433,7 @@ impl Storage {
                    AND {ACTIVE_RUNTIME_SOURCE_PREDICATE}
              )
              SELECT sources.provider, sources.session_id, sources.chain_id,
-                    sources.hostname, sources.is_sidechain,
+                    sources.hostname, sources.is_sidechain, sources.source_ok,
                     COALESCE(SUM(rollup.runtime_secs), 0),
                     state.open_turn_started_ms,
                     CASE WHEN state.open_turn_started_ms IS NULL THEN NULL ELSE (
@@ -13443,7 +13456,7 @@ impl Storage {
                ON state.provider = sources.provider
               AND state.source_key = sources.source_key
              GROUP BY sources.provider, sources.session_id, sources.chain_id,
-                      sources.hostname, sources.is_sidechain,
+                      sources.hostname, sources.is_sidechain, sources.source_ok,
                       sources.source_key, state.open_turn_started_ms,
                       state.finalized_through_rowid"
         );
@@ -13459,9 +13472,10 @@ impl Storage {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, bool>(4)?,
-                        row.get::<_, f64>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, f64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 })
                 .map_err(|error| format!("Query session lifetime runtime: {error}"))?;
@@ -13472,6 +13486,7 @@ impl Storage {
                     chain_id,
                     hostname,
                     is_sidechain,
+                    source_ok,
                     finalized_secs,
                     open_turn_started_ms,
                     packed_last_event,
@@ -13494,6 +13509,7 @@ impl Storage {
                     ChainRuntime {
                         finalized_secs: finalized_secs.max(0.0),
                         is_sidechain,
+                        source_ok,
                         open_tail,
                     },
                 );
@@ -13602,7 +13618,6 @@ impl Storage {
             row.current_turn_runtime_secs = current_root_turn.map(|(_, seconds, _)| seconds);
             row.current_turn_runtime_active =
                 current_root_turn.is_some_and(|(_, _, runtime_active)| runtime_active);
-            row.runtime_as_of_ms = (covered || current_root_turn.is_some()).then_some(now_ms);
             row.active_runtime_rate = session_rate;
             if let Some(agents) = &mut row.observed_agents {
                 for agent in agents {
@@ -13612,7 +13627,7 @@ impl Storage {
                         agent.agent_id.clone(),
                         row.hostname.clone(),
                     ));
-                    if let Some(runtime) = runtime.filter(|_| runtime_complete) {
+                    if let Some(runtime) = runtime.filter(|runtime| runtime.source_ok) {
                         let through_ms = if session_live {
                             Some(now_ms)
                         } else {
@@ -13627,6 +13642,13 @@ impl Storage {
                     }
                 }
             }
+            row.runtime_as_of_ms = (covered
+                || current_root_turn.is_some()
+                || row
+                    .observed_agents
+                    .as_ref()
+                    .is_some_and(|agents| agents.iter().any(|agent| agent.runtime_secs.is_some())))
+            .then_some(now_ms);
         }
         Ok(())
     }
@@ -13833,11 +13855,6 @@ impl Storage {
 /// The value grammars, the monotonic rule and the tolerance policy live in
 /// that module; these methods only move the three `settings` rows through it.
 ///
-/// `dead_code` is allowed for the block because the primitive is deliberately
-/// shipped ahead of its consumers: the insert-time watermark filter, the
-/// chunked delete engine and the four Tauri commands are separate items that
-/// build on it, and pinning the invariants at this layer is the point.
-#[allow(dead_code)]
 impl Storage {
     /// Filesystem path of the database this handle owns.
     ///
@@ -13957,7 +13974,6 @@ impl Storage {
 }
 
 impl Storage {
-    #[allow(dead_code)]
     pub fn get_indicator_primary_provider(&self) -> Result<Option<IntegrationProvider>, String> {
         let Some(raw) = self.get_setting(INDICATOR_PRIMARY_PROVIDER_KEY)? else {
             return Ok(None);
@@ -13969,7 +13985,6 @@ impl Storage {
         }
     }
 
-    #[allow(dead_code)]
     pub fn set_indicator_primary_provider(
         &self,
         provider: Option<IntegrationProvider>,
@@ -15509,8 +15524,7 @@ impl Storage {
     /// so a "this rule was bad" judgment is sticky across re-extraction.
     /// `feedback` is validated to the closed set. `note` is maintainer-only
     /// metadata persisted verbatim and is NEVER read back into any inference
-    /// prompt. The Tauri IPC command is a separate later task.
-    #[allow(dead_code)] // IPC wiring (T046-IPC) is a later task
+    /// prompt.
     pub fn submit_rule_feedback(
         &self,
         name: &str,
@@ -16159,7 +16173,6 @@ impl Storage {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn reconcile_learned_rules(&self) -> Result<bool, String> {
         use sha2::{Digest, Sha256};
 
@@ -17294,7 +17307,6 @@ impl Storage {
 
     /// Create a new optimization run record. Returns the run ID.
     /// Uses atomic INSERT...WHERE NOT EXISTS to prevent TOCTOU race.
-    #[allow(dead_code)]
     pub fn create_optimization_run(
         &self,
         project_path: &str,
@@ -17323,7 +17335,7 @@ impl Storage {
     }
 
     /// Update an optimization run with results.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn update_optimization_run(
         &self,
         run_id: i64,
@@ -17356,7 +17368,6 @@ impl Storage {
     }
 
     /// Get optimization runs for a project.
-    #[allow(dead_code)]
     pub fn get_optimization_runs(
         &self,
         project_path: &str,
@@ -17415,7 +17426,7 @@ impl Storage {
     }
 
     /// Store an optimization suggestion.
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn store_optimization_suggestion(
         &self,
         run_id: i64,
@@ -17449,7 +17460,6 @@ impl Storage {
     }
 
     /// Get optimization suggestions for a project with pagination, optionally filtered by status.
-    #[allow(dead_code)]
     pub fn get_optimization_suggestions(
         &self,
         project_path: &str,
@@ -17460,11 +17470,10 @@ impl Storage {
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
         let conn = self.conn.lock().unwrap();
 
-        let mut query = "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
-                                proposed_content, merge_sources, status, error, resolved_at, created_at,
-                                original_content, diff_summary, backup_data, group_id
-                         FROM optimization_suggestions WHERE project_path = ?1"
-            .to_string();
+        let mut query = format!(
+            "SELECT {OPTIMIZATION_SUGGESTION_COLUMNS} \
+             FROM optimization_suggestions WHERE project_path = ?1"
+        );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>];
         let mut next_param = 2;
@@ -17490,37 +17499,16 @@ impl Storage {
             .map_err(|e| format!("Failed to prepare suggestions query: {e}"))?;
 
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let merge_sources_json: Option<String> = row.get(8)?;
-                let merge_sources: Option<Vec<String>> =
-                    merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
-                Ok(crate::models::OptimizationSuggestion {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    project_path: row.get(2)?,
-                    provider_scope: parse_provider_scope(row.get(3)?),
-                    action_type: row.get(4)?,
-                    target_file: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    proposed_content: row.get(7)?,
-                    merge_sources,
-                    status: row.get(9)?,
-                    error: row.get(10)?,
-                    resolved_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    original_content: row.get(13)?,
-                    diff_summary: row.get(14)?,
-                    backup_data: row.get(15)?,
-                    group_id: row.get(16)?,
-                })
-            })
+            .query_map(
+                rusqlite::params_from_iter(params.iter()),
+                decode_optimization_suggestion,
+            )
             .map_err(|e| format!("Failed to query suggestions: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect suggestions: {e}"))
     }
 
     /// Get denied suggestions for a project (for denial context in optimizer prompt).
-    #[allow(dead_code)]
     pub fn get_denied_suggestions(
         &self,
         project_path: &str,
@@ -17528,15 +17516,10 @@ impl Storage {
         limit: i64,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
         let conn = self.conn.lock().unwrap();
-        let (query, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
+        let (where_clause, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = match provider {
             Some(provider) => (
-                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
-                        proposed_content, merge_sources, status, error, resolved_at, created_at,
-                        original_content, diff_summary, backup_data, group_id
-                 FROM optimization_suggestions
-                 WHERE project_path = ?1 AND status = 'denied' AND instr(provider_scope, ?2) > 0
-                 ORDER BY resolved_at DESC LIMIT ?3"
-                    .to_string(),
+                "project_path = ?1 AND status = 'denied' AND instr(provider_scope, ?2) > 0 \
+                 ORDER BY resolved_at DESC LIMIT ?3",
                 vec![
                     Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(provider_scope_contains_json(provider)),
@@ -17544,54 +17527,32 @@ impl Storage {
                 ],
             ),
             None => (
-                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
-                        proposed_content, merge_sources, status, error, resolved_at, created_at,
-                        original_content, diff_summary, backup_data, group_id
-                 FROM optimization_suggestions
-                 WHERE project_path = ?1 AND status = 'denied'
-                 ORDER BY resolved_at DESC LIMIT ?2"
-                    .to_string(),
+                "project_path = ?1 AND status = 'denied' \
+                 ORDER BY resolved_at DESC LIMIT ?2",
                 vec![
                     Box::new(project_path.to_string()) as Box<dyn rusqlite::types::ToSql>,
                     Box::new(limit),
                 ],
             ),
         };
+        let query = format!(
+            "SELECT {OPTIMIZATION_SUGGESTION_COLUMNS} \
+             FROM optimization_suggestions WHERE {where_clause}"
+        );
         let mut stmt = conn
             .prepare_cached(&query)
             .map_err(|e| format!("Failed to prepare denied suggestions query: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let merge_sources_json: Option<String> = row.get(8)?;
-                let merge_sources: Option<Vec<String>> =
-                    merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
-                Ok(crate::models::OptimizationSuggestion {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    project_path: row.get(2)?,
-                    provider_scope: parse_provider_scope(row.get(3)?),
-                    action_type: row.get(4)?,
-                    target_file: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    proposed_content: row.get(7)?,
-                    merge_sources,
-                    status: row.get(9)?,
-                    error: row.get(10)?,
-                    resolved_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    original_content: row.get(13)?,
-                    diff_summary: row.get(14)?,
-                    backup_data: row.get(15)?,
-                    group_id: row.get(16)?,
-                })
-            })
+            .query_map(
+                rusqlite::params_from_iter(params.iter()),
+                decode_optimization_suggestion,
+            )
             .map_err(|e| format!("Failed to query denied suggestions: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect denied suggestions: {e}"))
     }
 
     /// Update a suggestion status (approve/deny).
-    #[allow(dead_code)]
     pub fn update_suggestion_status(
         &self,
         suggestion_id: i64,
@@ -17609,48 +17570,23 @@ impl Storage {
     }
 
     /// Get a single suggestion by ID.
-    #[allow(dead_code)]
     pub fn get_suggestion_by_id(
         &self,
         suggestion_id: i64,
     ) -> Result<crate::models::OptimizationSuggestion, String> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
-                    proposed_content, merge_sources, status, error, resolved_at, created_at,
-                    original_content, diff_summary, backup_data, group_id
-             FROM optimization_suggestions WHERE id = ?1",
+            &format!(
+                "SELECT {OPTIMIZATION_SUGGESTION_COLUMNS} \
+                 FROM optimization_suggestions WHERE id = ?1"
+            ),
             rusqlite::params![suggestion_id],
-            |row| {
-                let merge_sources_json: Option<String> = row.get(8)?;
-                let merge_sources: Option<Vec<String>> =
-                    merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
-                Ok(crate::models::OptimizationSuggestion {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    project_path: row.get(2)?,
-                    provider_scope: parse_provider_scope(row.get(3)?),
-                    action_type: row.get(4)?,
-                    target_file: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    proposed_content: row.get(7)?,
-                    merge_sources,
-                    status: row.get(9)?,
-                    error: row.get(10)?,
-                    resolved_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    original_content: row.get(13)?,
-                    diff_summary: row.get(14)?,
-                    backup_data: row.get(15)?,
-                    group_id: row.get(16)?,
-                })
-            },
+            decode_optimization_suggestion,
         )
         .map_err(|e| format!("Suggestion not found: {e}"))
     }
 
     /// Upsert a memory file record (scan tracking).
-    #[allow(dead_code)]
     pub fn upsert_memory_file(
         &self,
         project_path: &str,
@@ -17670,7 +17606,6 @@ impl Storage {
     }
 
     /// Get previously recorded memory file hashes for change detection.
-    #[allow(dead_code)]
     pub fn get_memory_file_hashes(
         &self,
         project_path: &str,
@@ -17694,7 +17629,6 @@ impl Storage {
     /// - Expire pending/undone suggestions older than 14 days (set status to 'expired')
     /// - Delete denied suggestions older than 90 days
     /// - Clear original_content/backup_data from approved suggestions older than 30 days
-    #[allow(dead_code)]
     pub fn cleanup_stale_suggestions(&self, project_path: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let now = Utc::now();
@@ -17731,7 +17665,6 @@ impl Storage {
     }
 
     /// Check if there's already a pending suggestion with the same action type and target file.
-    #[allow(dead_code)]
     pub fn has_duplicate_pending(
         &self,
         project_path: &str,
@@ -17760,7 +17693,6 @@ impl Storage {
     }
 
     /// Set group_id for a suggestion.
-    #[allow(dead_code)]
     pub fn set_suggestion_group_id(
         &self,
         suggestion_id: i64,
@@ -17776,46 +17708,21 @@ impl Storage {
     }
 
     /// Get all pending suggestions in a group.
-    #[allow(dead_code)]
     pub fn get_suggestions_by_group(
         &self,
         group_id: &str,
     ) -> Result<Vec<crate::models::OptimizationSuggestion>, String> {
         let conn = self.conn.lock().unwrap();
+        let query = format!(
+            "SELECT {OPTIMIZATION_SUGGESTION_COLUMNS} \
+             FROM optimization_suggestions WHERE group_id = ?1 \
+             ORDER BY created_at ASC"
+        );
         let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, run_id, project_path, provider_scope, action_type, target_file, reasoning,
-                        proposed_content, merge_sources, status, error, resolved_at, created_at,
-                        original_content, diff_summary, backup_data, group_id
-                 FROM optimization_suggestions WHERE group_id = ?1
-                 ORDER BY created_at ASC",
-            )
+            .prepare_cached(&query)
             .map_err(|e| format!("Failed to prepare group suggestions query: {e}"))?;
         let rows = stmt
-            .query_map(rusqlite::params![group_id], |row| {
-                let merge_sources_json: Option<String> = row.get(8)?;
-                let merge_sources: Option<Vec<String>> =
-                    merge_sources_json.and_then(|j| serde_json::from_str(&j).ok());
-                Ok(crate::models::OptimizationSuggestion {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    project_path: row.get(2)?,
-                    provider_scope: parse_provider_scope(row.get(3)?),
-                    action_type: row.get(4)?,
-                    target_file: row.get(5)?,
-                    reasoning: row.get(6)?,
-                    proposed_content: row.get(7)?,
-                    merge_sources,
-                    status: row.get(9)?,
-                    error: row.get(10)?,
-                    resolved_at: row.get(11)?,
-                    created_at: row.get(12)?,
-                    original_content: row.get(13)?,
-                    diff_summary: row.get(14)?,
-                    backup_data: row.get(15)?,
-                    group_id: row.get(16)?,
-                })
-            })
+            .query_map(rusqlite::params![group_id], decode_optimization_suggestion)
             .map_err(|e| format!("Failed to query group suggestions: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect group suggestions: {e}"))
@@ -27056,7 +26963,7 @@ mod tests {
         {
             let conn = storage.conn.lock().unwrap();
             conn.execute_batch(
-                "DELETE FROM schema_version WHERE version = 40;
+                "DELETE FROM schema_version WHERE version >= 40;
                  ALTER TABLE context_savings_events ADD COLUMN snapshot_ref TEXT;
                  INSERT INTO context_savings_events (
                      event_id, schema_version, provider, hostname, timestamp,
@@ -27141,6 +27048,115 @@ mod tests {
             ),
             1,
             "migration 40 must not run twice"
+        );
+        drop(conn);
+        clear_env();
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Migration 41 Codex Replay Scope]]
+    #[test]
+    #[serial]
+    fn migration_41_rearms_only_active_codex_transcripts() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "DELETE FROM settings
+                     WHERE key = 'codex_agent_identity_reingest_pending';
+                 DELETE FROM schema_version WHERE version >= 41;
+                 INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     hostname, mtime_ns, size_bytes, content_sha256,
+                     seen_generation, processing_status, suppressed_sha256
+                 ) VALUES
+                     ('codex', 'codex-ok', 'codex-root', '/codex-ok',
+                      'codex-ok', 'codex-ok', 'codex-ok', 'host-a',
+                      101, 201, 'sha-ok', 1, 'ok', NULL),
+                     ('codex', 'codex-suppressed', 'codex-root',
+                      '/codex-suppressed', 'codex-suppressed',
+                      'codex-suppressed', 'codex-suppressed', 'host-a',
+                      102, 202, 'sha-suppressed', 1, 'suppressed',
+                      'sha-suppressed'),
+                     ('codex', 'codex-failed', 'codex-root', '/codex-failed',
+                      'codex-failed', 'codex-failed', 'codex-failed', 'host-a',
+                      103, 203, 'sha-failed', 1, 'failed', NULL),
+                     ('claude', 'claude-ok', 'claude-root', '/claude-ok',
+                      'claude-ok', 'claude-ok', 'claude-ok', 'host-a',
+                      104, 204, 'sha-claude', 1, 'ok', NULL);
+                 INSERT INTO response_times (
+                     provider, source_key, session_id, chain_id, timestamp,
+                     response_secs, is_sidechain
+                 ) VALUES
+                     ('codex', 'codex-ok', 'codex-ok', 'codex-ok',
+                      '2026-01-01T00:00:01Z', 1.0, 0),
+                     ('claude', 'claude-ok', 'claude-ok', 'claude-ok',
+                      '2026-01-01T00:00:02Z', 1.0, 0);",
+            )
+            .expect("prepare migration 41 fixture");
+        }
+        drop(storage);
+
+        let migrated = init_storage_in(&dir);
+        let conn = migrated.conn.lock().unwrap();
+        let source = |key: &str| {
+            conn.query_row(
+                "SELECT processing_status, mtime_ns, size_bytes, content_sha256
+                 FROM transcript_analytics_sources WHERE source_key = ?1",
+                params![key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .expect("read migrated source")
+        };
+        assert_eq!(
+            source("codex-ok"),
+            ("stale".to_string(), 101, 201, "sha-ok".to_string())
+        );
+        assert_eq!(source("codex-suppressed").0, "suppressed");
+        assert_eq!(source("codex-failed").0, "failed");
+        assert_eq!(source("claude-ok").0, "ok");
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM response_times"),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM settings
+                 WHERE key = 'codex_agent_identity_reingest_pending'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read Codex search replay marker"),
+            "1"
+        );
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM schema_version WHERE version = 41"
+            ),
+            1
+        );
+        drop(conn);
+        drop(migrated);
+
+        let reopened = init_storage_in(&dir);
+        let conn = reopened.conn.lock().unwrap();
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM schema_version WHERE version = 41"
+            ),
+            1,
+            "migration 41 must not run twice"
         );
         drop(conn);
         clear_env();
@@ -28125,6 +28141,128 @@ mod tests {
                 .expect("seed owned chain"),
             TranscriptAnalyticsReplacement::Replaced(RetentionInsertFilterCounts::default())
         );
+    }
+
+    /// A reconciled child's own rollup and open-tail state are complete for
+    /// that source even when an unrelated historical backfill has failed.
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Observed Agent Runtime During Failed Backfill]]
+    #[test]
+    #[serial]
+    fn observed_agent_runtime_uses_reconciled_source_during_failed_backfill() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+            .expect("runtime base")
+            .with_timezone(&Utc);
+        let pinned_now = base + chrono::Duration::seconds(60);
+        seed_owned_chain(
+            &storage,
+            &OwnedChainSpec {
+                source_key: "source-open-agent",
+                session_id: "session-open-agent",
+                chain_id: "agent-open",
+                parent_chain_id: Some("session-open-agent"),
+                is_sidechain: true,
+            },
+            &[(
+                base.to_rfc3339(),
+                crate::sessions::SessionEventKind::UserText,
+            )],
+        );
+        seed_owned_chain(
+            &storage,
+            &OwnedChainSpec {
+                source_key: "source-failed-agent",
+                session_id: "session-open-agent",
+                chain_id: "agent-failed",
+                parent_chain_id: Some("session-open-agent"),
+                is_sidechain: true,
+            },
+            &[(
+                base.to_rfc3339(),
+                crate::sessions::SessionEventKind::UserText,
+            )],
+        );
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "UPDATE rollup_meta
+                    SET runtime_backfill_status = 'failed'
+                  WHERE id = 1;
+                 UPDATE transcript_analytics_sources
+                    SET processing_status = 'failed'
+                  WHERE provider = 'claude'
+                    AND source_key = 'source-failed-agent';",
+            )
+            .expect("mark unrelated historical backfill failed");
+
+        let mut rows = [SessionBreakdown {
+            provider: "claude".to_string(),
+            session_id: "session-open-agent".to_string(),
+            hostname: "fixture-host".to_string(),
+            total_tokens: 0,
+            turn_count: 0,
+            first_seen: base.to_rfc3339(),
+            last_active: pinned_now.to_rfc3339(),
+            ended_at: None,
+            project: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: Some(vec![
+                crate::models::ObservedSessionAgent {
+                    agent_id: "agent-open".to_string(),
+                    model_id: None,
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+                crate::models::ObservedSessionAgent {
+                    agent_id: "agent-failed".to_string(),
+                    model_id: None,
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+                crate::models::ObservedSessionAgent {
+                    agent_id: "agent-absent".to_string(),
+                    model_id: None,
+                    agent_type: None,
+                    runtime_secs: None,
+                    runtime_active: false,
+                },
+            ]),
+            observed_only: false,
+        }];
+
+        with_pinned_query_now(pinned_now, || {
+            storage
+                .populate_session_runtime_evidence(&mut rows)
+                .expect("project source-local agent runtime")
+        });
+
+        let row = &rows[0];
+        assert_eq!(row.active_runtime_secs, None);
+        assert_eq!(row.agent_count, None);
+        assert_eq!(row.agent_runtime_secs, None);
+        assert_eq!(row.current_turn_runtime_secs, None);
+        assert_eq!(row.runtime_as_of_ms, Some(pinned_now.timestamp_millis()));
+        let agents = row.observed_agents.as_ref().expect("observed agents");
+        assert_eq!(agents[0].runtime_secs, Some(60.0));
+        assert!(agents[0].runtime_active);
+        assert_eq!(agents[1].runtime_secs, None);
+        assert!(!agents[1].runtime_active);
+        assert_eq!(agents[2].runtime_secs, None);
+        assert!(!agents[2].runtime_active);
+
+        clear_env();
     }
 
     fn rollup_test_wal_path(database_path: &Path) -> PathBuf {
@@ -29195,6 +29333,173 @@ mod tests {
                 |row| row.get::<_, String>(0),
             )
             .expect("read completed status"),
+            "complete"
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Backfill Atomic Deadline Overrun]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_finishes_atomic_source_after_deadline() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |hours: i64| (base + chrono::Duration::hours(hours)).to_rfc3339();
+        let spec = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-deadline",
+            source_key: "runtime-deadline-source",
+            session_id: "runtime-deadline-session",
+            generation: 1,
+            marker: "runtime-deadline",
+            rows: 0,
+        };
+        let events = vec![
+            (at(0), crate::sessions::SessionEventKind::UserText),
+            (at(1), crate::sessions::SessionEventKind::AsstText),
+            (at(2), crate::sessions::SessionEventKind::UserText),
+            (at(3), crate::sessions::SessionEventKind::AsstText),
+        ];
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&spec, &events))
+            .expect("seed deadline runtime source");
+        let expected = runtime_rollup_rows(&storage, spec.source_key);
+        storage
+            .reset_runtime_rollup_backfill()
+            .expect("reset deadline runtime backfill");
+
+        let mut conn = Connection::open(storage.database_path()).expect("open backfill writer");
+        let mut target = RuntimeRollupBackfillTarget::default();
+        let state = target.load_state(&conn).expect("load pending state");
+        target
+            .prepare_chunk(&conn, state, 1)
+            .expect("prepare deadline runtime source");
+        let tx = conn.transaction().expect("begin deadline transaction");
+        let chunk = target
+            .fold_chunk(
+                &tx,
+                state,
+                RollupBackfillChunkBudget {
+                    deadline: Instant::now(),
+                },
+            )
+            .expect("expired advisory deadline must not split an atomic source");
+        assert!(chunk.completed);
+        assert_eq!(chunk.rows_processed, events.len() as u64);
+        let next = RollupBackfillState {
+            rows_done: chunk.rows_processed,
+            done_through: chunk.done_through,
+        };
+        target
+            .persist_chunk(&tx, next, chunk.completed)
+            .expect("persist atomic source bookmark");
+        tx.commit().expect("commit complete source fold");
+
+        assert_eq!(runtime_rollup_rows(&storage, spec.source_key), expected);
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT runtime_backfill_status FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read deadline completion status"),
+            "complete"
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Runtime Backfill Failed Startup Resume]]
+    #[test]
+    #[serial]
+    fn runtime_backfill_resumes_failed_status_on_next_startup_run() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:05:00Z").expect("base time");
+        let at = |minutes: i64| (base + chrono::Duration::minutes(minutes)).to_rfc3339();
+        let events = vec![
+            (at(0), crate::sessions::SessionEventKind::UserText),
+            (at(1), crate::sessions::SessionEventKind::AsstText),
+        ];
+        let first = TranscriptSourceSpec {
+            provider: IntegrationProvider::Claude,
+            source_root_key: "root-runtime-failed-resume",
+            source_key: "runtime-failed-resume-1",
+            session_id: "runtime-failed-resume-session-1",
+            generation: 1,
+            marker: "runtime-failed-resume-1",
+            rows: 0,
+        };
+        let second = TranscriptSourceSpec {
+            source_key: "runtime-failed-resume-2",
+            session_id: "runtime-failed-resume-session-2",
+            marker: "runtime-failed-resume-2",
+            ..first
+        };
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&first, &events))
+            .expect("seed first failed-resume source");
+        storage
+            .replace_transcript_analytics_snapshot(&runtime_snapshot(&second, &events))
+            .expect("seed second failed-resume source");
+        let first_expected = runtime_rollup_rows(&storage, first.source_key);
+        let second_expected = runtime_rollup_rows(&storage, second.source_key);
+        storage
+            .reset_runtime_rollup_backfill()
+            .expect("reset failed-resume runtime backfill");
+
+        let interrupt = |_progress: &crate::rollup_backfill::RollupBackfillProgress| {
+            crate::rollup_backfill::RollupChunkControl::Interrupt
+        };
+        let controls = RollupBackfillControls {
+            after_chunk: Some(&interrupt),
+            ..RollupBackfillControls::default()
+        };
+        let first_run = storage
+            .run_runtime_rollup_backfill_with_controls(&controls)
+            .expect("commit first source before simulated failure");
+        assert_eq!(first_run.terminal, RollupBackfillTerminal::Interrupted);
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rollup_meta SET runtime_backfill_status = 'failed' WHERE id = 1",
+                [],
+            )
+            .expect("persist simulated failed startup state");
+        drop(storage);
+        let storage = init_storage_in(&dir);
+
+        let resumed = storage
+            .run_runtime_rollup_backfill()
+            .expect("next startup runtime run resumes failed state");
+        assert_eq!(resumed.terminal, RollupBackfillTerminal::Completed);
+        assert_eq!(
+            runtime_rollup_rows(&storage, first.source_key),
+            first_expected
+        );
+        assert_eq!(
+            runtime_rollup_rows(&storage, second.source_key),
+            second_expected
+        );
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT runtime_backfill_status FROM rollup_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read resumed completion status"),
             "complete"
         );
         clear_env();
@@ -30647,13 +30952,15 @@ mod tests {
         assert!(!raw[3].current_turn_runtime_active);
         assert_eq!(raw[4].current_turn_runtime_secs, Some(30.0));
         assert!(!raw[4].current_turn_runtime_active);
-        assert!(raw.iter().all(|row| {
-            row.observed_agents
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .all(|agent| agent.runtime_secs.is_none())
-        }));
+        let raw_agents = raw[0].observed_agents.as_ref().expect("raw agent coverage");
+        assert_eq!(raw_agents[0].runtime_secs, Some(55.0));
+        assert!(raw_agents[0].runtime_active);
+        assert_eq!(raw_agents[1].runtime_secs, Some(50.0));
+        assert!(raw_agents[1].runtime_active);
+        assert_eq!(raw_agents[2].runtime_secs, Some(300.0));
+        assert!(!raw_agents[2].runtime_active);
+        assert_eq!(raw_agents[3].runtime_secs, None);
+        assert!(!raw_agents[3].runtime_active);
 
         storage
             .run_runtime_rollup_backfill()

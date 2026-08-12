@@ -30,7 +30,13 @@ export function useCachedInvokeEvents(): void {
 					) {
 						return;
 					}
-					cachedInvokeStore.invalidateEvent(eventName, refreshMounted());
+					cachedInvokeStore.invalidateEvent(
+						eventName,
+						refreshMounted(),
+						eventName === "transcript-analytics-updated"
+							? "get_session_breakdown"
+							: null,
+					);
 				}).catch((error: unknown) => {
 					if (!disposed) {
 						console.error("Cached invoke event listener failed:", error);

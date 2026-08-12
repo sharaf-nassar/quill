@@ -18,3 +18,4 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs
 - [[crash-reporting-tests]] — Rust crash payload privacy and release identity test specs
 - [[appimage-integration-tests]] — Version-aware AppImage refresh test specs
+- [[window-chrome-tests]] — Cross-platform resize policy and macOS configuration test specs

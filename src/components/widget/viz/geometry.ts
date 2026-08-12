@@ -167,3 +167,20 @@ export function seriesMax(series: readonly (readonly number[])[]): number {
 export function seriesTotal(values: readonly number[]): number {
   return values.reduce((sum, value) => sum + value, 0);
 }
+
+/** Per-bucket sum across every series. */
+export function bucketTotals(
+  series: ReadonlyArray<{ values: readonly number[] }>,
+): number[] {
+  const length = series.reduce(
+    (max, entry) => Math.max(max, entry.values.length),
+    0,
+  );
+  const totals = new Array<number>(length).fill(0);
+  for (const entry of series) {
+    entry.values.forEach((value, index) => {
+      totals[index] += value;
+    });
+  }
+  return totals;
+}

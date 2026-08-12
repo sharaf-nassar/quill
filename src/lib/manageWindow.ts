@@ -8,6 +8,7 @@
 
 import { emit } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { WINDOW_CHROME_OPTIONS } from "./windowChrome";
 
 const MANAGE_LABEL = "manage";
 
@@ -32,7 +33,7 @@ export async function openManageWindow(section?: string): Promise<void> {
     height: 680,
     minWidth: 720,
     minHeight: 480,
-    decorations: false,
+    ...WINDOW_CHROME_OPTIONS,
     transparent: true,
     resizable: true,
   });

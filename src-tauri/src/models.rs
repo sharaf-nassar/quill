@@ -227,7 +227,6 @@ pub struct DataPoint {
     pub utilization: f64,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct IndicatorMetric {
@@ -240,7 +239,6 @@ pub struct IndicatorMetric {
     pub display_reset_time: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusIndicatorState {
@@ -1088,7 +1086,6 @@ pub struct LearningLogEvent {
 // --- Memory optimizer models ---
 
 /// Action types for memory optimization suggestions
-#[allow(dead_code)]
 #[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ActionType {
@@ -1112,7 +1109,6 @@ impl std::fmt::Display for ActionType {
 }
 
 /// LLM response: a single optimization suggestion
-#[allow(dead_code)]
 #[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 pub struct OptimizationSuggestionLlm {
     pub action_type: ActionType,
@@ -1124,7 +1120,6 @@ pub struct OptimizationSuggestionLlm {
 }
 
 /// Top-level LLM analysis output for memory optimization
-#[allow(dead_code)]
 #[derive(Deserialize, Serialize, Clone, Debug, schemars::JsonSchema)]
 pub struct OptimizationOutput {
     #[serde(default)]
@@ -1132,7 +1127,6 @@ pub struct OptimizationOutput {
 }
 
 /// A memory file record returned to frontend
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct MemoryFile {
     pub id: i64,
@@ -1149,7 +1143,6 @@ pub struct MemoryFile {
 }
 
 /// An optimization suggestion returned to frontend
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct OptimizationSuggestion {
     pub id: i64,
@@ -1172,7 +1165,6 @@ pub struct OptimizationSuggestion {
 }
 
 /// An optimization run record returned to frontend
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct OptimizationRun {
     pub id: i64,
@@ -1188,7 +1180,6 @@ pub struct OptimizationRun {
 }
 
 /// A known project for the memory optimizer
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct KnownProject {
     pub path: String,
@@ -1200,14 +1191,12 @@ pub struct KnownProject {
 }
 
 /// Event payload for memory optimizer log messages
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct MemoryOptimizerLogEvent {
     pub message: String,
 }
 
 /// Event payload for memory optimizer status changes
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct MemoryOptimizerUpdatedEvent {
     pub run_id: i64,
@@ -1215,7 +1204,6 @@ pub struct MemoryOptimizerUpdatedEvent {
 }
 
 /// Event payload for memory files changed
-#[allow(dead_code)]
 #[derive(Serialize, Clone, Debug)]
 pub struct MemoryFilesUpdatedEvent {
     pub project_path: String,

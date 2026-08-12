@@ -44,7 +44,9 @@ mod storage;
 mod transcript_analytics;
 mod transcript_identity;
 mod transcript_scan;
+mod transcript_watcher;
 mod tray_keepalive;
+mod window_chrome;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use models::{
@@ -761,18 +763,36 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
             // during the walk is caught by this tick or the next, never lost.
             let tick_start = std::time::SystemTime::now();
             let previous = watermark;
-            let changed = tauri::async_runtime::spawn_blocking(move || {
-                collect_rescan_changed_sources(previous)
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let roots = sessions::enumerate_retained_jsonl_source_roots();
+                let changed = collect_rescan_changed_sources_from_roots(previous, &roots);
+                let storage = get_storage()?;
+                let summary = transcript_analytics::run_transcript_analytics_reconciliation(
+                    storage,
+                    &sessions::SessionIndex::local_hostname(),
+                    &roots,
+                )?;
+                Ok::<_, String>((changed, summary))
             })
             .await;
-            let changed = match changed {
-                Ok(changed) => changed,
+            let (changed, summary) = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => {
+                    log::warn!("Transcript rescan reconciliation failed: {error}");
+                    continue;
+                }
                 Err(error) => {
                     log::warn!("Transcript rescan worker failed: {error}");
                     continue;
                 }
             };
             watermark = tick_start;
+
+            if (summary.replaced_sources > 0 || summary.pruned_sources > 0)
+                && let Err(error) = app.emit(TRANSCRIPT_ANALYTICS_UPDATED_EVENT, ())
+            {
+                log::warn!("Failed to emit transcript rescan analytics update: {error}");
+            }
 
             if changed.is_empty() {
                 continue;
@@ -805,9 +825,17 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
 fn collect_rescan_changed_sources(
     watermark: std::time::SystemTime,
 ) -> Vec<sessions::DiscoveredRetainedJsonlSource> {
+    let roots = sessions::enumerate_retained_jsonl_source_roots();
+    collect_rescan_changed_sources_from_roots(watermark, &roots)
+}
+
+fn collect_rescan_changed_sources_from_roots(
+    watermark: std::time::SystemTime,
+    roots: &[sessions::ProviderSourceRoot],
+) -> Vec<sessions::DiscoveredRetainedJsonlSource> {
     let mut changed = Vec::new();
-    for root in sessions::enumerate_retained_jsonl_source_roots() {
-        for source in root.sources {
+    for root in roots {
+        for source in &root.sources {
             let Ok(metadata) = std::fs::metadata(&source.canonical_path) else {
                 continue;
             };
@@ -815,7 +843,7 @@ fn collect_rescan_changed_sources(
                 continue;
             };
             if modified > watermark {
-                changed.push(source);
+                changed.push(source.clone());
             }
         }
     }
@@ -4181,9 +4209,6 @@ async fn set_runtime_settings(
 /// run's own outcome is decided, and a failed notification must not turn a
 /// completed prune into a failed one.
 ///
-/// `dead_code` is allowed because the completion path ships ahead of the
-/// composite command that calls it, which is a separate work item.
-#[allow(dead_code)]
 pub(crate) fn invalidate_analytics_after_retention(
     storage: &storage::Storage,
     emit: impl FnOnce(&'static str),
@@ -4196,7 +4221,6 @@ pub(crate) fn invalidate_analytics_after_retention(
 ///
 /// Emission failure is logged rather than propagated — see
 /// [`invalidate_analytics_after_retention`].
-#[allow(dead_code)]
 pub(crate) fn emit_retention_analytics_invalidation(app: &tauri::AppHandle, event: &'static str) {
     if let Err(error) = app.emit(event, ()) {
         log::warn!("Failed to emit retention analytics invalidation: {error}");
@@ -4227,7 +4251,6 @@ const RETENTION_MAINTENANCE_PROGRESS_EVENT: &str = "retention-maintenance-progre
 
 /// Event carrying the terminal retention-maintenance result, including the
 /// `"partial"` case.
-#[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_MAINTENANCE_FINISHED_EVENT: &str = "retention-maintenance-finished";
 
 /// Phase label for the pre-delete row count.
@@ -4238,7 +4261,6 @@ const RETENTION_MAINTENANCE_FINISHED_EVENT: &str = "retention-maintenance-finish
 const RETENTION_PHASE_COUNTING_ROWS: &str = "Counting rows";
 
 /// Phase label for the delete-phase disk/WAL/TEMP preflight.
-#[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_PHASE_CHECKING_DISK_SPACE: &str = "Checking disk space";
 
 /// Phase label for the optional JSONL sidecar written before deletion.
@@ -4246,11 +4268,9 @@ const RETENTION_PHASE_ARCHIVING_ROWS: &str = "Archiving rows";
 
 /// Phase label for the chunked delete, whose `pct` advances per chunk so a
 /// several-hundred-thousand-row delete visibly moves.
-#[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_PHASE_REMOVING_OLD_ROWS: &str = "Removing old rows";
 
 /// Phase label for the VACUUM handoff that turns freed pages into freed disk.
-#[allow(dead_code)] // Emitted by the retention commands, which land next.
 const RETENTION_PHASE_COMPACTING_DATABASE: &str = "Compacting database";
 
 /// Payload of [`RETENTION_MAINTENANCE_PROGRESS_EVENT`], deliberately identical
@@ -4282,7 +4302,6 @@ fn emit_retention_maintenance_progress(app: &tauri::AppHandle, phase: &'static s
 /// maintenance result types without either of them having to own the event
 /// name. A failed emit is logged, never propagated: the run itself already
 /// succeeded and its record is durable in `retention.last_run`.
-#[allow(dead_code)] // Called by the retention commands, which land next.
 fn emit_retention_maintenance_finished<P: serde::Serialize + Clone>(
     app: &tauri::AppHandle,
     result: &P,
@@ -5735,6 +5754,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .plugin(window_chrome::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
@@ -5760,16 +5780,12 @@ pub fn run() {
                 })
                 .build(),
         )
-        // The plugin's automatic restore applies every flag, which for the
-        // decorationless widget would also replay a saved `decorated` or
-        // `visible` value over the config. Skipping the initial restore for
-        // `main` drops every flag for that window, so the two the widget
-        // actually wants — position and size — are restored explicitly in
-        // `setup`. Saving is unaffected: `skip_initial_state` gates only the
-        // restore, so the widget's geometry is still persisted on resize and
-        // move like every other window.
+        // Never restore decorations: platform config owns whether a native
+        // frame exists. `main` also skips automatic restore so visibility
+        // remains owned by close-to-tray; setup restores its geometry below.
         .plugin(
             tauri_plugin_window_state::Builder::new()
+                .with_state_flags(StateFlags::all() & !StateFlags::DECORATIONS)
                 .skip_initial_state("main")
                 .build(),
         )
@@ -5819,6 +5835,7 @@ pub fn run() {
             if let Err(error) = spawn_runtime_rollup_backfill(app.handle().clone()) {
                 log::error!("Could not schedule runtime rollup backfill: {error}");
             }
+            transcript_watcher::start(app.handle().clone());
             // Always-on incremental rescan so live coverage no longer depends
             // solely on the per-session notify hook. Feeds changed sources into
             // the same live-reconcile queue; spawned async to never block setup.
@@ -6008,10 +6025,9 @@ pub fn run() {
                 // The plugin's automatic restore is skipped for `main`, so the
                 // geometry a widget must keep across restarts — where the user
                 // parked it and how big they dragged it — is restored here.
-                // Only these two flags: the widget is deliberately
-                // decorationless and its visibility is owned by close-to-tray,
-                // so restoring DECORATIONS, VISIBLE, MAXIMIZED, or FULLSCREEN
-                // would let a stale state file undo that. SIZE is additionally
+                // Only these two flags: platform config owns decorations and
+                // close-to-tray owns visibility, so restoring other state here
+                // could let a stale file undo either contract. SIZE is additionally
                 // withheld on the one launch that resets a pre-widget size —
                 // see `widget_restore_flags`. With no storage the marker can
                 // neither be read nor written, so fall back to the safe half of

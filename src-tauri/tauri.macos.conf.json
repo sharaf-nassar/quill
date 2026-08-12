@@ -1,0 +1,20 @@
+{
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "Quill",
+        "width": 360,
+        "height": 800,
+        "minWidth": 320,
+        "minHeight": 200,
+        "alwaysOnTop": false,
+        "transparent": true,
+        "decorations": true,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ]
+  }
+}

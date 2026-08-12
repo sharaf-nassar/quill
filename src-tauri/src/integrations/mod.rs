@@ -17,8 +17,6 @@ pub use manager::{
     set_context_telemetry_enabled, set_minimax_api_key, startup_refresh,
 };
 
-#[allow(unused_imports)]
-pub use manifest::OwnedAssetManifest;
 pub use types::{IntegrationProvider, ProviderStatus};
 
 // Provider installers and restart-hook setup share deployment state plus

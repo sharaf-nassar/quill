@@ -24,7 +24,7 @@ A provider with no live buckets still gets a row stating why: `SETUP` in amber w
 
 CPA pool rows derive mean account pressure from routing-usable account snapshots and are never persisted as independent facts.
 
-[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags; every account remains in the total denominator. Each window is the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. Routing-unusable accounts never contribute.
+[[src-tauri/src/cpa/aggregate.rs#compute_cpa_pools]] groups Claude and Codex accounts separately. Healthy means CPA's documented `active` or compatible `ready` status without disabled or unavailable flags; every account remains in the total denominator. Each window is normally the arithmetic mean of healthy accounts returning that window, so missing buckets are excluded rather than read as zero. When every account is cooling, their readable snapshots provide a fallback mean so the provider row retains quota data.
 
 The widget renders each aggregate as that provider's sole top-level row while the pool exists: fixed provider identity, inline healthy/total count, mean window cells, and reset readouts for visible canonical windows. Each reset uses only its matching aggregate window's earliest contributing timestamp; missing timestamps show a dash and elapsed timestamps show neutral `now`. A semantic disclosure reveals at most six account rows plus a remainder count.
 
@@ -42,7 +42,11 @@ Its reset is the earliest parseable contributing reset because that is when the 
 
 #### Health denominator with unusable exclusions
 
-Every account counts toward total, but only active or ready, non-disabled, available accounts count as healthy or contribute buckets. A cooling account at 100% weekly therefore cannot dilute shorter-window utilization.
+Every account counts toward total, but while any account is active or ready, only active or ready, non-disabled, available accounts count as healthy or contribute buckets. A cooling sibling therefore cannot dilute active utilization.
+
+#### All-cooling fallback
+
+When every account is cooling and quota-readable, all returned cooling snapshots contribute to the provider mean while the healthy count remains zero.
 
 #### Missing account buckets stay gaps
 

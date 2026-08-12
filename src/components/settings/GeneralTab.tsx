@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { WINDOW_CHROME_OPTIONS } from "../../lib/windowChrome";
 import {
   RUNTIME_SETTINGS_DEFAULTS,
   type UseRuntimeSettingsResult,
@@ -74,7 +75,7 @@ function GeneralTab({ runtime, learning }: GeneralTabProps) {
       height: 600,
       minWidth: 380,
       minHeight: 360,
-      decorations: false,
+      ...WINDOW_CHROME_OPTIONS,
       transparent: true,
       resizable: true,
     });

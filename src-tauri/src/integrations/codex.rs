@@ -1,8 +1,6 @@
-#![allow(dead_code)]
-
 use crate::integrations::deploy::{
-    FileSnapshots, PublishedBatch, StagedDirectory, copy_dir_recursive, path_exists,
-    publish_staged_batch, recover_staged_batch, remove_path, validate_staged_mcp,
+    FileSnapshots, PublishedBatch, StagedDirectory, copy_dir_recursive, copy_named_files,
+    path_exists, publish_staged_batch, recover_staged_batch, remove_path, validate_staged_mcp,
 };
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
@@ -34,7 +32,6 @@ const AGENTS_BLOCK_START: &str = "<!-- quill-managed:codex:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:codex:end -->";
 const HOOK_OBSERVER_PAYLOAD_MARKER: &str = "quill-managed-observer-payload: 4";
 
-const MCP_SERVER_KEY: &str = "mcp_servers.quill";
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
 const QBUILD_GUARD_SCRIPT: &str = "qbuild-guard.sh";
 const LEGACY_MANAGED_HOOK_SCRIPT_FILES: [&str; 1] = ["report-tokens.sh"];
@@ -280,10 +277,7 @@ pub fn detect() -> Result<ProviderStatus, String> {
     })
 }
 
-pub fn install(
-    app: &tauri::AppHandle,
-    features: IntegrationFeatures,
-) -> Result<OwnedAssetManifest, String> {
+pub fn install(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
     let paths = resolve_codex_install_paths()?;
     let deployment_targets = deployment_targets();
     let snapshots = FileSnapshots::capture(
@@ -303,14 +297,14 @@ pub fn install(
         update_config_toml(features, &paths)?;
         update_agents_md(&paths.agents)?;
         verify_with_paths(features, &paths)?;
-        Ok(build_owned_manifest())
+        Ok(())
     })();
 
     match setup_result {
-        Ok(manifest) => {
+        Ok(()) => {
             published.commit()?;
             write_deployment_stamp_best_effort(app, features);
-            Ok(manifest)
+            Ok(())
         }
         Err(err) => Err(published.rollback_with_error(err)),
     }
@@ -1310,29 +1304,7 @@ fn build_owned_manifest() -> OwnedAssetManifest {
             templates_dir().to_string_lossy().to_string(),
             mcp_dir().to_string_lossy().to_string(),
         ],
-        config_keys: vec![FEATURES_MARKER.to_string(), MCP_SERVER_KEY.to_string()],
-        markdown_blocks: vec![AGENTS_BLOCK_START.to_string()],
     }
-}
-
-fn copy_named_files(src_dir: &Path, dst_dir: &Path, file_names: &[&str]) -> Result<(), String> {
-    for file_name in file_names {
-        let source = src_dir.join(file_name);
-        if !source.exists() {
-            return Err(format!("Bundled file missing at {}", source.display()));
-        }
-
-        let target = dst_dir.join(file_name);
-        fs::copy(&source, &target).map_err(|err| {
-            format!(
-                "Failed to copy {} -> {}: {err}",
-                source.display(),
-                target.display()
-            )
-        })?;
-    }
-
-    Ok(())
 }
 
 fn deploy_files(

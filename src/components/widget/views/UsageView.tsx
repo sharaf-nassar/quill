@@ -22,7 +22,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AreaChart, Sparkline, type VizSeries } from "../viz";
+import { AreaChart, bucketTotals, Sparkline, type VizSeries } from "../viz";
 import { selectInsightLine } from "./insightLine";
 import { useActivitySeries, useProviderTokenSeries } from "../../../hooks/useWidgetSeries";
 import { useBreakdownData } from "../../../hooks/useBreakdownData";
@@ -34,6 +34,7 @@ import { useContextSavingsStats } from "../../../hooks/useContextSavingsStats";
 import { useLlmRuntimeStats } from "../../../hooks/useLlmRuntimeStats";
 import { useRetentionCutoff } from "../../../hooks/useRetentionCutoff";
 import { openManageWindow } from "../../../lib/manageWindow";
+import { IS_MACOS } from "../../../lib/windowChrome";
 import {
   formatAdaptiveClockDurationSecs,
   formatClockDurationSecs,
@@ -41,6 +42,7 @@ import {
   formatExtrapolatedRuntime,
   formatNumber,
   formatObservedSessionAgents,
+  formatRecency,
   isSessionLive,
   resolveSessionMetrics,
 } from "../../../utils/format";
@@ -94,18 +96,6 @@ function formatNetLines(value: number): string {
   return formatNumber(value);
 }
 
-/** Compact recency for a 38px column: `now`, `42m`, `3h`, `2d`. */
-function formatRecency(timestamp: string, nowMs: number): string {
-  const then = new Date(timestamp).getTime();
-  if (!Number.isFinite(then)) return "—";
-  const minutes = Math.floor((nowMs - then) / 60_000);
-  if (minutes < 1) return "now";
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h`;
-  return `${Math.floor(hours / 24)}d`;
-}
-
 /** Last path segment of a project path; null when there is no path at all. */
 function projectName(path: string | null | undefined): string | null {
   if (!path) return null;
@@ -131,18 +121,6 @@ function axisLabels(timestamps: readonly string[], range: RangeType): string[] {
           hour12: false,
         });
   });
-}
-
-/** Per-bucket sum across every provider series. */
-function bucketTotals(series: ReadonlyArray<{ values: number[] }>): number[] {
-  const length = series.reduce((max, entry) => Math.max(max, entry.values.length), 0);
-  const totals = new Array<number>(length).fill(0);
-  for (const entry of series) {
-    entry.values.forEach((value, index) => {
-      totals[index] += value;
-    });
-  }
-  return totals;
 }
 
 interface Delta {
@@ -510,8 +488,7 @@ function emptyBreakdownLabel(mode: BreakdownMode): string {
 
 /** `⌘M` on macOS, `Ctrl+M` everywhere else — the accelerator main.tsx binds. */
 function manageAccelerator(): string {
-  const agent = typeof navigator === "undefined" ? "" : navigator.userAgent;
-  return /mac/i.test(agent) ? "⌘M" : "Ctrl+M";
+  return IS_MACOS ? "⌘M" : "Ctrl+M";
 }
 
 export interface UsageViewProps {

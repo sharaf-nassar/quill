@@ -153,6 +153,33 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn copy_named_files<S: AsRef<str>>(
+    src_dir: &Path,
+    dst_dir: &Path,
+    file_names: &[S],
+) -> Result<(), String> {
+    fs::create_dir_all(dst_dir)
+        .map_err(|err| format!("Failed to create directory {}: {err}", dst_dir.display()))?;
+
+    for file_name in file_names {
+        let source = src_dir.join(file_name.as_ref());
+        if !source.exists() {
+            return Err(format!("Bundled file missing at {}", source.display()));
+        }
+
+        let target = dst_dir.join(file_name.as_ref());
+        fs::copy(&source, &target).map_err(|err| {
+            format!(
+                "Failed to copy {} -> {}: {err}",
+                source.display(),
+                target.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 impl PublishedBatch {
     /// Make the published trees authoritative and discard the backup.
     pub(crate) fn commit(self) -> Result<(), String> {

@@ -20,6 +20,18 @@ export function formatNumber(n: number): string {
 	return n.toLocaleString("en-US");
 }
 
+/** Compact recency for narrow widget columns: `now`, `42m`, `3h`, `2d`. */
+export function formatRecency(timestamp: string, nowMs: number): string {
+	const then = new Date(timestamp).getTime();
+	if (!Number.isFinite(then)) return "—";
+	const minutes = Math.floor((nowMs - then) / 60_000);
+	if (minutes < 1) return "now";
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.floor(hours / 24)}d`;
+}
+
 function agentModelFamily(provider: IntegrationProvider, modelId: string) {
 	const matches = (family: string) =>
 		new RegExp(`(^|[-_.])${family}($|[-_.])`, "i").test(modelId);

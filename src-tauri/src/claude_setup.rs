@@ -1,6 +1,6 @@
 use crate::integrations::deploy::{
-    FileSnapshots, PublishedBatch, StagedDirectory, copy_dir_recursive, path_exists,
-    publish_staged_batch, recover_staged_batch, remove_path, validate_staged_mcp,
+    FileSnapshots, PublishedBatch, StagedDirectory, copy_dir_recursive, copy_named_files,
+    path_exists, publish_staged_batch, recover_staged_batch, remove_path, validate_staged_mcp,
 };
 use crate::integrations::manifest::OwnedAssetManifest;
 use crate::models::IntegrationFeatures;
@@ -382,8 +382,6 @@ fn context_scripts_for(features: IntegrationFeatures) -> Vec<&'static str> {
     scripts
 }
 
-const MCP_SERVER_KEY: &str = "mcpServers.quill";
-
 fn all_managed_script_files() -> impl Iterator<Item = &'static str> {
     ALL_MANAGED_SCRIPT_FILES.into_iter()
 }
@@ -405,8 +403,6 @@ fn build_owned_manifest(paths: &ClaudePaths) -> OwnedAssetManifest {
             mcp_dir().to_string_lossy().to_string(),
             templates_dir().to_string_lossy().to_string(),
         ],
-        config_keys: vec![MCP_SERVER_KEY.to_string()],
-        markdown_blocks: vec![BLOCK_START.to_string()],
     }
 }
 
@@ -434,10 +430,7 @@ pub(crate) fn recover_interrupted_install() -> Result<(), String> {
     recover_staged_batch(&deployment_targets())
 }
 
-pub fn install_with_manifest(
-    app: &tauri::AppHandle,
-    features: IntegrationFeatures,
-) -> Result<OwnedAssetManifest, String> {
+pub fn install(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
     let paths = resolve_claude_install_paths()?;
     let runtime = resolve_runtime_paths()?;
     preflight_configuration(&paths)?;
@@ -454,15 +447,15 @@ pub fn install_with_manifest(
         update_claude_md(&paths)?;
         cleanup_legacy_hook_files(&paths)?;
         verify_with_paths(features, &paths, &runtime)?;
-        Ok(build_owned_manifest(&paths))
+        Ok(())
     })();
 
     match setup_result {
-        Ok(manifest) => {
+        Ok(()) => {
             published.commit()?;
             cleanup_stale_skills_best_effort();
             write_deployment_stamp_best_effort(app, features);
-            Ok(manifest)
+            Ok(())
         }
         Err(err) => Err(published.rollback_with_error(err)),
     }
@@ -966,34 +959,6 @@ fn cleanup_stale_skills_best_effort() {
             stale_skills_dir.display()
         ),
     }
-}
-
-fn copy_named_files<S: AsRef<str>>(
-    src_dir: &Path,
-    dst_dir: &Path,
-    file_names: &[S],
-) -> Result<(), String> {
-    fs::create_dir_all(dst_dir)
-        .map_err(|err| format!("Failed to create directory {}: {err}", dst_dir.display()))?;
-
-    for file_name in file_names {
-        let file_name = file_name.as_ref();
-        let source = src_dir.join(file_name);
-        if !source.exists() {
-            return Err(format!("Bundled file missing at {}", source.display()));
-        }
-
-        let target = dst_dir.join(file_name);
-        fs::copy(&source, &target).map_err(|err| {
-            format!(
-                "Failed to copy {} -> {}: {err}",
-                source.display(),
-                target.display()
-            )
-        })?;
-    }
-
-    Ok(())
 }
 
 fn deploy_template(

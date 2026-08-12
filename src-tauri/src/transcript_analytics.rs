@@ -1075,16 +1075,24 @@ pub(crate) fn run_startup_transcript_analytics_reconciliation(
     storage: &Storage,
     hostname: &str,
 ) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
+    let roots = enumerate_retained_jsonl_source_roots();
+    run_transcript_analytics_reconciliation(storage, hostname, &roots)
+}
+
+pub(crate) fn run_transcript_analytics_reconciliation(
+    storage: &Storage,
+    hostname: &str,
+    roots: &[ProviderSourceRoot],
+) -> Result<TranscriptAnalyticsReconciliationSummary, String> {
     let _permit = acquire_transcript_reconciliation(
         retained_jsonl_source_root_identities()
             .into_iter()
             .map(|(provider, source_root_key)| (provider, source_root_key.to_owned())),
     )?;
     let force_full_reparse = transcript_analytics_reingest_pending(storage);
-    let roots = enumerate_retained_jsonl_source_roots();
     let mut summary = TranscriptAnalyticsReconciliationSummary::default();
     let mut completed_roots = 0usize;
-    for root in &roots {
+    for root in roots {
         let outcome = match reconcile_transcript_source_root(
             storage,
             root,
@@ -1983,6 +1991,108 @@ mod tests {
             std::env::set_var("QUILL_DATA_DIR", dir.path());
         }
         Storage::init().expect("init storage")
+    }
+
+    // @lat: [[backend#Backend#Database#Schema#Transcript Analytics Test Specs#Modern Codex Turn Extraction]]
+    #[test]
+    fn modern_codex_messages_create_response_rows_without_legacy_duplicates() {
+        let dir = TempDir::new().expect("tempdir");
+        let source = write_jsonl_source(
+            dir.path(),
+            "rollout-modern.jsonl",
+            IntegrationProvider::Codex,
+            RetainedJsonlSourceLayoutHint::CodexTranscript,
+            &[
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-01-01T00:00:00.000Z",
+                    "payload": { "id": "codex-modern", "cwd": "/work/quill" }
+                })
+                .to_string(),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-01-01T00:00:01.000Z",
+                    "payload": { "type": "message", "role": "user", "content": [
+                        { "type": "input_text", "text": "first prompt" }
+                    ] }
+                })
+                .to_string(),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-01-01T00:00:02.000Z",
+                    "payload": { "type": "message", "role": "assistant", "content": [
+                        { "type": "output_text", "text": "first answer" }
+                    ] }
+                })
+                .to_string(),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-01-01T00:00:03.000Z",
+                    "payload": { "type": "user_message", "message": "second prompt" }
+                })
+                .to_string(),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-01-01T00:00:03.005Z",
+                    "payload": { "type": "message", "role": "user", "content": [
+                        { "type": "input_text", "text": "second prompt" }
+                    ] }
+                })
+                .to_string(),
+                json!({
+                    "type": "response_item",
+                    "timestamp": "2026-01-01T00:00:04.000Z",
+                    "payload": { "type": "message", "role": "assistant", "content": [
+                        { "type": "output_text", "text": "second answer" }
+                    ] }
+                })
+                .to_string(),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-01-01T00:00:04.005Z",
+                    "payload": { "type": "agent_message", "message": "second answer" }
+                })
+                .to_string(),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-01-01T00:00:05.000Z",
+                    "payload": { "type": "user_message", "message": "legacy-only prompt" }
+                })
+                .to_string(),
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-01-01T00:00:06.000Z",
+                    "payload": { "type": "agent_message", "message": "legacy-only answer" }
+                })
+                .to_string(),
+            ],
+        );
+
+        let parsed = parse_transcript_analytics_source(&source, TEST_HOSTNAME)
+            .expect("parse modern Codex source");
+        assert_eq!(
+            parsed.snapshot.response_times.len(),
+            3,
+            "modern-only and unmatched legacy turns must survive while adjacent copies coalesce"
+        );
+        assert_eq!(
+            parsed
+                .snapshot
+                .session_events
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::UserText))
+                .count(),
+            3
+        );
+        assert_eq!(
+            parsed
+                .snapshot
+                .session_events
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::AsstText))
+                .count(),
+            3
+        );
     }
 
     fn clear_env() {

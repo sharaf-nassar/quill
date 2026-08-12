@@ -3327,6 +3327,102 @@ pub(crate) fn has_nonempty_codex_assistant_output(payload: &serde_json::Value) -
         && codex_text_blocks(payload, "output_text").next().is_some()
 }
 
+fn codex_response_message(payload: &serde_json::Value) -> Option<(&str, String)> {
+    let role = payload.get("role").and_then(|value| value.as_str())?;
+    let block_type = match role {
+        "user" => "input_text",
+        "assistant" => "output_text",
+        _ => return None,
+    };
+    let content = codex_text_blocks(payload, block_type)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!content.is_empty()).then_some((role, content))
+}
+
+fn duplicate_codex_legacy_message_ordinals(records: &[JsonlRecord]) -> HashSet<u64> {
+    let mut duplicates = HashSet::new();
+    let mut previous: Option<(bool, &str, String, &str, u64)> = None;
+
+    for record in records {
+        let object = &record.value;
+        let Some(payload) = object.get("payload") else {
+            continue;
+        };
+        let candidate = match object.get("type").and_then(|value| value.as_str()) {
+            Some("event_msg") => {
+                let role = match payload.get("type").and_then(|value| value.as_str()) {
+                    Some("user_message") => "user",
+                    Some("agent_message") => "assistant",
+                    _ => continue,
+                };
+                let Some(content) = payload
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .filter(|content| !content.trim().is_empty())
+                else {
+                    continue;
+                };
+                (false, role, content.to_owned())
+            }
+            Some("response_item")
+                if payload.get("type").and_then(|value| value.as_str()) == Some("message") =>
+            {
+                let Some((role, content)) = codex_response_message(payload) else {
+                    continue;
+                };
+                (true, role, content)
+            }
+            _ => continue,
+        };
+        let timestamp = object
+            .get("timestamp")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+
+        if let Some((
+            previous_native,
+            previous_role,
+            previous_content,
+            previous_timestamp,
+            previous_ordinal,
+        )) = previous.as_ref()
+            && *previous_native != candidate.0
+            && *previous_role == candidate.1
+            && *previous_content == candidate.2
+            && record.ordinal == previous_ordinal.saturating_add(1)
+            && codex_message_timestamps_within_10ms(previous_timestamp, timestamp)
+        {
+            if candidate.0 {
+                duplicates.insert(*previous_ordinal);
+                previous = Some((true, candidate.1, candidate.2, timestamp, record.ordinal));
+            } else {
+                duplicates.insert(record.ordinal);
+            }
+        } else {
+            previous = Some((
+                candidate.0,
+                candidate.1,
+                candidate.2,
+                timestamp,
+                record.ordinal,
+            ));
+        }
+    }
+
+    duplicates
+}
+
+fn codex_message_timestamps_within_10ms(left: &str, right: &str) -> bool {
+    let Ok(left) = chrono::DateTime::parse_from_rfc3339(left) else {
+        return false;
+    };
+    let Ok(right) = chrono::DateTime::parse_from_rfc3339(right) else {
+        return false;
+    };
+    (left - right).num_milliseconds().abs() <= 10
+}
+
 fn make_tool_message(
     uuid: String,
     session_id: String,
@@ -3883,6 +3979,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
     let mut messages: Vec<ExtractedMessage> = Vec::new();
     let mut events: Vec<ExtractedEvent> = Vec::new();
     let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
+    let duplicate_legacy_messages = duplicate_codex_legacy_message_ordinals(records);
     let native_identity = match resolve_codex_native_identity(records) {
         Ok(identity) => identity,
         Err(error) => {
@@ -3947,6 +4044,9 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                     "agent_message" => "assistant",
                     _ => continue,
                 };
+                if duplicate_legacy_messages.contains(&line_idx) {
+                    continue;
+                }
                 let content = payload
                     .get("message")
                     .and_then(|value| value.as_str())
@@ -4006,6 +4106,50 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                     .and_then(|value| value.as_str())
                     .unwrap_or("")
                 {
+                    "message" => {
+                        let Some((role, content)) = codex_response_message(payload) else {
+                            continue;
+                        };
+                        let uuid = payload
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned);
+                        if !timestamp.is_empty() {
+                            events.push(ExtractedEvent {
+                                source_ordinal: line_idx,
+                                event_ordinal: 0,
+                                timestamp: timestamp.clone(),
+                                kind: if role == "user" {
+                                    SessionEventKind::UserText
+                                } else {
+                                    SessionEventKind::AsstText
+                                },
+                                is_sidechain: native_identity.is_sidechain,
+                                agent_id: None,
+                                uuid: uuid.clone(),
+                                parent_uuid: None,
+                            });
+                        }
+                        messages.push(ExtractedMessage {
+                            uuid: uuid.unwrap_or_else(|| format!("{session_id}:event:{line_idx}")),
+                            session_id: session_id.clone(),
+                            role: role.to_owned(),
+                            content,
+                            timestamp,
+                            git_branch: git_branch.clone(),
+                            tools_used: Vec::new(),
+                            files_modified: Vec::new(),
+                            code_changes: Vec::new(),
+                            commands_run: Vec::new(),
+                            tool_details: Vec::new(),
+                            tool_actions: Vec::new(),
+                            is_sidechain: native_identity.is_sidechain,
+                            agent_id: None,
+                            parent_uuid: None,
+                            cwd: cwd.clone(),
+                        });
+                    }
                     "agent_message" => {
                         let content = codex_text_blocks(payload, "input_text")
                             .collect::<Vec<_>>()
@@ -4264,26 +4408,6 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                                 .and_then(|value| value.as_str())
                                 .filter(|value| !value.is_empty())
                                 .map(str::to_owned),
-                            parent_uuid: None,
-                        });
-                    }
-                    "message"
-                        if !timestamp.is_empty()
-                            && has_nonempty_codex_assistant_output(payload) =>
-                    {
-                        let uuid = payload
-                            .get("id")
-                            .and_then(|value| value.as_str())
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_owned);
-                        events.push(ExtractedEvent {
-                            source_ordinal: line_idx,
-                            event_ordinal: 0,
-                            timestamp: timestamp.clone(),
-                            kind: SessionEventKind::AsstText,
-                            is_sidechain: native_identity.is_sidechain,
-                            agent_id: None,
-                            uuid: uuid.clone(),
                             parent_uuid: None,
                         });
                     }

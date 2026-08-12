@@ -46,11 +46,11 @@ Manual dispatch must select an existing `v*` tag. The `create-release` job rejec
 
 ### Backend CI Gate
 
-`.github/workflows/ci.yml` is the Rust backend gate (feature 005, FR-021 / SC-008) that also blocks release on failure.
+`.github/workflows/ci.yml` is the cross-platform Rust backend gate that also blocks release on failure.
 
-It triggers on `pull_request`, `push` to `main`, and `workflow_call`, installs the Linux Tauri development packages before Rust setup, installs Rust from `rust-toolchain.toml`, runs in `src-tauri` with `permissions: contents: read`, and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (warnings deny — hard gate), and `cargo test`. Its single job id `rust` is stable for reuse.
+It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and pins Rust 1.95.0 plus the Cargo cache. The Linux job installs Tauri development packages and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; the `macos-latest` job keeps `cargo check --all-targets` for AppKit-only code and runs the focused `runtime_backfill_` tests against bundled SQLite in the macOS filesystem/runtime environment before merge.
 
-`release.yml` calls it as a reusable workflow (`ci` job using `./.github/workflows/ci.yml`) and makes `create-release` `needs: ci`, so a failing learning-logic suite blocks the entire build/sign/notarize/publish chain (no OS/notarization matrix duplicated). Contract: `specs/005-learning-system-hardening/contracts/evaluation-harness.md`.
+`release.yml` calls it as a reusable workflow (`ci` job using `./.github/workflows/ci.yml`) and makes `create-release` `needs: ci`, so either a Linux gate failure or macOS compile failure blocks the entire build/sign/notarize/publish chain without duplicating release signing. Contract: `specs/005-learning-system-hardening/contracts/evaluation-harness.md`.
 
 ### Draft Release Pre-Creation
 
@@ -68,9 +68,11 @@ Unix free-space probes normalize `statvfs` counters to `u64` before multiplicati
 
 ### Version Injection
 
-Parses version from git tag (e.g., `v0.2.1` -> `0.2.1`). Updates `src-tauri/Cargo.toml` via sed and `package.json` via Node.js before build.
+Parses version from git tag (e.g., `v0.2.1` -> `0.2.1`) and updates `src-tauri/Cargo.toml` via sed before build.
 
 Source builds retain the `0.0.0-injected-by-ci` sentinel. [[src-tauri/src/lib.rs#packaged_version_allows_updates]] disables their updater so newer local schema migrations cannot be replaced by an older published release; tag-injected builds keep normal version ordering.
+
+`package.json` remains a frontend sentinel: Tauri package metadata comes from Cargo because `tauri.conf.json` omits `version`, while frontend crash reporting reads the tag from `VITE_APP_VERSION`. The release gate compares that tag and both Sentry identifiers directly with Cargo's injected version.
 
 The Rust Sentry SDK prefixes Cargo's injected package version with `v`, matching `SENTRY_RELEASE`, `VITE_APP_VERSION`, and the GitHub tag on every release platform.
 
@@ -184,6 +186,8 @@ Two categories of finding recur. A component that exports both `export function 
 ## Scripts
 
 Utility scripts for development, testing, and documentation tasks.
+
+`npm test` runs every `scripts/*.test.mjs` file through Node's native, quoted glob handling. Focused verification can invoke a test file directly with `node --test`.
 
 ### Screenshot Capture
 

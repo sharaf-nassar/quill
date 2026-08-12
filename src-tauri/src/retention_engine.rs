@@ -47,12 +47,6 @@
 //! was chosen here. They are a ceiling derived from a measurement, not a
 //! threshold this module can fail against.
 
-// The delete engine is deliberately shipped ahead of its consumers: the
-// composite command and the preview command are separate items that call into
-// it, and pinning the destructive invariants at this layer — with their own
-// tests — is the point of landing it first.
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::os::raw::c_int;
@@ -562,7 +556,7 @@ pub(crate) fn available_disk_space(path: &Path) -> Result<u64, String> {
     let result = unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) };
     if result != 0 {
         return Err(format!(
-            "Read free disk space for the retention delete phase: {}",
+            "Read available disk space: {}",
             std::io::Error::last_os_error()
         ));
     }
@@ -572,12 +566,12 @@ pub(crate) fn available_disk_space(path: &Path) -> Result<u64, String> {
     let available_blocks = u64::from(stats.f_bavail);
     available_blocks
         .checked_mul(stats.f_frsize)
-        .ok_or_else(|| "Free disk space value overflowed the delete-phase preflight".to_string())
+        .ok_or_else(|| "Available disk space value overflowed".to_string())
 }
 
 #[cfg(not(unix))]
 pub(crate) fn available_disk_space(_path: &Path) -> Result<u64, String> {
-    Err("The retention delete-phase preflight is unavailable on this platform".to_string())
+    Err("Available disk space probing is unavailable on this platform".to_string())
 }
 
 /// The one-pass doomed-rowid scan, for one target table.

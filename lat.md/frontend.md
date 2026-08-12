@@ -20,7 +20,7 @@ Three Tauri windows are routed by the `?view=` URL parameter, each with its own 
 
 The former per-tool windows (`sessions`, `learning`, `restart`, `runs`, `settings`) were retired into Manage sections, and run history folded into the Learning section. All three remaining routes are reachable without an enabled provider — the Manage workspace gates each tool section inline (Settings always renders), so the former `BlockedWindow` per-window provider-blocking was removed.
 
-Every route also mounts [[src/components/WindowResizeHandles.tsx]] as a sibling of its view, because all three windows are decorationless and none of them gets a resize border from the window manager. The main route takes the default `widget` geometry; `manage` and `release-notes` take the `roomy` variant.
+Every route mounts [[src/components/WindowResizeHandles.tsx]] as a sibling of its view. It suppresses itself on macOS, where AppKit supplies the resize frame; on Linux and Windows main takes `widget` geometry while `manage` and `release-notes` take `roomy`.
 
 ## Manage Workspace
 
@@ -56,13 +56,13 @@ Geometry is the user's, not the shell's. The window drags freely on both axes an
 
 Deleting the sizer left the config height as the only thing deciding how tall the widget opens, so that height is now measured against this shell rather than left at the sizer's old starting value: 43px of non-scrolling chrome plus the 745px the saturated Usage view renders at 360px wide, rounded to a 800px default and capped to the display on the launch that seeds it — see [[architecture#Multi-Window Design#Window Configuration#Seeded Height Clamp]]. The measurement is a one-off design input, not a runtime behaviour; nothing in the shell reads its own height any more.
 
-The drag itself comes from [[src/components/WindowResizeHandles.tsx]], because a `decorations: false` window has no native border to grab — see [[architecture#Multi-Window Design#Window Configuration]]. [[src/main.tsx]] mounts it beside `App` in its default `widget` geometry; the other two routes mount the same component in the `roomy` variant.
+Resize follows [[architecture#Multi-Window Design#Window Configuration|the platform chrome policy]]. macOS uses AppKit's native frame; Linux and Windows use [[src/components/WindowResizeHandles.tsx]], mounted in `widget` geometry for main and `roomy` geometry for the other routes.
 
 ### Component Tree
 
 The widget nests [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]] above a scrolling content column holding [[src/components/widget/LimitsSection.tsx]] and, below it, the switchable view region ([[lat.md/frontend#Frontend#Components#Widget View Region]]).
 
-`WidgetTitleBar` carries the widget's whole chrome contract in three grid tracks: the brand glyph and `Quill` wordmark on the left, the update button centred on the window (rendered only once the 4-hour updater check finds a release, wired to `install_app_update`), and a right cluster of the always-on-top toggle, the settings key, and the close key. The bar and its non-interactive children carry `data-tauri-drag-region`, so a decorationless window stays draggable. The always-on-top toggle reads and writes the persisted `always_on_top` setting through [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]], so the tray checkitem, the Settings toggle, and the titlebar are one state; a failed write surfaces as a toast rather than a button that lies. Both the settings key and the ⌘M/Ctrl+M accelerator registered in [[src/main.tsx]] go through [[src/lib/manageWindow.ts#openManageWindow]], which focuses an existing Manage window instead of stacking a second one.
+`WidgetTitleBar` carries the widget's whole chrome contract in three grid tracks: the brand glyph and `Quill` wordmark on the left, the update button centred on the window (rendered only once the 4-hour updater check finds a release, wired to `install_app_update`), and a right cluster of the always-on-top toggle, the settings key, and the close key. The bar and its non-interactive children carry `data-tauri-drag-region`, preserving custom drag behavior under either platform chrome policy. The always-on-top toggle reads and writes the persisted `always_on_top` setting through [[src/hooks/useRuntimeSettings.ts#useRuntimeSettings]], so the tray checkitem, the Settings toggle, and the titlebar are one state; a failed write surfaces as a toast rather than a button that lies. Both the settings key and the ⌘M/Ctrl+M accelerator registered in [[src/main.tsx]] go through [[src/lib/manageWindow.ts#openManageWindow]], which focuses an existing Manage window instead of stacking a second one.
 
 ## Components
 
@@ -77,7 +77,7 @@ The widget's own chrome lives under `src/components/widget/` and is described in
 - **ReleaseNotesWindow** (`src/windows/ReleaseNotesWindow.tsx`) — Standalone window that fetches published GitHub releases through the [[src-tauri/src/lib.rs#get_release_notes]] command, shows the latest first, and places Previous/Next navigation plus the selectable release URL in a top toolbar below the titlebar. Centers the release tag between the release counter and publish date, renders release bodies as sanitized GitHub-flavored Markdown that fills the scroll area, surfaces loading, empty, and error states with a Retry control, and supports Escape plus Left/Right arrow keyboard navigation. Its only entry point is the About row in the General settings tab — the widget titlebar carries no version affordance.
 - **ConfirmDialog** ([[src/components/ConfirmDialog.tsx]]) — Shared confirmation modal used for destructive provider cleanup and provider installation confirmation, driven from the Integrations settings tab. Built on the native `<dialog>` element via `showModal()`, so Escape dismissal arrives through the `cancel` event and the scrim is `::backdrop` styling rather than a managed overlay.
 - **CommandPalette** ([[src/components/CommandPalette.tsx]]) — The Manage workspace's `⌘K` / `Ctrl K` substring-filtered navigator over its four sections plus Back-to-Live and Close-Tools actions.
-- **WindowResizeHandles** ([[src/components/WindowResizeHandles.tsx]]) — The resize border shared by all three decorationless windows: eight absolutely-positioned zones (four edges, four corners, the corners painted last so they win the diagonal cursor) inside a click-through fixed overlay, each handing its gesture to the compositor through `startResizeDragging` so the drag stays native and never round-trips through React. They are `aria-hidden`, pointer-only, hold no focusable content, and act on the left button alone so the widget's right-click Refresh/Quit menu still opens. The `variant` prop picks the geometry, which is expressed as the `--wrh-edge` and `--wrh-corner` custom properties on the overlay: `widget` (default) is 5px edges and 12px corners, `roomy` keeps the 5px edges and drops to 8px corners for Manage and release-notes. Both mounts are in [[src/main.tsx]] — see [[architecture#Multi-Window Design#Window Configuration#Resize Border Geometry]] for why the two windows cannot share one number.
+- **WindowResizeHandles** ([[src/components/WindowResizeHandles.tsx]]) — Linux/Windows fallback resize border shared by all three routes: eight pointer-only zones hand left-button gestures to `startResizeDragging`. It renders nothing on macOS, where AppKit provides the frame. `widget` uses 5px edges and 12px corners; `roomy` keeps 5px edges and uses 8px corners for Manage and release-notes. See [[architecture#Multi-Window Design#Window Configuration#Resize Border Geometry]].
 - **RetentionBanner** ([[src/components/RetentionBanner.tsx#RetentionBanner]]) — The multi-line retention disclosure, described in [[lat.md/frontend#Frontend#Components#Retention Degradation]]. The widget states the same fact as a condensed one-line variant inside the affected view rather than mounting this banner.
 
 The pre-widget main-window chrome — `TitleBar`, `UsageDisplay`, `UsageRow`, the `live/` modules, and the `ProviderMenu` popover with its legacy `IntegrationsWindow` host — was deleted with the widget redesign. Their responsibilities moved to [[src/components/widget/WidgetTitleBar.tsx#WidgetTitleBar]], [[src/components/widget/LimitsSection.tsx#LimitsSection]], and the Settings surfaces respectively.
@@ -196,6 +196,10 @@ Rule management and memory optimization UI in `src/components/learning/`.
 
 Full-text session search UI in `src/components/sessions/` for a shared Claude-plus-Codex index.
 
+All query, filter, sort, and pagination requests pass through one guarded
+request path. A newer request invalidates older responses, including during
+React Strict Mode cleanup, so stale results cannot replace the latest scope.
+
 - **SearchBar** (42 lines) — Query input with real-time validation.
 - **FilterBar** — Multi-select filters for provider, project, host, role, date range, and git branch.
 - **ResultCard** — Search hit preview with provider badge, snippet, and per-session code-change pill. Takes the retention cutoff and swaps the line counts for a pruned marker when the hit predates it — see [[frontend#Frontend#Components#Retention Degradation]].
@@ -261,15 +265,14 @@ cutoff null — degrading to the pre-014 rendering rather than to a banner
 asserting a boundary that may not exist. It is deliberately separate from the
 Settings control's policy hook, which can also write.
 
-[[src/components/RetentionBanner.tsx#RetentionBanner]] renders the cutoff plus a
-per-surface footnote and returns nothing when the cutoff is null. Its
-`RetentionSurface` union is the scope of the whole treatment, and it is small on
-purpose: `range_to_duration` caps every range-based reader at 30 days and the
+[[src/components/RetentionBanner.tsx#RetentionBanner]] renders the Session
+Search cutoff disclosure and returns nothing when the cutoff is null. Its scope
+is narrow on purpose: `range_to_duration` caps every range-based reader at 30 days and the
 retention preset floor is 30 days, so `get_code_stats`,
 `get_code_stats_history` and `get_llm_runtime_stats` provably cannot reach a
 pruned row and must **not** carry the banner — claiming loss where there is none
 is as dishonest as hiding loss where there is. Only Session Search renders
-this banner for `get_batch_session_code_stats` (surface `session-search`). It
+this banner for `get_batch_session_code_stats`. It
 mounts the full banner from
 [[src/windows/SessionsWindowView.tsx]]; the widget has no room for a
 multi-line disclosure, so affected Trends rows and Charts panels state the
@@ -323,7 +326,7 @@ Sessions separate lifetime work from the active root turn without treating stale
 
 The main rail's fixed no-wrap lifetime group orders retained agent count, one 9 px Agent Orchid bot icon, then agent-only active runtime. Positive totals remain visible after every agent closes; zero or unavailable totals omit the group when no current agents exist. An open list keeps unknown totals as em dashes rather than inferring them from its membership. The second rail exists only for those open agents, whose no-wrap model/runtime pairs wrap at the 320 px width floor without another nested separator. Open model names use Meter Green as explicit healthy/live status while their runtimes stay muted neutral. Known agent-runtime baselines advance from the shared producer timestamp by the number of observed agents with known runtime and an active accrual bit; unknown baselines remain unknown. Long models ellipsize; instant `.wg-row-datum` tooltips replace delayed native titles and retain full identity. Claude tiers sort Opus → Sonnet → Haiku → Fable, Codex tiers sort Sol → Terra → Luna, other exact labels sort stably after known tiers, and `?` identifies only an agent with neither model nor type.
 
-`SessionBreakdown.active_runtime_secs` is nullable lifetime family runtime and stays null until runtime backfill completes. Nullable `agent_count` and `agent_runtime_secs` describe distinct retained sidechains and their agent-only active runtime. Root runtime never enters those values. `current_turn_runtime_secs` is nullable root open-tail evidence, `current_turn_runtime_active` controls its one-second accrual, and shared nullable `runtime_as_of_ms` timestamps every baseline. `active_runtime_rate` remains the additive family accrual rate. `turn_count` is the host-qualified lifetime count of completed root prompt-response turns; in-flight and sub-agent turns do not contribute. `observed_agents` preserves each open agent's identity, nullable lifetime runtime, and accrual bit used for agent-total extrapolation. `observed_only` still renders unavailable tokens and turns as em dashes.
+`SessionBreakdown.active_runtime_secs` is nullable lifetime family runtime and stays null until runtime backfill completes. Nullable `agent_count` and `agent_runtime_secs` describe distinct retained sidechains and their agent-only active runtime. Root runtime never enters those values. `current_turn_runtime_secs` is nullable root open-tail evidence, `current_turn_runtime_active` controls its one-second accrual, and shared nullable `runtime_as_of_ms` timestamps every baseline. `active_runtime_rate` remains the additive family accrual rate. `turn_count` is the host-qualified lifetime count of completed root prompt-response turns; in-flight and sub-agent turns do not contribute. `observed_agents` preserves each open agent's identity, nullable source-local runtime, and accrual bit used for agent-total extrapolation; a successfully reconciled chain can publish those fields before global historical runtime backfill completes, while a failed or absent chain stays unknown. `observed_only` still renders unavailable tokens and turns as em dashes.
 
 Exact open-agent membership and transcript identity come from one registry snapshot. Retained model resolution runs after unlocking against those captured targets, so a scan landing mid-resolution cannot mix generations into one agent list.
 
@@ -422,9 +425,11 @@ invalidates entries; only an emitted event does. `tokens-updated`,
 `sessions-index-updated`, `transcript-analytics-updated`,
 `context-savings-updated`, `hooks-observed-updated`, and data-changing
 `model-analytics-updated` events each invalidate only hooks that declared that
-dependency. Sessions and Hooks both declare `hooks-observed-updated`; accepted
-lifecycle changes therefore join the same mounted fan-out no later than five
-seconds after the event, with no feature-specific timer or polling path.
+dependency. Mounted session breakdowns refresh immediately after
+`transcript-analytics-updated`; sibling analytics queries keep the shared
+five-second fan-out. Sessions and Hooks both declare `hooks-observed-updated`,
+so accepted lifecycle changes join that normal fan-out without a
+feature-specific timer or polling path.
 
 `useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 

@@ -48,11 +48,14 @@ fn compute_provider_pool(
         .iter()
         .filter(|account| account.is_healthy())
         .count();
+    let all_cooling = provider_accounts.iter().all(|account| {
+        account.is_quota_readable() && account.health.status.trim().eq_ignore_ascii_case("cooling")
+    });
     let mut means = BTreeMap::<String, (UsageBucket, f64, usize)>::new();
     for account in provider_accounts
         .iter()
         .copied()
-        .filter(|account| account.is_healthy())
+        .filter(|account| account.is_healthy() || all_cooling)
     {
         let Some(buckets) = account.buckets.as_ref() else {
             continue;
@@ -258,6 +261,33 @@ mod tests {
         assert_eq!(pool.buckets.len(), 2);
         assert_eq!(pool.buckets[0].utilization, 13.0);
         assert_eq!(pool.buckets[1].utilization, 21.0);
+    }
+
+    // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#All-cooling fallback]]
+    #[test]
+    fn averages_cooling_accounts_when_none_are_active() {
+        let accounts = [
+            account(
+                "a",
+                "cooling",
+                false,
+                false,
+                false,
+                Some(vec![bucket("a", "5h", 40.0)]),
+            ),
+            account(
+                "b",
+                "cooling",
+                false,
+                false,
+                false,
+                Some(vec![bucket("b", "5h", 100.0)]),
+            ),
+        ];
+
+        let pool = &compute_cpa_pools(&accounts)[0];
+        assert_eq!((pool.healthy, pool.total), (0, 2));
+        assert_eq!(pool.buckets[0].utilization, 70.0);
     }
 
     // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation#Usable lifecycle compatibility]]

@@ -194,7 +194,7 @@ After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted runni
 
 [[src-tauri/src/sessions.rs#SessionIndex#startup_scan]] uses the same concrete provider walkers as retained inventory but consumes their permissive search view. Search keeps original filesystem paths with nanosecond-mtime-and-size fingerprints and remains parent-session aware, while analytics derives canonical containment and root-completeness proofs separately. Search extraction and scan failures cannot suppress startup or periodic analytics reconciliation.
 
-The always-on transcript rescan loop ([[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]) sends every source modified past its watermark once through [[src-tauri/src/lib.rs#enqueue_retained_live_source]]. Periodic discovery therefore covers model evidence and runtime analytics when a session hook never fires, without translating source keys or merging sibling work.
+[[src-tauri/src/transcript_watcher.rs#start]] recursively watches distinct Claude and Codex transcript roots and admits debounced JSONL create, content-write, and rename targets through strict single-source validation and [[src-tauri/src/lib.rs#enqueue_retained_live_source]]. Missing or failed watches retry every 120 seconds without duplicate registration; ambiguous canonical roots are rejected.
 
 [[src/hooks/useModelAnalytics.ts#useModelAnalytics]] requests only one command-and-arguments-scoped overview through the process-lifetime invoke cache. Data-changing model events invalidate that key and join the shared five-second-or-longer mounted fan-out; the 60-second fallback poll follows the same path. Each accepted overview advances the frontend refresh generation and updates both [[src/components/widget/views/ModelsView.tsx#ModelsView]] bands as one unit. The widget has no selected-model paging or lazy chain-history request to fan out.
 
@@ -261,7 +261,7 @@ Failure is isolated per source. `RootReconciliationFault` separates a source-sco
 
 Live notifications use the shared provider-plus-source coordinator while transcript reconciliation keeps its own completion and retry state. Scoped reconciliation combines the changed source with persisted sibling identities and reparses only descendants whose resolved root moves. A provider/root permit serializes full inventory-through-prune and scoped prepare-through-commit lifecycles, while registry writes reject older generations.
 
-Live coverage no longer depends solely on the per-session `/sessions/notify` hook. The always-on transcript rescan loop ([[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]], see [[architecture#Background Tasks]]) re-enumerates both roots on an interval and enqueues sources whose mtime advanced past its in-memory watermark through [[src-tauri/src/lib.rs#enqueue_retained_live_source]], so a session created after startup whose hook never fires is still ingested. Unchanged sources short-circuit to a stat-only `SuppressedUnchanged` verdict.
+Live coverage no longer depends solely on the per-session `/sessions/notify` hook. [[src-tauri/src/transcript_watcher.rs#start]] coalesces relevant JSONL bursts for at most one second, then reuses strict source validation and the canonical live queue. Remove, rename, notify-rescan, and bounded-buffer overflow signals promptly invoke existing whole-root graph reconciliation and pruning. The 120-second rescan loop ([[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]], see [[architecture#Background Tasks]]) reuses one inventory for whole-root reconciliation and changed-source admission, recovering missed deletions and events. Unchanged sources short-circuit to a stat-only `SuppressedUnchanged` verdict.
 
 Per-source capped backoff lets healthy siblings continue after one source fails. A successful changed snapshot emits `transcript-analytics-updated`, refreshing runtime and breakdown views without relying on Session Search events.
 
@@ -284,6 +284,30 @@ One failed transcript source must not delay a healthy sibling or its independent
 ##### Model Backfill Isolation
 
 A reserved model-history backfill must gate model work only; transcript jobs remain immediately eligible.
+
+#### Transcript Watcher Test Specs
+
+These tests pin provider routing, bounded coalescing, event filtering, and recovery behavior without starting a live Quill window.
+
+##### Provider Paths And Burst Coalescing
+
+Claude and Codex JSONL paths must retain their provider while duplicate bursts collapse to one pending path and flush by the one-second ceiling.
+
+##### Relevant Event Filtering And Prune Recovery
+
+Only unambiguous in-root JSONL create, content-write, and rename targets may enter targeted admission. Remove and rename events must request whole-root pruning recovery; metadata stays ignored.
+
+##### Late Root And Watch Recovery
+
+A missing or failed provider root must retry registration later, while an already watched root must never register twice.
+
+##### Bounded Overflow Recovery
+
+Exceeding either bounded event buffer must request prompt whole-root reconciliation instead of silently waiting for periodic recovery.
+
+##### Duplicate Root Rejection
+
+Two providers resolving to one canonical root must not register the later duplicate or route either provider's event by first match.
 
 ### Live Analytics Origin
 

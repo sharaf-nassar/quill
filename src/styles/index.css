@@ -1757,10 +1757,9 @@ body {
 }
 
 /* ─── Resize border ───
-   `decorations: false` leaves the window manager no frame to hit-test, so the
-   eight zones rendered by src/components/WindowResizeHandles.tsx are the whole
-   resize affordance of every window in the app. The overlay is click-through;
-   only the zones take the pointer.
+   Linux/Windows `decorations: false` leaves no native frame, so these eight
+   zones are their resize affordance. macOS renders none and uses AppKit. The
+   overlay is click-through; only the zones take the pointer.
 
    The geometry is two numbers — `--wrh-edge` and `--wrh-corner` — because the
    clearance it has to respect belongs to the host window's chrome, not to the

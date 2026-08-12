@@ -13,7 +13,7 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 ## Multi-Window Design
 
-The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main widget, the consolidated Manage workspace, and a release-notes viewer. All three are decorationless, transparent, and freely resizable.
+The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main widget, the consolidated Manage workspace, and a release-notes viewer. All three are transparent, paint custom visual chrome, and resize freely.
 
 The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
@@ -23,15 +23,15 @@ The Sessions, Learning, Restart, and Settings management surfaces are consolidat
 
 The main widget lives in `src-tauri/tauri.conf.json`, while the dynamically created `manage` and `release-notes` windows are allowed by `src-tauri/capabilities/default.json`.
 
-The main window is `resizable: true` and drags freely on both axes. It opens at 360x800 with a 320px minimum width and a 200px minimum height, declares no maximum on either axis, and stays borderless and transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to the Settings window, which is now the only place it appears.
+The main window is `resizable: true` and drags freely on both axes. It opens at 360x800 with a 320px minimum width and a 200px minimum height, declares no maximum on either axis, and stays transparent so the widget can paint its own rounded surface. Its chrome is [[src/components/widget/WidgetTitleBar.tsx]]; the app version moved to Settings.
 
 Topmost behavior is a backend-owned runtime setting, not restored window geometry. [[src-tauri/src/lib.rs#apply_runtime_settings]] admits one Settings or tray writer through a nonblocking gate, submits each changed native request immediately, and only publishes the preference after persistence and checkitem synchronization succeed; failed stages compensate to the persisted prior state. A concurrent writer receives a busy error instead of blocking the event-loop thread while another writer marshals menu work back to it.
 
 The 800px height is measured, not chosen. The default Usage view renders 788px tall at the 360px design width with its breakdown saturated at `BREAKDOWN_LIMIT` rows — 43px of non-scrolling chrome (40px titlebar, 1px rule, 2px shell borders) above a 745px content column — and 800 rounds that up so sub-pixel rounding at fractional display scaling cannot reintroduce a scrollbar. Usage is also the tallest view, so Trends, Charts, Models, and Context all fit inside it. The earlier 560 was a placeholder for the deleted content-driven sizer described in [[frontend#Main Window Layout]], and once that sizer was gone it opened the widget with its lower bands cut off.
 
-`resizable: true` is inert by itself on a `decorations: false` window: there is no native frame for the window manager to hit-test, so the flag only means the compositor will honour a resize the app asks for. The affordance that asks is [[src/components/WindowResizeHandles.tsx]], and all three windows are decorationless, so [[src/main.tsx]] mounts it on all three routes — see [[architecture#Multi-Window Design#Window Configuration#Resize Border Geometry]].
+Chrome follows one platform policy. On macOS every window is decorated with an overlay titlebar and hidden title, while the backend `window_chrome` plugin hides AppKit's close, miniaturize, and zoom buttons; AppKit supplies native edge and corner hit-testing without visible system chrome. The complete main-window object is repeated in `tauri.macos.conf.json` because Tauri replaces platform-config arrays, and dynamic windows spread [[src/lib/windowChrome.ts#WINDOW_CHROME_OPTIONS]]. The macOS config enables `macOSPrivateApi` to preserve the transparent shell; Quill's DMG/app distribution accepts the resulting Mac App Store incompatibility. Linux and Windows remain decorationless and use [[src/components/WindowResizeHandles.tsx]] — see [[architecture#Multi-Window Design#Window Configuration#Resize Border Geometry]].
 
-Geometry belongs to the user, so `tauri-plugin-window-state` persists the widget's size and position like every other window. The plugin is still built with `skip_initial_state("main")` because its automatic restore replays every flag, and a saved `decorated` or `visible` value would undo the decorationless surface and the close-to-tray contract. Skipping that restore drops all flags for the window, so the two the widget actually wants are restored explicitly in setup with `StateFlags::POSITION | StateFlags::SIZE`; `skip_initial_state` gates only the restore, so saving is unaffected. Other windows keep the plugin's full default behaviour.
+Geometry belongs to the user, so `tauri-plugin-window-state` persists size and position. Its global state flags exclude `DECORATIONS`, preventing stale state from overriding either platform's chrome policy. `main` still skips automatic restore and explicitly restores position and size so visibility remains owned by close-to-tray; saving is unaffected. Other windows restore the remaining flags automatically.
 
 Size restore is guarded by a one-time reset, [[src-tauri/src/lib.rs#widget_restore_flags]]. A profile upgrading from the pre-widget split-pane main window still has that window's much wider geometry saved under `main` — several hundred pixels past the widget's 360px — and restoring it would override the config default on the first widget launch. While the [[src-tauri/src/lib.rs#WIDGET_SIZE_RESET_MARKER_KEY]] setting is absent the restore therefore asks for `StateFlags::POSITION` alone, so the config size wins, and the marker is written at that moment rather than after the window is up so a later startup failure cannot replay the reset over a size the user has since chosen. The plugin still saves on exit, which replaces the stale entry with the widget's own geometry; every launch after that restores `POSITION | SIZE` as before. Position is never withheld, and the key is deliberately distinct from the `widget_ui_v1` always-on-top marker, which earlier builds may already have written.
 
@@ -45,7 +45,9 @@ The clamp is gated on `StateFlags::SIZE` being absent from the restore flags rat
 
 #### Resize Border Geometry
 
-The eight zones have to clear each host window's own chrome, so the geometry is two custom properties on the overlay — `--wrh-edge` and `--wrh-corner` — and the `variant` prop of [[src/components/WindowResizeHandles.tsx]] selects which pair applies.
+Linux and Windows use eight HTML resize zones; macOS uses AppKit's native frame.
+
+Fallback geometry uses `--wrh-edge`, `--wrh-corner`, and the `variant` prop of [[src/components/WindowResizeHandles.tsx]].
 
 The widget takes the default 5px edges and 12px corners: 12px is `.wg-shell`'s own radius, so the corner square covers exactly the transparent notch, and the titlebar keycaps and view dropdown still clear it by at least 2px. Manage and release-notes take the `roomy` variant — the same 5px edges, but 8px corners.
 

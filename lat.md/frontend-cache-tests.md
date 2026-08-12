@@ -22,6 +22,10 @@ Resolving async push-listener registrations causes no cache invalidation; only a
 
 Continuous one-second invalidations produce complete mounted fan-outs no more often than every 5,000 ms, without starvation or cancellation when a sibling subscriber leaves.
 
+## Transcript runtime refresh is immediate
+
+A transcript event refreshes mounted session breakdown data immediately, coalesces updates during an in-flight read, and leaves sibling analytics on the shared 5,000 ms cadence.
+
 ## Arguments isolate cache entries
 
 Stable serialization coalesces equivalent object key order while distinct ranges remain distinct cache entries.

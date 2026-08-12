@@ -12,5 +12,11 @@ export type { VizSeries } from "./AreaChart";
 export { default as Bars } from "./Bars";
 export type { VizBar } from "./Bars";
 export { default as Sparkline } from "./Sparkline";
-export { areaPath, scalePoints, seriesMax, smoothPath } from "./geometry";
+export {
+  areaPath,
+  bucketTotals,
+  scalePoints,
+  seriesMax,
+  smoothPath,
+} from "./geometry";
 export type { VizPoint } from "./geometry";

@@ -92,9 +92,8 @@ const ManageWindowView = React.lazy(
 const params = new URLSearchParams(window.location.search);
 const view = params.get("view");
 
-// The widget paints its own rounded surface on a transparent, decorationless
-// window, so the document must not paint one behind it. Other routes keep the
-// opaque page background.
+// The widget paints its own rounded surface on a transparent window, so the
+// document must not paint one behind it. Other routes keep an opaque page.
 document.documentElement.dataset.view = view ?? "main";
 
 // ⌘M / Ctrl+M opens the Manage workspace, focusing it when it already exists.
@@ -109,12 +108,9 @@ if (view === null) {
   });
 }
 
-// All three windows are decorationless, so all three need the resize border.
-// It is mounted per route rather than once around `RoutedView` because the
-// zone geometry has to clear each window's own chrome: the widget's 12px
-// corner squares match `.wg-shell`'s radius, while Manage and release-notes
-// put a close key close enough to the top-right corner to need the smaller
-// `roomy` squares.
+// Linux and Windows need the custom resize border; it suppresses itself on
+// macOS where AppKit owns frame hit-testing. Each route retains its fallback
+// geometry because its zones must clear that window's custom chrome.
 function MainAppView() {
   const integrations = useIntegrations();
   return (

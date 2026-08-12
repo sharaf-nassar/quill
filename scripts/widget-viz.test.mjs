@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  bucketTotals,
   bucketIndexAtPosition,
   legendPositionAtPosition,
 } from "../src/components/widget/viz/geometry.ts";
+
+// @lat: [[widget-viz-tests#Widget Viz Tests#Bucket Series Totals]]
+test("bucket totals align uneven provider series", () => {
+  assert.deepEqual(
+    bucketTotals([{ values: [1, 2, 3] }, { values: [4, 5] }]),
+    [5, 7, 3],
+  );
+  assert.deepEqual(bucketTotals([]), []);
+});
 
 // @lat: [[widget-viz-tests#Widget Viz Tests#Pointer Scrub Bucket Mapping]]
 test("pointer positions select buckets and place the floating legend", () => {

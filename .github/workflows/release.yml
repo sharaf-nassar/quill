@@ -100,12 +100,6 @@ jobs:
           echo "Setting version to ${VERSION}"
           sed -i.bak -E 's/^version = ".*"/version = "'"${VERSION}"'"/' src-tauri/Cargo.toml
           rm -f src-tauri/Cargo.toml.bak
-          node -e "
-            const fs = require('fs');
-            const p = JSON.parse(fs.readFileSync('package.json'));
-            p.version = '${VERSION}';
-            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
-          "
 
       - name: Import Apple Developer Certificate
         if: matrix.platform == 'macos-latest'
@@ -145,15 +139,10 @@ jobs:
             exit 1
           fi
 
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
           CARGO_VERSION="$(node -e 'const fs = require("fs"); const match = fs.readFileSync("src-tauri/Cargo.toml", "utf8").match(/^version = "([^"]+)"$/m); if (!match) process.exit(1); process.stdout.write(match[1])')"
           EXPECTED_RELEASE="v${CARGO_VERSION}"
 
-          if [ "$PACKAGE_VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::package.json and Cargo.toml versions differ"
-            exit 1
-          fi
-          if [ "$SENTRY_RELEASE" != "$EXPECTED_RELEASE" ] || [ "$VITE_APP_VERSION" != "$EXPECTED_RELEASE" ]; then
+          if [ "$GITHUB_REF_NAME" != "$EXPECTED_RELEASE" ] || [ "$SENTRY_RELEASE" != "$EXPECTED_RELEASE" ] || [ "$VITE_APP_VERSION" != "$EXPECTED_RELEASE" ]; then
             echo "::error::Sentry release identifiers do not match ${EXPECTED_RELEASE}"
             exit 1
           fi

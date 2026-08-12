@@ -12,6 +12,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { listen } from "@tauri-apps/api/event";
 import { useIntegrations } from "../hooks/useIntegrations";
+import { IS_MACOS } from "../lib/windowChrome";
 import CommandPalette, {
   type PaletteCommand,
 } from "../components/CommandPalette";
@@ -128,8 +129,7 @@ const SECTIONS: SectionDef[] = [
 
 const SECTION_IDS = SECTIONS.map((s) => s.id);
 const STORAGE_KEY = "quill-manage-section";
-const IS_MAC =
-  typeof navigator !== "undefined" && navigator.userAgent.includes("Mac");
+const IS_MAC = IS_MACOS;
 
 function resolveInitialSection(): ManageSection {
   const fromUrl = new URLSearchParams(window.location.search).get("section");

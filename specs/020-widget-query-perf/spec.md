@@ -191,7 +191,8 @@ that selecting a smaller window actually costs less.
 - Switching between views and back re-renders from cache without re-issuing
   the full query fan-out; a background revalidate is allowed.
 - During active ingest, a mounted view's query fan-out is coalesced to a
-  cadence of ≥5s (normative; supersedes 013 clarification Q7).
+  cadence of ≥5s (normative; supersedes 013 clarification Q7), except the
+  session breakdown refreshes immediately after transcript analytics commits.
 
 ### S5 — Query-level cleanups hold up
 
@@ -499,7 +500,8 @@ rollout with 18,057 token events has zero DB rows and no inventory row
 despite live ingest); true current throughput understated ~100×. (b) Skills all-time is a
 **bug** — scope to the selected range. (c) Refresh cadence during active
 ingest: **coalesce to ≥5s** (normative; explicitly supersedes 013
-clarification Q7's "live ingest events still force a refresh").
+clarification Q7's "live ingest events still force a refresh"), except the
+session breakdown refreshes immediately after transcript analytics commits.
 (d) Comparison deltas use the **prior period of equal length (range×2)**,
 replacing next-larger-preset; the prior-period fetch is the one
 enumerated, justified over-range query.
