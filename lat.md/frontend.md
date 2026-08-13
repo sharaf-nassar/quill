@@ -328,7 +328,7 @@ The main rail's fixed no-wrap lifetime group orders retained agent count, one 9 
 
 `SessionBreakdown.active_runtime_secs` is nullable lifetime family runtime and stays null until runtime backfill completes. Nullable `agent_count` and `agent_runtime_secs` describe distinct retained sidechains and their agent-only active runtime. Root runtime never enters those values. `current_turn_runtime_secs` is nullable root open-tail evidence, `current_turn_runtime_active` controls its one-second accrual, and shared nullable `runtime_as_of_ms` timestamps every baseline. `active_runtime_rate` remains the additive family accrual rate. `turn_count` is the host-qualified lifetime count of completed root prompt-response turns; in-flight and sub-agent turns do not contribute. `observed_agents` preserves each open agent's identity, nullable source-local runtime, and accrual bit used for agent-total extrapolation; a successfully reconciled chain can publish those fields before global historical runtime backfill completes, while a failed or absent chain stays unknown. `observed_only` still renders unavailable tokens and turns as em dashes.
 
-Exact open-agent membership and transcript identity come from one registry snapshot. Retained model resolution runs after unlocking against those captured targets, so a scan landing mid-resolution cannot mix generations into one agent list.
+Exact open-agent membership, transcript identity, and each agent's model all come from [[data-flow#Data Flow#Live Session Tracker|the live fold]] under one lock, so a row's agent list is one consistent answer rather than a merge of two sources that can disagree.
 
 ### Restart Component
 
@@ -423,13 +423,15 @@ listener registration and module timers clean up under Strict Mode, while
 settled data survives the unmount. Listener promise settlement never
 invalidates entries; only an emitted event does. `tokens-updated`,
 `sessions-index-updated`, `transcript-analytics-updated`,
-`context-savings-updated`, `hooks-observed-updated`, and data-changing
-`model-analytics-updated` events each invalidate only hooks that declared that
-dependency. Mounted session breakdowns refresh immediately after
-`transcript-analytics-updated`; sibling analytics queries keep the shared
+`context-savings-updated`, `hooks-observed-updated`, `sessions-live-updated`,
+and data-changing `model-analytics-updated` events each invalidate only hooks
+that declared that dependency. Mounted session breakdowns refresh immediately
+after `transcript-analytics-updated`; sibling analytics queries keep the shared
 five-second fan-out. Sessions and Hooks both declare `hooks-observed-updated`,
 so accepted lifecycle changes join that normal fan-out without a
-feature-specific timer or polling path.
+feature-specific timer or polling path. Only the Sessions breakdown declares
+`sessions-live-updated`, so an agent opening or closing reaches the rows on the
+same fan-out, already coalesced by the tracker's own emit window.
 
 `useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 

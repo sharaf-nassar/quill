@@ -4,7 +4,7 @@ lat:
 ---
 # Live Subagent Count Tests
 
-These authorized tests protect transcript-derived session truth, provider delivery, nullable IPC, audit separation, and positive-only Sessions rows.
+These authorized tests protect the live fold over local transcripts, provider delivery, nullable IPC, audit separation, and positive-only Sessions rows.
 
 ## Sessions Terminal Evidence Projection
 
@@ -20,7 +20,7 @@ Command-layer enrichment overlays exact provider, host, and root matches while u
 
 ## Limited Stored Session Reopening
 
-A retained row outside the SQL limit rejoins transcript reconciliation by provider, session, and normalized host, preserving token and turn metrics even when neither stored nor scanned evidence supplies cwd.
+A retained row outside the SQL limit rejoins the result through the fold's own ranking keys by provider, session, and normalized host, preserving token and turn metrics even when neither the stored row nor the fold supplies cwd.
 
 ## Claude Managed Observer Hooks
 
@@ -58,7 +58,7 @@ Frontend provenance formatting renders unavailable synthetic tokens as an em das
 
 ## Shared Root Session Id
 
-Retained inventory and live scanning derive a transcript's root session id through one helper per provider, so the two consumers cannot drift apart on layout rules.
+Retained inventory and the live fold derive a transcript's root session id through one helper per provider, so the two consumers cannot drift apart on layout rules.
 
 Claude parents resolve to the file stem and sub-agents to the directory holding `subagents/` at any nesting depth, including the Workflow layout. Codex takes the trailing uuid of a `rollout-<timestamp>-<thread id>` name and rejects a malformed one outright rather than returning a truncated id.
 

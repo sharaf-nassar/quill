@@ -136,13 +136,13 @@ Hook fires are durable SQLite audit rows; the newest root terminal hook is also 
 
 Root Stop and SessionEnd are observed for both providers, plus Claude StopFailure. SessionStart and subagent lifecycle stay transcript-derived; crashes and power loss retain the five-minute fallback.
 
-Disabling activity tracking removes both managed observer paths and clears every snapshot. Provider disable clears only that provider. Activity and provider mutations emit `hooks-observed-updated` after the clear so mounted Sessions caches refresh immediately; the next Sessions read rebuilds the cleared state from a fresh scan. Snapshots past the 15-minute staleness cutoff are removed rather than kept as distrusted state, so reads fail closed to null and memory stays bounded by sessions still producing evidence.
+Disabling activity tracking removes both managed observer paths and clears the whole fold; provider disable clears only that provider's half of it. Both mutations emit `hooks-observed-updated` after the clear so mounted Sessions caches refresh immediately, and the next sweep rather than the next read rebuilds whatever is still live. A session silent past [[src-tauri/src/live_tracker.rs#IDLE_AFTER]] is evicted rather than kept as distrusted state, so an uncovered row reads as null instead of a false zero and memory stays bounded by sessions still producing evidence.
 
 Codex config changes flow through parsed TOML: install snapshots the active custom or default Codex home, records prior feature and MCP environment values, replaces only Quill commands, then reconciles positional trust keys against pre/post `hooks/list` metadata. Verification reparses the file, rejects retired Quill shell-hook commands omitted from `hooks/list`, and checks exact enabled/trusted handlers; startup repair then migrates stale registrations, which is also what prunes lifecycle registrations written by an older Quill. Uninstall targets the recorded home and restores the captured user values.
 
 ## Live Session Tracker
 
-[[src-tauri/src/live_tracker.rs#LiveTracker]] folds live session state from local transcripts as they are written, so a Sessions read costs a map lock instead of a directory walk. It replaces the scan-on-read snapshot pipeline below.
+[[src-tauri/src/live_tracker.rs#LiveTracker]] folds live session state from local transcripts as they are written, so a Sessions read costs a map lock instead of a directory walk. It is the sole owner of liveness and open-agent membership, so no read-time reconciler remains.
 
 [[src-tauri/src/live_tracker.rs#LiveTracker#apply_paths]] folds the transcripts the filesystem watcher reports. Each file carries the byte offset already consumed, so steady state parses only appended bytes; a trailing line without its newline is a record still being written and is left for the next fold, and a file shorter than its offset was rewritten rather than appended to and is folded whole. A file whose length still equals its offset is skipped without being opened, so the sweep costs one `stat` per quiet transcript.
 
