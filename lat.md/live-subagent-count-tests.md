@@ -156,7 +156,7 @@ Claude parents resolve to the file stem and sub-agents to the directory holding 
 
 ## Live Tracker Tail Mechanics
 
-A fold consumes only the bytes appended since the previous one and leaves a record still mid-write unconsumed, so activity advances exactly once and only when its record is complete.
+A fold consumes only the bytes appended since the previous one and leaves a record still mid-write unconsumed, so activity advances and a spawn closes exactly once, and only when the record carrying that evidence is complete.
 
 ## Live Tracker Truncation Reset
 
@@ -169,3 +169,29 @@ A session quiet past the idle cutoff releases both its folded state and the file
 ## Live Tracker Enable Toggles
 
 Disabling activity tracking or one provider clears the folded state it covers and keeps later folds out, and re-enabling rebuilds from the transcripts on the next sweep rather than from anything retained.
+
+## Live Tracker Spawn Resolution
+
+A tool-spawned agent stays open until its spawning call has a result anywhere in the session tree, including the depth-2 case whose result lands in the parent agent's transcript rather than the root.
+
+The session takes its origin and project from the root transcript's first record, and each agent takes its type from the metadata written beside it.
+
+## Live Tracker Workflow Journal
+
+Workflow-spawned agents carry no spawning tool call, so the journal the fold pulls in beside them is their only closure evidence and each agent id resolves against its own `result` record.
+
+## Live Tracker Abandoned Spawn
+
+An unresolved spawn whose own transcript went silent past the cutoff is abandoned rather than slow, while a sibling still writing stays open and keeps the session itself live.
+
+## Live Tracker Session Activity
+
+A session takes origin and project from its first record and keeps them, advances activity from later timestamped content, and ignores hook-result attachments so terminal bookkeeping cannot reopen it.
+
+## Live Tracker Agent Metadata
+
+A `.meta.json` that lost the race to the transcript beside it is picked up by a later event rather than never, so the agent gains its type and its spawning call without any new transcript bytes behind the retry.
+
+## Live Tracker Agent Model
+
+An agent's model comes from its own assistant records and passes the same validation retained evidence does, so a malformed id leaves the agent unlabelled instead of mislabelled.

@@ -39,9 +39,9 @@ pub(crate) use crate::live_tracker::IDLE_AFTER;
 /// so one pass serves the whole burst instead of one pass per reader.
 const MIN_SCAN_INTERVAL: TimeDelta = TimeDelta::seconds(3);
 
-const AGENT_FILE_PREFIX: &str = "agent-";
-const WORKFLOW_DIR_PREFIX: &str = "wf_";
-const WORKFLOW_JOURNAL: &str = "journal.jsonl";
+pub(crate) const AGENT_FILE_PREFIX: &str = "agent-";
+pub(crate) const WORKFLOW_DIR_PREFIX: &str = "wf_";
+pub(crate) const WORKFLOW_JOURNAL: &str = "journal.jsonl";
 
 /// Guard against a malformed parent chain walking forever. Measured Codex spawn
 /// depth across 4487 spawned rollouts reaches 3 (4175 at 1, 297 at 2, 15 at 3).
@@ -154,9 +154,9 @@ struct AgentFile {
 /// The `.meta.json` Claude writes beside every sub-agent transcript at spawn.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct AgentMeta {
-    tool_use_id: Option<String>,
-    agent_type: Option<String>,
+pub(crate) struct AgentMeta {
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) agent_type: Option<String>,
 }
 
 /// The fields of a transcript record this scanner reads. `content` stays an
@@ -173,6 +173,8 @@ pub(crate) struct ScanRecord {
 #[derive(Deserialize)]
 struct ScanMessage {
     content: Option<serde_json::Value>,
+    /// Present on every assistant record, absent on user records.
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -482,7 +484,7 @@ fn collect_active_sessions(
 }
 
 /// `agent-<id>.jsonl` carries the same id the workflow journal records use.
-fn claude_agent_id(path: &Path) -> Option<String> {
+pub(crate) fn claude_agent_id(path: &Path) -> Option<String> {
     path.file_stem()?
         .to_str()?
         .strip_prefix(AGENT_FILE_PREFIX)
@@ -784,7 +786,7 @@ fn codex_turn_event(line: &str) -> Option<&'static str> {
     }
 }
 
-fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
+pub(crate) fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
     let stem = transcript.file_stem()?.to_str()?;
     let meta = transcript.with_file_name(format!("{stem}.meta.json"));
     serde_json::from_str(&std::fs::read_to_string(meta).ok()?).ok()
@@ -849,15 +851,30 @@ pub(crate) fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<
 
 /// Origin a root transcript's first timestamped record supplies: when the
 /// session started and the project it runs in.
-fn claude_session_origin(record: &ScanRecord) -> Option<(DateTime<Utc>, Option<String>)> {
+pub(crate) fn claude_session_origin(
+    record: &ScanRecord,
+) -> Option<(DateTime<Utc>, Option<String>)> {
     Some((claude_record_timestamp(record)?, record.cwd.clone()))
+}
+
+/// The model a Claude assistant record names, validated through the same gate
+/// retained evidence passes.
+///
+/// A sub-agent transcript's own assistant records state the model that agent is
+/// running, so its label needs no retained child evidence to be resolved.
+pub(crate) fn claude_record_model(record: &ScanRecord) -> Option<String> {
+    if record.kind.as_deref() != Some("assistant") {
+        return None;
+    }
+    let model = record.message.as_ref()?.model.as_deref()?;
+    crate::model_usage::validate_model_id(model).ok()
 }
 
 /// The agent id a workflow journal line reports as finished.
 ///
 /// A journal carries a `started` and a `result` record per agent it drives, and
 /// only the `result` is closure evidence.
-fn journal_result_agent_id(line: &str) -> Option<String> {
+pub(crate) fn journal_result_agent_id(line: &str) -> Option<String> {
     let record = serde_json::from_str::<JournalRecord>(line).ok()?;
     if record.kind != "result" {
         return None;
@@ -871,7 +888,7 @@ fn journal_result_agent_id(line: &str) -> Option<String> {
 /// to the spawning tool call. An agent with no spawn evidence at all cannot be
 /// claimed open, and one whose own transcript went silent past the idle window
 /// is abandoned rather than slow.
-fn claude_agent_open(
+pub(crate) fn claude_agent_open(
     agent_id: &str,
     workflow: bool,
     tool_use_id: Option<&str>,
@@ -886,7 +903,7 @@ fn claude_agent_open(
     !closed && idle_for <= IDLE_AFTER
 }
 
-fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
+pub(crate) fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
     record
         .message
         .as_ref()

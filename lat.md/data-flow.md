@@ -150,6 +150,16 @@ Codex config changes flow through parsed TOML: install snapshots the active cust
 
 A state-changing fold emits `sessions-live-updated`, coalesced over a 250 ms window so a burst of appends wakes its readers once.
 
+### Claude Fold Rules
+
+Claude transcripts fold by the role their own path states: the session's transcript, a sub-agent transcript at any depth, or a workflow journal.
+
+The session transcript's first timestamped record supplies origin and project through [[src-tauri/src/transcript_scan.rs#claude_session_origin]] and is never re-read, so the origin is established once. Timestamped non-`attachment` records from anywhere in the tree advance activity, because Claude writes hook results after SessionEnd and that bookkeeping must not reopen a finished session.
+
+A sub-agent's `.meta.json`, read by [[src-tauri/src/transcript_scan.rs#read_agent_meta]], supplies its spawning `toolUseId` and agent type. It is written beside the transcript at spawn and can lose the race to it, so the read is retried on every later event for that agent until it lands rather than once when the file is first seen. [[src-tauri/src/transcript_scan.rs#claude_agent_open]] then keeps a tool-spawned agent open until that id appears in a `tool_result` — one resolved-id set per session, fed by every file in the tree, which is what covers the depth≥2 spawn whose result lands in the parent agent's transcript rather than the root. A workflow agent under `subagents/workflows/wf_*/` answers instead to its `journal.jsonl`, which the fold pulls in alongside the agent because the transcript walker enumerates agent files but not journals. An unresolved spawn whose own transcript went silent past [[src-tauri/src/live_tracker.rs#IDLE_AFTER]] is abandoned rather than slow.
+
+[[src-tauri/src/transcript_scan.rs#claude_record_model]] takes an agent's model from its own assistant records, validated through the same gate retained evidence passes, so a sub-agent's label needs no retained child evidence and no second scan to resolve.
+
 ## Transcript-Derived Session Snapshots
 
 [[src-tauri/src/transcript_scan.rs#TranscriptScanner]] derives live Claude and Codex session and agent state from transcripts on disk, so a session that started before Quill launched reports correct agent counts on the first scan rather than staying unknown.
