@@ -201,3 +201,35 @@ A `.meta.json` that lost the race to the transcript beside it is picked up by a 
 ## Live Tracker Agent Model
 
 An agent's model comes from its own assistant records and passes the same validation retained evidence does, so a malformed id leaves the agent unlabelled instead of mislabelled.
+
+## Live Tracker Codex Turn Resolution
+
+A Codex sub-agent counts only while its own rollout's newest turn boundary is a `task_started`, so a thread that completed or aborted its turn stops counting while still being listed with the role its head declared.
+
+The user thread at the root of the chain is the session, never one of its own agents, and it takes its origin and project from that root rollout's head.
+
+## Live Tracker Codex Session Activity
+
+Codex root activity comes from substantive rollout content, so lifecycle, token bookkeeping, and empty items appended after a turn ends cannot reopen a finished session while a later valid tool record does.
+
+## Live Tracker Codex Bounded Initialization
+
+A rollout's first fold reads only a bounded tail, so activity older than that window falls back to the thread's own start rather than costing a read of the whole file, and later folds parse only appended bytes.
+
+A rewritten rollout is shorter than the offset already consumed, which clears the activity it had contributed before its replacement's tail is folded.
+
+## Live Tracker Codex Agent Model
+
+A Codex agent takes the first model its own rollout names and keeps that answer when a later record restates a different one, and stays unlabelled rather than borrowing a sibling's when its rollout names none or names one that fails validation.
+
+## Live Tracker Codex Spawn Chain
+
+Every spawn in a chain folds into the one user thread at its root rather than into its immediate parent, across both spawn schema eras, so a grandchild reaching the root only by hopping through its parent joins the same session.
+
+## Live Tracker Codex Turn Tail
+
+A turn's own records can push its `task_started` out of the bounded window, and a window holding no boundary means the tail is still inside a turn; a boundary still mid-write is left unconsumed rather than read as half a record.
+
+## Live Tracker Codex Idle Cutoff
+
+A rollout that died mid-turn leaves an unmatched `task_started` forever, so silence past the cutoff is the only thing that stops it counting, and once its root goes quiet too the whole tree leaves the fold and releases its offsets.

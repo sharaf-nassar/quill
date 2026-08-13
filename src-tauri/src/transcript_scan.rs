@@ -51,7 +51,7 @@ const MAX_CODEX_SPAWN_DEPTH: u32 = 16;
 /// the 4487 spawned rollouts measured has a boundary inside a window this long,
 /// and a window without one is itself the answer: a rollout only accumulates
 /// records inside a turn, so the tail is still in an open one.
-const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
+pub(crate) const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
 
 /// How far into a rollout the head read looks for the thread's model.
 ///
@@ -203,14 +203,14 @@ struct CodexAgentFile {
 /// The `session_meta` record every Codex rollout opens with. It is written once
 /// at thread creation, so a re-read always yields the same answer.
 #[derive(Clone)]
-struct CodexHead {
-    session_id: String,
+pub(crate) struct CodexHead {
+    pub(crate) session_id: String,
     parent_id: Option<String>,
-    subagent: bool,
-    agent_role: Option<String>,
-    model: Option<String>,
-    cwd: Option<String>,
-    started_at: Option<DateTime<Utc>>,
+    pub(crate) subagent: bool,
+    pub(crate) agent_role: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
 }
 
 const CODEX_EVENT_RECORD: &str = "event_msg";
@@ -304,8 +304,8 @@ impl TranscriptScanner {
         // Only a rollout that is still being written can hold an open agent, so
         // stage two reads the head of the fresh files and of the ancestors they
         // name, never of the whole corpus.
-        for (id, (path, modified)) in &index {
-            if elapsed(now, *modified) > IDLE_AFTER {
+        for (id, path) in &index {
+            if !crate::live_tracker::modified_within_idle_window(path, now) {
                 continue;
             }
             let Some(head) = codex_head(id, &index, &mut heads) else {
@@ -500,33 +500,31 @@ pub(crate) fn claude_agent_id(path: &Path) -> Option<String> {
 /// out having an unreadable head — so locating the ancestor a sub-agent names
 /// costs a map lookup rather than a second walk. The id is only a locator:
 /// identity always comes from the head record itself.
-fn codex_rollout_index(sessions_dir: &Path) -> HashMap<String, (PathBuf, SystemTime)> {
+fn codex_rollout_index(sessions_dir: &Path) -> HashMap<String, PathBuf> {
     let mut index = HashMap::new();
     for path in crate::sessions::discover_codex_transcripts_in(sessions_dir) {
         let Some(thread_id) = crate::sessions::codex_thread_id(&path) else {
             continue;
         };
-        let Ok(modified) = std::fs::metadata(&path).and_then(|metadata| metadata.modified()) else {
-            continue;
-        };
-        index.insert(thread_id, (path, modified));
+        index.insert(thread_id, path);
     }
     index
 }
 
 /// Read one rollout's `session_meta`, memoised for the pass because the root of
 /// a deep chain is reached again from every sub-agent under it.
-fn codex_head(
+pub(crate) fn codex_head(
     thread_id: &str,
-    index: &HashMap<String, (PathBuf, SystemTime)>,
+    index: &HashMap<String, PathBuf>,
     heads: &mut HashMap<String, Option<CodexHead>>,
 ) -> Option<CodexHead> {
     if let Some(cached) = heads.get(thread_id) {
         return cached.clone();
     }
-    let head = index
-        .get(thread_id)
-        .and_then(|(path, _)| read_codex_head(path));
+    // A thread the index does not hold is not memoised: the answer belongs to
+    // the index rather than to the file, and a caller that indexes as it goes
+    // would otherwise cache a miss that a later entry resolves.
+    let head = read_codex_head(index.get(thread_id)?);
     heads.insert(thread_id.to_owned(), head.clone());
     head
 }
@@ -606,9 +604,9 @@ fn read_codex_model(reader: impl BufRead) -> Option<String> {
 ///
 /// The hop count bounds the walk but is not reported: which root a sub-agent
 /// belongs to is observable, how many hops away it sits is not.
-fn codex_root(
+pub(crate) fn codex_root(
     head: &CodexHead,
-    index: &HashMap<String, (PathBuf, SystemTime)>,
+    index: &HashMap<String, PathBuf>,
     heads: &mut HashMap<String, Option<CodexHead>>,
 ) -> Option<String> {
     let mut current = head.clone();
@@ -628,13 +626,13 @@ fn codex_root(
 fn codex_session(
     root_id: String,
     group: CodexGroup,
-    index: &HashMap<String, (PathBuf, SystemTime)>,
+    index: &HashMap<String, PathBuf>,
     heads: &mut HashMap<String, Option<CodexHead>>,
     state: &mut ScannedSession,
 ) -> Option<TranscriptSession> {
     let root = codex_head(&root_id, index, heads)?;
     let started_at = root.started_at?;
-    let root_path = &index.get(&root_id)?.0;
+    let root_path = index.get(&root_id)?;
     let offsets = &mut state.offsets;
     let last_activity = &mut state.last_activity;
     let initialized = offsets.contains_key(root_path);
@@ -689,7 +687,7 @@ fn codex_session(
 ///
 /// Turn boundaries, context snapshots, token counts, and other bookkeeping can
 /// be appended after Stop, so neither they nor the file mtime are activity.
-fn codex_activity_timestamp(line: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn codex_activity_timestamp(line: &str) -> Option<DateTime<Utc>> {
     if !line.contains(CODEX_EVENT_RECORD) && !line.contains(CODEX_RESPONSE_ITEM_RECORD) {
         return None;
     }
@@ -740,12 +738,12 @@ fn codex_agent_running(path: &Path) -> bool {
     String::from_utf8_lossy(&window)
         .lines()
         .rev()
-        .find_map(codex_turn_event)
-        .map_or(truncated, |event| event == CODEX_TURN_STARTED)
+        .find_map(codex_turn_boundary)
+        .map_or(truncated, |(started, _)| started)
 }
 
 /// Read a bounded rollout tail and discard its first partial record.
-fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
+pub(crate) fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
     let mut file = File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let start = length.saturating_sub(CODEX_TAIL_SCAN_BYTES);
@@ -766,11 +764,15 @@ fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
     Some((window, body_offset, truncated))
 }
 
-/// The turn-lifecycle event a rollout line carries, if any.
+/// The turn boundary a rollout line carries: whether it opens a turn, and when
+/// the record claims to have been written.
+///
+/// The timestamp is the only clock a rollout that emits nothing but boundaries
+/// has, so a thread that died mid-turn still ages out of the idle window.
 ///
 /// Rollouts also carry whole-file `world_state` snapshots, so the cheap
 /// substring test keeps those megabytes out of the JSON parser.
-fn codex_turn_event(line: &str) -> Option<&'static str> {
+pub(crate) fn codex_turn_boundary(line: &str) -> Option<(bool, Option<DateTime<Utc>>)> {
     if !line.contains(CODEX_EVENT_RECORD) {
         return None;
     }
@@ -778,12 +780,16 @@ fn codex_turn_event(line: &str) -> Option<&'static str> {
     if record.kind != CODEX_EVENT_RECORD {
         return None;
     }
-    match record.payload?.get("type")?.as_str()? {
-        CODEX_TURN_STARTED => Some(CODEX_TURN_STARTED),
-        CODEX_TURN_COMPLETE => Some(CODEX_TURN_COMPLETE),
-        CODEX_TURN_ABORTED => Some(CODEX_TURN_ABORTED),
-        _ => None,
-    }
+    let started = match record.payload?.get("type")?.as_str()? {
+        CODEX_TURN_STARTED => true,
+        CODEX_TURN_COMPLETE | CODEX_TURN_ABORTED => false,
+        _ => return None,
+    };
+    let timestamp = record
+        .timestamp
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc));
+    Some((started, timestamp))
 }
 
 pub(crate) fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
