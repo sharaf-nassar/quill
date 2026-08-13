@@ -13653,63 +13653,6 @@ impl Storage {
         Ok(())
     }
 
-    // Dead with the read-path rewire; removed with the model-evidence overlay.
-    #[allow(dead_code)]
-    pub(crate) fn get_observed_agent_model_evidence(
-        &self,
-        targets: &[crate::models::ObservedAgentModelKey],
-    ) -> Result<HashMap<crate::models::ObservedAgentModelKey, String>, String> {
-        let conn = self.open_view_reader()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT agent_identity, derived_model_id
-                 FROM (
-                     SELECT CASE
-                                WHEN provider = 'codex' THEN chain_id
-                                ELSE agent_id
-                            END AS agent_identity,
-                            derived_model_id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY CASE
-                                    WHEN provider = 'codex' THEN chain_id
-                                    ELSE agent_id
-                                END
-                                ORDER BY observed_at_ms DESC, id DESC
-                            ) AS evidence_rank
-                     FROM model_usage_observations
-                     WHERE provider = ?1
-                       AND analytics_session_id = ?2
-                       AND (agent_id IS NOT NULL
-                            OR (provider = 'codex' AND is_sidechain = 1))
-                       AND derived_model_id IS NOT NULL
-                 )
-                 WHERE evidence_rank = 1",
-            )
-            .map_err(|error| format!("Prepare observed agent model evidence: {error}"))?;
-        let requested = targets.iter().cloned().collect::<HashSet<_>>();
-        let roots = targets
-            .iter()
-            .map(|target| (target.0.clone(), target.1.clone()))
-            .collect::<BTreeSet<_>>();
-        let mut evidence = HashMap::new();
-        for (provider, session_id) in roots {
-            let rows = stmt
-                .query_map(params![&provider, &session_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(|error| format!("Query observed agent model evidence: {error}"))?;
-            for row in rows {
-                let (agent_id, model_id) =
-                    row.map_err(|error| format!("Read observed agent model evidence: {error}"))?;
-                let key = (provider.clone(), session_id.clone(), agent_id);
-                if requested.contains(&key) {
-                    evidence.insert(key, model_id);
-                }
-            }
-        }
-        Ok(evidence)
-    }
-
     pub fn get_project_tokens(&self, days: i32) -> Result<Vec<ProjectTokens>, String> {
         let days = days.clamp(1, 365);
         let conn = self.conn.lock().unwrap();
@@ -20034,50 +19977,6 @@ mod tests {
         assert_eq!(rows[1].2.as_deref(), Some("aaaabbbbccccdddd"));
         assert_eq!(rows[1].3.as_deref(), Some("s1"));
         // stmt + conn drop at scope end; explicit drop would move-conflict.
-        clear_env();
-    }
-
-    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Retained Agent Model Lookup]]
-    #[test]
-    #[serial]
-    fn observed_agent_model_lookup_uses_latest_exact_agent_evidence() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        storage
-            .conn
-            .lock()
-            .unwrap()
-            .execute_batch(
-                "INSERT INTO model_usage_observations (
-                     provider, source_key, source_record_key, source_ordinal,
-                     observation_kind, source_session_id,
-                     analytics_session_id, chain_id, agent_id, raw_model_id,
-                     derived_model_id, is_sidechain, observed_at_ms,
-                     model_evidence, token_evidence
-                 ) VALUES
-                     ('claude', 'source-a', 'record-a1', 0, 'turn', 'root',
-                      'root', 'agent-a', 'agent-a', 'claude-opus-4-6',
-                      'claude-opus-4-6', 1, 1000, 'explicit', 'unavailable'),
-                     ('claude', 'source-a', 'record-a2', 1, 'turn', 'root',
-                      'root', 'agent-a', 'agent-a', 'claude-sonnet-4-6',
-                      'claude-sonnet-4-6', 1, 2000, 'explicit', 'unavailable'),
-                     ('claude', 'source-b', 'record-b1', 0, 'turn', 'other-root',
-                      'other-root', 'agent-a', 'agent-a', 'claude-haiku-4-5',
-                      'claude-haiku-4-5', 1, 3000, 'explicit', 'unavailable');",
-            )
-            .expect("insert retained model evidence");
-
-        let target = ("claude".to_owned(), "root".to_owned(), "agent-a".to_owned());
-        let missing = ("claude".to_owned(), "root".to_owned(), "agent-b".to_owned());
-        let evidence = storage
-            .get_observed_agent_model_evidence(&[target.clone(), missing.clone()])
-            .expect("read retained model evidence");
-        assert_eq!(
-            evidence.get(&target).map(String::as_str),
-            Some("claude-sonnet-4-6")
-        );
-        assert!(!evidence.contains_key(&missing));
         clear_env();
     }
 

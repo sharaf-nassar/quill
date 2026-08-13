@@ -10,24 +10,22 @@
 //! sweep that backstops missed watcher events, the enable toggles, and the
 //! debounced update event. The per-provider record semantics — Claude spawn
 //! resolution and Codex rollout grouping — fold into the same state through
-//! [`TrackerState::fold_file`].
+//! [`TrackerState::fold_file`], over the per-record evidence primitives at the
+//! end of this file.
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::integrations::IntegrationProvider;
 use crate::models::{ObservedSessionAgent, SessionBreakdown};
 use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
-use crate::transcript_scan::{
-    CodexHead, ScanRecord, WORKFLOW_DIR_PREFIX, WORKFLOW_JOURNAL, claude_activity_timestamp,
-    claude_agent_id, claude_agent_open, claude_record_model, claude_session_origin,
-    codex_activity_timestamp, codex_head, codex_root, codex_turn_boundary, journal_result_agent_id,
-    read_agent_meta, read_appended, read_codex_tail, tool_result_ids,
-};
 
 /// Silence past this cutoff means the producing process is gone rather than
 /// merely quiet: measured inter-record gaps reach p99.9 ≈ 309s, an order of
@@ -978,6 +976,451 @@ pub(crate) fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
         .then(|| cwd.to_owned())
 }
 
+// --- Transcript evidence primitives -------------------------------------
+//
+// Per-record rules the fold applies: what a Claude record states about a
+// session's origin, activity, model, and spawn resolution, and what a Codex
+// rollout's head, tail, and turn records state about identity, activity, and
+// whether its turn is still open.
+
+pub(crate) const AGENT_FILE_PREFIX: &str = "agent-";
+pub(crate) const WORKFLOW_DIR_PREFIX: &str = "wf_";
+pub(crate) const WORKFLOW_JOURNAL: &str = "journal.jsonl";
+
+/// Guard against a malformed parent chain walking forever. Measured Codex spawn
+/// depth across 4487 spawned rollouts reaches 3 (4175 at 1, 297 at 2, 15 at 3).
+const MAX_CODEX_SPAWN_DEPTH: u32 = 16;
+
+/// How far back a rollout is scanned for its newest turn boundary. Every one of
+/// the 4487 spawned rollouts measured has a boundary inside a window this long,
+/// and a window without one is itself the answer: a rollout only accumulates
+/// records inside a turn, so the tail is still in an open one.
+pub(crate) const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
+
+/// How far into a rollout the head read looks for the thread's model.
+///
+/// `turn_context` is head-clustered rather than tail-resident: a spawned
+/// rollout replays its parent's history first and emits its own turn records
+/// after it, so the tail of a long turn holds none. Across 900 sampled spawned
+/// rollouts every one names a model, at p50 line 6 / 94KiB and p90 line 8 /
+/// 131KiB; a window this long covers 97%. It is deliberately the same budget
+/// the turn tail already spends, so a rollout costs a bounded read at each end
+/// rather than an unbounded one at either.
+const CODEX_HEAD_SCAN_BYTES: u64 = 1 << 20;
+/// The `.meta.json` Claude writes beside every sub-agent transcript at spawn.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentMeta {
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) agent_type: Option<String>,
+}
+
+/// The fields of a transcript record the fold reads. `content` stays an
+/// untyped value because Claude writes it as either a string or a block array.
+#[derive(Deserialize)]
+pub(crate) struct ScanRecord {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    timestamp: Option<String>,
+    cwd: Option<String>,
+    message: Option<ScanMessage>,
+}
+
+#[derive(Deserialize)]
+struct ScanMessage {
+    content: Option<serde_json::Value>,
+    /// Present on every assistant record, absent on user records.
+    model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JournalRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "agentId")]
+    agent_id: Option<String>,
+}
+
+/// The `session_meta` record every Codex rollout opens with. It is written once
+/// at thread creation, so a re-read always yields the same answer.
+#[derive(Clone)]
+pub(crate) struct CodexHead {
+    pub(crate) session_id: String,
+    parent_id: Option<String>,
+    pub(crate) subagent: bool,
+    pub(crate) agent_role: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) started_at: Option<DateTime<Utc>>,
+}
+
+const CODEX_EVENT_RECORD: &str = "event_msg";
+const CODEX_TURN_STARTED: &str = "task_started";
+const CODEX_TURN_COMPLETE: &str = "task_complete";
+const CODEX_TURN_ABORTED: &str = "turn_aborted";
+const CODEX_TURN_CONTEXT_RECORD: &str = "turn_context";
+const CODEX_RESPONSE_ITEM_RECORD: &str = "response_item";
+
+#[derive(Deserialize)]
+struct CodexEventRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    timestamp: Option<String>,
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct CodexTurnContextRecord {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Option<CodexTurnContextPayload>,
+}
+
+#[derive(Deserialize)]
+struct CodexTurnContextPayload {
+    model: Option<String>,
+}
+
+/// `agent-<id>.jsonl` carries the same id the workflow journal records use.
+pub(crate) fn claude_agent_id(path: &Path) -> Option<String> {
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix(AGENT_FILE_PREFIX)
+        .filter(|agent_id| !agent_id.is_empty())
+        .map(str::to_owned)
+}
+
+/// Read one rollout's `session_meta`, memoised because the root of a deep
+/// chain is reached again from every sub-agent under it.
+pub(crate) fn codex_head(
+    thread_id: &str,
+    index: &HashMap<String, PathBuf>,
+    heads: &mut HashMap<String, Option<CodexHead>>,
+) -> Option<CodexHead> {
+    if let Some(cached) = heads.get(thread_id) {
+        return cached.clone();
+    }
+    // A thread the index does not hold is not memoised: the answer belongs to
+    // the index rather than to the file, and a caller that indexes as it goes
+    // would otherwise cache a miss that a later entry resolves.
+    let head = read_codex_head(index.get(thread_id)?);
+    heads.insert(thread_id.to_owned(), head.clone());
+    head
+}
+
+/// Identity comes from [`crate::transcript_identity::codex_metadata`], the same
+/// parser retained ingest uses, so which field names the spawning parent is
+/// decided in one place. Only the two fields that parser has no use for — the
+/// thread's own clock and its declared role — are read from the record here.
+fn read_codex_head(path: &Path) -> Option<CodexHead> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let record = serde_json::from_str::<serde_json::Value>(&line).ok()?;
+    let metadata = crate::transcript_identity::codex_metadata(&record)?;
+    // The head's identity fields — including the `source.subagent.thread_spawn`
+    // walk behind `agent_role` — are read by `codex_metadata`. Only the turn
+    // timestamp is read here, and only because it may sit on either level.
+    let timestamp = |owner: Option<&serde_json::Value>| {
+        owner
+            .and_then(|owner| owner.get("timestamp"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    Some(CodexHead {
+        session_id: metadata.source_session_id,
+        parent_id: metadata.parent_chain_id,
+        subagent: metadata.is_spawn,
+        agent_role: metadata.agent_role,
+        model: read_codex_model(reader),
+        cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
+        started_at: timestamp(record.get("payload"))
+            .or_else(|| timestamp(Some(&record)))
+            .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+            .map(|timestamp| timestamp.with_timezone(&Utc)),
+    })
+}
+
+/// The first model a rollout's `turn_context` records name, read from the same
+/// open handle the head parse already holds.
+///
+/// A spawned rollout opens with its parent's replayed history, so the first
+/// `turn_context` may be the parent's rather than the thread's own. That is
+/// deliberate: across the spawned rollouts measured, no thread's own model
+/// differed from the first one its file names, and 591 of 600 name exactly one
+/// model for their whole life. The read stops at the first hit, so the common
+/// case costs the handful of lines before it rather than the whole window.
+fn read_codex_model(reader: impl BufRead) -> Option<String> {
+    let mut line = String::new();
+    let mut reader = reader.take(CODEX_HEAD_SCAN_BYTES);
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => {}
+        }
+        // Rollouts carry whole-file `world_state` snapshots, so the cheap
+        // substring test keeps those megabytes out of the JSON parser.
+        if !line.contains(CODEX_TURN_CONTEXT_RECORD) {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<CodexTurnContextRecord>(&line) else {
+            continue;
+        };
+        if record.kind != CODEX_TURN_CONTEXT_RECORD {
+            continue;
+        }
+        if let Some(model) = record.payload.and_then(|payload| payload.model) {
+            return crate::model_usage::validate_model_id(&model).ok();
+        }
+    }
+}
+
+/// Walk a rollout's parent chain to the user thread that owns it. Codex records
+/// only the immediate parent, and nesting is real: measured depths run 1–3
+/// across 4487 spawned rollouts, every one of which resolves to a root thread
+/// the same corpus still holds.
+///
+/// The hop count bounds the walk but is not reported: which root a sub-agent
+/// belongs to is observable, how many hops away it sits is not.
+pub(crate) fn codex_root(
+    head: &CodexHead,
+    index: &HashMap<String, PathBuf>,
+    heads: &mut HashMap<String, Option<CodexHead>>,
+) -> Option<String> {
+    let mut current = head.clone();
+    let mut depth = 0;
+    let mut seen = HashSet::from([current.session_id.clone()]);
+    while current.subagent {
+        let parent_id = current.parent_id.clone()?;
+        if !seen.insert(parent_id.clone()) || depth >= MAX_CODEX_SPAWN_DEPTH {
+            return None;
+        }
+        depth += 1;
+        current = codex_head(&parent_id, index, heads)?;
+    }
+    Some(current.session_id)
+}
+
+/// Timestamp carried by user, assistant, reasoning, or tool content.
+///
+/// Turn boundaries, context snapshots, token counts, and other bookkeeping can
+/// be appended after Stop, so neither they nor the file mtime are activity.
+pub(crate) fn codex_activity_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    if !line.contains(CODEX_EVENT_RECORD) && !line.contains(CODEX_RESPONSE_ITEM_RECORD) {
+        return None;
+    }
+    let record = serde_json::from_str::<CodexEventRecord>(line).ok()?;
+    let payload = record.payload?;
+    let payload_kind = payload.get("type")?.as_str()?;
+    let substantive = match record.kind.as_str() {
+        CODEX_EVENT_RECORD => matches!(payload_kind, "user_message" | "agent_message"),
+        CODEX_RESPONSE_ITEM_RECORD => match payload_kind {
+            "agent_message" => crate::sessions::codex_text_blocks(&payload, "input_text")
+                .next()
+                .is_some(),
+            "message" => crate::sessions::has_nonempty_codex_assistant_output(&payload),
+            "function_call" | "custom_tool_call" => payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| !name.is_empty()),
+            "reasoning" | "function_call_output" | "custom_tool_call_output" => true,
+            _ => false,
+        },
+        _ => false,
+    };
+    substantive
+        .then_some(record.timestamp?)
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+/// Read a bounded rollout tail and discard its first partial record.
+pub(crate) fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
+    let mut file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(CODEX_TAIL_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut window = Vec::new();
+    file.read_to_end(&mut window).ok()?;
+    let truncated = start > 0;
+    let mut body_offset = start;
+    if truncated {
+        if let Some(newline) = window.iter().position(|byte| *byte == b'\n') {
+            window.drain(..=newline);
+            body_offset += newline as u64 + 1;
+        } else {
+            window.clear();
+            body_offset = length;
+        }
+    }
+    Some((window, body_offset, truncated))
+}
+
+/// The turn boundary a rollout line carries: whether it opens a turn, and when
+/// the record claims to have been written.
+///
+/// The timestamp is the only clock a rollout that emits nothing but boundaries
+/// has, so a thread that died mid-turn still ages out of the idle window.
+///
+/// Rollouts also carry whole-file `world_state` snapshots, so the cheap
+/// substring test keeps those megabytes out of the JSON parser.
+pub(crate) fn codex_turn_boundary(line: &str) -> Option<(bool, Option<DateTime<Utc>>)> {
+    if !line.contains(CODEX_EVENT_RECORD) {
+        return None;
+    }
+    let record = serde_json::from_str::<CodexEventRecord>(line).ok()?;
+    if record.kind != CODEX_EVENT_RECORD {
+        return None;
+    }
+    let started = match record.payload?.get("type")?.as_str()? {
+        CODEX_TURN_STARTED => true,
+        CODEX_TURN_COMPLETE | CODEX_TURN_ABORTED => false,
+        _ => return None,
+    };
+    let timestamp = record
+        .timestamp
+        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+        .map(|timestamp| timestamp.with_timezone(&Utc));
+    Some((started, timestamp))
+}
+
+pub(crate) fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
+    let stem = transcript.file_stem()?.to_str()?;
+    let meta = transcript.with_file_name(format!("{stem}.meta.json"));
+    serde_json::from_str(&std::fs::read_to_string(meta).ok()?).ok()
+}
+
+/// Hand every line appended since `offset` to `handle`, then advance `offset`.
+///
+/// A trailing line without its newline is a record still being written, so it
+/// is left unconsumed for the next pass instead of being parsed in half. A file
+/// shorter than the offset was rewritten rather than appended to, so it restarts
+/// from the beginning.
+pub(crate) fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMut(&str)) {
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return;
+    };
+    if length < *offset {
+        *offset = 0;
+    }
+    if length == *offset {
+        return;
+    }
+    let mut reader = BufReader::new(file);
+    if reader.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                if !line.ends_with('\n') {
+                    break;
+                }
+                *offset += read as u64;
+                handle(&line);
+            }
+        }
+    }
+}
+
+/// The RFC 3339 timestamp a Claude record carries, if any.
+fn claude_record_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(record.timestamp.as_deref()?)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+/// The timestamp a Claude record contributes to session activity.
+///
+/// Hook result attachments are appended after the turn they belong to has
+/// ended, so their write must not reopen a finished session.
+pub(crate) fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
+    if record.kind.as_deref() == Some("attachment") {
+        return None;
+    }
+    claude_record_timestamp(record)
+}
+
+/// Origin a root transcript's first timestamped record supplies: when the
+/// session started and the project it runs in.
+pub(crate) fn claude_session_origin(
+    record: &ScanRecord,
+) -> Option<(DateTime<Utc>, Option<String>)> {
+    Some((claude_record_timestamp(record)?, record.cwd.clone()))
+}
+
+/// The model a Claude assistant record names, validated through the same gate
+/// retained evidence passes.
+///
+/// A sub-agent transcript's own assistant records state the model that agent is
+/// running, so its label needs no retained child evidence to be resolved.
+pub(crate) fn claude_record_model(record: &ScanRecord) -> Option<String> {
+    if record.kind.as_deref() != Some("assistant") {
+        return None;
+    }
+    let model = record.message.as_ref()?.model.as_deref()?;
+    crate::model_usage::validate_model_id(model).ok()
+}
+
+/// The agent id a workflow journal line reports as finished.
+///
+/// A journal carries a `started` and a `result` record per agent it drives, and
+/// only the `result` is closure evidence.
+pub(crate) fn journal_result_agent_id(line: &str) -> Option<String> {
+    let record = serde_json::from_str::<JournalRecord>(line).ok()?;
+    if record.kind != "result" {
+        return None;
+    }
+    record.agent_id
+}
+
+/// Whether a Claude sub-agent is still working.
+///
+/// Precedence: a workflow agent answers to its journal; anything else answers
+/// to the spawning tool call. An agent with no spawn evidence at all cannot be
+/// claimed open, and one whose own transcript went silent past the idle window
+/// is abandoned rather than slow.
+pub(crate) fn claude_agent_open(
+    agent_id: &str,
+    workflow: bool,
+    tool_use_id: Option<&str>,
+    resolved: &HashSet<String>,
+    idle_for: TimeDelta,
+) -> bool {
+    let closed = if workflow {
+        resolved.contains(agent_id)
+    } else {
+        tool_use_id.is_none_or(|tool_use_id| resolved.contains(tool_use_id))
+    };
+    !closed && idle_for <= IDLE_AFTER
+}
+
+pub(crate) fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
+    record
+        .message
+        .as_ref()
+        .and_then(|message| message.content.as_ref())
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+        })
+        .filter_map(|block| {
+            block
+                .get("tool_use_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|tool_use_id| !tool_use_id.is_empty())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1793,7 +2236,7 @@ mod tests {
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
         let filler = format!(
             "{{\"type\":\"world_state\",\"payload\":{{\"text\":\"{}\"}}}}",
-            "x".repeat(crate::transcript_scan::CODEX_TAIL_SCAN_BYTES as usize)
+            "x".repeat(CODEX_TAIL_SCAN_BYTES as usize)
         );
         fixture.write(
             root,
@@ -1963,7 +2406,7 @@ mod tests {
             fs::metadata(fixture.path(agent))
                 .expect("stat rollout")
                 .len()
-                > crate::transcript_scan::CODEX_TAIL_SCAN_BYTES
+                > CODEX_TAIL_SCAN_BYTES
         );
 
         let tracker = LiveTracker::new(None);

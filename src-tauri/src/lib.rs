@@ -48,7 +48,6 @@ mod transcript_identity;
 // primitives are still called; the scanner orchestration around them goes with
 // the legacy-deletion pass.
 #[allow(dead_code)]
-mod transcript_scan;
 mod transcript_watcher;
 mod tray_keepalive;
 mod window_chrome;
@@ -5723,13 +5722,6 @@ pub fn run() {
             app.manage(LearningCapability::generate());
             let model_usage_runner_state = Arc::new(RetainedSourceRunnerState::new());
             app.manage(Arc::clone(&model_usage_runner_state));
-            let observed_subagents = Arc::new(server::ObservedSubagentState::default());
-            if !integrations::load_integration_features(storage)
-                .is_ok_and(|features| features.activity_tracking)
-            {
-                observed_subagents.set_activity_tracking_enabled(false);
-            }
-            app.manage(Arc::clone(&observed_subagents));
             // The live tracker must be managed before the transcript watcher
             // thread starts: the watcher's cold-start sweep resolves it from
             // app state and would otherwise find nothing to fold into.
