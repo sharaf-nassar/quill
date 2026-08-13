@@ -601,6 +601,22 @@ impl LiveTracker {
 
     /// Disabling or re-enabling tracking clears every folded session: coverage
     /// stays unknown until the next sweep rebuilds it from the transcripts.
+    /// Session ids folded so far, for tests outside this module. The read-path
+    /// surface arrives with the breakdown rewire.
+    #[cfg(test)]
+    pub(crate) fn folded_session_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .keys()
+            .map(|key| key.session_id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
         let mut state = self.state.lock().unwrap();
         state.activity_tracking_enabled = enabled;

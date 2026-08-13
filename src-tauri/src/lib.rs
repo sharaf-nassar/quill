@@ -5821,6 +5821,23 @@ pub fn run() {
                 observed_subagents.set_activity_tracking_enabled(false);
             }
             app.manage(Arc::clone(&observed_subagents));
+            // The live tracker must be managed before the transcript watcher
+            // thread starts: the watcher's cold-start sweep resolves it from
+            // app state and would otherwise find nothing to fold into.
+            let live_tracker = Arc::new(live_tracker::LiveTracker::new(Some(
+                app.handle().clone(),
+            )));
+            if !integrations::load_integration_features(storage)
+                .is_ok_and(|features| features.activity_tracking)
+            {
+                live_tracker.set_activity_tracking_enabled(false);
+            }
+            for status in integrations::load_statuses(storage).unwrap_or_default() {
+                if !status.enabled {
+                    live_tracker.set_provider_enabled(status.provider, false);
+                }
+            }
+            app.manage(Arc::clone(&live_tracker));
             // Retained runtime analytics are a startup responsibility, not a
             // side effect of opening or manually syncing Session Search.
             // Blocking inventory/parsing stays off the UI thread; shared root

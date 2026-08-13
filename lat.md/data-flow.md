@@ -150,6 +150,8 @@ Codex config changes flow through parsed TOML: install snapshots the active cust
 
 A state-changing fold emits `sessions-live-updated`, coalesced over a 250 ms window so a burst of appends wakes its readers once.
 
+[[src-tauri/src/transcript_watcher.rs#admit_pending]] is the tracker's only feed: the drained admission batch goes to the fold alongside the retained-ingest enqueue, so live state and retained ingest share one debounce and one set of filesystem events. The watcher thread sweeps before its first event, again on the recovery path that reconciles retained sources after an overflow, and unconditionally on the 120-second retry tick — unconditionally because notify's coarseness differs per platform and only a walk can prove nothing was missed. Startup manages the tracker before that thread starts and applies the saved activity-tracking and per-provider switches at construction, so a disabled provider is never folded even once.
+
 ### Claude Fold Rules
 
 Claude transcripts fold by the role their own path states: the session's transcript, a sub-agent transcript at any depth, or a workflow journal.
@@ -338,6 +340,10 @@ Exceeding either bounded event buffer must request prompt whole-root reconciliat
 ##### Duplicate Root Rejection
 
 Two providers resolving to one canonical root must not register the later duplicate or route either provider's event by first match.
+
+##### Live Tracker Admission
+
+A filesystem event on a watched transcript must reach the live tracker in the shape admission drains it, folding that session without a Quill window or an app handle.
 
 ### Live Analytics Origin
 

@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use crate::integrations::IntegrationProvider;
+use crate::live_tracker::LiveTracker;
 
 const QUIET_DEBOUNCE: Duration = Duration::from_millis(250);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -189,6 +190,9 @@ fn collect_event_paths(
 
 pub(crate) fn start(app: tauri::AppHandle) {
     std::thread::spawn(move || {
+        // Cold start: a session that predates launch produces no event of its
+        // own, so the tracker only learns about it from a sweep.
+        sweep_live_tracker(&app);
         if let Err(error) = run(app) {
             log::warn!(
                 "Transcript watcher unavailable; 120-second recovery scan remains active: {error}"
@@ -283,6 +287,9 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
                 },
             );
             retry_at = now + RETRY_INTERVAL;
+            // Unconditional: notify semantics differ per platform, so this tick
+            // is the backstop for events that never arrived.
+            sweep_live_tracker(&app);
         }
         let timeout = pending
             .timeout(now)
@@ -316,8 +323,8 @@ fn admit_pending(
     app: &tauri::AppHandle,
     (pending, recovery): (HashMap<PathBuf, IntegrationProvider>, bool),
 ) {
-    for (path, provider) in pending {
-        match crate::sessions::validate_retained_notify_source(provider, &path) {
+    for (path, provider) in &pending {
+        match crate::sessions::validate_retained_notify_source(*provider, path) {
             Ok(Some(source)) => {
                 if let Err(error) = crate::enqueue_retained_live_source(app, source) {
                     log::warn!("Transcript watcher failed to enqueue retained source: {error}");
@@ -332,8 +339,23 @@ fn admit_pending(
             }
         }
     }
+    if let Some(tracker) = live_tracker(app) {
+        tracker.apply_paths(pending);
+    }
     if recovery {
         reconcile_all(app);
+        sweep_live_tracker(app);
+    }
+}
+
+fn live_tracker(app: &tauri::AppHandle) -> Option<Arc<LiveTracker>> {
+    app.try_state::<Arc<LiveTracker>>()
+        .map(|state| Arc::clone(state.inner()))
+}
+
+fn sweep_live_tracker(app: &tauri::AppHandle) {
+    if let Some(tracker) = live_tracker(app) {
+        tracker.sweep(chrono::Utc::now());
     }
 }
 
@@ -532,6 +554,41 @@ mod tests {
             provider_for_path(&roots, &shared.join("session.jsonl")),
             None
         );
+    }
+
+    // @lat: [[data-flow#Data Flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Live Tracker Admission]]
+    #[test]
+    fn admitted_paths_fold_into_the_live_tracker() {
+        let root = tempfile::tempdir().expect("create fixture root");
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        let project = root.path().join("-home-user-project");
+        std::fs::create_dir_all(&project).expect("create project directory");
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        std::fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"/home/user/project\",\"timestamp\":\"{}\"}}\n",
+                chrono::Utc::now().to_rfc3339()
+            ),
+        )
+        .expect("write root transcript");
+
+        let mut roots = roots();
+        roots[0].resolved_path = root.path().to_path_buf();
+        roots[0].canonical_path = Some(root.path().to_path_buf());
+        let mut pending = PendingPaths::default();
+        collect_event_paths(
+            &roots,
+            &Event::new(EventKind::Create(CreateKind::File)).add_path(transcript),
+            &mut pending,
+            Instant::now(),
+        );
+        let (batch, recovery) = pending.take();
+        assert!(!recovery);
+
+        let tracker = LiveTracker::new(None);
+        tracker.apply_paths(batch);
+        assert_eq!(tracker.folded_session_ids(), vec![session_id.to_owned()]);
     }
 
     #[test]
