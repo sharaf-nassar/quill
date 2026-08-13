@@ -113,10 +113,6 @@ pub(crate) enum RollupBackfillTerminalError {
         required_bytes: u64,
         available_bytes: u64,
     },
-    CheckpointBusy {
-        log_frames: i64,
-        checkpointed_frames: i64,
-    },
     CheckpointFailed {
         reason: String,
     },
@@ -413,14 +409,15 @@ pub(crate) fn run_rollup_backfill<T: RollupBackfillTarget>(
                 log_frames,
                 checkpointed_frames,
             }) => {
-                return Ok(finish(
-                    controls,
-                    progress,
-                    RollupBackfillTerminal::Error(RollupBackfillTerminalError::CheckpointBusy {
-                        log_frames,
-                        checkpointed_frames,
-                    }),
-                ));
+                // A busy result means a concurrent reader or checkpointer blocked
+                // resetting the WAL, not that the fold is unsafe: the passive
+                // copy-back still ran and the next chunk retries in ~250 ms.
+                // Stopping here instead flipped the durable status to `failed`,
+                // which permanently nulled every gated lifetime runtime column.
+                log::warn!(
+                    "{target_name} rollup backfill checkpoint stayed busy \
+                     ({checkpointed_frames}/{log_frames} frames); continuing"
+                );
             }
             Err(reason) => {
                 return Ok(finish(
@@ -831,6 +828,7 @@ mod tests {
         assert_eq!(0, disk.progress.rows_done);
         assert_eq!(None, disk.progress.done_through);
 
+        let (_busy_directory, busy_path, mut busy_conn) = fixture(5);
         let busy = |_conn: &Connection| {
             Ok(RollupCheckpointResult::Busy {
                 log_frames: 3,
@@ -842,21 +840,15 @@ mod tests {
             ..controls()
         };
         let busy_report = run_rollup_backfill(
-            &mut conn,
-            &path,
+            &mut busy_conn,
+            &busy_path,
             &mut TestTarget::immediate(),
             &busy_controls,
         )
         .expect("checkpoint busy");
-        assert_eq!(
-            RollupBackfillTerminal::Error(RollupBackfillTerminalError::CheckpointBusy {
-                log_frames: 3,
-                checkpointed_frames: 1,
-            }),
-            busy_report.terminal
-        );
-        assert_eq!(2, busy_report.progress.rows_done);
-        assert_eq!(Some(2), busy_report.progress.done_through);
+        assert_eq!(RollupBackfillTerminal::Completed, busy_report.terminal);
+        assert_eq!(5, busy_report.progress.rows_done);
+        assert_eq!(Some(5), busy_report.progress.done_through);
 
         let failed = |_conn: &Connection| Err("checkpoint I/O error".to_string());
         let failed_controls = RollupBackfillControls {
@@ -876,8 +868,8 @@ mod tests {
             }),
             failed_report.terminal
         );
-        assert_eq!(4, failed_report.progress.rows_done);
-        assert_eq!(Some(4), failed_report.progress.done_through);
+        assert_eq!(2, failed_report.progress.rows_done);
+        assert_eq!(Some(2), failed_report.progress.done_through);
 
         let completed =
             run_rollup_backfill(&mut conn, &path, &mut TestTarget::immediate(), &controls())

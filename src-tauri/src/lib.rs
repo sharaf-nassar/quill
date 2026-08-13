@@ -1262,12 +1262,6 @@ fn rollup_terminal_detail(error: &RollupBackfillTerminalError) -> String {
         } => format!(
             "Not enough free disk space: {available_bytes} bytes available, {required_bytes} required. Free space, then rebuild again."
         ),
-        RollupBackfillTerminalError::CheckpointBusy {
-            log_frames,
-            checkpointed_frames,
-        } => format!(
-            "The WAL checkpoint stayed busy ({checkpointed_frames}/{log_frames} frames). Close long-running Quill views, then rebuild again."
-        ),
         RollupBackfillTerminalError::CheckpointFailed { reason } => {
             format!(
                 "The WAL checkpoint failed: {reason}. Rebuild to resume from committed progress."

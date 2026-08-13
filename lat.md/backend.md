@@ -1082,7 +1082,7 @@ Three facets need narrower handling because migration 37 omits their full grain.
 
 Each chunk receives a 250 ms advisory deadline and row limit, runs its fold plus durable bookmark update in one immediate transaction under the shared ingest permit, then releases the permit before `wal_checkpoint(TRUNCATE)`. The transaction deadline starts only after that permit is acquired, so a maintenance lease never consumes the fold budget. A disk preflight precedes every chunk.
 
-Checkpoint busy/failure and unreadable or insufficient disk space stop as typed terminal errors. A committed bookmark remains resumable if its following checkpoint fails; unexpected target SQL and invariant failures bubble to the caller and emit a generic failure detail instead of claiming a checkpoint fault.
+Checkpoint failure and unreadable or insufficient disk space stop as typed terminal errors. A busy checkpoint is not one: a concurrent reader or checkpointer only blocks resetting the WAL after the passive copy-back, so the run logs it and retries on the next chunk instead of durably marking the target `failed` and gating its consumers forever. A committed bookmark remains resumable if its following checkpoint fails; unexpected target SQL and invariant failures bubble to the caller and emit a generic failure detail instead of claiming a checkpoint fault.
 
 The runtime target prepares one source-keyed `session_events` block at a time outside the ingest permit, sorting and folding it in memory. Current source replacement writes one contiguous rowid block; the compact transaction revalidates its bounds, count, identity, content hash, and generation before replacing only unpruned rollup/state rows and advancing the source-end bookmark. Preparation can exceed the row target without extending the immediate transaction. Because source replacement cannot publish a partial fold, a compact commit that outlasts the advisory deadline finishes atomically, then releases the permit before the next source. `raw_pruned=1` rows remain authoritative, the first commit reconciles live folds, and empty databases complete with a null terminal bookmark. Startup always schedules runtime backfill, so a durable `failed` status resumes from its last committed source bookmark after update or restart.
 
@@ -1102,7 +1102,7 @@ A queued maintenance writer must acquire the fair ingest gate within one 250 ms 
 
 ###### Disk And Checkpoint Failures Stop Safely
 
-Disk refusal must advance no bookmark, while checkpoint busy or failure must stop with a typed terminal and preserve the already committed bookmark for exact resume.
+Disk refusal must advance no bookmark and checkpoint failure must stop with a typed terminal preserving its committed bookmark for exact resume, while an always-busy checkpoint must keep folding to completion.
 
 ##### Rollup Migration Test Specs
 
