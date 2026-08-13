@@ -21,7 +21,7 @@ use tauri::Emitter;
 use crate::integrations::IntegrationProvider;
 use crate::live_tracker::{
     SessionKey, local_observed_host, normalize_observed_hostname, observed_agent_type,
-    observed_root_cwd,
+    observed_root_cwd, row_key,
 };
 use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
@@ -70,6 +70,8 @@ const RETAINED_VALIDATE_RETRY_CAP: u32 = 5;
 /// Snapshots are idempotent and order-independent: the scanner re-derives the
 /// whole session rather than a delta, so a missed pass self-corrects on the
 /// next one instead of poisoning a folded state.
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 struct SessionSnapshot {
     key: SessionKey,
@@ -84,6 +86,8 @@ struct SessionSnapshot {
     agents: Vec<crate::transcript_scan::TranscriptAgent>,
 }
 
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 impl SessionSnapshot {
     /// A scan always produces an answer for the sessions it covers, so zero
     /// open agents is a real count rather than missing coverage.
@@ -101,6 +105,8 @@ impl SessionSnapshot {
 
 /// Reconciles per-source session snapshots: last-write-wins per session key by
 /// observation time, plus a staleness cutoff.
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 struct SnapshotReconciler {
     sessions: HashMap<SessionKey, SessionSnapshot>,
     activity_tracking_enabled: bool,
@@ -117,6 +123,8 @@ impl Default for SnapshotReconciler {
     }
 }
 
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 impl SnapshotReconciler {
     fn accepts(&self, provider: &str) -> bool {
         self.activity_tracking_enabled && !self.disabled_providers.contains(provider)
@@ -147,22 +155,16 @@ impl SnapshotReconciler {
 }
 
 /// Reconciled snapshot view of live session and agent state.
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 #[derive(Default)]
 pub(crate) struct ObservedSubagentState {
     inner: Mutex<SnapshotReconciler>,
     scanner: Mutex<crate::transcript_scan::TranscriptScanner>,
 }
 
-/// Reconciler key for a Sessions row, or `None` when the row's hostname does not
-/// normalize and so can never match a snapshot.
-fn row_key(row: &SessionBreakdown) -> Option<SessionKey> {
-    Some(SessionKey {
-        provider: row.provider.clone(),
-        host: normalize_observed_hostname(&row.hostname)?,
-        session_id: row.session_id.clone(),
-    })
-}
-
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 fn transcript_snapshot(
     session: crate::transcript_scan::TranscriptSession,
     host: &str,
@@ -191,6 +193,8 @@ fn transcript_snapshot(
     }
 }
 
+// Dead with the read-path rewire; removed with the reconciler itself.
+#[allow(dead_code)]
 impl ObservedSubagentState {
     /// Re-derive live session and agent state from Claude and Codex
     /// transcripts.

@@ -11,10 +11,6 @@
 //! debounced update event. The per-provider record semantics — Claude spawn
 //! resolution and Codex rollout grouping — fold into the same state through
 //! [`TrackerState::fold_file`].
-// Wired into the watcher, the setup path, and the Sessions read path by the
-// tasks that follow; the engine and its tests land first.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -24,6 +20,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use tauri::{AppHandle, Emitter};
 
 use crate::integrations::IntegrationProvider;
+use crate::models::{ObservedSessionAgent, SessionBreakdown};
 use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
 use crate::transcript_scan::{
     CodexHead, ScanRecord, WORKFLOW_DIR_PREFIX, WORKFLOW_JOURNAL, claude_activity_timestamp,
@@ -151,6 +148,36 @@ impl LiveSession {
             }
         })
     }
+
+    /// The open agents a Sessions row lists, in a stable order because a
+    /// `HashMap` has none and the rail renders them as written.
+    fn open_agents(&self, now: DateTime<Utc>) -> Vec<ObservedSessionAgent> {
+        let mut agents = self
+            .agents
+            .iter()
+            .filter(|(agent_id, _)| self.agent_open(agent_id, now))
+            .map(|(agent_id, agent)| ObservedSessionAgent {
+                agent_id: agent_id.clone(),
+                model_id: agent.model.clone(),
+                agent_type: agent.agent_type.clone(),
+                // Filled by the runtime pass, which keys on these ids.
+                runtime_secs: None,
+                runtime_active: false,
+            })
+            .collect::<Vec<_>>();
+        agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        agents
+    }
+}
+
+/// Tracker key for a Sessions row, or `None` when the row's hostname does not
+/// normalize and so can never match a folded session.
+pub(crate) fn row_key(row: &SessionBreakdown) -> Option<SessionKey> {
+    Some(SessionKey {
+        provider: row.provider.clone(),
+        host: normalize_observed_hostname(&row.hostname)?,
+        session_id: row.session_id.clone(),
+    })
 }
 
 /// What a transcript file contributes to the fold of its session.
@@ -599,10 +626,165 @@ impl LiveTracker {
         }
     }
 
-    /// Disabling or re-enabling tracking clears every folded session: coverage
-    /// stays unknown until the next sweep rebuilds it from the transcripts.
-    /// Session ids folded so far, for tests outside this module. The read-path
-    /// surface arrives with the breakdown rewire.
+    /// Folded identities that must survive storage's provisional limit so
+    /// their live activity can participate in final ranking.
+    pub(crate) fn session_ranking_keys(&self) -> Vec<(String, String, String)> {
+        self.state
+            .lock()
+            .unwrap()
+            .sessions
+            .keys()
+            .map(|key| {
+                (
+                    key.provider.clone(),
+                    key.session_id.clone(),
+                    key.host.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Lay live state over the rows storage returned.
+    ///
+    /// A row the tracker covers gets its open agents and, when the fold is
+    /// newer than the retained evidence, its liveness; a folded session with a
+    /// validated root cwd that storage has no row for at all becomes an
+    /// observed-only row. Both compete for the same limit, so the merged set is
+    /// re-ranked before it is truncated.
+    pub(crate) fn overlay(
+        &self,
+        mut rows: Vec<SessionBreakdown>,
+        range_from: &str,
+        hostname: Option<&str>,
+        provider: Option<IntegrationProvider>,
+        limit: Option<i32>,
+    ) -> Vec<SessionBreakdown> {
+        let now = Utc::now();
+        let state = self.state.lock().unwrap();
+        let mut seen = HashSet::new();
+
+        for row in &mut rows {
+            row.observed_only = false;
+            let Some(key) = row_key(row) else {
+                continue;
+            };
+            seen.insert(key.clone());
+            let Some(session) = state.sessions.get(&key) else {
+                continue;
+            };
+            row.observed_agents = Some(session.open_agents(now));
+            let stored = DateTime::parse_from_rfc3339(&row.last_active)
+                .ok()
+                .map(|at| at.with_timezone(&Utc));
+            if stored.is_none_or(|stored| session.last_activity > stored) {
+                row.last_active = session.last_activity.to_rfc3339();
+            }
+        }
+
+        let from = DateTime::parse_from_rfc3339(range_from)
+            .ok()
+            .map(|at| at.with_timezone(&Utc));
+        let hostname_filter = hostname.and_then(normalize_observed_hostname);
+        let provider_filter = provider.map(IntegrationProvider::as_str);
+
+        if let Some(from) = from.filter(|_| hostname.is_none() || hostname_filter.is_some()) {
+            for (key, session) in &state.sessions {
+                // A session without a validated root cwd has no project to name.
+                let Some(cwd) = session.cwd.as_ref() else {
+                    continue;
+                };
+                if seen.contains(key)
+                    || provider_filter.is_some_and(|filter| key.provider != filter)
+                    || hostname_filter
+                        .as_ref()
+                        .is_some_and(|filter| key.host != *filter)
+                    || session.last_activity < from
+                {
+                    continue;
+                }
+                rows.push(SessionBreakdown {
+                    provider: key.provider.clone(),
+                    session_id: key.session_id.clone(),
+                    hostname: key.host.clone(),
+                    total_tokens: 0,
+                    turn_count: 0,
+                    first_seen: session
+                        .started_at
+                        .unwrap_or(session.last_activity)
+                        .to_rfc3339(),
+                    last_active: session.last_activity.to_rfc3339(),
+                    ended_at: None,
+                    project: Some(cwd.clone()),
+                    active_runtime_secs: None,
+                    agent_count: None,
+                    agent_runtime_secs: None,
+                    current_turn_runtime_secs: None,
+                    current_turn_runtime_active: false,
+                    runtime_as_of_ms: None,
+                    active_runtime_rate: 0.0,
+                    observed_agents: Some(session.open_agents(now)),
+                    observed_only: true,
+                });
+            }
+        }
+        drop(state);
+
+        rows.sort_by(|a, b| {
+            let parse = |value: &str| {
+                DateTime::parse_from_rfc3339(value)
+                    .ok()
+                    .map(|at| at.with_timezone(&Utc))
+            };
+            parse(&b.last_active)
+                .cmp(&parse(&a.last_active))
+                .then_with(|| a.provider.cmp(&b.provider))
+                .then_with(|| a.hostname.cmp(&b.hostname))
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        rows.truncate(limit.unwrap_or(10).clamp(1, 500) as usize);
+        rows
+    }
+
+    /// Seed one folded session as if its transcripts had been read, so callers
+    /// outside this module can exercise the read path without laying down
+    /// fixture transcripts.
+    #[cfg(test)]
+    pub(crate) fn record_session(
+        &self,
+        provider: IntegrationProvider,
+        session_id: &str,
+        host: &str,
+        cwd: Option<&str>,
+        last_activity: DateTime<Utc>,
+        open_agents: &[&str],
+    ) -> bool {
+        let Some(host) = normalize_observed_hostname(host) else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        let session = state
+            .sessions
+            .entry(SessionKey {
+                provider: provider.as_str().to_owned(),
+                host,
+                session_id: session_id.to_owned(),
+            })
+            .or_default();
+        session.started_at = Some(last_activity);
+        session.last_activity = last_activity;
+        session.cwd = observed_root_cwd(cwd);
+        for agent_id in open_agents {
+            let agent = session
+                .agents
+                .entry((*agent_id).to_owned())
+                .or_insert_with(|| LiveAgent::new(false));
+            agent.turn_open = Some(true);
+            agent.last_activity = last_activity;
+        }
+        true
+    }
+
+    /// Session ids folded so far, for tests outside this module.
     #[cfg(test)]
     pub(crate) fn folded_session_ids(&self) -> Vec<String> {
         let mut ids = self
@@ -617,6 +799,8 @@ impl LiveTracker {
         ids
     }
 
+    /// Disabling or re-enabling tracking clears every folded session: coverage
+    /// stays unknown until the next sweep rebuilds it from the transcripts.
     pub(crate) fn set_activity_tracking_enabled(&self, enabled: bool) {
         let mut state = self.state.lock().unwrap();
         state.activity_tracking_enabled = enabled;
@@ -1846,5 +2030,75 @@ mod tests {
         let state = tracker.state.lock().unwrap();
         assert!(state.sessions.is_empty());
         assert!(state.files.is_empty());
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Read Overlay]]
+    #[test]
+    fn overlay_synthesizes_live_rows_and_reranks_them() {
+        let tracker = LiveTracker::new(None);
+        let now = Utc::now();
+        assert!(tracker.record_session(
+            IntegrationProvider::Claude,
+            "live-root",
+            "overlay-host.example.com",
+            Some("/live/project"),
+            now,
+            &["agent-b", "agent-a"],
+        ));
+        // No validated root cwd, so this one has no project to name and never
+        // becomes a row of its own.
+        assert!(tracker.record_session(
+            IntegrationProvider::Claude,
+            "rootless",
+            "overlay-host",
+            Some("relative/path"),
+            now,
+            &[],
+        ));
+
+        let stored = SessionBreakdown {
+            provider: "claude".to_owned(),
+            session_id: "stored-root".to_owned(),
+            hostname: "overlay-host".to_owned(),
+            total_tokens: 7,
+            turn_count: 1,
+            first_seen: (now - TimeDelta::minutes(30)).to_rfc3339(),
+            last_active: (now - TimeDelta::minutes(1)).to_rfc3339(),
+            ended_at: None,
+            project: Some("/stored/project".to_owned()),
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
+            observed_only: false,
+        };
+        let rows = tracker.overlay(
+            vec![stored],
+            &(now - TimeDelta::hours(1)).to_rfc3339(),
+            None,
+            None,
+            Some(2),
+        );
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].session_id, "live-root");
+        assert!(rows[0].observed_only);
+        assert_eq!(rows[0].project.as_deref(), Some("/live/project"));
+        assert_eq!(
+            rows[0].observed_agents.as_ref().map(|agents| agents
+                .iter()
+                .map(|agent| agent.agent_id.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["agent-a", "agent-b"])
+        );
+        // A row the fold does not cover keeps unknown agents and its own
+        // retained metrics.
+        assert_eq!(rows[1].session_id, "stored-root");
+        assert_eq!(rows[1].observed_agents, None);
+        assert_eq!(rows[1].total_tokens, 7);
     }
 }

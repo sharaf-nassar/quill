@@ -233,3 +233,9 @@ A turn's own records can push its `task_started` out of the bounded window, and 
 ## Live Tracker Codex Idle Cutoff
 
 A rollout that died mid-turn leaves an unmatched `task_started` forever, so silence past the cutoff is the only thing that stops it counting, and once its root goes quiet too the whole tree leaves the fold and releases its offsets.
+
+## Live Tracker Read Overlay
+
+A folded session storage has no row for becomes an observed-only row carrying its open agents in a stable order, and only a validated root cwd earns it: without one it names no project and stays out of the result.
+
+A stored row the fold does not cover keeps unknown agents and its own retained metrics.

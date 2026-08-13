@@ -13653,6 +13653,8 @@ impl Storage {
         Ok(())
     }
 
+    // Dead with the read-path rewire; removed with the model-evidence overlay.
+    #[allow(dead_code)]
     pub(crate) fn get_observed_agent_model_evidence(
         &self,
         targets: &[crate::models::ObservedAgentModelKey],
@@ -20482,17 +20484,14 @@ mod tests {
             .expect("read SQL frontier");
         assert_eq!(baseline[0].session_id, "leader");
 
-        let state = crate::server::ObservedSubagentState::default();
-        assert!(state.record_scanned_session(
-            crate::transcript_scan::TranscriptSession {
-                provider: IntegrationProvider::Codex,
-                session_id: "target".to_owned(),
-                cwd: None,
-                started_at: now - TimeDelta::minutes(20),
-                last_activity: now,
-                agents: Vec::new(),
-            },
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        assert!(tracker.record_session(
+            IntegrationProvider::Codex,
+            "target",
             "host",
+            None,
+            now,
+            &[],
         ));
         let rows = storage
             .get_session_breakdown_with_observed(
@@ -20500,19 +20499,10 @@ mod tests {
                 None,
                 None,
                 Some(1),
-                &state.session_ranking_keys(),
+                &tracker.session_ranking_keys(),
             )
             .expect("read observed retained candidates");
-        let mut rows = state
-            .merge(
-                rows,
-                &range_from_timestamp("1h"),
-                None,
-                None,
-                Some(1),
-                |_| Ok(HashMap::new()),
-            )
-            .expect("merge observed activity");
+        let mut rows = tracker.overlay(rows, &range_from_timestamp("1h"), None, None, Some(1));
         storage
             .populate_session_terminal_evidence(&mut rows, "1h", None, None)
             .expect("project terminal evidence");

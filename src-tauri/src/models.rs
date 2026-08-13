@@ -332,6 +332,8 @@ pub struct ObservedSessionAgent {
     pub runtime_active: bool,
 }
 
+// Dead with the read-path rewire; removed with the model-evidence overlay.
+#[allow(dead_code)]
 pub(crate) type ObservedAgentModelKey = (String, String, String);
 
 #[derive(Serialize, Clone, Debug)]
