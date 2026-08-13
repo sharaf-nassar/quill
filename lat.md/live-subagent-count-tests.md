@@ -147,3 +147,17 @@ A rollout that died mid-turn leaves an unmatched `task_started` forever, so sile
 A folded session storage has no row for becomes an observed-only row carrying its open agents in a stable order, and only a validated root cwd earns it: without one it names no project and stays out of the result.
 
 A stored row the fold does not cover keeps unknown agents and its own retained metrics.
+
+## Claude Rail Through The Read Path
+
+A spawned Claude agent reaches a Sessions row as an open agent carrying its own transcript's model, a process that never saw the spawn rebuilds that rail from the transcripts alone, and the spawning call's result closes it.
+
+A row for a host with no local transcripts rides the same read unchanged: its agent fields stay null rather than borrowing the local fold's answer.
+
+## Codex Rail Through The Read Path
+
+A spawned Codex rollout reaches a Sessions row the same way, with the model its own rollout names, survives a restart through the sweep that rebuilds the fold, and leaves the rail when its turn boundary closes.
+
+## Read Path Without Scan On Read
+
+A read over a folded corpus opens no transcript, so it holds the Sessions budget with headroom while the fold that produced the state is paid on the sweep instead.

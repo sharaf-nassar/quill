@@ -2544,4 +2544,299 @@ mod tests {
         assert_eq!(rows[1].observed_agents, None);
         assert_eq!(rows[1].total_tokens, 7);
     }
+
+    /// A Sessions row for a host with no local transcripts: the fold can never
+    /// cover it, so it is the control every end-to-end read carries.
+    fn remote_row(provider: &str, now: DateTime<Utc>) -> SessionBreakdown {
+        SessionBreakdown {
+            provider: provider.to_owned(),
+            session_id: "remote-root".to_owned(),
+            hostname: "remote-host.example.com".to_owned(),
+            total_tokens: 42,
+            turn_count: 3,
+            first_seen: (now - TimeDelta::minutes(10)).to_rfc3339(),
+            last_active: (now - TimeDelta::minutes(2)).to_rfc3339(),
+            ended_at: None,
+            project: Some("/remote/project".to_owned()),
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
+            observed_only: false,
+        }
+    }
+
+    /// Run the read path the `get_session_breakdown` command runs: the fold's
+    /// ranking keys, then its overlay over the rows storage returned.
+    fn read_path(
+        tracker: &LiveTracker,
+        rows: Vec<SessionBreakdown>,
+        now: DateTime<Utc>,
+    ) -> (Vec<(String, String, String)>, Vec<SessionBreakdown>) {
+        let keys = tracker.session_ranking_keys();
+        let rows = tracker.overlay(
+            rows,
+            &(now - TimeDelta::hours(1)).to_rfc3339(),
+            None,
+            None,
+            Some(10),
+        );
+        (keys, rows)
+    }
+
+    fn agent_ids(row: &SessionBreakdown) -> Vec<&str> {
+        row.observed_agents
+            .as_ref()
+            .expect("covered row carries observed agents")
+            .iter()
+            .map(|agent| agent.agent_id.as_str())
+            .collect()
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Claude Rail Through The Read Path]]
+    #[test]
+    fn a_claude_spawn_reaches_the_read_path_and_survives_a_restart() {
+        let fixture = Fixture::new();
+        let now = Utc::now();
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        fixture.write(&(record(&at(120)) + "\n"));
+        fixture.spawn_agent(
+            &fixture.subagents(),
+            "e2e",
+            "toolu_e2e",
+            &[
+                assistant(&at(90), "claude-opus-4-5-20251101"),
+                record(&at(60)),
+            ],
+        );
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, now);
+        let (keys, rows) = read_path(&tracker, vec![remote_row("claude", now)], now);
+        assert!(keys.contains(&(
+            "claude".to_owned(),
+            fixture.session_id.clone(),
+            local_observed_host().expect("local host").to_owned(),
+        )));
+        let live = rows
+            .iter()
+            .find(|row| row.session_id == fixture.session_id)
+            .expect("the folded session reaches the read path");
+        assert!(live.observed_only);
+        assert_eq!(agent_ids(live), vec!["e2e"]);
+        assert_eq!(
+            live.observed_agents.as_ref().expect("agents")[0].model_id,
+            Some("claude-opus-4-5-20251101".to_owned())
+        );
+        // No local transcripts for a remote host, so its agent fields stay
+        // honestly null rather than borrowing the local fold's answer.
+        let remote = rows
+            .iter()
+            .find(|row| row.session_id == "remote-root")
+            .expect("remote row survives the overlay");
+        assert_eq!(remote.observed_agents, None);
+        assert!(!remote.observed_only);
+        assert_eq!(remote.total_tokens, 42);
+
+        // Restart: a process with no memory of the fold rebuilds the same rail
+        // from the transcripts alone.
+        let restarted = LiveTracker::new(None);
+        fixture.sweep(&restarted, now);
+        let (_, rows) = read_path(&restarted, vec![remote_row("claude", now)], now);
+        let live = rows
+            .iter()
+            .find(|row| row.session_id == fixture.session_id)
+            .expect("the startup sweep rebuilds the session");
+        assert_eq!(agent_ids(live), vec!["e2e"]);
+
+        // The spawning call's result closes the rail on the next fold.
+        fixture.append(&(tool_result(&at(1), "toolu_e2e") + "\n"));
+        restarted.apply_paths_at(
+            [(fixture.root_transcript(), IntegrationProvider::Claude)],
+            now,
+        );
+        let (_, rows) = read_path(&restarted, vec![remote_row("claude", now)], now);
+        let live = rows
+            .iter()
+            .find(|row| row.session_id == fixture.session_id)
+            .expect("the session stays live after its agent closes");
+        assert!(agent_ids(live).is_empty());
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Rail Through The Read Path]]
+    #[test]
+    fn a_codex_spawn_reaches_the_read_path_and_survives_a_restart() {
+        let fixture = CodexFixture::new();
+        let now = Utc::now();
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let agent = "019fe372-6824-70e3-8fcd-000000000001";
+        fixture.write(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[&format!(
+                "{{\"type\":\"event_msg\",\"timestamp\":\"{}\",\"payload\":\
+                 {{\"type\":\"user_message\",\"message\":\"go\"}}}}",
+                at(120)
+            )],
+        );
+        fixture.write(
+            agent,
+            &spawned_by(root, "worker"),
+            &[&turn_context("gpt-5-codex"), &turn("task_started", &at(90))],
+        );
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, now);
+        let (keys, rows) = read_path(&tracker, vec![remote_row("codex", now)], now);
+        assert!(keys.contains(&(
+            "codex".to_owned(),
+            root.to_owned(),
+            local_observed_host().expect("local host").to_owned(),
+        )));
+        let live = rows
+            .iter()
+            .find(|row| row.session_id == root)
+            .expect("the folded rollout reaches the read path");
+        assert!(live.observed_only);
+        assert_eq!(agent_ids(live), vec![agent]);
+        assert_eq!(
+            live.observed_agents.as_ref().expect("agents")[0].model_id,
+            Some("gpt-5-codex".to_owned())
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "remote-root")
+                .expect("remote row survives the overlay")
+                .observed_agents,
+            None
+        );
+
+        let restarted = LiveTracker::new(None);
+        fixture.sweep(&restarted, now);
+        let (_, rows) = read_path(&restarted, Vec::new(), now);
+        assert_eq!(
+            agent_ids(
+                rows.iter()
+                    .find(|row| row.session_id == root)
+                    .expect("the startup sweep rebuilds the rollout")
+            ),
+            vec![agent]
+        );
+
+        // The turn boundary is the Codex closure evidence.
+        fixture.append(agent, &(turn("task_complete", &at(1)) + "\n"));
+        restarted.apply_paths_at([(fixture.path(agent), IntegrationProvider::Codex)], now);
+        let (_, rows) = read_path(&restarted, Vec::new(), now);
+        assert!(
+            agent_ids(
+                rows.iter()
+                    .find(|row| row.session_id == root)
+                    .expect("the session stays live after its turn ends")
+            )
+            .is_empty()
+        );
+    }
+
+    /// Lay down `sessions` Claude trees and `sessions` Codex rollouts, each
+    /// with one open agent, so the read path can be timed over a corpus.
+    fn write_corpus(claude_root: &Path, codex_root: &Path, sessions: usize, now: DateTime<Utc>) {
+        let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
+        fs::create_dir_all(codex_root.join("2026/08/08")).expect("create codex day tree");
+        for index in 0..sessions {
+            let session_id = format!("00000000-0000-4000-8000-{index:012}");
+            let project = claude_root.join(format!("-home-user-project-{index}"));
+            let subagents = project.join(&session_id).join("subagents");
+            fs::create_dir_all(&subagents).expect("create session tree");
+            fs::write(
+                project.join(format!("{session_id}.jsonl")),
+                record(&at(120)) + "\n",
+            )
+            .expect("write root transcript");
+            fs::write(
+                subagents.join("agent-corpus.jsonl"),
+                assistant(&at(90), "claude-opus-4-5-20251101") + "\n",
+            )
+            .expect("write agent transcript");
+            fs::write(
+                subagents.join("agent-corpus.meta.json"),
+                "{\"agentType\":\"general-purpose\",\"toolUseId\":\"toolu_corpus\",\
+                 \"spawnDepth\":1}",
+            )
+            .expect("write agent meta");
+
+            let thread = format!("019fe372-0000-70e3-8fcd-{index:012}");
+            fs::write(
+                codex_root
+                    .join("2026/08/08")
+                    .join(format!("rollout-2026-08-08T00-00-00-{thread}.jsonl")),
+                format!(
+                    "{{\"timestamp\":\"{}\",\"type\":\"session_meta\",\"payload\":\
+                     {{\"id\":\"{thread}\",\"timestamp\":\"{}\",\"cwd\":\"/home/user/project\",\
+                     \"thread_source\":\"user\"}}}}\n{}\n",
+                    at(120),
+                    at(120),
+                    format_args!(
+                        "{{\"type\":\"event_msg\",\"timestamp\":\"{}\",\"payload\":\
+                         {{\"type\":\"user_message\",\"message\":\"go\"}}}}",
+                        at(110)
+                    )
+                ),
+            )
+            .expect("write rollout");
+        }
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Read Path Without Scan On Read]]
+    #[test]
+    fn the_read_path_costs_a_map_lock_rather_than_a_scan() {
+        const SESSIONS: usize = 200;
+        /// The Sessions read budget the command has always held.
+        const BUDGET: Duration = Duration::from_millis(300);
+
+        let claude_root = tempfile::tempdir().expect("claude corpus root");
+        let codex_root = tempfile::tempdir().expect("codex corpus root");
+        let now = Utc::now();
+        write_corpus(claude_root.path(), codex_root.path(), SESSIONS, now);
+
+        let tracker = LiveTracker::new(None);
+        let started = Instant::now();
+        tracker.sweep_in(claude_root.path(), codex_root.path(), now);
+        let cold_sweep = started.elapsed();
+        let started = Instant::now();
+        tracker.sweep_in(claude_root.path(), codex_root.path(), now);
+        let warm_sweep = started.elapsed();
+        assert_eq!(tracker.session_ranking_keys().len(), SESSIONS * 2);
+
+        // The read is what the budget covers: no transcript is opened here, so
+        // the corpus the sweep folded costs nothing on this path.
+        let mut samples = (0..20)
+            .map(|_| {
+                let rows = (0..SESSIONS)
+                    .map(|_| remote_row("claude", now))
+                    .collect::<Vec<_>>();
+                let started = Instant::now();
+                let (keys, rows) = read_path(&tracker, rows, now);
+                let elapsed = started.elapsed();
+                assert_eq!(keys.len(), SESSIONS * 2);
+                assert_eq!(rows.len(), 10);
+                elapsed
+            })
+            .collect::<Vec<_>>();
+        samples.sort_unstable();
+        let p95 = samples[samples.len() * 95 / 100];
+        println!(
+            "live-tracker corpus={} cold_sweep={:?} warm_sweep={:?} read_p95={:?} read_max={:?}",
+            SESSIONS * 2,
+            cold_sweep,
+            warm_sweep,
+            p95,
+            samples.last().expect("samples")
+        );
+        assert!(p95 < BUDGET, "read path p95 {p95:?} exceeds {BUDGET:?}");
+    }
 }
