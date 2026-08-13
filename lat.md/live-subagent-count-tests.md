@@ -153,3 +153,19 @@ Frontend provenance formatting renders unavailable synthetic tokens as an em das
 Retained inventory and live scanning derive a transcript's root session id through one helper per provider, so the two consumers cannot drift apart on layout rules.
 
 Claude parents resolve to the file stem and sub-agents to the directory holding `subagents/` at any nesting depth, including the Workflow layout. Codex takes the trailing uuid of a `rollout-<timestamp>-<thread id>` name and rejects a malformed one outright rather than returning a truncated id.
+
+## Live Tracker Tail Mechanics
+
+A fold consumes only the bytes appended since the previous one and leaves a record still mid-write unconsumed, so activity advances exactly once and only when its record is complete.
+
+## Live Tracker Truncation Reset
+
+A transcript shorter than the offset already consumed was rewritten rather than appended to, so the replacement is folded whole instead of being read from a stale offset into the middle of a record.
+
+## Live Tracker Idle Eviction
+
+A session quiet past the idle cutoff releases both its folded state and the file offsets it owned, so memory stays bounded by live sessions and a revival re-reads its transcripts from zero.
+
+## Live Tracker Enable Toggles
+
+Disabling activity tracking or one provider clears the folded state it covers and keeps later folds out, and re-enabling rebuilds from the transcripts on the next sweep rather than from anything retained.

@@ -28,15 +28,10 @@ use serde::Deserialize;
 
 use crate::integrations::IntegrationProvider;
 
-/// Silence past this cutoff means the producing process is gone rather than
-/// merely quiet: measured inter-record gaps reach p99.9 ≈ 309s, an order of
-/// magnitude below it. It skips whole idle sessions in stage one and serves as
-/// the per-agent crash backstop for a spawn whose result never arrived.
-///
-/// The reconciler expires snapshots on the same cutoff. Two values would drift:
-/// a shorter one there would drop sessions this scanner still reports, and a
-/// longer one would retain husks of sessions it has already released.
-pub(crate) const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
+/// The idle cutoff this scanner shares with the live tracker that replaces it.
+/// Two values would drift: a shorter one would drop sessions the other still
+/// reports, and a longer one would retain husks it has already released.
+pub(crate) use crate::live_tracker::IDLE_AFTER;
 
 /// Minimum spacing between passes. Sessions reads arrive in bursts whenever
 /// several widgets invalidate at once, and stage one costs one directory walk
@@ -167,7 +162,7 @@ struct AgentMeta {
 /// The fields of a transcript record this scanner reads. `content` stays an
 /// untyped value because Claude writes it as either a string or a block array.
 #[derive(Deserialize)]
-struct ScanRecord {
+pub(crate) struct ScanRecord {
     #[serde(rename = "type")]
     kind: Option<String>,
     timestamp: Option<String>,
@@ -801,7 +796,7 @@ fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
 /// is left unconsumed for the next pass instead of being parsed in half. A file
 /// shorter than the offset was rewritten rather than appended to, so it restarts
 /// from the beginning.
-fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMut(&str)) {
+pub(crate) fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMut(&str)) {
     let Ok(file) = File::open(path) else {
         return;
     };
@@ -845,7 +840,7 @@ fn claude_record_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
 ///
 /// Hook result attachments are appended after the turn they belong to has
 /// ended, so their write must not reopen a finished session.
-fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
+pub(crate) fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
     if record.kind.as_deref() == Some("attachment") {
         return None;
     }

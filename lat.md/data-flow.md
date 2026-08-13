@@ -140,6 +140,16 @@ Disabling activity tracking removes both managed observer paths and clears every
 
 Codex config changes flow through parsed TOML: install snapshots the active custom or default Codex home, records prior feature and MCP environment values, replaces only Quill commands, then reconciles positional trust keys against pre/post `hooks/list` metadata. Verification reparses the file, rejects retired Quill shell-hook commands omitted from `hooks/list`, and checks exact enabled/trusted handlers; startup repair then migrates stale registrations, which is also what prunes lifecycle registrations written by an older Quill. Uninstall targets the recorded home and restores the captured user values.
 
+## Live Session Tracker
+
+[[src-tauri/src/live_tracker.rs#LiveTracker]] folds live session state from local transcripts as they are written, so a Sessions read costs a map lock instead of a directory walk. It replaces the scan-on-read snapshot pipeline below.
+
+[[src-tauri/src/live_tracker.rs#LiveTracker#apply_paths]] folds the transcripts the filesystem watcher reports. Each file carries the byte offset already consumed, so steady state parses only appended bytes; a trailing line without its newline is a record still being written and is left for the next fold, and a file shorter than its offset was rewritten rather than appended to and is folded whole. A file whose length still equals its offset is skipped without being opened, so the sweep costs one `stat` per quiet transcript.
+
+[[src-tauri/src/live_tracker.rs#LiveTracker#sweep]] is the cold start, the watcher-overflow recovery, and the periodic backstop for missed filesystem events. It walks both provider roots through [[src-tauri/src/sessions.rs#discover_claude_transcripts_in]] and [[src-tauri/src/sessions.rs#discover_codex_transcripts_in]] — the same walkers retained inventory uses — folds whatever moved, and releases sessions silent past [[src-tauri/src/live_tracker.rs#IDLE_AFTER]] along with the file offsets they owned. Disabling activity tracking or one provider clears the state it covers, and the next sweep rebuilds it.
+
+A state-changing fold emits `sessions-live-updated`, coalesced over a 250 ms window so a burst of appends wakes its readers once.
+
 ## Transcript-Derived Session Snapshots
 
 [[src-tauri/src/transcript_scan.rs#TranscriptScanner]] derives live Claude and Codex session and agent state from transcripts on disk, so a session that started before Quill launched reports correct agent counts on the first scan rather than staying unknown.

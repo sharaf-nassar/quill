@@ -14,6 +14,7 @@ mod git_analysis;
 mod indicator;
 mod integrations;
 mod learning;
+mod live_tracker;
 mod memory_optimizer;
 mod model_usage;
 mod models;
@@ -108,6 +109,8 @@ const CLAUDE_MODEL_RESCAN_NUDGE_INITIAL_SECS: u64 = 10;
 const CLAUDE_MODEL_RESCAN_NUDGE_RETRY_SECS: u64 = 30;
 // Shared with `server.rs`, which emits the same event from the notify path.
 pub(crate) const TRANSCRIPT_ANALYTICS_UPDATED_EVENT: &str = "transcript-analytics-updated";
+// Emitted by `live_tracker.rs` after a fold changes live session state.
+pub(crate) const SESSIONS_LIVE_UPDATED_EVENT: &str = "sessions-live-updated";
 const ROLLUP_BACKFILL_PROGRESS_EVENT: &str = "rollup-backfill-progress";
 const ROLLUP_BACKFILL_FINISHED_EVENT: &str = "rollup-backfill-finished";
 // Marker prefix `storage::Storage::init` puts in front of a schema upper-bound

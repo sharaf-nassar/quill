@@ -19,6 +19,10 @@ use tokio::net::TcpListener;
 use tauri::Emitter;
 
 use crate::integrations::IntegrationProvider;
+use crate::live_tracker::{
+    SessionKey, local_observed_host, normalize_observed_hostname, observed_agent_type,
+    observed_root_cwd,
+};
 use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
     LearningRunPayload, ObservationPayload, ObservedAgentModelKey, ObservedHookObservation,
@@ -31,8 +35,8 @@ use crate::storage::Storage;
 const DEFAULT_PORT: u16 = 19876;
 const MAX_REQUESTS: usize = 100;
 const RATE_WINDOW_SECS: u64 = 60;
-const MAX_STRING_LEN: usize = 256;
-const MAX_CWD_LEN: usize = 4096;
+pub(crate) const MAX_STRING_LEN: usize = 256;
+pub(crate) const MAX_CWD_LEN: usize = 4096;
 // Feature 009: tighter cap on `session_id` that matches the wire
 // contract in
 // specs/009-hooks-breakdown-tab/contracts/hooks-observed-endpoint.md
@@ -60,13 +64,6 @@ const MAX_MESSAGES_PER_REQUEST: usize = 500;
 const REMOTE_ASSISTANT_TOOL_USE_TYPE: &str = "assistant_tool_use";
 const SESSION_NOTIFY_DEBOUNCE_MS: u64 = 250;
 const RETAINED_VALIDATE_RETRY_CAP: u32 = 5;
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct SessionKey {
-    provider: String,
-    host: String,
-    session_id: String,
-}
 
 /// Complete session state as the transcript scanner last derived it.
 ///
@@ -100,20 +97,6 @@ impl SessionSnapshot {
     fn is_stale(&self, now: DateTime<Utc>) -> bool {
         now.signed_duration_since(self.last_activity) > crate::transcript_scan::IDLE_AFTER
     }
-}
-
-fn observed_agent_type(agent_type: Option<&str>) -> Option<String> {
-    let agent_type = agent_type?.trim();
-    (!agent_type.is_empty()
-        && agent_type.len() <= MAX_STRING_LEN
-        && !agent_type.chars().any(char::is_control))
-    .then(|| agent_type.to_owned())
-}
-
-fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
-    let cwd = cwd?.trim();
-    (!cwd.is_empty() && cwd.len() <= MAX_CWD_LEN && Path::new(cwd).is_absolute())
-        .then(|| cwd.to_owned())
 }
 
 /// Reconciles per-source session snapshots: last-write-wins per session key by
@@ -170,18 +153,6 @@ pub(crate) struct ObservedSubagentState {
     scanner: Mutex<crate::transcript_scan::TranscriptScanner>,
 }
 
-/// The local host every transcript-derived session belongs to.
-///
-/// Resolution can shell out, so it is done once per process rather than on
-/// every Sessions read.
-fn local_observed_host() -> Option<&'static str> {
-    static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    HOST.get_or_init(|| {
-        normalize_observed_hostname(&crate::sessions::SessionIndex::local_hostname())
-    })
-    .as_deref()
-}
-
 /// Reconciler key for a Sessions row, or `None` when the row's hostname does not
 /// normalize and so can never match a snapshot.
 fn row_key(row: &SessionBreakdown) -> Option<SessionKey> {
@@ -218,15 +189,6 @@ fn transcript_snapshot(
             })
             .collect(),
     }
-}
-
-fn normalize_observed_hostname(hostname: &str) -> Option<String> {
-    let hostname = hostname.trim();
-    if hostname.is_empty() || hostname.len() > MAX_STRING_LEN {
-        return None;
-    }
-    let short = hostname.split('.').next().unwrap_or_default();
-    (!short.is_empty()).then(|| short.to_ascii_lowercase())
 }
 
 impl ObservedSubagentState {
