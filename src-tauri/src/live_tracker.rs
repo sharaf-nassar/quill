@@ -16,8 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::Deserialize;
@@ -31,33 +30,32 @@ use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
 /// merely quiet: measured inter-record gaps reach p99.9 ≈ 309s, an order of
 /// magnitude below it. It evicts whole idle sessions and serves as the
 /// per-agent crash backstop for a spawn whose result never arrived.
-pub(crate) const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
-
-/// Update events are coalesced over this window. A single turn appends records
-/// continuously, and Sessions rows carry wall-clock-grained facts, so one event
-/// per window keeps the readers a burst would otherwise re-run.
-const EMIT_DEBOUNCE: Duration = Duration::from_millis(250);
+const IDLE_AFTER: TimeDelta = TimeDelta::minutes(15);
 
 /// One live session, addressed the way a Sessions row is.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct SessionKey {
-    pub(crate) provider: String,
-    pub(crate) host: String,
-    pub(crate) session_id: String,
+struct SessionKey {
+    provider: String,
+    host: String,
+    session_id: String,
 }
 
 /// Live state folded from one session's transcripts.
-#[derive(Debug)]
-pub(crate) struct LiveSession {
+///
+/// A default session carries the epoch as its activity, so folding a file that
+/// turns out to hold no timestamped record leaves a session the next sweep
+/// evicts rather than a live one.
+#[derive(Debug, Default)]
+struct LiveSession {
     /// Newest timestamp from transcript content. Provider rules decide which
     /// records count, so post-turn bookkeeping cannot reopen a finished
     /// session.
-    pub(crate) last_activity: DateTime<Utc>,
+    last_activity: DateTime<Utc>,
     /// When the session's own transcript opened, from its first timestamped
     /// record. That record is never re-read, so the origin is established once.
-    pub(crate) started_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
     /// The project the session runs in, from the same first record.
-    pub(crate) cwd: Option<String>,
+    cwd: Option<String>,
     /// Spawn tool-use ids seen in a `tool_result` and workflow agent ids seen
     /// in a journal `result`, from anywhere in this session's tree.
     ///
@@ -68,29 +66,15 @@ pub(crate) struct LiveSession {
     resolved: HashSet<String>,
     /// Sub-agents this session has spawned, by the id their transcript is
     /// named for.
-    pub(crate) agents: HashMap<String, LiveAgent>,
-}
-
-impl Default for LiveSession {
-    fn default() -> Self {
-        Self {
-            // Folding a file that turns out to hold no timestamped record
-            // leaves a session the next sweep evicts rather than a live one.
-            last_activity: DateTime::UNIX_EPOCH,
-            started_at: None,
-            cwd: None,
-            resolved: HashSet::new(),
-            agents: HashMap::new(),
-        }
-    }
+    agents: HashMap<String, LiveAgent>,
 }
 
 /// One sub-agent inside a [`LiveSession`].
-#[derive(Debug)]
-pub(crate) struct LiveAgent {
-    pub(crate) agent_type: Option<String>,
+#[derive(Debug, Default)]
+struct LiveAgent {
+    agent_type: Option<String>,
     /// The model this agent's own assistant records name.
-    pub(crate) model: Option<String>,
+    model: Option<String>,
     /// The spawning tool call, from the sibling `.meta.json`. Workflow agents
     /// have none and answer to their journal instead.
     tool_use_id: Option<String>,
@@ -109,16 +93,11 @@ pub(crate) struct LiveAgent {
 }
 
 impl LiveAgent {
-    fn new(workflow: bool) -> Self {
-        Self {
-            agent_type: None,
-            model: None,
-            tool_use_id: None,
-            workflow,
-            turn_open: None,
-            meta_read: false,
-            last_activity: DateTime::UNIX_EPOCH,
-        }
+    /// Record the turn boundary a rollout states, reporting whether it moved.
+    fn set_turn_open(&mut self, open: bool) -> bool {
+        let changed = self.turn_open != Some(open);
+        self.turn_open = Some(open);
+        changed
     }
 }
 
@@ -129,22 +108,28 @@ impl LiveSession {
     /// workflow agent to its journal, and anything else to the spawning tool
     /// call; either way a spawn whose own transcript went silent past the
     /// cutoff is abandoned rather than slow.
-    pub(crate) fn agent_open(&self, agent_id: &str, now: DateTime<Utc>) -> bool {
+    fn agent_open(&self, agent_id: &str, now: DateTime<Utc>) -> bool {
         self.agents.get(agent_id).is_some_and(|agent| {
-            let idle_for = now
-                .signed_duration_since(agent.last_activity)
-                .max(TimeDelta::zero());
+            if now.signed_duration_since(agent.last_activity) > IDLE_AFTER {
+                return false;
+            }
             match agent.turn_open {
-                Some(open) => open && idle_for <= IDLE_AFTER,
-                None => claude_agent_open(
-                    agent_id,
-                    agent.workflow,
-                    agent.tool_use_id.as_deref(),
-                    &self.resolved,
-                    idle_for,
-                ),
+                Some(open) => open,
+                // A workflow agent answers to its journal, anything else to the
+                // spawning tool call, and an agent with no spawn evidence at
+                // all cannot be claimed open.
+                None if agent.workflow => !self.resolved.contains(agent_id),
+                None => agent
+                    .tool_use_id
+                    .as_deref()
+                    .is_some_and(|tool_use_id| !self.resolved.contains(tool_use_id)),
             }
         })
+    }
+
+    /// The agent a file's records belong to, when they belong to one at all.
+    fn agent_mut(&mut self, agent_id: Option<&str>) -> Option<&mut LiveAgent> {
+        self.agents.get_mut(agent_id?)
     }
 
     /// The open agents a Sessions row lists, in a stable order because a
@@ -168,9 +153,27 @@ impl LiveSession {
     }
 }
 
+/// Move an activity clock forward, reporting whether the timestamp was newer.
+/// Every clock the fold keeps is a high-water mark, because transcript records
+/// are not guaranteed to be written in timestamp order.
+fn advance(slot: &mut DateTime<Utc>, timestamp: DateTime<Utc>) -> bool {
+    let newer = timestamp > *slot;
+    if newer {
+        *slot = timestamp;
+    }
+    newer
+}
+
+/// The instant an RFC 3339 string names, in UTC.
+fn utc(timestamp: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
 /// Tracker key for a Sessions row, or `None` when the row's hostname does not
 /// normalize and so can never match a folded session.
-pub(crate) fn row_key(row: &SessionBreakdown) -> Option<SessionKey> {
+fn row_key(row: &SessionBreakdown) -> Option<SessionKey> {
     Some(SessionKey {
         provider: row.provider.clone(),
         host: normalize_observed_hostname(&row.hostname)?,
@@ -200,18 +203,11 @@ struct FileTail {
     session: SessionKey,
 }
 
-#[derive(Default)]
-struct EmitState {
-    last_emit: Option<Instant>,
-    scheduled: bool,
-}
-
 /// Live session and agent state, folded from transcripts as they are written.
 pub(crate) struct LiveTracker {
     state: Mutex<TrackerState>,
     /// Absent in tests, which assert on folded state rather than on delivery.
     app: Option<AppHandle>,
-    emit: Arc<Mutex<EmitState>>,
 }
 
 struct TrackerState {
@@ -305,9 +301,8 @@ impl TrackerState {
                     // so a tail that reached back a mebibyte without finding one
                     // is still inside it. Any boundary the window does hold
                     // overrides that as the fold reaches it.
-                    if let Some(agent) = agent_id.and_then(|id| session.agents.get_mut(id)) {
-                        changed |= agent.turn_open != Some(truncated);
-                        agent.turn_open = Some(truncated);
+                    if let Some(agent) = session.agent_mut(agent_id) {
+                        changed |= agent.set_turn_open(truncated);
                     }
                     let complete = window
                         .iter()
@@ -333,15 +328,9 @@ impl TrackerState {
                     _ => None,
                 };
                 if let Some(timestamp) = claude_activity_timestamp(&record) {
-                    if timestamp > session.last_activity {
-                        session.last_activity = timestamp;
-                        changed = true;
-                    }
-                    if let Some(agent) = agent_id.and_then(|id| session.agents.get_mut(id))
-                        && timestamp > agent.last_activity
-                    {
-                        agent.last_activity = timestamp;
-                        changed = true;
+                    changed |= advance(&mut session.last_activity, timestamp);
+                    if let Some(agent) = session.agent_mut(agent_id) {
+                        changed |= advance(&mut agent.last_activity, timestamp);
                     }
                 }
                 if matches!(role, FileRole::Root)
@@ -355,7 +344,7 @@ impl TrackerState {
                 // A sub-agent transcript's own assistant records name the model
                 // that agent is running, so its label needs no retained
                 // evidence.
-                if let Some(agent) = agent_id.and_then(|id| session.agents.get_mut(id))
+                if let Some(agent) = session.agent_mut(agent_id)
                     && let Some(model) = claude_record_model(&record)
                     && agent.model.as_deref() != Some(model.as_str())
                 {
@@ -396,7 +385,10 @@ impl TrackerState {
             .entry(agent_id.to_owned())
             .or_insert_with(|| {
                 changed = true;
-                LiveAgent::new(workflow)
+                LiveAgent {
+                    workflow,
+                    ..LiveAgent::default()
+                }
             });
         if agent.meta_read {
             return changed;
@@ -448,8 +440,9 @@ impl TrackerState {
         host: &str,
         now: DateTime<Utc>,
     ) -> Option<(SessionKey, FileRole)> {
+        // The whole batch was indexed by `apply_paths_at` before any of it was
+        // resolved, so this rollout is already in `threads`.
         let thread_id = crate::sessions::codex_thread_id(path)?;
-        self.threads.insert(thread_id.clone(), path.to_owned());
         // Locating an ancestor is why the index covers the whole corpus, but
         // only a rollout still being written can hold live state, so a quiet one
         // is indexed without being opened.
@@ -476,28 +469,21 @@ impl TrackerState {
                 session.started_at = head.started_at;
                 session.cwd = observed_root_cwd(head.cwd.as_deref());
             }
-            if let Some(started_at) = head.started_at
-                && started_at > session.last_activity
-            {
-                session.last_activity = started_at;
+            if let Some(started_at) = head.started_at {
+                advance(&mut session.last_activity, started_at);
             }
             return Some((key, FileRole::Codex { agent_id: None }));
         }
         // A spawned rollout is the sub-agent: its head names the role it plays
         // and the first `turn_context` model its own file states.
-        let agent = session
-            .agents
-            .entry(head.session_id.clone())
-            .or_insert_with(|| LiveAgent::new(false));
+        let agent = session.agents.entry(head.session_id.clone()).or_default();
         agent.agent_type = observed_agent_type(head.agent_role.as_deref());
         agent.model = head.model;
         // The thread's own start is the floor its abandonment clock falls back
         // to: a rollout can spend a whole turn emitting records that carry no
         // timestamp of their own.
-        if let Some(started_at) = head.started_at
-            && started_at > agent.last_activity
-        {
-            agent.last_activity = started_at;
+        if let Some(started_at) = head.started_at {
+            advance(&mut agent.last_activity, started_at);
         }
         Some((
             key,
@@ -530,7 +516,6 @@ impl LiveTracker {
         Self {
             state: Mutex::new(TrackerState::default()),
             app,
-            emit: Arc::new(Mutex::new(EmitState::default())),
         }
     }
 
@@ -671,17 +656,12 @@ impl LiveTracker {
                 continue;
             };
             row.observed_agents = Some(session.open_agents(now));
-            let stored = DateTime::parse_from_rfc3339(&row.last_active)
-                .ok()
-                .map(|at| at.with_timezone(&Utc));
-            if stored.is_none_or(|stored| session.last_activity > stored) {
+            if utc(&row.last_active).is_none_or(|stored| session.last_activity > stored) {
                 row.last_active = session.last_activity.to_rfc3339();
             }
         }
 
-        let from = DateTime::parse_from_rfc3339(range_from)
-            .ok()
-            .map(|at| at.with_timezone(&Utc));
+        let from = utc(range_from);
         let hostname_filter = hostname.and_then(normalize_observed_hostname);
         let provider_filter = provider.map(IntegrationProvider::as_str);
 
@@ -728,13 +708,8 @@ impl LiveTracker {
         drop(state);
 
         rows.sort_by(|a, b| {
-            let parse = |value: &str| {
-                DateTime::parse_from_rfc3339(value)
-                    .ok()
-                    .map(|at| at.with_timezone(&Utc))
-            };
-            parse(&b.last_active)
-                .cmp(&parse(&a.last_active))
+            utc(&b.last_active)
+                .cmp(&utc(&a.last_active))
                 .then_with(|| a.provider.cmp(&b.provider))
                 .then_with(|| a.hostname.cmp(&b.hostname))
                 .then_with(|| a.session_id.cmp(&b.session_id))
@@ -772,10 +747,7 @@ impl LiveTracker {
         session.last_activity = last_activity;
         session.cwd = observed_root_cwd(cwd);
         for agent_id in open_agents {
-            let agent = session
-                .agents
-                .entry((*agent_id).to_owned())
-                .or_insert_with(|| LiveAgent::new(false));
+            let agent = session.agents.entry((*agent_id).to_owned()).or_default();
             agent.turn_open = Some(true);
             agent.last_activity = last_activity;
         }
@@ -820,36 +792,17 @@ impl LiveTracker {
             .retain(|_, tail| tail.session.provider != provider);
     }
 
-    /// Emit `sessions-live-updated`, coalescing a burst into one trailing
-    /// event so the readers it wakes run once per window.
+    /// Emit `sessions-live-updated`.
+    ///
+    /// A burst is already coalesced twice: the watcher drains its pending set
+    /// at most once per quiet window, and the frontend throttles the fan-out
+    /// those events wake. A third window here would only add a thread.
     fn notify(&self) {
-        let Some(app) = self.app.clone() else {
-            return;
-        };
-        let mut emit = self.emit.lock().unwrap();
-        if emit.scheduled {
-            return;
+        if let Some(app) = &self.app
+            && let Err(error) = app.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ())
+        {
+            log::warn!("Failed to emit live session update: {error}");
         }
-        let wait = emit.last_emit.map_or(Duration::ZERO, |last| {
-            EMIT_DEBOUNCE.saturating_sub(last.elapsed())
-        });
-        if wait.is_zero() {
-            emit.last_emit = Some(Instant::now());
-            drop(emit);
-            emit_live_update(&app);
-            return;
-        }
-        emit.scheduled = true;
-        drop(emit);
-        let state = Arc::clone(&self.emit);
-        std::thread::spawn(move || {
-            std::thread::sleep(wait);
-            let mut emit = state.lock().unwrap();
-            emit.scheduled = false;
-            emit.last_emit = Some(Instant::now());
-            drop(emit);
-            emit_live_update(&app);
-        });
     }
 }
 
@@ -860,18 +813,12 @@ impl LiveTracker {
 /// per pass — to fold sessions the same sweep then evicts. A file untouched
 /// past the cutoff cannot open an agent or advance activity, so the sweep pays
 /// one `stat` for it and stops retrying the `.meta.json` beside it.
-pub(crate) fn modified_within_idle_window(path: &Path, now: DateTime<Utc>) -> bool {
+fn modified_within_idle_window(path: &Path, now: DateTime<Utc>) -> bool {
     std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .is_ok_and(|modified| {
             now.signed_duration_since(DateTime::<Utc>::from(modified)) <= IDLE_AFTER
         })
-}
-
-fn emit_live_update(app: &AppHandle) {
-    if let Err(error) = app.emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ()) {
-        log::warn!("Failed to emit live session update: {error}");
-    }
 }
 
 /// Fold one Codex rollout line into its session, and into the sub-agent that
@@ -881,29 +828,33 @@ fn emit_live_update(app: &AppHandle) {
 /// bookkeeping cannot, and a turn boundary flips the agent's open bit. The
 /// agent's own clock takes either, because a rollout can spend a whole turn
 /// emitting nothing else.
+///
+/// Both rules read the same record, so the line is parsed once here: rollouts
+/// carry whole-file `world_state` snapshots, and the cheap substring test keeps
+/// those megabytes out of the JSON parser to begin with.
 fn fold_codex_line(line: &str, session: &mut LiveSession, agent_id: Option<&str>) -> bool {
+    if !line.contains(CODEX_EVENT_RECORD) && !line.contains(CODEX_RESPONSE_ITEM_RECORD) {
+        return false;
+    }
+    let Ok(record) = serde_json::from_str::<CodexEventRecord>(line) else {
+        return false;
+    };
     let mut changed = false;
     let agent_activity = |session: &mut LiveSession, timestamp| {
-        if let Some(agent) = agent_id.and_then(|id| session.agents.get_mut(id))
-            && timestamp > agent.last_activity
-        {
-            agent.last_activity = timestamp;
+        if let Some(agent) = session.agent_mut(agent_id) {
+            advance(&mut agent.last_activity, timestamp);
         }
     };
-    if let Some(timestamp) = codex_activity_timestamp(line) {
-        if timestamp > session.last_activity {
-            session.last_activity = timestamp;
-            changed = true;
-        }
+    if let Some(timestamp) = codex_activity_timestamp(&record) {
+        changed |= advance(&mut session.last_activity, timestamp);
         agent_activity(session, timestamp);
     }
-    if let Some((started, timestamp)) = codex_turn_boundary(line) {
+    if let Some((started, timestamp)) = codex_turn_boundary(&record) {
         if let Some(timestamp) = timestamp {
             agent_activity(session, timestamp);
         }
-        if let Some(agent) = agent_id.and_then(|id| session.agents.get_mut(id)) {
-            changed |= agent.turn_open != Some(started);
-            agent.turn_open = Some(started);
+        if let Some(agent) = session.agent_mut(agent_id) {
+            changed |= agent.set_turn_open(started);
         }
     }
     changed
@@ -943,7 +894,7 @@ fn claude_session_file(path: &Path) -> Option<(String, FileRole)> {
 ///
 /// Resolution can shell out, so it is done once per process rather than on
 /// every fold.
-pub(crate) fn local_observed_host() -> Option<&'static str> {
+fn local_observed_host() -> Option<&'static str> {
     static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
         normalize_observed_hostname(&crate::sessions::SessionIndex::local_hostname())
@@ -951,7 +902,7 @@ pub(crate) fn local_observed_host() -> Option<&'static str> {
     .as_deref()
 }
 
-pub(crate) fn normalize_observed_hostname(hostname: &str) -> Option<String> {
+fn normalize_observed_hostname(hostname: &str) -> Option<String> {
     let hostname = hostname.trim();
     if hostname.is_empty() || hostname.len() > MAX_STRING_LEN {
         return None;
@@ -961,7 +912,7 @@ pub(crate) fn normalize_observed_hostname(hostname: &str) -> Option<String> {
 }
 
 /// Trust boundary for a transcript-declared agent type.
-pub(crate) fn observed_agent_type(agent_type: Option<&str>) -> Option<String> {
+fn observed_agent_type(agent_type: Option<&str>) -> Option<String> {
     let agent_type = agent_type?.trim();
     (!agent_type.is_empty()
         && agent_type.len() <= MAX_STRING_LEN
@@ -970,7 +921,7 @@ pub(crate) fn observed_agent_type(agent_type: Option<&str>) -> Option<String> {
 }
 
 /// Trust boundary for a transcript-declared session root.
-pub(crate) fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
+fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
     let cwd = cwd?.trim();
     (!cwd.is_empty() && cwd.len() <= MAX_CWD_LEN && Path::new(cwd).is_absolute())
         .then(|| cwd.to_owned())
@@ -983,9 +934,9 @@ pub(crate) fn observed_root_cwd(cwd: Option<&str>) -> Option<String> {
 // rollout's head, tail, and turn records state about identity, activity, and
 // whether its turn is still open.
 
-pub(crate) const AGENT_FILE_PREFIX: &str = "agent-";
-pub(crate) const WORKFLOW_DIR_PREFIX: &str = "wf_";
-pub(crate) const WORKFLOW_JOURNAL: &str = "journal.jsonl";
+const AGENT_FILE_PREFIX: &str = "agent-";
+const WORKFLOW_DIR_PREFIX: &str = "wf_";
+const WORKFLOW_JOURNAL: &str = "journal.jsonl";
 
 /// Guard against a malformed parent chain walking forever. Measured Codex spawn
 /// depth across 4487 spawned rollouts reaches 3 (4175 at 1, 297 at 2, 15 at 3).
@@ -995,7 +946,7 @@ const MAX_CODEX_SPAWN_DEPTH: u32 = 16;
 /// the 4487 spawned rollouts measured has a boundary inside a window this long,
 /// and a window without one is itself the answer: a rollout only accumulates
 /// records inside a turn, so the tail is still in an open one.
-pub(crate) const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
+const CODEX_TAIL_SCAN_BYTES: u64 = 1 << 20;
 
 /// How far into a rollout the head read looks for the thread's model.
 ///
@@ -1010,15 +961,15 @@ const CODEX_HEAD_SCAN_BYTES: u64 = 1 << 20;
 /// The `.meta.json` Claude writes beside every sub-agent transcript at spawn.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AgentMeta {
-    pub(crate) tool_use_id: Option<String>,
-    pub(crate) agent_type: Option<String>,
+struct AgentMeta {
+    tool_use_id: Option<String>,
+    agent_type: Option<String>,
 }
 
 /// The fields of a transcript record the fold reads. `content` stays an
 /// untyped value because Claude writes it as either a string or a block array.
 #[derive(Deserialize)]
-pub(crate) struct ScanRecord {
+struct ScanRecord {
     #[serde(rename = "type")]
     kind: Option<String>,
     timestamp: Option<String>,
@@ -1044,14 +995,14 @@ struct JournalRecord {
 /// The `session_meta` record every Codex rollout opens with. It is written once
 /// at thread creation, so a re-read always yields the same answer.
 #[derive(Clone)]
-pub(crate) struct CodexHead {
-    pub(crate) session_id: String,
+struct CodexHead {
+    session_id: String,
     parent_id: Option<String>,
-    pub(crate) subagent: bool,
-    pub(crate) agent_role: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) cwd: Option<String>,
-    pub(crate) started_at: Option<DateTime<Utc>>,
+    subagent: bool,
+    agent_role: Option<String>,
+    model: Option<String>,
+    cwd: Option<String>,
+    started_at: Option<DateTime<Utc>>,
 }
 
 const CODEX_EVENT_RECORD: &str = "event_msg";
@@ -1069,20 +1020,8 @@ struct CodexEventRecord {
     payload: Option<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
-struct CodexTurnContextRecord {
-    #[serde(rename = "type")]
-    kind: String,
-    payload: Option<CodexTurnContextPayload>,
-}
-
-#[derive(Deserialize)]
-struct CodexTurnContextPayload {
-    model: Option<String>,
-}
-
 /// `agent-<id>.jsonl` carries the same id the workflow journal records use.
-pub(crate) fn claude_agent_id(path: &Path) -> Option<String> {
+fn claude_agent_id(path: &Path) -> Option<String> {
     path.file_stem()?
         .to_str()?
         .strip_prefix(AGENT_FILE_PREFIX)
@@ -1092,7 +1031,7 @@ pub(crate) fn claude_agent_id(path: &Path) -> Option<String> {
 
 /// Read one rollout's `session_meta`, memoised because the root of a deep
 /// chain is reached again from every sub-agent under it.
-pub(crate) fn codex_head(
+fn codex_head(
     thread_id: &str,
     index: &HashMap<String, PathBuf>,
     heads: &mut HashMap<String, Option<CodexHead>>,
@@ -1136,8 +1075,8 @@ fn read_codex_head(path: &Path) -> Option<CodexHead> {
         cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
         started_at: timestamp(record.get("payload"))
             .or_else(|| timestamp(Some(&record)))
-            .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
-            .map(|timestamp| timestamp.with_timezone(&Utc)),
+            .as_deref()
+            .and_then(utc),
     })
 }
 
@@ -1164,14 +1103,19 @@ fn read_codex_model(reader: impl BufRead) -> Option<String> {
         if !line.contains(CODEX_TURN_CONTEXT_RECORD) {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<CodexTurnContextRecord>(&line) else {
+        let Ok(record) = serde_json::from_str::<CodexEventRecord>(&line) else {
             continue;
         };
         if record.kind != CODEX_TURN_CONTEXT_RECORD {
             continue;
         }
-        if let Some(model) = record.payload.and_then(|payload| payload.model) {
-            return crate::model_usage::validate_model_id(&model).ok();
+        if let Some(model) = record
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("model"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return crate::model_usage::validate_model_id(model).ok();
         }
     }
 }
@@ -1183,7 +1127,7 @@ fn read_codex_model(reader: impl BufRead) -> Option<String> {
 ///
 /// The hop count bounds the walk but is not reported: which root a sub-agent
 /// belongs to is observable, how many hops away it sits is not.
-pub(crate) fn codex_root(
+fn codex_root(
     head: &CodexHead,
     index: &HashMap<String, PathBuf>,
     heads: &mut HashMap<String, Option<CodexHead>>,
@@ -1206,20 +1150,16 @@ pub(crate) fn codex_root(
 ///
 /// Turn boundaries, context snapshots, token counts, and other bookkeeping can
 /// be appended after Stop, so neither they nor the file mtime are activity.
-pub(crate) fn codex_activity_timestamp(line: &str) -> Option<DateTime<Utc>> {
-    if !line.contains(CODEX_EVENT_RECORD) && !line.contains(CODEX_RESPONSE_ITEM_RECORD) {
-        return None;
-    }
-    let record = serde_json::from_str::<CodexEventRecord>(line).ok()?;
-    let payload = record.payload?;
+fn codex_activity_timestamp(record: &CodexEventRecord) -> Option<DateTime<Utc>> {
+    let payload = record.payload.as_ref()?;
     let payload_kind = payload.get("type")?.as_str()?;
     let substantive = match record.kind.as_str() {
         CODEX_EVENT_RECORD => matches!(payload_kind, "user_message" | "agent_message"),
         CODEX_RESPONSE_ITEM_RECORD => match payload_kind {
-            "agent_message" => crate::sessions::codex_text_blocks(&payload, "input_text")
+            "agent_message" => crate::sessions::codex_text_blocks(payload, "input_text")
                 .next()
                 .is_some(),
-            "message" => crate::sessions::has_nonempty_codex_assistant_output(&payload),
+            "message" => crate::sessions::has_nonempty_codex_assistant_output(payload),
             "function_call" | "custom_tool_call" => payload
                 .get("name")
                 .and_then(serde_json::Value::as_str)
@@ -1230,13 +1170,12 @@ pub(crate) fn codex_activity_timestamp(line: &str) -> Option<DateTime<Utc>> {
         _ => false,
     };
     substantive
-        .then_some(record.timestamp?)
-        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
-        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .then_some(record.timestamp.as_deref()?)
+        .and_then(utc)
 }
 
 /// Read a bounded rollout tail and discard its first partial record.
-pub(crate) fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
+fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
     let mut file = File::open(path).ok()?;
     let length = file.metadata().ok()?.len();
     let start = length.saturating_sub(CODEX_TAIL_SCAN_BYTES);
@@ -1262,30 +1201,19 @@ pub(crate) fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool)> {
 ///
 /// The timestamp is the only clock a rollout that emits nothing but boundaries
 /// has, so a thread that died mid-turn still ages out of the idle window.
-///
-/// Rollouts also carry whole-file `world_state` snapshots, so the cheap
-/// substring test keeps those megabytes out of the JSON parser.
-pub(crate) fn codex_turn_boundary(line: &str) -> Option<(bool, Option<DateTime<Utc>>)> {
-    if !line.contains(CODEX_EVENT_RECORD) {
-        return None;
-    }
-    let record = serde_json::from_str::<CodexEventRecord>(line).ok()?;
+fn codex_turn_boundary(record: &CodexEventRecord) -> Option<(bool, Option<DateTime<Utc>>)> {
     if record.kind != CODEX_EVENT_RECORD {
         return None;
     }
-    let started = match record.payload?.get("type")?.as_str()? {
+    let started = match record.payload.as_ref()?.get("type")?.as_str()? {
         CODEX_TURN_STARTED => true,
         CODEX_TURN_COMPLETE | CODEX_TURN_ABORTED => false,
         _ => return None,
     };
-    let timestamp = record
-        .timestamp
-        .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
-        .map(|timestamp| timestamp.with_timezone(&Utc));
-    Some((started, timestamp))
+    Some((started, record.timestamp.as_deref().and_then(utc)))
 }
 
-pub(crate) fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
+fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
     let stem = transcript.file_stem()?.to_str()?;
     let meta = transcript.with_file_name(format!("{stem}.meta.json"));
     serde_json::from_str(&std::fs::read_to_string(meta).ok()?).ok()
@@ -1297,7 +1225,7 @@ pub(crate) fn read_agent_meta(transcript: &Path) -> Option<AgentMeta> {
 /// is left unconsumed for the next pass instead of being parsed in half. A file
 /// shorter than the offset was rewritten rather than appended to, so it restarts
 /// from the beginning.
-pub(crate) fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMut(&str)) {
+fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMut(&str)) {
     let Ok(file) = File::open(path) else {
         return;
     };
@@ -1330,30 +1258,21 @@ pub(crate) fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMu
     }
 }
 
-/// The RFC 3339 timestamp a Claude record carries, if any.
-fn claude_record_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(record.timestamp.as_deref()?)
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-}
-
 /// The timestamp a Claude record contributes to session activity.
 ///
 /// Hook result attachments are appended after the turn they belong to has
 /// ended, so their write must not reopen a finished session.
-pub(crate) fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
+fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
     if record.kind.as_deref() == Some("attachment") {
         return None;
     }
-    claude_record_timestamp(record)
+    utc(record.timestamp.as_deref()?)
 }
 
 /// Origin a root transcript's first timestamped record supplies: when the
 /// session started and the project it runs in.
-pub(crate) fn claude_session_origin(
-    record: &ScanRecord,
-) -> Option<(DateTime<Utc>, Option<String>)> {
-    Some((claude_record_timestamp(record)?, record.cwd.clone()))
+fn claude_session_origin(record: &ScanRecord) -> Option<(DateTime<Utc>, Option<String>)> {
+    Some((utc(record.timestamp.as_deref()?)?, record.cwd.clone()))
 }
 
 /// The model a Claude assistant record names, validated through the same gate
@@ -1361,7 +1280,7 @@ pub(crate) fn claude_session_origin(
 ///
 /// A sub-agent transcript's own assistant records state the model that agent is
 /// running, so its label needs no retained child evidence to be resolved.
-pub(crate) fn claude_record_model(record: &ScanRecord) -> Option<String> {
+fn claude_record_model(record: &ScanRecord) -> Option<String> {
     if record.kind.as_deref() != Some("assistant") {
         return None;
     }
@@ -1373,7 +1292,7 @@ pub(crate) fn claude_record_model(record: &ScanRecord) -> Option<String> {
 ///
 /// A journal carries a `started` and a `result` record per agent it drives, and
 /// only the `result` is closure evidence.
-pub(crate) fn journal_result_agent_id(line: &str) -> Option<String> {
+fn journal_result_agent_id(line: &str) -> Option<String> {
     let record = serde_json::from_str::<JournalRecord>(line).ok()?;
     if record.kind != "result" {
         return None;
@@ -1381,28 +1300,7 @@ pub(crate) fn journal_result_agent_id(line: &str) -> Option<String> {
     record.agent_id
 }
 
-/// Whether a Claude sub-agent is still working.
-///
-/// Precedence: a workflow agent answers to its journal; anything else answers
-/// to the spawning tool call. An agent with no spawn evidence at all cannot be
-/// claimed open, and one whose own transcript went silent past the idle window
-/// is abandoned rather than slow.
-pub(crate) fn claude_agent_open(
-    agent_id: &str,
-    workflow: bool,
-    tool_use_id: Option<&str>,
-    resolved: &HashSet<String>,
-    idle_for: TimeDelta,
-) -> bool {
-    let closed = if workflow {
-        resolved.contains(agent_id)
-    } else {
-        tool_use_id.is_none_or(|tool_use_id| resolved.contains(tool_use_id))
-    };
-    !closed && idle_for <= IDLE_AFTER
-}
-
-pub(crate) fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
+fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
     record
         .message
         .as_ref()
@@ -1425,10 +1323,16 @@ pub(crate) fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str>
 mod tests {
     use super::*;
     use std::fs;
+    use std::time::{Duration, Instant};
 
-    /// A Claude projects root holding one hand-written session tree.
+    /// One provider's transcript root, holding a hand-written tree that folds
+    /// into a single session. Both providers answer the same questions of the
+    /// tracker, so only the paths and the records differ.
     struct Fixture {
         root: tempfile::TempDir,
+        provider: IntegrationProvider,
+        /// The session every read helper addresses: the Claude session the tree
+        /// is named for, or the Codex user thread its rollouts hang off.
         session_id: String,
     }
 
@@ -1443,14 +1347,41 @@ mod tests {
                     .join("subagents"),
             )
             .expect("create session tree");
-            Self { root, session_id }
+            Self {
+                root,
+                provider: IntegrationProvider::Claude,
+                session_id,
+            }
+        }
+
+        fn codex(root_id: &str) -> Self {
+            let root = tempfile::tempdir().expect("create codex fixture root");
+            fs::create_dir_all(root.path().join("2026/08/08")).expect("create codex day tree");
+            Self {
+                root,
+                provider: IntegrationProvider::Codex,
+                session_id: root_id.to_owned(),
+            }
+        }
+
+        /// Where one transcript of this fixture's provider lives.
+        fn path(&self, session_id: &str) -> PathBuf {
+            match self.provider {
+                IntegrationProvider::Codex => self
+                    .root
+                    .path()
+                    .join("2026/08/08")
+                    .join(format!("rollout-2026-08-08T00-00-00-{session_id}.jsonl")),
+                _ => self
+                    .root
+                    .path()
+                    .join("-home-user-project")
+                    .join(format!("{session_id}.jsonl")),
+            }
         }
 
         fn root_transcript(&self) -> PathBuf {
-            self.root
-                .path()
-                .join("-home-user-project")
-                .join(format!("{}.jsonl", self.session_id))
+            self.path(&self.session_id)
         }
 
         fn subagents(&self) -> PathBuf {
@@ -1496,7 +1427,7 @@ mod tests {
 
         fn key(&self) -> SessionKey {
             SessionKey {
-                provider: IntegrationProvider::Claude.as_str().to_owned(),
+                provider: self.provider.as_str().to_owned(),
                 host: local_observed_host().expect("local host").to_owned(),
                 session_id: self.session_id.clone(),
             }
@@ -1506,21 +1437,46 @@ mod tests {
             fs::write(self.root_transcript(), body).expect("write root transcript");
         }
 
-        fn append(&self, body: &str) {
+        /// Write a rollout opening with `session_meta` plus the records that
+        /// follow it.
+        fn write_rollout(&self, thread_id: &str, meta: &str, records: &[&str]) {
+            let mut body = format!(
+                "{{\"timestamp\":\"2026-08-08T00:00:00Z\",\"type\":\"session_meta\",\
+                 \"payload\":{{\"id\":\"{thread_id}\",\"timestamp\":\"2026-08-08T00:00:00Z\",\
+                 \"cwd\":\"/home/user/project\"{meta}}}}}\n"
+            );
+            for record in records {
+                body.push_str(record);
+                body.push('\n');
+            }
+            fs::write(self.path(thread_id), body).expect("write rollout");
+        }
+
+        fn append_to(&self, path: &Path, body: &str) {
             use std::io::Write;
             let mut file = fs::OpenOptions::new()
                 .append(true)
-                .open(self.root_transcript())
-                .expect("open root transcript for append");
+                .open(path)
+                .expect("open transcript for append");
             file.write_all(body.as_bytes()).expect("append bytes");
         }
 
+        fn append(&self, body: &str) {
+            self.append_to(&self.root_transcript(), body);
+        }
+
+        fn append_rollout(&self, thread_id: &str, body: &str) {
+            self.append_to(&self.path(thread_id), body);
+        }
+
+        /// Sweep this fixture's root, pointing the other provider's walk at a
+        /// directory that does not exist.
         fn sweep(&self, tracker: &LiveTracker, now: DateTime<Utc>) {
-            tracker.sweep_in(
-                self.root.path(),
-                &self.root.path().join("absent-codex-root"),
-                now,
-            );
+            let absent = self.root.path().join("absent-root");
+            match self.provider {
+                IntegrationProvider::Codex => tracker.sweep_in(&absent, self.root.path(), now),
+                _ => tracker.sweep_in(self.root.path(), &absent, now),
+            }
         }
 
         fn last_activity(&self, tracker: &LiveTracker) -> Option<DateTime<Utc>> {
@@ -1998,113 +1954,6 @@ mod tests {
         });
     }
 
-    /// A Codex sessions root holding hand-written rollouts.
-    struct CodexFixture {
-        root: tempfile::TempDir,
-    }
-
-    impl CodexFixture {
-        fn new() -> Self {
-            let root = tempfile::tempdir().expect("create codex fixture root");
-            fs::create_dir_all(root.path().join("2026/08/08")).expect("create codex day tree");
-            Self { root }
-        }
-
-        fn path(&self, thread_id: &str) -> PathBuf {
-            self.root
-                .path()
-                .join("2026/08/08")
-                .join(format!("rollout-2026-08-08T00-00-00-{thread_id}.jsonl"))
-        }
-
-        /// Write a rollout opening with `session_meta` plus the records that
-        /// follow it.
-        fn write(&self, thread_id: &str, meta: &str, records: &[&str]) {
-            let mut body = format!(
-                "{{\"timestamp\":\"2026-08-08T00:00:00Z\",\"type\":\"session_meta\",\
-                 \"payload\":{{\"id\":\"{thread_id}\",\"timestamp\":\"2026-08-08T00:00:00Z\",\
-                 \"cwd\":\"/home/user/project\"{meta}}}}}\n"
-            );
-            for record in records {
-                body.push_str(record);
-                body.push('\n');
-            }
-            fs::write(self.path(thread_id), body).expect("write rollout");
-        }
-
-        fn append(&self, thread_id: &str, bytes: &str) {
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(self.path(thread_id))
-                .expect("open rollout for append");
-            file.write_all(bytes.as_bytes()).expect("append bytes");
-        }
-
-        fn sweep(&self, tracker: &LiveTracker, now: DateTime<Utc>) {
-            tracker.sweep_in(
-                &self.root.path().join("absent-claude-root"),
-                self.root.path(),
-                now,
-            );
-        }
-
-        fn key(&self, root_id: &str) -> SessionKey {
-            SessionKey {
-                provider: IntegrationProvider::Codex.as_str().to_owned(),
-                host: local_observed_host().expect("local host").to_owned(),
-                session_id: root_id.to_owned(),
-            }
-        }
-
-        fn with_session<T>(
-            &self,
-            tracker: &LiveTracker,
-            root_id: &str,
-            read: impl FnOnce(&LiveSession) -> T,
-        ) -> T {
-            let state = tracker.state.lock().unwrap();
-            read(
-                state
-                    .sessions
-                    .get(&self.key(root_id))
-                    .expect("folded session"),
-            )
-        }
-
-        fn last_activity(&self, tracker: &LiveTracker, root_id: &str) -> DateTime<Utc> {
-            self.with_session(tracker, root_id, |session| session.last_activity)
-        }
-
-        fn open_agents(
-            &self,
-            tracker: &LiveTracker,
-            root_id: &str,
-            now: DateTime<Utc>,
-        ) -> Vec<String> {
-            self.with_session(tracker, root_id, |session| {
-                let mut open = session
-                    .agents
-                    .keys()
-                    .filter(|agent_id| session.agent_open(agent_id, now))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                open.sort_unstable();
-                open
-            })
-        }
-
-        fn consumed(&self, tracker: &LiveTracker, thread_id: &str) -> Option<u64> {
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .files
-                .get(&self.path(thread_id))
-                .map(|tail| tail.offset)
-        }
-    }
-
     /// The modern flat spawn marker: `thread_source` plus `parent_thread_id`.
     fn spawned_by(parent: &str, role: &str) -> String {
         format!(
@@ -2127,22 +1976,22 @@ mod tests {
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Turn Resolution]]
     #[test]
     fn codex_agents_resolve_from_their_own_turn_records() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let fixture = Fixture::codex(root);
         let working = "019fe372-6824-70e3-8fcd-000000000001";
         let finished = "019fe372-6824-70e3-8fcd-000000000002";
         let aborted = "019fe372-6824-70e3-8fcd-000000000003";
-        fixture.write(
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &[&turn("task_started", "2026-08-08T00:00:01Z")],
         );
-        fixture.write(
+        fixture.write_rollout(
             working,
             &spawned_by(root, "explorer"),
             &[&turn("task_started", "2026-08-08T00:00:02Z")],
         );
-        fixture.write(
+        fixture.write_rollout(
             finished,
             &spawned_by(root, "worker"),
             &[
@@ -2150,7 +1999,7 @@ mod tests {
                 &turn("task_complete", "2026-08-08T00:00:03Z"),
             ],
         );
-        fixture.write(
+        fixture.write_rollout(
             aborted,
             &spawned_by(root, "worker"),
             &[
@@ -2165,10 +2014,10 @@ mod tests {
         // own turn boundary makes it no kind of agent.
         assert_eq!(tracker.state.lock().unwrap().sessions.len(), 1);
         assert_eq!(
-            fixture.open_agents(&tracker, root, parse("2026-08-08T00:00:05Z")),
+            fixture.open_agents(&tracker, parse("2026-08-08T00:00:05Z")),
             vec![working]
         );
-        fixture.with_session(&tracker, root, |session| {
+        fixture.with_session(&tracker, |session| {
             assert_eq!(session.agents.len(), 3);
             assert_eq!(session.started_at, Some(parse("2026-08-08T00:00:00Z")));
             assert_eq!(session.cwd.as_deref(), Some("/home/user/project"));
@@ -2182,9 +2031,9 @@ mod tests {
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Session Activity]]
     #[test]
     fn codex_activity_ignores_post_stop_bookkeeping() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
-        fixture.write(
+        let fixture = Fixture::codex(root);
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &[
@@ -2196,13 +2045,13 @@ mod tests {
         let tracker = LiveTracker::new(None);
         fixture.sweep(&tracker, parse("2026-08-08T00:02:05Z"));
         assert_eq!(
-            fixture.last_activity(&tracker, root),
-            parse("2026-08-08T00:02:00Z")
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:02:00Z"))
         );
 
         // Lifecycle, token bookkeeping, and empty items are all appended after
         // the turn they close, so none of them may reopen the session.
-        fixture.append(
+        fixture.append_rollout(
             root,
             concat!(
                 "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:03:00Z\",\"payload\":{\"type\":\"task_complete\"}}\n",
@@ -2214,31 +2063,31 @@ mod tests {
         );
         fixture.sweep(&tracker, parse("2026-08-08T00:05:05Z"));
         assert_eq!(
-            fixture.last_activity(&tracker, root),
-            parse("2026-08-08T00:02:00Z")
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:02:00Z"))
         );
 
-        fixture.append(
+        fixture.append_rollout(
             root,
             "{\"type\":\"response_item\",\"timestamp\":\"2026-08-08T00:06:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"{}\",\"call_id\":\"call-1\"}}\n",
         );
         fixture.sweep(&tracker, parse("2026-08-08T00:06:05Z"));
         assert_eq!(
-            fixture.last_activity(&tracker, root),
-            parse("2026-08-08T00:06:00Z")
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:06:00Z"))
         );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Bounded Initialization]]
     #[test]
     fn codex_activity_initialization_is_bounded_and_truncation_resets_it() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let fixture = Fixture::codex(root);
         let filler = format!(
             "{{\"type\":\"world_state\",\"payload\":{{\"text\":\"{}\"}}}}",
             "x".repeat(CODEX_TAIL_SCAN_BYTES as usize)
         );
-        fixture.write(
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &[
@@ -2254,23 +2103,23 @@ mod tests {
         let tracker = LiveTracker::new(None);
         fixture.sweep(&tracker, parse("2026-08-08T00:02:05Z"));
         assert_eq!(
-            fixture.last_activity(&tracker, root),
-            parse("2026-08-08T00:00:00Z")
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:00:00Z"))
         );
 
-        fixture.append(
+        fixture.append_rollout(
             root,
             "{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:03:00Z\",\"payload\":{\"type\":\"agent_message\",\"message\":\"appended\"}}\n",
         );
         fixture.sweep(&tracker, parse("2026-08-08T00:03:05Z"));
         assert_eq!(
-            fixture.last_activity(&tracker, root),
-            parse("2026-08-08T00:03:00Z")
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:03:00Z"))
         );
 
         // A rewritten rollout replaces its own history, so the activity it had
         // contributed goes with it and the replacement's tail answers instead.
-        fixture.write(
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &[
@@ -2283,31 +2132,31 @@ mod tests {
             fs::metadata(fixture.path(root))
                 .expect("stat rewritten rollout")
                 .len()
-                < fixture.consumed(&tracker, root).expect("first fold")
+                < fixture.consumed(&tracker).expect("first fold")
         );
         fixture.sweep(&tracker, parse("2026-08-08T00:04:05Z"));
         assert_eq!(
-            fixture.last_activity(&tracker, root),
-            parse("2026-08-08T00:00:00Z")
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:00:00Z"))
         );
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Agent Model]]
     #[test]
     fn codex_agents_take_the_first_model_their_rollout_names() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-0000000000a0";
+        let fixture = Fixture::codex(root);
         let named = "019fe372-6824-70e3-8fcd-0000000000a1";
         let silent = "019fe372-6824-70e3-8fcd-0000000000a2";
         let malformed = "019fe372-6824-70e3-8fcd-0000000000a3";
-        fixture.write(
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &[&turn("task_started", "2026-08-08T00:00:01Z")],
         );
         // The first `turn_context` wins even when a later one restates the
         // model: a switch mid-life is retained evidence's job, not this read's.
-        fixture.write(
+        fixture.write_rollout(
             named,
             &spawned_by(root, "worker"),
             &[
@@ -2318,7 +2167,7 @@ mod tests {
         );
         // A `turn_context` naming no model leaves the agent unlabelled rather
         // than inheriting a sibling's.
-        fixture.write(
+        fixture.write_rollout(
             silent,
             &spawned_by(root, "worker"),
             &[
@@ -2326,7 +2175,7 @@ mod tests {
                 &turn("task_started", "2026-08-08T00:00:01Z"),
             ],
         );
-        fixture.write(
+        fixture.write_rollout(
             malformed,
             &spawned_by(root, "worker"),
             &[
@@ -2337,7 +2186,7 @@ mod tests {
 
         let tracker = LiveTracker::new(None);
         fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
-        fixture.with_session(&tracker, root, |session| {
+        fixture.with_session(&tracker, |session| {
             assert_eq!(session.agents[named].model.as_deref(), Some("gpt-5.6-sol"));
             assert_eq!(session.agents[silent].model, None);
             // A control character never reaches the label; validation is the
@@ -2349,18 +2198,18 @@ mod tests {
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Spawn Chain]]
     #[test]
     fn nested_codex_spawns_group_under_the_user_thread() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let fixture = Fixture::codex(root);
         let child = "019fe372-6824-70e3-8fcd-000000000001";
         let grandchild = "019fe372-6824-70e3-8fcd-000000000002";
-        fixture.write(root, "", &[]);
-        fixture.write(
+        fixture.write_rollout(root, "", &[]);
+        fixture.write_rollout(
             child,
             &spawned_by(root, "worker"),
             &[&turn("task_started", "2026-08-08T00:00:01Z")],
         );
         // The legacy nested spawn marker carries the same parentage.
-        fixture.write(
+        fixture.write_rollout(
             grandchild,
             &format!(
                 ",\"source\":{{\"subagent\":{{\"thread_spawn\":{{\
@@ -2376,7 +2225,7 @@ mod tests {
         // session rather than one session holding both agents.
         assert_eq!(tracker.state.lock().unwrap().sessions.len(), 1);
         assert_eq!(
-            fixture.open_agents(&tracker, root, parse("2026-08-08T00:00:05Z")),
+            fixture.open_agents(&tracker, parse("2026-08-08T00:00:05Z")),
             vec![child, grandchild]
         );
     }
@@ -2384,10 +2233,10 @@ mod tests {
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Turn Tail]]
     #[test]
     fn codex_turn_state_is_read_backwards_from_the_end() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let fixture = Fixture::codex(root);
         let agent = "019fe372-6824-70e3-8fcd-000000000001";
-        fixture.write(root, "", &[]);
+        fixture.write_rollout(root, "", &[]);
         // A turn's own records push its `task_started` out of the scan window,
         // and a window with no boundary in it is itself the answer: still
         // inside a turn.
@@ -2397,7 +2246,7 @@ mod tests {
         );
         let mut records = vec![turn("task_started", "2026-08-08T00:00:01Z")];
         records.resize(records.len() + 512, filler);
-        fixture.write(
+        fixture.write_rollout(
             agent,
             &spawned_by(root, "worker"),
             &records.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2412,25 +2261,25 @@ mod tests {
         let tracker = LiveTracker::new(None);
         fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
         assert_eq!(
-            fixture.open_agents(&tracker, root, parse("2026-08-08T00:00:05Z")),
+            fixture.open_agents(&tracker, parse("2026-08-08T00:00:05Z")),
             vec![agent]
         );
 
         // A record still mid-write has no terminating newline; the fold leaves
         // the fragment unconsumed rather than reading half a boundary.
         let closing = turn("task_complete", "2026-08-08T00:00:06Z");
-        fixture.append(agent, &closing[..12]);
+        fixture.append_rollout(agent, &closing[..12]);
         fixture.sweep(&tracker, parse("2026-08-08T00:00:07Z"));
         assert_eq!(
-            fixture.open_agents(&tracker, root, parse("2026-08-08T00:00:07Z")),
+            fixture.open_agents(&tracker, parse("2026-08-08T00:00:07Z")),
             vec![agent]
         );
 
-        fixture.append(agent, &format!("{}\n", &closing[12..]));
+        fixture.append_rollout(agent, &format!("{}\n", &closing[12..]));
         fixture.sweep(&tracker, parse("2026-08-08T00:00:08Z"));
         assert!(
             fixture
-                .open_agents(&tracker, root, parse("2026-08-08T00:00:08Z"))
+                .open_agents(&tracker, parse("2026-08-08T00:00:08Z"))
                 .is_empty()
         );
     }
@@ -2438,17 +2287,17 @@ mod tests {
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Idle Cutoff]]
     #[test]
     fn quiet_codex_rollouts_leave_the_fold() {
-        let fixture = CodexFixture::new();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
+        let fixture = Fixture::codex(root);
         let agent = "019fe372-6824-70e3-8fcd-000000000001";
-        fixture.write(
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &["{\"type\":\"event_msg\",\"timestamp\":\"2026-08-08T00:20:00Z\",\"payload\":{\"type\":\"user_message\",\"message\":\"still here\"}}"],
         );
         // A thread that died mid-turn leaves an unmatched `task_started`, so
         // silence past the cutoff is the only evidence that it is gone.
-        fixture.write(
+        fixture.write_rollout(
             agent,
             &spawned_by(root, "worker"),
             &[&turn("task_started", "2026-08-08T00:00:01Z")],
@@ -2458,12 +2307,12 @@ mod tests {
         fixture.sweep(&tracker, parse("2026-08-08T00:20:05Z"));
         assert!(
             fixture
-                .open_agents(&tracker, root, parse("2026-08-08T00:20:05Z"))
+                .open_agents(&tracker, parse("2026-08-08T00:20:05Z"))
                 .is_empty()
         );
         // Its turn never closed, so silence is the only thing keeping it out of
         // the count while the root it belongs to stays live.
-        fixture.with_session(&tracker, root, |session| {
+        fixture.with_session(&tracker, |session| {
             assert_eq!(session.agents[agent].turn_open, Some(true));
         });
 
@@ -2670,12 +2519,12 @@ mod tests {
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Codex Rail Through The Read Path]]
     #[test]
     fn a_codex_spawn_reaches_the_read_path_and_survives_a_restart() {
-        let fixture = CodexFixture::new();
         let now = Utc::now();
         let at = |ago: i64| (now - TimeDelta::seconds(ago)).to_rfc3339();
         let root = "019fe372-6824-70e3-8fcd-3dfe7bcbbf80";
         let agent = "019fe372-6824-70e3-8fcd-000000000001";
-        fixture.write(
+        let fixture = Fixture::codex(root);
+        fixture.write_rollout(
             root,
             ",\"thread_source\":\"user\"",
             &[&format!(
@@ -2684,7 +2533,7 @@ mod tests {
                 at(120)
             )],
         );
-        fixture.write(
+        fixture.write_rollout(
             agent,
             &spawned_by(root, "worker"),
             &[&turn_context("gpt-5-codex"), &turn("task_started", &at(90))],
@@ -2729,7 +2578,7 @@ mod tests {
         );
 
         // The turn boundary is the Codex closure evidence.
-        fixture.append(agent, &(turn("task_complete", &at(1)) + "\n"));
+        fixture.append_rollout(agent, &(turn("task_complete", &at(1)) + "\n"));
         restarted.apply_paths_at([(fixture.path(agent), IntegrationProvider::Codex)], now);
         let (_, rows) = read_path(&restarted, Vec::new(), now);
         assert!(
@@ -2804,17 +2653,15 @@ mod tests {
         write_corpus(claude_root.path(), codex_root.path(), SESSIONS, now);
 
         let tracker = LiveTracker::new(None);
-        let started = Instant::now();
+        // Cold, then warm: the second pass stats the same corpus against the
+        // offsets the first one recorded.
         tracker.sweep_in(claude_root.path(), codex_root.path(), now);
-        let cold_sweep = started.elapsed();
-        let started = Instant::now();
         tracker.sweep_in(claude_root.path(), codex_root.path(), now);
-        let warm_sweep = started.elapsed();
         assert_eq!(tracker.session_ranking_keys().len(), SESSIONS * 2);
 
         // The read is what the budget covers: no transcript is opened here, so
         // the corpus the sweep folded costs nothing on this path.
-        let mut samples = (0..20)
+        let worst = (0..20)
             .map(|_| {
                 let rows = (0..SESSIONS)
                     .map(|_| remote_row("claude", now))
@@ -2826,17 +2673,9 @@ mod tests {
                 assert_eq!(rows.len(), 10);
                 elapsed
             })
-            .collect::<Vec<_>>();
-        samples.sort_unstable();
-        let p95 = samples[samples.len() * 95 / 100];
-        println!(
-            "live-tracker corpus={} cold_sweep={:?} warm_sweep={:?} read_p95={:?} read_max={:?}",
-            SESSIONS * 2,
-            cold_sweep,
-            warm_sweep,
-            p95,
-            samples.last().expect("samples")
-        );
-        assert!(p95 < BUDGET, "read path p95 {p95:?} exceeds {BUDGET:?}");
+            .max()
+            .expect("samples");
+        println!("live-tracker corpus={} read_max={worst:?}", SESSIONS * 2);
+        assert!(worst < BUDGET, "read path max {worst:?} exceeds {BUDGET:?}");
     }
 }

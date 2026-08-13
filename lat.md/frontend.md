@@ -431,7 +431,7 @@ five-second fan-out. Sessions and Hooks both declare `hooks-observed-updated`,
 so accepted lifecycle changes join that normal fan-out without a
 feature-specific timer or polling path. Only the Sessions breakdown declares
 `sessions-live-updated`, so an agent opening or closing reaches the rows on the
-same fan-out, already coalesced by the tracker's own emit window.
+same fan-out, already coalesced by the watcher's admission window upstream.
 
 `useMemoryData` tracks concurrent optimization runs by run id and uses background refreshes for event-driven updates so `Optimize All` does not drop out of the running state or flash the all-projects view on every completion event. The hook initializes the Memories tab to the aggregate `__all__` selection on first load, then reuses the project-scoped delete IPC command to support current-view bulk deletion in both single-project and all-projects modes.
 

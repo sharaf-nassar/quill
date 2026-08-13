@@ -44,10 +44,6 @@ pub(crate) mod sessions;
 mod storage;
 mod transcript_analytics;
 mod transcript_identity;
-// The tracker took over the read path, so only the extracted evidence
-// primitives are still called; the scanner orchestration around them goes with
-// the legacy-deletion pass.
-#[allow(dead_code)]
 mod transcript_watcher;
 mod tray_keepalive;
 mod window_chrome;
