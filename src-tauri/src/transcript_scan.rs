@@ -380,24 +380,17 @@ impl TranscriptScanner {
                 let Ok(record) = serde_json::from_str::<ScanRecord>(line) else {
                     return;
                 };
-                let timestamp = record
-                    .timestamp
-                    .as_deref()
-                    .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
-                    .map(|timestamp| timestamp.with_timezone(&Utc));
-                if record.kind.as_deref() != Some("attachment")
-                    && timestamp.is_some_and(|timestamp| {
-                        last_activity.is_none_or(|current| timestamp > current)
-                    })
+                if let Some(timestamp) = claude_activity_timestamp(&record)
+                    && last_activity.is_none_or(|current| timestamp > current)
                 {
-                    *last_activity = timestamp;
+                    *last_activity = Some(timestamp);
                 }
                 if is_root
                     && started_at.is_none()
-                    && let Some(timestamp) = timestamp
+                    && let Some((timestamp, origin_cwd)) = claude_session_origin(&record)
                 {
                     *started_at = Some(timestamp);
-                    *cwd = record.cwd.clone();
+                    *cwd = origin_cwd;
                 }
                 for tool_use_id in tool_result_ids(&record) {
                     if spawn_ids.contains(tool_use_id) {
@@ -411,13 +404,9 @@ impl TranscriptScanner {
         for journal in &files.journals {
             let mut offset = offsets.get(journal).copied().unwrap_or(0);
             read_appended(journal, &mut offset, |line| {
-                let Ok(record) = serde_json::from_str::<JournalRecord>(line) else {
-                    return;
-                };
-                if record.kind != "result" {
-                    return;
-                }
-                if let Some(agent_id) = record.agent_id.filter(|id| agent_ids.contains(id)) {
+                if let Some(agent_id) =
+                    journal_result_agent_id(line).filter(|id| agent_ids.contains(id))
+                {
                     resolved.insert(agent_id);
                 }
             });
@@ -429,24 +418,17 @@ impl TranscriptScanner {
             .agents
             .into_iter()
             .zip(metas)
-            .map(|(agent, meta)| {
-                // Precedence: a workflow agent answers to its journal; anything
-                // else answers to the spawning tool call. An agent with no spawn
-                // evidence at all cannot be claimed open.
-                let closed = if agent.workflow {
-                    resolved.contains(&agent.agent_id)
-                } else {
-                    meta.as_ref()
-                        .and_then(|meta| meta.tool_use_id.as_deref())
-                        .is_none_or(|tool_use_id| resolved.contains(tool_use_id))
-                };
-                let abandoned = elapsed(now, agent.modified) > IDLE_AFTER;
-                TranscriptAgent {
-                    agent_id: agent.agent_id,
-                    agent_type: meta.as_ref().and_then(|meta| meta.agent_type.clone()),
-                    model: None,
-                    open: !closed && !abandoned,
-                }
+            .map(|(agent, meta)| TranscriptAgent {
+                open: claude_agent_open(
+                    &agent.agent_id,
+                    agent.workflow,
+                    meta.as_ref().and_then(|meta| meta.tool_use_id.as_deref()),
+                    resolved,
+                    elapsed(now, agent.modified),
+                ),
+                agent_type: meta.as_ref().and_then(|meta| meta.agent_type.clone()),
+                agent_id: agent.agent_id,
+                model: None,
             })
             .collect();
 
@@ -850,6 +832,63 @@ fn read_appended(path: &Path, offset: &mut u64, mut handle: impl FnMut(&str)) {
             }
         }
     }
+}
+
+/// The RFC 3339 timestamp a Claude record carries, if any.
+fn claude_record_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(record.timestamp.as_deref()?)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+/// The timestamp a Claude record contributes to session activity.
+///
+/// Hook result attachments are appended after the turn they belong to has
+/// ended, so their write must not reopen a finished session.
+fn claude_activity_timestamp(record: &ScanRecord) -> Option<DateTime<Utc>> {
+    if record.kind.as_deref() == Some("attachment") {
+        return None;
+    }
+    claude_record_timestamp(record)
+}
+
+/// Origin a root transcript's first timestamped record supplies: when the
+/// session started and the project it runs in.
+fn claude_session_origin(record: &ScanRecord) -> Option<(DateTime<Utc>, Option<String>)> {
+    Some((claude_record_timestamp(record)?, record.cwd.clone()))
+}
+
+/// The agent id a workflow journal line reports as finished.
+///
+/// A journal carries a `started` and a `result` record per agent it drives, and
+/// only the `result` is closure evidence.
+fn journal_result_agent_id(line: &str) -> Option<String> {
+    let record = serde_json::from_str::<JournalRecord>(line).ok()?;
+    if record.kind != "result" {
+        return None;
+    }
+    record.agent_id
+}
+
+/// Whether a Claude sub-agent is still working.
+///
+/// Precedence: a workflow agent answers to its journal; anything else answers
+/// to the spawning tool call. An agent with no spawn evidence at all cannot be
+/// claimed open, and one whose own transcript went silent past the idle window
+/// is abandoned rather than slow.
+fn claude_agent_open(
+    agent_id: &str,
+    workflow: bool,
+    tool_use_id: Option<&str>,
+    resolved: &HashSet<String>,
+    idle_for: TimeDelta,
+) -> bool {
+    let closed = if workflow {
+        resolved.contains(agent_id)
+    } else {
+        tool_use_id.is_none_or(|tool_use_id| resolved.contains(tool_use_id))
+    };
+    !closed && idle_for <= IDLE_AFTER
 }
 
 fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
