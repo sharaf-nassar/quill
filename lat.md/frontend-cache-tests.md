@@ -20,7 +20,7 @@ Resolving async push-listener registrations causes no cache invalidation; only a
 
 ## Ingest storms keep one cadence
 
-Continuous one-second invalidations produce complete mounted fan-outs no more often than every 5,000 ms, without starvation or cancellation when a sibling subscriber leaves.
+Continuous one-second invalidations — including live-tracker `sessions-live-updated` emissions — produce complete mounted fan-outs no more often than every 5,000 ms, without starvation or cancellation when a sibling subscriber leaves.
 
 ## Transcript runtime refresh is immediate
 

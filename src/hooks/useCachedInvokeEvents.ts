@@ -9,6 +9,7 @@ const INGEST_EVENTS = [
 	"transcript-analytics-updated",
 	"context-savings-updated",
 	"hooks-observed-updated",
+	"sessions-live-updated",
 ] as const;
 
 /**

@@ -135,10 +135,19 @@ test("continuous ingest storms refresh one mounted fan-out every 5000ms or later
 	const store = new CachedInvokeStore();
 	const queryLog = [];
 	const descriptors = [
-		{ command: "get_token_stats", args: { range: "6h" } },
-		{ command: "get_project_breakdown", args: { range: "6h" } },
+		{ command: "get_token_stats", args: { range: "6h" }, event: "tokens-updated" },
+		{
+			command: "get_project_breakdown",
+			args: { range: "6h" },
+			event: "tokens-updated",
+		},
+		{
+			command: "get_session_breakdown",
+			args: { range: "6h" },
+			event: "sessions-live-updated",
+		},
 	];
-	const stops = descriptors.map((descriptor) => {
+	const stops = descriptors.map(({ event, ...descriptor }) => {
 		const key = cachedInvokeKey(descriptor);
 		return store.subscribe(
 			key,
@@ -147,7 +156,7 @@ test("continuous ingest storms refresh one mounted fan-out every 5000ms or later
 				return { ok: true };
 			},
 			() => {},
-			["tokens-updated"],
+			[event],
 		);
 	});
 	await settle();
@@ -155,6 +164,7 @@ test("continuous ingest storms refresh one mounted fan-out every 5000ms or later
 	for (let second = 1; second <= 12; second += 1) {
 		clock.tick(1_000);
 		store.invalidateEvent("tokens-updated");
+		store.invalidateEvent("sessions-live-updated");
 		await settle();
 	}
 
@@ -174,12 +184,15 @@ test("continuous ingest storms refresh one mounted fan-out every 5000ms or later
 		queryLog.filter((row) => row.command === descriptors[0].command).length,
 		3,
 	);
-	assert.equal(
-		queryLog.filter((row) => row.command === descriptors[1].command).at(-1).atMs,
-		15_000,
-	);
+	for (const descriptor of descriptors.slice(1)) {
+		assert.equal(
+			queryLog.filter((row) => row.command === descriptor.command).at(-1).atMs,
+			15_000,
+		);
+	}
 	console.info(`[query-window] ${JSON.stringify(queryLog)}`);
 	stops[1]();
+	stops[2]();
 });
 
 // @lat: [[frontend-cache-tests#Frontend Invoke Cache Tests#Transcript runtime refresh is immediate]]
