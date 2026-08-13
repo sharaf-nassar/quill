@@ -384,9 +384,9 @@ impl LiveTracker {
     /// Walk both provider roots and fold whatever the watcher did not deliver.
     ///
     /// This is the cold start, the overflow recovery, and the periodic backstop
-    /// for missed filesystem events: every enumerated transcript whose length
-    /// has moved past its consumed offset is folded, and idle sessions are
-    /// released.
+    /// for missed filesystem events: every enumerated transcript written inside
+    /// the idle window whose length has moved past its consumed offset is
+    /// folded, and idle sessions are released.
     pub(crate) fn sweep(&self, now: DateTime<Utc>) {
         self.sweep_in(
             &crate::data_paths::resolve_claude_projects_dir(),
@@ -404,7 +404,12 @@ impl LiveTracker {
         let codex = crate::sessions::discover_codex_transcripts_in(codex_sessions_dir)
             .into_iter()
             .map(|path| (path, IntegrationProvider::Codex));
-        self.apply_paths(claude.chain(codex).collect::<Vec<_>>());
+        self.apply_paths(
+            claude
+                .chain(codex)
+                .filter(|(path, _)| modified_within_idle_window(path, now))
+                .collect::<Vec<_>>(),
+        );
         if self.state.lock().unwrap().evict_idle(now) {
             self.notify();
         }
@@ -464,6 +469,21 @@ impl LiveTracker {
             emit_live_update(&app);
         });
     }
+}
+
+/// Whether a transcript was written recently enough to still hold live state.
+///
+/// Eviction releases an idle session's file offsets, so an ungated sweep would
+/// re-read every transcript in the corpus from byte zero — thousands of files
+/// per pass — to fold sessions the same sweep then evicts. A file untouched
+/// past the cutoff cannot open an agent or advance activity, so the sweep pays
+/// one `stat` for it and stops retrying the `.meta.json` beside it.
+fn modified_within_idle_window(path: &Path, now: DateTime<Utc>) -> bool {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| {
+            now.signed_duration_since(DateTime::<Utc>::from(modified)) <= IDLE_AFTER
+        })
 }
 
 fn emit_live_update(app: &AppHandle) {
@@ -707,6 +727,16 @@ mod tests {
         }
     }
 
+    /// Restamp a transcript so a sweep sees it as written at `at`.
+    fn set_modified(path: &Path, at: DateTime<Utc>) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open transcript to restamp")
+            .set_modified(at.into())
+            .expect("restamp transcript");
+    }
+
     fn record(timestamp: &str) -> String {
         format!(
             "{{\"type\":\"user\",\"cwd\":\"/home/user/project\",\"timestamp\":\"{timestamp}\"}}"
@@ -856,6 +886,42 @@ mod tests {
             fixture.last_activity(&tracker),
             Some(parse("2026-08-08T00:20:01Z"))
         );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Sweep Idle Gate]]
+    #[test]
+    fn a_sweep_skips_transcripts_untouched_past_the_cutoff() {
+        let fixture = Fixture::new();
+        fixture.write(&format!("{}\n", record("2026-08-08T00:00:00Z")));
+        fixture.spawn_agent(
+            &fixture.subagents(),
+            "eee",
+            "toolu_open",
+            &[record("2026-08-08T00:00:00Z")],
+        );
+        for path in [
+            fixture.root_transcript(),
+            fixture.subagents().join("agent-eee.jsonl"),
+        ] {
+            set_modified(&path, parse("2026-08-07T23:40:00Z"));
+        }
+        let tracker = LiveTracker::new(None);
+
+        // The records inside are recent, but the files have not been written
+        // since before the cutoff, so the sweep stats them and opens neither
+        // them nor the `.meta.json` beside the agent.
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        assert_eq!(fixture.last_activity(&tracker), None);
+        assert_eq!(fixture.consumed(&tracker), None);
+
+        // A write inside the window brings the same transcript back.
+        set_modified(&fixture.root_transcript(), parse("2026-08-08T00:00:04Z"));
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        assert_eq!(
+            fixture.last_activity(&tracker),
+            Some(parse("2026-08-08T00:00:00Z"))
+        );
+        assert!(fixture.with_session(&tracker, |session| session.agents.is_empty()));
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Enable Toggles]]

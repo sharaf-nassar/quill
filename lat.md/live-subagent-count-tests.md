@@ -166,6 +166,12 @@ A transcript shorter than the offset already consumed was rewritten rather than 
 
 A session quiet past the idle cutoff releases both its folded state and the file offsets it owned, so memory stays bounded by live sessions and a revival re-reads its transcripts from zero.
 
+## Live Tracker Sweep Idle Gate
+
+A sweep skips a transcript whose file has not been written since before the idle cutoff, however recent the records inside it read, and folds the same file once a write lands back inside the window.
+
+The gate is what keeps a sweep from re-reading the whole corpus from byte zero after eviction released its offsets, and it stops the metadata retry for sub-agents that are long gone.
+
 ## Live Tracker Enable Toggles
 
 Disabling activity tracking or one provider clears the folded state it covers and keeps later folds out, and re-enabling rebuilds from the transcripts on the next sweep rather than from anything retained.
