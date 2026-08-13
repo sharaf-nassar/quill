@@ -477,7 +477,7 @@ impl TrackerState {
         // A spawned rollout is the sub-agent: its head names the role it plays
         // and the first `turn_context` model its own file states.
         let agent = session.agents.entry(head.session_id.clone()).or_default();
-        agent.agent_type = observed_agent_type(head.agent_role.as_deref());
+        agent.agent_type = observed_agent_type(head.agent_label.as_deref());
         agent.model = head.model;
         // The thread's own start is the floor its abandonment clock falls back
         // to: a rollout can spend a whole turn emitting records that carry no
@@ -999,7 +999,11 @@ struct CodexHead {
     session_id: String,
     parent_id: Option<String>,
     subagent: bool,
-    agent_role: Option<String>,
+    /// What to call this sub-agent: the role its head declares, or the nickname
+    /// Codex gives it. Codex stopped writing `agent_role` after 2026-07-07 and
+    /// names threads by nickname instead, so the fallback is what current
+    /// rollouts actually answer with.
+    agent_label: Option<String>,
     model: Option<String>,
     cwd: Option<String>,
     started_at: Option<DateTime<Utc>>,
@@ -1042,9 +1046,32 @@ fn codex_head(
     // A thread the index does not hold is not memoised: the answer belongs to
     // the index rather than to the file, and a caller that indexes as it goes
     // would otherwise cache a miss that a later entry resolves.
-    let head = read_codex_head(index.get(thread_id)?);
+    let path = index.get(thread_id)?;
+    let head = read_codex_head(path);
+    // A spawned rollout states its model in a `turn_context` the head read can
+    // beat: it trails `session_meta` by 7ms at p50 but by 1.0s at p90 and 3.4s
+    // at the tail, while the watcher dispatches within a second of the first
+    // write. Caching that miss would leave a quarter of Codex sub-agents
+    // unlabelled for life, so the answer is left uncached for a later event to
+    // re-read, the way a `.meta.json` that lost the same race is retried.
+    if head
+        .as_ref()
+        .is_some_and(|head| head.subagent && head.model.is_none() && within_head_window(path))
+    {
+        return head;
+    }
     heads.insert(thread_id.to_owned(), head.clone());
     head
+}
+
+/// Whether appended bytes could still reach the head read's scan window.
+///
+/// The model scan is bounded to [`CODEX_HEAD_SCAN_BYTES`], so once a rollout has
+/// outgrown that budget a re-read covers bytes it has already rejected and the
+/// missing model is the final answer rather than a pending one. Bounding the
+/// retry this way costs a `stat` and needs no attempt counter.
+fn within_head_window(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() <= CODEX_HEAD_SCAN_BYTES)
 }
 
 /// Identity comes from [`crate::transcript_identity::codex_metadata`], the same
@@ -1058,8 +1085,9 @@ fn read_codex_head(path: &Path) -> Option<CodexHead> {
     let record = serde_json::from_str::<serde_json::Value>(&line).ok()?;
     let metadata = crate::transcript_identity::codex_metadata(&record)?;
     // The head's identity fields — including the `source.subagent.thread_spawn`
-    // walk behind `agent_role` — are read by `codex_metadata`. Only the turn
-    // timestamp is read here, and only because it may sit on either level.
+    // walk behind `agent_role` and the nickname behind it — are read by
+    // `codex_metadata`. Only the turn timestamp is read here, and only because
+    // it may sit on either level.
     let timestamp = |owner: Option<&serde_json::Value>| {
         owner
             .and_then(|owner| owner.get("timestamp"))
@@ -1070,7 +1098,7 @@ fn read_codex_head(path: &Path) -> Option<CodexHead> {
         session_id: metadata.source_session_id,
         parent_id: metadata.parent_chain_id,
         subagent: metadata.is_spawn,
-        agent_role: metadata.agent_role,
+        agent_label: metadata.agent_role.or(metadata.agent_nickname),
         model: read_codex_model(reader),
         cwd: metadata.cwd.map(|cwd| cwd.to_string_lossy().into_owned()),
         started_at: timestamp(record.get("payload"))
@@ -2192,6 +2220,104 @@ mod tests {
             // A control character never reaches the label; validation is the
             // same gate retained evidence passes through.
             assert_eq!(session.agents[malformed].model, None);
+        });
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Agent Name]]
+    #[test]
+    fn codex_agents_fall_back_to_the_nickname_their_head_gives_them() {
+        let root = "019fe372-6824-70e3-8fcd-0000000000b0";
+        let fixture = Fixture::codex(root);
+        let role = "019fe372-6824-70e3-8fcd-0000000000b1";
+        let nicknamed = "019fe372-6824-70e3-8fcd-0000000000b2";
+        let anonymous = "019fe372-6824-70e3-8fcd-0000000000b3";
+        fixture.write_rollout(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[&turn("task_started", "2026-08-08T00:00:01Z")],
+        );
+        // A head that declares both keeps the role: the nickname is the
+        // fallback, not the preference.
+        fixture.write_rollout(
+            role,
+            &format!(
+                "{},\"agent_nickname\":\"Curie\"",
+                spawned_by(root, "worker")
+            ),
+            &[&turn("task_started", "2026-08-08T00:00:01Z")],
+        );
+        // What current Codex actually writes: `agent_role` is null and the
+        // thread answers to its nickname instead.
+        fixture.write_rollout(
+            nicknamed,
+            ",\"thread_source\":\"subagent\",\"parent_thread_id\":\"{parent}\",\
+             \"agent_role\":null,\"agent_nickname\":\"Kepler\""
+                .replace("{parent}", root)
+                .as_str(),
+            &[&turn("task_started", "2026-08-08T00:00:01Z")],
+        );
+        // Neither field: unnamed rather than borrowing a sibling's name.
+        fixture.write_rollout(
+            anonymous,
+            &format!(",\"thread_source\":\"subagent\",\"parent_thread_id\":\"{root}\""),
+            &[&turn("task_started", "2026-08-08T00:00:01Z")],
+        );
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.agents[role].agent_type.as_deref(), Some("worker"));
+            assert_eq!(
+                session.agents[nicknamed].agent_type.as_deref(),
+                Some("Kepler")
+            );
+            assert_eq!(session.agents[anonymous].agent_type, None);
+        });
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Codex Model Retry]]
+    #[test]
+    fn a_codex_model_written_after_its_head_was_read_is_picked_up_later() {
+        let root = "019fe372-6824-70e3-8fcd-0000000000c0";
+        let fixture = Fixture::codex(root);
+        let late = "019fe372-6824-70e3-8fcd-0000000000c1";
+        let outgrown = "019fe372-6824-70e3-8fcd-0000000000c2";
+        fixture.write_rollout(
+            root,
+            ",\"thread_source\":\"user\"",
+            &[&turn("task_started", "2026-08-08T00:00:01Z")],
+        );
+        for spawn in [late, outgrown] {
+            fixture.write_rollout(
+                spawn,
+                &spawned_by(root, "worker"),
+                &[&turn("task_started", "2026-08-08T00:00:01Z")],
+            );
+        }
+        // A rollout past the scan window would only re-read bytes the first
+        // scan already rejected, so its missing model is the final answer.
+        fixture.append_rollout(
+            outgrown,
+            &format!(
+                "{{\"type\":\"response_item\",\"payload\":{{\"pad\":\"{}\"}}}}\n",
+                "p".repeat(usize::try_from(CODEX_HEAD_SCAN_BYTES).expect("window fits usize"))
+            ),
+        );
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.agents[late].model, None);
+            assert_eq!(session.agents[outgrown].model, None);
+        });
+
+        for spawn in [late, outgrown] {
+            fixture.append_rollout(spawn, &format!("{}\n", turn_context("gpt-5.6-sol")));
+        }
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:06Z"));
+        fixture.with_session(&tracker, |session| {
+            assert_eq!(session.agents[late].model.as_deref(), Some("gpt-5.6-sol"));
+            assert_eq!(session.agents[outgrown].model, None);
         });
     }
 

@@ -313,9 +313,113 @@ interface RowModel {
   title: string;
 }
 
+function AgentIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      className={`wg-row-agent-icon${className ? ` ${className}` : ""}`}
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path d="M6 2.75V1.5" />
+      <rect x="1.5" y="2.75" width="9" height="7.5" rx="2" />
+      <circle cx="4.25" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
+      <circle cx="7.75" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+function ActiveAgentRail({ agents }: Pick<RowModel, "agents">) {
+  if (!agents || agents.length === 0) return null;
+  return (
+    <div className="wg-row-agent-rail" role="list" aria-label="Currently open agents">
+      <AgentIcon className="wg-row-agent-live-icon" />
+      {agents.map((agent) => (
+        <span
+          className="wg-row-agent wg-row-datum"
+          key={agent.agentId}
+          role="listitem"
+          aria-label={`Currently open agent: ${agent.ariaLabel}`}
+          data-tooltip={agent.ariaLabel}
+        >
+          <span className="wg-row-agent-model" aria-hidden="true">{agent.model}</span>
+          <span className="wg-row-agent-time wg-num" aria-hidden="true">{agent.runtime}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function SessionMetrics({ row }: { row: RowModel }) {
+  if (!row.sessionStats) return null;
+  return (
+    <>
+      <span
+        className="wg-row-session-turns wg-row-datum"
+        data-tooltip="Main-session turns"
+        aria-label={row.sessionStats.turnsLabel}
+      >
+        <svg
+          className="wg-row-turn-icon"
+          viewBox="0 0 10 10"
+          fill="none"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M1.5 1.5h7v5h-4L2 8V6.5h-.5z" />
+        </svg>
+        {row.sessionStats.turns}
+      </span>
+      <span
+        className="wg-row-datum wg-row-session-runtime"
+        data-live={row.liveActivity ? "true" : undefined}
+        data-tooltip="Total runtime"
+        aria-label={row.sessionStats.runtimeLabel}
+      >
+        {row.sessionStats.runtime}
+      </span>
+    </>
+  );
+}
+
+function RowName({ row }: { row: RowModel }) {
+  return row.nameLabel ? (
+    <span
+      className="wg-row-name-tip wg-row-datum"
+      data-tooltip="Session"
+      aria-label={row.nameLabel}
+    >
+      <span className="wg-row-name" aria-hidden="true">
+        {row.name}
+      </span>
+    </span>
+  ) : (
+    <span className="wg-row-name">{row.name}</span>
+  );
+}
+
+function SessionIdentity({ row }: { row: RowModel }) {
+  return (
+    <span className="wg-row-session-identity">
+      <RowName row={row} />
+      {row.chip && (
+        <span
+          className="wg-row-session-provider wg-row-datum"
+          data-tone={row.chip.tone}
+          data-tooltip="Provider"
+          aria-label={row.chipLabel}
+        >
+          {row.chip.text}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
   const name = projectName(row.project) ?? row.session_id.slice(0, 8);
   const live = isSessionLive(row.last_active, row.ended_at, nowMs);
+  const liveActivity = live && row.current_turn_runtime_active;
   const metrics = resolveSessionMetrics(
     formatTokenCount(row.total_tokens),
     `${formatNumber(row.turn_count)} turns`,
@@ -334,15 +438,19 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     nowMs,
     formatClockDurationSecs,
   );
-  const turnCount = metrics.turns === null ? "—" : formatNumber(row.turn_count);
+  const displayedTurnCount = row.turn_count + (liveActivity ? 1 : 0);
+  const turnCount = metrics.turns === null && !liveActivity
+    ? "—"
+    : formatNumber(displayedTurnCount);
   const runtimeLabel =
     totalRuntime === "—"
       ? "Total session runtime unavailable"
       : `Total session runtime ${totalRuntime}`;
-  const turnsLabel =
-    metrics.turns === null
-      ? "Main-session turn count unavailable"
-      : `${formatNumber(row.turn_count)} completed main-session turns`;
+  const turnsLabel = turnCount === "—"
+    ? "Main-session turn count unavailable"
+    : liveActivity
+      ? `${turnCount} main-session ${displayedTurnCount === 1 ? "turn" : "turns"} including active turn`
+      : `${turnCount} completed main-session ${displayedTurnCount === 1 ? "turn" : "turns"}`;
   const currentTurnRuntime = live
     ? formatExtrapolatedRuntime(
         row.current_turn_runtime_secs,
@@ -388,7 +496,7 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
   return {
     key: `${row.provider}:${row.hostname}:${row.session_id}`,
     live,
-    liveActivity: live && row.current_turn_runtime_active,
+    liveActivity,
     name,
     nameLabel: `Session ${name} on ${row.hostname}`,
     sessionStats: {
@@ -794,18 +902,10 @@ function UsageView({ range }: UsageViewProps) {
                       aria-hidden="true"
                     />
                   )}
-                  {row.nameLabel ? (
-                    <span
-                      className="wg-row-name-tip wg-row-datum"
-                      data-tooltip="Session"
-                      aria-label={row.nameLabel}
-                    >
-                      <span className="wg-row-name" aria-hidden="true">
-                        {row.name}
-                      </span>
-                    </span>
+                  {row.sessionStats ? (
+                    <SessionIdentity row={row} />
                   ) : (
-                    <span className="wg-row-name">{row.name}</span>
+                    <RowName row={row} />
                   )}
                   {row.meta && <span className="wg-row-meta wg-num">{row.meta}</span>}
                   {row.sessionStats && (
@@ -819,17 +919,7 @@ function UsageView({ range }: UsageViewProps) {
                           >
                             {row.agentSummary.count}
                           </span>
-                          <svg
-                            className="wg-row-agent-icon"
-                            viewBox="0 0 12 12"
-                            fill="none"
-                            aria-hidden="true"
-                          >
-                            <path d="M6 2.75V1.5" />
-                            <rect x="1.5" y="2.75" width="9" height="7.5" rx="2" />
-                            <circle cx="4.25" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
-                            <circle cx="7.75" cy="6.5" r="0.65" fill="currentColor" stroke="none" />
-                          </svg>
+                          <AgentIcon />
                           <span
                             className="wg-row-agent-total-time wg-row-datum"
                             data-tooltip="Total agent runtime"
@@ -839,32 +929,10 @@ function UsageView({ range }: UsageViewProps) {
                           </span>
                         </span>
                       )}
-                      <span
-                        className="wg-row-session-turns wg-row-datum"
-                        data-tooltip="Main-session turns"
-                        aria-label={row.sessionStats.turnsLabel}
-                      >
-                        <svg
-                          className="wg-row-turn-icon"
-                          viewBox="0 0 10 10"
-                          fill="none"
-                          aria-hidden="true"
-                          focusable="false"
-                        >
-                          <path d="M1.5 1.5h7v5h-4L2 8V6.5h-.5z" />
-                        </svg>
-                        {row.sessionStats.turns}
-                      </span>
-                      <span
-                        className="wg-row-datum"
-                        data-tooltip="Total runtime"
-                        aria-label={row.sessionStats.runtimeLabel}
-                      >
-                        {row.sessionStats.runtime}
-                      </span>
+                      <SessionMetrics row={row} />
                     </span>
                   )}
-                  {row.chip && (
+                  {row.chip && !row.sessionStats && (
                     <span
                       className={`wg-row-chip${row.chipLabel ? " wg-row-datum" : ""}`}
                       data-tone={row.chip.tone}
@@ -896,22 +964,7 @@ function UsageView({ range }: UsageViewProps) {
                     {row.activity}
                   </span>
                 </div>
-                {row.agents && row.agents.length > 0 && (
-                  <div className="wg-row-agent-rail" role="list" aria-label="Currently open agents">
-                    {row.agents.map((agent) => (
-                      <span
-                        className="wg-row-agent wg-row-datum"
-                        key={agent.agentId}
-                        role="listitem"
-                        aria-label={`Currently open agent: ${agent.ariaLabel}`}
-                        data-tooltip={agent.ariaLabel}
-                      >
-                        <span className="wg-row-agent-model" aria-hidden="true">{agent.model}</span>
-                        <span className="wg-row-agent-time wg-num" aria-hidden="true">{agent.runtime}</span>
-                      </span>
-                    ))}
-                  </div>
-                )}
+                <ActiveAgentRail agents={row.agents} />
               </li>
             ))}
           </ul>

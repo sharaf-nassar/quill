@@ -76,7 +76,12 @@ export function formatObservedSessionAgents(
 			agent.runtime_active ? 1 : 0,
 			nowMs,
 		);
-		const identity = agent.model_id ?? agent.agent_type ?? "Unknown model";
+		// The chip has room for one label and shows the model family, so the
+		// agent's own name is only ever readable here. Both are named when both
+		// are known, because a Codex rail is several agents on one model and the
+		// name is the only thing that tells them apart.
+		const identity = [agent.agent_type, agent.model_id].filter(Boolean).join(" · ")
+			|| "Unknown model";
 		return {
 			agentId: agent.agent_id,
 			model: family.label,

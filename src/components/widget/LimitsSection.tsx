@@ -702,6 +702,9 @@ function CpaRow({
   const name = providerLabel(row.provider);
   const visibleAccounts = row.accounts.slice(0, MAX_VISIBLE_ACCOUNTS);
   const hiddenCount = Math.max(0, row.accounts.length - visibleAccounts.length);
+  const allCooling =
+    row.accounts.length > 0 &&
+    row.accounts.every((account) => account.state === "cooling");
   const healthText =
     row.healthy === null || row.total === null
       ? "—/—"
@@ -740,10 +743,15 @@ function CpaRow({
           aria-hidden="true"
         />
         <span className="wg-cpa-identity">
-          <span className="wg-limits-name">{name.toUpperCase()}</span>
-          <span className="wg-cpa-health" aria-label={healthLabel}>
-            {healthText}
+          <span className="wg-cpa-identity-line">
+            <span className="wg-limits-name">{name.toUpperCase()}</span>
+            <span className="wg-cpa-health" aria-label={healthLabel}>
+              {healthText}
+            </span>
           </span>
+          {!expanded && allCooling && (
+            <span className="wg-cpa-pool-state">COOLING</span>
+          )}
         </span>
 
         {row.state === "ready" && (

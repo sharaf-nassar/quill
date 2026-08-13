@@ -103,6 +103,27 @@ test("formats every open agent with ordered model and runtime identity", () => {
 	);
 });
 
+// @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Agent Rail Tooltip Identity]]
+test("agent tooltips name the agent alongside its model", () => {
+	assert.deepEqual(
+		formatObservedSessionAgents("codex", [
+			{ agent_id: "a", model_id: "gpt-5.6-sol", agent_type: "Curie", runtime_secs: 1, runtime_active: false },
+			{ agent_id: "b", model_id: "gpt-5.6-sol", agent_type: null, runtime_secs: 1, runtime_active: false },
+			{ agent_id: "c", model_id: null, agent_type: "Kepler", runtime_secs: 1, runtime_active: false },
+			{ agent_id: "d", model_id: null, agent_type: null, runtime_secs: 1, runtime_active: false },
+		], 1_000, 3_000).map(({ model, ariaLabel }) => ({ model, ariaLabel })),
+		[
+			// Both known: the chip still shows the model, so the name is only
+			// readable in the tooltip.
+			{ model: "Sol", ariaLabel: "Curie · gpt-5.6-sol, agent a, 1s active runtime" },
+			{ model: "Sol", ariaLabel: "gpt-5.6-sol, agent b, 1s active runtime" },
+			// No model: the name is the chip label and the whole identity.
+			{ model: "Kepler", ariaLabel: "Kepler, agent c, 1s active runtime" },
+			{ model: "?", ariaLabel: "Unknown model, agent d, 1s active runtime" },
+		],
+	);
+});
+
 test("Sessions fixtures expose lifetime and current-turn runtime evidence", () => {
 	const rows = handleInvoke("get_session_breakdown");
 	assert.ok(rows.every((row) => "active_runtime_secs" in row));

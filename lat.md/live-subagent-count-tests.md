@@ -52,9 +52,25 @@ Frontend contracts keep retained agent count, bot icon, and runtime before root 
 
 Positive historical totals remain visible without adding a second row, while empty zero/unknown groups disappear. Only open agents create a wrapping second rail; unknown totals stay unknown beside them, and instant tooltips plus accessible labels distinguish lifetime totals from green live names and neutral runtimes.
 
+## Active Agent Rail Indicator
+
+Each non-empty active-agent rail starts with exactly one decorative live indicator, while an empty agent list renders no rail or indicator.
+
+## Agent Rail Tooltip Identity
+
+The chip has room for one label and spends it on the model family, so an agent's own name is named beside its model in the tooltip; an agent with no model falls back to its name as the chip label, and one with neither reads as an unknown model.
+
 ## Observed-Only Sessions Presentation
 
 Frontend provenance formatting renders unavailable synthetic tokens as an em dash and omits the false zero-turn tooltip claim while retained rows keep real metrics.
+
+## Active Root Turn Presentation
+
+Session rows add one active root turn only from open-root evidence and apply the lifetime-runtime live cue under the same predicate; inactive and unevidenced observed-only rows keep completed-only or unavailable values.
+
+## Session Row Column Layout
+
+Session identity keeps the full reduced-scale provider name directly after the session name and centered against the row height; stable columns prevent optional agent totals and variable-width values from shifting later fields.
 
 ## Shared Root Session Id
 
@@ -112,7 +128,7 @@ An agent's model comes from its own assistant records and passes the same valida
 
 ## Live Tracker Codex Turn Resolution
 
-A Codex sub-agent counts only while its own rollout's newest turn boundary is a `task_started`, so a thread that completed or aborted its turn stops counting while still being listed with the role its head declared.
+A Codex sub-agent counts only while its own rollout's newest turn boundary is a `task_started`, so a thread that completed or aborted its turn stops counting while still being listed with the name its head declared.
 
 The user thread at the root of the chain is the session, never one of its own agents, and it takes its origin and project from that root rollout's head.
 
@@ -129,6 +145,18 @@ A rewritten rollout is shorter than the offset already consumed, which clears th
 ## Live Tracker Codex Agent Model
 
 A Codex agent takes the first model its own rollout names and keeps that answer when a later record restates a different one, and stays unlabelled rather than borrowing a sibling's when its rollout names none or names one that fails validation.
+
+## Live Tracker Codex Agent Name
+
+A Codex agent answers to the role its head declares, falls back to the nickname Codex gives the thread when that role is absent, and stays unnamed rather than borrowing a sibling's name when its head declares neither.
+
+Current Codex stopped writing `agent_role` after 2026-07-07 and names threads by nickname instead, so the fallback is the only field live rollouts actually answer with.
+
+## Live Tracker Codex Model Retry
+
+A `turn_context` written after the head read is picked up by a later event rather than never, because a head with no model yet is left uncached the way a `.meta.json` that lost the same race is retried.
+
+The retry ends once the rollout outgrows the bounded scan window, since from there a re-read would only cover bytes the first scan already rejected.
 
 ## Live Tracker Codex Spawn Chain
 
