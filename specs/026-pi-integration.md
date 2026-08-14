@@ -546,6 +546,15 @@ Transcript pipeline (needed in every MVP variant):
 
 Extension (whichever release it lands in):
 
+- **Use a plain JSON Schema object for `registerTool.parameters`.** A real
+  pi 0.84.1 extension-loader run passed `pi.registerTool()` with a plain
+  object, a bare `typebox` import, and a `createRequire` fallback rooted at
+  pi's install. The plain object is the smallest deployable shape and pi's
+  validator explicitly supports JSON Schema without TypeBox symbols. It
+  needs no import, bundled dependency, or companion file, so the lifecycle
+  owned manifest remains `quill.ts` plus the managed `AGENTS.md` block.
+  Reproduce with `node scripts/spike_pi_register_tool.mjs`; the script uses
+  isolated pi config/session directories and removes them after the run.
 - **Local-only is a hard guard, not an inherited discipline.** The shared
   `~/.config/quill/config.json` consumed by `lib.cjs` supports a REMOTE
   `config.url` (and `session-sync.cjs` ships transcripts off-device), so
@@ -884,10 +893,10 @@ requested at the analyze gate as part of plan approval.
 
 ## Risks
 
-- **TypeBox runtime resolution** (extension parameters): 30-minute spike
-  against real pi is the first extension-phase task; fallbacks: plain
-  object literal, `createRequire` against pi's install path. Discovered
-  late, it collapses the no-`node_modules` deployment story.
+- **TypeBox runtime resolution is closed for pi 0.84.1.** The extension uses
+  a plain JSON Schema object, which passed the real loader and needs no
+  runtime import. Re-run `scripts/spike_pi_register_tool.mjs` when raising
+  the minimum pi version to catch extension-loader or validator drift.
 - **Context HTTP API scope balloon**: the Python surface is ~1,900 lines
   with SSRF guards and FTS; if Rust parity for a niche operation balloons
   mid-build, file follow-up beads per clarification 2C rather than
@@ -957,7 +966,9 @@ Every item syncs its own `lat.md` sections as part of its acceptance
    surfaces, per-provider breakdown pi columns. Depends on 6, 7.
 9. **TypeBox/registerTool spike** — deliverable: a decision record naming
    the chosen parameter shape plus one passing `registerTool` call
-   against pi ≥ the pinned version. Depends on nothing (do first).
+   against pi ≥ the pinned version. Completed against pi 0.84.1: use a
+   plain JSON Schema object and deploy no extra files. Depends on nothing
+   (do first).
    Blocks 7, 11a.
 10. **Context HTTP API** — `context_store.rs` + separate loopback-only
     listener + `/api/v1/context/*` with threat model, setting-gated
