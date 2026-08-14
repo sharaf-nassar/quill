@@ -86,7 +86,7 @@ use crate::models::{
     ModelOverviewActivity, ModelOverviewActivitySeries, ModelOverviewCombinations,
     ModelOverviewDelegation, ModelOverviewDelegationTop, ModelOverviewPair,
     ModelOverviewProjectCell, ModelOverviewProjectRow, ModelOverviewRow, ModelOverviewTotals,
-    ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse,
+    ModelRange, ModelRunningNow, ModelSessionRow, ModelSessionsResponse, ModelTokenScope,
     ModelUsageOverviewResponse, ObservationPayload, ObservationSummary, ProjectBreakdown,
     ProjectTokens, ProviderTokenSeries, ProviderTokenSeriesResponse, RunInferenceCall,
     RunInferenceConfinement, RunInferenceSummary, SessionBreakdown, SessionCodeStats,
@@ -10133,6 +10133,8 @@ impl Storage {
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
                            AND observation.derived_model_id COLLATE BINARY = ?4
+                           AND (observation.provider != 'pi'
+                                OR observation.turn_id LIKE 'active-branch:%')
                          GROUP BY observation.provider COLLATE BINARY,
                                   observation.analytics_session_id COLLATE BINARY
                      ) AS matching_sessions"
@@ -10167,6 +10169,8 @@ impl Storage {
                            AND observation.observed_at_ms >= ?1
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
+                           AND (observation.provider != 'pi'
+                                OR observation.turn_id LIKE 'active-branch:%')
                      ),
                      selected_sessions AS (
                          SELECT provider,
@@ -10455,6 +10459,11 @@ impl Storage {
                     let display_name =
                         model_session_display_name(row.cwd.as_deref(), &row.session_id);
                     Ok(ModelSessionRow {
+                        token_scope: if row.provider == "pi" {
+                            ModelTokenScope::ActiveBranch
+                        } else {
+                            ModelTokenScope::AllBranches
+                        },
                         provider: row.provider,
                         session_id: row.session_id,
                         display_name,
@@ -10540,6 +10549,8 @@ impl Storage {
                      WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                        AND observation.provider COLLATE BINARY = ?1
                        AND observation.analytics_session_id COLLATE BINARY = ?2
+                       AND (observation.provider != 'pi'
+                            OR observation.turn_id LIKE 'active-branch:%')
                        AND observation.observed_at_ms >= ?3
                        AND observation.observed_at_ms < ?4
                      ORDER BY observation.observed_at_ms ASC,
@@ -10755,6 +10766,11 @@ impl Storage {
                 primary_model,
                 distinct_models,
                 switch_count,
+                token_scope: if provider == "pi" {
+                    ModelTokenScope::ActiveBranch
+                } else {
+                    ModelTokenScope::AllBranches
+                },
                 attributed_tokens,
                 unattributed_tokens,
                 chains,
@@ -23372,6 +23388,139 @@ mod tests {
         storage
             .replace_model_source(&source, &observations, &fingerprint)
             .expect("replace model source");
+    }
+
+    fn seed_pi_model_source(storage: &Storage, dir: &TempDir, source_key: &str, jsonl: &str) {
+        let layout_hint = crate::sessions::RetainedJsonlSourceLayoutHint::PiTranscript;
+        let context = crate::model_usage::PiAdapterContext {
+            source_key,
+            layout_hint: &layout_hint,
+            hostname: Some("host-a"),
+        };
+        let parsed = crate::model_usage::parse_pi_model_usage_jsonl(jsonl, context);
+        let native = match &parsed.native_identity {
+            crate::model_usage::ProviderNativeIdentityState::Valid(native) => native,
+            state => panic!("expected valid Pi native identity, got {state:?}"),
+        };
+        let path = dir.path().join(format!("{source_key}.jsonl"));
+        std::fs::write(&path, jsonl).expect("write Pi transcript");
+        let fast = crate::transcript_identity::model_source_fast_fingerprint(
+            &std::fs::metadata(&path).expect("stat Pi transcript"),
+        )
+        .expect("fingerprint Pi transcript");
+        let fingerprint = ModelSourceFingerprint::from_content(fast, jsonl.as_bytes());
+        let attempted_at_ms = Utc::now().timestamp_millis();
+        let source = NormalizedSource {
+            provider: IntegrationProvider::Pi,
+            source_root_key: "root-pi".to_string(),
+            source_key: source_key.to_string(),
+            path,
+            layout_hint,
+            source_session_id: Some(native.source_session_id.clone()),
+            analytics_session_id: Some(native.analytics_session_id().to_string()),
+            chain_id: Some(native.chain_id.clone()),
+            parent_chain_id: native.parent_chain_id.clone(),
+            is_sidechain: false,
+            agent_id: None,
+            agent_nickname: None,
+            cwd: native.cwd.clone(),
+            hostname: native.hostname.clone(),
+            first_activity_at_ms: Some(native.first_activity_at_ms),
+            last_activity_at_ms: Some(native.last_activity_at_ms),
+            mtime_ns: None,
+            size_bytes: None,
+            content_sha256: None,
+            last_error: None,
+            suppressed_sha256: None,
+            suppressed_at_ms: None,
+            seen_generation: 1,
+            processing_status: SourceProcessingStatus::Ok,
+            observation_count: i64::try_from(parsed.observations.len())
+                .expect("Pi observation count"),
+            last_attempt_at_ms: Some(attempted_at_ms),
+            last_success_at_ms: Some(attempted_at_ms),
+        };
+        storage
+            .replace_model_source(&source, &parsed.observations, &fingerprint)
+            .expect("replace Pi model source");
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Idempotent All Versus Active Totals]]
+    #[test]
+    #[serial]
+    fn pi_replacement_is_idempotent_and_session_totals_are_active_branch() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let jsonl = include_str!("../tests/fixtures/pi_sessions/model_usage_branches.jsonl");
+
+        seed_pi_model_source(&storage, &dir, "pi-source", jsonl);
+        seed_pi_model_source(&storage, &dir, "pi-source", jsonl);
+
+        let conn = storage.conn.lock().unwrap();
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM model_usage_observations WHERE provider = 'pi'"
+            ),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT SUM(COALESCE(input_tokens, 0)
+                            + COALESCE(output_tokens, 0)
+                            + COALESCE(cache_creation_tokens, 0)
+                            + COALESCE(cache_read_tokens, 0))
+                 FROM model_usage_observations WHERE provider = 'pi'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("sum Pi all-branch usage"),
+            236
+        );
+        drop(conn);
+
+        let overview = storage
+            .get_model_usage_overview(ModelRange::SevenDays, Some("pi"))
+            .expect("read Pi all-branch overview");
+        assert_eq!(overview.totals.total_tokens, 236);
+
+        let history = storage
+            .get_session_model_history("pi", "session-usage-v3", ModelRange::SevenDays)
+            .expect("read Pi session history");
+        assert_eq!(history.token_scope, ModelTokenScope::ActiveBranch);
+        assert_eq!(
+            serde_json::to_value(&history).expect("serialize Pi history")["tokenScope"],
+            "active-branch"
+        );
+        assert_eq!(history.attributed_tokens, 164);
+
+        let active_identity = ModelIdentity {
+            provider: "pi".to_string(),
+            model_id: "google/gemini-2.5-pro".to_string(),
+        };
+        let sessions = storage
+            .get_model_sessions(ModelRange::SevenDays, &active_identity, None, Some(10))
+            .expect("page Pi model sessions");
+        assert_eq!(sessions.sessions.len(), 1);
+        assert_eq!(
+            sessions.sessions[0].token_scope,
+            ModelTokenScope::ActiveBranch
+        );
+        assert_eq!(sessions.sessions[0].selected_model_tokens, 138);
+
+        let abandoned_identity = ModelIdentity {
+            provider: "pi".to_string(),
+            model_id: "openai/gpt-5.6".to_string(),
+        };
+        assert_eq!(
+            storage
+                .get_model_sessions(ModelRange::SevenDays, &abandoned_identity, None, Some(10))
+                .expect("page abandoned Pi model sessions")
+                .total,
+            0
+        );
+        clear_env();
     }
 
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Source Nickname Persistence]]

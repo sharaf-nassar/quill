@@ -1445,6 +1445,13 @@ pub struct ModelAnalyticsScope {
     pub scope_final: bool,
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelTokenScope {
+    AllBranches,
+    ActiveBranch,
+}
+
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSessionRow {
@@ -1455,6 +1462,7 @@ pub struct ModelSessionRow {
     pub hostname: Option<String>,
     pub selected_model_tokens: i64,
     pub selected_model_turns: i64,
+    pub token_scope: ModelTokenScope,
     pub last_activity_at: String,
     pub primary_model: ModelIdentity,
     pub distinct_models: i64,
@@ -1656,6 +1664,7 @@ pub struct SessionModelHistoryResponse {
     pub primary_model: Option<ModelIdentity>,
     pub distinct_models: i64,
     pub switch_count: i64,
+    pub token_scope: ModelTokenScope,
     pub attributed_tokens: i64,
     pub unattributed_tokens: i64,
     pub chains: Vec<SessionModelChain>,

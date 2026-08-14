@@ -382,6 +382,27 @@ pub(crate) fn resolve_codex_native_identity(
     })
 }
 
+/// Resolve one Pi transcript from its session header.
+pub(crate) fn resolve_pi_native_identity(
+    session: &crate::pi_session::PiSession,
+) -> Result<NativeChainIdentity, IdentityError> {
+    let source_session_id = session.header.id.trim();
+    if source_session_id.is_empty() {
+        return Err(IdentityError::MissingNativeIdentity);
+    }
+
+    Ok(NativeChainIdentity {
+        provider: IntegrationProvider::Pi,
+        source_session_id: source_session_id.to_owned(),
+        chain_id: source_session_id.to_owned(),
+        parent_chain_id: None,
+        is_sidechain: false,
+        agent_id: None,
+        agent_nickname: None,
+        cwd: (!session.header.cwd.trim().is_empty()).then(|| PathBuf::from(&session.header.cwd)),
+    })
+}
+
 fn native_parent_cycle(
     start: &str,
     declared_identities: &HashMap<String, CodexDeclaredIdentity>,
@@ -810,5 +831,24 @@ mod tests {
             resolve_codex_native_identity(&conflicting),
             Err(IdentityError::ConflictingNativeIdentity)
         ));
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Native Session Identity]]
+    #[test]
+    fn resolve_pi_native_identity_uses_header_not_filename_or_entries() {
+        let session = crate::pi_session::parse_pi_session_jsonl(include_str!(
+            "../tests/fixtures/pi_sessions/model_usage_branches.jsonl"
+        ))
+        .expect("parse Pi fixture")
+        .expect("Pi session");
+
+        let identity = resolve_pi_native_identity(&session).expect("Pi native identity");
+
+        assert_eq!(identity.provider, IntegrationProvider::Pi);
+        assert_eq!(identity.source_session_id, "session-usage-v3");
+        assert_eq!(identity.chain_id, "session-usage-v3");
+        assert_eq!(identity.parent_chain_id, None);
+        assert_eq!(identity.cwd, Some(PathBuf::from("/work/pi-usage")));
+        assert!(!identity.is_sidechain);
     }
 }
