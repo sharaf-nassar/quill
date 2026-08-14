@@ -1,5 +1,22 @@
 ## What's New
 
+**Pi integration**
+
+Quill now indexes and searches Pi sessions, follows live Pi activity, attributes
+token and model usage, and gives Pi agents Quill's history and working-context
+tools through Pi's extension API. Pi remains absent from LIMITS because Quill
+has no supported Pi rate-limit source.
+
+Enabling Pi installs the executable managed file `quill.ts` at
+`~/.pi/agent/extensions/quill.ts`, or
+`$PI_CODING_AGENT_DIR/extensions/quill.ts` when configured. Quill repairs and
+self-updates that file. Disabling Pi removes it while preserving every other Pi
+file.
+
+Downgrade note: older Quill builds that do not understand provider `pi` drop
+its saved enablement entry. If you downgrade and later return to a current
+build, re-enable Pi.
+
 **Session continuity removed**
 
 Quill no longer captures or injects cross-session task hints. The next update

@@ -6,9 +6,9 @@ product
 
 ## Users
 
-Developers who run AI coding agents — Claude Code, Codex, and MiniMax — and need
-full visibility into what those agents are burning and doing, without leaving the
-desktop or shipping anything to a cloud.
+Developers who run AI coding agents — Claude Code, Codex, Pi, and MiniMax — and
+need full visibility into what those agents are burning and doing, without
+leaving the desktop or shipping anything to a cloud.
 
 They are mid-flow in an agent-driven coding session. The default surface is a
 compact, always-on-top widget glanceable in a screen corner; deeper windows
@@ -23,8 +23,9 @@ Quill is a local, cross-platform desktop console (Tauri + React 19) for AI codin
 agents. It accounts for every token, session, and rule the agents touch: live
 rate-limit pressure, historical analytics with breakdowns by host/project/session,
 full-text search across all past sessions, behavioral-rule extraction, a memory
-optimizer for agent instruction files, and MCP tools the agents call directly
-(context preservation that keeps large transient data out of LLM transcripts).
+optimizer for agent instruction files, and tools the agents call directly
+(through MCP for Claude Code and Codex, and a managed extension for Pi).
+Context preservation keeps large transient data out of LLM transcripts.
 
 Success is when the operator trusts the numbers at a glance and never has to guess
 what their agents are doing or spending. It runs on the user's own plan — no API

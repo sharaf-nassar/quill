@@ -4,7 +4,7 @@
   <img src="src-tauri/icons/quill-original.png" width="128" alt="Quill icon" />
 </p>
 
-A cross-platform desktop widget that displays your Claude Code, Codex, and other AI assistant usage in a compact, always-on-top floating window — with full-text session search, behavioral learning, and an optional context preservation feature that keeps large working context out of LLM transcripts. Built with Tauri + React.
+A cross-platform desktop widget for Claude Code, Codex, Pi, and other AI assistants. It combines usage analytics, full-text session search, behavioral learning, and optional context preservation in a compact, always-on-top window. Built with Tauri + React.
 
 > Marketing site (live limits, analytics, search, learning): <https://sharaf-nassar.github.io/quill/> · Source under [`marketing-site/`](marketing-site/README.md).
 
@@ -17,8 +17,8 @@ A one-line tour. Each item links to its full description in [Features in depth](
 - **[Agent visibility](#agent-visibility)** — sessions show the subagents Quill actually observed running, grouped by model (`2×Opus · 3×Sonnet`)
 - **[Multi-account pools](#multi-account-pools)** — connect a local CLI Proxy API instance and LIMITS reports mean pool pressure instead of a single account
 - **[Manage workspace](#manage-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, Instances, and Settings
-- **[Session search](#session-search)** — Tantivy-backed full-text search across every Claude Code and Codex session, with filters and snippet highlighting
-- **[Token tracking](#token-tracking)** — per-turn input/output/cache counts collected by the bundled hooks
+- **[Session search](#session-search)** — Tantivy-backed full-text search across every Claude Code, Codex, and Pi session, with filters and snippet highlighting
+- **[Token tracking](#token-tracking)** — per-turn input/output/cache counts collected by each provider integration
 - **[Code stats](#code-stats)** — lines added and removed per session by language, plus tokens per LOC and LOC per hour
 - **[Learning](#learning)** — observes tool-use patterns across sessions and extracts reusable rules with confidence scores
 - **[Memory optimizer](#memory-optimizer)** — suggests merges, updates, and removals for your memory files; every change is diff-reviewed and undoable
@@ -203,7 +203,16 @@ No additional configuration is needed — the widget starts tracking utilization
 
 ### Enabling context preservation (optional)
 
-Open the Manage workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and toggle **Working Context Preservation** in **Settings → Context**. Enabling installs the context MCP tool, routing hooks, and capture scripts for currently active providers (Claude Code, Codex). Disabling redeploys the base integration and removes context assets while preserving historical context stores and analytics rows. The widget's **Context** view then reports what the store kept out of the transcript, what came back, and what routing cost.
+Open the Manage workspace (⌘M / Ctrl+M, or the settings key in the widget titlebar) and toggle **Working Context Preservation** in **Settings → Context**. For Claude Code and Codex, enabling installs the context MCP tool, routing hooks, and capture scripts. Pi receives the core history and context tools plus equivalent routing policy through its managed extension. Disabling redeploys the base integrations and removes context assets while preserving historical context stores and analytics rows. The widget's **Context** view then reports what the store kept out of the transcript, what came back, and what routing cost.
+
+### Pi integration
+
+Enable Pi under **Settings → Integrations**. Quill indexes Pi transcripts for
+Session Search, follows live sessions, and ingests usage watcher-side from
+`AssistantMessage` transcript entries, preserving each recorded upstream model.
+It also registers `quill_` history and
+working-context tools through Pi's extension API and Quill's local HTTP API.
+Pi does not use MCP or external hook commands, and it has no LIMITS row.
 
 ## Token Tracking, Learning & Session Search
 
@@ -338,7 +347,7 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 
 ### Session search
 
-- Full-text search across all Claude Code and Codex sessions (powered by Tantivy)
+- Full-text search across all Claude Code, Codex, and Pi sessions (powered by Tantivy)
 - Filter by provider, project, host, role, and date range; sort by relevance or recency
 - Snippet highlighting with expandable message context and a session detail panel
 - Indexes subagent transcripts and Codex inter-agent messages alongside root sessions
@@ -346,9 +355,10 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 
 ### Token tracking
 
-- Per-turn input/output/cache token counts via the bundled Claude Code and Codex hooks
+- Claude Code and Codex hook telemetry uses the authenticated local HTTP server for per-turn input/output/cache token counts
+- Pi usage is ingested watcher-side from `AssistantMessage` transcript entries
+- Pi usage retains the recorded upstream provider and model; Quill does not assign Pi costs
 - Feeds the Usage view's provider chart, the readout sparklines, and the In / Out / Cache footer
-- Delivered over a local HTTP server with bearer-token auth — see [Token Tracking, Learning & Session Search](#token-tracking-learning--session-search)
 
 ### Code stats
 
@@ -383,11 +393,12 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 ### Working context preservation
 
 - Optional, default-off feature toggled from **Settings → Context** — keeps large transient context (web pages, file reads, command output, search results) out of the LLM transcript by routing it through a local searchable store
-- **Context MCP tools** — when enabled, installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute` / `quill_execute_file` / `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats` so the assistant can store, search, and retrieve focused chunks instead of dumping content into the conversation
-- **Routing hooks** — block raw `WebFetch` and noisy `curl`/`wget` dumps, nudge broad `Bash`/`Read`/`Grep`/build/test output toward `quill_*` tools, and use per-session marker files to avoid repeating guidance
+- **Claude Code and Codex tools** — MCP installs `quill_index_context`, `quill_search_context`, `quill_get_context_source`, `quill_execute`, `quill_execute_file`, `quill_batch_execute`, `quill_fetch_and_index`, `quill_purge_context`, and `quill_context_stats`. Claude Code and Codex receive `quill_execute_file` and `quill_batch_execute` through MCP; Pi does not register those two tools
+- **Pi tools** — Pi registers `quill_index_context`, `quill_fetch_and_index`, `quill_execute`, `quill_search_context`, `quill_get_context_source`, `quill_context_stats`, and `quill_purge_context`, plus `quill_search_history`, through its managed extension and local HTTP APIs
+- **Routing integrations** — Claude Code and Codex hooks block raw `WebFetch` and noisy `curl`/`wget` dumps and nudge broad output toward `quill_*` tools. Pi applies the same policy inside its managed extension
 - **Telemetry** — every preservation event reports compact byte and token estimates to the widget's Context view; large content stays in the local context store and never enters the analytics database
-- Toggling the feature deploys or removes context scripts, the context MCP tool, instruction templates, and hooks for currently enabled providers; historical context stores and analytics rows are preserved on disable
-- Available for both Claude Code and Codex via their respective integrations
+- Toggling the feature deploys or removes each provider's context assets; historical context stores and analytics rows are preserved on disable
+- Available for Claude Code and Codex through MCP and hooks, and for Pi through its managed extension
 
 ### MCP server
 

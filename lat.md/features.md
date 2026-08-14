@@ -254,7 +254,7 @@ Promotion preconditions `lifecycle='awaiting_review'` and an inactive tombstone 
 
 ## Session Search
 
-Full-text search across Claude Code and Codex session transcripts, powered by Tantivy in [[src-tauri/src/sessions.rs]].
+Full-text search across Claude Code, Codex, and Pi session transcripts, powered by Tantivy in [[src-tauri/src/sessions.rs]].
 
 ### Indexing
 
@@ -280,7 +280,7 @@ Quill preserves large transient context as searchable refs so assistants can kee
 
 Context preservation is controlled by a global default-off setting in Quill.
 
-The [[features#Settings Window]] exposes a `Context` tab backed by `context_preservation.enabled` in the settings table. Enabling installs the local context scripts, context MCP tool, context-aware instruction templates, and hooks for currently enabled Claude Code and Codex providers; future Claude or Codex provider enables inherit the setting. Disabling redeploys only the base Quill integration for those providers, removing context hooks and local context assets while preserving historical context stores and analytics rows. Toggle sync runs when an enabled provider home exists, even if the provider CLI is temporarily unavailable, so disable cleanup can still remove local feature assets.
+The [[features#Settings Window]] exposes a `Context` tab backed by `context_preservation.enabled` in the settings table. Claude Code and Codex receive local context scripts, MCP tools, templates, and hooks. Pi receives its seven context tools, history tool, and equivalent routing behavior through its managed extension. Disabling redeploys each base integration while preserving historical context stores and analytics rows. Toggle sync runs when an enabled provider home exists, even if its CLI is temporarily unavailable, so disable cleanup can still remove local feature assets.
 
 ### Context MCP Tools
 

@@ -1,6 +1,6 @@
 # Architecture
 
-Quill is a cross-platform Claude Code and Codex companion built with Tauri (Rust) and React. It tracks usage, analytics, behavioral patterns, session history, and provider integrations.
+Quill is a cross-platform Claude Code, Codex, and Pi companion built with Tauri and React. It tracks usage, analytics, behavioral patterns, session history, and provider integrations.
 
 ## Tech Stack
 
@@ -131,7 +131,7 @@ All tasks that touch the database or network MUST be spawned async — never blo
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
 - **Live usage refresh**: Background loop that updates the main widget and tray summary rows. The enable flag (`live_usage.enabled`) and refresh interval (`live_usage.interval_seconds`, 60–600, default 180) are read from the settings table on every iteration so the [[features#Settings Window]] can adjust both at runtime.
-- **Transcript rescan loop**: Always-on incremental rescan of both transcript roots (`~/.claude/projects/` and `~/.codex/sessions/**`) via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Every 120 seconds it enqueues each changed canonical source once; one coordinator tracks independent model and transcript completion, retry, and events. A separate [[src-tauri/src/lib.rs#spawn_startup_model_source_reconciliation]] pass re-admits retained model inventory after every launch. Unchanged sources are cheap stat-only no-ops.
+- **Transcript rescan loop**: Always-on incremental rescan of the Claude, Codex, and configured Pi transcript roots via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Every 120 seconds it enqueues each changed canonical source once; one coordinator tracks independent model and transcript completion, retry, and events. A separate [[src-tauri/src/lib.rs#spawn_startup_model_source_reconciliation]] pass re-admits retained model inventory after every launch. Unchanged sources are cheap stat-only no-ops.
 - **Rule filesystem watcher**: Optional. The `rule_watcher.enabled` setting (default true) is checked at startup; disabling skips the `notify` watcher entirely. Live re-toggling takes effect after the next app launch since the watcher holds an OS handle.
 - **Tray "Check for Update"**: Manual trigger via system tray menu. Uses `tauri-plugin-dialog` to show a native OS confirmation dialog when an update is found (Install / Not Now), or an info dialog when already up to date. The frontend still performs its own 4-hour availability check via `@tauri-apps/plugin-updater`, but the titlebar install action now delegates to [[src-tauri/src/lib.rs#install_app_update]] so Rust owns the install-and-restart boundary.
 
