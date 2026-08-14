@@ -22,8 +22,7 @@ const AGENTS_TEMPLATE_FILE: &str = "agents-md-section.md";
 const QUILL_EXTENSION_MARKER: &str = "quill-managed:pi";
 const PAYLOAD_MARKER: &str = "quill-managed-pi-payload: 2";
 const CONTEXT_HTTP_ENABLED_KEY: &str = "context_http.enabled";
-const FEATURES_PLACEHOLDER: &str =
-    "const FEATURES = { context_preservation: true, activity_tracking: true };";
+const FEATURES_PLACEHOLDER: &str = "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:pi:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:pi:end -->";
 
@@ -401,10 +400,11 @@ fn current_stamp(
     deployment_stamp_current(
         &[bundle],
         &format!(
-            "{}\u{1f}{version}\u{1f}{}\u{1f}{}",
+            "{}\u{1f}{version}\u{1f}{}\u{1f}{}\u{1f}{}",
             env!("CARGO_PKG_VERSION"),
             features.context_preservation,
             features.activity_tracking,
+            features.context_telemetry,
         ),
     )
 }
@@ -419,8 +419,10 @@ fn render_extension(bundle: &Path, features: IntegrationFeatures) -> Result<Vec<
         .replace(
             FEATURES_PLACEHOLDER,
             &format!(
-                "const FEATURES = {{ context_preservation: {}, activity_tracking: {} }};",
-                features.context_preservation, features.activity_tracking,
+                "const FEATURES = {{ context_preservation: {}, activity_tracking: {}, context_telemetry: {} }};",
+                features.context_preservation,
+                features.activity_tracking,
+                features.context_telemetry,
             ),
         )
         .into_bytes())
@@ -825,7 +827,7 @@ pub(crate) fn resolve_session_dir_from(
 mod tests {
     use super::*;
 
-    const PAYLOAD: &str = "// quill-managed:pi\n// quill-managed-pi-payload: 2\nconst FEATURES = { context_preservation: true, activity_tracking: true };\nexport default function quill() {}\n";
+    const PAYLOAD: &str = "// quill-managed:pi\n// quill-managed-pi-payload: 2\nconst FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };\nexport default function quill() {}\n";
     const AGENTS: &str = "<!-- quill-managed:pi:start -->\n## Quill Session History\n\nUse `quill_search_history`.\n<!-- quill-managed:pi:end -->\n";
 
     struct Harness {
@@ -1174,7 +1176,7 @@ mod tests {
         .unwrap();
         let installed = fs::read_to_string(harness.paths.extension_path()).unwrap();
         assert!(installed.contains(
-            "const FEATURES = { context_preservation: false, activity_tracking: true };"
+            "const FEATURES = { context_preservation: false, activity_tracking: true, context_telemetry: true };"
         ));
         assert!(deployment_is_current_with_paths(
             &harness.bundle,
@@ -1191,6 +1193,17 @@ mod tests {
             &harness.bundle,
             &harness.paths,
             disabled,
+            &harness.storage,
+        ));
+
+        let telemetry_disabled = IntegrationFeatures {
+            context_telemetry: false,
+            ..features
+        };
+        assert!(!deployment_is_current_with_paths(
+            &harness.bundle,
+            &harness.paths,
+            telemetry_disabled,
             &harness.storage,
         ));
     }
