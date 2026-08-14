@@ -6,6 +6,7 @@ mod claude_setup;
 mod compress_prose;
 mod config;
 mod context_category;
+mod context_store;
 mod cpa;
 mod crash_reporting;
 pub mod data_paths;

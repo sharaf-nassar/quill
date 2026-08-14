@@ -9,6 +9,225 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
+pub(crate) struct ContextFetch {
+    pub body: Vec<u8>,
+    pub truncated: bool,
+    pub final_url: String,
+    pub content_type: String,
+    pub status: u16,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// Fetch one public HTTP(S) resource for the loopback context API.
+///
+/// Redirects stay manual so every hop gets the same DNS/private-address
+/// check. The response stream is drained only until the configured cap.
+pub(crate) async fn fetch_context_url(url: &str, max_bytes: usize) -> Result<ContextFetch, String> {
+    let mut current = reqwest::Url::parse(url).map_err(|_| "Invalid URL".to_string())?;
+    for redirects in 0..=5 {
+        let addresses = validate_public_url(&current).await?;
+        let client = build_context_fetch_client(current.host_str().unwrap(), &addresses)?;
+        let mut response = client
+            .get(current.clone())
+            .header("User-Agent", "Quill-Context/0.1")
+            .send()
+            .await
+            .map_err(|error| format!("Context fetch failed: {error}"))?;
+        if response.status().is_redirection()
+            && let Some(location) = response.headers().get(reqwest::header::LOCATION)
+        {
+            if redirects == 5 {
+                return Err("Too many redirects while fetching URL".into());
+            }
+            current = current
+                .join(location.to_str().map_err(|_| "Invalid redirect URL")?)
+                .map_err(|_| "Invalid redirect URL".to_string())?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!("Context fetch returned {}", response.status()));
+        }
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let mut body = Vec::new();
+        let mut observed = 0usize;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| format!("Read context response: {error}"))?
+        {
+            observed = observed.saturating_add(chunk.len());
+            if body.len() < max_bytes {
+                body.extend_from_slice(&chunk[..chunk.len().min(max_bytes - body.len())]);
+            }
+            if observed > max_bytes {
+                break;
+            }
+        }
+        return Ok(ContextFetch {
+            body,
+            truncated: observed > max_bytes,
+            final_url: current.to_string(),
+            content_type: header_string(&headers, reqwest::header::CONTENT_TYPE)
+                .unwrap_or_else(|| "text/plain".into()),
+            status,
+            etag: header_string(&headers, reqwest::header::ETAG),
+            last_modified: header_string(&headers, reqwest::header::LAST_MODIFIED),
+        });
+    }
+    unreachable!()
+}
+
+fn header_string(
+    headers: &reqwest::header::HeaderMap,
+    name: reqwest::header::HeaderName,
+) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+async fn validate_public_url(url: &reqwest::Url) -> Result<Vec<std::net::SocketAddr>, String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Only http and https URLs are supported".into());
+    }
+    let host = url.host_str().ok_or("URL must include a hostname")?;
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return Err("Refusing to fetch localhost URLs".into());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or("URL has no usable port")?;
+    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| format!("Could not resolve URL hostname: {error}"))?
+        .collect();
+    if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err("Refusing to fetch a non-public URL address".into());
+    }
+    Ok(addresses)
+}
+
+fn build_context_fetch_client(
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|error| format!("Build context fetch client: {error}"))
+}
+
+fn is_public_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            !(a == 0
+                || ip.is_private()
+                || (a == 100 && b & 0xc0 == 0x40)
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || (a == 192 && b == 0 && c == 0 && !matches!(d, 9 | 10))
+                || ip.is_documentation()
+                || (a == 198 && b & 0xfe == 18)
+                || a >= 240)
+        }
+        std::net::IpAddr::V6(ip) => {
+            let [a, b, c, _, _, _, _, _] = ip.segments();
+            let bits = u128::from_be_bytes(ip.octets());
+            let global_ietf_assignment = bits == 0x2001_0001_0000_0000_0000_0000_0000_0001
+                || bits == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || matches!((b, c), (3, _) | (4, 0x112))
+                || (0x20..=0x3f).contains(&b);
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || matches!(ip.segments(), [0, 0, 0, 0, 0, 0xffff, _, _])
+                || matches!(ip.segments(), [0x64, 0xff9b, 1, _, _, _, _, _])
+                || matches!(ip.segments(), [0x100, 0, 0, 0, _, _, _, _])
+                || (a == 0x2001 && b < 0x200 && !global_ietf_assignment)
+                || a == 0x2002
+                || matches!(
+                    ip.segments(),
+                    [0x2001, 0xdb8, ..] | [0x3fff, 0..=0x0fff, ..]
+                )
+                || a == 0x5f00
+                || (a & 0xfe00) == 0xfc00
+                || (a & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_fetch_tests {
+    use super::{build_context_fetch_client, is_public_ip};
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // @lat: [[context-http-api-tests#Fetch address boundary]]
+    #[test]
+    fn accepts_only_globally_reachable_fetch_addresses() {
+        for address in [
+            "100.64.0.1",
+            "0.0.0.1",
+            "240.0.0.1",
+            "::ffff:127.0.0.1",
+            "fc00::1",
+            "fe80::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !is_public_ip(address.parse::<IpAddr>().unwrap()),
+                "{address}"
+            );
+        }
+
+        for address in ["8.8.8.8", "2606:4700:4700::1111"] {
+            assert!(
+                is_public_ip(address.parse::<IpAddr>().unwrap()),
+                "{address}"
+            );
+        }
+    }
+
+    // @lat: [[context-http-api-tests#Pinned fetch resolution]]
+    #[tokio::test]
+    async fn hostname_fetch_uses_validated_addresses() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            let length = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..length]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("host: fetch-pin.invalid")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+
+        let client = build_context_fetch_client("fetch-pin.invalid", &[address]).unwrap();
+        let response = client
+            .get("http://fetch-pin.invalid/test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        server.await.unwrap();
+    }
+}
+
 /// Hard cap on the Codex usage request. The child round-trips to the ChatGPT
 /// backend, so this sits well above the shared HTTP client's 15s ceiling — it
 /// exists to bound a hung app-server, not to police a slow network.

@@ -16,6 +16,16 @@ Tauri plugins configured: `tauri-plugin-dialog`, `tauri-plugin-log`, `tauri-plug
 
 [[src-tauri/src/server.rs]] (995 lines) runs an Axum HTTP server on port 19876 (configurable via `QUILL_PORT` env var) to receive data from external hook scripts.
 
+### Loopback context API
+
+Large transient output uses a separate authenticated HTTP server implemented by [[src-tauri/src/context_store.rs#spawn_context_server]]. It shares the Python tools' context SQLite database and writer contract.
+
+The main server still binds `0.0.0.0` for remote provider ingestion. Context routes never mount there. `context_http.enabled` gates a distinct `127.0.0.1:19877` listener, and `QUILL_CONTEXT_PORT` may override only its port.
+
+Both writers use WAL, foreign keys, a 30-second busy timeout, and transactional source replacement. Requests and serialized responses are capped. Fetch rejects non-global destinations and pins each redirect request to its validated DNS results. Execute also checks `context_preservation`, canonicalizes its working directory under configured roots, rejects destructive command patterns, kills timed-out process groups, and drains stdout and stderr into bounded buffers.
+
+The route set is `/api/v1/context/{index,fetch,execute,search,source,stats,purge}`. [[context-http-api-tests]] records network, auth, execution, and exact shared-store parity coverage.
+
 ### Authentication
 
 All endpoints require a Bearer token validated with constant-time comparison (`subtle` crate). The token is generated on first launch by [[src-tauri/src/auth.rs]] and stored at `~/.local/share/com.quilltoolkit.app/auth_secret` with mode 0o600.

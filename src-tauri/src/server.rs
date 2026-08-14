@@ -27,6 +27,8 @@ use crate::sessions;
 use crate::storage::Storage;
 
 const DEFAULT_PORT: u16 = 19876;
+const DEFAULT_CONTEXT_PORT: u16 = 19877;
+const CONTEXT_HTTP_ENABLED_KEY: &str = "context_http.enabled";
 const MAX_REQUESTS: usize = 100;
 const RATE_WINDOW_SECS: u64 = 60;
 pub(crate) const MAX_STRING_LEN: usize = 256;
@@ -133,7 +135,7 @@ pub async fn start_server(
 
     let state = Arc::new(ServerState {
         storage,
-        secret,
+        secret: secret.clone(),
         rate_limiter: Mutex::new(VecDeque::new()),
         obs_rate_limiter: Mutex::new(VecDeque::new()),
         context_savings_rate_limiter: Mutex::new(VecDeque::new()),
@@ -143,6 +145,53 @@ pub async fn start_server(
         app_handle,
         session_index,
     });
+
+    // The main router below is intentionally reachable on 0.0.0.0. Context
+    // routes, especially execute, live on a separate loopback listener and
+    // remain absent until an integration consumer sets this key.
+    let context_enabled = storage
+        .get_setting(CONTEXT_HTTP_ENABLED_KEY)
+        .ok()
+        .flatten()
+        .is_some_and(|value| value == "true");
+    let context_port = std::env::var("QUILL_CONTEXT_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_CONTEXT_PORT);
+    let context_db = dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".config/quill/context/context.db");
+    let allowed_roots = [dirs::home_dir(), Some(std::env::temp_dir())]
+        .into_iter()
+        .flatten()
+        .collect();
+    let execute_enabled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+        crate::integrations::load_integration_features(storage)
+            .is_ok_and(|features| features.context_preservation)
+    });
+    let _context_server = match crate::context_store::spawn_context_server(
+        crate::context_store::ContextServerConfig {
+            enabled: context_enabled,
+            port: context_port,
+            db_path: context_db,
+            secret: secret.clone(),
+            allowed_roots,
+            execute_enabled,
+        },
+    )
+    .await
+    {
+        Ok(handle) => {
+            if let Some(server) = &handle {
+                log::info!("Context HTTP server listening on {}", server.addr);
+            }
+            handle
+        }
+        Err(error) => {
+            log::error!("Could not start context HTTP server: {error}");
+            None
+        }
+    };
 
     let app = Router::new()
         .route("/api/v1/health", get(health))
@@ -1809,5 +1858,39 @@ mod observed_subagent_tests {
                 event
             ));
         }
+    }
+
+    #[test]
+    // @lat: [[context-http-api-tests#Pi context savings ingestion]]
+    fn context_savings_validation_accepts_pi() {
+        let payload = ContextSavingsEventsBatchPayload {
+            events: vec![ContextSavingsEventPayload {
+                event_id: "pi-event".into(),
+                schema_version: 1,
+                provider: IntegrationProvider::Pi,
+                session_id: Some("pi-session".into()),
+                hostname: "localhost".into(),
+                cwd: Some("/tmp/project".into()),
+                timestamp: "2026-08-14T12:00:00Z".into(),
+                event_type: "mcp.search".into(),
+                source: "pi".into(),
+                decision: "returned".into(),
+                category: Some("routing".into()),
+                reason: None,
+                delivered: true,
+                indexed_bytes: None,
+                returned_bytes: Some(12),
+                input_bytes: Some(24),
+                tokens_indexed_est: None,
+                tokens_returned_est: Some(3),
+                tokens_saved_est: Some(0),
+                tokens_preserved_est: Some(0),
+                estimate_method: Some("ceil_bytes_div_4".into()),
+                estimate_confidence: Some(1.0),
+                source_ref: Some("source:1".into()),
+                metadata_json: None,
+            }],
+        };
+        assert!(validate_context_savings_batch(&payload).is_ok());
     }
 }
