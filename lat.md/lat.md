@@ -23,5 +23,6 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[pi-provider-plumbing-tests]] — Pi provider persistence, breakdown, hook, and root test specs
 - [[pi-integrations-ui-tests]] — Pi setup, consent, provider-count, and Limits omission test specs
 - [[pi-session-parser-tests]] — Pi JSONL format and active-path parser test specs
+- [[pi-watcher-index-tests]] — Pi watcher and Session Search indexing test specs
 - [[pi-lifecycle-tests]] — Pi detection, transactional deployment, repair, and packaging test specs
 - [[context-http-api-tests]] — Loopback context API security, parity, execution, and pi telemetry test specs

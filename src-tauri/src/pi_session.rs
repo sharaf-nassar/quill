@@ -183,9 +183,17 @@ pub(crate) fn parse_pi_session_file(
 pub(crate) fn parse_pi_session_jsonl(
     contents: &str,
 ) -> Result<Option<PiSession>, PiSessionParseError> {
-    let mut values = contents
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok());
+    parse_pi_session_values(
+        contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok()),
+    )
+}
+
+pub(crate) fn parse_pi_session_values(
+    values: impl IntoIterator<Item = Value>,
+) -> Result<Option<PiSession>, PiSessionParseError> {
+    let mut values = values.into_iter();
     let Some(header_value) = values.next() else {
         return Ok(None);
     };

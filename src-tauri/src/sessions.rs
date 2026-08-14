@@ -66,6 +66,7 @@ pub(crate) enum RetainedJsonlSourceLayoutHint {
     ClaudeParent { default_project: String },
     ClaudeSubagent { default_project: String },
     CodexTranscript,
+    PiTranscript,
 }
 
 /// Bounded failure returned while validating one hook-notified transcript.
@@ -131,7 +132,15 @@ pub(crate) fn validate_retained_notify_source(
             CODEX_SOURCE_ROOT_KEY,
             crate::data_paths::resolve_codex_sessions_dir(),
         ),
-        IntegrationProvider::Pi => return Ok(None),
+        IntegrationProvider::Pi => (
+            PI_SOURCE_ROOT_KEY,
+            crate::data_paths::resolve_pi_sessions_dir().map_err(|error| {
+                log::warn!("Failed to resolve Pi transcript root: {error}");
+                RetainedNotifySourceValidationError::Unavailable(
+                    "Pi transcript validation is temporarily unavailable",
+                )
+            })?,
+        ),
         IntegrationProvider::MiniMax => unreachable!("MiniMax returned above"),
     };
 
@@ -305,6 +314,9 @@ fn retained_jsonl_source_layout_hint(
         IntegrationProvider::Codex if !components.is_empty() => {
             Some(RetainedJsonlSourceLayoutHint::CodexTranscript)
         }
+        IntegrationProvider::Pi if !components.is_empty() => {
+            Some(RetainedJsonlSourceLayoutHint::PiTranscript)
+        }
         IntegrationProvider::Codex | IntegrationProvider::Pi | IntegrationProvider::MiniMax => None,
     }
 }
@@ -327,6 +339,12 @@ pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot>
         enumerate_claude_retained_jsonl_source_root(),
         enumerate_codex_retained_jsonl_source_root(),
     ]
+}
+
+fn enumerate_session_search_roots() -> Vec<ProviderSourceRoot> {
+    let mut roots = enumerate_retained_jsonl_source_roots();
+    roots.push(enumerate_pi_session_search_root());
+    roots
 }
 
 /// Stable identities for every configured retained transcript root.
@@ -358,6 +376,19 @@ pub(crate) fn enumerate_codex_retained_jsonl_source_root() -> ProviderSourceRoot
         CODEX_SOURCE_ROOT_KEY,
         crate::data_paths::resolve_codex_sessions_dir(),
         collect_codex_jsonl_candidates,
+    )
+}
+
+fn enumerate_pi_session_search_root() -> ProviderSourceRoot {
+    let root = crate::data_paths::resolve_pi_sessions_dir().unwrap_or_else(|error| {
+        log::warn!("Failed to resolve Pi transcript root: {error}");
+        std::env::temp_dir().join("quill-unavailable-pi-sessions")
+    });
+    enumerate_provider_source_root(
+        IntegrationProvider::Pi,
+        PI_SOURCE_ROOT_KEY,
+        root,
+        collect_pi_jsonl_candidates,
     )
 }
 
@@ -728,6 +759,14 @@ fn collect_codex_jsonl_candidates(
     }
 
     collection
+}
+
+fn collect_pi_jsonl_candidates(
+    sessions_dir: &Path,
+    provider: IntegrationProvider,
+    diagnostic: &mut Option<String>,
+) -> TranscriptCandidateCollection {
+    collect_codex_jsonl_candidates(sessions_dir, provider, diagnostic)
 }
 
 /// Enumerate every Claude transcript under `projects_dir`, flagging sub-agent
@@ -1439,7 +1478,7 @@ impl SessionIndex {
         let mut state = self.state.lock().unwrap();
         let hostname = Self::local_hostname();
         let mut writer = self.writer.lock().unwrap();
-        let roots = enumerate_retained_jsonl_source_roots();
+        let roots = enumerate_session_search_roots();
         let discovered_paths = roots
             .iter()
             .flat_map(|root| &root.sources)
@@ -1492,6 +1531,10 @@ impl SessionIndex {
                         RetainedJsonlSourceLayoutHint::CodexTranscript => {
                             codex_thread_id(tracked_path)
                         }
+                        RetainedJsonlSourceLayoutHint::PiTranscript => tracked_path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .map(str::to_owned),
                     });
             let Some(session_id) = session_id else {
                 continue;
@@ -1596,6 +1639,7 @@ impl SessionIndex {
                     (default_project.clone(), true)
                 }
                 RetainedJsonlSourceLayoutHint::CodexTranscript => ("unknown".to_string(), false),
+                RetainedJsonlSourceLayoutHint::PiTranscript => ("unknown".to_string(), false),
             };
             DiscoveredSessionFile {
                 provider: source.provider,
@@ -3485,7 +3529,9 @@ pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl(path),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl(path),
-        IntegrationProvider::Pi => unsupported_extracted_session(path),
+        IntegrationProvider::Pi => {
+            extract_pi_messages(path, crate::pi_session::parse_pi_session_file(Some(path)))
+        }
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
     }
 }
@@ -3496,6 +3542,9 @@ pub(crate) fn extract_messages_from_jsonl_contents(
     path: &Path,
     contents: &str,
 ) -> ExtractedSession {
+    if provider == IntegrationProvider::Pi {
+        return extract_pi_messages(path, crate::pi_session::parse_pi_session_jsonl(contents));
+    }
     let records = parse_jsonl_records(contents);
     extract_messages_from_jsonl_records(provider, path, &records)
 }
@@ -3509,8 +3558,91 @@ pub(crate) fn extract_messages_from_jsonl_records(
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl_records(path, records),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl_records(records),
-        IntegrationProvider::Pi => unsupported_extracted_session(path),
+        IntegrationProvider::Pi => extract_pi_messages(
+            path,
+            crate::pi_session::parse_pi_session_values(
+                records.iter().map(|record| record.value.clone()),
+            ),
+        ),
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
+    }
+}
+
+fn extract_pi_messages(
+    path: &Path,
+    parsed: Result<Option<crate::pi_session::PiSession>, crate::pi_session::PiSessionParseError>,
+) -> ExtractedSession {
+    let session = match parsed {
+        Ok(Some(session)) => session,
+        Ok(None) => return unsupported_extracted_session(path),
+        Err(error) => {
+            log::warn!("Failed to parse Pi JSONL {}: {error}", path.display());
+            return unsupported_extracted_session(path);
+        }
+    };
+    let session_id = session.header.id;
+    let cwd = session.header.cwd;
+    let project_name = Path::new(&cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned);
+    let mut seen = HashSet::new();
+    let messages = session
+        .entries
+        .into_iter()
+        .filter_map(|entry| {
+            let crate::pi_session::PiSessionEntry::Message(entry) = entry else {
+                return None;
+            };
+            if !seen.insert(entry.base.id.clone()) {
+                return None;
+            }
+            let role = entry.message.get("role")?.as_str()?.to_owned();
+            let content = pi_message_text(entry.message.get("content")?);
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(ExtractedMessage {
+                uuid: entry.base.id,
+                session_id: session_id.clone(),
+                role,
+                content,
+                timestamp: entry.base.timestamp,
+                git_branch: String::new(),
+                tools_used: Vec::new(),
+                files_modified: Vec::new(),
+                code_changes: Vec::new(),
+                commands_run: Vec::new(),
+                tool_details: Vec::new(),
+                tool_actions: Vec::new(),
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: entry.base.parent_id,
+                cwd: Some(cwd.clone()),
+            })
+        })
+        .collect();
+
+    ExtractedSession {
+        session_id,
+        project_name,
+        messages,
+        extraction_succeeded: true,
+        events: Vec::new(),
+        hook_invocations: Vec::new(),
+    }
+}
+
+fn pi_message_text(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(blocks) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|value| value.as_str()) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
     }
 }
 
@@ -4564,8 +4696,30 @@ pub(crate) fn find_session_path(
             let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
             find_codex_session_path_in(&sessions_dir, session_id)
         }
-        IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(None),
+        IntegrationProvider::Pi => {
+            let sessions_dir = crate::data_paths::resolve_pi_sessions_dir()?;
+            find_pi_session_path_in(&sessions_dir, session_id)
+        }
+        IntegrationProvider::MiniMax => Ok(None),
     }
+}
+
+fn find_pi_session_path_in(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    unique_session_path(
+        IntegrationProvider::Pi,
+        session_id,
+        collect_pi_jsonl_candidates(sessions_dir, IntegrationProvider::Pi, &mut None)
+            .candidates
+            .into_iter()
+            .filter(|source| {
+                extract_messages_from_jsonl(IntegrationProvider::Pi, &source.path).session_id
+                    == session_id
+            })
+            .map(|source| source.path),
+    )
 }
 
 fn find_codex_session_path_in(
@@ -4992,6 +5146,207 @@ mod tests {
         assert_eq!(
             find_codex_session_path_in(tmp.path(), session_id).expect("lookup"),
             Some(rollout)
+        );
+    }
+
+    #[test]
+    fn pi_session_lookup_uses_header_id_instead_of_filename() {
+        let temp = TempDir::new().expect("tempdir");
+        let nested = temp.path().join("--work-quill--");
+        fs::create_dir_all(&nested).expect("create Pi project directory");
+        let transcript = nested.join("different-name.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-header-id","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"entry","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"context"}}"#,
+                "\n",
+            ),
+        )
+        .expect("write Pi transcript");
+
+        assert_eq!(
+            find_pi_session_path_in(temp.path(), "pi-header-id").expect("find Pi session"),
+            Some(transcript)
+        );
+    }
+
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Message Identity And Extraction]]
+    #[test]
+    fn pi_extraction_uses_header_identity_and_deduplicates_entry_ids() {
+        let transcript = concat!(
+            r#"{"type":"session","version":3,"id":"pi-session","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+            "\n",
+            r#"{"type":"message","id":"user-1","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"find the needle"}}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2026-08-14T08:00:02Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"skip"},{"type":"text","text":"needle found"}]}}"#,
+            "\n",
+            r#"{"type":"message","id":"assistant-1","parentId":"user-1","timestamp":"2026-08-14T08:00:03Z","message":{"role":"assistant","content":"duplicate"}}"#,
+            "\n",
+        );
+
+        let extracted = extract_messages_from_jsonl_contents(
+            IntegrationProvider::Pi,
+            Path::new("not-the-session-id.jsonl"),
+            transcript,
+        );
+
+        assert!(extracted.extraction_succeeded);
+        assert_eq!(extracted.session_id, "pi-session");
+        assert_eq!(extracted.project_name.as_deref(), Some("quill"));
+        assert_eq!(extracted.messages.len(), 2);
+        assert_eq!(extracted.messages[0].uuid, "user-1");
+        assert_eq!(extracted.messages[1].uuid, "assistant-1");
+        assert_eq!(extracted.messages[1].content, "needle found");
+        assert_eq!(extracted.messages[1].parent_uuid.as_deref(), Some("user-1"));
+        assert!(
+            extracted
+                .messages
+                .iter()
+                .all(|message| message.session_id == "pi-session"
+                    && message.cwd.as_deref() == Some("/work/quill"))
+        );
+    }
+
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Recursive Candidate Collection]]
+    #[test]
+    fn pi_candidate_collection_accepts_nested_jsonl_files_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let project = temp.path().join("--work-quill--");
+        fs::create_dir_all(&project).expect("create Pi project directory");
+        let transcript = project.join("session.jsonl");
+        fs::write(&transcript, "{}\n").expect("write transcript");
+        fs::write(project.join("ignored.json"), "{}\n").expect("write ignored file");
+
+        let root = enumerate_provider_source_root(
+            IntegrationProvider::Pi,
+            PI_SOURCE_ROOT_KEY,
+            temp.path().to_path_buf(),
+            collect_pi_jsonl_candidates,
+        );
+
+        assert_eq!(root.outcome, ProviderRootEnumerationOutcome::Complete);
+        assert_eq!(root.sources.len(), 1);
+        assert_eq!(root.sources[0].filesystem_path, transcript);
+        assert_eq!(root.sources[0].provider, IntegrationProvider::Pi);
+        assert!(matches!(
+            root.sources[0].layout_hint,
+            RetainedJsonlSourceLayoutHint::PiTranscript
+        ));
+    }
+
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Provider Safe Search]]
+    #[test]
+    fn pi_search_hits_and_facets_keep_provider_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let messages = extract_messages_from_jsonl_contents(
+            IntegrationProvider::Pi,
+            Path::new("session.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"shared","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"pi-entry","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"provider-safe-needle"}}"#,
+                "\n",
+            ),
+        )
+        .messages;
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Pi,
+                "shared",
+                "quill",
+                "host",
+                &messages,
+            )
+            .expect("index Pi message");
+        index.reader.reload().expect("reload index");
+
+        let result = index
+            .search(
+                "provider-safe-needle",
+                &SearchFilters {
+                    provider: Some(IntegrationProvider::Pi),
+                    ..SearchFilters::default()
+                },
+                "relevance",
+                0,
+                10,
+            )
+            .expect("search Pi messages");
+        assert_eq!(result.total_hits, 1);
+        assert_eq!(result.hits[0].provider, IntegrationProvider::Pi);
+        assert_eq!(result.hits[0].message_id, "pi-entry");
+        assert!(
+            index
+                .get_facets()
+                .expect("facets")
+                .providers
+                .iter()
+                .any(|facet| { facet.name == "pi" && facet.count == 1 })
+        );
+    }
+
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Provider Safe Cleanup]]
+    #[test]
+    fn pi_cleanup_does_not_delete_same_id_from_other_providers() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let make_message = |uuid: &str, content: &str| ExtractedMessage {
+            uuid: uuid.to_string(),
+            session_id: "shared".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            timestamp: "2026-08-14T08:00:01Z".to_string(),
+            git_branch: String::new(),
+            tools_used: Vec::new(),
+            files_modified: Vec::new(),
+            code_changes: Vec::new(),
+            commands_run: Vec::new(),
+            tool_details: Vec::new(),
+            tool_actions: Vec::new(),
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: None,
+            cwd: None,
+        };
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Claude,
+                "shared",
+                "project",
+                "host",
+                &[make_message("claude-entry", "keep-me")],
+            )
+            .expect("index Claude message");
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Pi,
+                "shared",
+                "project",
+                "host",
+                &[make_message("pi-entry", "remove-me")],
+            )
+            .expect("index Pi message");
+        index
+            .replace_session_docs_batch(IntegrationProvider::Pi, "shared", "project", "host", &[])
+            .expect("clean Pi session");
+        index.reader.reload().expect("reload index");
+
+        assert_eq!(
+            index
+                .search("keep-me", &SearchFilters::default(), "relevance", 0, 10)
+                .expect("search Claude message")
+                .total_hits,
+            1
+        );
+        assert_eq!(
+            index
+                .search("remove-me", &SearchFilters::default(), "relevance", 0, 10)
+                .expect("search Pi message")
+                .total_hits,
+            0
         );
     }
 

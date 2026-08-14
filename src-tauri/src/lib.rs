@@ -19,8 +19,6 @@ mod live_tracker;
 mod memory_optimizer;
 mod model_usage;
 mod models;
-// Item 3 wires this format module into the watcher and indexer.
-#[allow(dead_code)]
 mod pi_session;
 mod prompt_utils;
 mod redaction;
@@ -3670,6 +3668,14 @@ async fn confirm_enable_provider(
     }?;
     live_tracker.set_provider_enabled(provider, true);
     let _ = app.emit("hooks-observed-updated", ());
+
+    if provider == integrations::IntegrationProvider::Pi
+        && let Some(index) = app.try_state::<sessions::SessionIndexState>()
+    {
+        let index = Arc::clone(&index.0);
+        let app_handle = app.clone();
+        run_blocking(move || index.startup_scan(&app_handle, STORAGE.get()))?;
+    }
 
     clear_usage_cache().await;
     if let Err(error) = refresh_usage_cache(Some(&app), false).await {

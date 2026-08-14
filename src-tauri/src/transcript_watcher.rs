@@ -1,4 +1,4 @@
-//! Event-driven admission for retained Claude and Codex transcripts.
+//! Event-driven admission for local provider transcripts.
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -70,7 +70,7 @@ impl PendingPaths {
 }
 
 fn transcript_roots() -> Vec<TranscriptRoot> {
-    vec![
+    let mut roots = vec![
         (
             IntegrationProvider::Claude,
             crate::data_paths::resolve_claude_projects_dir(),
@@ -79,15 +79,30 @@ fn transcript_roots() -> Vec<TranscriptRoot> {
             IntegrationProvider::Codex,
             crate::data_paths::resolve_codex_sessions_dir(),
         ),
-    ]
-    .into_iter()
-    .map(|(provider, resolved_path)| TranscriptRoot {
-        provider,
-        resolved_path,
-        canonical_path: None,
-        watched: false,
-    })
-    .collect()
+    ];
+    if let Ok(path) = crate::data_paths::resolve_pi_sessions_dir() {
+        roots.push((IntegrationProvider::Pi, path));
+    }
+    roots
+        .into_iter()
+        .map(|(provider, resolved_path)| TranscriptRoot {
+            provider,
+            resolved_path,
+            canonical_path: None,
+            watched: false,
+        })
+        .collect()
+}
+
+fn refresh_resolved_root_paths(
+    roots: &mut [TranscriptRoot],
+    mut resolve: impl FnMut(IntegrationProvider) -> Option<PathBuf>,
+) {
+    for root in roots {
+        if let Some(path) = resolve(root.provider) {
+            root.resolved_path = path;
+        }
+    }
 }
 
 fn retry_root_watches(
@@ -262,6 +277,14 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
         }
         let now = Instant::now();
         if now >= retry_at {
+            refresh_resolved_root_paths(&mut roots, |provider| match provider {
+                IntegrationProvider::Claude => {
+                    Some(crate::data_paths::resolve_claude_projects_dir())
+                }
+                IntegrationProvider::Codex => Some(crate::data_paths::resolve_codex_sessions_dir()),
+                IntegrationProvider::Pi => crate::data_paths::resolve_pi_sessions_dir().ok(),
+                IntegrationProvider::MiniMax => None,
+            });
             reset_changed_root_watches(
                 &mut roots,
                 |path| {
@@ -273,7 +296,7 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
                     let _ = watcher.unwatch(path);
                 },
             );
-            retry_root_watches(
+            let added = retry_root_watches(
                 &mut roots,
                 |path| {
                     std::fs::canonicalize(path)
@@ -286,6 +309,9 @@ fn run(app: tauri::AppHandle) -> Result<(), String> {
                         .map_err(|error| error.to_string())
                 },
             );
+            if added > 0 {
+                sync_search_index(&app);
+            }
             retry_at = now + RETRY_INTERVAL;
             // Unconditional: notify semantics differ per platform, so this tick
             // is the backstop for events that never arrived.
@@ -323,10 +349,13 @@ fn admit_pending(
     app: &tauri::AppHandle,
     (pending, recovery): (HashMap<PathBuf, IntegrationProvider>, bool),
 ) {
+    let has_pending = !pending.is_empty();
     for (path, provider) in &pending {
         match crate::sessions::validate_retained_notify_source(*provider, path) {
             Ok(Some(source)) => {
-                if let Err(error) = crate::enqueue_retained_live_source(app, source) {
+                if *provider != IntegrationProvider::Pi
+                    && let Err(error) = crate::enqueue_retained_live_source(app, source)
+                {
                     log::warn!("Transcript watcher failed to enqueue retained source: {error}");
                 }
             }
@@ -342,9 +371,20 @@ fn admit_pending(
     if let Some(tracker) = live_tracker(app) {
         tracker.apply_paths(pending);
     }
+    if has_pending || recovery {
+        sync_search_index(app);
+    }
     if recovery {
         reconcile_all(app);
         sweep_live_tracker(app);
+    }
+}
+
+fn sync_search_index(app: &tauri::AppHandle) {
+    if let Some(index) = app.try_state::<crate::sessions::SessionIndexState>()
+        && let Err(error) = index.0.startup_scan(app, crate::STORAGE.get())
+    {
+        log::warn!("Transcript watcher search-index sync failed: {error}");
     }
 }
 
@@ -381,6 +421,7 @@ fn reconcile_all(app: &tauri::AppHandle) {
 mod tests {
     use super::*;
     use notify::event::{CreateKind, DataChange, MetadataKind, RemoveKind, RenameMode};
+    use serial_test::serial;
 
     fn roots() -> Vec<TranscriptRoot> {
         vec![
@@ -397,6 +438,39 @@ mod tests {
                 watched: true,
             },
         ]
+    }
+
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Root Registration And Refresh]]
+    #[test]
+    #[serial]
+    fn configured_roots_include_pi_and_refresh_changed_resolution() {
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+        }
+        let mut roots = transcript_roots();
+        let pi = roots
+            .iter()
+            .find(|root| root.provider == IntegrationProvider::Pi)
+            .expect("Pi transcript root");
+        assert!(pi.resolved_path.ends_with("quill-demo-empty-pi-sessions"));
+
+        let changed = PathBuf::from("/new/pi/sessions");
+        refresh_resolved_root_paths(&mut roots, |provider| {
+            (provider == IntegrationProvider::Pi).then(|| changed.clone())
+        });
+        assert_eq!(
+            roots
+                .iter()
+                .find(|root| root.provider == IntegrationProvider::Pi)
+                .expect("refreshed Pi transcript root")
+                .resolved_path,
+            changed
+        );
+
+        unsafe {
+            std::env::remove_var("QUILL_DEMO_MODE");
+        }
     }
 
     // @lat: [[data-flow#Session Indexing Pipeline#Source-Owned Analytics Snapshots#Transcript Watcher Test Specs#Provider Paths And Burst Coalescing]]

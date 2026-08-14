@@ -270,6 +270,9 @@ pub fn resolve_pi_sessions_dir_with_default(default: PathBuf) -> PathBuf {
 }
 
 pub fn resolve_pi_sessions_dir() -> Result<PathBuf, String> {
+    if demo_mode_active() {
+        return Ok(resolve_pi_sessions_dir_with_default(PathBuf::new()));
+    }
     crate::integrations::pi::resolve_session_dir().map(resolve_pi_sessions_dir_with_default)
 }
 
@@ -454,6 +457,20 @@ mod tests {
         let default = PathBuf::from("/tmp/quill-test-fallback-default-rules-2");
         let result = resolve_rules_dir_with_default(default.clone());
         assert_eq!(result, default);
+        clear_env();
+    }
+
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Demo Root Isolation]]
+    #[test]
+    #[serial]
+    fn pi_demo_without_override_never_uses_persisted_root() {
+        clear_env();
+        set_env(DEMO_MODE_ENV, "1");
+        let persisted = PathBuf::from("/real/persisted/pi/sessions");
+        let resolved = resolve_pi_sessions_dir_with_default(persisted.clone());
+
+        assert_ne!(resolved, persisted);
+        assert!(resolved.ends_with("quill-demo-empty-pi-sessions"));
         clear_env();
     }
 }

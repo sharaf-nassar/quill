@@ -204,7 +204,7 @@ After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted runni
 
 [[src-tauri/src/sessions.rs#SessionIndex#startup_scan]] uses the same concrete provider walkers as retained inventory but consumes their permissive search view. Search keeps original filesystem paths with nanosecond-mtime-and-size fingerprints and remains parent-session aware, while analytics derives canonical containment and root-completeness proofs separately. Search extraction and scan failures cannot suppress startup or periodic analytics reconciliation.
 
-[[src-tauri/src/transcript_watcher.rs#start]] recursively watches distinct Claude and Codex transcript roots and admits debounced JSONL create, content-write, and rename targets through strict single-source validation and [[src-tauri/src/lib.rs#enqueue_retained_live_source]]. Missing or failed watches retry every 120 seconds without duplicate registration; ambiguous canonical roots are rejected.
+[[src-tauri/src/transcript_watcher.rs#start]] recursively watches distinct Claude, Codex, and Pi transcript roots. It admits debounced JSONL changes through strict validation and runs the shared Session Search sync. Missing, changed, or failed watches retry every 120 seconds; ambiguous canonical roots are rejected.
 
 [[src/hooks/useModelAnalytics.ts#useModelAnalytics]] requests only one command-and-arguments-scoped overview through the process-lifetime invoke cache. Data-changing model events invalidate that key and join the shared five-second-or-longer mounted fan-out; the 60-second fallback poll follows the same path. Each accepted overview advances the frontend refresh generation and updates both [[src/components/widget/views/ModelsView.tsx#ModelsView]] bands as one unit. The widget has no selected-model paging or lazy chain-history request to fan out.
 
@@ -212,12 +212,12 @@ After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted runni
 
 Session transcripts are indexed for full-text search with enriched metadata, while provider-aware side tables keep tool and latency data distinct.
 
-1. Claude Code writes session JSONL files to `~/.claude/projects/`, and Codex writes rollout transcripts to `~/.codex/sessions/`
-2. When Session Search opens, [[src-tauri/src/sessions.rs]] scans both provider transcript roots incrementally by mtime
+1. Claude Code writes session JSONL files to `~/.claude/projects/`, Codex writes rollout transcripts to `~/.codex/sessions/`, and Pi writes tree sessions to its persisted lifecycle session directory
+2. When Session Search opens, [[src-tauri/src/sessions.rs]] scans all three provider roots incrementally by mtime; enabling Pi runs the same full sync for existing sessions
 3. Provider hook scripts can also post `POST /api/v1/sessions/notify` with JSONL path plus provider metadata, while incremental remote sync can push `POST /api/v1/sessions/messages`
 4. `notify` requests acknowledge first, then feed independent search and analytics schedulers; remote `messages` requests acknowledge only after source-less analytics commits, while Tantivy indexing remains asynchronous and best effort
 5. Local Claude full-transcript sync runs on `Stop`, `StopFailure`, and `SessionEnd` instead of every `PostToolUse`, so full-file reindexing happens only at terminal boundaries
-6. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details
+6. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details; Pi uses the session header id and indexes each text-bearing message entry once by entry id
 7. Indexed into Tantivy with fields: provider, message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
 8. Retained runtime, response, tool, skill, and hook rows persist in provider-aware SQLite snapshots owned by canonical transcript source; remote message and hook pushes use separate source-less identities
 9. Frontend search queries use TF-IDF weighted scoring with snippet generation
