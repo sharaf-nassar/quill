@@ -1,4 +1,4 @@
-use super::{codex, cpa, integration_mutation_guard, minimax};
+use super::{codex, cpa, integration_mutation_guard, minimax, pi};
 use crate::brevity;
 use crate::integrations::cpa::{
     CpaConnectError, CpaConnectResult, CpaConnectionStatus, ValidatedCpaConnection,
@@ -99,7 +99,7 @@ pub fn confirm_enable_with_key(
             codex::install(app, features)?;
         }
         IntegrationProvider::Pi => {
-            return Err("Pi integration lifecycle is not available yet.".to_string());
+            pi::install(app, features)?;
         }
         IntegrationProvider::MiniMax => {
             let key = api_key
@@ -230,7 +230,7 @@ pub fn confirm_disable(
             codex::uninstall(remove_shared_restart_assets)?;
         }
         IntegrationProvider::Pi => {
-            return Err("Pi integration lifecycle is not available yet.".to_string());
+            pi::uninstall()?;
         }
         IntegrationProvider::MiniMax => {
             minimax::delete_api_key(&storage)?;
@@ -426,6 +426,7 @@ fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, Str
     [
         IntegrationProvider::Claude,
         IntegrationProvider::Codex,
+        IntegrationProvider::Pi,
         IntegrationProvider::MiniMax,
     ]
     .into_iter()
@@ -438,9 +439,7 @@ fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, Stri
     match provider {
         IntegrationProvider::Claude => crate::claude_setup::detect(),
         IntegrationProvider::Codex => codex::detect(),
-        IntegrationProvider::Pi => {
-            Err("Pi integration lifecycle is not available yet.".to_string())
-        }
+        IntegrationProvider::Pi => pi::detect(),
         IntegrationProvider::MiniMax => minimax::detect(),
     }
 }
@@ -487,9 +486,10 @@ fn should_repair_provider(status: &ProviderStatus) -> bool {
     status.enabled
         && status.detected_cli
         && status.detected_home
+        && status.setup_state != ProviderSetupState::Error
         && matches!(
             status.provider,
-            IntegrationProvider::Claude | IntegrationProvider::Codex
+            IntegrationProvider::Claude | IntegrationProvider::Codex | IntegrationProvider::Pi
         )
 }
 
@@ -498,7 +498,7 @@ fn should_sync_context_assets(status: &ProviderStatus) -> bool {
         && status.detected_home
         && matches!(
             status.provider,
-            IntegrationProvider::Claude | IntegrationProvider::Codex
+            IntegrationProvider::Claude | IntegrationProvider::Codex | IntegrationProvider::Pi
         )
 }
 
@@ -529,7 +529,13 @@ fn repair_provider(
             }
             codex::install(app, features)
         }
-        IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(()),
+        IntegrationProvider::Pi => {
+            if pi::deployment_is_current(app, features) {
+                return Ok(());
+            }
+            pi::install(app, features)
+        }
+        IntegrationProvider::MiniMax => Ok(()),
     }
 }
 
@@ -547,7 +553,8 @@ fn sync_features_for_enabled_providers(
         let result = match status.provider {
             IntegrationProvider::Claude => crate::claude_setup::install(app, features),
             IntegrationProvider::Codex => codex::install(app, features),
-            IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(()),
+            IntegrationProvider::Pi => pi::install(app, features),
+            IntegrationProvider::MiniMax => Ok(()),
         };
 
         match result {
@@ -585,16 +592,26 @@ fn merge_saved_statuses(
                 .iter()
                 .find(|saved| saved.provider == status.provider)
             {
-                status.enabled = saved.enabled;
-                status.user_has_made_choice = saved.user_has_made_choice;
-                status.last_error = saved.last_error.clone();
-                if status.enabled && !status.detected_cli && !status.detected_home {
-                    status.setup_state = ProviderSetupState::Missing;
-                }
+                apply_saved_status(&mut status, saved);
             }
             status
         })
         .collect())
+}
+
+fn apply_saved_status(status: &mut ProviderStatus, saved: &ProviderStatus) {
+    status.enabled = saved.enabled;
+    status.user_has_made_choice = saved.user_has_made_choice;
+    if status.last_error.is_none() {
+        status.last_error = saved.last_error.clone();
+    }
+    if status.enabled
+        && status.last_error.is_none()
+        && !status.detected_cli
+        && !status.detected_home
+    {
+        status.setup_state = ProviderSetupState::Missing;
+    }
 }
 
 fn load_saved_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
@@ -690,5 +707,57 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].provider, IntegrationProvider::Claude);
         assert!(statuses[0].enabled);
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Manager Wiring]]
+    #[test]
+    fn enabled_pi_provider_participates_in_repair_and_feature_sync() {
+        let mut status = ProviderStatus {
+            provider: IntegrationProvider::Pi,
+            detected_cli: true,
+            detected_home: true,
+            enabled: true,
+            setup_state: ProviderSetupState::Installed,
+            user_has_made_choice: true,
+            last_error: None,
+            last_verified_at: None,
+            last_detection_attempts: Vec::new(),
+        };
+
+        assert!(should_repair_provider(&status));
+        assert!(should_sync_context_assets(&status));
+
+        status.setup_state = ProviderSetupState::Error;
+        status.last_error = Some("Quill requires pi >= 0.84.0".to_string());
+        assert!(!should_repair_provider(&status));
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Typed Detection Errors]]
+    #[test]
+    fn saved_status_does_not_hide_a_fresh_pi_detection_error() {
+        let mut detected = ProviderStatus {
+            provider: IntegrationProvider::Pi,
+            detected_cli: true,
+            detected_home: true,
+            enabled: false,
+            setup_state: ProviderSetupState::Error,
+            user_has_made_choice: false,
+            last_error: Some("Pi extensions directory is not writable".to_string()),
+            last_verified_at: None,
+            last_detection_attempts: Vec::new(),
+        };
+        let mut saved = detected.clone();
+        saved.enabled = true;
+        saved.user_has_made_choice = true;
+        saved.last_error = None;
+
+        apply_saved_status(&mut detected, &saved);
+
+        assert!(detected.enabled);
+        assert_eq!(
+            detected.last_error.as_deref(),
+            Some("Pi extensions directory is not writable")
+        );
+        assert_eq!(detected.setup_state, ProviderSetupState::Error);
     }
 }

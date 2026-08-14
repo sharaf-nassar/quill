@@ -342,9 +342,23 @@ The reader thread is deliberately never joined. Group termination closes the pip
 
 Process groups are a `#[cfg(unix)]` mechanism. Windows is not a supported target, and the unconditional deadline plus non-blocking teardown keep the failure there bounded to a leaked child rather than a wedge.
 
+## Pi Integration Deployment
+
+[[src-tauri/src/integrations/pi.rs]] owns Pi detection, extension deployment, managed instructions, transactional removal, and startup repair.
+
+Pi must resolve through the shared login-shell, launcher, and symlink-aware PATH logic and report version 0.84.0 or newer. A resolved CLI with old or unparseable output, invalid persisted paths, or a non-writable extensions directory produces an error status with `last_error`; saved status merging preserves that fresh failure.
+
+The selected `$PI_CODING_AGENT_DIR` and `$PI_CODING_AGENT_SESSION_DIR`, or their `~/.pi/agent` defaults, are captured in `~/.config/quill/pi/integration-state.json` with the detected Pi version. Later repair and removal use those persisted paths even if the environment changes.
+
+Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes only marked Quill files, the managed block, state, and stamp. It does not delete indexed Pi sessions or analytics.
+
+Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
+
+Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. Verification compares exact extension bytes, checks the payload marker, rejects extra Quill-marked extension files, requires the current AGENTS block, and parses the four-field integration state. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
+
 ## Provider CLI Detection
 
-Claude and Codex CLI detection runs through [[src-tauri/src/config.rs#resolve_command_path]] with an invalidatable login-shell PATH cache so the integrations menu's "Rescan PATH" action can pick up new installs without restarting Quill.
+Claude, Codex, and Pi CLI detection runs through [[src-tauri/src/config.rs#resolve_command_path]] with an invalidatable login-shell PATH cache so the integrations menu's "Rescan PATH" action can pick up new installs without restarting Quill.
 
 Detection layers a login-shell `command -v` lookup with a static fallback list and dynamic per-package-manager prefix queries. The cache lives in an `RwLock` and is cleared via [[src-tauri/src/config.rs#refresh_shell_path]] when the UI calls [[src-tauri/src/integrations/manager.rs#force_rescan]].
 
@@ -356,7 +370,7 @@ Windows is not covered: detection assumes a Unix shell (`bash -lc`/`zsh -lc`) an
 
 After the static list, `resolve_command_path_with_attempts` queries `npm config get prefix`, `bun pm bin -g`, and `yarn global bin` through the login shell to pick up custom global-install prefixes. Results are cached and invalidated alongside the shell PATH. Returned bin dirs are validated against a trusted-roots allow-list (`$HOME`, `/usr`, `/opt`, `/Library`, `/snap`, `/nix`, `/run/current-system`, Linuxbrew, flatpak); a malicious npm/bun config that points the prefix elsewhere is dropped before Quill could later execute the binary as a trusted CLI. Failed detections record every path inspected on `ProviderStatus.lastDetectionAttempts` (omitted from JSON when empty) with the user's home directory redacted to `~/...` so the persisted/emitted blob does not leak the local username; the integrations menu's per-row diagnostic tooltip renders the redacted paths as inline `<code>` so they read distinctly from the surrounding prose.
 
-Both Claude and Codex detection share [[src-tauri/src/config.rs#detect_provider_cli]], which calls `resolve_command_path_with_attempts`, runs `--version` with `path_for_resolved_command`'s symlink-aware PATH augmentation, and returns the success bool plus the (already-redacted) attempts list.
+Claude and Codex detection share [[src-tauri/src/config.rs#detect_provider_cli]]. Pi uses the same resolver and `path_for_resolved_command` augmentation but parses the returned version to enforce its 0.84.0 floor.
 
 ## Shared Outbound HTTP Client
 

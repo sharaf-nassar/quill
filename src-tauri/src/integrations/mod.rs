@@ -35,6 +35,9 @@ pub(crate) fn integration_mutation_guard() -> Result<MutexGuard<'static, ()>, St
     if let Err(err) = codex::recover_interrupted_install() {
         errors.push(format!("Codex recovery failed: {err}"));
     }
+    if let Err(err) = pi::recover_interrupted_install() {
+        errors.push(format!("Pi recovery failed: {err}"));
+    }
 
     // Recovery is non-destructive and converges: an unrollbackable transaction
     // is quarantined and reported as recovered. An error here means recovery
