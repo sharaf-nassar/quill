@@ -708,6 +708,808 @@ depth-2 closure, a proven pending boundary, unrelated results, reset paths,
 and any separately admitted notification rule. Each key test then receives
 one `lat.md` test-spec link.
 
+## Measurement Evidence
+
+The 2026-08-14 baseline is gap-free and misses both materiality thresholds.
+It changes no runtime behavior and authorizes no production implementation.
+
+### Fixed capture protocol
+
+Capture time was `2026-08-14T05:00:54Z`; the active cutoff was 900 seconds,
+at `2026-08-14T04:45:54Z`. The probe fixed every candidate transcript and
+metadata byte size before reading. It selected root sessions from eligible
+activity in the root or any descendant, then read every selected tree through
+those byte boundaries regardless of descendant mtime.
+
+Inputs were opened read-only. The walker resolved symlinks and rejected any
+target outside the authorized root. Device, inode, size, and modification
+checks detected replacement, shrink, and in-place instability. Only complete
+newline-terminated JSONL records entered the result sets. No network API,
+Quill process, browser protocol, or live window was used.
+
+The root came only from a nonprinted `QUILL_MEASURE_CLAUDE_ROOT` value. Neither
+the probe nor this artifact stores its resolved value. The build profile was
+debug on Linux x86_64 with 64 logical CPUs, 64-bit pointers, and a `64-127`
+GiB RAM bucket. Toolchain versions were Python 3.12.3, rustc 1.95.0, and Cargo
+1.95.0. Git revision was
+`458f218ca8822c826260f8adf44abd915016826f`.
+
+### Literal commands
+
+The environment value was set outside these recorded commands and never
+printed. These are the commands run against the one capture:
+
+```bash
+python3 -I /tmp/quill-live-resolved-probe.py --self-test
+python3 -I /tmp/quill-live-resolved-probe.py \
+  --projects-dir "$QUILL_MEASURE_CLAUDE_ROOT" \
+  --capture-time "2026-08-14T05:00:54Z" \
+  --idle-seconds 900
+```
+
+The seven required cases passed exactly:
+
+```json
+{"cases":7,"failed":0}
+```
+
+Isolated production-path timings used the required existing test command:
+
+```bash
+cd src-tauri
+cargo test live_tracker::tests::the_read_path_costs_a_map_lock_rather_than_a_scan -- --nocapture
+```
+
+### Probe source
+
+This is the exact 648-line temporary probe, SHA-256
+`b3a256495fb9c41a6db603ad8cf1a175a941d07cb8178fa1f9b04dac3e471514`.
+It uses only the Python standard library.
+
+```python
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+
+
+TOP_KEYS = {
+    "schema_version", "capture", "environment", "population", "dimensions",
+    "timings", "gaps", "decision",
+}
+DIMENSIONS = ("all_results", "known_spawn_results", "unmatched_results")
+COMPONENTS = (
+    "count", "payload_bytes", "rounded_payload_bytes", "reserved_slot_bytes",
+    "control_bytes", "allocation_allowance_bytes",
+    "policy_accounting_proxy_bytes",
+)
+GAP_KEYS = (
+    "malformed_records", "unreadable_files", "unstable_files", "replaced_files",
+    "incomplete_trailing_lines",
+)
+ERROR_KEYS = {
+    "invalid_arguments", "missing_root", "relative_root", "unreadable_root",
+    "outside_root_symlink", "broken_symlink", "invalid_capture_time",
+    "invalid_idle_seconds", "privacy_schema_failure",
+}
+
+
+class SafeParser(argparse.ArgumentParser):
+    def error(self, _message):
+        raise ValueError
+
+
+def compact(value):
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def error_result(kind, count=1):
+    assert kind in ERROR_KEYS
+    return 2, "", compact({"errors": {kind: count}})
+
+
+def parse_utc(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def utc_text(value):
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def command_version(*command):
+    try:
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+    return result.stdout.strip().splitlines()[0]
+
+
+def ram_bucket():
+    try:
+        gib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30
+    except (OSError, ValueError):
+        return "unknown"
+    for low, high, label in (
+        (0, 8, "<8"), (8, 16, "8-15"), (16, 32, "16-31"),
+        (32, 64, "32-63"), (64, 128, "64-127"),
+    ):
+        if low <= gib < high:
+            return label
+    return ">=128"
+
+
+def empty_gaps():
+    return {key: 0 for key in GAP_KEYS}
+
+
+def add_gaps(target, source):
+    for key in GAP_KEYS:
+        target[key] += source[key]
+
+
+def within_root(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def snapshot_files(root):
+    files = []
+    gaps = empty_gaps()
+    errors = {"outside_root_symlink": 0, "broken_symlink": 0}
+    seen_dirs = set()
+    seen_files = set()
+
+    def walk(directory):
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            gaps["unreadable_files"] += 1
+            return
+        try:
+            directory_stat = os.stat(directory)
+        except OSError:
+            gaps["unreadable_files"] += 1
+            return
+        directory_key = (directory_stat.st_dev, directory_stat.st_ino)
+        if directory_key in seen_dirs:
+            return
+        seen_dirs.add(directory_key)
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    try:
+                        resolved = path.resolve(strict=True)
+                    except OSError:
+                        errors["broken_symlink"] += 1
+                        continue
+                    if not within_root(resolved, root):
+                        errors["outside_root_symlink"] += 1
+                        continue
+                    path = resolved
+                if path.is_dir():
+                    walk(path)
+                    continue
+                name = path.name
+                if path.suffix != ".jsonl" and not (
+                    name.startswith("agent-") and name.endswith(".meta.json")
+                ):
+                    continue
+                stat = path.stat()
+                file_key = (stat.st_dev, stat.st_ino)
+                if file_key in seen_files:
+                    continue
+                seen_files.add(file_key)
+                files.append({
+                    "path": path,
+                    "size": stat.st_size,
+                    "dev": stat.st_dev,
+                    "ino": stat.st_ino,
+                    "mtime_ns": stat.st_mtime_ns,
+                })
+            except OSError:
+                gaps["unreadable_files"] += 1
+
+    walk(root)
+    return files, gaps, {key: value for key, value in errors.items() if value}
+
+
+def session_key(path, root):
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return None
+    if "subagents" in parts:
+        index = parts.index("subagents")
+        return parts[:index] if index else None
+    if path.suffix == ".jsonl":
+        return (*parts[:-1], path.stem)
+    return None
+
+
+def read_fixed(item):
+    gaps = empty_gaps()
+    try:
+        descriptor = os.open(item["path"], os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        gaps["unreadable_files"] += 1
+        return None, gaps
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (item["dev"], item["ino"]):
+            gaps["replaced_files"] += 1
+            return None, gaps
+        if before.st_size < item["size"]:
+            gaps["unstable_files"] += 1
+            return None, gaps
+        chunks = []
+        remaining = item["size"]
+        while remaining:
+            chunk = os.read(descriptor, min(1 << 20, remaining))
+            if not chunk:
+                gaps["unstable_files"] += 1
+                return None, gaps
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    except OSError:
+        gaps["unreadable_files"] += 1
+        return None, gaps
+    finally:
+        os.close(descriptor)
+    try:
+        current = item["path"].stat()
+    except OSError:
+        gaps["replaced_files"] += 1
+        return None, gaps
+    if (current.st_dev, current.st_ino) != (item["dev"], item["ino"]):
+        gaps["replaced_files"] += 1
+    if after.st_size < item["size"] or current.st_size < item["size"]:
+        gaps["unstable_files"] += 1
+    if (
+        current.st_mtime_ns != item["mtime_ns"]
+        and current.st_size == item["size"]
+    ):
+        gaps["unstable_files"] += 1
+    return b"".join(chunks), gaps
+
+
+def records(raw, gaps):
+    if raw is None:
+        return []
+    complete = len(raw)
+    if raw and not raw.endswith(b"\n"):
+        gaps["incomplete_trailing_lines"] += 1
+        complete = raw.rfind(b"\n") + 1
+    parsed = []
+    for line in raw[:complete].splitlines():
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            gaps["malformed_records"] += 1
+            continue
+        if not isinstance(value, dict):
+            gaps["malformed_records"] += 1
+            continue
+        parsed.append(value)
+    return parsed
+
+
+def scan_group(items, capture, cutoff):
+    all_results = set()
+    spawn_ids = set()
+    newest_activity = None
+    gaps = empty_gaps()
+    for item in items:
+        raw, file_gaps = read_fixed(item)
+        add_gaps(gaps, file_gaps)
+        if raw is None:
+            continue
+        if item["path"].name.endswith(".meta.json"):
+            try:
+                meta = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                gaps["malformed_records"] += 1
+                continue
+            if not isinstance(meta, dict):
+                gaps["malformed_records"] += 1
+                continue
+            tool_use_id = meta.get("toolUseId")
+            if isinstance(tool_use_id, str) and tool_use_id:
+                spawn_ids.add(tool_use_id)
+            continue
+        for record in records(raw, gaps):
+            if record.get("type") != "attachment":
+                timestamp = parse_utc(record.get("timestamp"))
+                if timestamp is not None and timestamp <= capture:
+                    newest_activity = max(newest_activity, timestamp) if newest_activity else timestamp
+            message = record.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id")
+                if isinstance(tool_use_id, str) and tool_use_id:
+                    all_results.add(tool_use_id)
+    active = newest_activity is not None and newest_activity >= cutoff
+    return {
+        "active": active,
+        "all_results": all_results,
+        "known_spawn_results": all_results & spawn_ids,
+        "unmatched_results": all_results - spawn_ids,
+        "gaps": gaps,
+    }
+
+
+def proxy(values, pointer_bytes):
+    lengths = [len(value.encode("utf-8")) for value in values]
+    count = len(lengths)
+    if not count:
+        return {key: 0 for key in COMPONENTS}
+    buckets = 8
+    while count > 7 * buckets // 8:
+        buckets *= 2
+    rounded = sum(((max(1, length) + 15) // 16) * 16 for length in lengths)
+    components = {
+        "count": count,
+        "payload_bytes": sum(lengths),
+        "rounded_payload_bytes": rounded,
+        "reserved_slot_bytes": buckets * 3 * pointer_bytes,
+        "control_bytes": buckets + 16,
+        "allocation_allowance_bytes": 32 * (count + 1),
+    }
+    components["policy_accounting_proxy_bytes"] = sum(
+        components[key] for key in COMPONENTS[2:-1]
+    )
+    return components
+
+
+def normalized_number(value):
+    return int(value) if int(value) == value else value
+
+
+def distribution(values):
+    if not values:
+        return {"median": 0, "p95": 0, "maximum": 0}
+    ordered = sorted(values)
+    return {
+        "median": normalized_number(statistics.median(ordered)),
+        "p95": ordered[math.ceil(0.95 * len(ordered)) - 1],
+        "maximum": ordered[-1],
+    }
+
+
+def dimension_summary(session_metrics, name):
+    metrics = [session[name] for session in session_metrics]
+    return {
+        "per_session": {
+            key: distribution([metric[key] for metric in metrics])
+            for key in COMPONENTS
+        },
+        "tracker_total": {
+            key: sum(metric[key] for metric in metrics) for key in COMPONENTS
+        },
+    }
+
+
+def timing_placeholder():
+    return {"sample_count": 0, "median_ms": None, "p95_ms": None, "maximum_ms": None}
+
+
+def validate_success(result, session_metrics):
+    if set(result) != TOP_KEYS:
+        return False
+    if set(result["capture"]) != {"utc", "cutoff_utc", "idle_seconds", "fixed_byte_boundaries"}:
+        return False
+    if set(result["environment"]) != {
+        "git_revision", "os_family", "architecture", "logical_cpu_count", "ram_bucket_gib",
+        "pointer_width_bits", "python_version", "rust_version", "cargo_version", "rust_build_profile",
+    }:
+        return False
+    if set(result["population"]) != {
+        "candidate_file_count", "candidate_file_bytes", "candidate_session_count",
+        "included_file_count", "included_file_bytes", "included_session_count",
+        "excluded_inactive_session_count",
+    }:
+        return False
+    if set(result["dimensions"]) != set(DIMENSIONS):
+        return False
+    for name in DIMENSIONS:
+        summary = result["dimensions"][name]
+        if set(summary) != {"per_session", "tracker_total"}:
+            return False
+        if set(summary["per_session"]) != set(COMPONENTS):
+            return False
+        if set(summary["tracker_total"]) != set(COMPONENTS):
+            return False
+        if any(set(stat) != {"median", "p95", "maximum"} for stat in summary["per_session"].values()):
+            return False
+        recomputed = dimension_summary(session_metrics, name)
+        if recomputed != summary:
+            return False
+    if set(result["timings"]) != {"cold_sweep_ms", "warm_sweep_ms", "appended_fold_ms", "sessions_read_ms"}:
+        return False
+    if any(
+        set(timing) != {"sample_count", "median_ms", "p95_ms", "maximum_ms"}
+        for timing in result["timings"].values()
+    ):
+        return False
+    if set(result["gaps"]) != set(GAP_KEYS):
+        return False
+    if set(result["decision"]) != {
+        "max_per_session_unmatched_policy_proxy_bytes",
+        "aggregate_unmatched_policy_proxy_bytes", "per_session_threshold_bytes",
+        "aggregate_threshold_bytes", "memory_gate_passed", "disposition",
+    }:
+        return False
+    allowed_strings = {
+        result["capture"]["utc"], result["capture"]["cutoff_utc"],
+        result["environment"]["git_revision"], result["environment"]["os_family"],
+        result["environment"]["architecture"], result["environment"]["ram_bucket_gib"],
+        result["environment"]["python_version"], result["environment"]["rust_version"],
+        result["environment"]["cargo_version"], "debug", "miss", "pass", "inconclusive",
+    }
+    def strings(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [item for child in value.values() for item in strings(child)]
+        if isinstance(value, list):
+            return [item for child in value for item in strings(child)]
+        return []
+    return all(value in allowed_strings for value in strings(result))
+
+
+def measure(root, capture, idle_seconds):
+    cutoff = capture - dt.timedelta(seconds=idle_seconds)
+    files, walk_gaps, errors = snapshot_files(root)
+    if errors:
+        return None, errors
+    groups = {}
+    for item in files:
+        key = session_key(item["path"], root)
+        if key is not None:
+            groups.setdefault(key, []).append(item)
+    recent_groups = {
+        key: items for key, items in groups.items()
+        if any(item["mtime_ns"] / 1e9 >= cutoff.timestamp() for item in items if item["path"].suffix == ".jsonl")
+    }
+    selected = []
+    selected_items = []
+    gaps = walk_gaps
+    for items in recent_groups.values():
+        scanned = scan_group(items, capture, cutoff)
+        if scanned["active"] or any(scanned["gaps"].values()):
+            add_gaps(gaps, scanned["gaps"])
+            selected.append(scanned)
+            selected_items.extend(items)
+    pointer_bytes = struct.calcsize("P")
+    session_metrics = [
+        {name: proxy(session[name], pointer_bytes) for name in DIMENSIONS}
+        for session in selected
+    ]
+    dimensions = {
+        name: dimension_summary(session_metrics, name) for name in DIMENSIONS
+    }
+    unmatched = [session["unmatched_results"] for session in session_metrics]
+    maximum_unmatched = max(
+        (metric["policy_accounting_proxy_bytes"] for metric in unmatched), default=0,
+    )
+    aggregate_unmatched = dimensions["unmatched_results"]["tracker_total"]["policy_accounting_proxy_bytes"]
+    gap_total = sum(gaps.values())
+    passed = maximum_unmatched >= 1_048_576 or aggregate_unmatched >= 16_777_216
+    disposition = "inconclusive" if gap_total else ("pass" if passed else "miss")
+    result = {
+        "schema_version": 1,
+        "capture": {
+            "utc": utc_text(capture),
+            "cutoff_utc": utc_text(cutoff),
+            "idle_seconds": idle_seconds,
+            "fixed_byte_boundaries": True,
+        },
+        "environment": {
+            "git_revision": command_version("git", "rev-parse", "HEAD"),
+            "os_family": platform.system(),
+            "architecture": platform.machine(),
+            "logical_cpu_count": os.cpu_count() or 0,
+            "ram_bucket_gib": ram_bucket(),
+            "pointer_width_bits": pointer_bytes * 8,
+            "python_version": platform.python_version(),
+            "rust_version": command_version("rustc", "--version"),
+            "cargo_version": command_version("cargo", "--version"),
+            "rust_build_profile": "debug",
+        },
+        "population": {
+            "candidate_file_count": len(files),
+            "candidate_file_bytes": sum(item["size"] for item in files),
+            "candidate_session_count": len(recent_groups),
+            "included_file_count": len(selected_items),
+            "included_file_bytes": sum(item["size"] for item in selected_items),
+            "included_session_count": len(selected),
+            "excluded_inactive_session_count": len(recent_groups) - len(selected),
+        },
+        "dimensions": dimensions,
+        "timings": {
+            "cold_sweep_ms": timing_placeholder(),
+            "warm_sweep_ms": timing_placeholder(),
+            "appended_fold_ms": timing_placeholder(),
+            "sessions_read_ms": timing_placeholder(),
+        },
+        "gaps": gaps,
+        "decision": {
+            "max_per_session_unmatched_policy_proxy_bytes": maximum_unmatched,
+            "aggregate_unmatched_policy_proxy_bytes": aggregate_unmatched,
+            "per_session_threshold_bytes": 1_048_576,
+            "aggregate_threshold_bytes": 16_777_216,
+            "memory_gate_passed": passed,
+            "disposition": disposition,
+        },
+    }
+    if not validate_success(result, session_metrics):
+        return None, {"privacy_schema_failure": 1}
+    return result, None
+
+
+def execute(projects_dir, capture_time, idle_seconds):
+    if projects_dir is None:
+        return error_result("missing_root")
+    candidate = Path(projects_dir)
+    if not candidate.is_absolute():
+        return error_result("relative_root")
+    try:
+        root = candidate.resolve(strict=True)
+    except OSError:
+        return error_result("missing_root")
+    if not root.is_dir():
+        return error_result("unreadable_root")
+    capture = parse_utc(capture_time)
+    if capture is None:
+        return error_result("invalid_capture_time")
+    if idle_seconds <= 0:
+        return error_result("invalid_idle_seconds")
+    result, errors = measure(root, capture, idle_seconds)
+    if errors:
+        kind, count = sorted(errors.items())[0]
+        return error_result(kind, count)
+    return 0, compact(result), ""
+
+
+def result_record(timestamp, tool_use_id):
+    return compact({
+        "type": "user", "timestamp": timestamp,
+        "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use_id}]},
+    })
+
+
+def run_self_test():
+    failed = 0
+    capture = "2026-08-14T00:00:00Z"
+    timestamp = "2026-08-13T23:59:00Z"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        project = root / "project"
+        project.mkdir()
+
+        (project / "s1.jsonl").write_text(result_record(timestamp, "root") + "\n")
+
+        (project / "s2.jsonl").write_text(compact({"type": "user", "timestamp": timestamp}) + "\n")
+        parent = project / "s2" / "subagents"
+        child = parent / "agent-parent" / "subagents"
+        child.mkdir(parents=True)
+        (parent / "agent-parent.jsonl").write_text(result_record(timestamp, "depth2") + "\n")
+        (child / "agent-child.jsonl").write_text(compact({"type": "assistant", "timestamp": timestamp}) + "\n")
+        (child / "agent-child.meta.json").write_text(compact({"toolUseId": "depth2"}))
+
+        (project / "s3.jsonl").write_text(result_record(timestamp, "late") + "\n")
+        late = project / "s3" / "subagents"
+        late.mkdir(parents=True)
+        (late / "agent-late.jsonl").write_text(compact({"type": "assistant", "timestamp": timestamp}) + "\n")
+        (late / "agent-late.meta.json").write_text(compact({"toolUseId": "late"}))
+
+        (project / "s4.jsonl").write_bytes(
+            (result_record(timestamp, "root") + "\n{malformed}\n" + result_record(timestamp, "partial")).encode()
+        )
+        capture_epoch = parse_utc(capture).timestamp()
+        for path in root.rglob("*"):
+            if path.is_file():
+                os.utime(path, (capture_epoch, capture_epoch))
+
+        code, stdout, stderr = execute(str(root), capture, 900)
+        if code or stderr:
+            failed += 1
+        else:
+            output = json.loads(stdout)
+            pointer = struct.calcsize("P")
+            one = 200 if pointer == 4 else 296
+            expected = {
+                "all_results": (4, 18, 4 * one, (1, 1, 1), (4, 6, 6), (one, one, one)),
+                "known_spawn_results": (2, 10, 2 * one, (0.5, 1, 1), (2, 6, 6), (one / 2, one, one)),
+                "unmatched_results": (2, 8, 2 * one, (0.5, 1, 1), (2, 4, 4), (one / 2, one, one)),
+            }
+            for name, values in expected.items():
+                dimension = output["dimensions"][name]
+                total = dimension["tracker_total"]
+                ordered = lambda metric: tuple(
+                    dimension["per_session"][metric][key]
+                    for key in ("median", "p95", "maximum")
+                )
+                observed = (
+                    total["count"], total["payload_bytes"], total["policy_accounting_proxy_bytes"],
+                    ordered("count"), ordered("payload_bytes"),
+                    ordered("policy_accounting_proxy_bytes"),
+                )
+                if observed != values:
+                    failed += 1
+            if output["population"]["included_session_count"] != 4:
+                failed += 1
+            if output["gaps"]["malformed_records"] != 1 or output["gaps"]["incomplete_trailing_lines"] != 1:
+                failed += 1
+
+        missing = root / "absent"
+        cases = [
+            (execute(str(missing), capture, 900), (2, "", '{"errors":{"missing_root":1}}')),
+            (execute("relative", capture, 900), (2, "", '{"errors":{"relative_root":1}}')),
+        ]
+        outside = Path(tempfile.mkdtemp())
+        try:
+            (root / "escape").symlink_to(outside, target_is_directory=True)
+            cases.append((
+                execute(str(root), capture, 900),
+                (2, "", '{"errors":{"outside_root_symlink":1}}'),
+            ))
+            for observed, expected in cases:
+                if observed != expected:
+                    failed += 1
+        finally:
+            os.rmdir(outside)
+    print(compact({"cases": 7, "failed": failed}))
+    return int(failed != 0)
+
+
+def main(argv=None):
+    parser = SafeParser(add_help=True)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--projects-dir")
+    parser.add_argument("--capture-time")
+    parser.add_argument("--idle-seconds", type=int, default=900)
+    try:
+        arguments = parser.parse_args(argv)
+    except (ValueError, SystemExit):
+        code, stdout, stderr = error_result("invalid_arguments")
+    else:
+        if arguments.self_test:
+            return run_self_test()
+        code, stdout, stderr = execute(
+            arguments.projects_dir, arguments.capture_time, arguments.idle_seconds,
+        )
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr, file=sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+### Strict-allowlist aggregate output
+
+The output below is the probe's complete standard output. Its only top-level
+keys are `schema_version`, `capture`, `environment`, `population`,
+`dimensions`, `timings`, `gaps`, and `decision`. The zero timing placeholders
+are filled by the separate isolated Rust fixture evidence below.
+
+```json
+{"capture":{"cutoff_utc":"2026-08-14T04:45:54Z","fixed_byte_boundaries":true,"idle_seconds":900,"utc":"2026-08-14T05:00:54Z"},"decision":{"aggregate_threshold_bytes":16777216,"aggregate_unmatched_policy_proxy_bytes":59968,"disposition":"miss","max_per_session_unmatched_policy_proxy_bytes":57328,"memory_gate_passed":false,"per_session_threshold_bytes":1048576},"dimensions":{"all_results":{"per_session":{"allocation_allowance_bytes":{"maximum":15904,"median":8416,"p95":15904},"control_bytes":{"maximum":1040,"median":544,"p95":1040},"count":{"maximum":496,"median":262,"p95":496},"payload_bytes":{"maximum":14880,"median":7860,"p95":14880},"policy_accounting_proxy_bytes":{"maximum":57392,"median":30016,"p95":57392},"reserved_slot_bytes":{"maximum":24576,"median":12672,"p95":24576},"rounded_payload_bytes":{"maximum":15872,"median":8384,"p95":15872}},"tracker_total":{"allocation_allowance_bytes":16832,"control_bytes":1088,"count":524,"payload_bytes":15720,"policy_accounting_proxy_bytes":60032,"reserved_slot_bytes":25344,"rounded_payload_bytes":16768}},"known_spawn_results":{"per_session":{"allocation_allowance_bytes":{"maximum":64,"median":32,"p95":64},"control_bytes":{"maximum":24,"median":12,"p95":24},"count":{"maximum":1,"median":0.5,"p95":1},"payload_bytes":{"maximum":30,"median":15,"p95":30},"policy_accounting_proxy_bytes":{"maximum":312,"median":156,"p95":312},"reserved_slot_bytes":{"maximum":192,"median":96,"p95":192},"rounded_payload_bytes":{"maximum":32,"median":16,"p95":32}},"tracker_total":{"allocation_allowance_bytes":64,"control_bytes":24,"count":1,"payload_bytes":30,"policy_accounting_proxy_bytes":312,"reserved_slot_bytes":192,"rounded_payload_bytes":32}},"unmatched_results":{"per_session":{"allocation_allowance_bytes":{"maximum":15872,"median":8400,"p95":15872},"control_bytes":{"maximum":1040,"median":544,"p95":1040},"count":{"maximum":495,"median":261.5,"p95":495},"payload_bytes":{"maximum":14850,"median":7845,"p95":14850},"policy_accounting_proxy_bytes":{"maximum":57328,"median":29984,"p95":57328},"reserved_slot_bytes":{"maximum":24576,"median":12672,"p95":24576},"rounded_payload_bytes":{"maximum":15840,"median":8368,"p95":15840}},"tracker_total":{"allocation_allowance_bytes":16800,"control_bytes":1088,"count":523,"payload_bytes":15690,"policy_accounting_proxy_bytes":59968,"reserved_slot_bytes":25344,"rounded_payload_bytes":16736}}},"environment":{"architecture":"x86_64","cargo_version":"cargo 1.95.0 (f2d3ce0bd 2026-03-21)","git_revision":"458f218ca8822c826260f8adf44abd915016826f","logical_cpu_count":64,"os_family":"Linux","pointer_width_bits":64,"python_version":"3.12.3","ram_bucket_gib":"64-127","rust_build_profile":"debug","rust_version":"rustc 1.95.0 (59807616e 2026-04-14)"},"gaps":{"incomplete_trailing_lines":0,"malformed_records":0,"replaced_files":0,"unreadable_files":0,"unstable_files":0},"population":{"candidate_file_bytes":2356232909,"candidate_file_count":6228,"candidate_session_count":4,"excluded_inactive_session_count":2,"included_file_bytes":5940088,"included_file_count":4,"included_session_count":2},"schema_version":1,"timings":{"appended_fold_ms":{"maximum_ms":null,"median_ms":null,"p95_ms":null,"sample_count":0},"cold_sweep_ms":{"maximum_ms":null,"median_ms":null,"p95_ms":null,"sample_count":0},"sessions_read_ms":{"maximum_ms":null,"median_ms":null,"p95_ms":null,"sample_count":0},"warm_sweep_ms":{"maximum_ms":null,"median_ms":null,"p95_ms":null,"sample_count":0}}}
+```
+
+The probe's strict recursive key check ran before output. Its independent
+component recomputation matched every emitted distribution and tracker total.
+Manual arithmetic also matched the three tracker-wide proxies:
+
+```text
+all:       16,768 + 25,344 + 1,088 + 16,832 = 60,032 bytes
+known:         32 +    192 +    24 +     64 =    312 bytes
+unmatched: 16,736 + 25,344 + 1,088 + 16,800 = 59,968 bytes
+```
+
+The privacy audit found no unexpected key or string value and no content, ID,
+path, prompt, payload, per-file row, hostname, exact CPU model, exact RAM, raw
+environment, or transcript hash. Every gap count was zero: malformed records,
+unreadable files, unstable files, replacements, and incomplete trailing lines.
+
+### Isolated timing samples
+
+The existing fixture created 400 synthetic folded sessions. Five fresh
+trackers supplied independent cold and warm sweeps. The last tracker supplied
+20 appended one-record folds and 20 Sessions read samples. Values are
+milliseconds, as printed by the temporary timing statements before their
+removal.
+
+```text
+cold = [51.707733, 44.047132, 40.488298, 40.678463, 42.848277]
+warm = [18.909773, 18.265895, 17.807614, 17.426772, 17.782615]
+appended = [0.111444, 0.035658, 0.033554, 0.034697, 0.033455,
+            0.032723, 0.032262, 0.035117, 0.032513, 0.032994,
+            0.032673, 0.032622, 0.032362, 0.032553, 0.036891,
+            0.032693, 0.032132, 0.032743, 0.031952, 0.031972]
+read = [11.141484, 11.206450, 11.021124, 11.072582, 11.050690,
+        11.067763, 11.002427, 11.011966, 11.037364, 11.110035,
+        10.994823, 11.093372, 11.336119, 11.413548, 12.364256,
+        12.060322, 13.131942, 12.442587, 12.212735, 13.255340]
+```
+
+Nearest-rank p95 uses rank `ceil(0.95n)` and median uses the midpoint average
+for even counts.
+
+| Dimension | Samples | Median ms | p95 ms | Maximum ms | Gate | Result |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Cold sweep | 5 | 42.848277 | 51.707733 | 51.707733 | p95 <= 80 | pass |
+| Warm stat-only sweep | 5 | 17.807614 | 18.909773 | 18.909773 | p95 <= 21 | pass |
+| Appended one-record fold | 20 | 0.032708 | 0.036891 | 0.111444 | baseline only | recorded |
+| Sessions read | 20 | 11.1257595 | 13.131942 | 13.255340 | max <= 300 | pass |
+
+No timing is a UI or allocator measurement. The appended p95 is the baseline
+for a later paired candidate; this task has no candidate overhead claim.
+
+### Restoration, policy, and decision
+
+`git hash-object src-tauri/src/live_tracker.rs` returned
+`e8b16395205c4eec9765f692ff16ca1b6d0131ee` before temporary timing prints and
+the same digest after their removal. No source or test diff remains.
+
+For each nonempty dimension with count `n`, pointer size `p`, payload lengths
+`length_i`, and the smallest power-of-two bucket count `b >= 8` satisfying
+`n <= floor(7b / 8)`, the policy was applied exactly:
+
+```text
+rounded_payload_bytes = sum(round_up(max(1, length_i), 16))
+reserved_slot_bytes = b * (3 * p)
+control_bytes = b + 16
+allocation_allowance_bytes = 32 * (n + 1)
+policy_accounting_proxy_bytes = rounded_payload_bytes
+                              + reserved_slot_bytes
+                              + control_bytes
+                              + allocation_allowance_bytes
+```
+
+All components are zero when `n = 0`. This deliberately padded policy proxy
+is neither allocator truth nor a heap or RSS bound. Allocator metadata,
+fragmentation, concrete Rust `HashSet` layout, its inline value, and unrelated
+tracker state remain unmeasured.
+
+The complete, gap-free baseline has a maximum per-session unmatched policy
+proxy of 57,328 bytes and an aggregate unmatched policy proxy of 59,968 bytes.
+Both miss their exact 1,048,576-byte and 16,777,216-byte thresholds. Cold,
+warm, and read gates pass. The measurement disposition is therefore **miss**:
+retire `quill-tcq7` as the approved evidence-backed non-goal, create no
+production task, and require fresh refinement before any later implementation.
+
 ## Risks
 
 - **Disk reconstruction differs from a live heap.** Full-tree scanning is a

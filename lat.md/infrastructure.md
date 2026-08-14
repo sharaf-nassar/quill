@@ -50,6 +50,8 @@ Manual dispatch must select an existing `v*` tag. The `create-release` job rejec
 
 It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and pins Rust 1.95.0 plus the Cargo cache. The Linux job installs Tauri development packages and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; the `macos-latest` job keeps `cargo check --all-targets` for AppKit-only code and runs the focused `runtime_backfill_` tests against bundled SQLite in the macOS filesystem/runtime environment before merge.
 
+Because the base Tauri config enables `app.macOSPrivateApi`, the `tauri` dependency must keep the matching `macos-private-api` Cargo feature on every target; Tauri rejects config/feature drift before release.
+
 `release.yml` calls it as a reusable workflow (`ci` job using `./.github/workflows/ci.yml`) and makes `create-release` `needs: ci`, so either a Linux gate failure or macOS compile failure blocks the entire build/sign/notarize/publish chain without duplicating release signing. Contract: `specs/005-learning-system-hardening/contracts/evaluation-harness.md`.
 
 ### Draft Release Pre-Creation
