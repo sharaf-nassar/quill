@@ -63,12 +63,14 @@ marketing-site/                              # NEW — site source root (FR-002)
 │   ├── screenshots/                         # @2x PNG captures from sandboxed Quill
 │   │   ├── hero.png
 │   │   ├── live.png
-│   │   ├── analytics-now.png
-│   │   ├── analytics-charts.png
+│   │   ├── models.png
 │   │   ├── analytics-context.png
 │   │   ├── sessions.png
-│   │   └── learning.png
-│   └── og-image.png                         # 1200x630 social-share preview
+│   │   ├── learning.png
+│   │   ├── instances.png
+│   │   ├── settings.png
+│   │   ├── memory.png
+│   │   └── brevity.png
 └── README.md                                # Source-tree map and contribution notes
 
 .github/workflows/

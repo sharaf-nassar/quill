@@ -1168,8 +1168,8 @@ fn range_to_duration(range: &str) -> TimeDelta {
         "24h" => TimeDelta::hours(24),
         "2d" => TimeDelta::days(2),
         "7d" => TimeDelta::days(7),
-        // Internal comparison window shared by weekly trends and the 7d code
-        // insight delta; not part of the user-facing range vocabulary.
+        // Internal comparison window for the 7d code insight delta; not part
+        // of the user-facing range vocabulary.
         "14d" => TimeDelta::days(14),
         "30d" => TimeDelta::days(30),
         "90d" => TimeDelta::days(90),

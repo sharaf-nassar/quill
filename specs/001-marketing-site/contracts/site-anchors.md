@@ -7,7 +7,7 @@ This contract declares the URL fragment identifiers the marketing site exposes a
 | Anchor        | Section heading (visible)                              | Content                                                             |
 |---------------|--------------------------------------------------------|---------------------------------------------------------------------|
 | `#hero`       | (no visible heading — top of page)                     | Product-led hero: prelude, headline "Stop running your coding agents blind.", deck "You get the insight. Your agents get the tools.", lede, CTAs, trust line, large `hero.png` window |
-| `#analytics`  | "Every token accounted for — not estimated."           | Description + `analytics-now.png` and `analytics-charts.png`         |
+| `#analytics`  | "Every token accounted for — not estimated."           | Description + Usage view in `hero.png`                               |
 | `#context`    | "Keep bloated context out of the model's window."      | Agent-facing MCP working-memory tools + `analytics-context.png`     |
 | `#search`     | "Every past run, indexed — Claude and Codex."          | Description + `sessions.png`                                         |
 | `#live`       | "Know the cap before it cuts the run."                 | Description + `live.png`                                             |

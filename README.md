@@ -13,7 +13,7 @@ A cross-platform desktop widget that displays your Claude Code, Codex, and other
 A one-line tour. Each item links to its full description in [Features in depth](#features-in-depth).
 
 - **[Live usage](#live-usage)** — a LIMITS band pinned above everything else, one row per enabled provider (Claude, Codex, MiniMax), with per-window utilization bars and reset countdowns
-- **[Widget views](#widget-views)** — Usage, Trends, Charts, Models, and Context swap in one region under a shared 1H/6H/24H/7D range strip; every chart comes from an internal SVG kit, so Quill ships no charting dependency
+- **[Widget views](#widget-views)** — Usage, Models, and Context swap in one region under a shared 1H/6H/24H/7D range strip; widget graphics use an internal SVG kit, so Quill ships no charting dependency
 - **[Agent visibility](#agent-visibility)** — sessions show the subagents Quill actually observed running, grouped by model (`2×Opus · 3×Sonnet`)
 - **[Multi-account pools](#multi-account-pools)** — connect a local CLI Proxy API instance and LIMITS reports mean pool pressure instead of a single account
 - **[Manage workspace](#manage-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, Instances, and Settings
@@ -38,12 +38,10 @@ dropdown swaps.
 <table>
   <tr>
     <td align="center"><strong>Usage</strong></td>
-    <td align="center"><strong>Charts</strong></td>
     <td align="center"><strong>Context</strong></td>
   </tr>
   <tr>
     <td valign="top"><img src="marketing-site/assets/screenshots/hero.png" width="300" alt="The Quill widget on its Usage view: LIMITS rows for Claude and Codex with utilization bars and reset countdowns, a six-hour token chart, runtime and tokens-per-line readouts with sparklines, and a session breakdown" /></td>
-    <td valign="top"><img src="marketing-site/assets/screenshots/analytics-charts.png" width="300" alt="The Quill widget on its Charts view: stacked tokens, code-added-and-removed, and cache-hit timelines under the LIMITS band" /></td>
     <td valign="top"><img src="marketing-site/assets/screenshots/analytics-context.png" width="300" alt="The Quill widget on its Context view: preserved and retrieved token totals with a ratio bar, the tokens-saved insight line, and routing cost" /></td>
   </tr>
 </table>
@@ -267,7 +265,7 @@ cargo tauri dev
 - **Pin key** in the titlebar toggles always-on-top
 - **Settings key** in the titlebar opens the Manage workspace at its Settings section
 - **Close key** in the titlebar hides the widget to the tray; Quill keeps running
-- **View name** below LIMITS opens the view list — Usage, Trends, Charts, Models, Context
+- **View name** below LIMITS opens the view list — Usage, Models, Context
 - **1H / 6H / 24H / 7D** re-scopes every band of the active view at once
 - **⌘M / Ctrl+M**, or the Manage button in the Usage footer, opens the Manage workspace
 - **⌘K / Ctrl+K** inside Manage opens the command palette
@@ -301,8 +299,6 @@ selected window. Every chart is drawn by an internal SVG kit — Quill ships no
 charting dependency.
 
 - **Usage** (default) — a per-provider stacked area chart with the range's total tokens and an in-range momentum delta overlaid, a hover-only legend chip, one computed insight line, a 3×2 readout grid (LLM runtime, tokens per LOC, LOC per hour, sessions, projects, net lines) where each metric carries its own sparkline, a switchable breakdown (Sessions, Projects, Hosts, Skills, Hooks), and an In / Out / Cache footer
-- **Trends** — three week-over-week rows (tokens, velocity, cache efficiency) with a delta and paired mini-bars each; fixed to the last seven days against the seven before them, so the view declares itself unranged rather than offering a control that would do nothing
-- **Charts** — token flow, code changes, and cache efficiency stacked on one time axis under one shared crosshair, so the three can be read against each other
 - **Models** — a running-now strip per provider plus the session-ranked model list; raw model ids exactly as observed, qualified by a provider swatch, with attributed tokens beside each
 - **Context** — preserved and retrieved token totals with a split bar, the shared cache-savings line, and the routing cost
 - Honesty disclosures keep the home that matches their data: the Hooks breakdown carries the Claude/Codex tracking-asymmetry note, and a condensed retention line appears wherever pruning affects what is drawn
@@ -358,7 +354,6 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 
 - Lines of code added/removed tracked per session, grouped by language
 - Net lines, tokens per LOC, and LOC per hour sit in the Usage view's readout grid, each with its own sparkline
-- The code-changes timeline shares the Charts view's axis and crosshair, and velocity is one of the Trends view's week-over-week rows
 
 ### Learning
 

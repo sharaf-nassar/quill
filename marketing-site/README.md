@@ -13,14 +13,10 @@ marketing-site/
 └── assets/
     ├── logo.png            Real Quill app icon (tiled) — used as favicon
     ├── logo-mark.png       Borderless feather mark (app-icon frame stripped) — header brand
-    ├── og-image.png        1200×630 social-share preview — logo mark beside the widget's
-    │                       Usage frame with its Charts view behind; composed from the
-    │                       shots below, carries no baked-in copy, recompose on recapture
     ├── fonts/              Self-hosted woff2 — Space Grotesk (display) + Geist (body), OFL
     └── screenshots/        @2x captures from the dummy-data Quill instance
-        ├── hero.png            The widget on its Usage view — the whole 360px window
+        ├── hero.png            Usage view for #hero, #analytics, and social previews
         ├── live.png            Same frame; the #live section clips it to LIMITS
-        ├── analytics-charts.png  The widget on its Charts view (the #analytics section)
         ├── analytics-context.png The widget on its Context view (the #context section)
         ├── sessions.png         Manage → Sessions, a query typed and a result open
         ├── learning.png         Manage → Learning, active rules over candidates
@@ -28,11 +24,11 @@ marketing-site/
         └── brevity.png         Brevity profile toggle (the #brevity section)
 ```
 
-The main window is the 360px widget, so the first four PNGs are all the same
-window on different views rather than four separate surfaces. The last four
-come from the Manage workspace: `sessions.png` and `learning.png` are whole
-sections captured by `take_screenshots.sh`, while `memory.png` and
-`brevity.png` are sub-panels inside a section and stay manual.
+The main window is the 360px widget. `hero.png` serves both `#hero` and
+`#analytics`; `live.png` copies that Usage frame for `#live`;
+`analytics-context.png` shows Context. `sessions.png` and `learning.png` are
+whole Manage sections captured by `take_screenshots.sh`, while `memory.png`
+and `brevity.png` are sub-panels and stay manual.
 
 ## Anchored sections
 
@@ -125,7 +121,7 @@ The launcher uses env-var path overrides (`QUILL_DEMO_MODE=1`, `QUILL_DATA_DIR`,
 ## Editing rules
 
 - Add or remove a feature section: edit `<section>` blocks in `index.html`. Anchor IDs above are stable.
-- Add or remove a screenshot: place the PNG under `assets/screenshots/`, reference it from the appropriate `<figure>`. Filenames map 1:1 to anchored sections.
+- Add or remove a screenshot: place the PNG under `assets/screenshots/` and reference it from every appropriate `<figure>`. One capture may serve multiple anchored sections.
 - Change visual CSS: bump the `styles.css?v=...` query in `index.html` so local previews and Pages visitors do not keep stale cached styles.
 - Replace a screenshot in place (same filename, new content): bump its `?v=N` query on every `<img src>`/preload reference in `index.html`. Browsers cache images by URL and may serve a stale cached copy otherwise — re-capturing without bumping leaves visitors looking at the old shot.
 - Visual direction stays Signal Theater — see [spec.md § Clarifications](../specs/001-marketing-site/spec.md#clarifications). Avoid generic SaaS-landing-page conventions.

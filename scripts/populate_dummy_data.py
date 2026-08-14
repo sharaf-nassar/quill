@@ -307,7 +307,7 @@ def populate_token_snapshots(conn: sqlite3.Connection) -> list[tuple[str, str, d
 	[[scripts/populate_dummy_data.py#populate_response_times]] can put this
 	corpus's turns on this corpus's sessions.
 
-	Drives the token CHARTS (30D/7D ranges) and the LIVE 6h summary. The Live
+	Drives the Usage chart ranges and live summary. The live
 	summary (useLiveSummaryData.ts) and get_session_breakdown derive
 	`last_active`/`project` from token_snapshots, then filter client-side to the
 	rolling 6h window — so we seed BOTH a 30-day historical spread AND a
@@ -849,7 +849,7 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 	`full_input` for legacy rows. Every code_change row therefore carries its
 	own counts, computed exactly the way sessions.rs::count_code_change_lines
 	does at ingest — otherwise TOK/LOC, LOC/HR and NET LINES read empty and the
-	Charts CODE timeline reads "no code changes in this range".
+	code-history readers report no changes.
 
 	The default NOW tab runs the 1h range, so
 	velocity = (lines changed in the last hour). We therefore (a) spread ~80%
@@ -867,7 +867,7 @@ def populate_tool_actions(conn: sqlite3.Connection) -> None:
 	non_code_tools = ["Read", "Bash", "Grep", "Glob", "WebSearch", "WebFetch", "Task", "TodoWrite"]
 
 	# (session_id, provider). Tool work is attributed the same way the token
-	# corpus is, so the Charts CODE timeline and the token series describe one
+	# corpus is, so code-history queries and the token series describe one
 	# consistent two-provider workspace.
 	sessions = [
 		(rand_session(), "claude" if idx % 3 != 2 else "codex")

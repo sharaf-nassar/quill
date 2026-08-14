@@ -83,10 +83,8 @@ const VIOLET_SHADES = [
 /** Rank seven and beyond renders neutral rather than a generated hue. */
 const NEUTRAL_SHADE = "#8b949e";
 
-// 24-hour, matching the Usage readouts and the Charts axis. A 12-hour clock
-// here would put `05:39 PM` beside the axis' `17:40` for the same instant, and
-// the `AM`/`PM` suffix is not a tabular figure — the takeover caption would
-// change width as the day crossed noon.
+// 24-hour, matching the Usage readouts. The `AM`/`PM` suffix is not a tabular
+// figure and would make the takeover caption change width across noon.
 const CLOCK_FORMAT = new Intl.DateTimeFormat(undefined, {
   hour: "2-digit",
   minute: "2-digit",

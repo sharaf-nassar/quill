@@ -12,7 +12,7 @@ Every internal comparison range resolves to exactly twice its displayed widget r
 
 ## Displayed Windows Bound Every Query
 
-Code insights and weekly trends may request exactly two displayed periods; every other logged widget query stays at or below its displayed range.
+Code insights may request exactly two displayed periods; every other logged widget query stays at or below its displayed range.
 
 ## Breakdown Transitions Issue Unique Reads
 

@@ -6,8 +6,8 @@ Feature 014 ships retention as an outright delete: the user picks an age window,
 previews, confirms, and Quill removes source-owned pre-cutoff rows from
 `tool_actions` and `session_events`, then compacts. The rows are gone. The
 consumer-side treatment (S4, `RetentionBanner` + `src/utils/retention.ts`) is
-deliberately cheap — it marks pre-cutoff ranges and relabels `all` as "all
-retained" — so the product is *honest* about the hole but the hole is total.
+deliberately cheap — it marks pre-cutoff session timestamps and relabels `all`
+as "all retained" — so the product is *honest* about the hole but the hole is total.
 
 **Corrected during review:** an earlier draft of this paragraph claimed the loss
 shows up as a missing long-horizon trend chart. It does not. `RangeType` is
@@ -127,9 +127,9 @@ Acceptance Criteria:
 - `get_session_breakdown`, `get_session_subagent_tree` and
   `get_batch_session_code_stats` (today's three degrading readers) return
   aggregate-backed values for pre-cutoff spans when aggregates exist.
-- The span classifier gains an `aggregated` state; `retentionSpanFor` and
-  `markPrunedRange` return it, and `PRUNED_PLACEHOLDER` is used only where no
-  aggregate exists.
+- Reader results gain an aggregate-backed state, and `PRUNED_PLACEHOLDER` is
+  used only where no aggregate exists. The instant-only `isPruned` helper stays
+  boolean and does not learn reader state.
 - The banner copy distinguishes "summarized" from "removed".
 - Readers provably unable to reach a pruned row (`get_code_stats`,
   `get_code_stats_history`, `get_llm_runtime_stats` — capped at 30 days by
@@ -493,13 +493,10 @@ above; the review that found them is recorded here.
   contract mismatch: uhg's bead says it must cover "the rows the preview counts,
   including the non-conforming-timestamp classes", but 014 counts those *because
   they are retained, not deleted*.
-- **The `straddles` state is silently dropped.** `RetentionSpan` is
-  `retained | straddles | pruned`; Goal 5 and US3 enumerate
-  `retained | aggregated | pruned`. `straddles` combined with `aggregated` is the
-  common case for any long session, and `straddles` is exactly what
-  `BreakdownPanel` consumes via `markPrunedRange`. Also, `retentionSpanFor` is a
-  pure timestamp/cutoff function with no knowledge of aggregate existence — it
-  cannot return `aggregated` without a new input.
+- **No range classifier exists today.** `isPruned` compares one timestamp with
+  the watermark and has no knowledge of aggregate coverage. A future
+  summarized/straddling state belongs in the reader result, not this cutoff
+  helper, and must represent partially aggregated long sessions explicitly.
 - **Coverage cannot be inferred from row existence.** Rollup is opt-in and
   non-backfilling, so the band below the watermark is a patchwork of pre-ship
   runs, rollup-off runs, and rollup-on runs. Under a "does a row exist for this

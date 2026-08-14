@@ -374,8 +374,8 @@ export interface CodeStatsHistoryPoint {
  * **Degrades under retention (feature 014).** The command reads `tool_actions`,
  * so a session older than the retention watermark returns all-zero counts that
  * are indistinguishable from "this session changed no code". Consumers must
- * classify the session with `retentionSpanFor` and render `PRUNED_PLACEHOLDER`
- * instead of a zero when the span is `pruned`.
+ * check the session timestamp with `isPruned` and render `PRUNED_PLACEHOLDER`
+ * instead of a zero when it falls before the watermark.
  */
 export interface SessionCodeStats {
 	lines_added: number;

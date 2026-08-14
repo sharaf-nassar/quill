@@ -130,7 +130,7 @@ A developer past the marketing pitch wants to confirm Quill fits their setup bef
 #### Content structure
 
 - **FR-009**: The site MUST include a hero section with a headline, a one-line value proposition, a primary call-to-action, and a primary screenshot of the desktop app's main window. The screenshot MAY be augmented with CSS/JS motion that is not required for comprehension. The hero MUST NOT use a `<video>` tag. The hero MUST degrade to a fully readable static screenshot when JavaScript is disabled, the motion script fails to load, or `prefers-reduced-motion: reduce` is set.
-- **FR-010**: The site MUST include dedicated feature sections for at least Live Usage, Analytics Dashboard (Now, Trends, Charts, Context tabs), Context Savings, Session Search, and Learning System.
+- **FR-010**: The site MUST include dedicated feature sections for Live Usage analytics, Context Savings, Session Search, and Learning System.
 - **FR-011**: Each feature section MUST include a benefit-oriented heading, a short description, and at least one screenshot showing that feature in the actual UI.
 - **FR-012**: The Analytics section MUST explicitly explain *how analytics and insights help when working with an LLM* — covering at minimum: subscription-usage awareness (Pro/Max/Plus 5-hour and 7-day windows), latency visibility, token-efficiency feedback, context savings, code velocity, and routing-cost transparency.
 - **FR-013**: The site MUST include a "supported providers" affordance naming Claude Code, Codex, and MiniMax with the correct integration semantics for each.

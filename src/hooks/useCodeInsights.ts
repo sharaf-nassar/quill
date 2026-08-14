@@ -47,10 +47,7 @@ function computeEfficiency(tokens: number, loc: number): number | null {
 // the window we fall back to the wall-clock span so the card still shows a
 // number instead of dropping to an em-dash.
 //
-// Exported because the widget's week-over-week Trends view has to divide by the
-// same denominator; two copies of this formula would let one surface disagree
-// with the other about the same week.
-export function computeVelocity(
+function computeVelocity(
 	loc: number,
 	activeSecs: number,
 	fallbackMs: number,
@@ -68,7 +65,7 @@ export function computeVelocity(
 // runtime from the wider comparison-range fetch, since get_llm_runtime_stats
 // only accepts the four fixed ranges and cannot query the prior window
 // directly.
-export function activeSecsInWindow(
+function activeSecsInWindow(
 	sparkline: number[],
 	compStart: number,
 	compMs: number,

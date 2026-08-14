@@ -9,7 +9,6 @@ import {
 	breakdownQuery,
 	codeInsightsHistoryQueries,
 	usageBreakdownQueries,
-	weeklyTrendQueries,
 } from "../src/hooks/widgetQueryPlan.ts";
 
 async function settle() {
@@ -313,23 +312,6 @@ test("widget query plans request only the displayed range or its exact prior per
 		queryLog.push({ displayedRange, queries });
 	}
 
-	assert.deepEqual(
-		weeklyTrendQueries().map(({ command, args }) => ({ command, args })),
-		[
-			{
-				command: "get_token_history",
-				args: {
-					range: "14d",
-					provider: null,
-					hostname: null,
-					sessionId: null,
-					cwd: null,
-				},
-			},
-			{ command: "get_code_stats_history", args: { range: "14d" } },
-			{ command: "get_llm_runtime_stats", args: { range: "14d" } },
-		],
-	);
 	assert.deepEqual(breakdownQuery("skills", "6h"), {
 		command: "get_skill_breakdown",
 		args: { range: "6h", provider: null, allTime: false, limit: 100 },

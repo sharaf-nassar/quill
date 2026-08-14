@@ -86,28 +86,29 @@ It:
 
 ## R5. Screenshot scope (which views to capture)
 
-**Decision**: The dummy-data instance produces seven canonical PNGs (all @2x for HiDPI rendering per FR-021):
+**Decision**: The capture script produces eight PNGs from the dummy-data instance, all at 2× for HiDPI rendering per FR-021.
 
 | Filename                       | View                                            | Section anchor   |
 |--------------------------------|-------------------------------------------------|------------------|
-| `hero.png`                     | Main window with Live + Analytics dual pane     | `#hero`          |
-| `live.png`                     | Full Live pane: summary rail + grouped quotas   | `#live`          |
-| `analytics-now.png`            | Analytics → Now tab with 6 insight cards        | `#analytics`     |
-| `analytics-charts.png`         | Analytics → Charts tab composite                | `#analytics`     |
-| `analytics-context.png`        | Analytics → Context tab strip + breakdown       | `#context`       |
-| `sessions.png`                 | Session Search window with results              | `#search`        |
-| `learning.png`                 | Learning window — Rules tab with several rules  | `#learning`      |
+| `hero.png`                     | Widget → Usage view                             | `#hero`, `#analytics` |
+| `live.png`                     | Copy of the Usage frame                         | `#live`          |
+| `models.png`                   | Widget → Models view                            | Product docs     |
+| `analytics-context.png`        | Widget → Context view                           | `#context`       |
+| `sessions.png`                 | Manage → Sessions                               | `#search`        |
+| `learning.png`                 | Manage → Learning                               | `#learning`      |
+| `instances.png`                | Manage → Instances                              | Product docs     |
+| `settings.png`                 | Manage → Settings                               | Product docs     |
 
-Optional follow-up captures (not v1): Settings window, Restart window, Release Notes window, Plugin Manager.
+Memory and brevity remain manual sub-panel captures because they are not Manage sections.
 
 **Rationale**:
-- Maps 1:1 to the anchored sections from Q2's clarification, so no section ships without a screenshot (FR-022).
-- Includes Charts and Context tabs explicitly because the spec's Analytics narrative (FR-012) calls them out as showcasing how analytics help with LLM work.
+- `hero.png` intentionally serves both the product hero and analytics section.
+- Models, Instances, and Settings captures support product documentation outside the marketing anchors.
 - @2x captures honor FR-021 / SC-007.
 
 **Alternatives considered**:
-- **One composite shot for the hero, no per-feature shots**: Defeats the deep-dive purpose (US2). Rejected.
-- **Capture every secondary window**: Makes the asset set unwieldy and the page heavier than necessary. Deferred to a v2 if needed.
+- **One Usage shot only**: Leaves Context and Manage claims without visual proof. Rejected.
+- **Capture every sub-panel**: Makes the asset set unwieldy. Keep only the two marketed sub-panels manual.
 
 ## R6. GitHub Pages workflow shape
 
@@ -168,12 +169,12 @@ jobs:
 
 ## R7. OG / social-share preview
 
-**Decision**: Hand-built 1200×630 PNG (`marketing-site/assets/og-image.png`) composed of the hero screenshot and Signal Theater typography, with the headline "Quill gives agent work telemetry." Referenced via `<meta property="og:image">`, `<meta name="twitter:card" content="summary_large_image">`, and `<meta name="twitter:image">`.
+**Decision**: Reuse `marketing-site/assets/screenshots/hero.png` for Open Graph and Twitter metadata, so social previews show the current Usage view without a separate composite.
 
 **Rationale**:
-- Meaningful preview > brand-only logo (per spec edge case "Social-share preview").
-- Static PNG is the simplest, most universally-supported format for OG previews.
-- 1200×630 is the recommended OG image dimension.
+- The real Usage view is more informative than a brand-only logo.
+- Static PNG is universally supported by social preview clients.
+- Reusing the canonical capture prevents a separate composite from going stale.
 
 **Alternatives considered**:
 - **Dynamically generated OG image** (e.g., an Edge Function or `@vercel/og`-style approach): Far too complex for v1; unavailable on plain GitHub Pages without external services. Rejected.

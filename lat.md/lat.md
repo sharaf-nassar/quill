@@ -13,7 +13,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[live-subagent-count-tests]] — Observed subagent lifecycle, IPC, provider, audit, and Sessions-row test specs
 - [[widget-range-tests]] — Exact comparison windows and unique breakdown query test specs
 - [[widget-viz-tests]] — Pointer-to-bucket interaction test specs for widget charts
-- [[widget-view-tests]] — Persistence test specs for widget view controls
+- [[widget-view-tests]] — Availability and persistence test specs for widget view controls
 - [[widget-limits-tests]] — Collapsed CPA provider-state cue test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs

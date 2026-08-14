@@ -72,31 +72,6 @@ export function codeInsightsHistoryQueries(
   ];
 }
 
-export const WEEKLY_TRENDS_HISTORY_RANGE = "14d" as const;
-
-export function weeklyTrendQueries(): readonly WidgetQueryDescriptor[] {
-  return [
-    {
-      command: "get_token_history",
-      args: {
-        range: WEEKLY_TRENDS_HISTORY_RANGE,
-        provider: null,
-        hostname: null,
-        sessionId: null,
-        cwd: null,
-      },
-    },
-    {
-      command: "get_code_stats_history",
-      args: { range: WEEKLY_TRENDS_HISTORY_RANGE },
-    },
-    {
-      command: "get_llm_runtime_stats",
-      args: { range: WEEKLY_TRENDS_HISTORY_RANGE },
-    },
-  ];
-}
-
 export interface BreakdownQueryOptions {
   readonly skillAllTime?: boolean;
   readonly skillProvider?: IntegrationProvider | null;

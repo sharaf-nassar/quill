@@ -38,7 +38,7 @@ In a plain browser during dev (no Tauri runtime), the app installs a mock IPC la
 
 [[src/mocks/installBrowserMock.ts#installBrowserMock]] calls `mockWindows` and `mockIPC` from `@tauri-apps/api/mocks`, routing every `invoke()` to [[src/mocks/ipcFixtures.ts#handleInvoke]], and adds a fixed `MOCK DATA` badge. [[src/mocks/ipcFixtures.ts#handleInvoke]] returns typed sample data for the data commands (provider statuses with an enabled provider so the dashboard is not gated, usage buckets spanning the green/amber/red thresholds, token/code/breakdown/analytics datasets), benign defaults for Tauri core `plugin:*` commands so `listen()` resolves with events left inert, and `null` for anything unmapped.
 
-Widget fixtures answer per range rather than serving one fixed window. `get_provider_token_series` returns aligned per-provider bucket values with per-provider totals whose sum equals the response total by construction, and `get_activity_series` returns aligned session and project counts; both honor the `range` (including the new `6h` step) and `buckets` arguments. `get_token_history`, `get_code_stats_history`, and `get_llm_runtime_stats` also honor the internal `2h`/`12h`/`2d`/`14d` comparison ranges, so browser-mode deltas exercise the same exact two-period windows as Tauri. Runtime sparklines always sum to their reported total because consumers prorate them across the current/prior boundary. The `retentionFixture=recent_watermark` control moves the mock watermark inside the last fortnight, which is how the Trends retention disclosure is reached in browser mode.
+Widget fixtures answer per range rather than serving one fixed window. `get_provider_token_series` returns aligned per-provider bucket values with per-provider totals whose sum equals the response total by construction, and `get_activity_series` returns aligned session and project counts; both honor the `range` (including the new `6h` step) and `buckets` arguments. `get_token_history`, `get_code_stats_history`, and `get_llm_runtime_stats` also honor the internal `2h`/`12h`/`2d`/`14d` comparison ranges, so browser-mode deltas exercise the same exact two-period windows as Tauri. Runtime sparklines always sum to their reported total because consumers prorate them across the current/prior boundary.
 
 Model analytics mock handlers validate the same range, provider, and provider-qualified selection arguments as Tauri before applying dev-only failures. `modelFixture` selects lifecycle and exact empty-scope responses; retry keeps that scenario pending until another scenario or reload resets it. `modelFailure` rejects aggregate, history, session-page, session-detail, retry, or all commands through the shared structured envelope, and invalid nonempty controls warn and reject instead of silently falling back. Provider-qualified suppressed sources are removed before global or scoped facts. Opaque IDs remain dynamic evidence, not a support catalog.
 
@@ -84,13 +84,12 @@ The pre-widget main-window chrome — `TitleBar`, `UsageDisplay`, `UsageRow`, th
 
 ### Widget Viz Kit
 
-Three SVG primitives under `src/components/widget/viz/` draw every widget chart with no charting dependency, so the Flat Polish treatments (surface-faded overlay, hover-only legend, endpoint markers) stay under direct control.
+Two SVG primitives under `src/components/widget/viz/` draw widget history with no charting dependency, so the Flat Polish treatments (surface-faded overlay, hover-only legend, endpoint markers) stay under direct control.
 
 Recharts is hostile to those treatments and costs 3.7 MB for shapes the widget can emit in ~300 lines, so the kit owns all widget visualization. The primitives take plain value arrays and a colour, never a data-frame; scaling and curve construction live in one shared module.
 
 - **Sparkline** — [[src/components/widget/viz/Sparkline.tsx#Sparkline]] renders the 13px trend line under each readout cell: metric-hue stroke at 60% opacity plus a solid endpoint dot, no axes or ticks. Without a `label` prop it is `aria-hidden`, because the adjacent readout already states the number.
 - **AreaChart** — [[src/components/widget/viz/AreaChart.tsx#AreaChart]] stacks one smoothed area per provider on a shared scale and keeps the series inside the lower ~62% so the overlaid headline never collides. At rest its top-right hover/focus legend states range totals and its final-point markers remain visible; pointer scrubbing moves the measured legend along both pointer axes, flips it horizontally, clamps it vertically inside the chart, swaps it to one bucket, brightens its time, and draws a crosshair plus active markers. Keyboard scrubbing anchors the same legend beside the selected bucket. Pointer leave, blur, and Escape restore the summary, while a polite live region announces each reading. Gradient ids are derived from `useId()` with punctuation stripped so `url(#…)` stays valid. A range with no values renders the shared empty state at the chart's own height, so nothing below shifts.
-- **Bars** — [[src/components/widget/viz/Bars.tsx#Bars]] renders horizontal magnitude rows on a shared scale; each track is a real `role="progressbar"` with `aria-valuenow`/`min`/`max` and a formatted `aria-valuetext`, so the value is announced rather than inferred from pixel width.
 - **geometry** — [[src/components/widget/viz/geometry.ts#scalePoints]] maps values into viewBox coordinates and [[src/components/widget/viz/geometry.ts#smoothPath]] builds the catmull-rom-to-bezier curve used by `specs/018-widget-ui-redesign/mockup.tpl.html`, so shipped charts trace the mockup's silhouette. Every helper returns new arrays or strings and never mutates its input.
 
 ### Widget Limits Band
@@ -113,9 +112,7 @@ A CPA pool's native disclosure button exposes `aria-expanded` and uses the widge
 
 [[src/components/widget/ViewRegion.tsx#ViewRegion]] owns everything below LIMITS: one band header carrying the view name and the shared range strip, then whichever view that name selects.
 
-View and range both live in the region rather than inside a view, so switching views keeps the operator's range and the mockup's single control strip stays single. A compact view is registered by adding one entry to the region's `VIEWS` list; only registered views reach the dropdown, so the list can never offer a view that would render nothing. The range vocabulary is 1H/6H/24H/7D — `30d` is deliberately absent, because a month is not a widget scope. A fresh profile defaults to 1H, and the last valid selection persists in local storage across restarts. Missing, invalid, inaccessible, or unwritable storage falls back safely without preventing current-session selection.
-
-A registered view may declare itself unranged. The range strip is then hidden for as long as that view is showing, rather than left standing as a control that would change nothing: Trends fixes its own windows, and an inert toggle strip would be a lie about what the instrument responds to.
+View and range both live in the region rather than inside a view, so switching views keeps the operator's range and the mockup's single control strip stays single. Only Usage, Models, and Context are registered, so only those options reach the dropdown. The range vocabulary is 1H/6H/24H/7D — `30d` is deliberately absent, because a month is not a widget scope. A fresh profile defaults to 1H, and the last valid selection persists in local storage across restarts. Missing, invalid, inaccessible, or unwritable storage falls back safely without preventing current-session selection.
 
 [[src/components/widget/ViewSwitcher.tsx#ViewSwitcher]] is a listbox rather than a menu, because the control has a value: the trigger is `aria-haspopup="listbox"` with `aria-expanded`, the popup carries exactly one `aria-selected` option, and keyboard movement runs through `aria-activedescendant` so focus never leaves the list. Escape, Tab and an outside click all close it, and Escape returns focus to the trigger.
 
@@ -135,30 +132,6 @@ Priority is fixed and ordered by how much of the story the rest of the widget do
 
 The breakdown switches five modes over one main-row grammar — status dot, name, optional metadata, identity chip, primary value, activity — filled per mode: Sessions (provider, tokens, live runtime or inactive recency), Projects (session count, tokens), Hosts (turns, tokens), Skills (range-scoped uses, last used), Hooks (QUILL chip where Quill-deployed, fires, last fired). Sessions add agent totals, turns, and lifetime runtime to that main row; only open agents add a wrapping second rail. Rows without open agents stay 30 px. Session identity pairs shrinkable project text with a reduced-scale unboxed full provider name, both centered against the full row height, followed by grid-assigned agent, turn, lifetime, token, and activity columns that stay aligned across rows and fit the 320 px minimum. A missing optional agent total leaves its deliberate grid slot empty instead of shifting later metrics. The visible Projects readout uses one secondary project request except while Projects is selected, when the selected breakdown result supplies both regions; no command-and-args key mounts twice. The Hooks header retains its Claude/Codex audit-tracking disclosure.
 
-#### Trends View
-
-[[src/components/widget/views/TrendsView.tsx#TrendsView]] is the widget's slow instrument: three week-over-week rows — tokens, velocity, cache efficiency — each carrying this week's value, the delta against last week, and the paired mini-bars behind it.
-
-The windows are the last seven days against the seven before them and are not re-scopable, which is why the view registers itself unranged. Every figure comes from [[src/hooks/useWeeklyTrends.ts#useWeeklyTrends]], which reads one exact 14-day `get_token_history`, `get_code_stats_history`, and `get_llm_runtime_stats` response, then splits both equal weeks at the midpoint. Velocity divides by [[src/hooks/useCodeInsights.ts#computeVelocity]]'s active-runtime denominator — the same definition the Usage readout prints — and prorates both halves of that one runtime sparkline, avoiding the former 30-day scan and duplicate current-week runtime query.
-
-Both sides or neither: a delta renders only when both weeks have a figure, since a percentage against an absent week is invented movement. Colour stays on the delta and is assigned by meaning — rising velocity and rising cache efficiency read green, while token volume, being neither good nor bad, stays neutral. The bars carry no hue at all; this week is bright and last week is dim, on one shared scale.
-
-Only velocity degrades under retention: it reads `tool_actions` and `session_events`, both of which [[lat.md/frontend#Frontend#Components#Retention Degradation]] prunes, while the token figures come from snapshots retention never touches. A compared week that falls entirely below the watermark renders as an em dash with no delta rather than as a collapse in output, and a condensed line beneath the rows states the cutoff whenever either week is affected.
-
-#### Charts View
-
-[[src/components/widget/views/ChartsView.tsx#ChartsView]] stacks tokens, code changes and cache efficiency on one time axis under one crosshair, so the operator can read the three against each other rather than one at a time.
-
-Correlation is the view's only reason to exist, so every panel is bucketed onto the timestamps `get_provider_token_series` returns for the region's range. The code and cache sources arrive on their own server-side granularity and are re-gridded by [[src/components/widget/views/ChartsView.tsx#bucketAssigner]], which reads the bucket width from the grid itself instead of recomputing it — a panel drawn on a different grid would make the shared crosshair assert an alignment that does not exist. Cache rates come from summed numerators and denominators per bucket rather than averaged point rates, so a busy minute is not outvoted by an idle one and the range figure is the same weighted rate the Usage footer reports.
-
-There is no floating tooltip. Scrubbing — pointer, or arrow keys once the stack has focus — swaps each panel's head value in place and brightens the matching axis tick, which makes the axis itself the time readout and costs no layout shift. The stack is a labelled `role="group"` with a screen-reader instruction and a polite live region announcing the bucket's three values together. Escape clears the reading, a range change drops it because the grid is rebuilt, and every head reads `—` until its own source lands so no panel states a zero it has not measured.
-
-Because that brightened tick *is* the readout, no two ticks may read alike, and [[src/components/widget/views/ChartsView.tsx#axisLabels]] derives the caption format from the returned grid rather than from the range name. A window inside a day is unambiguous as `HH:MM`; a window spanning days takes the weekday, and a grid whose buckets are narrower than a day takes the hour on top of it. 7D is exactly that case — eight buckets across seven days sit 21h apart, so bare weekdays repeat and the axis would assert one bucket while the crosshair read another. Ticks never wrap, so a longer caption cannot change the row's height.
-
-Gaps stay gaps: a bucket with no cacheable input has no hit rate, so the cache line breaks over it instead of drawing 0%, while tokens and code are genuinely zero when nothing happened and are drawn as zero. Failure is region-local — a failed code or cache read leaves its own panel stating so while the others keep charting — except for the token series itself, which is the shared grid, so losing it collapses the band to one line rather than showing three panels that cannot be compared.
-
-Colour follows [[lat.md/frontend#Frontend#Styling#Color System]]: tokens carry provider identity, and because added-versus-removed lines are a category rather than a threshold state, the diff pair is drawn from the metric ramp (`--metric-net-lines` up, `--metric-loc-per-hr` down) instead of the conventional green/red the severity rule reserves. Cache takes the widget's throughput cyan. The condensed retention line appears under the panels only when the watermark actually falls inside the drawn window, because `get_code_stats_history` reads the `tool_actions` rows [[lat.md/frontend#Frontend#Components#Retention Degradation]] prunes.
-
 #### Models View
 
 [[src/components/widget/views/ModelsView.tsx#ModelsView]] answers "what am I running, and what did the work" in two bands: a running-now strip, then the session-ranked model list.
@@ -167,7 +140,7 @@ Both bands read the region's range through [[src/hooks/useModelAnalytics.ts#useM
 
 Identity obeys DESIGN.md's Model-Shade Rule exactly as the full page does. Each model renders as a rank-assigned shade of its provider's family ramp (Claude orange, Codex blue, every other provider violet, rank seven and beyond neutral), assigned once per response from the delivered session-ranked order so both bands agree on a model's shade. A swatch never stands alone — it rides beside the raw id, qualified by a provider chip, and an unrecognized provider keeps a neutral chip rather than borrowing another family's hue. Ids are mono, rendered exactly as observed and ellipsized when they outgrow the column with the full string in `title`; no catalog, alias, or friendly name participates. The ranked list shows the top five models on one shared session scale, each track a real `role="progressbar"`, with attributed tokens beside the id.
 
-A ranked row only exists because its model ran sessions, and a session that ran necessarily burned tokens — so a zero attributed-token figure is the absence of a measurement rather than a measurement of nothing, and it is what a provider whose observations carry no token columns looks like. [[src/components/widget/views/ModelsView.tsx#tokenReading]] therefore prints an em dash with the reason on hover instead of `0`, the same way every panel head states a figure it does not have. Times in both bands are 24-hour, matching the Usage readouts and the Charts axis; a 12-hour caption would print `05:39 PM` for the instant the axis calls `17:40`, and its meridiem suffix is not a tabular figure.
+A ranked row only exists because its model ran sessions, and a session that ran necessarily burned tokens — so a zero attributed-token figure is the absence of a measurement rather than a measurement of nothing, and it is what a provider whose observations carry no token columns looks like. [[src/components/widget/views/ModelsView.tsx#tokenReading]] therefore prints an em dash with the reason on hover instead of `0`, the same way every panel head states a figure it does not have. Times in both bands are 24-hour, matching the Usage readouts; a 12-hour caption would print `05:39 PM` for the instant another widget readout calls `17:40`, and its meridiem suffix is not a tabular figure.
 
 Three disclosures keep a compact home here. Coverage states the share of token activity that carries model evidence whenever it is short of 100%, because activity recorded before a chain's first observation stays unattributed instead of being assigned a model. A retained-history line appears only while that source inventory needs attention, carrying its state, processed-source count, and Retry. A separate model-index line reads persisted `buildingIndex` on mount and committed [[src/hooks/useRollupBackfill.ts#useRollupBackfill]] events while present; it shows observation counts, raw-evidence fallback, stopped recovery, or the completed refresh. Emptiness is a claim the view has to earn from final backend scope.
 
@@ -272,18 +245,15 @@ retention preset floor is 30 days, so `get_code_stats`,
 `get_code_stats_history` and `get_llm_runtime_stats` provably cannot reach a
 pruned row and must **not** carry the banner — claiming loss where there is none
 is as dishonest as hiding loss where there is. Only Session Search renders
-this banner for `get_batch_session_code_stats`. It
-mounts the full banner from
+this banner for `get_batch_session_code_stats`. It mounts the full banner from
 [[src/windows/SessionsWindowView.tsx]]; the widget has no room for a
-multi-line disclosure, so affected Trends rows and Charts panels state the
-same cutoff as a condensed one-line variant. Styling is chrome-grey by design:
+multi-line disclosure, so the Usage Sessions breakdown states the same cutoff
+as a condensed one-line variant. Styling is chrome-grey by design:
 DESIGN.md reserves green/amber/red for the severity meter, and a boundary the
 user opted into is a fact about the instrument, not an alarm.
 
 [[src/utils/retention.ts]] holds the pure helpers.
-[[src/utils/retention.ts#retentionSpanFor]] classifies a `[first_seen,
-last_active]` span as `retained` / `straddles` / `pruned`;
-[[src/utils/retention.ts#isPruned]] is the single-instant form;
+[[src/utils/retention.ts#isPruned]] checks a single timestamp against the watermark;
 [[src/utils/retention.ts#formatRetentionCutoff]] renders the watermark date; and
 [[src/utils/retention.ts#PRUNED_PLACEHOLDER]] is the em dash that replaces a
 zero which is really absent data. Two conservatisms are deliberate, both erring
@@ -386,7 +356,6 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 |------|---------|----------------|
 | `useProviderTokenSeries` | Aligned per-provider token series plus per-provider totals for the widget hero chart, on the shared 8-bucket grid | `get_provider_token_series` |
 | `useActivitySeries` | Per-bucket distinct session and project counts for the widget sparklines, on the same grid | `get_activity_series` |
-| `useWeeklyTrends` | Week-over-week tokens, velocity and cache efficiency for the widget Trends view, with each week classified against the retention watermark | `get_token_history`, `get_code_stats_history`, `get_llm_runtime_stats` |
 | `useCodeStats` | Lines added/removed by language, plus the bucketed history the net-lines sparkline reads | `get_code_stats`, `get_code_stats_history` |
 | `useCodeInsights` | Tokens-per-LOC and LOC-per-active-hour with their trends, over one shared comparison-range fetch | `get_code_stats_history`, `get_llm_runtime_stats`, `get_token_history` |
 | `useLlmRuntimeStats` | Cumulative runtime, session count, turn count, avg per turn, sparkline | `get_llm_runtime_stats` |
@@ -398,12 +367,12 @@ Hooks that invoke Tauri commands and return async state (data, loading, error).
 | `useLearningData` | Rules, runs, settings, observations, logs | Multiple learning commands + events |
 | `useMemoryData` | Memory files, suggestions, projects | Multiple memory optimizer commands |
 
-[[src/hooks/widgetQueryPlan.ts#codeInsightsHistoryQueries]] is the pure range plan shared by hooks and the query-log tests. For each displayed widget range it names only the exact two-period internal range (`2h`, `12h`, `2d`, or `14d`); [[src/hooks/widgetQueryPlan.ts#weeklyTrendQueries]] fixes Trends to the same 14-day rule, and breakdown descriptors keep Skills on the selected range.
+[[src/hooks/widgetQueryPlan.ts#codeInsightsHistoryQueries]] is the pure range plan shared by hooks and the query-log tests. For each displayed widget range it names only the exact two-period internal range (`2h`, `12h`, `2d`, or `14d`), and breakdown descriptors keep Skills on the selected range.
 
 The hooks the deleted analytics pane owned — `useAnalyticsData`, `useTokenData`, `useLiveSummaryData`, `useSessionHealth`, `useActivityPattern`, `useEfficiencyStats`, `useVelocityStats`, `useCacheEfficiency`, `useSessionSubagents`, `useSkillProjects`, `useModelSessions`, `useSessionModelHistory` — were removed with it. The widget reads `get_token_stats` directly for its footer totals rather than reviving a history hook for three numbers.
 
 [[src/hooks/useCachedInvoke.ts#useCachedInvoke]] is the shared cache primitive
-for `useModelAnalytics`, `useWidgetSeries`, `useWeeklyTrends`, `useCodeStats`,
+for `useModelAnalytics`, `useWidgetSeries`, `useCodeStats`,
 `useCodeInsights`, `useLlmRuntimeStats`, `useContextSavingsStats`, and
 `useBreakdownData`. [[src/hooks/cachedInvokeStore.ts#CachedInvokeStore]] keys
 entries by logical command plus stable serialized arguments, retains accepted
@@ -451,8 +420,6 @@ Hooks follow a consistent async state pattern: `useState` for data/loading/error
 React Context providers used across the frontend for shared state.
 
 - **ToastProvider** (`src/hooks/useToast.tsx`) — Notification system via React Context. Provides `toast(level, message)` to any component.
-
-There is no crosshair context any more: the widget's Charts view keeps its three panels on one grid and one local scrub index inside [[src/components/widget/views/ChartsView.tsx#ChartsView]], so cross-chart synchronization needs no shared provider.
 
 ## Type Definitions
 
@@ -523,7 +490,7 @@ The widget main window resizes freely but its density does not scale with it, so
 
 Type sizes, gutters, and the vertical ladder stay fixed at the 360px design width whatever the window measures.
 
-Height behaves the same way: because the ladder is fixed, each view has one natural height at 360px wide rather than a range, which is what makes a static default honest. Usage is both the default and the tallest — 788px measured against the browser mock with its breakdown saturated at `BREAKDOWN_LIMIT` rows — while Trends, Charts, Models, and Context all measured shorter on the same fixtures, between 452px and 678px. A default sized for Usage therefore clears every view, and the shorter ones simply leave surface below their last band rather than scrolling.
+Height behaves the same way: because the ladder is fixed, each view has one natural height at 360px wide rather than a range, which is what makes a static default honest. Usage is both the default and the tallest — 788px measured against the browser mock with its breakdown saturated at `BREAKDOWN_LIMIT` rows — while Models and Context measured shorter on the same fixtures. A default sized for Usage therefore clears every view, and the shorter ones simply leave surface below their last band rather than scrolling.
 
 Bands absorb the width instead of scaling into it. The shell is a flex column at `height: 100vh`, the content column has no width of its own, `.wg-grid` splits into three `1fr` tracks, and rows are flex lines whose text cells carry `min-width: 0` so they ellipsize rather than push. The one band with an intrinsic width wider than the 320px floor is `.wg-footer`, which wraps its Manage affordance onto a second line under that pressure; at the design width and above it stays a single 40px row. The `.wg-row` hover bleed (`margin: 0 -7px`) reports as horizontal overflow on `.wg-rows` at every width — it is contained by the band's 14px gutter and clipped by `.wg-scroll`, which is the intent.
 
@@ -539,4 +506,4 @@ Shared formatting helpers under `src/utils/`. The chart helpers went with the ch
 | `src/utils/tokens.ts` | `formatTokenCount()` (1.2M, 5.4k display) |
 | `src/utils/time.ts` | `timeAgo()` (ISO string to relative "5m ago") |
 | `src/utils/providers.ts` | `providerLabel()`, `normalizeProviderScope()`, `providerScopeLabel()`, `providerFilterLabel()`, `providerBadgeClass()`, `providerScopeClass()`, `memoryTypeLabel()`, `PROVIDER_ASYMMETRY_DISCLOSURE` |
-| `src/utils/retention.ts` | `retentionSpanFor()`, `isPruned()`, `formatRetentionCutoff()`, `PRUNED_PLACEHOLDER` — see [[frontend#Frontend#Components#Retention Degradation]] |
+| `src/utils/retention.ts` | `isPruned()`, `formatRetentionCutoff()`, `PRUNED_PLACEHOLDER` — see [[frontend#Frontend#Components#Retention Degradation]] |

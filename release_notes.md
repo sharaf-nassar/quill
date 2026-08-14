@@ -10,9 +10,8 @@ while preserving working-context data and third-party hooks.
 
 The split Live/Analytics dashboard has been replaced by a single 360px
 always-on-top monitoring widget: a compact LIMITS band with one row per
-provider, and a switchable view below it — Usage, Trends, Charts, Models, and
-Context — all in one window. Everything the old dashboard showed is still
-here, adapted to the narrower surface. Management surfaces (Sessions,
+provider, and a switchable view below it — Usage, Models, and Context — all in
+one window. Management surfaces (Sessions,
 Learning, Instances, Settings) are unchanged and still open from the titlebar.
 
 Because the old layout is gone, its preferences are gone with it. The saved

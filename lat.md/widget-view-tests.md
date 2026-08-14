@@ -6,6 +6,10 @@ lat:
 
 These tests protect persistent widget view controls without browser-test infrastructure.
 
+## Available Widget Views
+
+Opening the widget view list exposes only Usage, Models, and Context, with exactly one selected option.
+
 ## Stored Range Preference
 
 Only 1H, 6H, 24H, and 7D restore from local storage. Missing, invalid, inaccessible, or unwritable storage degrades to the 1H default without breaking current-session selection.

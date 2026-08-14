@@ -469,8 +469,8 @@ a full-screen drag.
 
 ### Charts
 - Drawn by an internal SVG kit, not a charting library. Primitives are
-  Sparkline, AreaChart (multi-series with an overlay slot and a hover-only
-  legend chip), and Bars.
+  Sparkline and AreaChart (multi-series with an overlay slot and a hover-only
+  legend chip).
 - A sparkline is a metric-hue stroke at 60% opacity plus a solid endpoint dot:
   no axes, no ticks, no grid.
 - An area series is kept inside the lower ~62% of its box so the overlaid

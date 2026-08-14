@@ -215,7 +215,7 @@ const TOKEN_HISTORY_GEOMETRY: Record<string, { count: number; stepMs: number }> 
   "6h": { count: 24, stepMs: 15 * M },
   "12h": { count: 49, stepMs: 15 * M },
   "2d": { count: 49, stepMs: H },
-  // Fifteen inclusive daily boundaries cover both complete compared weeks.
+  // Fifteen inclusive daily boundaries cover the 7d window and prior period.
   "14d": { count: 15, stepMs: D },
   "30d": { count: 30, stepMs: D },
 };
@@ -225,10 +225,9 @@ function tokenHistory(range: string): TokenDataPoint[] {
   const { count, stepMs } = TOKEN_HISTORY_GEOMETRY[range] ?? DEFAULT_TOKEN_HISTORY;
   const pts: TokenDataPoint[] = [];
   for (let i = count - 1; i >= 0; i--) {
-    // Daily points span more than one week, so they carry a week-over-week
-    // story as well: the current week runs busier and caches better than the
-    // one before it, which is what the Trends rows are drawn to show. Sub-daily
-    // ranges keep the flat shape the usage chart is verified against.
+    // Daily points span the displayed window and its comparison period. The
+    // current half runs busier and caches better so Usage deltas have evidence;
+    // sub-daily ranges keep the flat shape the usage chart is verified against.
     const thisWeek = stepMs >= D && i * stepMs < 7 * D;
     const volume = thisWeek ? 1.18 : 1;
     const cacheShare = thisWeek ? 1.12 : 1;
@@ -343,11 +342,10 @@ const hookBreakdown: HookBreakdown[] = [
  * reports.
  *
  * The real command derives both from one walk over `session_events`, and
- * consumers rely on that: `useCodeInsights` and the widget's week-over-week
- * Trends rows recover a prior window's active seconds by prorating this
- * sparkline, so a shape that did not add up to the total would make the same
- * week read differently depending on which side of the comparison it landed
- * on. Seven buckets, matching the backend's fixed grid.
+ * `useCodeInsights` relies on that to recover the prior window's active seconds
+ * by prorating this sparkline. A shape that did not add up to the total would
+ * make the same period read differently depending on which side of the
+ * comparison it landed on. Seven buckets match the backend's fixed grid.
  */
 const RUNTIME_SHAPE = [0.11, 0.14, 0.12, 0.17, 0.15, 0.18, 0.13];
 /** Active LLM seconds per day of window — about 7.3 hours of real work. */
@@ -1704,10 +1702,7 @@ type RetentionScenario =
   // Chunks committed, then the run stopped. Carries error_reason.
   | "partial"
   // The cutoff covers every owned row — drives the explicit-loss copy.
-  | "everything_older"
-  // The watermark sits inside the widget's two compared weeks, so surfaces
-  // that degrade under retention (the Trends velocity row) have to disclose it.
-  | "recent_watermark";
+  | "everything_older";
 
 const RETENTION_SCENARIOS: ReadonlySet<RetentionScenario> = new Set([
   "preview",
@@ -1717,7 +1712,6 @@ const RETENTION_SCENARIOS: ReadonlySet<RetentionScenario> = new Set([
   "skipped_compaction",
   "partial",
   "everything_older",
-  "recent_watermark",
 ]);
 
 const warnedInvalidRetentionScenarios = new Set<string>();
@@ -1747,13 +1741,6 @@ const RETENTION_WINDOW_PRESETS = [30, 90, 180, 365] as const;
 // against stored transcript timestamps. `toISOString()` produces this form.
 const retentionCutoff = (windowDays: number) => iso(windowDays * D);
 
-// How far back the mock watermark sits. The default keeps every recent surface
-// undegraded; `recent_watermark` moves it inside the last fortnight so the
-// widget's week-over-week Trends rows have to state that the earlier week's
-// code activity was pruned.
-const watermarkDays = (scenario: RetentionScenario) =>
-  scenario === "recent_watermark" ? 10 : 90;
-
 // Reassigned, never mutated, so `set_retention_policy` in the browser behaves
 // like the real write-then-reread.
 let retentionWindowDays: number | null = 90;
@@ -1766,7 +1753,7 @@ const affectedSurfaces = [
 
 function retentionAuditRecord(scenario: RetentionScenario): RetentionAuditRecord | null {
   if (scenario === "noop") return null;
-  const cutoff = retentionCutoff(watermarkDays(scenario));
+  const cutoff = retentionCutoff(90);
   const base: RetentionAuditRecord = {
     schema: 1,
     status: "completed",
@@ -1818,8 +1805,7 @@ function retentionPolicy(): RetentionPolicy {
   const scenario = readRetentionScenario();
   return {
     window_days: retentionWindowDays,
-    watermark:
-      retentionWindowDays === null ? null : retentionCutoff(watermarkDays(scenario)),
+    watermark: retentionWindowDays === null ? null : retentionCutoff(90),
     last_run: retentionAuditRecord(scenario),
   };
 }

@@ -104,7 +104,7 @@ Open a PR. On merge to `main`, the GitHub Actions Pages workflow runs and the li
 After the Actions run finishes:
 - Click the green check on the merge commit → "View deployment" → opens the deployed URL.
 - Confirm the new screenshots are visible.
-- Confirm the OG preview by pasting the URL into a chat client (Slack, Discord, X) — the social card should render `og-image.png`.
+- Confirm the OG preview by pasting the URL into a chat client (Slack, Discord, X) — the social card should render `screenshots/hero.png`.
 
 ## Troubleshooting
 
@@ -115,7 +115,7 @@ After the Actions run finishes:
 | Lighthouse Performance drops to 70-something                       | Probably a PNG over ~300 KB. Re-export tighter; consider PNG-8 for low-color shots. |
 | Pages workflow stays "queued" forever                              | Concurrency lock from a previous run. Cancel the queued job in the Actions UI.     |
 | Screenshot driver complains "no window titled Quill"               | Demo Quill not on screen yet, or `xdotool` not installed (Linux only).             |
-| OG preview shows a generic Pages icon                              | `og-image.png` missing or `<meta>` tag wrong. Validate with the LinkedIn / Twitter / OG previewer. |
+| OG preview shows a generic Pages icon                              | `screenshots/hero.png` missing or `<meta>` tag wrong. Validate with the LinkedIn / Twitter / OG previewer. |
 
 ## Independent test mapping
 

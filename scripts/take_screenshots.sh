@@ -46,8 +46,6 @@
 #   hero.png / live.png     widget on the Usage view (live.png is a copy — the
 #                           LIMITS band the `#live` section sells is part of
 #                           the same 360px frame now)
-#   trends.png              widget on the Trends view
-#   analytics-charts.png    widget on the Charts view   (site anchor #analytics)
 #   models.png              widget on the Models view
 #   analytics-context.png   widget on the Context view  (site anchor #context)
 #   sessions.png            Manage → Sessions
@@ -109,10 +107,8 @@ PARK_GAP=60
 # src/components/widget/ViewRegion.tsx. Selection is by absolute row index, so
 # this order is load-bearing — keep it in sync when a view is added.
 VIEW_ROW_USAGE=0
-VIEW_ROW_TRENDS=1
-VIEW_ROW_CHARTS=2
-VIEW_ROW_MODELS=3
-VIEW_ROW_CONTEXT=4
+VIEW_ROW_MODELS=1
+VIEW_ROW_CONTEXT=2
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
@@ -359,25 +355,17 @@ fi
 # ── Widget views ──────────────────────────────────────────────────────────────
 
 echo ""
-echo "[1/9] hero.png + live.png (Usage view)"
+echo "[1/7] hero.png + live.png (Usage view)"
 capture_view "$VIEW_ROW_USAGE" "Usage" "$OUTDIR/hero.png"
 cp "$OUTDIR/hero.png" "$OUTDIR/live.png"
 log "Saved: $OUTDIR/live.png (copy of hero.png)"
 
 echo ""
-echo "[2/9] trends.png (Trends view)"
-capture_view "$VIEW_ROW_TRENDS" "Trends" "$OUTDIR/trends.png"
-
-echo ""
-echo "[3/9] analytics-charts.png (Charts view)"
-capture_view "$VIEW_ROW_CHARTS" "Charts" "$OUTDIR/analytics-charts.png"
-
-echo ""
-echo "[4/9] models.png (Models view)"
+echo "[2/7] models.png (Models view)"
 capture_view "$VIEW_ROW_MODELS" "Models" "$OUTDIR/models.png"
 
 echo ""
-echo "[5/9] analytics-context.png (Context view)"
+echo "[3/7] analytics-context.png (Context view)"
 capture_view "$VIEW_ROW_CONTEXT" "Context" "$OUTDIR/analytics-context.png"
 
 # ── Manage workspace ──────────────────────────────────────────────────────────
@@ -392,19 +380,19 @@ log "Manage window: $MANAGE_WID"
 sleep 0.6
 
 echo ""
-echo "[6/9] sessions.png (Manage → Sessions)"
+echo "[4/7] sessions.png (Manage → Sessions)"
 capture_section "Sessions" "$OUTDIR/sessions.png"
 
 echo ""
-echo "[7/9] learning.png (Manage → Learning)"
+echo "[5/7] learning.png (Manage → Learning)"
 capture_section "Learning" "$OUTDIR/learning.png"
 
 echo ""
-echo "[8/9] instances.png (Manage → Instances)"
+echo "[6/7] instances.png (Manage → Instances)"
 capture_section "Instances" "$OUTDIR/instances.png"
 
 echo ""
-echo "[9/9] settings.png (Manage → Settings)"
+echo "[7/7] settings.png (Manage → Settings)"
 capture_section "Settings" "$OUTDIR/settings.png"
 
 xdotool windowclose "$MANAGE_WID" 2>/dev/null || true

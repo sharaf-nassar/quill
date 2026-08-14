@@ -1,6 +1,6 @@
 // ViewSwitcher — the widget's view dropdown.
 //
-// The 360px surface cannot host a tab bar for five views, so the view region's
+// The 360px surface cannot host a tab bar, so the view region's
 // header carries its own name as a listbox trigger: the label *is* the current
 // view, and opening it swaps everything below LIMITS.
 //
@@ -15,7 +15,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 /** Every view the widget's view region can host. */
-export type WidgetView = "usage" | "trends" | "charts" | "models" | "context";
+export type WidgetView = "usage" | "models" | "context";
 
 export interface ViewOption {
   readonly id: WidgetView;

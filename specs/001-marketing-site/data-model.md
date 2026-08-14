@@ -63,18 +63,15 @@ The seeder uses `random.seed(42)` for full determinism. Every reseed produces th
 
 ## 3. Screenshot asset naming
 
-Captured PNGs land in `marketing-site/assets/screenshots/`. Each filename binds to one anchored section so a missing screenshot is immediately visible in the rendered site.
+Captured PNGs land in `marketing-site/assets/screenshots/`. The table states every consumer explicitly because `hero.png` serves both the product hero and analytics section.
 
 | Filename                  | Captured from                              | Used by section |
 |---------------------------|--------------------------------------------|-----------------|
-| `hero.png`                | Quill main window — Live + Analytics panes | `#hero`         |
-| `live.png`                | Live pane (full)                           | `#live`         |
-| `analytics-now.png`       | Analytics → Now tab                        | `#analytics`    |
-| `analytics-charts.png`    | Analytics → Charts tab                     | `#analytics`    |
-| `analytics-context.png`   | Analytics → Context tab                    | `#context`      |
-| `sessions.png`            | Session Search window                      | `#search`       |
-| `learning.png`            | Learning window — Rules tab                | `#learning`     |
-| `og-image.png`            | Composite (hero screenshot + banner)       | `<head>` meta   |
+| `hero.png`                | Widget → Usage view                        | `#hero`, `#analytics` |
+| `live.png`                | Copy of the Widget Usage view              | `#live`         |
+| `analytics-context.png`   | Widget → Context view                      | `#context`      |
+| `sessions.png`            | Manage → Sessions                          | `#search`       |
+| `learning.png`            | Manage → Learning                          | `#learning`     |
 | `logo.png`                | Real Quill app icon, resized for web use   | header + favicon |
 
 **Capture conventions**:
@@ -94,7 +91,7 @@ marketing-site/
 ├── assets/
 │   ├── screenshots/            # Per § 3 above
 │   ├── logo.png                # Real Quill app icon used in header + favicon
-│   └── og-image.png            # 1200x630 social-share preview
+│   └── screenshots/hero.png    # Usage screenshot reused for social previews
 └── README.md                   # Maps the folder, links the spec, notes the deploy contract
 ```
 

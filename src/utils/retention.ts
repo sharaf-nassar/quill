@@ -5,7 +5,7 @@
  * older than the retention watermark. Nothing else in the schema is touched, so
  * a pre-cutoff session keeps its token totals and turn counts while losing the
  * rows behind its code stats and its sub-agent tree. Rendered naively that loss
- * looks like a quiet month; these helpers exist so it renders as *absent*
+ * looks like measured inactivity; these helpers exist so it renders as *absent*
  * instead of as zero.
  *
  * The boundary these helpers compare against is the **watermark**, not the
@@ -25,16 +25,6 @@
  *   watermark, so a marked figure may still be partially populated. All copy
  *   built on these helpers must say "may be incomplete", never "is empty".
  */
-
-/**
- * How a time span sits against the retention cutoff.
- *
- * - `retained` — entirely at or after the cutoff, or retention is off.
- * - `straddles` — starts before the cutoff and continues past it, so the
- *   figure mixes pruned and retained rows.
- * - `pruned` — entirely before the cutoff.
- */
-export type RetentionSpan = "retained" | "straddles" | "pruned";
 
 /**
  * Rendered in place of a numeric zero that is really absent data. An em dash
@@ -70,46 +60,12 @@ export function formatRetentionCutoff(cutoff: string): string {
 	});
 }
 
-/**
- * Classify a `[firstSeen, lastActive]` span against the cutoff. A null cutoff
- * (retention never run, or disabled) classifies everything as `retained`.
- */
-export function retentionSpanFor(
-	firstSeen: string | null | undefined,
-	lastActive: string | null | undefined,
-	cutoff: string | null,
-): RetentionSpan {
-	const boundary = instant(cutoff);
-	if (boundary === null) {
-		return "retained";
-	}
-
-	const end = instant(lastActive);
-	const start = instant(firstSeen) ?? end;
-	if (end === null || start === null) {
-		return "retained";
-	}
-
-	if (end < boundary) {
-		return "pruned";
-	}
-	if (start < boundary) {
-		return "straddles";
-	}
-	return "retained";
-}
-
-/** Single-instant form of {@link retentionSpanFor} — true when pre-cutoff. */
+/** True when a valid timestamp falls before a valid retention cutoff. */
 export function isPruned(
 	timestamp: string | null | undefined,
 	cutoff: string | null,
 ): boolean {
-	return retentionSpanFor(timestamp, timestamp, cutoff) === "pruned";
+	const at = instant(timestamp);
+	const boundary = instant(cutoff);
+	return at !== null && boundary !== null && at < boundary;
 }
-
-/*
- * A per-row range-marking generic lived here while the split-pane analytics
- * charts drew multi-day axes. The widget's compact views classify whole ranges
- * with `retentionSpanFor` and single instants with `isPruned`, so it went with
- * the rest of the legacy main window rather than survive as unused surface.
- */
