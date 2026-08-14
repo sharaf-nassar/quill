@@ -304,6 +304,7 @@ interface RowModel {
   };
   nameLabel?: string;
   chipLabel?: string;
+  parentSessionId?: string;
   agentSummary?: {
     count: string;
     countLabel: string;
@@ -311,6 +312,7 @@ interface RowModel {
     runtimeLabel: string;
   };
   agents?: ReturnType<typeof formatObservedSessionAgents>;
+  linkedSessions?: ReadonlyArray<{ sessionId: string; modelId: string | null }>;
   value: string;
   valueLabel?: string;
   activity: string;
@@ -376,6 +378,47 @@ function ActiveAgentRail({ agents }: Pick<RowModel, "agents">) {
   );
 }
 
+function LinkIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg
+      className={`wg-row-link-icon${className ? ` ${className}` : ""}`}
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path d="M4.75 7.25 7.25 4.75M4 8.75H3a2 2 0 0 1 0-4h2M8 3.25h1a2 2 0 1 1 0 4H7" />
+    </svg>
+  );
+}
+
+function LiveLinkedSessionRail({
+  sessions,
+}: {
+  sessions: RowModel["linkedSessions"];
+}) {
+  if (!sessions || sessions.length === 0) return null;
+  const countLabel = `${sessions.length} live linked ${sessions.length === 1 ? "session" : "sessions"}`;
+  return (
+    <div className="wg-row-linked-rail" role="list" aria-label="Live linked sessions">
+      <LinkIcon className="wg-row-linked-live-icon" />
+      <span className="wg-row-linked-count" aria-label={countLabel}>
+        {countLabel}
+      </span>
+      {sessions.map((session) => (
+        <span
+          className="wg-row-linked-session wg-row-datum"
+          key={session.sessionId}
+          role="listitem"
+          aria-label={`Live linked session ${session.sessionId}${session.modelId ? `, model ${session.modelId}` : ""}`}
+          data-tooltip={session.sessionId}
+        >
+          {session.modelId ?? session.sessionId.slice(0, 8)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function SessionMetrics({ row }: { row: RowModel }) {
   if (!row.sessionStats) return null;
   return (
@@ -425,6 +468,7 @@ function RowName({ row }: { row: RowModel }) {
 }
 
 function SessionIdentity({ row }: { row: RowModel }) {
+  const linkedCount = row.linkedSessions?.length ?? 0;
   return (
     <span className="wg-row-session-identity">
       <RowName row={row} />
@@ -436,6 +480,24 @@ function SessionIdentity({ row }: { row: RowModel }) {
           aria-label={row.chipLabel}
         >
           {row.chip.text}
+        </span>
+      )}
+      {row.parentSessionId && (
+        <span
+          className="wg-row-session-parent wg-row-datum"
+          data-tooltip="Parent Pi session"
+          aria-label={`Parent Pi session ${row.parentSessionId}`}
+        >
+          ↳ {row.parentSessionId.slice(0, 8)}
+        </span>
+      )}
+      {linkedCount > 0 && (
+        <span
+          className="wg-row-linked-summary wg-row-datum"
+          data-tooltip="Live linked sessions"
+          aria-label={`${linkedCount} live linked ${linkedCount === 1 ? "session" : "sessions"}`}
+        >
+          <LinkIcon /> {linkedCount}
         </span>
       )}
     </span>
@@ -535,6 +597,7 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     },
     chip: { text: providerTag(row.provider), tone: row.provider },
     chipLabel: `Provider ${providerTag(row.provider)}`,
+    parentSessionId: row.provider === "pi" ? row.parent_session_id ?? undefined : undefined,
     agentSummary:
       hasAgentTotals || agents.length > 0
         ? {
@@ -557,6 +620,13 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
           }
         : undefined,
     agents,
+    linkedSessions:
+      row.provider === "pi"
+        ? (row.live_linked_sessions ?? []).map((session) => ({
+            sessionId: session.session_id,
+            modelId: session.model_id,
+          }))
+        : undefined,
     value: metrics.tokens,
     valueLabel:
       metrics.tokens === "—"
@@ -1004,6 +1074,7 @@ function UsageView({ range }: UsageViewProps) {
                   </span>
                 </div>
                 <ActiveAgentRail agents={row.agents} />
+                <LiveLinkedSessionRail sessions={row.linkedSessions} />
               </li>
             ))}
           </ul>

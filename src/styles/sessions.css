@@ -253,6 +253,27 @@
   padding-left: 20px;
 }
 
+.sessions-parent-link {
+  appearance: none;
+  border: 0;
+  border-radius: 3px;
+  padding: 1px 3px;
+  background: transparent;
+  color: var(--provider-pi);
+  font: inherit;
+  cursor: pointer;
+}
+
+.sessions-parent-link:hover {
+  background: rgba(21, 128, 61, 0.14);
+  color: var(--text-hi);
+}
+
+.sessions-parent-link:focus-visible {
+  outline: 2px solid rgba(96, 165, 250, 0.7);
+  outline-offset: 2px;
+}
+
 /* ─── Role icons ─── */
 .sessions-role-icon {
   font-size: 12px;

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -180,6 +182,61 @@ pub(crate) fn parse_pi_session_file(
     parse_pi_session_jsonl(&contents)
 }
 
+pub(crate) fn read_pi_session_header(path: &Path) -> Option<PiSessionHeader> {
+    let mut line = String::new();
+    BufReader::new(File::open(path).ok()?)
+        .take(64 * 1024)
+        .read_line(&mut line)
+        .ok()?;
+    let value = serde_json::from_str::<Value>(&line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    let header = serde_json::from_value::<PiSessionHeader>(value).ok()?;
+    matches!(header.version.unwrap_or(1), 2 | 3).then_some(header)
+}
+
+/// Resolve Pi's path-valued `parentSession` to its stable header id.
+///
+/// Every hop must be an absolute, readable Pi transcript inside the same
+/// configured session root. A broken hop invalidates the whole chain so a
+/// malformed or cyclic declaration cannot create partial lineage.
+pub(crate) fn resolve_pi_parent_session_id(
+    child_path: &Path,
+    child_header: &PiSessionHeader,
+) -> Option<String> {
+    let mut next = child_header.parent_session.clone()?;
+    let child_path = std::fs::canonicalize(child_path).ok()?;
+    let session_root = child_path.parent()?.parent()?.to_owned();
+    let mut seen = HashSet::from([child_path]);
+    let mut immediate = None;
+
+    loop {
+        let declared = Path::new(&next);
+        if !declared.is_absolute() {
+            return None;
+        }
+        let parent_path = std::fs::canonicalize(declared).ok()?;
+        if parent_path.extension()? != "jsonl"
+            || !parent_path.starts_with(&session_root)
+            || !seen.insert(parent_path.clone())
+        {
+            return None;
+        }
+        let parent = read_pi_session_header(&parent_path)?;
+        let parent_id = parent.id.trim();
+        if parent_id.is_empty() || parent_id.len() > 500 || parent_id.chars().any(char::is_control)
+        {
+            return None;
+        }
+        immediate.get_or_insert_with(|| parent_id.to_owned());
+        let Some(parent_session) = parent.parent_session else {
+            return immediate;
+        };
+        next = parent_session;
+    }
+}
+
 pub(crate) fn parse_pi_session_jsonl(
     contents: &str,
 ) -> Result<Option<PiSession>, PiSessionParseError> {
@@ -257,6 +314,7 @@ mod tests {
 
     use super::{
         PiSessionEntry, PiSessionParseError, parse_pi_session_file, parse_pi_session_jsonl,
+        resolve_pi_parent_session_id,
     };
 
     const V3: &str = include_str!("../tests/fixtures/pi_sessions/v3.jsonl");
@@ -362,5 +420,96 @@ mod tests {
             parse_pi_session_file(Some(Path::new("/definitely/missing/pi.jsonl"))),
             Ok(None)
         ));
+    }
+
+    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Parent Path Resolution]]
+    #[test]
+    fn resolves_parent_path_to_its_header_session_id() {
+        let root = tempfile::tempdir().expect("create Pi root");
+        let project = root.path().join("--work-quill--");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let parent_path = project.join("parent.jsonl");
+        let child_path = project.join("child.jsonl");
+        std::fs::write(
+            &parent_path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"parent-id\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"/work/quill\"}\n",
+        )
+        .expect("write parent");
+        let child_json = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"child-id\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\",\"parentSession\":{}}}\n",
+            serde_json::to_string(&parent_path).expect("encode path")
+        );
+        std::fs::write(&child_path, &child_json).expect("write child");
+        let child = parse_pi_session_jsonl(&child_json)
+            .expect("parse child")
+            .expect("child session");
+
+        assert_eq!(
+            resolve_pi_parent_session_id(&child_path, &child.header).as_deref(),
+            Some("parent-id")
+        );
+    }
+
+    // @lat: [[pi-session-parser-tests#Pi Session Parser Test Specs#Invalid Parent Chains]]
+    #[test]
+    fn rejects_missing_external_and_cyclic_parent_chains() {
+        let root = tempfile::tempdir().expect("create Pi root");
+        let project = root.path().join("--work-quill--");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        let child_path = project.join("child.jsonl");
+        std::fs::write(
+            &child_path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"child-id\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\"}\n",
+        )
+        .expect("write child anchor");
+        let missing = project.join("missing.jsonl");
+        let external = tempfile::NamedTempFile::new().expect("external parent");
+        let malformed = project.join("malformed.jsonl");
+        std::fs::write(&malformed, "{}\n").expect("write malformed parent");
+
+        for rejected in [&missing, external.path(), &malformed] {
+            let child = parse_pi_session_jsonl(&format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"child-id\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\",\"parentSession\":{}}}\n",
+                serde_json::to_string(rejected).expect("encode path")
+            ))
+            .expect("parse child")
+            .expect("child session");
+            assert_eq!(
+                resolve_pi_parent_session_id(&child_path, &child.header),
+                None
+            );
+        }
+
+        let relative = parse_pi_session_jsonl(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"child-id\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\",\"parentSession\":\"parent.jsonl\"}\n",
+        )
+        .expect("parse relative child")
+        .expect("relative child session");
+        assert_eq!(
+            resolve_pi_parent_session_id(&child_path, &relative.header),
+            None
+        );
+
+        let parent_path = project.join("parent.jsonl");
+        std::fs::write(
+            &parent_path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"parent-id\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"/work/quill\",\"parentSession\":{}}}\n",
+                serde_json::to_string(&child_path).expect("encode child path")
+            ),
+        )
+        .expect("write cyclic parent");
+        let child_json = format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"child-id\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\",\"parentSession\":{}}}\n",
+            serde_json::to_string(&parent_path).expect("encode parent path")
+        );
+        std::fs::write(&child_path, &child_json).expect("write cyclic child");
+        let child = parse_pi_session_jsonl(&child_json)
+            .expect("parse child")
+            .expect("child session");
+        assert_eq!(
+            resolve_pi_parent_session_id(&child_path, &child.header),
+            None
+        );
     }
 }

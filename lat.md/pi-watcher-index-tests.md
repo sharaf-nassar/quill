@@ -18,6 +18,10 @@ The persisted Pi session root admits nested JSONL transcripts and ignores other 
 
 Pi search hits and provider facets retain Pi identity instead of falling back to another provider.
 
+## Parent Session Search Metadata
+
+Pi search documents store the parent header id resolved from the declared transcript path so child results can navigate to their parent without path leakage.
+
 ## Provider Safe Cleanup
 
 Reindex cleanup deletes Pi documents only, even when another provider uses the same session id.

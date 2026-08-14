@@ -6332,6 +6332,7 @@ mod tests {
         let row = |session_id: &str| SessionBreakdown {
             provider: "claude".to_string(),
             session_id: session_id.to_string(),
+            parent_session_id: None,
             hostname: "ipc-host".to_string(),
             total_tokens: 1,
             turn_count: 1,
@@ -6347,6 +6348,7 @@ mod tests {
             runtime_as_of_ms: None,
             active_runtime_rate: 0.0,
             observed_agents: None,
+            live_linked_sessions: None,
             observed_only: false,
         };
         let mut rows = vec![row("covered-root"), row("storage-only-root")];

@@ -17,6 +17,31 @@ interface ResultCardProps {
 	 */
 	retentionCutoff: string | null;
 	onSelect: () => void;
+	onNavigateSession: (sessionId: string) => void;
+}
+
+export function ParentSessionLink({
+	parentSessionId,
+	onNavigateSession,
+}: {
+	parentSessionId: string | null;
+	onNavigateSession: (sessionId: string) => void;
+}) {
+	if (!parentSessionId) return null;
+	return (
+		<button
+			type="button"
+			className="sessions-parent-link"
+			aria-label={`Open parent Pi session ${parentSessionId}`}
+			title={`Open parent Pi session ${parentSessionId}`}
+			onClick={(event) => {
+				event.stopPropagation();
+				onNavigateSession(parentSessionId);
+			}}
+		>
+			parent {parentSessionId.slice(0, 9)}
+		</button>
+	);
 }
 
 function ResultCard({
@@ -25,6 +50,7 @@ function ResultCard({
 	locStats,
 	retentionCutoff,
 	onSelect,
+	onNavigateSession,
 }: ResultCardProps) {
 	// Sanitize snippet HTML -- only <mark> tags allowed for search highlighting
 	const sanitized = DOMPurify.sanitize(hit.snippet, {
@@ -69,6 +95,15 @@ function ResultCard({
 			</div>
 			<div className="sessions-result-meta">
 				{meta}
+				{hit.provider === "pi" && hit.parent_session_id && (
+					<>
+						{" \u00B7 "}
+						<ParentSessionLink
+							parentSessionId={hit.parent_session_id}
+							onNavigateSession={onNavigateSession}
+						/>
+					</>
+				)}
 				{locPruned ? (
 					<>
 						{" \u00B7 "}

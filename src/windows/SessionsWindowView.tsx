@@ -56,6 +56,7 @@ function SessionsWindowView() {
 	const [loading, setLoading] = useState(false);
 	const [page, setPage] = useState(0);
 	const [query, setQuery] = useState("");
+	const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const searchRequestRef = useRef(0);
 	const hitKey = useCallback(
 		(hit: Pick<SearchHit, "provider" | "message_id">) =>
@@ -109,7 +110,7 @@ function SessionsWindowView() {
 			nextPage: number,
 		) => {
 			const requestId = ++searchRequestRef.current;
-			if (!nextQuery.trim()) {
+			if (!nextQuery.trim() && !nextFilters.session_id) {
 				setResults([]);
 				setTotalHits(0);
 				setQueryTimeMs(0);
@@ -147,25 +148,57 @@ function SessionsWindowView() {
 
 	useEffect(
 		() => () => {
+			if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
 			searchRequestRef.current += 1;
 		},
 		[],
 	);
 
+	const cancelPendingSearch = useCallback(() => {
+		if (searchTimerRef.current) {
+			clearTimeout(searchTimerRef.current);
+			searchTimerRef.current = null;
+		}
+	}, []);
+
 	const handleSearch = useCallback(
 		(value: string) => {
+			cancelPendingSearch();
+			const nextFilters = { ...filters, session_id: undefined };
 			setQuery(value);
+			setFilters(nextFilters);
 			setPage(0);
 			setSelectedHit(null);
-			void runSearch(value, filters, sortBy, 0);
+			searchTimerRef.current = setTimeout(() => {
+				searchTimerRef.current = null;
+				void runSearch(value, nextFilters, sortBy, 0);
+			}, 300);
 		},
-		[filters, runSearch, sortBy],
+		[cancelPendingSearch, filters, runSearch, sortBy],
+	);
+
+	const handleNavigateSession = useCallback(
+		(sessionId: string) => {
+			cancelPendingSearch();
+			const nextFilters: SearchFilters = {
+				provider: "pi",
+				session_id: sessionId,
+			};
+			setQuery("");
+			setFilters(nextFilters);
+			setSortBy("recency");
+			setPage(0);
+			setSelectedHit(null);
+			void runSearch("", nextFilters, "recency", 0);
+		},
+		[cancelPendingSearch, runSearch],
 	);
 
 	const handleLoadMore = useCallback(() => {
+		cancelPendingSearch();
 		const nextPage = page + 1;
 		void runSearch(query, filters, sortBy, nextPage);
-	}, [filters, page, query, runSearch, sortBy]);
+	}, [cancelPendingSearch, filters, page, query, runSearch, sortBy]);
 
 	const handleSelect = useCallback(
 		async (hit: SearchHit) => {
@@ -190,6 +223,7 @@ function SessionsWindowView() {
 
 	const handleFiltersChange = useCallback(
 		(newFilters: SearchFilters) => {
+			cancelPendingSearch();
 			setFilters(newFilters);
 			if (query.trim()) {
 				setPage(0);
@@ -197,11 +231,12 @@ function SessionsWindowView() {
 				void runSearch(query, newFilters, sortBy, 0);
 			}
 		},
-		[query, runSearch, sortBy],
+		[cancelPendingSearch, query, runSearch, sortBy],
 	);
 
 	const handleSortChange = useCallback(
 		(newSort: SortMode) => {
+			cancelPendingSearch();
 			setSortBy(newSort);
 			if (query.trim()) {
 				setPage(0);
@@ -209,7 +244,7 @@ function SessionsWindowView() {
 				void runSearch(query, filters, newSort, 0);
 			}
 		},
-		[filters, query, runSearch],
+		[cancelPendingSearch, filters, query, runSearch],
 	);
 
 	return (
@@ -221,7 +256,7 @@ function SessionsWindowView() {
 							<div className="sessions-loading">Refreshing session index...</div>
 						) : (
 							<>
-								<SearchBar onSearch={handleSearch} />
+								<SearchBar value={query} onSearch={handleSearch} />
 								<FilterBar
 									facets={facets}
 									filters={filters}
@@ -235,7 +270,7 @@ function SessionsWindowView() {
 									</div>
 								)}
 								<RetentionBanner cutoff={retentionCutoff} />
-								{query.trim() && !loading && (
+								{(query.trim() || filters.session_id) && !loading && (
 									<div className="sessions-results-header">
 										{totalHits} result{totalHits !== 1 ? "s" : ""} in {queryTimeMs}ms
 									</div>
@@ -258,6 +293,7 @@ function SessionsWindowView() {
 										}
 										retentionCutoff={retentionCutoff}
 										onSelect={() => handleSelect(hit)}
+										onNavigateSession={handleNavigateSession}
 									/>
 								))}
 								{results.length >= PAGE_SIZE &&
@@ -286,6 +322,7 @@ function SessionsWindowView() {
 								})] ?? null
 							}
 							retentionCutoff={retentionCutoff}
+							onNavigateSession={handleNavigateSession}
 						/>
 					) : (
 						<div className="sessions-detail-empty">

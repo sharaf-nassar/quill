@@ -3,6 +3,7 @@ import type { SearchHit, SessionContext, SessionCodeStats } from "../../types";
 import { providerLabel } from "../../utils/providers";
 import { isPruned, PRUNED_PLACEHOLDER } from "../../utils/retention";
 import { timeAgo } from "../../utils/time";
+import { ParentSessionLink } from "./ResultCard";
 
 interface DetailPanelProps {
 	hit: SearchHit;
@@ -10,9 +11,16 @@ interface DetailPanelProps {
 	locStats: SessionCodeStats | null;
 	/** Retention watermark, or null when nothing has been pruned (feature 014). */
 	retentionCutoff: string | null;
+	onNavigateSession: (sessionId: string) => void;
 }
 
-function DetailPanel({ hit, context, locStats, retentionCutoff }: DetailPanelProps) {
+function DetailPanel({
+	hit,
+	context,
+	locStats,
+	retentionCutoff,
+	onNavigateSession,
+}: DetailPanelProps) {
 	// Sanitize snippet HTML -- only <mark> tags allowed for search highlighting
 	const sanitized = DOMPurify.sanitize(hit.snippet, {
 		ALLOWED_TAGS: ["mark"],
@@ -65,6 +73,15 @@ function DetailPanel({ hit, context, locStats, retentionCutoff }: DetailPanelPro
 					{[providerLabelText, hit.project, hit.host, hit.git_branch, timeAgo(hit.timestamp)]
 						.filter(Boolean)
 						.join(" \u00B7 ")}
+					{hit.provider === "pi" && hit.parent_session_id && (
+						<>
+							{" \u00B7 "}
+							<ParentSessionLink
+								parentSessionId={hit.parent_session_id}
+								onNavigateSession={onNavigateSession}
+							/>
+						</>
+					)}
 				</div>
 			</div>
 

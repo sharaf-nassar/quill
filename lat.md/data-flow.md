@@ -182,6 +182,16 @@ Pi live state remains tail-provable and bounded; active-branch reconstruction st
 
 Every changed Pi fingerprint replaces that file's prior live contribution. This catches initial deferred flush and migrations that preserve or grow length. Missing files produce no row, and the shared idle cutoff removes quiet files. Live Pi cumulative tokens render as `—`; retained analytics remains the separate source for historical usage.
 
+### Pi Session Lineage
+
+Pi lineage exists only when transcript headers prove it; paths, timing, cwd, filenames, and models never infer a relationship.
+
+[[src-tauri/src/pi_session.rs#resolve_pi_parent_session_id]] canonicalizes Pi 0.84.1's path-valued `parentSession`, requires every path in the chain to remain inside the same Pi session root, and reads each stable header id. Missing or malformed headers, paths outside the root, and cycles leave the child unlinked. Provider and host remain part of the live key, so equal ids from other providers or machines cannot join.
+
+[[src-tauri/src/live_tracker.rs#LiveTracker#overlay]] derives live child lists from the existing bounded session map on each read. It stores no second graph: provider disable, activity disable, and idle eviction remove the source sessions and therefore their links. Children remain independent rows with parent metadata; a parent receives only concurrently live children whose complete chain resolved.
+
+Session Search stores the resolved parent header id in each Pi document. The Sessions view can navigate from a child result to its provider-qualified parent without exposing the filesystem path from the transcript header.
+
 ## Model Observation Reconciliation
 
 Retained Claude and Codex transcripts become source-owned model observations without coupling model identity to Session Search indexing.

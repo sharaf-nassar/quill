@@ -13305,6 +13305,7 @@ impl Storage {
                 Ok(SessionBreakdown {
                     provider: row.get(0)?,
                     session_id: row.get(1)?,
+                    parent_session_id: None,
                     hostname: row.get(2)?,
                     total_tokens: row.get(3)?,
                     turn_count: row.get(4)?,
@@ -13320,6 +13321,7 @@ impl Storage {
                     runtime_as_of_ms: None,
                     active_runtime_rate: 0.0,
                     observed_agents: None,
+                    live_linked_sessions: None,
                     observed_only: false,
                 })
             })
@@ -28305,6 +28307,7 @@ mod tests {
         let mut rows = [SessionBreakdown {
             provider: "claude".to_string(),
             session_id: "session-open-agent".to_string(),
+            parent_session_id: None,
             hostname: "fixture-host".to_string(),
             total_tokens: 0,
             turn_count: 0,
@@ -28342,6 +28345,7 @@ mod tests {
                     runtime_active: false,
                 },
             ]),
+            live_linked_sessions: None,
             observed_only: false,
         }];
 
@@ -30940,6 +30944,7 @@ mod tests {
         let session_row = || SessionBreakdown {
             provider: "claude".to_string(),
             session_id: "session-runtime".to_string(),
+            parent_session_id: None,
             hostname: "fixture-host".to_string(),
             total_tokens: 1,
             turn_count: 1,
@@ -30984,6 +30989,7 @@ mod tests {
                     runtime_active: false,
                 },
             ]),
+            live_linked_sessions: None,
             observed_only: false,
         };
         let assert_live = |row: &SessionBreakdown| {

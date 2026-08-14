@@ -286,6 +286,9 @@ pub struct SessionStats {
 pub struct SessionBreakdown {
     pub provider: String,
     pub session_id: String,
+    /// Transcript-proven Pi parent header id. Null for other providers and
+    /// unlinked Pi sessions.
+    pub parent_session_id: Option<String>,
     pub hostname: String,
     pub total_tokens: i64,
     pub turn_count: i64,
@@ -318,6 +321,9 @@ pub struct SessionBreakdown {
     /// Current transcript snapshot's open native agents. Null is unknown;
     /// an empty vector is covered with none open.
     pub observed_agents: Option<Vec<ObservedSessionAgent>>,
+    /// Concurrent Pi children whose `parentSession` chains resolve to this
+    /// session. This is lineage activity, not a native agent count.
+    pub live_linked_sessions: Option<Vec<ObservedLinkedSession>>,
     /// True when current-process hook evidence supplied the row before the
     /// first retained token snapshot made its metrics available.
     pub observed_only: bool,
@@ -330,6 +336,12 @@ pub struct ObservedSessionAgent {
     pub agent_type: Option<String>,
     pub runtime_secs: Option<f64>,
     pub runtime_active: bool,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ObservedLinkedSession {
+    pub session_id: String,
+    pub model_id: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]

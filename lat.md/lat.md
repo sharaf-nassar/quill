@@ -27,6 +27,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[pi-live-session-tests]] — Pi bounded live-fold and token-gap test specs
 - [[pi-model-usage-tests]] — Pi model-usage identity, tree totals, tolerance, and replay test specs
 - [[pi-e2e-validation-tests]] — Pi numeric search, usage, and bounded-tail evidence
+- [[pi-lineage-ui-tests]] — Pi parent navigation and live linked-session copy test specs
 - [[pi-lifecycle-tests]] — Pi detection, transactional deployment, repair, and packaging test specs
 - [[pi-extension-tests]] — Pi tool, telemetry, local-only, containment, and real-loader test specs
 - [[context-http-api-tests]] — Loopback context API security, parity, execution, and pi telemetry test specs

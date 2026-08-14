@@ -29,3 +29,11 @@ Malformed lines, unsupported future types, and invalid known entries do not prev
 ## Ephemeral Sessions
 
 An absent session-file path or a missing file returns no session, covering Pi's non-persisted ephemeral mode without filesystem mutation.
+
+## Parent Path Resolution
+
+An absolute Pi `parentSession` transcript path resolves to the parent's stable header id inside the same session root.
+
+## Invalid Parent Chains
+
+Missing, external, malformed, relative, or cyclic Pi parent chains resolve as unlinked rather than creating partial lineage.

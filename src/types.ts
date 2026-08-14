@@ -169,6 +169,8 @@ export interface HostBreakdown {
 export interface SessionBreakdown {
   provider: IntegrationProvider;
   session_id: string;
+  /** Transcript-proven Pi parent header id; null when unlinked. */
+  parent_session_id: string | null;
   hostname: string;
   total_tokens: number;
   turn_count: number;
@@ -193,6 +195,8 @@ export interface SessionBreakdown {
   active_runtime_rate: number;
   /** Current open native agents; null means transcript coverage is unknown. */
   observed_agents: ObservedSessionAgent[] | null;
+  /** Concurrent Pi children proven by `parentSession`; never a native agent count. */
+  live_linked_sessions: ObservedLinkedSession[] | null;
   /** True until retained token metrics arrive for a current-boot observed root. */
   observed_only: boolean;
 }
@@ -203,6 +207,11 @@ export interface ObservedSessionAgent {
   agent_type: string | null;
   runtime_secs: number | null;
   runtime_active: boolean;
+}
+
+export interface ObservedLinkedSession {
+  session_id: string;
+  model_id: string | null;
 }
 
 export interface SkillBreakdown {
@@ -608,12 +617,14 @@ export interface SearchFilters {
   date_from?: string;
   date_to?: string;
   git_branch?: string;
+  session_id?: string;
 }
 
 export interface SearchHit {
   provider: IntegrationProvider;
 	message_id: string;
 	session_id: string;
+	parent_session_id: string | null;
 	content: string;
 	snippet: string;
 	role: string;

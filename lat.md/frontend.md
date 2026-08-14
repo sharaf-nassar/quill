@@ -302,6 +302,8 @@ The main rail's fixed no-wrap lifetime group orders retained agent count, one 9 
 
 Exact open-agent membership, transcript identity, and each agent's model all come from [[data-flow#Data Flow#Live Session Tracker|the live fold]] under one lock, so a row's agent list is one consistent answer rather than a merge of two sources that can disagree.
 
+Pi lineage uses a separate rail and count labeled `live linked session` or `live linked sessions`. It never enters retained `agent_count`, `observed_agents`, agent runtime, or native-agent wording. Child rows keep a parent marker, and Session Search parent links filter directly by the stable provider-qualified session id.
+
 ### Restart Component
 
 Controls for restarting Claude Code and Codex instances from Manage → Instances.

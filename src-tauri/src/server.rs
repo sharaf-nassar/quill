@@ -1605,6 +1605,7 @@ async fn post_session_messages(
             sessions::ExtractedMessage {
                 uuid: message.uuid.clone(),
                 session_id: payload.session_id.clone(),
+                parent_session_id: None,
                 role: message.role.clone(),
                 content: message.content.clone(),
                 timestamp: message.timestamp.clone(),

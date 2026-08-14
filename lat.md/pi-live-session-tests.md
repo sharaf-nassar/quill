@@ -45,3 +45,7 @@ A Pi conversation with no session file produces no live row.
 ## Bounded Large Branch Tail
 
 A synthetic branched Pi session of 104,857,951 bytes scans 1,048,576 bytes, the shared tail bound, from an isolated temporary file.
+
+## Proven Live Lineage
+
+One parent with two live declared children exposes exactly two linked sessions while an unlinked sibling stays independent and Pi native agent count stays unknown.

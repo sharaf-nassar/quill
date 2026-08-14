@@ -1021,6 +1021,7 @@ pub struct SessionSchema {
     pub provider: Field,
     pub message_id: Field,
     pub session_id: Field,
+    pub parent_session_id: Field,
     pub content: Field,
     pub role: Field,
     pub project: Field,
@@ -1080,7 +1081,7 @@ pub struct SessionIndex {
 }
 
 impl SessionIndex {
-    const SCHEMA_VERSION: u32 = 5;
+    const SCHEMA_VERSION: u32 = 6;
 
     /// Open an existing index or create a new one at the given directory.
     pub fn open_or_create(index_dir: &Path) -> Result<Self, String> {
@@ -1145,6 +1146,7 @@ impl SessionIndex {
         let provider = builder.add_text_field("provider", STRING | STORED);
         let message_id = builder.add_text_field("message_id", STRING | STORED);
         let session_id = builder.add_text_field("session_id", STRING | STORED);
+        let parent_session_id = builder.add_text_field("parent_session_id", STRING | STORED);
         let role = builder.add_text_field("role", STRING | STORED);
         let git_branch = builder.add_text_field("git_branch", STRING | STORED);
 
@@ -1175,6 +1177,7 @@ impl SessionIndex {
             provider,
             message_id,
             session_id,
+            parent_session_id,
             content,
             role,
             project,
@@ -1286,6 +1289,9 @@ impl SessionIndex {
         doc.add_text(self.fields.provider, provider.as_str());
         doc.add_text(self.fields.message_id, &msg.uuid);
         doc.add_text(self.fields.session_id, &msg.session_id);
+        if let Some(parent_session_id) = &msg.parent_session_id {
+            doc.add_text(self.fields.parent_session_id, parent_session_id);
+        }
         doc.add_text(self.fields.content, &msg.content);
         doc.add_text(self.fields.role, &msg.role);
         doc.add_text(self.fields.git_branch, &msg.git_branch);
@@ -2069,6 +2075,9 @@ impl SessionIndex {
                     .unwrap_or(IntegrationProvider::Claude),
                 message_id: get_text(f.message_id),
                 session_id: get_text(f.session_id),
+                parent_session_id: doc
+                    .get_first(f.parent_session_id)
+                    .and_then(|value| value.as_value().as_str().map(str::to_owned)),
                 content: get_text(f.content),
                 snippet: snippet_html,
                 role: get_text(f.role),
@@ -2229,6 +2238,7 @@ pub struct SearchHit {
     pub provider: IntegrationProvider,
     pub message_id: String,
     pub session_id: String,
+    pub parent_session_id: Option<String>,
     pub content: String,
     pub snippet: String,
     pub role: String,
@@ -2387,6 +2397,7 @@ pub struct ExtractedEvent {
 pub struct ExtractedMessage {
     pub uuid: String,
     pub session_id: String,
+    pub parent_session_id: Option<String>,
     pub role: String,
     pub content: String,
     pub timestamp: String,
@@ -3522,6 +3533,7 @@ fn make_tool_message(
     ExtractedMessage {
         uuid,
         session_id: session_id.clone(),
+        parent_session_id: None,
         role: "assistant".to_string(),
         content: String::new(),
         timestamp: timestamp.clone(),
@@ -3608,6 +3620,7 @@ fn extract_pi_messages(
             return unsupported_extracted_session(path);
         }
     };
+    let parent_session_id = crate::pi_session::resolve_pi_parent_session_id(path, &session.header);
     let session_id = session.header.id;
     let cwd = session.header.cwd;
     let project_name = Path::new(&cwd)
@@ -3633,6 +3646,7 @@ fn extract_pi_messages(
             Some(ExtractedMessage {
                 uuid: entry.base.id,
                 session_id: session_id.clone(),
+                parent_session_id: parent_session_id.clone(),
                 role,
                 content,
                 timestamp: entry.base.timestamp,
@@ -4080,6 +4094,7 @@ fn extract_claude_messages_from_jsonl_records(
         messages.push(ExtractedMessage {
             uuid,
             session_id: session_id.clone(),
+            parent_session_id: None,
             role,
             content,
             timestamp,
@@ -4261,6 +4276,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                 messages.push(ExtractedMessage {
                     uuid: format!("{session_id}:event:{line_idx}"),
                     session_id: session_id.clone(),
+                    parent_session_id: None,
                     role: role.to_string(),
                     content,
                     timestamp,
@@ -4314,6 +4330,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                         messages.push(ExtractedMessage {
                             uuid: uuid.unwrap_or_else(|| format!("{session_id}:event:{line_idx}")),
                             session_id: session_id.clone(),
+                            parent_session_id: None,
                             role: role.to_owned(),
                             content,
                             timestamp,
@@ -4356,6 +4373,7 @@ fn extract_codex_messages_from_jsonl_records(records: &[JsonlRecord]) -> Extract
                         messages.push(ExtractedMessage {
                             uuid: format!("{session_id}:event:{line_idx}"),
                             session_id: session_id.clone(),
+                            parent_session_id: None,
                             role: author.to_string(),
                             content: content_parts.join("\n"),
                             timestamp,
@@ -5316,6 +5334,57 @@ mod tests {
         );
     }
 
+    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Parent Session Search Metadata]]
+    #[test]
+    fn pi_search_hit_resolves_parent_path_to_header_identity() {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("--work-quill--");
+        fs::create_dir_all(&project).expect("create project dir");
+        let parent = project.join("parent.jsonl");
+        let child = project.join("child.jsonl");
+        fs::write(
+            &parent,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"stable-parent\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"/work/quill\"}\n",
+        )
+        .expect("write parent");
+        fs::write(
+            &child,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"stable-child\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\",\"parentSession\":{}}}\n{{\"type\":\"message\",\"id\":\"child-message\",\"parentId\":null,\"timestamp\":\"2026-08-14T08:00:02Z\",\"message\":{{\"role\":\"user\",\"content\":\"lineage-needle\"}}}}\n",
+                serde_json::to_string(&parent).expect("encode parent path")
+            ),
+        )
+        .expect("write child");
+        let messages = extract_messages_from_jsonl(IntegrationProvider::Pi, &child).messages;
+        let index_dir = TempDir::new().expect("index tempdir");
+        let index = SessionIndex::open_or_create(index_dir.path()).expect("open index");
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Pi,
+                "stable-child",
+                "quill",
+                "host",
+                &messages,
+            )
+            .expect("index child");
+        index.reader.reload().expect("reload index");
+
+        let result = index
+            .search(
+                "lineage-needle",
+                &SearchFilters::default(),
+                "relevance",
+                0,
+                10,
+            )
+            .expect("search child");
+        assert_eq!(
+            result.hits[0].parent_session_id.as_deref(),
+            Some("stable-parent")
+        );
+        assert_eq!(result.hits[0].provider, IntegrationProvider::Pi);
+    }
+
     // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Provider Safe Cleanup]]
     #[test]
     fn pi_cleanup_does_not_delete_same_id_from_other_providers() {
@@ -5324,6 +5393,7 @@ mod tests {
         let make_message = |uuid: &str, content: &str| ExtractedMessage {
             uuid: uuid.to_string(),
             session_id: "shared".to_string(),
+            parent_session_id: None,
             role: "user".to_string(),
             content: content.to_string(),
             timestamp: "2026-08-14T08:00:01Z".to_string(),

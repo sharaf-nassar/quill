@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::integrations::IntegrationProvider;
-use crate::models::{ObservedSessionAgent, SessionBreakdown};
+use crate::models::{ObservedLinkedSession, ObservedSessionAgent, SessionBreakdown};
 use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
 use crate::transcript_identity::{ModelSourceFastFingerprint, model_source_fast_fingerprint};
 
@@ -60,6 +60,8 @@ struct LiveSession {
     /// Upstream provider and model from Pi's newest assistant message.
     model_provider: Option<String>,
     model: Option<String>,
+    /// Stable header id resolved from Pi's path-valued `parentSession` chain.
+    parent_session_id: Option<String>,
     /// Spawn tool-use ids seen in a `tool_result` and workflow agent ids seen
     /// in a journal `result`, from anywhere in this session's tree.
     ///
@@ -200,6 +202,7 @@ enum FileRole {
     Pi {
         started_at: DateTime<Utc>,
         cwd: Option<String>,
+        parent_session_id: Option<String>,
     },
 }
 
@@ -343,7 +346,11 @@ impl TrackerState {
                     });
                 }
             }
-            FileRole::Pi { started_at, cwd } => {
+            FileRole::Pi {
+                started_at,
+                cwd,
+                parent_session_id,
+            } => {
                 if let Some(replaced) = replaced_session {
                     sessions.remove(&replaced);
                 }
@@ -351,6 +358,7 @@ impl TrackerState {
                     last_activity: *started_at,
                     started_at: Some(*started_at),
                     cwd: cwd.clone(),
+                    parent_session_id: parent_session_id.clone(),
                     ..LiveSession::default()
                 };
                 let Some((window, body_offset, _, _)) = read_codex_tail(path) else {
@@ -720,6 +728,29 @@ impl LiveTracker {
         let now = Utc::now();
         let state = self.state.lock().unwrap();
         let mut seen = HashSet::new();
+        let mut linked_by_parent = HashMap::<SessionKey, Vec<ObservedLinkedSession>>::new();
+        for (child_key, child) in &state.sessions {
+            let Some(parent_session_id) = child.parent_session_id.as_ref() else {
+                continue;
+            };
+            let parent_key = SessionKey {
+                provider: IntegrationProvider::Pi.as_str().to_owned(),
+                host: child_key.host.clone(),
+                session_id: parent_session_id.clone(),
+            };
+            if state.sessions.contains_key(&parent_key) {
+                linked_by_parent
+                    .entry(parent_key)
+                    .or_default()
+                    .push(ObservedLinkedSession {
+                        session_id: child_key.session_id.clone(),
+                        model_id: child.model.clone(),
+                    });
+            }
+        }
+        for linked in linked_by_parent.values_mut() {
+            linked.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        }
 
         for row in &mut rows {
             row.observed_only = false;
@@ -731,6 +762,9 @@ impl LiveTracker {
                 continue;
             };
             row.observed_agents = Some(session.open_agents(now));
+            row.parent_session_id = session.parent_session_id.clone();
+            row.live_linked_sessions = (key.provider == IntegrationProvider::Pi.as_str())
+                .then(|| linked_by_parent.get(&key).cloned().unwrap_or_default());
             if utc(&row.last_active).is_none_or(|stored| session.last_activity > stored) {
                 row.last_active = session.last_activity.to_rfc3339();
             }
@@ -758,6 +792,7 @@ impl LiveTracker {
                 rows.push(SessionBreakdown {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
+                    parent_session_id: session.parent_session_id.clone(),
                     hostname: key.host.clone(),
                     total_tokens: 0,
                     turn_count: 0,
@@ -776,6 +811,8 @@ impl LiveTracker {
                     runtime_as_of_ms: None,
                     active_runtime_rate: 0.0,
                     observed_agents: Some(session.open_agents(now)),
+                    live_linked_sessions: (key.provider == IntegrationProvider::Pi.as_str())
+                        .then(|| linked_by_parent.get(key).cloned().unwrap_or_default()),
                     observed_only: true,
                 });
             }
@@ -987,19 +1024,8 @@ fn normalize_observed_hostname(hostname: &str) -> Option<String> {
 }
 
 fn pi_session_file(path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
-    let mut line = String::new();
-    BufReader::new(File::open(path).ok()?)
-        .take(64 * 1024)
-        .read_line(&mut line)
-        .ok()?;
-    let value = serde_json::from_str::<serde_json::Value>(&line).ok()?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("session") {
-        return None;
-    }
-    let header = serde_json::from_value::<crate::pi_session::PiSessionHeader>(value).ok()?;
-    if !matches!(header.version.unwrap_or(1), 2 | 3) {
-        return None;
-    }
+    let header = crate::pi_session::read_pi_session_header(path)?;
+    let parent_session_id = crate::pi_session::resolve_pi_parent_session_id(path, &header);
     let session_id = observed_name(&header.id)?;
     Some((
         SessionKey {
@@ -1010,6 +1036,7 @@ fn pi_session_file(path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
         FileRole::Pi {
             started_at: utc(&header.timestamp)?,
             cwd: observed_root_cwd(Some(&header.cwd)),
+            parent_session_id,
         },
     ))
 }
@@ -1950,6 +1977,70 @@ mod tests {
                 .unwrap()
                 .sessions
                 .contains_key(&fixture.key())
+        );
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Proven Live Lineage]]
+    #[test]
+    fn pi_parent_exposes_exactly_two_linked_children_and_keeps_sibling_independent() {
+        let root = tempfile::tempdir().expect("create Pi root");
+        let project = root.path().join("--work-quill--");
+        fs::create_dir_all(&project).expect("create project directory");
+        let now = parse("2026-08-14T08:00:10Z");
+        let write = |name: &str, id: &str, parent: Option<&Path>, second: u32| {
+            let parent = parent.map_or(String::new(), |path| {
+                format!(
+                    ",\"parentSession\":{}",
+                    serde_json::to_string(path).expect("encode parent path")
+                )
+            });
+            let path = project.join(name);
+            fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"/work/quill\"{parent}}}\n{{\"type\":\"message\",\"id\":\"entry-{id}\",\"parentId\":null,\"timestamp\":\"2026-08-14T08:00:{second:02}Z\",\"message\":{{\"role\":\"assistant\",\"content\":[],\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\"}}}}\n"
+                ),
+            )
+            .expect("write Pi transcript");
+            set_modified(&path, now);
+            path
+        };
+        let parent = write("parent.jsonl", "parent", None, 1);
+        write("child-a.jsonl", "child-a", Some(&parent), 2);
+        write("child-b.jsonl", "child-b", Some(&parent), 3);
+        write("sibling.jsonl", "sibling", None, 4);
+
+        let tracker = LiveTracker::new(None);
+        tracker.sweep_in(&[(IntegrationProvider::Pi, root.path().to_path_buf())], now);
+        let (_, rows) = read_path(&tracker, Vec::new(), now);
+        assert_eq!(rows.len(), 4);
+        let parent_row = rows.iter().find(|row| row.session_id == "parent").unwrap();
+        assert_eq!(
+            parent_row
+                .live_linked_sessions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["child-a", "child-b"]
+        );
+        assert_eq!(parent_row.agent_count, None);
+        assert_eq!(parent_row.observed_agents, Some(Vec::new()));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "child-a")
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("parent")
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.session_id == "sibling")
+                .unwrap()
+                .parent_session_id,
+            None
         );
     }
 
@@ -2976,6 +3067,7 @@ mod tests {
         let stored = SessionBreakdown {
             provider: "claude".to_owned(),
             session_id: "stored-root".to_owned(),
+            parent_session_id: None,
             hostname: "overlay-host".to_owned(),
             total_tokens: 7,
             turn_count: 1,
@@ -2991,6 +3083,7 @@ mod tests {
             runtime_as_of_ms: None,
             active_runtime_rate: 0.0,
             observed_agents: None,
+            live_linked_sessions: None,
             observed_only: false,
         };
         let rows = tracker.overlay(
@@ -3025,6 +3118,7 @@ mod tests {
         SessionBreakdown {
             provider: provider.to_owned(),
             session_id: "remote-root".to_owned(),
+            parent_session_id: None,
             hostname: "remote-host.example.com".to_owned(),
             total_tokens: 42,
             turn_count: 3,
@@ -3040,6 +3134,7 @@ mod tests {
             runtime_as_of_ms: None,
             active_runtime_rate: 0.0,
             observed_agents: None,
+            live_linked_sessions: None,
             observed_only: false,
         }
     }

@@ -1,40 +1,17 @@
-import { useRef, useEffect, useCallback } from "react";
-
 interface SearchBarProps {
+  value: string;
   onSearch: (value: string) => void;
 }
 
-function SearchBar({ onSearch }: SearchBarProps) {
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const handleChange = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      const value = e.target.value;
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-      timerRef.current = setTimeout(() => {
-        onSearch(value);
-      }, 300);
-    },
-    [onSearch],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-    };
-  }, []);
-
+function SearchBar({ value, onSearch }: SearchBarProps) {
   return (
     <input
       className="sessions-search-input"
       type="text"
       autoFocus
       placeholder="Search sessions..."
-      onChange={handleChange}
+      value={value}
+      onChange={(event) => onSearch(event.target.value)}
     />
   );
 }
