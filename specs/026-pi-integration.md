@@ -524,12 +524,12 @@ Transcript pipeline (needed in every MVP variant):
   `IntegrationProvider` union in `src/types.ts:279`) — without a sweep,
   pi rows silently vanish (constitution 1). One regression test asserts
   a pi hook row and a pi usage row surface in the breakdown.
-- **Downgrade-safe status persistence:** once `"pi"` lands in the saved
-  `ProviderStatus` list, an older Quill's whole-array deserialization
-  fails and drops every provider's enablement
-  (`src-tauri/src/integrations/manager.rs:590-602` returns empty on
-  error) — parse saved statuses per-entry and skip unknown providers
-  instead of discarding the array.
+- **Downgrade-safe status persistence:** keep
+  `integration.providers.v1` limited to Claude, Codex, and MiniMax so a
+  pre-Pi build can keep reading and changing it. Store Pi's
+  `ProviderStatus` under `integration.provider.pi.v1`; current readers
+  merge that sidecar with the per-entry tolerant legacy array. A mixed
+  array written by an earlier Pi-aware build migrates on the next save.
 - **Fold cost is budgeted (constitution 10):** reuse the existing
   oversize rejection and bounded tail-read patterns
   (`live_tracker.rs#read_codex_tail`); one `stat` per quiet transcript,
@@ -732,8 +732,8 @@ whole files off the UI thread on change (constitution 3).
   table, min-version gate, install/verify/uninstall, orphan sweep of
   Quill-marked extension files, pi-version + dirs in integration state.
 - `src-tauri/src/integrations/manager.rs` — provider registration, startup
-  repair, mutation-guard coverage, per-entry tolerant `ProviderStatus`
-  parse (downgrade safety).
+  repair, mutation-guard coverage, per-entry tolerant legacy parsing,
+  and split legacy/Pi status persistence for downgrade safety.
 - `src-tauri/src/integrations/deploy.rs` — reused as-is
   (configuration-only snapshot path); no staging of `~/.pi/agent/`.
 - `src-tauri/pi-integration/` (new) — `quill.ts`, pi AGENTS section
@@ -788,9 +788,12 @@ whole files off the UI thread on change (constitution 3).
 No new main-analytics tables. `provider` TEXT columns accept `pi`;
 `hook_invocations` rows carry provider `pi` with the existing event names.
 Count IPC payloads (`models.rs:339-371`) gain additive `pi_count` fields
-(no wire breakage). Saved `ProviderStatus` persistence switches to
-per-entry parsing that skips unknown providers (a downgrade keeps
-Claude/Codex enablement). New pi `integration-state.json` (versioned):
+(no wire breakage). `integration.providers.v1` stays readable by pre-Pi
+builds because it contains only Claude, Codex, and MiniMax; Pi uses
+`integration.provider.pi.v1`. Current readers merge both settings and
+migrate older mixed arrays on save, preserving Pi across an old-build
+round trip while accepting old-build changes to legacy providers. New pi
+`integration-state.json` (versioned):
 selected config/session dirs, recorded pi version, extension filename,
 AGENTS state. New per-provider deployment stamp file, as today. The context
 store keeps its existing schema; the Rust module and Python tools share it

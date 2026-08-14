@@ -10,6 +10,10 @@ These tests pin Pi's shared provider contracts before parser and lifecycle work 
 
 Unknown saved providers are skipped entry by entry while known provider enablement survives.
 
+## Downgrade-safe Status Persistence
+
+Mixed provider arrays migrate into legacy and Pi-specific settings, so pre-Pi edits remain authoritative without erasing Pi's saved choice.
+
 ## Provider Breakdowns
 
 Pi skill usage and hook rows remain visible in aggregate and provider-filtered breakdowns.

@@ -13,6 +13,8 @@ const CONTEXT_PRESERVATION_ENABLED_KEY: &str = "context_preservation.enabled";
 const ACTIVITY_TRACKING_ENABLED_KEY: &str = "feature.activity_tracking.enabled";
 const CONTEXT_TELEMETRY_ENABLED_KEY: &str = "feature.context_telemetry.enabled";
 const BREVITY_ENABLED_KEY: &str = "feature.brevity.enabled";
+const LEGACY_PROVIDER_STATUSES_KEY: &str = "integration.providers.v1";
+const PI_PROVIDER_STATUS_KEY: &str = "integration.provider.pi.v1";
 
 fn demo_mode_active() -> bool {
     std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1")
@@ -615,11 +617,23 @@ fn apply_saved_status(status: &mut ProviderStatus, saved: &ProviderStatus) {
 }
 
 fn load_saved_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    let Some(json) = storage.get_setting("integration.providers.v1")? else {
-        return Ok(Vec::new());
-    };
+    let mut statuses = storage
+        .get_setting(LEGACY_PROVIDER_STATUSES_KEY)?
+        .map(|json| parse_saved_statuses(&json))
+        .unwrap_or_default();
 
-    Ok(parse_saved_statuses(&json))
+    if let Some(json) = storage.get_setting(PI_PROVIDER_STATUS_KEY)? {
+        match serde_json::from_str::<ProviderStatus>(&json) {
+            Ok(status) if status.provider == IntegrationProvider::Pi => {
+                statuses.retain(|saved| saved.provider != IntegrationProvider::Pi);
+                statuses.push(status);
+            }
+            Ok(_) => log::warn!("Ignoring non-Pi status in Pi provider settings"),
+            Err(err) => log::warn!("Failed to parse saved Pi provider settings: {err}"),
+        }
+    }
+
+    Ok(statuses)
 }
 
 fn parse_saved_statuses(json: &str) -> Vec<ProviderStatus> {
@@ -643,8 +657,28 @@ fn parse_saved_statuses(json: &str) -> Vec<ProviderStatus> {
 }
 
 fn save_statuses(storage: &Storage, statuses: &[ProviderStatus]) -> Result<(), String> {
-    let json = serde_json::to_string(statuses).map_err(|e| e.to_string())?;
-    storage.set_setting("integration.providers.v1", &json)
+    let legacy_statuses: Vec<_> = statuses
+        .iter()
+        .filter(|status| {
+            matches!(
+                status.provider,
+                IntegrationProvider::Claude
+                    | IntegrationProvider::Codex
+                    | IntegrationProvider::MiniMax
+            )
+        })
+        .collect();
+    let pi_status = statuses
+        .iter()
+        .find(|status| status.provider == IntegrationProvider::Pi)
+        .ok_or_else(|| "Missing Pi provider status".to_string())?;
+    let legacy_json = serde_json::to_string(&legacy_statuses).map_err(|e| e.to_string())?;
+    let pi_json = serde_json::to_string(pi_status).map_err(|e| e.to_string())?;
+
+    storage.set_settings_atomically(&[
+        (LEGACY_PROVIDER_STATUSES_KEY, &legacy_json),
+        (PI_PROVIDER_STATUS_KEY, &pi_json),
+    ])
 }
 
 fn log_statuses(statuses: &[ProviderStatus]) {
@@ -675,6 +709,7 @@ fn emit_context_preservation_status(app: &AppHandle, status: &ContextPreservatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Saved Status Tolerance]]
@@ -707,6 +742,83 @@ mod tests {
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].provider, IntegrationProvider::Claude);
         assert!(statuses[0].enabled);
+    }
+
+    #[test]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Downgrade-safe Status Persistence]]
+    fn saved_provider_statuses_survive_a_pre_pi_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("quill.db"), false)
+            .expect("initialize temporary storage");
+        let status = |provider, enabled| ProviderStatus {
+            provider,
+            detected_cli: true,
+            detected_home: true,
+            enabled,
+            setup_state: ProviderSetupState::Installed,
+            user_has_made_choice: true,
+            last_error: None,
+            last_verified_at: None,
+            last_detection_attempts: Vec::new(),
+        };
+        let mixed_statuses = vec![
+            status(IntegrationProvider::Claude, true),
+            status(IntegrationProvider::Codex, true),
+            status(IntegrationProvider::Pi, true),
+            status(IntegrationProvider::MiniMax, false),
+        ];
+
+        storage
+            .set_setting(
+                LEGACY_PROVIDER_STATUSES_KEY,
+                &serde_json::to_string(&mixed_statuses).expect("serialize mixed legacy statuses"),
+            )
+            .expect("seed mixed legacy statuses");
+
+        let migrated = load_saved_statuses(&storage).expect("load mixed legacy statuses");
+        save_statuses(&storage, &migrated).expect("migrate saved statuses");
+
+        let legacy_json = storage
+            .get_setting(LEGACY_PROVIDER_STATUSES_KEY)
+            .expect("read legacy statuses")
+            .expect("legacy statuses exist");
+        let mut legacy_statuses: Vec<ProviderStatus> =
+            serde_json::from_str(&legacy_json).expect("pre-Pi build can read legacy statuses");
+        assert_eq!(
+            legacy_statuses
+                .iter()
+                .map(|status| status.provider)
+                .collect::<Vec<_>>(),
+            vec![
+                IntegrationProvider::Claude,
+                IntegrationProvider::Codex,
+                IntegrationProvider::MiniMax,
+            ]
+        );
+
+        let claude = legacy_statuses
+            .iter_mut()
+            .find(|status| status.provider == IntegrationProvider::Claude)
+            .expect("Claude legacy status");
+        claude.enabled = false;
+        storage
+            .set_setting(
+                LEGACY_PROVIDER_STATUSES_KEY,
+                &serde_json::to_string(&legacy_statuses).expect("serialize pre-Pi statuses"),
+            )
+            .expect("simulate pre-Pi save");
+
+        let round_tripped = load_saved_statuses(&storage).expect("load after pre-Pi save");
+        assert!(
+            round_tripped.iter().any(|status| {
+                status.provider == IntegrationProvider::Claude && !status.enabled
+            })
+        );
+        assert!(
+            round_tripped
+                .iter()
+                .any(|status| { status.provider == IntegrationProvider::Pi && status.enabled })
+        );
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Manager Wiring]]
