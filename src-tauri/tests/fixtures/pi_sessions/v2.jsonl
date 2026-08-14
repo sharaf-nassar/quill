@@ -1,0 +1,2 @@
+{"type":"session","version":2,"id":"session-v2","timestamp":"2026-08-14T08:00:00.000Z","cwd":"/work/v2"}
+{"type":"message","id":"hook","parentId":null,"timestamp":"2026-08-14T08:00:01.000Z","message":{"role":"hookMessage","content":"legacy hook","timestamp":1786694401000}}

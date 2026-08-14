@@ -18,6 +18,9 @@ mod live_tracker;
 mod memory_optimizer;
 mod model_usage;
 mod models;
+// Item 3 wires this format module into the watcher and indexer.
+#[allow(dead_code)]
+mod pi_session;
 mod prompt_utils;
 mod redaction;
 mod releases;

@@ -1,0 +1,6 @@
+not json
+{"type":"session","version":3,"id":"session-noise","timestamp":"2026-08-14T08:00:00.000Z","cwd":"/work/noise"}
+{"type":"future_entry","id":"future","parentId":null,"timestamp":"2026-08-14T08:00:01.000Z"}
+{"type":"message","id":"broken","parentId":null,"timestamp":"2026-08-14T08:00:02.000Z"}
+{"type":"message","id":"kept","parentId":null,"timestamp":"2026-08-14T08:00:03.000Z","message":{"role":"user","content":"kept","timestamp":1786694403000}}
+{"type":"message"

@@ -1,0 +1,10 @@
+{"type":"session","version":3,"id":"session-v3","timestamp":"2026-08-14T08:00:00.000Z","cwd":"/work/quill","parentSession":"/sessions/parent.jsonl"}
+{"type":"message","id":"root","parentId":null,"timestamp":"2026-08-14T08:00:01.000Z","message":{"role":"user","content":"hello","timestamp":1786694401000}}
+{"type":"message","id":"main","parentId":"root","timestamp":"2026-08-14T08:00:02.000Z","message":{"role":"assistant","content":[],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1786694402000}}
+{"type":"thinking_level_change","id":"thinking","parentId":"main","timestamp":"2026-08-14T08:00:03.000Z","thinkingLevel":"high"}
+{"type":"model_change","id":"model","parentId":"thinking","timestamp":"2026-08-14T08:00:04.000Z","provider":"anthropic","modelId":"claude-sonnet-4-5"}
+{"type":"compaction","id":"compact","parentId":"model","timestamp":"2026-08-14T08:00:05.000Z","summary":"compact","firstKeptEntryId":"root","tokensBefore":1200}
+{"type":"branch_summary","id":"summary","parentId":"compact","timestamp":"2026-08-14T08:00:06.000Z","fromId":"root","summary":"branch"}
+{"type":"custom","id":"custom","parentId":"summary","timestamp":"2026-08-14T08:00:07.000Z","customType":"quill","data":{"seen":true}}
+{"type":"label","id":"label","parentId":"custom","timestamp":"2026-08-14T08:00:08.000Z","targetId":"root","label":"start"}
+{"type":"message","id":"branch-leaf","parentId":"root","timestamp":"2026-08-14T08:00:09.000Z","message":{"role":"user","content":"branch","timestamp":1786694409000}}

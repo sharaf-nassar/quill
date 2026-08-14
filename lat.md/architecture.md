@@ -71,6 +71,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | HTTP server | [[src-tauri/src/server.rs]] | Axum API on port 19876 for hook data ingestion |
 | Storage | [[src-tauri/src/storage.rs]] | SQLite schema, migrations, queries, aggregation |
 | Sessions | [[src-tauri/src/sessions.rs]] | Tantivy full-text indexing of session transcripts |
+| Pi session format | [[src-tauri/src/pi_session.rs]] | Tolerant v2/v3 JSONL tree parsing and active-path resolution |
 | Learning | [[src-tauri/src/learning.rs]] | Two-stream LLM analysis for behavioral pattern discovery |
 | Memory optimizer | [[src-tauri/src/memory_optimizer.rs]] | LLM-driven memory file optimization |
 | Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
