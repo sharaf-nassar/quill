@@ -450,6 +450,8 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     formatTokenCount(row.total_tokens),
     `${formatNumber(row.turn_count)} turns`,
     row.observed_only,
+	row.provider,
+	live,
   );
   const totalRuntime = formatExtrapolatedRuntime(
     row.active_runtime_secs,

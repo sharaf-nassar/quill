@@ -803,6 +803,19 @@ pub(crate) fn discover_codex_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf>
         .collect()
 }
 
+/// Enumerate every Pi session transcript under `sessions_dir`.
+pub(crate) fn discover_pi_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf> {
+    if !sessions_dir.exists() {
+        return Vec::new();
+    }
+    let mut diagnostic = None;
+    collect_pi_jsonl_candidates(sessions_dir, IntegrationProvider::Pi, &mut diagnostic)
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
+}
+
 /// A Codex rollout filename ends with the 36-character thread uuid.
 const CODEX_THREAD_ID_LEN: usize = 36;
 

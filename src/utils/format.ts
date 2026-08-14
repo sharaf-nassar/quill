@@ -100,8 +100,13 @@ export function resolveSessionMetrics(
 	tokens: string,
 	turns: string,
 	observedOnly: boolean,
+	provider?: IntegrationProvider,
+	live = false,
 ): { tokens: string; turns: string | null } {
-	return observedOnly ? { tokens: "—", turns: null } : { tokens, turns };
+	return {
+		tokens: observedOnly || (provider === "pi" && live) ? "—" : tokens,
+		turns: observedOnly ? null : turns,
+	};
 }
 
 /** Format a byte count using binary units. */

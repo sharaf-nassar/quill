@@ -167,3 +167,11 @@ test("observed-only session metrics stay unavailable instead of reading as zero"
 		turns: "7 turns",
 	});
 });
+
+// @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Explicit Token Gap]]
+test("live Pi session tokens stay unavailable", () => {
+	assert.deepEqual(resolveSessionMetrics("12.3k", "7 turns", false, "pi", true), {
+		tokens: "—",
+		turns: "7 turns",
+	});
+});
