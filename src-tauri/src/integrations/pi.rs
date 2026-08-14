@@ -4,6 +4,7 @@ use crate::integrations::deploy::{
 };
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::IntegrationFeatures;
+use crate::storage::Storage;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -19,7 +20,10 @@ const SESSION_DIR_ENV: &str = "PI_CODING_AGENT_SESSION_DIR";
 const EXTENSION_FILE: &str = "quill.ts";
 const AGENTS_TEMPLATE_FILE: &str = "agents-md-section.md";
 const QUILL_EXTENSION_MARKER: &str = "quill-managed:pi";
-const PAYLOAD_MARKER: &str = "quill-managed-pi-payload: 1";
+const PAYLOAD_MARKER: &str = "quill-managed-pi-payload: 2";
+const CONTEXT_HTTP_ENABLED_KEY: &str = "context_http.enabled";
+const FEATURES_PLACEHOLDER: &str =
+    "const FEATURES = { context_preservation: true, activity_tracking: true };";
 const AGENTS_BLOCK_START: &str = "<!-- quill-managed:pi:start -->";
 const AGENTS_BLOCK_END: &str = "<!-- quill-managed:pi:end -->";
 
@@ -163,16 +167,22 @@ fn validate_pi_version(output: &str) -> Result<String, String> {
 }
 
 // @lat: [[infrastructure#Infrastructure#Pi Integration Deployment]]
-pub fn install(app: &tauri::AppHandle, _features: IntegrationFeatures) -> Result<(), String> {
+pub fn install(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
     let paths = resolve_install_paths()?;
     let cli_path = crate::config::resolve_command_path("pi")
         .ok_or_else(|| "Pi CLI was not found in PATH".to_string())?;
     let version = validate_pi_version(&read_pi_version(&cli_path)?)?;
     let bundle = pi_bundle(app)?;
-    install_from_bundle(&bundle, &paths, &version)
+    install_from_bundle(&bundle, &paths, &version, features, &Storage::init()?)
 }
 
-fn install_from_bundle(bundle: &Path, paths: &PiInstallPaths, version: &str) -> Result<(), String> {
+fn install_from_bundle(
+    bundle: &Path,
+    paths: &PiInstallPaths,
+    version: &str,
+    features: IntegrationFeatures,
+    storage: &Storage,
+) -> Result<(), String> {
     validate_pi_version(version)?;
     validate_directory_path(&paths.config_dir, "Pi config directory")?;
     validate_directory_path(&paths.session_dir, "Pi session directory")?;
@@ -194,6 +204,7 @@ fn install_from_bundle(bundle: &Path, paths: &PiInstallPaths, version: &str) -> 
     }
 
     let snapshots = capture_snapshots(paths)?;
+    let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
     let setup = (|| {
         fs::create_dir_all(paths.extensions_dir()).map_err(|error| {
             format!(
@@ -211,7 +222,7 @@ fn install_from_bundle(bundle: &Path, paths: &PiInstallPaths, version: &str) -> 
                 })?;
             }
         }
-        fs::copy(bundle.join(EXTENSION_FILE), &extension).map_err(|error| {
+        fs::write(&extension, render_extension(bundle, features)?).map_err(|error| {
             format!(
                 "Failed to install Pi extension {}: {error}",
                 extension.display()
@@ -219,24 +230,29 @@ fn install_from_bundle(bundle: &Path, paths: &PiInstallPaths, version: &str) -> 
         })?;
         update_agents_block(&paths.agents_path(), &bundle.join(AGENTS_TEMPLATE_FILE))?;
         write_integration_state(paths, version)?;
-        verify_without_stamp(bundle, paths)?;
-        let stamp = current_stamp(bundle, version)?;
+        storage.set_setting(CONTEXT_HTTP_ENABLED_KEY, "true")?;
+        verify_without_stamp(bundle, paths, features, storage)?;
+        let stamp = current_stamp(bundle, version, features)?;
         write_deployment_stamp(&paths.provider_root, &stamp)?;
         Ok(())
     })();
 
     match setup {
         Ok(()) => snapshots.commit(),
-        Err(error) => Err(snapshots.restore_with_error(error)),
+        Err(error) => {
+            let error = restore_context_setting(storage, prior_context_setting, error);
+            Err(snapshots.restore_with_error(error))
+        }
     }
 }
 
 pub fn uninstall() -> Result<(), String> {
-    uninstall_with_paths(&resolve_uninstall_paths()?)
+    uninstall_with_paths(&resolve_uninstall_paths()?, &Storage::init()?)
 }
 
-fn uninstall_with_paths(paths: &PiInstallPaths) -> Result<(), String> {
+fn uninstall_with_paths(paths: &PiInstallPaths, storage: &Storage) -> Result<(), String> {
     let snapshots = capture_snapshots(paths)?;
+    let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
     let result = (|| {
         for extension in quill_extension_files(&paths.extensions_dir())? {
             remove_path(&extension).map_err(|error| {
@@ -251,34 +267,48 @@ fn uninstall_with_paths(paths: &PiInstallPaths) -> Result<(), String> {
             remove_path(&path)
                 .map_err(|error| format!("Failed to remove {}: {error}", path.display()))?;
         }
-        verify_uninstalled(paths)
+        // Pi is the only installed consumer of this listener today.
+        storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY)?;
+        verify_uninstalled(paths, storage)
     })();
     match result {
         Ok(()) => snapshots.commit(),
-        Err(error) => Err(snapshots.restore_with_error(error)),
+        Err(error) => {
+            let error = restore_context_setting(storage, prior_context_setting, error);
+            Err(snapshots.restore_with_error(error))
+        }
     }
 }
 
-pub fn verify(app: &tauri::AppHandle) -> Result<(), String> {
+pub fn verify(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
     let paths = resolve_install_paths()?;
-    verify_with_paths(&pi_bundle(app)?, &paths)
+    verify_with_paths(&pi_bundle(app)?, &paths, features, &Storage::init()?)
 }
 
-fn verify_with_paths(bundle: &Path, paths: &PiInstallPaths) -> Result<(), String> {
-    verify_without_stamp(bundle, paths)?;
+fn verify_with_paths(
+    bundle: &Path,
+    paths: &PiInstallPaths,
+    features: IntegrationFeatures,
+    storage: &Storage,
+) -> Result<(), String> {
+    verify_without_stamp(bundle, paths, features, storage)?;
     let state = load_state(&paths.state_path())?
         .ok_or_else(|| "Pi integration state is missing".to_string())?;
-    let stamp = current_stamp(bundle, &state.pi_version)?;
+    let stamp = current_stamp(bundle, &state.pi_version, features)?;
     if !deployment_stamp_matches(&paths.provider_root, &stamp) {
         return Err("Pi deployment stamp is stale".to_string());
     }
     Ok(())
 }
 
-fn verify_without_stamp(bundle: &Path, paths: &PiInstallPaths) -> Result<(), String> {
+fn verify_without_stamp(
+    bundle: &Path,
+    paths: &PiInstallPaths,
+    features: IntegrationFeatures,
+    storage: &Storage,
+) -> Result<(), String> {
     verify_bundle(bundle)?;
-    let expected = fs::read(bundle.join(EXTENSION_FILE))
-        .map_err(|error| format!("Failed to read bundled Pi extension: {error}"))?;
+    let expected = render_extension(bundle, features)?;
     let actual = fs::read(paths.extension_path())
         .map_err(|error| format!("Failed to read installed Pi extension: {error}"))?;
     if actual != expected || !contains_bytes(&actual, PAYLOAD_MARKER.as_bytes()) {
@@ -298,28 +328,54 @@ fn verify_without_stamp(bundle: &Path, paths: &PiInstallPaths) -> Result<(), Str
         return Err("Pi integration state does not match its install paths".to_string());
     }
     validate_pi_version(&state.pi_version)?;
+    if storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?.as_deref() != Some("true") {
+        return Err("Pi context HTTP listener setting is disabled".to_string());
+    }
     Ok(())
 }
 
-pub(crate) fn deployment_is_current(
-    app: &tauri::AppHandle,
-    _features: IntegrationFeatures,
-) -> bool {
-    verify(app).is_ok()
+pub(crate) fn deployment_is_current(app: &tauri::AppHandle, features: IntegrationFeatures) -> bool {
+    verify(app, features).is_ok()
 }
 
 #[cfg(test)]
-fn deployment_is_current_with_paths(bundle: &Path, paths: &PiInstallPaths) -> bool {
-    verify_with_paths(bundle, paths).is_ok()
+fn deployment_is_current_with_paths(
+    bundle: &Path,
+    paths: &PiInstallPaths,
+    features: IntegrationFeatures,
+    storage: &Storage,
+) -> bool {
+    verify_with_paths(bundle, paths, features, storage).is_ok()
 }
 
 pub(crate) fn recover_interrupted_install() -> Result<(), String> {
-    recover_staged_batch(&[provider_root().join("configuration")])
+    let paths = resolve_uninstall_paths()?;
+    recover_interrupted_install_with_paths(&paths, &Storage::init()?)
 }
 
-#[cfg(test)]
-fn recover_interrupted_install_with_paths(paths: &PiInstallPaths) -> Result<(), String> {
-    recover_staged_batch(&paths.transaction_targets())
+fn recover_interrupted_install_with_paths(
+    paths: &PiInstallPaths,
+    storage: &Storage,
+) -> Result<(), String> {
+    recover_staged_batch(&paths.transaction_targets())?;
+    let installed = paths.extension_path().is_file()
+        && is_quill_extension(&paths.extension_path()).unwrap_or(false);
+    if installed {
+        storage.set_setting(CONTEXT_HTTP_ENABLED_KEY, "true")
+    } else {
+        storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY)
+    }
+}
+
+fn restore_context_setting(storage: &Storage, prior: Option<String>, primary: String) -> String {
+    let restored = match prior {
+        Some(value) => storage.set_setting(CONTEXT_HTTP_ENABLED_KEY, &value),
+        None => storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY),
+    };
+    match restored {
+        Ok(()) => primary,
+        Err(error) => format!("{primary}; context HTTP setting rollback failed: {error}"),
+    }
 }
 
 fn capture_snapshots(paths: &PiInstallPaths) -> Result<FileSnapshots, String> {
@@ -337,11 +393,37 @@ fn capture_snapshots(paths: &PiInstallPaths) -> Result<FileSnapshots, String> {
     FileSnapshots::capture(&paths.transaction_targets(), &files)
 }
 
-fn current_stamp(bundle: &Path, version: &str) -> Result<String, String> {
+fn current_stamp(
+    bundle: &Path,
+    version: &str,
+    features: IntegrationFeatures,
+) -> Result<String, String> {
     deployment_stamp_current(
         &[bundle],
-        &format!("{}\u{1f}{version}", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "{}\u{1f}{version}\u{1f}{}\u{1f}{}",
+            env!("CARGO_PKG_VERSION"),
+            features.context_preservation,
+            features.activity_tracking,
+        ),
     )
+}
+
+fn render_extension(bundle: &Path, features: IntegrationFeatures) -> Result<Vec<u8>, String> {
+    let source = fs::read_to_string(bundle.join(EXTENSION_FILE))
+        .map_err(|error| format!("Failed to read bundled Pi extension: {error}"))?;
+    if !source.contains(FEATURES_PLACEHOLDER) {
+        return Err("Bundled Pi extension feature marker is missing".to_string());
+    }
+    Ok(source
+        .replace(
+            FEATURES_PLACEHOLDER,
+            &format!(
+                "const FEATURES = {{ context_preservation: {}, activity_tracking: {} }};",
+                features.context_preservation, features.activity_tracking,
+            ),
+        )
+        .into_bytes())
 }
 
 fn pi_bundle(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -368,6 +450,9 @@ fn verify_bundle(bundle: &Path) -> Result<(), String> {
         .map_err(|error| format!("Failed to read bundled Pi extension: {error}"))?;
     if !contains_bytes(&payload, PAYLOAD_MARKER.as_bytes()) {
         return Err("Bundled Pi extension payload marker is missing".to_string());
+    }
+    if !contains_bytes(&payload, FEATURES_PLACEHOLDER.as_bytes()) {
+        return Err("Bundled Pi extension feature marker is missing".to_string());
     }
     Ok(())
 }
@@ -661,7 +746,7 @@ fn remove_agents_block(path: &Path) -> Result<(), String> {
     }
 }
 
-fn verify_uninstalled(paths: &PiInstallPaths) -> Result<(), String> {
+fn verify_uninstalled(paths: &PiInstallPaths, storage: &Storage) -> Result<(), String> {
     if !quill_extension_files(&paths.extensions_dir())?.is_empty() {
         return Err("A Quill-owned Pi extension remains after uninstall".to_string());
     }
@@ -672,6 +757,9 @@ fn verify_uninstalled(paths: &PiInstallPaths) -> Result<(), String> {
     }
     if paths.state_path().exists() || paths.stamp_path().exists() {
         return Err("Pi lifecycle metadata remains after uninstall".to_string());
+    }
+    if storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?.is_some() {
+        return Err("Pi context HTTP listener setting remains after uninstall".to_string());
     }
     Ok(())
 }
@@ -737,14 +825,14 @@ pub(crate) fn resolve_session_dir_from(
 mod tests {
     use super::*;
 
-    const PAYLOAD: &str =
-        "// quill-managed:pi\n// quill-managed-pi-payload: 1\nexport default function quill() {}\n";
+    const PAYLOAD: &str = "// quill-managed:pi\n// quill-managed-pi-payload: 2\nconst FEATURES = { context_preservation: true, activity_tracking: true };\nexport default function quill() {}\n";
     const AGENTS: &str = "<!-- quill-managed:pi:start -->\n## Quill Session History\n\nUse `quill_search_history`.\n<!-- quill-managed:pi:end -->\n";
 
     struct Harness {
         _temp: tempfile::TempDir,
         bundle: PathBuf,
         paths: PiInstallPaths,
+        storage: Storage,
     }
 
     impl Harness {
@@ -760,10 +848,12 @@ mod tests {
                 session_dir: config_dir.join("sessions"),
                 config_dir,
             };
+            let storage = Storage::init_at(temp.path().join("quill.db"), false).unwrap();
             Self {
                 _temp: temp,
                 bundle,
                 paths,
+                storage,
             }
         }
     }
@@ -810,11 +900,19 @@ mod tests {
         fs::write(&agents, b"user bytes without newline").unwrap();
         fs::write(&other, b"export default () => 42;\n").unwrap();
 
-        install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap();
-        verify_with_paths(&harness.bundle, &harness.paths).unwrap();
+        let features = IntegrationFeatures::default();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+        verify_with_paths(&harness.bundle, &harness.paths, features, &harness.storage).unwrap();
         assert_eq!(fs::read(&other).unwrap(), b"export default () => 42;\n");
 
-        uninstall_with_paths(&harness.paths).unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage).unwrap();
         assert_eq!(fs::read(&agents).unwrap(), b"user bytes without newline");
         assert_eq!(fs::read(&other).unwrap(), b"export default () => 42;\n");
         assert!(!harness.paths.extension_path().exists());
@@ -829,18 +927,34 @@ mod tests {
         let agents = harness.paths.agents_path();
         fs::create_dir_all(harness.paths.extensions_dir()).unwrap();
         fs::write(&agents, b"original agents").unwrap();
-        fs::write(harness.paths.extension_path(), b"original extension").unwrap();
+        fs::write(harness.paths.extension_path(), PAYLOAD).unwrap();
+        harness
+            .storage
+            .set_setting(CONTEXT_HTTP_ENABLED_KEY, "true")
+            .unwrap();
 
         let snapshots = capture_snapshots(&harness.paths).unwrap();
         fs::write(&agents, b"partial agents").unwrap();
         fs::write(harness.paths.extension_path(), b"partial extension").unwrap();
+        harness
+            .storage
+            .delete_setting(CONTEXT_HTTP_ENABLED_KEY)
+            .unwrap();
         drop(snapshots);
 
-        recover_interrupted_install_with_paths(&harness.paths).unwrap();
+        recover_interrupted_install_with_paths(&harness.paths, &harness.storage).unwrap();
         assert_eq!(fs::read(&agents).unwrap(), b"original agents");
         assert_eq!(
             fs::read(harness.paths.extension_path()).unwrap(),
-            b"original extension"
+            PAYLOAD.as_bytes()
+        );
+        assert_eq!(
+            harness
+                .storage
+                .get_setting(CONTEXT_HTTP_ENABLED_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("true")
         );
     }
 
@@ -848,14 +962,31 @@ mod tests {
     #[test]
     fn verification_rejects_stale_or_tampered_deployments() {
         let harness = Harness::new();
-        install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap();
+        let features = IntegrationFeatures::default();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
 
         fs::write(harness.paths.stamp_path(), "stale").unwrap();
         assert!(!deployment_is_current_with_paths(
             &harness.bundle,
-            &harness.paths
+            &harness.paths,
+            features,
+            &harness.storage
         ));
-        install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
 
         fs::write(
             harness.paths.extension_path(),
@@ -865,39 +996,76 @@ mod tests {
             ),
         )
         .unwrap();
-        assert!(verify_with_paths(&harness.bundle, &harness.paths).is_err());
-        install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap();
+        assert!(
+            verify_with_paths(&harness.bundle, &harness.paths, features, &harness.storage).is_err()
+        );
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
 
         fs::write(harness.paths.agents_path(), "user only").unwrap();
-        assert!(verify_with_paths(&harness.bundle, &harness.paths).is_err());
-        install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap();
+        assert!(
+            verify_with_paths(&harness.bundle, &harness.paths, features, &harness.storage).is_err()
+        );
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
 
         let orphan = harness.paths.extensions_dir().join("old-quill.ts");
         fs::write(&orphan, "// quill-managed:pi\n").unwrap();
-        assert!(verify_with_paths(&harness.bundle, &harness.paths).is_err());
+        assert!(
+            verify_with_paths(&harness.bundle, &harness.paths, features, &harness.storage).is_err()
+        );
         fs::remove_file(orphan).unwrap();
 
         fs::write(harness.paths.state_path(), "not json").unwrap();
-        assert!(verify_with_paths(&harness.bundle, &harness.paths).is_err());
+        assert!(
+            verify_with_paths(&harness.bundle, &harness.paths, features, &harness.storage).is_err()
+        );
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Owned File Boundaries]]
     #[test]
     fn install_sweeps_only_marked_orphans_and_refuses_user_quill_ts() {
         let harness = Harness::new();
+        let features = IntegrationFeatures::default();
         fs::create_dir_all(harness.paths.extensions_dir()).unwrap();
         let orphan = harness.paths.extensions_dir().join("old-quill.ts");
         let other = harness.paths.extensions_dir().join("other.ts");
         fs::write(&orphan, "// quill-managed:pi\n").unwrap();
         fs::write(&other, "// user extension\n").unwrap();
 
-        install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
         assert!(!orphan.exists());
         assert!(other.exists());
 
-        uninstall_with_paths(&harness.paths).unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage).unwrap();
         fs::write(harness.paths.extension_path(), "// user owns this\n").unwrap();
-        let error = install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap_err();
+        let error = install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap_err();
         assert!(error.contains("not Quill-owned"));
         assert_eq!(
             fs::read_to_string(harness.paths.extension_path()).unwrap(),
@@ -912,7 +1080,14 @@ mod tests {
             let target = harness.paths.config_dir.join("outside.ts");
             fs::write(&target, PAYLOAD).unwrap();
             symlink(&target, harness.paths.extension_path()).unwrap();
-            let error = install_from_bundle(&harness.bundle, &harness.paths, "0.84.1").unwrap_err();
+            let error = install_from_bundle(
+                &harness.bundle,
+                &harness.paths,
+                "0.84.1",
+                features,
+                &harness.storage,
+            )
+            .unwrap_err();
             assert!(error.contains("symbolic link"));
             assert_eq!(fs::read_to_string(target).unwrap(), PAYLOAD);
         }
@@ -952,5 +1127,71 @@ mod tests {
                 .join(EXTENSION_FILE)
                 .is_file()
         );
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Context HTTP Setting]]
+    #[test]
+    fn install_and_uninstall_wire_the_context_http_setting() {
+        let harness = Harness::new();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            IntegrationFeatures::default(),
+            &harness.storage,
+        )
+        .unwrap();
+        let after_install = harness
+            .storage
+            .get_setting(CONTEXT_HTTP_ENABLED_KEY)
+            .unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage).unwrap();
+        let after_uninstall = harness
+            .storage
+            .get_setting(CONTEXT_HTTP_ENABLED_KEY)
+            .unwrap();
+
+        assert_eq!(after_install.as_deref(), Some("true"));
+        assert_eq!(after_uninstall, None);
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Feature-gated Payload]]
+    #[test]
+    fn deployed_payload_and_stamp_follow_integration_features() {
+        let harness = Harness::new();
+        let features = IntegrationFeatures {
+            context_preservation: false,
+            activity_tracking: true,
+            ..IntegrationFeatures::default()
+        };
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+        let installed = fs::read_to_string(harness.paths.extension_path()).unwrap();
+        assert!(installed.contains(
+            "const FEATURES = { context_preservation: false, activity_tracking: true };"
+        ));
+        assert!(deployment_is_current_with_paths(
+            &harness.bundle,
+            &harness.paths,
+            features,
+            &harness.storage,
+        ));
+
+        let disabled = IntegrationFeatures {
+            activity_tracking: false,
+            ..features
+        };
+        assert!(!deployment_is_current_with_paths(
+            &harness.bundle,
+            &harness.paths,
+            disabled,
+            &harness.storage,
+        ));
     }
 }

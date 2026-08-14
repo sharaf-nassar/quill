@@ -5465,7 +5465,7 @@ impl Storage {
         Self::init_at(path.to_path_buf(), false).map(drop)
     }
 
-    fn init_at(path: PathBuf, production_startup: bool) -> Result<Self, String> {
+    pub(crate) fn init_at(path: PathBuf, production_startup: bool) -> Result<Self, String> {
         let mut conn =
             Connection::open(&path).map_err(|e| format!("Failed to open database: {e}"))?;
 

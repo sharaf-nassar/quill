@@ -891,6 +891,10 @@ requested at the analyze gate as part of plan approval.
 - E2E numeric criteria: synthetic pi corpus, enable, searchable within
   15 seconds of transcript write; usage totals equal transcript sums.
 
+### Item 11a measured evidence
+
+Pi 0.84.1 loaded bundled `quill.ts` with isolated config and session roots, called `quill_context_stats` once, persisted the session, and completed in 1016.4 ms end to end. The Node timing case kept synchronous handler work below 10 ms.
+
 ## Risks
 
 - **TypeBox runtime resolution is closed for pi 0.84.1.** The extension uses

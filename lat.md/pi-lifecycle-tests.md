@@ -41,3 +41,11 @@ Enabled Pi installs participate in startup repair and feature-triggered lifecycl
 ## Typed Detection Errors
 
 Saved enablement cannot hide a fresh version, path, or writability error reported by Pi detection.
+
+## Context HTTP Setting
+
+Install enables the setting-gated loopback context listener, uninstall clears it, and both changes share the recoverable deployment transaction.
+
+## Feature-gated Payload
+
+Deployment renders only the two Pi feature flags into `quill.ts`, and either flag changing invalidates the payload stamp until reinstall.
