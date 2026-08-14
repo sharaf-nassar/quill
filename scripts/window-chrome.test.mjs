@@ -47,7 +47,7 @@ test("macOS config repeats the complete main window and preserves transparency",
   assert.equal(decorations, true);
   assert.equal(titleBarStyle, "Overlay");
   assert.equal(hiddenTitle, true);
-  assert.equal(mac.app.macOSPrivateApi, true);
+  assert.equal(base.app.macOSPrivateApi, true);
 
   const native = readFileSync("src-tauri/src/window_chrome.rs", "utf8");
   assert.match(native, /\.on_window_ready\(hide_standard_buttons\)/);

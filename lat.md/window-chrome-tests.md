@@ -12,4 +12,4 @@ macOS uses native overlay chrome while Linux and Windows retain decorationless w
 
 ## macOS main-window override
 
-The macOS platform config repeats every base main-window field, then enables overlay chrome, hidden title text, and private transparency support.
+The macOS platform config repeats every base main-window field and enables overlay chrome and hidden title text, while the merged base config supplies private transparency support.
