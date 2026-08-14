@@ -413,7 +413,7 @@ function directRows(
 ): LimitsRow[] {
   const loaded = data !== null;
   return statuses
-    .filter((status) => status.enabled)
+    .filter((status) => status.enabled && status.provider !== "pi")
     .map((status) => {
       const cells = directCells(status.provider, data?.buckets ?? [], nowMs);
       const providerError =
@@ -906,8 +906,10 @@ function LimitsSection({
       </div>
       {providerOrder.map((provider) => {
         const directRow = directByProvider.get(provider);
-        const cpaRow =
-          provider === "mini_max" ? undefined : cpaByProvider.get(provider);
+        const cpaProvider = asCpaProvider(provider);
+        const cpaRow = cpaProvider
+          ? cpaByProvider.get(cpaProvider)
+          : undefined;
         const showCpa =
           cpaRow !== undefined &&
           (cpaPoolProviders.has(cpaRow.provider) || directRow === undefined);

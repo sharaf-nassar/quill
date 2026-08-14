@@ -928,10 +928,7 @@ async fn post_hook_observed(
     if payload.session_id.is_empty() || payload.session_id.len() > MAX_SESSION_ID_LEN {
         return (StatusCode::BAD_REQUEST, "Invalid session_id".to_string());
     }
-    if !matches!(
-        payload.provider,
-        IntegrationProvider::Claude | IntegrationProvider::Codex
-    ) {
+    if !is_supported_observed_hook_provider(payload.provider) {
         return (StatusCode::BAD_REQUEST, "Invalid provider".to_string());
     }
     if !is_supported_observed_hook_event(payload.provider, &payload.hook_event) {
@@ -984,6 +981,13 @@ async fn post_hook_observed(
 
     store_hook_in_background(state.storage, state.app_handle.clone(), payload);
     (StatusCode::ACCEPTED, "queued".to_string())
+}
+
+fn is_supported_observed_hook_provider(provider: IntegrationProvider) -> bool {
+    matches!(
+        provider,
+        IntegrationProvider::Claude | IntegrationProvider::Codex | IntegrationProvider::Pi
+    )
 }
 
 fn is_supported_observed_hook_event(provider: IntegrationProvider, event: &str) -> bool {
@@ -1774,7 +1778,9 @@ mod observed_subagent_tests {
     use super::*;
 
     #[test]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Hook Observation Contract]]
     fn hook_validation_accepts_provider_terminal_events() {
+        assert!(is_supported_observed_hook_provider(IntegrationProvider::Pi));
         for event in ["Stop", "StopFailure", "SessionEnd"] {
             assert!(is_supported_observed_hook_event(
                 IntegrationProvider::Claude,
@@ -1791,5 +1797,17 @@ mod observed_subagent_tests {
             IntegrationProvider::Codex,
             "StopFailure"
         ));
+        for event in [
+            "SessionStart",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SessionEnd",
+        ] {
+            assert!(is_supported_observed_hook_event(
+                IntegrationProvider::Pi,
+                event
+            ));
+        }
     }
 }

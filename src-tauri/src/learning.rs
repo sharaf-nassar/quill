@@ -57,7 +57,9 @@ pub fn is_safe_rule_name(name: &str) -> bool {
 
 fn requested_provider_scope(provider: Option<IntegrationProvider>) -> Vec<IntegrationProvider> {
     match provider {
+        Some(IntegrationProvider::Pi) => Vec::new(),
         Some(provider) => vec![provider],
+        // Pi does not participate in learning analysis in v1.
         None => vec![IntegrationProvider::Claude, IntegrationProvider::Codex],
     }
 }
@@ -161,6 +163,7 @@ fn provider_scope_label(provider_scope: &[IntegrationProvider]) -> String {
         .map(|provider| match provider {
             IntegrationProvider::Claude => "Claude Code",
             IntegrationProvider::Codex => "Codex",
+            IntegrationProvider::Pi => "Pi",
             IntegrationProvider::MiniMax => "MiniMax",
         })
         .collect();
@@ -891,6 +894,9 @@ pub async fn spawn_analysis(
     app: &tauri::AppHandle,
     micro: bool,
 ) -> Result<(), String> {
+    if provider == Some(IntegrationProvider::Pi) {
+        return Err("Learning analysis is not supported for Pi.".to_string());
+    }
     // ── Phase 0: Setup ──────────────────────────────────────────────────
     let phase0_start = Instant::now();
     let provider_scope = requested_provider_scope(provider);
@@ -1900,6 +1906,12 @@ pub fn sanitize_rule_content(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Deferred Learning]]
+    fn pi_is_excluded_from_learning_scope() {
+        assert!(requested_provider_scope(Some(IntegrationProvider::Pi)).is_empty());
+    }
 
     #[test]
     fn sanitize_rule_content_strips_code_fences() {

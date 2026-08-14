@@ -1332,7 +1332,7 @@ fn resolve_native_identity(
             resolve_codex_native_identity(records)?,
             TranscriptRecordDiagnostics::default(),
         ),
-        IntegrationProvider::MiniMax => {
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => {
             return Err(TranscriptAnalyticsError::UnsupportedProvider);
         }
     };

@@ -210,6 +210,7 @@ export interface SkillBreakdown {
   total_count: number;
   claude_count: number;
   codex_count: number;
+  pi_count: number;
   project_count: number;
   last_used: string;
 }
@@ -229,6 +230,7 @@ export interface HookBreakdown {
   is_quill: boolean;
   codex_count: number;
   claude_count: number;
+  pi_count: number;
   total_count: number;
   last_fired_at: string;
 }
@@ -276,7 +278,7 @@ export interface PendingUpdate {
 
 // Integration provider types
 
-export type IntegrationProvider = "claude" | "codex" | "mini_max";
+export type IntegrationProvider = "claude" | "codex" | "pi" | "mini_max";
 export type IndicatorPrimaryProvider = IntegrationProvider | null;
 export type ProviderFilter = "all" | IntegrationProvider;
 

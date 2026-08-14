@@ -1090,7 +1090,7 @@ fn learned_rule_dirs(provider: Option<IntegrationProvider>) -> Vec<PathBuf> {
             push_unique_dir(&mut dirs, codex_dir);
             push_unique_dir(&mut dirs, shared_dir);
         }
-        Some(IntegrationProvider::MiniMax) => {}
+        Some(IntegrationProvider::Pi | IntegrationProvider::MiniMax) => {}
         None => {
             push_unique_dir(&mut dirs, claude_dir);
             push_unique_dir(&mut dirs, codex_dir);
@@ -1116,6 +1116,7 @@ fn inferred_rule_provider_scope(path: &std::path::Path) -> Vec<IntegrationProvid
         IntegrationProvider::Codex,
     ]);
     if path.starts_with(&shared_dir) {
+        // Pi has no learned-rule scope in v1.
         return vec![IntegrationProvider::Claude, IntegrationProvider::Codex];
     }
 
@@ -12782,10 +12783,11 @@ impl Storage {
                  COUNT(*) AS total_count,
                  COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
                  COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
+                 COALESCE(SUM(CASE WHEN provider = 'pi' THEN 1 ELSE 0 END), 0) AS pi_count,
                  COUNT(DISTINCT cwd) AS project_count,
                  MAX(timestamp) AS last_used
              FROM skill_usages
-             WHERE provider IN ('claude', 'codex')",
+             WHERE provider IN ('claude', 'codex', 'pi')",
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -12813,8 +12815,9 @@ impl Storage {
                     total_count: row.get(1)?,
                     claude_count: row.get(2)?,
                     codex_count: row.get(3)?,
-                    project_count: row.get(4)?,
-                    last_used: row.get(5)?,
+                    pi_count: row.get(4)?,
+                    project_count: row.get(5)?,
+                    last_used: row.get(6)?,
                 })
             })
             .map_err(|e| format!("Query error: {e}"))?;
@@ -12872,10 +12875,11 @@ impl Storage {
                  CASE WHEN hook_identity LIKE 'quill:%' THEN 1 ELSE 0 END AS is_quill,
                  COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
                  COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
+                 COALESCE(SUM(CASE WHEN provider = 'pi' THEN 1 ELSE 0 END), 0) AS pi_count,
                  COUNT(*) AS total_count,
                  MAX(timestamp) AS last_fired_at
              FROM hook_invocations hi
-             WHERE provider IN ('claude', 'codex')",
+             WHERE provider IN ('claude', 'codex', 'pi')",
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -12909,8 +12913,9 @@ impl Storage {
                     is_quill: is_quill_i != 0,
                     codex_count: row.get(4)?,
                     claude_count: row.get(5)?,
-                    total_count: row.get(6)?,
-                    last_fired_at: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    pi_count: row.get(6)?,
+                    total_count: row.get(7)?,
+                    last_fired_at: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
                 })
             })
             .map_err(|e| format!("Query hook breakdown: {e}"))?;
@@ -12945,10 +12950,11 @@ impl Storage {
                  COUNT(*) AS total_count,
                  COALESCE(SUM(CASE WHEN provider = 'claude' THEN 1 ELSE 0 END), 0) AS claude_count,
                  COALESCE(SUM(CASE WHEN provider = 'codex' THEN 1 ELSE 0 END), 0) AS codex_count,
+                 COALESCE(SUM(CASE WHEN provider = 'pi' THEN 1 ELSE 0 END), 0) AS pi_count,
                  MAX(timestamp) AS last_used
              FROM skill_usages
              WHERE skill_name = ?1
-               AND provider IN ('claude', 'codex')",
+               AND provider IN ('claude', 'codex', 'pi')",
         );
 
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -12978,7 +12984,8 @@ impl Storage {
                 let total_count: i64 = row.get(2)?;
                 let claude_count: i64 = row.get(3)?;
                 let codex_count: i64 = row.get(4)?;
-                let last_used: String = row.get(5)?;
+                let pi_count: i64 = row.get(5)?;
+                let last_used: String = row.get(6)?;
                 Ok(SkillProjectBreakdown {
                     skill_name: skill_name.to_string(),
                     project: cwd,
@@ -12986,6 +12993,7 @@ impl Storage {
                     total_count,
                     claude_count,
                     codex_count,
+                    pi_count,
                     last_used,
                 })
             })
@@ -13035,11 +13043,13 @@ impl Storage {
                 total_count: 0,
                 claude_count: 0,
                 codex_count: 0,
+                pi_count: 0,
                 last_used: String::new(),
             });
             entry.total_count += row.total_count;
             entry.claude_count += row.claude_count;
             entry.codex_count += row.codex_count;
+            entry.pi_count += row.pi_count;
             if row.last_used > entry.last_used {
                 entry.last_used = row.last_used;
             }
@@ -15071,6 +15081,7 @@ impl Storage {
                 }
                 "commit" => {}
                 "session" => {
+                    // Pi lookup lands with its transcript parser and indexer.
                     let found = [IntegrationProvider::Claude, IntegrationProvider::Codex]
                         .into_iter()
                         .any(|p| {
@@ -18862,6 +18873,60 @@ mod tests {
             std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
             std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
         }
+    }
+
+    #[test]
+    #[serial]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Provider Breakdowns]]
+    fn pi_rows_surface_in_provider_breakdowns() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO skill_usages (
+                    provider, session_id, chain_id, message_id, skill_name, skill_path,
+                    timestamp, cwd, hostname
+                 ) VALUES ('pi', 'pi-session', 'pi-session', 'pi-message', 'inspect',
+                           '/skills/inspect', '2030-01-01T00:00:00Z',
+                           '/work/pi', 'host')",
+                [],
+            )
+            .expect("insert pi skill usage");
+            conn.execute(
+                "INSERT INTO hook_invocations (
+                    provider, session_id, chain_id, timestamp, hook_event,
+                    hook_identity, cwd, hostname
+                 ) VALUES ('pi', 'pi-session', 'pi-session', '2030-01-01T00:00:01Z',
+                           'PreToolUse', 'PreToolUse:Bash', '/work/pi', 'host')",
+                [],
+            )
+            .expect("insert pi hook");
+        }
+
+        let skills = storage
+            .get_skill_breakdown("30d", Some(IntegrationProvider::Pi), true, None)
+            .expect("pi skill breakdown");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].pi_count, 1);
+        let projects = storage
+            .get_skill_project_breakdown(
+                "inspect",
+                "30d",
+                Some(IntegrationProvider::Pi),
+                true,
+                None,
+            )
+            .expect("pi skill project breakdown");
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].pi_count, 1);
+        let hooks = storage
+            .get_hook_breakdown("30d", Some(IntegrationProvider::Pi), true, None)
+            .expect("pi hook breakdown");
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].pi_count, 1);
+        clear_env();
     }
 
     // @lat: [[widget-range-tests#Widget Range Query Tests#Internal Comparison Ranges Are Exact]]

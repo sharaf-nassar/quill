@@ -115,6 +115,7 @@ pub fn memory_dir(project_path: &str) -> PathBuf {
 fn included_providers(provider: Option<IntegrationProvider>) -> Vec<IntegrationProvider> {
     match provider {
         Some(provider) => vec![provider],
+        // Pi instruction files are excluded from Memory Optimizer in v1.
         None => vec![IntegrationProvider::Claude, IntegrationProvider::Codex],
     }
 }
@@ -122,8 +123,7 @@ fn included_providers(provider: Option<IntegrationProvider>) -> Vec<IntegrationP
 fn provider_memory_dir(provider: IntegrationProvider, project_path: &str) -> Option<PathBuf> {
     match provider {
         IntegrationProvider::Claude => Some(memory_dir(project_path)),
-        IntegrationProvider::Codex => None,
-        IntegrationProvider::MiniMax => None,
+        IntegrationProvider::Codex | IntegrationProvider::Pi | IntegrationProvider::MiniMax => None,
     }
 }
 
@@ -176,7 +176,7 @@ fn instruction_candidates(
                 "Global Codex instructions".to_string(),
             ),
         ],
-        IntegrationProvider::MiniMax => vec![],
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => vec![],
     }
 }
 

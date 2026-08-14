@@ -338,6 +338,7 @@ pub struct SkillBreakdown {
     pub total_count: i64,
     pub claude_count: i64,
     pub codex_count: i64,
+    pub pi_count: i64,
     pub project_count: i64,
     pub last_used: String,
 }
@@ -350,6 +351,7 @@ pub struct SkillProjectBreakdown {
     pub total_count: i64,
     pub claude_count: i64,
     pub codex_count: i64,
+    pub pi_count: i64,
     pub last_used: String,
 }
 
@@ -369,6 +371,7 @@ pub struct HookBreakdown {
     pub is_quill: bool,
     pub codex_count: i64,
     pub claude_count: i64,
+    pub pi_count: i64,
     pub total_count: i64,
     pub last_fired_at: String,
 }

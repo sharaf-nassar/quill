@@ -98,6 +98,9 @@ pub fn confirm_enable_with_key(
         IntegrationProvider::Codex => {
             codex::install(app, features)?;
         }
+        IntegrationProvider::Pi => {
+            return Err("Pi integration lifecycle is not available yet.".to_string());
+        }
         IntegrationProvider::MiniMax => {
             let key = api_key
                 .map(|k| k.trim().to_string())
@@ -225,6 +228,9 @@ pub fn confirm_disable(
         }
         IntegrationProvider::Codex => {
             codex::uninstall(remove_shared_restart_assets)?;
+        }
+        IntegrationProvider::Pi => {
+            return Err("Pi integration lifecycle is not available yet.".to_string());
         }
         IntegrationProvider::MiniMax => {
             minimax::delete_api_key(&storage)?;
@@ -405,6 +411,7 @@ fn sync_brevity_blocks(
         .map(|status| status.provider)
         .collect();
 
+    // Pi brevity injection is deferred in v1.
     for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
         let present = providers_with_block.contains(&provider);
         if let Err(err) = brevity::apply_block(provider, present, &providers_with_block) {
@@ -431,6 +438,9 @@ fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, Stri
     match provider {
         IntegrationProvider::Claude => crate::claude_setup::detect(),
         IntegrationProvider::Codex => codex::detect(),
+        IntegrationProvider::Pi => {
+            Err("Pi integration lifecycle is not available yet.".to_string())
+        }
         IntegrationProvider::MiniMax => minimax::detect(),
     }
 }
@@ -519,7 +529,7 @@ fn repair_provider(
             }
             codex::install(app, features)
         }
-        IntegrationProvider::MiniMax => Ok(()),
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(()),
     }
 }
 
@@ -537,7 +547,7 @@ fn sync_features_for_enabled_providers(
         let result = match status.provider {
             IntegrationProvider::Claude => crate::claude_setup::install(app, features),
             IntegrationProvider::Codex => codex::install(app, features),
-            IntegrationProvider::MiniMax => Ok(()),
+            IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(()),
         };
 
         match result {
@@ -592,13 +602,27 @@ fn load_saved_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String>
         return Ok(Vec::new());
     };
 
-    match serde_json::from_str(&json) {
-        Ok(statuses) => Ok(statuses),
+    Ok(parse_saved_statuses(&json))
+}
+
+fn parse_saved_statuses(json: &str) -> Vec<ProviderStatus> {
+    let entries = match serde_json::from_str::<Vec<serde_json::Value>>(json) {
+        Ok(entries) => entries,
         Err(err) => {
             log::warn!("Failed to parse saved provider settings; ignoring cached value: {err}");
-            Ok(Vec::new())
+            return Vec::new();
         }
-    }
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| match serde_json::from_value(entry) {
+            Ok(status) => Some(status),
+            Err(err) => {
+                log::warn!("Skipping invalid saved provider entry: {err}");
+                None
+            }
+        })
+        .collect()
 }
 
 fn save_statuses(storage: &Storage, statuses: &[ProviderStatus]) -> Result<(), String> {
@@ -628,5 +652,43 @@ fn emit_statuses(app: &AppHandle, statuses: &[ProviderStatus]) {
 fn emit_context_preservation_status(app: &AppHandle, status: &ContextPreservationStatus) {
     if let Err(err) = app.emit("context-preservation-updated", status) {
         log::warn!("Failed to emit context-preservation-updated event: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Saved Status Tolerance]]
+    fn saved_statuses_skip_unknown_providers_without_dropping_known_entries() {
+        let json = r#"[
+            {
+                "provider":"claude",
+                "detectedCli":true,
+                "detectedHome":true,
+                "enabled":true,
+                "setupState":"installed",
+                "userHasMadeChoice":true,
+                "lastError":null,
+                "lastVerifiedAt":null
+            },
+            {
+                "provider":"future_provider",
+                "detectedCli":true,
+                "detectedHome":true,
+                "enabled":true,
+                "setupState":"installed",
+                "userHasMadeChoice":true,
+                "lastError":null,
+                "lastVerifiedAt":null
+            }
+        ]"#;
+
+        let statuses = parse_saved_statuses(json);
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].provider, IntegrationProvider::Claude);
+        assert!(statuses[0].enabled);
     }
 }

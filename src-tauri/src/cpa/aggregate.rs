@@ -26,6 +26,7 @@ pub(crate) fn is_usable_account_status(status: &str) -> bool {
 
 // @lat: [[features#Features#Live Usage View#CPA Pool Aggregation]]
 pub(crate) fn compute_cpa_pools(accounts: &[CpaAccountSnapshot]) -> Vec<CpaPoolAggregate> {
+    // Pi has transcript usage only and no quota pool in v1.
     [IntegrationProvider::Claude, IntegrationProvider::Codex]
         .into_iter()
         .filter_map(|provider| compute_provider_pool(accounts, provider))

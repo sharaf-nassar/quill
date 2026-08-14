@@ -25,6 +25,7 @@ fn rule_watcher_enabled(storage: &Storage) -> bool {
 }
 
 fn rule_directories() -> Vec<PathBuf> {
+    // Pi has no learning-rule scope in v1.
     vec![
         learned_rules_dir_for_scope(&[IntegrationProvider::Claude]),
         learned_rules_dir_for_scope(&[IntegrationProvider::Codex]),

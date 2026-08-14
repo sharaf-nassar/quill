@@ -798,10 +798,12 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
             }
             let mut claude = 0usize;
             let mut codex = 0usize;
+            let mut pi = 0usize;
             for source in &changed {
                 match source.provider {
                     integrations::IntegrationProvider::Claude => claude += 1,
                     integrations::IntegrationProvider::Codex => codex += 1,
+                    integrations::IntegrationProvider::Pi => pi += 1,
                     integrations::IntegrationProvider::MiniMax => {}
                 }
             }
@@ -811,8 +813,8 @@ fn spawn_transcript_rescan_loop(app: tauri::AppHandle) {
                 }
             }
             log::info!(
-                "Transcript rescan enqueued {} changed sources (claude={claude} codex={codex})",
-                claude + codex,
+                "Transcript rescan enqueued {} changed sources (claude={claude} codex={codex} pi={pi})",
+                claude + codex + pi,
             );
         }
     });
@@ -2878,6 +2880,9 @@ async fn refresh_usage_cache(
                             });
                         }
                     }
+                }
+                integrations::IntegrationProvider::Pi => {
+                    // Pi has transcript analytics but no quota API in v1.
                 }
             }
         }

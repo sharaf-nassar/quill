@@ -158,6 +158,8 @@ A 500 ms time-based debounce coalesces wake-with-display-change events that fire
 
 On startup, [[src-tauri/src/integrations/manager.rs]] refreshes all provider state for the UI.
 
+`IntegrationProvider` includes Pi as `pi`. Pi's versioned integration state records its selected config directory, session directory, and detected CLI version so later lifecycle and transcript work share one path contract.
+
 CLI providers (Claude, Codex) run installers after explicit enable confirmation: Claude via [[src-tauri/src/claude_setup.rs]] and Codex via [[src-tauri/src/integrations/codex.rs]]. Service-only providers like MiniMax ([[src-tauri/src/integrations/minimax.rs]]) require only an API key, stored in the SQLite settings table. CPA follows the service-only persistence pattern but remains a cross-provider usage source rather than a `ProviderStatus`; [[src-tauri/src/integrations/cpa.rs#load_connection]] supplies its URL and Rust-owned key to polling.
 
 ### Transactional Managed Deployment

@@ -39,6 +39,7 @@ pub fn default_app_data_dir() -> Option<PathBuf> {
 }
 const CLAUDE_PROJECTS_DIR_ENV: &str = "QUILL_CLAUDE_PROJECTS_DIR";
 const CODEX_SESSIONS_DIR_ENV: &str = "QUILL_CODEX_SESSIONS_DIR";
+const PI_SESSIONS_DIR_ENV: &str = "QUILL_PI_SESSIONS_DIR";
 
 static BANNER: Once = Once::new();
 
@@ -250,6 +251,28 @@ pub fn resolve_codex_sessions_dir() -> PathBuf {
     resolve_codex_sessions_dir_with_default(default_codex_sessions_dir())
 }
 
+pub fn resolve_pi_sessions_dir_with_default(default: PathBuf) -> PathBuf {
+    if !demo_mode_active() {
+        return default;
+    }
+
+    match std::env::var(PI_SESSIONS_DIR_ENV) {
+        Ok(raw) if !raw.is_empty() => canonicalize_or_exit(PI_SESSIONS_DIR_ENV, &raw),
+        _ => {
+            let placeholder = std::env::temp_dir().join("quill-demo-empty-pi-sessions");
+            let _ = std::fs::create_dir_all(&placeholder);
+            log::warn!(
+                "QUILL_DEMO_MODE=1 but {PI_SESSIONS_DIR_ENV} unset; using empty placeholder"
+            );
+            placeholder
+        }
+    }
+}
+
+pub fn resolve_pi_sessions_dir() -> Result<PathBuf, String> {
+    crate::integrations::pi::resolve_session_dir().map(resolve_pi_sessions_dir_with_default)
+}
+
 /// Best-effort peek for banner output. Reads the override env var directly
 /// without canonicalizing or exiting — the actual resolver will exit if the
 /// override is broken when a real call-site needs it.
@@ -282,6 +305,39 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
+    #[test]
+    #[serial]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Persisted Session Directory]]
+    fn pi_session_dir_prefers_saved_integration_state() {
+        clear_env();
+        let temp = TempDir::new().expect("tempdir");
+        let config_dir = temp.path().join("agent");
+        let session_dir = temp.path().join("saved-sessions");
+        let state_path = temp.path().join("integration-state.json");
+        let state = crate::integrations::pi::PiIntegrationState {
+            version: 1,
+            config_dir: config_dir.clone(),
+            session_dir: session_dir.clone(),
+            pi_version: "0.84.0".to_string(),
+        };
+        std::fs::write(
+            &state_path,
+            serde_json::to_string(&state).expect("serialize state"),
+        )
+        .expect("write state");
+
+        set_env("PI_CODING_AGENT_SESSION_DIR", "/ignored/session-dir");
+        assert_eq!(
+            crate::integrations::pi::resolve_session_dir_from(
+                &state_path,
+                config_dir.join("sessions")
+            )
+            .expect("resolve pi session dir"),
+            session_dir
+        );
+        clear_env();
+    }
+
     /// Reset the resolver's environment to a known state. Tests own all three
     /// env vars during their critical section because the resolver reads them
     /// at every call.
@@ -294,6 +350,9 @@ mod tests {
             std::env::remove_var(DEMO_MODE_ENV);
             std::env::remove_var(DATA_DIR_ENV);
             std::env::remove_var(RULES_DIR_ENV);
+            std::env::remove_var("PI_CODING_AGENT_DIR");
+            std::env::remove_var("PI_CODING_AGENT_SESSION_DIR");
+            std::env::remove_var(PI_SESSIONS_DIR_ENV);
         }
     }
 

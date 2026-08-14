@@ -11,6 +11,7 @@ fn provider_label(provider: IntegrationProvider) -> &'static str {
     match provider {
         IntegrationProvider::Claude => "Claude",
         IntegrationProvider::Codex => "Codex",
+        IntegrationProvider::Pi => "Pi",
         IntegrationProvider::MiniMax => "MiniMax",
     }
 }
@@ -79,6 +80,7 @@ fn resolve_metrics_for_provider(
     match provider {
         IntegrationProvider::Claude => resolve_claude_metrics(buckets),
         IntegrationProvider::Codex => resolve_codex_metrics(buckets),
+        IntegrationProvider::Pi => (None, None),
         IntegrationProvider::MiniMax => resolve_minimax_metrics(buckets),
     }
 }

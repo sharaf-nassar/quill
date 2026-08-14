@@ -41,6 +41,7 @@ function formatElapsed(seconds: number): string {
 	return `${m}m ${s}s`;
 }
 
+// Pi restart orchestration is deferred in v1.
 const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
 
 function providerHeading(provider: IntegrationProvider): string {

@@ -19,6 +19,7 @@ use crate::transcript_identity::{
 
 const CLAUDE_SOURCE_ROOT_KEY: &str = "claude:projects";
 const CODEX_SOURCE_ROOT_KEY: &str = "codex:sessions";
+const PI_SOURCE_ROOT_KEY: &str = "pi:sessions";
 const ROOT_DIAGNOSTIC_MAX_CHARS: usize = 240;
 
 /// One provider-owned filesystem root that may contain retained transcripts.
@@ -130,6 +131,7 @@ pub(crate) fn validate_retained_notify_source(
             CODEX_SOURCE_ROOT_KEY,
             crate::data_paths::resolve_codex_sessions_dir(),
         ),
+        IntegrationProvider::Pi => return Ok(None),
         IntegrationProvider::MiniMax => unreachable!("MiniMax returned above"),
     };
 
@@ -303,7 +305,7 @@ fn retained_jsonl_source_layout_hint(
         IntegrationProvider::Codex if !components.is_empty() => {
             Some(RetainedJsonlSourceLayoutHint::CodexTranscript)
         }
-        IntegrationProvider::Codex | IntegrationProvider::MiniMax => None,
+        IntegrationProvider::Codex | IntegrationProvider::Pi | IntegrationProvider::MiniMax => None,
     }
 }
 
@@ -331,10 +333,11 @@ pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot>
 ///
 /// Callers that serialize whole-root work use these identities before walking
 /// the filesystem, so live reconciliation cannot interleave with inventory.
-pub(crate) fn retained_jsonl_source_root_identities() -> [(IntegrationProvider, &'static str); 2] {
-    [
+pub(crate) fn retained_jsonl_source_root_identities() -> Vec<(IntegrationProvider, &'static str)> {
+    vec![
         (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
         (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
+        (IntegrationProvider::Pi, PI_SOURCE_ROOT_KEY),
     ]
 }
 
@@ -3482,6 +3485,7 @@ pub fn extract_messages_from_jsonl(provider: IntegrationProvider, path: &Path) -
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl(path),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl(path),
+        IntegrationProvider::Pi => unsupported_extracted_session(path),
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
     }
 }
@@ -3505,7 +3509,23 @@ pub(crate) fn extract_messages_from_jsonl_records(
     match provider {
         IntegrationProvider::Claude => extract_claude_messages_from_jsonl_records(path, records),
         IntegrationProvider::Codex => extract_codex_messages_from_jsonl_records(records),
+        IntegrationProvider::Pi => unsupported_extracted_session(path),
         IntegrationProvider::MiniMax => unreachable!("MiniMax has no transcript source"),
+    }
+}
+
+fn unsupported_extracted_session(path: &Path) -> ExtractedSession {
+    ExtractedSession {
+        session_id: path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        project_name: None,
+        messages: Vec::new(),
+        extraction_succeeded: false,
+        events: Vec::new(),
+        hook_invocations: Vec::new(),
     }
 }
 
@@ -4544,7 +4564,7 @@ pub(crate) fn find_session_path(
             let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
             find_codex_session_path_in(&sessions_dir, session_id)
         }
-        IntegrationProvider::MiniMax => Ok(None),
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(None),
     }
 }
 
@@ -4625,6 +4645,19 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Transcript Root Coverage]]
+    fn retained_source_roots_cover_all_transcript_providers() {
+        assert_eq!(
+            retained_jsonl_source_root_identities(),
+            vec![
+                (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
+                (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
+                (IntegrationProvider::Pi, PI_SOURCE_ROOT_KEY),
+            ]
+        );
+    }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Shared Root Session Id]]
     #[test]

@@ -1,15 +1,21 @@
 import type { IntegrationProvider, ProviderFilter } from "../types";
 
-const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
+const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "pi", "mini_max"];
 
 export function providerLabel(provider: IntegrationProvider): string {
   if (provider === "claude") return "Claude";
   if (provider === "codex") return "Codex";
+  if (provider === "pi") return "Pi";
   return "MiniMax";
 }
 
 export function providerTag(provider: string): string {
-  if (provider === "claude" || provider === "codex" || provider === "mini_max") {
+  if (
+    provider === "claude" ||
+    provider === "codex" ||
+    provider === "pi" ||
+    provider === "mini_max"
+  ) {
     return providerLabel(provider).toUpperCase();
   }
   return provider.replace(/_/g, "").toUpperCase();
@@ -18,6 +24,7 @@ export function providerTag(provider: string): string {
 export function providerHue(provider: string): string {
   if (provider === "claude") return "var(--provider-claude)";
   if (provider === "codex") return "var(--provider-codex)";
+  if (provider === "pi") return "var(--provider-pi)";
   if (provider === "mini_max") return "var(--provider-minimax)";
   return "var(--provider-agent)";
 }

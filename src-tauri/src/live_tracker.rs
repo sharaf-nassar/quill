@@ -416,7 +416,7 @@ impl TrackerState {
         let (session_id, role) = match provider {
             IntegrationProvider::Claude => claude_session_file(path)?,
             IntegrationProvider::Codex => return self.codex_file(path, host, now),
-            IntegrationProvider::MiniMax => return None,
+            IntegrationProvider::Pi | IntegrationProvider::MiniMax => return None,
         };
         Some((
             SessionKey {
@@ -584,26 +584,41 @@ impl LiveTracker {
     /// folded, and idle sessions are released.
     pub(crate) fn sweep(&self, now: DateTime<Utc>) {
         self.sweep_in(
-            &crate::data_paths::resolve_claude_projects_dir(),
-            &crate::data_paths::resolve_codex_sessions_dir(),
+            &[
+                (
+                    IntegrationProvider::Claude,
+                    crate::data_paths::resolve_claude_projects_dir(),
+                ),
+                (
+                    IntegrationProvider::Codex,
+                    crate::data_paths::resolve_codex_sessions_dir(),
+                ),
+            ],
             now,
         );
     }
 
-    fn sweep_in(&self, projects_dir: &Path, codex_sessions_dir: &Path, now: DateTime<Utc>) {
-        // The retained inventory walkers, so the provider trees are never
-        // traversed a second way.
-        let claude = crate::sessions::discover_claude_transcripts_in(projects_dir)
-            .into_iter()
-            .map(|(path, _)| (path, IntegrationProvider::Claude))
-            .filter(|(path, _)| modified_within_idle_window(path, now));
-        // A quiet rollout still enters the Codex thread index, because the
-        // ancestor a live spawn names is routinely one that has been quiet for
-        // hours; the same gate then keeps it from being parsed.
-        let codex = crate::sessions::discover_codex_transcripts_in(codex_sessions_dir)
-            .into_iter()
-            .map(|path| (path, IntegrationProvider::Codex));
-        self.apply_paths_at(claude.chain(codex).collect::<Vec<_>>(), now);
+    fn sweep_in(&self, roots: &[(IntegrationProvider, PathBuf)], now: DateTime<Utc>) {
+        let mut paths = Vec::new();
+        for (provider, root) in roots {
+            match provider {
+                IntegrationProvider::Claude => paths.extend(
+                    crate::sessions::discover_claude_transcripts_in(root)
+                        .into_iter()
+                        .map(|(path, _)| (path, *provider))
+                        .filter(|(path, _)| modified_within_idle_window(path, now)),
+                ),
+                // Quiet Codex rollouts still enter the thread index because a
+                // live child may name an old ancestor.
+                IntegrationProvider::Codex => paths.extend(
+                    crate::sessions::discover_codex_transcripts_in(root)
+                        .into_iter()
+                        .map(|path| (path, *provider)),
+                ),
+                IntegrationProvider::Pi | IntegrationProvider::MiniMax => {}
+            }
+        }
+        self.apply_paths_at(paths, now);
         if self.state.lock().unwrap().evict_idle(now) {
             self.notify();
         }
@@ -1501,10 +1516,17 @@ mod tests {
         /// directory that does not exist.
         fn sweep(&self, tracker: &LiveTracker, now: DateTime<Utc>) {
             let absent = self.root.path().join("absent-root");
-            match self.provider {
-                IntegrationProvider::Codex => tracker.sweep_in(&absent, self.root.path(), now),
-                _ => tracker.sweep_in(self.root.path(), &absent, now),
-            }
+            let roots = match self.provider {
+                IntegrationProvider::Codex => vec![
+                    (IntegrationProvider::Claude, absent),
+                    (IntegrationProvider::Codex, self.root.path().to_path_buf()),
+                ],
+                _ => vec![
+                    (IntegrationProvider::Claude, self.root.path().to_path_buf()),
+                    (IntegrationProvider::Codex, absent),
+                ],
+            };
+            tracker.sweep_in(&roots, now);
         }
 
         fn last_activity(&self, tracker: &LiveTracker) -> Option<DateTime<Utc>> {
@@ -2781,8 +2803,15 @@ mod tests {
         let tracker = LiveTracker::new(None);
         // Cold, then warm: the second pass stats the same corpus against the
         // offsets the first one recorded.
-        tracker.sweep_in(claude_root.path(), codex_root.path(), now);
-        tracker.sweep_in(claude_root.path(), codex_root.path(), now);
+        let roots = [
+            (
+                IntegrationProvider::Claude,
+                claude_root.path().to_path_buf(),
+            ),
+            (IntegrationProvider::Codex, codex_root.path().to_path_buf()),
+        ];
+        tracker.sweep_in(&roots, now);
+        tracker.sweep_in(&roots, now);
         assert_eq!(tracker.session_ranking_keys().len(), SESSIONS * 2);
 
         // The read is what the budget covers: no transcript is opened here, so

@@ -7,6 +7,7 @@ use std::str::FromStr;
 pub enum IntegrationProvider {
     Claude,
     Codex,
+    Pi,
     MiniMax,
 }
 
@@ -15,6 +16,7 @@ impl IntegrationProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
             Self::MiniMax => "mini_max",
         }
     }
@@ -33,6 +35,7 @@ impl FromStr for IntegrationProvider {
         match value {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
             "mini_max" => Ok(Self::MiniMax),
             _ => Err(format!("Unknown integration provider: {value}")),
         }

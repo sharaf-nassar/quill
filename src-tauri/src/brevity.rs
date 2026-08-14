@@ -44,7 +44,7 @@ pub fn target_path(provider: IntegrationProvider) -> Option<PathBuf> {
     match provider {
         IntegrationProvider::Claude => Some(home.join(".claude").join("CLAUDE.md")),
         IntegrationProvider::Codex => Some(home.join(".codex").join("AGENTS.md")),
-        IntegrationProvider::MiniMax => None,
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => None,
     }
 }
 

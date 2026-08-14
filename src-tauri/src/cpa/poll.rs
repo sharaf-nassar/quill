@@ -57,7 +57,9 @@ pub(crate) async fn poll_account_snapshots(
                             status_code: None,
                         }),
                     },
-                    IntegrationProvider::MiniMax => unreachable!("CPA window plan is native-only"),
+                    IntegrationProvider::Pi | IntegrationProvider::MiniMax => {
+                        unreachable!("CPA window plan is limited to quota providers")
+                    }
                 };
                 (call.account_position, result)
             }

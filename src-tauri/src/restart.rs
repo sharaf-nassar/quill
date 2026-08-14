@@ -171,6 +171,7 @@ pub fn resume_dir_for_provider(provider: IntegrationProvider) -> PathBuf {
     let suffix = match provider {
         IntegrationProvider::Claude => "claude-resume",
         IntegrationProvider::Codex => "codex-resume",
+        IntegrationProvider::Pi => "pi-resume",
         IntegrationProvider::MiniMax => "minimax-resume",
     };
 
@@ -280,7 +281,7 @@ fn cmdline_matches_provider(cmdline: &str, provider: IntegrationProvider) -> boo
             token_match("claude") || cmdline.contains("@anthropic-ai/claude-code")
         }
         IntegrationProvider::Codex => token_match("codex"),
-        IntegrationProvider::MiniMax => false,
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => false,
     }
 }
 
@@ -1645,7 +1646,7 @@ fn write_resume_file(
     let cmd = match provider {
         IntegrationProvider::Claude => format!("claude --resume \"{session_id}\""),
         IntegrationProvider::Codex => format!("codex resume \"{session_id}\""),
-        IntegrationProvider::MiniMax => return Ok(()),
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => return Ok(()),
     };
     fs::write(&file_path, &cmd).map_err(|e| format!("Failed to write resume file: {e}"))?;
 
@@ -1657,6 +1658,7 @@ fn write_resume_file(
 #[cfg(unix)]
 fn cleanup_stale_resume_files() {
     let cutoff = std::time::SystemTime::now() - Duration::from_secs(300);
+    // Pi restart orchestration is deferred in v1.
     for provider in [IntegrationProvider::Claude, IntegrationProvider::Codex] {
         let rdir = resume_dir_for_provider(provider);
         let entries = match fs::read_dir(&rdir) {
@@ -1724,7 +1726,7 @@ fn restart_via_tmux(
     let cmd = match provider {
         IntegrationProvider::Claude => format!("claude --resume \"{session_id}\""),
         IntegrationProvider::Codex => format!("codex resume \"{session_id}\""),
-        IntegrationProvider::MiniMax => return Ok(()),
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => return Ok(()),
     };
     let output = Command::new("tmux")
         .args(["send-keys", "-t", target, &cmd, "Enter"])
@@ -1756,7 +1758,7 @@ fn should_wait_for_idle(instance: &RestartInstance) -> bool {
                 || instance.status == InstanceStatus::Unknown
         }
         IntegrationProvider::Codex => false,
-        IntegrationProvider::MiniMax => false,
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => false,
     }
 }
 
@@ -2022,7 +2024,7 @@ pub async fn install_restart_hooks(provider: Option<IntegrationProvider>) -> Res
             match provider.unwrap_or(IntegrationProvider::Claude) {
                 IntegrationProvider::Claude => install_claude_restart_hooks(),
                 IntegrationProvider::Codex => install_codex_restart_hooks(),
-                IntegrationProvider::MiniMax => Ok(()),
+                IntegrationProvider::Pi | IntegrationProvider::MiniMax => Ok(()),
             }
         })
     }
@@ -2040,7 +2042,7 @@ pub async fn check_restart_hooks_installed(provider: Option<IntegrationProvider>
         match provider.unwrap_or(IntegrationProvider::Claude) {
             IntegrationProvider::Claude => hooks_installed() && shell_integration_installed(),
             IntegrationProvider::Codex => shell_integration_installed(),
-            IntegrationProvider::MiniMax => false,
+            IntegrationProvider::Pi | IntegrationProvider::MiniMax => false,
         }
     }
     #[cfg(not(unix))]

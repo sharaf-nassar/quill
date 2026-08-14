@@ -4,6 +4,7 @@ pub(crate) mod deploy;
 pub mod manager;
 pub mod manifest;
 pub mod minimax;
+pub(crate) mod pi;
 pub(crate) mod retirement;
 pub mod types;
 

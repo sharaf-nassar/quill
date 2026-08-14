@@ -3048,7 +3048,7 @@ fn parse_model_source(
                 hostname: Some(hostname),
             },
         ),
-        IntegrationProvider::MiniMax => {
+        IntegrationProvider::Pi | IntegrationProvider::MiniMax => {
             log::warn!(
                 "Unsupported provider source reached model reconciliation: {}",
                 discovered.canonical_path.display()

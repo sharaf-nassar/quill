@@ -70,7 +70,7 @@ impl PendingPaths {
 }
 
 fn transcript_roots() -> Vec<TranscriptRoot> {
-    [
+    vec![
         (
             IntegrationProvider::Claude,
             crate::data_paths::resolve_claude_projects_dir(),
