@@ -28,6 +28,7 @@ colors:
   signal-orchid: "#c084fc"
   provider-claude: "#fb923c"
   provider-codex: "#60a5fa"
+  provider-pi: "#15803d"
   provider-minimax: "#a78bfa"
   provider-agent: "#c084fc"
   metric-runtime: "#22d3ee"
@@ -263,6 +264,8 @@ provider can never masquerade as a status.
 - **Claude Orange** (`#fb923c`) — deliberately redder than caution amber.
 - **Codex Blue** (`#60a5fa`) — blue/orange is the canonical colorblind-safe
   two-group pairing.
+- **Pi Dark Green** (`#15803d`) — a provider green held at CIEDE2000 ΔE ≥ 20
+  from Meter Green in both the Graphite Stack and Flat Polish systems.
 - **MiniMax Violet** (`#a78bfa`), **Agent Orchid** (`#c084fc`) — additional
   provider families and sub-agent/orchestration rows.
 

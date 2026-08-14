@@ -71,6 +71,7 @@
   /* Provider identity — fixed code, never a status hue */
   --provider-claude: #fb923c;
   --provider-codex: #60a5fa;
+  --provider-pi: #15803d;
   --provider-minimax: #a78bfa;
   --provider-agent: #c084fc;
 
