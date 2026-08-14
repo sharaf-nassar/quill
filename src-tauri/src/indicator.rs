@@ -41,7 +41,9 @@ fn to_indicator_metric(
 }
 
 fn find_bucket_by_key<'a>(buckets: &'a [UsageBucket], key: &str) -> Option<&'a UsageBucket> {
-    buckets.iter().find(|bucket| bucket.key == key)
+    buckets
+        .iter()
+        .find(|bucket| bucket.key == key || bucket.key.strip_prefix("cpa/pool/") == Some(key))
 }
 
 fn find_codex_base_bucket<'a>(buckets: &'a [UsageBucket], prefix: &str) -> Option<&'a UsageBucket> {
@@ -56,14 +58,29 @@ fn compare_utilization_desc(left: &&UsageBucket, right: &&UsageBucket) -> Orderi
 }
 
 fn provider_has_metrics(provider: IntegrationProvider, usage: &UsageData) -> bool {
+    let (short_window, weekly_window) = resolve_metrics_for_usage(provider, usage);
+    short_window.is_some() || weekly_window.is_some()
+}
+
+fn resolve_metrics_for_usage(
+    provider: IntegrationProvider,
+    usage: &UsageData,
+) -> (Option<IndicatorMetric>, Option<IndicatorMetric>) {
+    if let Some(pool) = usage
+        .cpa_pools
+        .iter()
+        .find(|pool| pool.provider == provider)
+    {
+        return resolve_metrics_for_provider(provider, &pool.buckets);
+    }
+
     let buckets = usage
         .buckets
         .iter()
         .filter(|bucket| bucket.provider == provider)
         .cloned()
         .collect::<Vec<_>>();
-    let (short_window, weekly_window) = resolve_metrics_for_provider(provider, &buckets);
-    short_window.is_some() || weekly_window.is_some()
+    resolve_metrics_for_provider(provider, &buckets)
 }
 
 fn provider_is_enabled(provider: IntegrationProvider, statuses: &[ProviderStatus]) -> bool {
@@ -188,8 +205,10 @@ fn resolve_codex_metrics(
     buckets: &[UsageBucket],
 ) -> (Option<IndicatorMetric>, Option<IndicatorMetric>) {
     let short_window = find_codex_base_bucket(buckets, "primary_")
+        .or_else(|| find_bucket_by_key(buckets, "codex_300m"))
         .map(|bucket| to_indicator_metric(IntegrationProvider::Codex, bucket, None));
     let weekly_window = find_codex_base_bucket(buckets, "secondary_")
+        .or_else(|| find_bucket_by_key(buckets, "codex_10080m"))
         .map(|bucket| to_indicator_metric(IntegrationProvider::Codex, bucket, None));
     (short_window, weekly_window)
 }
@@ -242,7 +261,8 @@ fn resolve_provider_choice(
     usage: &UsageData,
 ) -> (Option<IntegrationProvider>, Option<IntegrationProvider>) {
     if let Some(provider) = configured
-        && provider_is_enabled(provider, statuses)
+        && (provider_is_enabled(provider, statuses)
+            || usage.cpa_pools.iter().any(|pool| pool.provider == provider))
         && provider_has_metrics(provider, usage)
     {
         return (configured, Some(provider));
@@ -252,6 +272,7 @@ fn resolve_provider_choice(
         .iter()
         .filter(|status| status.enabled)
         .map(|status| status.provider)
+        .chain(usage.cpa_pools.iter().map(|pool| pool.provider))
         .find(|provider| provider_has_metrics(*provider, usage));
 
     (configured, resolved)
@@ -276,18 +297,8 @@ pub fn resolve_indicator_state(
 ) -> StatusIndicatorState {
     let (configured_primary_provider, resolved_primary_provider) =
         resolve_provider_choice(configured_provider, statuses, usage);
-    let provider_buckets = resolved_primary_provider
-        .map(|provider| {
-            usage
-                .buckets
-                .iter()
-                .filter(|bucket| bucket.provider == provider)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let (short_window, weekly_window) = resolved_primary_provider
-        .map(|provider| resolve_metrics_for_provider(provider, &provider_buckets))
+        .map(|provider| resolve_metrics_for_usage(provider, usage))
         .unwrap_or((None, None));
     let provider_error = resolved_provider_error(resolved_primary_provider, usage);
     let warning = build_warning(
@@ -316,5 +327,217 @@ pub fn resolve_indicator_state(
         updated_at: None,
         short_window,
         weekly_window,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::integrations::types::ProviderSetupState;
+    use crate::models::{CpaPoolAggregate, UsageSource};
+
+    fn status(provider: IntegrationProvider) -> ProviderStatus {
+        ProviderStatus {
+            provider,
+            detected_cli: true,
+            detected_home: true,
+            enabled: true,
+            setup_state: ProviderSetupState::Installed,
+            user_has_made_choice: true,
+            last_error: None,
+            last_verified_at: None,
+            last_detection_attempts: Vec::new(),
+        }
+    }
+
+    fn bucket(
+        provider: IntegrationProvider,
+        key: &str,
+        utilization: f64,
+        source: UsageSource,
+    ) -> UsageBucket {
+        UsageBucket {
+            provider,
+            key: key.to_string(),
+            label: key.to_string(),
+            utilization,
+            resets_at: Some("2030-01-01T00:00:00Z".to_string()),
+            sort_order: 0,
+            source,
+            account_id: None,
+            account_label: None,
+        }
+    }
+
+    fn usage(buckets: Vec<UsageBucket>, cpa_pools: Vec<CpaPoolAggregate>) -> UsageData {
+        UsageData {
+            buckets,
+            provider_errors: Vec::new(),
+            provider_credits: Vec::new(),
+            cpa_accounts: Vec::new(),
+            cpa_pools,
+            error: None,
+        }
+    }
+
+    // @lat: [[indicator-tests#Indicator Tests#Claude CPA Pool Precedence]]
+    #[test]
+    fn claude_cpa_pool_wins_over_account_buckets() {
+        let provider = IntegrationProvider::Claude;
+        let raw = vec![
+            bucket(provider, "cpa/account-a/five_hour", 91.0, UsageSource::Cpa),
+            bucket(provider, "cpa/account-a/seven_day", 92.0, UsageSource::Cpa),
+        ];
+        let short_reset = "2030-02-01T00:15:00Z";
+        let weekly_reset = "2030-02-02T00:20:00Z";
+        let mut short_bucket = bucket(provider, "cpa/pool/five_hour", 31.0, UsageSource::Cpa);
+        short_bucket.resets_at = Some(short_reset.to_string());
+        let mut weekly_bucket = bucket(provider, "cpa/pool/seven_day", 42.0, UsageSource::Cpa);
+        weekly_bucket.resets_at = Some(weekly_reset.to_string());
+        let pool = CpaPoolAggregate {
+            provider,
+            healthy: 2,
+            total: 2,
+            buckets: vec![short_bucket, weekly_bucket],
+        };
+
+        let state =
+            resolve_indicator_state(Some(provider), &[status(provider)], &usage(raw, vec![pool]));
+
+        assert_eq!(state.resolved_primary_provider, Some(provider));
+        assert_ne!(state.title_text, "Indicator state unavailable");
+        assert!(state.title_text.contains("31%"));
+        assert!(state.title_text.contains("42%"));
+        let short_window = state.short_window.unwrap();
+        assert_eq!(short_window.utilization, 31.0);
+        assert_eq!(short_window.resets_at.as_deref(), Some(short_reset));
+        assert_eq!(
+            short_window.display_reset_time,
+            format_local_reset_time(Some(short_reset))
+        );
+        let weekly_window = state.weekly_window.unwrap();
+        assert_eq!(weekly_window.utilization, 42.0);
+        assert_eq!(weekly_window.resets_at.as_deref(), Some(weekly_reset));
+        assert_eq!(
+            weekly_window.display_reset_time,
+            format_local_reset_time(Some(weekly_reset))
+        );
+    }
+
+    // @lat: [[indicator-tests#Indicator Tests#Codex CPA-Only Resolution]]
+    #[test]
+    fn codex_cpa_only_pool_resolves_provider_state() {
+        let provider = IntegrationProvider::Codex;
+        let short_reset = "2030-03-01T00:25:00Z";
+        let weekly_reset = "2030-03-02T00:30:00Z";
+        let mut short_bucket = bucket(provider, "cpa/pool/codex_300m", 23.0, UsageSource::Cpa);
+        short_bucket.resets_at = Some(short_reset.to_string());
+        let mut weekly_bucket = bucket(provider, "cpa/pool/codex_10080m", 67.0, UsageSource::Cpa);
+        weekly_bucket.resets_at = Some(weekly_reset.to_string());
+        let pool = CpaPoolAggregate {
+            provider,
+            healthy: 1,
+            total: 1,
+            buckets: vec![short_bucket, weekly_bucket],
+        };
+
+        let state = resolve_indicator_state(
+            Some(provider),
+            &[status(provider)],
+            &usage(Vec::new(), vec![pool]),
+        );
+
+        assert_eq!(state.resolved_primary_provider, Some(provider));
+        assert_ne!(state.title_text, "Indicator state unavailable");
+        assert!(state.title_text.contains("23%"));
+        assert!(state.title_text.contains("67%"));
+        let short_window = state.short_window.unwrap();
+        assert_eq!(short_window.utilization, 23.0);
+        assert_eq!(short_window.resets_at.as_deref(), Some(short_reset));
+        assert_eq!(
+            short_window.display_reset_time,
+            format_local_reset_time(Some(short_reset))
+        );
+        let weekly_window = state.weekly_window.unwrap();
+        assert_eq!(weekly_window.utilization, 67.0);
+        assert_eq!(weekly_window.resets_at.as_deref(), Some(weekly_reset));
+        assert_eq!(
+            weekly_window.display_reset_time,
+            format_local_reset_time(Some(weekly_reset))
+        );
+    }
+
+    // @lat: [[indicator-tests#Indicator Tests#Configured CPA Provider Availability]]
+    #[test]
+    fn configured_cpa_pool_ignores_missing_or_disabled_native_status() {
+        let provider = IntegrationProvider::Codex;
+        let pool = CpaPoolAggregate {
+            provider,
+            healthy: 1,
+            total: 1,
+            buckets: vec![bucket(
+                provider,
+                "cpa/pool/codex_300m",
+                23.0,
+                UsageSource::Cpa,
+            )],
+        };
+        let usage = usage(Vec::new(), vec![pool]);
+        let mut disabled = status(provider);
+        disabled.enabled = false;
+
+        for statuses in [Vec::new(), vec![disabled]] {
+            let state = resolve_indicator_state(Some(provider), &statuses, &usage);
+            assert_eq!(state.resolved_primary_provider, Some(provider));
+        }
+    }
+
+    // @lat: [[indicator-tests#Indicator Tests#Automatic CPA Provider Selection]]
+    #[test]
+    fn auto_selects_cpa_pool_without_native_status() {
+        let provider = IntegrationProvider::Claude;
+        let pool = CpaPoolAggregate {
+            provider,
+            healthy: 1,
+            total: 1,
+            buckets: vec![bucket(
+                provider,
+                "cpa/pool/five_hour",
+                31.0,
+                UsageSource::Cpa,
+            )],
+        };
+
+        let state = resolve_indicator_state(None, &[], &usage(Vec::new(), vec![pool]));
+
+        assert_eq!(state.resolved_primary_provider, Some(provider));
+        assert_eq!(state.short_window.unwrap().utilization, 31.0);
+    }
+
+    // @lat: [[indicator-tests#Indicator Tests#Direct Native Fallback]]
+    #[test]
+    fn direct_native_buckets_remain_the_fallback() {
+        let provider = IntegrationProvider::Claude;
+        let direct = vec![
+            bucket(provider, "five_hour", 12.0, UsageSource::Direct),
+            bucket(provider, "seven_day", 34.0, UsageSource::Direct),
+        ];
+        let usage = usage(direct, Vec::new());
+
+        let state = resolve_indicator_state(Some(provider), &[status(provider)], &usage);
+
+        assert_eq!(state.resolved_primary_provider, Some(provider));
+        assert_eq!(state.short_window.unwrap().utilization, 12.0);
+        assert_eq!(state.weekly_window.unwrap().utilization, 34.0);
+
+        let mut disabled = status(provider);
+        disabled.enabled = false;
+        for statuses in [Vec::new(), vec![disabled]] {
+            assert_eq!(
+                resolve_indicator_state(Some(provider), &statuses, &usage)
+                    .resolved_primary_provider,
+                None
+            );
+        }
     }
 }

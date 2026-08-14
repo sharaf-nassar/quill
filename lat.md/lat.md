@@ -15,6 +15,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[widget-viz-tests]] — Pointer-to-bucket interaction test specs for widget charts
 - [[widget-view-tests]] — Availability and persistence test specs for widget view controls
 - [[widget-limits-tests]] — Collapsed CPA provider-state cue test specs
+- [[indicator-tests]] — CPA pool precedence and direct-fallback indicator test specs
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs
 - [[crash-reporting-tests]] — Rust crash payload privacy and release identity test specs

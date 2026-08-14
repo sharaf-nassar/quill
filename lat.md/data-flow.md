@@ -427,5 +427,5 @@ The status indicator has one backend-owned provider preference shared across the
 1. `useIntegrations()` loads `get_indicator_primary_provider` alongside provider statuses so the Integrations tab starts from the persisted preference
 2. The Integrations tab renders an `Auto` option plus enabled providers, and preserves a disabled unavailable option when a saved provider is temporarily missing
 3. Changing the selector invokes `set_indicator_primary_provider`, which stores the configured provider in the settings table
-4. The backend recomputes `StatusIndicatorState`, emits `indicator-updated`, and updates the tray summary from that backend-owned payload
+4. The backend recomputes `StatusIndicatorState`, emits `indicator-updated`, and updates the tray summary from that backend-owned payload. A matching CPA pool is authoritative over account-qualified buckets and available independently of native provider status; its Claude and Codex pool keys map to the normal short and weekly windows. Direct native buckets remain the fallback when no matching pool exists.
 5. `useIntegrations()` listens for `indicator-updated` to keep all mounted selector instances synchronized
