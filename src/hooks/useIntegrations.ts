@@ -9,7 +9,7 @@ import type {
   StatusIndicatorState,
 } from "../types";
 
-const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "mini_max"];
+const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "pi", "mini_max"];
 
 function sortStatuses(statuses: ProviderStatus[]): ProviderStatus[] {
   return [...statuses].sort(

@@ -324,6 +324,9 @@ function integrationToggleState(
   busy: boolean,
 ): { tone: ToggleTone; label: string; disabled: boolean } {
   if (busy) return { tone: "busy", label: "...", disabled: true };
+  if (status.setupState === "error") {
+    return { tone: "error", label: "ERROR", disabled: false };
+  }
   if (status.enabled) return { tone: "on", label: "ON", disabled: false };
   if (!status.detectedCli) return { tone: "na", label: "N/A", disabled: true };
   if (status.setupState === "missing") {
@@ -343,6 +346,16 @@ function providerActionCopy(action: PendingProviderAction) {
         confirmLabel: `Enable ${label}`,
         destructive: false,
         needsApiKey: true,
+      };
+    }
+    if (action.provider === "pi") {
+      return {
+        title: `Enable ${label}?`,
+        description:
+          "Quill will install the executable extension file quill.ts at ~/.pi/agent/extensions/quill.ts by default, or $PI_CODING_AGENT_DIR/extensions/quill.ts when that directory is configured. Quill repairs and self-updates the stamped file. A running Pi process loads the updated file after /reload.",
+        confirmLabel: `Enable ${label}`,
+        destructive: false,
+        needsApiKey: false,
       };
     }
     return {
@@ -470,7 +483,7 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
 
       <SettingRow
         label="Rescan PATH"
-        description="Re-search PATH for the Claude Code and Codex CLIs without restarting Quill."
+        description="Re-search PATH for the Claude Code, Codex, and Pi CLIs without restarting Quill."
         control={
           <Toggle
             tone={rescanInFlight ? "busy" : "off"}
@@ -517,7 +530,9 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
           const state = integrationToggleState(status, busy);
           const attempts = status.lastDetectionAttempts ?? [];
           const description =
-            state.tone === "na" && attempts.length > 0
+            state.tone === "error"
+              ? status.lastError ?? "Integration setup failed; click to retry."
+              : state.tone === "na" && attempts.length > 0
               ? `CLI not found. Checked: ${attempts.slice(0, 3).join(", ")}${attempts.length > 3 ? " …" : ""}`
               : state.tone === "on"
                 ? "Quill assets installed and active."

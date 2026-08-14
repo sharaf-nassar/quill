@@ -46,7 +46,7 @@ import {
   isSessionLive,
   resolveSessionMetrics,
 } from "../../../utils/format";
-import { providerHue, providerTag } from "../../../utils/providers";
+import { providerHue, providerLabel, providerTag } from "../../../utils/providers";
 import { formatRetentionCutoff } from "../../../utils/retention";
 import { formatTokenCount } from "../../../utils/tokens";
 import type {
@@ -54,6 +54,7 @@ import type {
   CodeStatsHistoryPoint,
   HookBreakdown,
   HostBreakdown,
+  IntegrationProvider,
   InsightTrend,
   ProjectBreakdown,
   RangeType,
@@ -291,6 +292,10 @@ interface RowModel {
   chip?: { text: string; tone: string };
   /** Dim secondary count, e.g. `41 sess`. */
   meta?: string;
+  providerCounts?: ReadonlyArray<{
+    provider: Extract<IntegrationProvider, "claude" | "codex" | "pi">;
+    count: number;
+  }>;
   sessionStats?: {
     runtime: string;
     runtimeLabel: string;
@@ -311,6 +316,27 @@ interface RowModel {
   activity: string;
   activityLabel?: string;
   title: string;
+}
+
+function ProviderCounts({ counts }: { counts: NonNullable<RowModel["providerCounts"]> }) {
+  return (
+    <span className="wg-row-provider-counts wg-num" aria-label="Provider counts">
+      {counts.map(({ provider, count }) => (
+        <span
+          className="wg-row-provider-count"
+          data-provider={provider}
+          aria-label={`${providerLabel(provider)} ${formatCount(count)}`}
+          title={`${providerLabel(provider)} ${formatCount(count)}`}
+          key={provider}
+        >
+          <span aria-hidden="true">
+            {provider === "claude" ? "CL" : provider === "codex" ? "CX" : "PI"}
+          </span>{" "}
+          {formatCount(count)}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 function AgentIcon({ className = "" }: { className?: string }) {
@@ -551,6 +577,11 @@ function buildRows(
       return {
         key: row.skill_name,
         name: row.skill_name,
+        providerCounts: [
+          { provider: "claude", count: row.claude_count },
+          { provider: "codex", count: row.codex_count },
+          { provider: "pi", count: row.pi_count },
+        ],
         value: `${formatCount(row.total_count)} uses`,
         activity: formatRecency(row.last_used, nowMs),
         title: `${row.skill_name} · ${formatNumber(row.project_count)} projects`,
@@ -560,6 +591,11 @@ function buildRows(
       return {
         key: `${row.hook_identity}:${row.hook_event}`,
         name: row.hook_identity,
+        providerCounts: [
+          { provider: "claude", count: row.claude_count },
+          { provider: "codex", count: row.codex_count },
+          { provider: "pi", count: row.pi_count },
+        ],
         chip: row.is_quill ? { text: "QUILL", tone: "quill" } : undefined,
         value: `${formatCount(row.total_count)} fires`,
         activity: formatRecency(row.last_fired_at, nowMs),
@@ -908,6 +944,7 @@ function UsageView({ range }: UsageViewProps) {
                     <RowName row={row} />
                   )}
                   {row.meta && <span className="wg-row-meta wg-num">{row.meta}</span>}
+                  {row.providerCounts && <ProviderCounts counts={row.providerCounts} />}
                   {row.sessionStats && (
                     <span className="wg-row-session-stats wg-num">
                       {row.agentSummary && (

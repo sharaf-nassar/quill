@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-export type ToggleTone = "on" | "off" | "na" | "setup" | "busy";
+export type ToggleTone = "on" | "off" | "na" | "setup" | "error" | "busy";
 
 interface ToggleProps {
   tone: ToggleTone;
@@ -17,6 +17,7 @@ const DEFAULT_LABELS: Record<ToggleTone, string> = {
   off: "OFF",
   na: "N/A",
   setup: "SETUP",
+  error: "ERROR",
   busy: "...",
 };
 

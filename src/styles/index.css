@@ -2467,6 +2467,28 @@ body {
   white-space: nowrap;
 }
 
+.wg-row-provider-counts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, auto));
+  gap: 5px;
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 8px;
+  white-space: nowrap;
+}
+
+.wg-row-provider-count[data-provider="claude"] {
+  color: var(--provider-claude);
+}
+
+.wg-row-provider-count[data-provider="codex"] {
+  color: var(--provider-codex);
+}
+
+.wg-row-provider-count[data-provider="pi"] {
+  color: var(--provider-pi);
+}
+
 .wg-row-session-stats {
   display: contents;
   color: var(--faint);

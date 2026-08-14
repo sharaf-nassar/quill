@@ -160,8 +160,8 @@ function ContextTab({ integrations, features }: ContextTabProps) {
         <p>
           Disabling globally strips only the managed block; the rest of each file stays intact.
           When <code>AGENTS.md</code> is a symlink to <code>CLAUDE.md</code>, the writer
-          canonicalizes the path so a single underlying file is never edited twice. MiniMax has
-          no managed agent file and is excluded.
+          canonicalizes the path so a single underlying file is never edited twice. Pi and MiniMax
+          are excluded from the brevity profile.
         </p>
       </div>
     </div>

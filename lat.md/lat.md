@@ -21,6 +21,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[appimage-integration-tests]] — Version-aware AppImage refresh test specs
 - [[window-chrome-tests]] — Cross-platform resize policy and macOS configuration test specs
 - [[pi-provider-plumbing-tests]] — Pi provider persistence, breakdown, hook, and root test specs
+- [[pi-integrations-ui-tests]] — Pi setup, consent, provider-count, and Limits omission test specs
 - [[pi-session-parser-tests]] — Pi JSONL format and active-path parser test specs
 - [[pi-lifecycle-tests]] — Pi detection, transactional deployment, repair, and packaging test specs
 - [[context-http-api-tests]] — Loopback context API security, parity, execution, and pi telemetry test specs

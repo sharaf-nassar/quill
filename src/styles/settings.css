@@ -211,6 +211,12 @@
   border-color: rgba(251, 191, 36, 0.5);
 }
 
+.settings-toggle--error {
+  color: var(--meter-red);
+  background: rgba(248, 113, 113, 0.08);
+  border-color: rgba(248, 113, 113, 0.22);
+}
+
 .settings-toggle--busy {
   color: var(--signal-blue);
   background: rgba(96, 165, 250, 0.1);

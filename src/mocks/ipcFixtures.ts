@@ -138,6 +138,16 @@ const providerStatuses: ProviderStatus[] = [
     lastError: null,
     lastVerifiedAt: iso(90 * 1000),
   },
+  {
+    provider: "pi",
+    detectedCli: true,
+    detectedHome: true,
+    enabled: true,
+    setupState: "installed",
+    userHasMadeChoice: true,
+    lastError: null,
+    lastVerifiedAt: iso(2 * M),
+  },
   // Enabled but not answering: exercises the widget LIMITS row's SETUP state
   // (paired with the `auth` provider error below), which is the only way to
   // see a provider row that has no live buckets in browser mode.
@@ -324,15 +334,15 @@ const sessionBreakdown: SessionBreakdown[] = [
 ];
 
 const skillBreakdown: SkillBreakdown[] = [
-  { skill_name: "impeccable", total_count: 142, claude_count: 120, codex_count: 22, pi_count: 0, project_count: 3, last_used: iso(12 * M) },
-  { skill_name: "find-docs", total_count: 88, claude_count: 60, codex_count: 28, pi_count: 0, project_count: 5, last_used: iso(4 * H) },
-  { skill_name: "deep-research", total_count: 31, claude_count: 31, codex_count: 0, pi_count: 0, project_count: 2, last_used: iso(2 * D) },
+  { skill_name: "impeccable", total_count: 151, claude_count: 120, codex_count: 22, pi_count: 9, project_count: 3, last_used: iso(12 * M) },
+  { skill_name: "find-docs", total_count: 93, claude_count: 60, codex_count: 28, pi_count: 5, project_count: 5, last_used: iso(4 * H) },
+  { skill_name: "deep-research", total_count: 33, claude_count: 31, codex_count: 0, pi_count: 2, project_count: 2, last_used: iso(2 * D) },
 ];
 
 const hookBreakdown: HookBreakdown[] = [
-  { hook_identity: "quill:context-router", hook_event: "PreToolUse", tool_name: "Bash", is_quill: true, codex_count: 41, claude_count: 380, pi_count: 0, total_count: 421, last_fired_at: iso(3 * M) },
-  { hook_identity: "quill:observe.cjs", hook_event: "PreToolUse", tool_name: "Bash", is_quill: true, codex_count: 12, claude_count: 96, pi_count: 0, total_count: 108, last_fired_at: iso(45 * M) },
-  { hook_identity: "commit_message_validator.py", hook_event: "PreToolUse", tool_name: "Bash", is_quill: false, codex_count: 0, claude_count: 64, pi_count: 0, total_count: 64, last_fired_at: iso(5 * H) },
+  { hook_identity: "quill:context-router", hook_event: "PreToolUse", tool_name: "Bash", is_quill: true, codex_count: 41, claude_count: 380, pi_count: 18, total_count: 439, last_fired_at: iso(3 * M) },
+  { hook_identity: "quill:observe.cjs", hook_event: "PreToolUse", tool_name: "Bash", is_quill: true, codex_count: 12, claude_count: 96, pi_count: 7, total_count: 115, last_fired_at: iso(45 * M) },
+  { hook_identity: "commit_message_validator.py", hook_event: "PreToolUse", tool_name: "Bash", is_quill: false, codex_count: 0, claude_count: 64, pi_count: 3, total_count: 67, last_fired_at: iso(5 * H) },
 ];
 
 // --- Stats --------------------------------------------------------------------
