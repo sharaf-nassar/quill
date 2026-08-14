@@ -388,6 +388,14 @@ fn sync_search_index(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg(test)]
+fn sync_search_index_for_test(
+    index: &crate::sessions::SessionIndex,
+    storage: Option<&crate::storage::Storage>,
+) -> Result<usize, String> {
+    index.startup_scan_without_emit(storage)
+}
+
 fn live_tracker(app: &tauri::AppHandle) -> Option<Arc<LiveTracker>> {
     app.try_state::<Arc<LiveTracker>>()
         .map(|state| Arc::clone(state.inner()))
@@ -685,5 +693,187 @@ mod tests {
                 Some(&IntegrationProvider::Codex)
             );
         }
+    }
+
+    // @lat: [[pi-e2e-validation-tests#Pi End To End Validation#Numeric Pipeline Evidence]]
+    #[test]
+    #[serial]
+    fn pi_numeric_pipeline_evidence() {
+        use crate::models::ModelRange;
+        use crate::sessions::{SearchFilters, SessionIndex};
+        use crate::storage::Storage;
+        use notify::Watcher;
+        use serde_json::{Value, json};
+        use std::fs;
+        use std::io::{Seek, SeekFrom, Write};
+
+        struct DemoEnv;
+        impl Drop for DemoEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("QUILL_DEMO_MODE");
+                    std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+                }
+            }
+        }
+
+        const SEARCH_LIMIT: Duration = Duration::from_secs(15);
+        const LARGE_BYTES: u64 = 100 * 1024 * 1024;
+        let temp = tempfile::tempdir().expect("create isolated Pi E2E root");
+        let pi_root = temp.path().join("pi-sessions");
+        fs::create_dir_all(&pi_root).expect("create enabled Pi root");
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &pi_root);
+        }
+        let _env = DemoEnv;
+
+        let (tx, rx) = mpsc::sync_channel(MAX_PENDING_PATHS);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let callback_overflow = Arc::clone(&overflow);
+        let mut watcher = RecommendedWatcher::new(
+            move |event| forward_event(&tx, &callback_overflow, event),
+            notify::Config::default(),
+        )
+        .expect("create Pi transcript watcher");
+        let canonical_root = fs::canonicalize(&pi_root).expect("canonical Pi root");
+        let mut roots = vec![TranscriptRoot {
+            provider: IntegrationProvider::Pi,
+            resolved_path: pi_root.clone(),
+            canonical_path: None,
+            watched: false,
+        }];
+        assert_eq!(
+            retry_root_watches(
+                &mut roots,
+                |path| fs::canonicalize(path).ok().filter(|path| path.is_dir()),
+                |path| watcher
+                    .watch(path, RecursiveMode::Recursive)
+                    .map_err(|error| error.to_string()),
+            ),
+            1
+        );
+        assert_eq!(roots[0].canonical_path.as_ref(), Some(&canonical_root));
+
+        let now = chrono::Utc::now() - chrono::TimeDelta::seconds(10);
+        let stamp = |offset: i64| (now + chrono::TimeDelta::seconds(offset)).to_rfc3339();
+        let records = [
+            json!({"type":"session","version":3,"id":"pi-e2e","timestamp":stamp(0),"cwd":"/work/pi-e2e"}),
+            json!({"type":"message","id":"root","parentId":null,"timestamp":stamp(1),"message":{"role":"user","content":"find watcher admission needle"}}),
+            json!({"type":"message","id":"main","parentId":"root","timestamp":stamp(2),"message":{"role":"assistant","content":"watcher admission needle","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":11,"output":7,"cacheRead":3,"cacheWrite":5}}}),
+            json!({"type":"message","id":"branch","parentId":"root","timestamp":stamp(3),"message":{"role":"assistant","content":"abandoned branch","provider":"openai","model":"gpt-5.6","usage":{"input":13,"output":17,"cacheRead":19,"cacheWrite":23}}}),
+            json!({"type":"message","id":"active","parentId":"main","timestamp":stamp(4),"message":{"role":"assistant","content":"active branch","provider":"google","model":"gemini-2.5-pro","usage":{"input":29,"output":31,"cacheRead":37,"cacheWrite":41}}}),
+        ];
+        let corpus = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let usage_expected = corpus
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["message"]["role"] == "assistant")
+            .flat_map(|entry| {
+                ["input", "output", "cacheRead", "cacheWrite"].map(move |dimension| {
+                    entry["message"]["usage"][dimension].as_i64().unwrap_or(0)
+                })
+            })
+            .sum::<i64>();
+        assert_eq!(usage_expected, 236);
+
+        let transcript = pi_root.join("pi-e2e.jsonl");
+        let index = SessionIndex::open_or_create(&temp.path().join("search-index"))
+            .expect("open isolated search index");
+        let storage =
+            Storage::init_at(temp.path().join("quill.db"), false).expect("open isolated storage");
+        let started = Instant::now();
+        fs::write(&transcript, &corpus).expect("write post-registration Pi transcript");
+        let mut pending = PendingPaths::default();
+        let searchable_ms = loop {
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < SEARCH_LIMIT,
+                "Pi transcript was not searchable within 15000 ms; measured={} ms",
+                elapsed.as_millis()
+            );
+            match rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(Ok(event)) => collect_event_paths(&roots, &event, &mut pending, Instant::now()),
+                Ok(Err(error)) => panic!("Pi watcher event failed: {error}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("Pi watcher disconnected"),
+            }
+            if !pending.paths.is_empty() && pending.timeout(Instant::now()).is_zero() {
+                let (paths, recovery) = pending.take();
+                assert!(!recovery);
+                assert_eq!(paths.get(&transcript), Some(&IntegrationProvider::Pi));
+                sync_search_index_for_test(&index, Some(&storage)).expect("admit Pi search source");
+            }
+            let result = index
+                .search(
+                    "watcher admission needle",
+                    &SearchFilters {
+                        provider: Some(IntegrationProvider::Pi),
+                        ..SearchFilters::default()
+                    },
+                    "relevance",
+                    0,
+                    10,
+                )
+                .expect("poll Pi search index");
+            if result.total_hits > 0 {
+                break started.elapsed().as_millis();
+            }
+        };
+
+        let source =
+            crate::sessions::validate_retained_notify_source(IntegrationProvider::Pi, &transcript)
+                .expect("validate Pi model source")
+                .expect("retained Pi model source");
+        crate::model_usage::reconcile_source_for_test(&storage, source)
+            .expect("persist Pi model usage");
+        let usage_actual = storage
+            .get_model_usage_overview(ModelRange::SevenDays, Some("pi"))
+            .expect("read persisted Pi overview")
+            .totals
+            .total_tokens;
+        assert_eq!(usage_actual, usage_expected);
+
+        let large = temp.path().join("large-branched.jsonl");
+        let mut file = fs::File::create(&large).expect("create large Pi transcript");
+        file.write_all(format!("{}\n", records[0]).as_bytes())
+            .expect("write large Pi header");
+        file.set_len(LARGE_BYTES)
+            .expect("extend large Pi transcript");
+        file.seek(SeekFrom::End(0)).expect("seek large Pi tail");
+        file.write_all(format!("\n{}\n{}\n", records[2], records[3]).as_bytes())
+            .expect("write branched Pi tail");
+        drop(file);
+        let large_file_bytes = fs::metadata(&large)
+            .expect("stat large Pi transcript")
+            .len();
+        let tail_started = Instant::now();
+        let (tail_bound_bytes, tail_read_bytes) =
+            crate::live_tracker::bounded_tail_stats_for_test(&large).expect("read bounded Pi tail");
+        let tail_elapsed_ms = tail_started.elapsed().as_millis();
+        assert!(large_file_bytes >= LARGE_BYTES);
+        assert!(tail_read_bytes <= tail_bound_bytes);
+        assert!(tail_bound_bytes <= 1_048_576);
+        let tracker = LiveTracker::new(None);
+        tracker.apply_paths([(large, IntegrationProvider::Pi)]);
+        assert!(tracker.folded_session_ids().contains(&"pi-e2e".to_owned()));
+
+        println!(
+            "PI_E2E_RESULT={}",
+            json!({
+                "searchable_ms": searchable_ms,
+                "usage_expected": usage_expected,
+                "usage_actual": usage_actual,
+                "large_file_bytes": large_file_bytes,
+                "tail_bound_bytes": tail_bound_bytes,
+                "tail_read_bytes": tail_read_bytes,
+                "tail_elapsed_ms": tail_elapsed_ms,
+            })
+        );
     }
 }

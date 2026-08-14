@@ -1486,6 +1486,23 @@ impl SessionIndex {
     ) -> Result<usize, String> {
         use tauri::Emitter;
 
+        let total_indexed = self.startup_scan_inner(storage)?;
+        let _ = app_handle.emit("sessions-index-updated", total_indexed);
+        Ok(total_indexed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_scan_without_emit(
+        &self,
+        storage: Option<&crate::storage::Storage>,
+    ) -> Result<usize, String> {
+        self.startup_scan_inner(storage)
+    }
+
+    fn startup_scan_inner(
+        &self,
+        storage: Option<&crate::storage::Storage>,
+    ) -> Result<usize, String> {
         let mut total_indexed = 0usize;
         let mut index_changed = false;
         let mut state = self.state.lock().unwrap();
@@ -1819,8 +1836,6 @@ impl SessionIndex {
         self.save_state()?;
 
         log::info!("Session index scan complete: {total_indexed} messages indexed");
-        let _ = app_handle.emit("sessions-index-updated", total_indexed);
-
         Ok(total_indexed)
     }
 
