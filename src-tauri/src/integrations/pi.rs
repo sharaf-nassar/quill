@@ -2,6 +2,7 @@ use crate::integrations::deploy::{
     FileSnapshots, deployment_stamp_current, deployment_stamp_matches, recover_staged_batch,
     remove_path, write_deployment_stamp,
 };
+use crate::integrations::manifest::OwnedAssetManifest;
 use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
 use crate::models::IntegrationFeatures;
 use crate::storage::Storage;
@@ -269,6 +270,7 @@ fn uninstall_with_paths(
     remove_shared_config: bool,
 ) -> Result<(), String> {
     let snapshots = capture_snapshots(paths)?;
+    let manifest = build_owned_manifest(paths);
     let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
     let result = (|| {
         for extension in quill_extension_files(&paths.extensions_dir())? {
@@ -290,6 +292,8 @@ fn uninstall_with_paths(
         if remove_shared_config {
             crate::integrations::config_contract::remove_at(&paths.quill_config)?;
         }
+        remove_owned_artifacts(&manifest)?;
+        verify_owned_artifacts_removed(&manifest)?;
         Ok(())
     })();
     match result {
@@ -299,6 +303,39 @@ fn uninstall_with_paths(
             Err(snapshots.restore_with_error(error))
         }
     }
+}
+
+fn build_owned_manifest(paths: &PiInstallPaths) -> OwnedAssetManifest {
+    let root = paths
+        .quill_config
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"));
+    OwnedAssetManifest {
+        files: vec![root.join("pi-extension.log").to_string_lossy().into_owned()],
+        directories: vec![root.join("pi-spool").to_string_lossy().into_owned()],
+    }
+}
+
+fn remove_owned_artifacts(manifest: &OwnedAssetManifest) -> Result<(), String> {
+    for path in manifest.files.iter().chain(&manifest.directories) {
+        let path = Path::new(path);
+        remove_path(path)
+            .map_err(|error| format!("Failed to remove {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn verify_owned_artifacts_removed(manifest: &OwnedAssetManifest) -> Result<(), String> {
+    for path in manifest.files.iter().chain(&manifest.directories) {
+        let path = Path::new(path);
+        if path.exists() {
+            return Err(format!(
+                "Quill-owned Pi artifact remains after uninstall: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn verify(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<(), String> {
@@ -1028,6 +1065,21 @@ mod tests {
         fs::create_dir_all(harness.paths.extensions_dir()).unwrap();
         fs::write(&agents, b"user bytes without newline").unwrap();
         fs::write(&other, b"export default () => 42;\n").unwrap();
+        let spool = harness
+            .paths
+            .quill_config
+            .parent()
+            .unwrap()
+            .join("pi-spool");
+        let log = harness
+            .paths
+            .quill_config
+            .parent()
+            .unwrap()
+            .join("pi-extension.log");
+        fs::create_dir(&spool).unwrap();
+        fs::write(spool.join("session.123.jsonl"), b"spooled\n").unwrap();
+        fs::write(&log, b"bounded log\n").unwrap();
 
         let features = IntegrationFeatures::default();
         install_from_bundle(
@@ -1047,6 +1099,8 @@ mod tests {
         assert!(!harness.paths.extension_path().exists());
         assert!(!harness.paths.state_path().exists());
         assert!(!harness.paths.stamp_path().exists());
+        assert!(!spool.exists());
+        assert!(!log.exists());
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Crash Recovery]]

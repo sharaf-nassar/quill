@@ -36,7 +36,7 @@ Pi 0.84.0 and newer pass detection, while older, unknown, and malformed versions
 
 ## Transactional Round Trip
 
-Install and uninstall preserve existing AGENTS.md bytes and unrelated Pi extensions while removing every Quill-owned lifecycle artifact.
+Install and uninstall preserve existing AGENTS.md bytes and unrelated Pi extensions while removing every Quill-owned lifecycle, spool, and extension-log artifact.
 
 ## Crash Recovery
 

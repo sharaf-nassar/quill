@@ -30,7 +30,9 @@ fn pi_extension_error(value: &str) -> Option<PiExtensionErrorKind> {
             Some(PiExtensionErrorKind::ProtocolMismatch)
         }
         "RegistrationError" => Some(PiExtensionErrorKind::Registration),
-        "SpoolError" | "spool_corrupt" => Some(PiExtensionErrorKind::Spool),
+        "SpoolError" | "spool_corrupt" | "spool_corrupt_gap" | "spool_drop_gap" => {
+            Some(PiExtensionErrorKind::Spool)
+        }
         _ => Some(PiExtensionErrorKind::Unknown),
     }
 }
@@ -53,16 +55,17 @@ fn pi_extension_health_at(
                 PiExtensionHealthState::Stale
             }
         });
+    let last_error = storage
+        .get_setting("pi_extension.spool_gap")?
+        .filter(|value| !value.is_empty())
+        .or(storage.get_setting("pi_extension.last_error")?);
     Ok(PiExtensionHealth {
         state,
         last_seen,
         protocol: storage.get_setting("pi_extension.protocol")?,
         extension_version: storage.get_setting("pi_extension.extension_version")?,
         min_quill_version: storage.get_setting("pi_extension.min_quill_version")?,
-        last_error: storage
-            .get_setting("pi_extension.last_error")?
-            .as_deref()
-            .and_then(pi_extension_error),
+        last_error: last_error.as_deref().and_then(pi_extension_error),
     })
 }
 
@@ -846,6 +849,34 @@ mod tests {
             Some(PiExtensionErrorKind::ProtocolMismatch)
         );
         assert_eq!(health.protocol.as_deref(), Some("2"));
+    }
+
+    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Typed health gap]]
+    #[test]
+    fn pi_extension_health_surfaces_spool_drop_and_corrupt_gaps() {
+        assert_eq!(
+            pi_extension_error("spool_drop_gap"),
+            Some(PiExtensionErrorKind::Spool)
+        );
+        assert_eq!(
+            pi_extension_error("spool_corrupt_gap"),
+            Some(PiExtensionErrorKind::Spool)
+        );
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("quill.db"), false).unwrap();
+        storage
+            .set_settings_atomically(&[
+                ("pi_extension.last_error", ""),
+                ("pi_extension.spool_gap", "spool_drop_gap"),
+            ])
+            .unwrap();
+        assert_eq!(
+            pi_extension_health_at(&storage, Utc::now())
+                .unwrap()
+                .last_error,
+            Some(PiExtensionErrorKind::Spool)
+        );
     }
 
     #[test]

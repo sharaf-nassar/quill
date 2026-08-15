@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Json, Router,
@@ -64,6 +66,13 @@ const MAX_MESSAGES_PER_REQUEST: usize = 500;
 const REMOTE_ASSISTANT_TOOL_USE_TYPE: &str = "assistant_tool_use";
 const SESSION_NOTIFY_DEBOUNCE_MS: u64 = 250;
 const RETAINED_VALIDATE_RETRY_CAP: u32 = 5;
+const PI_SPOOL_FILE_MAX_BYTES: u64 = 1024 * 1024;
+const PI_SPOOL_DIR_MAX_BYTES: u64 = 16 * PI_SPOOL_FILE_MAX_BYTES;
+const PI_SPOOL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const PI_SPOOL_DRAIN_INTERVAL: Duration = Duration::from_secs(15);
+const PI_SPOOL_MAX_FILES_PER_PASS: usize = 1024;
+const PI_SPOOL_CORRUPT_GAP: &str = "spool_corrupt_gap";
+const PI_SPOOL_DROP_GAP: &str = "spool_drop_gap";
 
 struct PendingSessionNotify {
     generation: u64,
@@ -155,6 +164,7 @@ pub async fn start_server(
         live_tracker,
         demo_mode: std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1"),
     });
+    spawn_pi_spool_drain(Arc::clone(&state));
 
     // The main router below is intentionally reachable on 0.0.0.0. Context
     // routes, especially execute, live on a separate loopback listener and
@@ -707,6 +717,409 @@ fn ingest_pi_track(
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct PiSpoolLimits {
+    max_file_bytes: u64,
+    max_dir_bytes: u64,
+    max_age: Duration,
+    max_files_per_pass: usize,
+    max_track_records_per_pass: usize,
+    max_message_records_per_pass: usize,
+}
+
+impl Default for PiSpoolLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: PI_SPOOL_FILE_MAX_BYTES,
+            max_dir_bytes: PI_SPOOL_DIR_MAX_BYTES,
+            max_age: PI_SPOOL_MAX_AGE,
+            max_files_per_pass: PI_SPOOL_MAX_FILES_PER_PASS,
+            max_track_records_per_pass: MAX_PI_TRACK_REQUESTS / 8,
+            max_message_records_per_pass: MAX_PI_SESSION_MSG_REQUESTS / 8,
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq)]
+struct PiSpoolDrainOutcome {
+    ingested_records: usize,
+    corrupt_records: usize,
+    dropped_files: usize,
+    throttled: bool,
+}
+
+#[derive(Debug)]
+enum PiSpoolDrainError {
+    File {
+        path: PathBuf,
+        error: std::io::Error,
+    },
+    Ingest(String),
+}
+
+impl std::fmt::Display for PiSpoolDrainError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File { path, error } => write!(formatter, "{}: {error}", path.display()),
+            Self::Ingest(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for PiSpoolDrainError {}
+
+#[derive(serde::Deserialize)]
+struct PiSpoolRecord {
+    endpoint: String,
+    payload: serde_json::Value,
+}
+
+struct PiSpoolFile {
+    path: PathBuf,
+    pid: u32,
+    claimed: bool,
+    size: u64,
+    modified: SystemTime,
+}
+
+fn pi_spool_pid(name: &str) -> Option<(u32, bool)> {
+    let (original, claimed) = match name.split_once(".jsonl.quill-claimed-") {
+        Some((original, suffix)) if !suffix.is_empty() => (original, true),
+        None => (name.strip_suffix(".jsonl")?, false),
+        _ => return None,
+    };
+    let pid = original.rsplit_once('.')?.1.parse().ok()?;
+    (pid > 0).then_some((pid, claimed))
+}
+
+#[cfg(unix)]
+fn pi_spool_process_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal;
+    use nix::unistd::Pid;
+
+    if pid > i32::MAX as u32 {
+        return false;
+    }
+    match signal::kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) | Err(Errno::EPERM) => true,
+        Err(Errno::ESRCH) => false,
+        Err(_) => true,
+    }
+}
+
+#[cfg(not(unix))]
+fn pi_spool_process_alive(_pid: u32) -> bool {
+    // No portable std API exposes process liveness. Retaining the file is the
+    // only lossless fallback on unsupported targets.
+    true
+}
+
+fn claim_dead_pi_spool_file(file: &mut PiSpoolFile) -> Result<(), PiSpoolDrainError> {
+    if file.claimed {
+        return Ok(());
+    }
+    let name = file
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("validated UTF-8 Pi spool filename");
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let claimed = file.path.with_file_name(format!(
+        "{name}.quill-claimed-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::rename(&file.path, &claimed).map_err(|error| PiSpoolDrainError::File {
+        path: file.path.clone(),
+        error,
+    })?;
+    file.path = claimed;
+    file.claimed = true;
+    Ok(())
+}
+
+fn remove_pi_spool_file(path: &Path) -> Result<(), PiSpoolDrainError> {
+    fs::remove_file(path).map_err(|error| PiSpoolDrainError::File {
+        path: path.to_path_buf(),
+        error,
+    })
+}
+
+fn record_pi_spool_gap(storage: &Storage, gap: &'static str) -> Result<(), PiSpoolDrainError> {
+    storage
+        .set_settings_atomically(&[
+            ("pi_extension.last_error", gap),
+            ("pi_extension.spool_gap", gap),
+        ])
+        .map_err(PiSpoolDrainError::Ingest)
+}
+
+fn drain_pi_spool_once_with(
+    storage: &Storage,
+    live_tracker: &crate::live_tracker::LiveTracker,
+    track_limiter: &Mutex<VecDeque<Instant>>,
+    message_limiter: &Mutex<VecDeque<Instant>>,
+    root: &Path,
+    limits: PiSpoolLimits,
+    process_alive: impl Fn(u32) -> bool,
+) -> Result<PiSpoolDrainOutcome, PiSpoolDrainError> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(PiSpoolDrainError::File {
+                path: root.to_path_buf(),
+                error: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Pi spool root is not a directory",
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PiSpoolDrainOutcome::default());
+        }
+        Err(error) => {
+            return Err(PiSpoolDrainError::File {
+                path: root.to_path_buf(),
+                error,
+            });
+        }
+    }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return Err(PiSpoolDrainError::File {
+                path: root.to_path_buf(),
+                error,
+            });
+        }
+    };
+    let mut files = Vec::new();
+    let mut directory_overflow = false;
+    for entry in entries {
+        if files.len() >= limits.max_files_per_pass {
+            directory_overflow = true;
+            break;
+        }
+        let entry = entry.map_err(|error| PiSpoolDrainError::File {
+            path: root.to_path_buf(),
+            error,
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((pid, claimed)) = pi_spool_pid(&name) else {
+            continue;
+        };
+        let file_type = entry.file_type().map_err(|error| PiSpoolDrainError::File {
+            path: entry.path(),
+            error,
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| PiSpoolDrainError::File {
+            path: entry.path(),
+            error,
+        })?;
+        files.push(PiSpoolFile {
+            path: entry.path(),
+            pid,
+            claimed,
+            size: metadata.len(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+    files.sort_by_key(|file| file.modified);
+    let mut remaining_bytes = files.iter().map(|file| file.size).sum::<u64>();
+    let mut outcome = PiSpoolDrainOutcome::default();
+    let mut track_records = 0;
+    let mut message_records = 0;
+    let mut gap = directory_overflow.then_some(PI_SPOOL_DROP_GAP);
+
+    for mut file in files {
+        let live = !file.claimed && process_alive(file.pid);
+        let capped = file.size > limits.max_file_bytes
+            || remaining_bytes > limits.max_dir_bytes
+            || file
+                .modified
+                .elapsed()
+                .is_ok_and(|age| age > limits.max_age);
+        if capped {
+            outcome.dropped_files += 1;
+            gap = Some(PI_SPOOL_DROP_GAP);
+            if !live {
+                claim_dead_pi_spool_file(&mut file)?;
+                remove_pi_spool_file(&file.path)?;
+                remaining_bytes = remaining_bytes.saturating_sub(file.size);
+            }
+            continue;
+        }
+        if !live {
+            claim_dead_pi_spool_file(&mut file)?;
+        }
+
+        let mut bytes = Vec::with_capacity(file.size as usize);
+        fs::File::open(&file.path)
+            .map_err(|error| PiSpoolDrainError::File {
+                path: file.path.clone(),
+                error,
+            })?
+            .take(file.size)
+            .read_to_end(&mut bytes)
+            .map_err(|error| PiSpoolDrainError::File {
+                path: file.path.clone(),
+                error,
+            })?;
+        let trailing_partial = !bytes.is_empty() && !bytes.ends_with(b"\n");
+        let mut complete = true;
+        for line in bytes.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if trailing_partial && line.as_ptr_range().end == bytes.as_ptr_range().end {
+                if live {
+                    complete = false;
+                    break;
+                }
+                outcome.corrupt_records += 1;
+                gap = Some(PI_SPOOL_CORRUPT_GAP);
+                continue;
+            }
+            let record: PiSpoolRecord = match serde_json::from_slice(line) {
+                Ok(record) => record,
+                Err(_) => {
+                    outcome.corrupt_records += 1;
+                    gap = Some(PI_SPOOL_CORRUPT_GAP);
+                    continue;
+                }
+            };
+            match record.endpoint.as_str() {
+                "/api/v1/pi/track" => {
+                    if track_records >= limits.max_track_records_per_pass
+                        || !check_rate_limit_with_max(track_limiter, MAX_PI_TRACK_REQUESTS)
+                    {
+                        outcome.throttled = true;
+                        complete = false;
+                        break;
+                    }
+                    track_records += 1;
+                    let payload: PiTrackEnvelope = match serde_json::from_value(record.payload) {
+                        Ok(payload) => payload,
+                        Err(_) => {
+                            outcome.corrupt_records += 1;
+                            gap = Some(PI_SPOOL_CORRUPT_GAP);
+                            continue;
+                        }
+                    };
+                    match crate::with_ingest_write_permit(|| {
+                        ingest_pi_track(storage, live_tracker, &payload, false)
+                    }) {
+                        Ok(()) => outcome.ingested_records += 1,
+                        Err(error) if error.status == StatusCode::BAD_REQUEST => {
+                            outcome.corrupt_records += 1;
+                            gap = Some(PI_SPOOL_CORRUPT_GAP);
+                        }
+                        Err(error) => return Err(PiSpoolDrainError::Ingest(error.message)),
+                    }
+                }
+                "/api/v1/sessions/messages" => {
+                    if message_records >= limits.max_message_records_per_pass
+                        || !check_rate_limit_with_max(message_limiter, MAX_PI_SESSION_MSG_REQUESTS)
+                    {
+                        outcome.throttled = true;
+                        complete = false;
+                        break;
+                    }
+                    message_records += 1;
+                    let payload: SessionMessagesPayload =
+                        match serde_json::from_value(record.payload) {
+                            Ok(payload) => payload,
+                            Err(_) => {
+                                outcome.corrupt_records += 1;
+                                gap = Some(PI_SPOOL_CORRUPT_GAP);
+                                continue;
+                            }
+                        };
+                    if payload.provider != IntegrationProvider::Pi
+                        || validate_session_messages_payload(&payload).is_err()
+                    {
+                        outcome.corrupt_records += 1;
+                        gap = Some(PI_SPOOL_CORRUPT_GAP);
+                        continue;
+                    }
+                    crate::with_rollup_backfill_write_permit(|| {
+                        persist_remote_session_analytics(storage, &payload)
+                    })
+                    .map_err(PiSpoolDrainError::Ingest)?;
+                    outcome.ingested_records += 1;
+                }
+                _ => {
+                    outcome.corrupt_records += 1;
+                    gap = Some(PI_SPOOL_CORRUPT_GAP);
+                }
+            }
+        }
+        if complete && !live {
+            remove_pi_spool_file(&file.path)?;
+            remaining_bytes = remaining_bytes.saturating_sub(file.size);
+        }
+        if outcome.throttled {
+            break;
+        }
+    }
+    if let Some(gap) = gap {
+        record_pi_spool_gap(storage, gap)?;
+    }
+    Ok(outcome)
+}
+
+fn pi_spool_root() -> PathBuf {
+    crate::integrations::config_contract::config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("pi-spool")
+}
+
+fn spawn_pi_spool_drain(state: Arc<ServerState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PI_SPOOL_DRAIN_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if state.demo_mode || crate::ingest_is_quiesced() {
+                continue;
+            }
+            let drain_state = Arc::clone(&state);
+            let result = tokio::task::spawn_blocking(move || {
+                drain_pi_spool_once_with(
+                    drain_state.storage,
+                    &drain_state.live_tracker,
+                    &drain_state.pi_track_rate_limiter,
+                    &drain_state.pi_session_rate_limiter,
+                    &pi_spool_root(),
+                    PiSpoolLimits::default(),
+                    pi_spool_process_alive,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(outcome)) if outcome.ingested_records > 0 => {
+                    let _ = state
+                        .app_handle
+                        .emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
+                    let _ = state.app_handle.emit("transcript-analytics-updated", ());
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => log::warn!("Pi spool drain failed: {error}"),
+                Err(error) => log::warn!("Pi spool drain worker failed: {error}"),
+            }
+        }
+    });
 }
 
 async fn post_pi_track(
@@ -2716,5 +3129,350 @@ mod observed_subagent_tests {
             .get_model_usage_overview(crate::models::ModelRange::SevenDays, Some("pi"))
             .expect("read pushed Pi usage");
         assert_eq!(overview.totals.total_tokens, 100);
+    }
+
+    fn spool_track_payload(session_id: &str) -> serde_json::Value {
+        let started = chrono::Utc::now() - chrono::TimeDelta::seconds(4);
+        serde_json::json!({
+            "protocol": PI_TRACK_PROTOCOL,
+            "extension_version": "1.2.3",
+            "min_quill_version": "0.9.0",
+            "events": [
+                {
+                    "type": "session_start",
+                    "event_uuid": format!("{session_id}-start"),
+                    "session_id": session_id,
+                    "hostname": "HOST.EXAMPLE.COM",
+                    "timestamp": started.to_rfc3339(),
+                    "cwd": "/work/pi",
+                    "reason": "startup",
+                    "lineage": { "kind": "root" }
+                },
+                {
+                    "type": "usage",
+                    "event_uuid": format!("{session_id}-usage"),
+                    "session_id": session_id,
+                    "hostname": "HOST.EXAMPLE.COM",
+                    "timestamp": (started + chrono::TimeDelta::seconds(3)).to_rfc3339(),
+                    "model_provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_tokens": 30,
+                    "cache_write_tokens": 40,
+                    "cost": {
+                        "input": 0.01,
+                        "output": 0.02,
+                        "cache_read": 0.03,
+                        "cache_write": 0.04,
+                        "total": 0.10
+                    }
+                }
+            ]
+        })
+    }
+
+    fn spool_runtime_payload(session_id: &str) -> serde_json::Value {
+        let started = chrono::Utc::now() - chrono::TimeDelta::seconds(3);
+        serde_json::json!({
+            "provider": "pi",
+            "host": "host",
+            "session_id": session_id,
+            "project": "/work/pi",
+            "cwd": "/work/pi",
+            "messages": [
+                {
+                    "uuid": format!("{session_id}-user"),
+                    "type": "input",
+                    "timestamp": started.to_rfc3339(),
+                    "content": "",
+                    "role": "user",
+                    "event_kinds": ["user_text"]
+                },
+                {
+                    "uuid": format!("{session_id}-assistant"),
+                    "type": "turn_end",
+                    "timestamp": (started + chrono::TimeDelta::seconds(2)).to_rfc3339(),
+                    "content": "",
+                    "role": "assistant",
+                    "event_kinds": ["asst_text"]
+                }
+            ]
+        })
+    }
+
+    fn spool_line(endpoint: &str, payload: serde_json::Value) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({ "endpoint": endpoint, "payload": payload })
+        )
+    }
+
+    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Live overlap]]
+    #[test]
+    fn pi_spool_live_file_is_retained_and_replay_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = dir.path().join("pi-spool");
+        std::fs::create_dir(&spool).unwrap();
+        let path = spool.join("live-session.4242.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                spool_line("/api/v1/pi/track", spool_track_payload("live-session")),
+                spool_line(
+                    "/api/v1/sessions/messages",
+                    spool_runtime_payload("live-session")
+                )
+            ),
+        )
+        .unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        let track_limiter = Mutex::new(VecDeque::new());
+        let message_limiter = Mutex::new(VecDeque::new());
+
+        let first = drain_pi_spool_once_with(
+            &storage,
+            &tracker,
+            &track_limiter,
+            &message_limiter,
+            &spool,
+            PiSpoolLimits::default(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(first.ingested_records, 2);
+        assert!(path.exists());
+        let appended = spool_line("/api/v1/pi/track", spool_track_payload("appended-session"));
+        let mut live_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut live_file, appended.as_bytes()).unwrap();
+        drop(live_file);
+
+        let second = drain_pi_spool_once_with(
+            &storage,
+            &tracker,
+            &track_limiter,
+            &message_limiter,
+            &spool,
+            PiSpoolLimits::default(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(second.ingested_records, 3);
+        assert!(path.exists());
+
+        let rows = tracker.overlay(
+            Vec::new(),
+            "2026-01-01T00:00:00Z",
+            Some("host"),
+            Some(IntegrationProvider::Pi),
+            Some(10),
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.total_tokens == 100));
+        let overview = storage
+            .get_model_usage_overview(crate::models::ModelRange::SevenDays, Some("pi"))
+            .unwrap();
+        assert_eq!(overview.totals.total_tokens, 200);
+        let runtime = storage.get_llm_runtime_stats("30d", None).unwrap();
+        assert_eq!(runtime.turn_count, 1);
+        assert_eq!(runtime.total_runtime_secs, 2.0);
+    }
+
+    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Corrupt continuation and dead cleanup]]
+    #[test]
+    fn pi_spool_corrupt_line_records_typed_gap_and_continues_before_dead_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = dir.path().join("pi-spool");
+        std::fs::create_dir(&spool).unwrap();
+        let path = spool.join("dead-session.4243.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "not-json\n{}",
+                spool_line("/api/v1/pi/track", spool_track_payload("dead-session"))
+            ),
+        )
+        .unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+
+        let outcome = drain_pi_spool_once_with(
+            &storage,
+            &tracker,
+            &Mutex::new(VecDeque::new()),
+            &Mutex::new(VecDeque::new()),
+            &spool,
+            PiSpoolLimits::default(),
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.corrupt_records, 1);
+        assert_eq!(outcome.ingested_records, 1);
+        assert!(!path.exists());
+        assert_eq!(
+            storage
+                .get_setting("pi_extension.last_error")
+                .unwrap()
+                .as_deref(),
+            Some(PI_SPOOL_CORRUPT_GAP)
+        );
+    }
+
+    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Cap drop gap]]
+    #[test]
+    fn pi_spool_size_and_age_caps_drop_only_dead_file_and_record_typed_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = dir.path().join("pi-spool");
+        std::fs::create_dir(&spool).unwrap();
+        let dead = spool.join("dead-session.4244.jsonl");
+        let live = spool.join("live-session.4245.jsonl");
+        std::fs::write(
+            &dead,
+            spool_line("/api/v1/pi/track", spool_track_payload("dead-session")),
+        )
+        .unwrap();
+        std::fs::write(&live, b"").unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        let limits = PiSpoolLimits {
+            max_file_bytes: std::fs::metadata(&dead).unwrap().len() - 1,
+            max_age: Duration::ZERO,
+            ..PiSpoolLimits::default()
+        };
+
+        let outcome = drain_pi_spool_once_with(
+            &storage,
+            &tracker,
+            &Mutex::new(VecDeque::new()),
+            &Mutex::new(VecDeque::new()),
+            &spool,
+            limits,
+            |pid| pid == 4245,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.dropped_files, 2);
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert_eq!(
+            storage
+                .get_setting("pi_extension.last_error")
+                .unwrap()
+                .as_deref(),
+            Some(PI_SPOOL_DROP_GAP)
+        );
+        assert_eq!(
+            storage
+                .get_setting("pi_extension.spool_gap")
+                .unwrap()
+                .as_deref(),
+            Some(PI_SPOOL_DROP_GAP)
+        );
+    }
+
+    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Ingest throttling]]
+    #[test]
+    fn pi_spool_default_budgets_leave_half_each_rate_window_for_live_traffic() {
+        let default_limits = PiSpoolLimits::default();
+        assert_eq!(
+            default_limits.max_track_records_per_pass * 4,
+            MAX_PI_TRACK_REQUESTS / 2
+        );
+        assert_eq!(
+            default_limits.max_message_records_per_pass * 4,
+            MAX_PI_SESSION_MSG_REQUESTS / 2
+        );
+    }
+
+    #[test]
+    fn pi_spool_drain_stops_at_the_configured_ingest_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spool = dir.path().join("pi-spool");
+        std::fs::create_dir(&spool).unwrap();
+        let path = spool.join("dead-session.4246.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{}{}",
+                spool_line("/api/v1/pi/track", spool_track_payload("first-session")),
+                spool_line("/api/v1/pi/track", spool_track_payload("second-session"))
+            ),
+        )
+        .unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        let limits = PiSpoolLimits {
+            max_track_records_per_pass: 1,
+            ..PiSpoolLimits::default()
+        };
+
+        let outcome = drain_pi_spool_once_with(
+            &storage,
+            &tracker,
+            &Mutex::new(VecDeque::new()),
+            &Mutex::new(VecDeque::new()),
+            &spool,
+            limits,
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.ingested_records, 1);
+        assert!(outcome.throttled);
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 1);
+
+        let resumed = drain_pi_spool_once_with(
+            &storage,
+            &tracker,
+            &Mutex::new(VecDeque::new()),
+            &Mutex::new(VecDeque::new()),
+            &spool,
+            PiSpoolLimits::default(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(resumed.ingested_records, 2);
+        assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
+    }
+
+    // @lat: [[pi-spool-tests#Pi Spool Drain Test Specs#Symlink boundary]]
+    #[cfg(unix)]
+    #[test]
+    fn pi_spool_drain_rejects_a_symlinked_root_without_removing_target_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("outside");
+        std::fs::create_dir(&target).unwrap();
+        let outside = target.join("session.4247.jsonl");
+        std::fs::write(
+            &outside,
+            spool_line("/api/v1/pi/track", spool_track_payload("outside-session")),
+        )
+        .unwrap();
+        let spool = dir.path().join("pi-spool");
+        symlink(&target, &spool).unwrap();
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+
+        assert!(
+            drain_pi_spool_once_with(
+                &storage,
+                &tracker,
+                &Mutex::new(VecDeque::new()),
+                &Mutex::new(VecDeque::new()),
+                &spool,
+                PiSpoolLimits::default(),
+                |_| false,
+            )
+            .is_err()
+        );
+        assert!(outside.exists());
     }
 }

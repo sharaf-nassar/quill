@@ -358,7 +358,7 @@ Pi must resolve through the shared login-shell, launcher, and symlink-aware PATH
 
 The selected `$PI_CODING_AGENT_DIR` and `$PI_CODING_AGENT_SESSION_DIR`, or their `~/.pi/agent` defaults, are captured in `~/.config/quill/pi/integration-state.json` with the detected Pi version. Later repair and removal use those persisted paths even if the environment changes.
 
-Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes only marked Quill files, the managed block, state, and stamp. It does not delete indexed Pi sessions or analytics.
+Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes marked Quill files, the managed block, state, stamp, Pi spool directory, and bounded extension log. It does not delete indexed Pi sessions or analytics.
 
 Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
 
