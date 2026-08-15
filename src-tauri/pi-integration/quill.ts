@@ -3,8 +3,20 @@
 // Quill-managed Pi integration, payload/stamp 2.
 // Disable Pi in Quill to remove this file.
 
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  appendFileSync,
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { hostname, homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -12,7 +24,15 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 const LOCAL_TIMEOUT_MS = 1500;
 const CONTEXT_PORT = "19877";
 const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };
+const PROTOCOL_VERSION = 1;
+const EXTENSION_VERSION = "0.1.0";
+const MIN_QUILL_VERSION = "0.9.0";
+const SPOOL_FILE_MAX_BYTES = 1024 * 1024;
+const SPOOL_DIR_MAX_BYTES = 16 * SPOOL_FILE_MAX_BYTES;
+const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const LOG_MAX_BYTES = 256 * 1024;
 const TAINTED_MAX_PATHS = 256;
+let lastNoticeRoot;
 const READER_COMMAND_PATTERN =
   /\b(cat|bat|head|tail|less|more|view|od|xxd|strings|hexdump|sed|awk|grep|rg|ack|jq|yq|xq|xmllint)\b/i;
 const BINARY_URL_EXT_RE =
@@ -158,6 +178,10 @@ const TOOLS = [
 const EVENT_MAP = {
   session_start: "SessionStart",
   input: "UserPromptSubmit",
+  agent_start: "SubagentStart",
+  agent_settled: "SubagentStop",
+  tool_execution_start: "PreToolUse",
+  tool_execution_end: "PostToolUse",
   tool_call: "PreToolUse",
   tool_result: "PostToolUse",
   turn_end: "Stop",
@@ -165,6 +189,36 @@ const EVENT_MAP = {
   session_before_compact: "PreCompact",
   session_compact: "PostCompact",
 };
+const TRACKING_EVENTS = new Set([
+  "session_start",
+  "session_shutdown",
+  "agent_start",
+  "agent_settled",
+  "turn_start",
+  "turn_end",
+  "message_end",
+  "tool_execution_start",
+  "tool_execution_end",
+  "model_select",
+  "input",
+]);
+
+export class QuillExtensionError extends Error {
+  constructor(message, options = {}) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+
+export class ConfigError extends QuillExtensionError {}
+export class TransportError extends QuillExtensionError {}
+export class ProtocolMismatchError extends QuillExtensionError {}
+export class RegistrationError extends QuillExtensionError {}
+export class SpoolError extends QuillExtensionError {}
+
+function errorMessage(error) {
+  return error instanceof Error ? `${error.name}: ${error.message}` : `Error: ${String(error)}`;
+}
 
 function localBase(value) {
   const url = new URL(value);
@@ -181,18 +235,33 @@ function localBase(value) {
 
 function loadConfig() {
   const root = process.env.HOME || process.env.USERPROFILE || homedir();
-  const config = JSON.parse(readFileSync(join(root, ".config", "quill", "config.json"), "utf8"));
-  if (typeof config.url !== "string" || typeof config.secret !== "string" || !config.secret) {
-    throw new Error("Invalid Quill config");
+  let config;
+  try {
+    config = JSON.parse(readFileSync(join(root, ".config", "quill", "config.json"), "utf8"));
+  } catch (error) {
+    throw new ConfigError("Quill config is missing or malformed", { cause: error });
   }
-  const main = localBase(config.url);
-  const context = config.context_url ? localBase(config.context_url) : new URL(main);
+  if (typeof config.url !== "string" || typeof config.secret !== "string" || !config.secret) {
+    throw new ConfigError("Invalid Quill config");
+  }
+  let main;
+  let context;
+  try {
+    main = localBase(config.url);
+    context = config.context_url ? localBase(config.context_url) : new URL(main);
+  } catch (error) {
+    throw new ConfigError("Invalid Quill config URL", { cause: error });
+  }
   if (!config.context_url) context.port = CONTEXT_PORT;
+  const quillRoot = join(root, ".config", "quill");
   return {
     main: main.origin,
     context: context.origin,
     secret: config.secret,
     home: root,
+    quillRoot,
+    spoolRoot: join(quillRoot, "pi-spool"),
+    logPath: join(quillRoot, "pi-extension.log"),
     markerRoot: join(root, ".config", "quill", "context", "markers"),
     hostname:
       (typeof config.hostname === "string" && config.hostname.trim()) ||
@@ -214,8 +283,145 @@ async function fetchJson(config, url, options) {
     headers: headers(config),
     signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
   });
-  if (!response.ok) throw new Error(`Quill returned ${response.status}`);
+  if (!response.ok) throw new TransportError(`Quill returned ${response.status}`);
   return response.json();
+}
+
+function safeSessionId(value) {
+  return String(value || "unknown").replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
+}
+
+function writeLog(config, error) {
+  try {
+    const line = `${new Date().toISOString()} ${errorMessage(error)}\n`;
+    mkdirSync(config.quillRoot, { recursive: true, mode: 0o700 });
+    let size = 0;
+    try {
+      size = statSync(config.logPath).size;
+    } catch (statError) {
+      if (statError?.code !== "ENOENT") throw statError;
+    }
+    if (size + Buffer.byteLength(line) > LOG_MAX_BYTES) {
+      writeFileSync(config.logPath, line, { mode: 0o600 });
+    } else {
+      appendFileSync(config.logPath, line, { mode: 0o600 });
+    }
+    chmodSync(config.logPath, 0o600);
+  } catch (logError) {
+    console.error("Quill Pi extension log failure", errorMessage(logError));
+  }
+}
+
+function spoolFile(config, sessionId) {
+  return join(config.spoolRoot, `${safeSessionId(sessionId)}.${process.pid}.jsonl`);
+}
+
+function pruneSpool(config, incomingBytes, currentPath) {
+  const now = Date.now();
+  const files = readdirSync(config.spoolRoot)
+    .filter((name) => name.endsWith(".jsonl"))
+    .map((name) => {
+      const path = join(config.spoolRoot, name);
+      return { path, ...statSync(path) };
+    })
+    .sort((left, right) => left.mtimeMs - right.mtimeMs);
+  let total = files.reduce((sum, file) => sum + file.size, 0);
+  for (const file of files) {
+    if (file.path !== currentPath && (now - file.mtimeMs > SPOOL_MAX_AGE_MS || total + incomingBytes > SPOOL_DIR_MAX_BYTES)) {
+      unlinkSync(file.path);
+      total -= file.size;
+    }
+  }
+  return total;
+}
+
+function appendSpool(config, endpoint, payload) {
+  const sessionId = payload.session_id || payload.events?.[0]?.session_id;
+  const line = `${JSON.stringify({ endpoint, payload })}\n`;
+  const bytes = Buffer.byteLength(line);
+  if (bytes > SPOOL_FILE_MAX_BYTES) throw new SpoolError("Spool record exceeds file cap");
+  try {
+    mkdirSync(config.spoolRoot, { recursive: true, mode: 0o700 });
+    chmodSync(config.spoolRoot, 0o700);
+    const path = spoolFile(config, sessionId);
+    let fileBytes = 0;
+    try {
+      fileBytes = statSync(path).size;
+    } catch (statError) {
+      if (statError?.code !== "ENOENT") throw statError;
+    }
+    pruneSpool(config, bytes, path);
+    if (fileBytes + bytes > SPOOL_FILE_MAX_BYTES) {
+      throw new SpoolError("Spool file cap reached; newest event dropped");
+    }
+    appendFileSync(path, line, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  } catch (error) {
+    if (error instanceof SpoolError) throw error;
+    throw new SpoolError("Failed to append Pi tracking spool", { cause: error });
+  }
+}
+
+async function responseError(response) {
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    body = null;
+  }
+  if (response.status === 400 && body?.error === "protocol_mismatch") {
+    return new ProtocolMismatchError(body.message || "Pi tracking protocol mismatch");
+  }
+  return new TransportError(body?.message || `Quill returned ${response.status}`);
+}
+
+async function postPayload(config, endpoint, payload, retryAuth = true) {
+  let response;
+  try {
+    response = await fetch(`${config.main}${endpoint}`, {
+      method: "POST",
+      headers: headers(config),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw new TransportError("Quill request failed", { cause: error });
+  }
+  if (response.status === 401 && retryAuth) {
+    Object.assign(config, loadConfig());
+    return postPayload(config, endpoint, payload, false);
+  }
+  if (!response.ok) throw await responseError(response);
+  try {
+    await response.body?.cancel();
+  } catch (error) {
+    writeLog(config, new TransportError("Failed to release Quill response", { cause: error }));
+  }
+}
+
+function sendTracked(config, state, endpoint, payload) {
+  let request;
+  try {
+    request = postPayload(config, endpoint, payload);
+  } catch (error) {
+    request = Promise.reject(error);
+  }
+  return request.then(
+    () => true,
+    (error) => {
+      const failure = error instanceof QuillExtensionError
+        ? error
+        : new TransportError("Unexpected Pi tracking failure", { cause: error });
+      state.lastError = failure.name;
+      writeLog(config, failure);
+      try {
+        appendSpool(config, endpoint, payload);
+      } catch (spoolError) {
+        writeLog(config, spoolError);
+      }
+      return false;
+    },
+  );
 }
 
 function success(data) {
@@ -391,7 +597,7 @@ function loadTainted(config, sessionId) {
   try {
     const state = JSON.parse(readFileSync(taintedStatePath(config, sessionId), "utf8"));
     return new Set((Array.isArray(state.paths) ? state.paths : []).filter((path) => !isDegenerateTaint(path)));
-  } catch {
+  } catch (error) {
     return new Set();
   }
 }
@@ -402,8 +608,8 @@ function saveTainted(config, sessionId, paths) {
     const bounded = [...paths].slice(-TAINTED_MAX_PATHS);
     mkdirSync(dirname(statePath), { recursive: true });
     writeFileSync(statePath, JSON.stringify({ paths: bounded }), "utf8");
-  } catch {
-    // Taint persistence is best effort; routing must keep working.
+  } catch (error) {
+    writeLog(config, new QuillExtensionError("Taint persistence failed", { cause: error }));
   }
 }
 
@@ -544,11 +750,11 @@ function postRoutingTelemetry(config, event, ctx, reason, route) {
       body: JSON.stringify({ events: [body] }),
       signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
     }).then(
-      (response) => response.body?.cancel().catch(() => {}),
-      () => {},
+      (response) => response.body?.cancel().catch((error) => writeLog(config, error)),
+      (error) => writeLog(config, new TransportError("Routing telemetry failed", { cause: error })),
     );
-  } catch {
-    // Routing telemetry never changes the routing decision.
+  } catch (error) {
+    writeLog(config, new TransportError("Routing telemetry failed", { cause: error }));
   }
 }
 
@@ -603,9 +809,315 @@ function postTelemetry(config, event, ctx, hookEvent) {
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(LOCAL_TIMEOUT_MS),
   }).then(
-    (response) => response.body?.cancel().catch(() => {}),
-    () => {},
+    (response) => response.body?.cancel().catch((error) => writeLog(config, error)),
+    (error) => writeLog(config, new TransportError("Hook telemetry failed", { cause: error })),
   );
+}
+
+function isoTimestamp(value) {
+  const date = value === undefined ? new Date() : new Date(value);
+  return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
+}
+
+function stableId(prefix, ...parts) {
+  return `${prefix}_${createHash("sha256").update(JSON.stringify(parts)).digest("hex").slice(0, 32)}`;
+}
+
+function sessionInfo(ctx) {
+  const manager = ctx.sessionManager;
+  const header = manager.getHeader?.();
+  return {
+    id: header?.id || manager.getSessionId(),
+    file: manager.getSessionFile?.(),
+    header,
+    cwd: ctx.cwd || header?.cwd || null,
+  };
+}
+
+function readSessionId(path) {
+  let handle;
+  try {
+    handle = openSync(path, "r");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const length = readSync(handle, buffer, 0, buffer.length, 0);
+    const firstLine = buffer.toString("utf8", 0, length).split("\n", 1)[0];
+    const header = JSON.parse(firstLine);
+    if (header?.type !== "session" || typeof header.id !== "string" || !header.id) {
+      throw new ConfigError("Parent session header has no stable id");
+    }
+    return header.id;
+  } catch (error) {
+    if (error instanceof QuillExtensionError) throw error;
+    throw new ConfigError("Cannot resolve parent session", { cause: error });
+  } finally {
+    if (handle !== undefined) closeSync(handle);
+  }
+}
+
+function resolveStart(event, info) {
+  const parentPath = info.header?.parentSession || (event.reason === "fork" ? event.previousSessionFile : undefined);
+  const resolved = new Map();
+  const resolveId = (path) => {
+    if (!resolved.has(path)) resolved.set(path, readSessionId(path));
+    return resolved.get(path);
+  };
+  let lineage = { kind: "root" };
+  if (parentPath) {
+    try {
+      lineage = { kind: "linked", parent_session_id: resolveId(parentPath) };
+    } catch (error) {
+      lineage = { kind: "unresolved", reason: "parent_header_unavailable" };
+    }
+  }
+  let previousSessionId;
+  if (["new", "resume", "fork"].includes(event.reason) && event.previousSessionFile) {
+    try {
+      previousSessionId = resolveId(event.previousSessionFile);
+    } catch (error) {
+      previousSessionId = undefined;
+    }
+  }
+  return { lineage, previousSessionId };
+}
+
+function trackEnvelope(state, events) {
+  return {
+    protocol: PROTOCOL_VERSION,
+    extension_version: EXTENSION_VERSION,
+    min_quill_version: MIN_QUILL_VERSION,
+    ...(state.lastError ? { last_error: state.lastError } : {}),
+    events,
+  };
+}
+
+function trackEvent(config, state, info, type, fields = {}, identity = randomUUID()) {
+  const timestamp = fields.timestamp || isoTimestamp();
+  const event = {
+    type,
+    event_uuid: stableId("pi", info.id, type, identity),
+    session_id: info.id,
+    hostname: config.hostname,
+    timestamp,
+    ...fields,
+  };
+  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope(state, [event]));
+}
+
+function trackEvents(config, state, info, events) {
+  return sendTracked(config, state, "/api/v1/pi/track", trackEnvelope(state, events));
+}
+
+function runtimeMessage(config, state, info, message) {
+  const payload = {
+    provider: "pi",
+    host: config.hostname,
+    session_id: info.id,
+    project: info.cwd || "unknown",
+    cwd: info.cwd,
+    messages: [{
+      uuid: message.uuid,
+      type: message.type,
+      timestamp: message.timestamp,
+      content: "",
+      role: message.role,
+      tools_used: message.tools || [],
+      files_modified: [],
+      event_kinds: message.eventKinds,
+    }],
+  };
+  return sendTracked(config, state, "/api/v1/sessions/messages", payload);
+}
+
+function notifySession(config, state, info) {
+  if (!info.file) return Promise.resolve(true);
+  const payload = {
+    provider: "pi",
+    session_id: info.id,
+    jsonl_path: info.file,
+    host: config.hostname,
+    cwd: info.cwd,
+    project: info.cwd,
+  };
+  return postPayload(config, "/api/v1/sessions/notify", payload).then(
+    () => true,
+    (error) => {
+      state.lastError = error.name;
+      writeLog(config, error);
+      return false;
+    },
+  );
+}
+
+function defer(config, task) {
+  queueMicrotask(() => {
+    try {
+      void task();
+    } catch (error) {
+      writeLog(config, new TransportError("Pi tracking handler failed", { cause: error }));
+    }
+  });
+}
+
+function registerHandler(pi, config, event, handler) {
+  try {
+    pi.on(event, handler);
+  } catch (error) {
+    writeLog(config, new RegistrationError(`Cannot register ${event}`, { cause: error }));
+  }
+}
+
+function registerTracking(pi, config) {
+  const state = { lastError: null };
+  const activity = (event, ctx, name) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      postTelemetry(config, event, ctx, EVENT_MAP[name]);
+      return trackEvent(config, state, info, "activity", {}, `${name}:${randomUUID()}`);
+    });
+  };
+
+  registerHandler(pi, config, "session_start", (event, ctx) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      const { lineage, previousSessionId } = resolveStart(event, info);
+      const timestamp = isoTimestamp(info.header?.timestamp);
+      postTelemetry(config, event, ctx, EVENT_MAP.session_start);
+      const handshake = trackEvent(config, state, info, "session_start", {
+        timestamp,
+        cwd: info.cwd,
+        ephemeral: !info.file,
+        reason: event.reason,
+        ...(previousSessionId ? { previous_session_id: previousSessionId } : {}),
+        lineage,
+      }, `${event.reason}:${timestamp}`);
+      void notifySession(config, state, info);
+      return handshake;
+    });
+  });
+  registerHandler(pi, config, "session_shutdown", async (event, ctx) => {
+    try {
+      const info = sessionInfo(ctx);
+      postTelemetry(config, event, ctx, EVENT_MAP.session_shutdown);
+      await trackEvent(config, state, info, "session_end", { reason: event.reason }, `${event.reason}:${event.targetSessionFile || ""}`);
+    } catch (error) {
+      writeLog(config, new TransportError("Pi shutdown tracking failed", { cause: error }));
+    }
+  });
+  registerHandler(pi, config, "agent_start", (event, ctx) => activity(event, ctx, "agent_start"));
+  registerHandler(pi, config, "agent_settled", (event, ctx) => activity(event, ctx, "agent_settled"));
+  registerHandler(pi, config, "turn_start", (event, ctx) => activity(event, ctx, "turn_start"));
+  registerHandler(pi, config, "input", (event, ctx) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      const timestamp = isoTimestamp();
+      postTelemetry(config, event, ctx, EVENT_MAP.input);
+      void trackEvent(config, state, info, "activity", { timestamp }, `input:${randomUUID()}`);
+      return runtimeMessage(config, state, info, {
+        uuid: stableId("pi_msg", info.id, "input", timestamp),
+        type: "user",
+        timestamp,
+        role: "user",
+        eventKinds: ["user_text"],
+      });
+    });
+  });
+  registerHandler(pi, config, "tool_execution_start", (event, ctx) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      const timestamp = isoTimestamp();
+      postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_start);
+      void trackEvent(config, state, info, "activity", { timestamp }, `tool-start:${event.toolCallId}`);
+      return runtimeMessage(config, state, info, {
+        uuid: stableId("pi_msg", info.id, "tool-start", event.toolCallId),
+        type: "assistant_tool_use",
+        timestamp,
+        role: "assistant",
+        tools: [event.toolName],
+        eventKinds: ["asst_tool_use"],
+      });
+    });
+  });
+  registerHandler(pi, config, "tool_execution_end", (event, ctx) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      const timestamp = isoTimestamp();
+      postTelemetry(config, event, ctx, EVENT_MAP.tool_execution_end);
+      void trackEvent(config, state, info, "activity", { timestamp }, `tool-end:${event.toolCallId}`);
+      return runtimeMessage(config, state, info, {
+        uuid: stableId("pi_msg", info.id, "tool-end", event.toolCallId),
+        type: "tool_result",
+        timestamp,
+        role: "user",
+        eventKinds: ["user_tool_result"],
+      });
+    });
+  });
+  registerHandler(pi, config, "model_select", (event, ctx) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      return trackEvent(config, state, info, "model", {
+        model_provider: event.model.provider,
+        model: event.model.id,
+      }, `model:${event.model.provider}:${event.model.id}:${randomUUID()}`);
+    });
+  });
+  registerHandler(pi, config, "message_end", (event, ctx) => {
+    if (event.message?.role !== "assistant" || !event.message.usage) return;
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      const message = event.message;
+      const timestamp = isoTimestamp(message.timestamp);
+      const cost = message.usage.cost || {};
+      const identity = message.responseId || stableId("response", info.id, timestamp, message.provider, message.model);
+      const common = {
+        session_id: info.id,
+        hostname: config.hostname,
+        timestamp,
+      };
+      return trackEvents(config, state, info, [
+        {
+          ...common,
+          type: "model",
+          event_uuid: stableId("pi", info.id, "message-model", identity),
+          model_provider: message.provider,
+          model: message.model,
+        },
+        {
+          ...common,
+          type: "usage",
+          event_uuid: stableId("pi", info.id, "usage", identity),
+          model_provider: message.provider,
+          model: message.model,
+          input_tokens: Number(message.usage.input || 0),
+          output_tokens: Number(message.usage.output || 0),
+          cache_read_tokens: Number(message.usage.cacheRead || 0),
+          cache_write_tokens: Number(message.usage.cacheWrite || 0),
+          cost: {
+            input: Number(cost.input || 0),
+            output: Number(cost.output || 0),
+            cache_read: Number(cost.cacheRead || 0),
+            cache_write: Number(cost.cacheWrite || 0),
+            total: Number(cost.total || 0),
+          },
+        },
+      ]);
+    });
+  });
+  registerHandler(pi, config, "turn_end", (event, ctx) => {
+    defer(config, () => {
+      const info = sessionInfo(ctx);
+      const timestamp = isoTimestamp(event.message?.timestamp);
+      postTelemetry(config, event, ctx, EVENT_MAP.turn_end);
+      void trackEvent(config, state, info, "activity", { timestamp }, `turn:${event.turnIndex}`);
+      return runtimeMessage(config, state, info, {
+        uuid: stableId("pi_msg", info.id, "turn", event.turnIndex, timestamp),
+        type: "assistant",
+        timestamp,
+        role: "assistant",
+        eventKinds: ["asst_text"],
+      });
+    });
+  });
 }
 
 // @lat: [[infrastructure#Infrastructure#Pi Integration Deployment#Extension Tools and Telemetry]]
@@ -613,7 +1125,12 @@ export default function quill(pi) {
   let config;
   try {
     config = loadConfig();
-  } catch {
+  } catch (error) {
+    const root = process.env.HOME || process.env.USERPROFILE || homedir();
+    if (lastNoticeRoot !== root) {
+      lastNoticeRoot = root;
+      console.warn("Quill Pi extension inactive: install or repair Quill config.");
+    }
     return;
   }
 
@@ -637,41 +1154,36 @@ export default function quill(pi) {
                 body: JSON.stringify(payload),
               });
               return success(data);
-            } catch {
+            } catch (error) {
               return unavailable();
             }
           },
         });
-      } catch {
-        // A duplicate or incompatible registration must not stop Pi loading.
+      } catch (error) {
+        writeLog(config, new RegistrationError(`Cannot register ${tool.name}`, { cause: error }));
       }
     }
-    try {
-      pi.on("tool_call", (event, ctx) => {
-        try {
-          return routeToolCall(config, event, ctx);
-        } catch {
-          return undefined;
-        }
-      });
-    } catch {
-      // Event API drift self-disables context routing.
-    }
+    registerHandler(pi, config, "tool_call", (event, ctx) => {
+      try {
+        return routeToolCall(config, event, ctx);
+      } catch (error) {
+        writeLog(config, new QuillExtensionError("Context routing failed", { cause: error }));
+        return undefined;
+      }
+    });
   }
 
   if (FEATURES.activity_tracking) {
+    registerTracking(pi, config);
     for (const [eventName, hookEvent] of Object.entries(EVENT_MAP)) {
-      try {
-        pi.on(eventName, (event, ctx) => {
-          try {
-            postTelemetry(config, event, ctx, hookEvent);
-          } catch {
-            // Telemetry never alters Pi lifecycle behavior.
-          }
-        });
-      } catch {
-        // Event API drift self-disables this one observation.
-      }
+      if (TRACKING_EVENTS.has(eventName)) continue;
+      registerHandler(pi, config, eventName, (event, ctx) => {
+        try {
+          postTelemetry(config, event, ctx, hookEvent);
+        } catch (error) {
+          writeLog(config, new TransportError("Hook telemetry failed", { cause: error }));
+        }
+      });
     }
   }
 }

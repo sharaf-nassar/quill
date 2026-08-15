@@ -366,13 +366,19 @@ Startup repair takes the same fast path as Codex: a deployment is current only w
 
 ### Extension Tools and Telemetry
 
-The single-file Pi extension exposes Quill's local history and working-context APIs while failing closed on non-loopback configuration.
+The single-file Pi extension is Pi's production tracking reporter and exposes Quill's local history and working-context APIs.
 
-Install renders `context_preservation`, `activity_tracking`, and `context_telemetry` into the owned payload and deployment stamp. Context preservation registers eight plain-JSON-Schema `quill_` tools plus Pi's context router; activity tracking maps Pi lifecycle events to existing hook names with provider `pi`.
+Install renders `context_preservation`, `activity_tracking`, and `context_telemetry` into the owned payload and deployment stamp. Context preservation registers eight plain-JSON-Schema `quill_` tools plus Pi's context router; activity tracking registers lifecycle, agent, turn, message, tool-execution, model, and input handlers.
+
+Session start sends a protocol-1 handshake and lifecycle event to `/api/v1/pi/track`, resolves lineage from one bounded parent-header read, and notifies indexing only for persisted transcripts. Runtime evidence uses `/api/v1/sessions/messages`; payloads contain empty content because analytics needs identities, roles, event kinds, and timestamps, not conversation text.
+
+Every send uses the shared 1500 ms timeout. Hot handlers defer work and never await requests; only shutdown awaits its bounded lifecycle send. Stable hashed identities make the attempted request and any spool record identical across asynchronous failure handling.
+
+Tracking failure lazily creates `<quill-config>/pi-spool/<session-id>.<pid>.jsonl`: a 0700 directory containing capped 0600 files with identifiers, usage, and lifecycle metadata only. A size-capped private log records typed config, registration, transport, protocol, and spool failures. Invalid config creates neither artifact and prints one notice before remaining inert.
 
 The router ports the canonical Claude/Codex fetch and tainted-read policy to Pi's `bash`, `read`, and fetch tool inputs. It returns Pi's `{ block, reason }` result, persists at most 256 tainted paths per session, and names ready `quill_` replacements in every denial. Turning context preservation off omits the router entirely after `/reload`.
 
-Tool requests use the main local URL for session history and the separate context origin for `/api/v1/context/*`. Both require exact loopback hostnames and share Codex's 1500 ms local timeout. Telemetry starts bounded requests without awaiting them. Context telemetry remains dependent on context preservation and posts Pi routing events with all routing token estimates set to zero.
+Tool requests use the main local URL for session history and the separate context origin for `/api/v1/context/*`. Both require exact loopback hostnames. Hook telemetry maps agent and tool-execution boundaries alongside the retained lifecycle vocabulary. Context telemetry remains dependent on context preservation and posts Pi routing events with all routing token estimates set to zero.
 
 The file transaction also sets `context_http.enabled=true`; removal clears it because Pi is the only installed listener consumer. Recovery reconciles the setting with the restored owned extension. [[pi-extension-tests]] and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Context HTTP Setting]] pin these boundaries.
 

@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -61,11 +69,30 @@ function routingHandler(pi) {
   return pi.handlers.get("tool_call")?.[0];
 }
 
-function context(sessionId = "pi-session") {
+function context(sessionId = "pi-session", options = {}) {
+  const sessionFile = options.sessionFile;
   return {
     cwd: "/tmp/project",
-    sessionManager: { getSessionId: () => sessionId },
+    mode: "tui",
+    ui: { notify: options.notify || (() => {}) },
+    model: options.model,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getSessionFile: () => sessionFile,
+      getHeader: () => ({
+        type: "session",
+        id: sessionId,
+        timestamp: "2026-08-14T08:00:00.000Z",
+        cwd: "/tmp/project",
+        ...(options.parentSession ? { parentSession: options.parentSession } : {}),
+      }),
+    },
   };
+}
+
+async function flushRequests() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 async function withHome(config, run) {
@@ -83,19 +110,342 @@ async function withHome(config, run) {
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Self disabling load]]
 test("missing, malformed, and remote config leave Pi unchanged", async () => {
-  for (const config of [
-    undefined,
-    "{",
-    { url: "https://quill.example.test", secret: "secret" },
-    { url: "http://127.0.0.1.evil.test:19876", secret: "secret" },
-  ]) {
-    await withHome(config, () => {
-      const pi = fakePi();
-      assert.doesNotThrow(() => quill(pi.api));
-      assert.equal(pi.tools.size, 0);
-      assert.equal(pi.handlers.size, 0);
-    });
+  const oldWarn = console.warn;
+  console.warn = () => {};
+  try {
+    for (const config of [
+      undefined,
+      "{",
+      { url: "https://quill.example.test", secret: "secret" },
+      { url: "http://127.0.0.1.evil.test:19876", secret: "secret" },
+    ]) {
+      await withHome(config, () => {
+        const pi = fakePi();
+        assert.doesNotThrow(() => quill(pi.api));
+        assert.equal(pi.tools.size, 0);
+        assert.equal(pi.handlers.size, 0);
+      });
+    }
+  } finally {
+    console.warn = oldWarn;
   }
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#No Quill inertness]]
+test("invalid config performs no disk writes and emits one notice", async () => {
+  const root = configRoot("{");
+  const oldHome = process.env.HOME;
+  const warnings = [];
+  const oldWarn = console.warn;
+  process.env.HOME = root;
+  console.warn = (...parts) => warnings.push(parts.join(" "));
+  try {
+    const before = readdirSync(root, { recursive: true }).sort();
+    quill(fakePi().api);
+    quill(fakePi().api);
+    assert.deepEqual(readdirSync(root, { recursive: true }).sort(), before);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /Quill.*config/i);
+  } finally {
+    console.warn = oldWarn;
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Tracking registration]]
+test("registers every production tracking handler", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, () => {
+    const pi = fakePi();
+    quill(pi.api);
+    for (const event of [
+      "session_start",
+      "session_shutdown",
+      "agent_start",
+      "agent_settled",
+      "turn_start",
+      "turn_end",
+      "message_end",
+      "tool_execution_start",
+      "tool_execution_end",
+      "model_select",
+      "input",
+    ]) {
+      assert.equal(pi.handlers.get(event)?.length, 1, event);
+    }
+  });
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Tracking envelopes]]
+test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret", hostname: "PI-HOST" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, json: async () => ({}), body: { cancel: async () => {} } };
+      };
+      const ctx = context("session-track", {
+        model: { provider: "anthropic", id: "claude-sonnet" },
+      });
+      try {
+        pi.handlers.get("session_start")[0]({ type: "session_start", reason: "startup" }, ctx);
+        pi.handlers.get("agent_start")[0]({ type: "agent_start" }, ctx);
+        pi.handlers.get("agent_settled")[0]({ type: "agent_settled" }, ctx);
+        pi.handlers.get("input")[0]({ type: "input", text: "secret prompt", source: "interactive" }, ctx);
+        pi.handlers.get("turn_start")[0]({ type: "turn_start", turnIndex: 0, timestamp: 1_765_699_201_000 }, ctx);
+        pi.handlers.get("tool_execution_start")[0](
+          { type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: { path: "/secret" } },
+          ctx,
+        );
+        pi.handlers.get("tool_execution_end")[0](
+          { type: "tool_execution_end", toolCallId: "tool-1", toolName: "read", result: "secret", isError: false },
+          ctx,
+        );
+        pi.handlers.get("model_select")[0](
+          { type: "model_select", model: { provider: "openai", id: "gpt-5" }, source: "set" },
+          ctx,
+        );
+        const assistant = {
+          role: "assistant",
+          provider: "openai",
+          model: "gpt-5",
+          responseId: "response-1",
+          timestamp: 1_765_699_202_000,
+          content: [{ type: "text", text: "secret answer" }],
+          usage: {
+            input: 11,
+            output: 7,
+            cacheRead: 3,
+            cacheWrite: 2,
+            totalTokens: 23,
+            cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.02, total: 0.35 },
+          },
+        };
+        pi.handlers.get("message_end")[0]({ type: "message_end", message: assistant }, ctx);
+        const nextAssistant = {
+          ...assistant,
+          responseId: "response-2",
+          timestamp: 1_765_699_203_000,
+          usage: {
+            input: 5,
+            output: 4,
+            cacheRead: 1,
+            cacheWrite: 6,
+            totalTokens: 16,
+            cost: { input: 0.05, output: 0.08, cacheRead: 0.01, cacheWrite: 0.06, total: 0.2 },
+          },
+        };
+        pi.handlers.get("message_end")[0]({ type: "message_end", message: nextAssistant }, ctx);
+        pi.handlers.get("message_end")[0]({ type: "message_end", message: nextAssistant }, ctx);
+        pi.handlers.get("turn_end")[0](
+          { type: "turn_end", turnIndex: 0, message: assistant, toolResults: [] },
+          ctx,
+        );
+        await pi.handlers.get("session_shutdown")[0]({ type: "session_shutdown", reason: "quit" }, ctx);
+        await flushRequests();
+
+        const track = calls.filter((call) => call.url.endsWith("/api/v1/pi/track"));
+        assert.ok(track.length >= 8);
+        assert.ok(track.every(({ body }) => body.protocol === 1));
+        assert.ok(track.every(({ body }) => typeof body.extension_version === "string"));
+        assert.ok(track.every(({ body }) => body.min_quill_version));
+        const events = track.flatMap(({ body }) => body.events);
+        assert.ok(events.some((event) => event.type === "session_start" && event.lineage.kind === "root"));
+        assert.ok(events.some((event) => event.type === "session_end" && event.reason === "quit"));
+        assert.ok(events.some((event) => event.type === "model" && event.model === "gpt-5"));
+        const usageBatches = track.filter(({ body }) =>
+          body.events.some((event) => event.event_uuid === "pi_e56c5118f3692e9dabf155823c5a9cbb")
+        );
+        assert.equal(usageBatches.length, 2);
+        assert.deepEqual(usageBatches[0].body, {
+          protocol: 1,
+          extension_version: "0.1.0",
+          min_quill_version: "0.9.0",
+          events: [
+            {
+              type: "model",
+              event_uuid: "pi_b89631f1c47149577bcff18311333a55",
+              session_id: "session-track",
+              hostname: "PI-HOST",
+              timestamp: "2025-12-14T08:00:03.000Z",
+              model_provider: "openai",
+              model: "gpt-5",
+            },
+            {
+              type: "usage",
+              event_uuid: "pi_e56c5118f3692e9dabf155823c5a9cbb",
+              session_id: "session-track",
+              hostname: "PI-HOST",
+              timestamp: "2025-12-14T08:00:03.000Z",
+              model_provider: "openai",
+              model: "gpt-5",
+              input_tokens: 5,
+              output_tokens: 4,
+              cache_read_tokens: 1,
+              cache_write_tokens: 6,
+              cost: {
+                input: 0.05,
+                output: 0.08,
+                cache_read: 0.01,
+                cache_write: 0.06,
+                total: 0.2,
+              },
+            },
+          ],
+        });
+        assert.equal(usageBatches[1].body.events[1].event_uuid, usageBatches[0].body.events[1].event_uuid);
+
+        const messages = calls
+          .filter((call) => call.url.endsWith("/api/v1/sessions/messages"))
+          .flatMap((call) => call.body.messages);
+        assert.ok(messages.some((message) => message.event_kinds.includes("user_text")));
+        assert.ok(messages.some((message) => message.event_kinds.includes("asst_text")));
+        assert.ok(messages.some((message) => message.event_kinds.includes("asst_tool_use")));
+        assert.ok(messages.some((message) => message.event_kinds.includes("user_tool_result")));
+        assert.ok(messages.every((message) => message.content === ""));
+        assert.equal(new Set(messages.map((message) => message.uuid)).size, messages.length);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Handshake and lineage]]
+test("session start resolves lineage once and notifies only persisted sessions", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const parent = join(process.env.HOME, "parent.jsonl");
+    const child = join(process.env.HOME, "child.jsonl");
+    writeFileSync(parent, `${JSON.stringify({ type: "session", id: "parent-id" })}\nignored\n`);
+    writeFileSync(child, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
+    const pi = fakePi();
+    quill(pi.api);
+    const calls = [];
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), body: JSON.parse(options.body) });
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      const ctx = context("child-id", { sessionFile: child, parentSession: parent });
+      pi.handlers.get("session_start")[0]({ type: "session_start", reason: "fork", previousSessionFile: parent }, ctx);
+      await flushRequests();
+      const start = calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0];
+      assert.deepEqual(start.lineage, { kind: "linked", parent_session_id: "parent-id" });
+      assert.equal(start.previous_session_id, "parent-id");
+      assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 1);
+
+      const ephemeralPi = fakePi();
+      quill(ephemeralPi.api);
+      ephemeralPi.handlers.get("session_start")[0](
+        { type: "session_start", reason: "startup" },
+        context("ephemeral"),
+      );
+      await flushRequests();
+      assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 1);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Stable teardown identity]]
+test("session event identity survives extension teardown", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const ids = [];
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      if (String(url).endsWith("/api/v1/pi/track")) {
+        ids.push(JSON.parse(options.body).events[0].event_uuid);
+      }
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const pi = fakePi();
+        quill(pi.api);
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "reload" },
+          context("stable-session"),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(ids.length, 2);
+      assert.equal(ids[0], ids[1]);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Spool durability]]
+test("failed sends lazily create bounded private spool and log files", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const pi = fakePi();
+    quill(pi.api);
+    const spool = join(process.env.HOME, ".config", "quill", "pi-spool");
+    assert.equal(readdirSync(join(process.env.HOME, ".config", "quill")).includes("pi-spool"), false);
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = () => Promise.reject(new Error("connection refused"));
+    try {
+      const handler = pi.handlers.get("model_select")[0];
+      for (let index = 0; index < 1800; index += 1) {
+        handler(
+          { type: "model_select", model: { provider: "openai", id: `gpt-${index}` }, source: "set" },
+          context("spool-session"),
+        );
+      }
+      await flushRequests();
+      assert.equal(statSync(spool).mode & 0o777, 0o700);
+      const files = readdirSync(spool).filter((file) => file.endsWith(".jsonl"));
+      assert.equal(files.length, 1);
+      const path = join(spool, files[0]);
+      assert.equal(statSync(path).mode & 0o777, 0o600);
+      assert.ok(statSync(path).size <= 1024 * 1024);
+      const text = readFileSync(path, "utf8");
+      assert.match(text, /event_uuid/);
+      assert.doesNotMatch(text, /secret prompt|secret answer|connection refused/);
+      const log = join(process.env.HOME, ".config", "quill", "pi-extension.log");
+      assert.ok(statSync(log).size <= 256 * 1024);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Protocol degradation]]
+test("protocol mismatch becomes a typed bounded failure without escaping", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const pi = fakePi();
+    quill(pi.api);
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: "protocol_mismatch", message: "unsupported" }),
+      body: { cancel: async () => {} },
+    });
+    try {
+      assert.doesNotThrow(() =>
+        pi.handlers.get("session_start")[0]({ type: "session_start", reason: "startup" }, context()),
+      );
+      await flushRequests();
+      const log = readFileSync(
+        join(process.env.HOME, ".config", "quill", "pi-extension.log"),
+        "utf8",
+      );
+      assert.match(log, /ProtocolMismatchError/);
+      assert.ok(statSync(join(process.env.HOME, ".config", "quill", "pi-extension.log")).size <= 256 * 1024);
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
 });
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Tool registration boundary]]
@@ -125,9 +475,17 @@ test("rendered feature flags independently gate tools and telemetry", async () =
     { url: "http://localhost:19876", secret: "secret" },
     async () => {
       const source = readFileSync(join(import.meta.dirname, "quill.ts"), "utf8");
-      for (const [flags, expectedTools, expectedHandlers] of [
-        [{ context_preservation: false, activity_tracking: true, context_telemetry: true }, 0, 8],
-        [{ context_preservation: true, activity_tracking: false, context_telemetry: false }, 8, 1],
+      for (const [flags, expectedTools, requiredHandlers] of [
+        [
+          { context_preservation: false, activity_tracking: true, context_telemetry: true },
+          0,
+          ["session_start", "session_shutdown", "message_end", "tool_execution_start"],
+        ],
+        [
+          { context_preservation: true, activity_tracking: false, context_telemetry: false },
+          8,
+          ["tool_call"],
+        ],
       ]) {
         const path = join(
           process.env.HOME,
@@ -144,7 +502,11 @@ test("rendered feature flags independently gate tools and telemetry", async () =
         const pi = fakePi();
         rendered(pi.api);
         assert.equal(pi.tools.size, expectedTools);
-        assert.equal(pi.handlers.size, expectedHandlers);
+        assert.deepEqual(
+          [...pi.handlers.keys()].filter((name) => requiredHandlers.includes(name)).sort(),
+          requiredHandlers.toSorted(),
+        );
+        assert.equal(pi.handlers.has("session_start"), flags.activity_tracking);
       }
     },
   );
@@ -287,9 +649,11 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
       const timeouts = [];
       const oldFetch = globalThis.fetch;
       const oldTimeout = AbortSignal.timeout;
-      globalThis.fetch = async (_url, options) => {
-        payloads.push(JSON.parse(options.body));
-        return { body: { cancel: async () => {} } };
+      globalThis.fetch = async (url, options) => {
+        if (String(url).endsWith("/api/v1/hooks/observed")) {
+          payloads.push(JSON.parse(options.body));
+        }
+        return { ok: true, status: 202, body: { cancel: async () => {} } };
       };
       AbortSignal.timeout = (milliseconds) => {
         timeouts.push(milliseconds);
@@ -310,7 +674,10 @@ test("telemetry maps Pi events and uses the shared local timeout", async () => {
           pi.handlers.get(event).at(-1)({ toolName: "read" }, context());
         }
         await new Promise((resolve) => setImmediate(resolve));
-        assert.deepEqual(payloads.map((payload) => payload.hook_event), Object.values(mapping));
+        assert.deepEqual(
+          payloads.map((payload) => payload.hook_event).sort(),
+          Object.values(mapping).sort(),
+        );
         assert.ok(payloads.every((payload) => payload.provider === "pi"));
         assert.ok(payloads.every((payload) => payload.session_id === "pi-session"));
         assert.ok(payloads.every((payload) => payload.hostname === "pi-host"));
@@ -673,8 +1040,56 @@ test("context telemetry off preserves routing without posting", async () => {
   );
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Sustained event load]]
+test("sustains 1000 events per minute without turn delay or unbounded RSS", async () => {
+  const minutes = Number(process.env.QUILL_PI_LOAD_MINUTES || "0.01");
+  const total = Math.max(1, Math.round(minutes * 1000));
+  const intervalMs = (minutes * 60_000) / total;
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const pi = fakePi();
+    quill(pi.api);
+    let requests = 0;
+    let maxHandlerMs = 0;
+    const rssStart = process.memoryUsage().rss;
+    let rssMax = rssStart;
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      requests += 1;
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      await new Promise((resolve) => {
+        let sent = 0;
+        const timer = setInterval(() => {
+          const started = performance.now();
+          pi.handlers.get("model_select")[0](
+            { type: "model_select", model: { provider: "probe", id: `model-${sent % 2}` }, source: "set" },
+            context("load-session"),
+          );
+          maxHandlerMs = Math.max(maxHandlerMs, performance.now() - started);
+          rssMax = Math.max(rssMax, process.memoryUsage().rss);
+          sent += 1;
+          if (sent === total) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, intervalMs);
+      });
+      await flushRequests();
+      assert.equal(requests, total);
+      assert.ok(maxHandlerMs < 10, `max handler delay ${maxHandlerMs.toFixed(3)}ms`);
+      assert.ok(rssMax - rssStart < 64 * 1024 * 1024, `RSS grew ${rssMax - rssStart} bytes`);
+      console.log(
+        `PI_LOAD_RESULT minutes=${minutes} events=${total} max_handler_ms=${maxHandlerMs.toFixed(3)} rss_delta=${rssMax - rssStart}`,
+      );
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Real Pi session]]
-test("Pi 0.84.1 loads and calls a Quill tool in an isolated session", async () => {
+test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", async () => {
   const piBin = "/home/mamba/.nvm/versions/node/v25.8.2/bin/pi";
   const root = mkdtempSync(join(tmpdir(), "quill-real-pi-"));
   const configDir = join(root, "pi-agent");
@@ -686,6 +1101,8 @@ test("Pi 0.84.1 loads and calls a Quill tool in an isolated session", async () =
 
   let modelCalls = 0;
   let contextCalls = 0;
+  const trackBodies = [];
+  const runtimeBodies = [];
   const server = createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
@@ -729,6 +1146,23 @@ test("Pi 0.84.1 loads and calls a Quill tool in an isolated session", async () =
       assert.equal(request.headers.authorization, "Bearer real-pi-secret");
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ sources: 7, chunks: 11 }));
+      return;
+    }
+    if (request.url === "/api/v1/pi/track") {
+      trackBodies.push(JSON.parse(body));
+      response.writeHead(202, { "Content-Type": "application/json" });
+      response.end("{}");
+      return;
+    }
+    if (request.url === "/api/v1/sessions/messages") {
+      runtimeBodies.push(JSON.parse(body));
+      response.writeHead(202, { "Content-Type": "application/json" });
+      response.end("{}");
+      return;
+    }
+    if (request.url === "/api/v1/sessions/notify") {
+      response.writeHead(202, { "Content-Type": "application/json" });
+      response.end("{}");
       return;
     }
     if (request.url === "/api/v1/hooks/observed") {
@@ -817,10 +1251,15 @@ test("Pi 0.84.1 loads and calls a Quill tool in an isolated session", async () =
     );
     assert.equal(modelCalls, 2);
     assert.equal(contextCalls, 1);
+    const trackEvents = trackBodies.flatMap((body) => body.events);
+    assert.ok(trackEvents.some((event) => event.type === "session_start"));
+    assert.ok(trackEvents.some((event) => event.type === "usage"));
+    assert.ok(trackEvents.some((event) => event.type === "session_end"));
+    assert.ok(runtimeBodies.flatMap((body) => body.messages).some((message) => message.role === "assistant"));
     assert.match(stdout, /Quill probe complete/);
     assert.match(stdout, /"sources":7/);
     assert.ok(readdirSync(sessionDir, { recursive: true }).some((entry) => entry.endsWith(".jsonl")));
-    console.log(`REAL_PI_RESULT version=0.84.1 context_calls=1 session_ms=${sessionMs}`);
+    console.log(`REAL_PI_RESULT version=0.84.2 context_calls=1 session_ms=${sessionMs}`);
   } finally {
     server.close();
     await once(server, "close");
