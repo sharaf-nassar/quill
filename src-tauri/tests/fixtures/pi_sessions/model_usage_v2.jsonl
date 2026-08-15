@@ -1,3 +1,0 @@
-{"type":"session","version":2,"id":"session-usage-v2","timestamp":"2026-08-13T09:00:00.000Z","cwd":"/work/pi-v2"}
-{"type":"message","id":"hook","parentId":null,"timestamp":"2026-08-13T09:00:01.000Z","message":{"role":"hookMessage","content":"legacy hook","timestamp":1786611601000}}
-{"type":"message","id":"assistant","parentId":"hook","timestamp":"2026-08-13T09:00:02.000Z","message":{"role":"assistant","content":[],"provider":"mistral","model":"codestral","usage":{"input":2,"output":3,"cacheRead":4,"cacheWrite":5,"totalTokens":14,"cost":{"total":123}},"stopReason":"stop","timestamp":1786611602000}}

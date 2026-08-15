@@ -25,7 +25,6 @@ use tauri::{AppHandle, Emitter};
 use crate::integrations::IntegrationProvider;
 use crate::models::{ObservedLinkedSession, ObservedSessionAgent, PiLineage, SessionBreakdown};
 use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
-use crate::transcript_identity::{ModelSourceFastFingerprint, model_source_fast_fingerprint};
 
 /// Silence past this cutoff means the producing process is gone rather than
 /// merely quiet: measured inter-record gaps reach p99.9 ≈ 309s, an order of
@@ -202,11 +201,6 @@ enum FileRole {
     /// A Codex rollout, folding into the root of its spawn chain. A spawned
     /// rollout is the sub-agent it names; a root one carries no agent.
     Codex { agent_id: Option<String> },
-    /// A Pi session, whose identity and cwd live in its header.
-    Pi {
-        started_at: DateTime<Utc>,
-        cwd: Option<String>,
-    },
 }
 
 /// How far one transcript has been folded.
@@ -216,8 +210,6 @@ struct FileTail {
     offset: u64,
     /// Session this file's records fold into.
     session: SessionKey,
-    /// Pi rewrites can preserve or grow length, so offset alone is insufficient.
-    fingerprint: Option<ModelSourceFastFingerprint>,
 }
 
 /// Live session and agent state, folded from transcripts as they are written.
@@ -277,22 +269,9 @@ impl TrackerState {
             changed |= self.register_agent(&key, agent_id, *workflow, path);
         }
         let previous = self.files.get(path);
-        let replaced_session = previous
-            .filter(|tail| matches!(role, FileRole::Pi { .. }) && tail.session != key)
-            .map(|tail| tail.session.clone());
         let mut offset = previous.map_or(0, |tail| tail.offset);
-        let metadata = std::fs::metadata(path).ok();
-        let length = metadata.as_ref().map(std::fs::Metadata::len);
-        let fingerprint = metadata
-            .as_ref()
-            .and_then(|metadata| model_source_fast_fingerprint(metadata).ok());
-        if matches!(role, FileRole::Pi { .. })
-            && fingerprint.is_some()
-            && previous.and_then(|tail| tail.fingerprint) == fingerprint
-        {
-            return changed;
-        }
-        if !matches!(role, FileRole::Pi { .. }) && length == Some(offset) {
+        let length = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+        if length == Some(offset) {
             return changed;
         }
         // A rollout is parsed from scratch the first time it is seen and again
@@ -349,33 +328,6 @@ impl TrackerState {
                     });
                 }
             }
-            FileRole::Pi { started_at, cwd } => {
-                if let Some(replaced) = replaced_session {
-                    sessions.remove(&replaced);
-                }
-                let pushed = sessions.remove(&key);
-                let mut session = LiveSession {
-                    last_activity: *started_at,
-                    started_at: Some(*started_at),
-                    cwd: cwd.clone(),
-                    lineage: pushed.as_ref().and_then(|session| session.lineage.clone()),
-                    live_tokens: pushed.and_then(|session| session.live_tokens),
-                    ..LiveSession::default()
-                };
-                let Some((window, body_offset, _, _)) = read_codex_tail(path) else {
-                    return changed;
-                };
-                let complete = window
-                    .iter()
-                    .rposition(|byte| *byte == b'\n')
-                    .map_or(0, |newline| newline + 1);
-                for line in String::from_utf8_lossy(&window[..complete]).lines() {
-                    fold_pi_line(line, &mut session);
-                }
-                offset = body_offset + complete as u64;
-                sessions.insert(key.clone(), session);
-                changed = true;
-            }
             _ => read_appended(path, &mut offset, |line| {
                 let Ok(record) = serde_json::from_str::<ScanRecord>(line) else {
                     return;
@@ -427,9 +379,6 @@ impl TrackerState {
             FileTail {
                 offset,
                 session: key,
-                fingerprint: matches!(role, FileRole::Pi { .. })
-                    .then_some(fingerprint)
-                    .flatten(),
             },
         );
         changed
@@ -482,8 +431,7 @@ impl TrackerState {
         let (session_id, role) = match provider {
             IntegrationProvider::Claude => claude_session_file(path)?,
             IntegrationProvider::Codex => return self.codex_file(path, host, now),
-            IntegrationProvider::Pi => return pi_session_file(path, host),
-            IntegrationProvider::MiniMax => return None,
+            _ => return None,
         };
         Some((
             SessionKey {
@@ -860,7 +808,7 @@ impl LiveTracker {
     /// the idle window whose length has moved past its consumed offset is
     /// folded, and idle sessions are released.
     pub(crate) fn sweep(&self, now: DateTime<Utc>) {
-        let mut roots = vec![
+        let roots = vec![
             (
                 IntegrationProvider::Claude,
                 crate::data_paths::resolve_claude_projects_dir(),
@@ -870,9 +818,6 @@ impl LiveTracker {
                 crate::data_paths::resolve_codex_sessions_dir(),
             ),
         ];
-        if let Ok(root) = crate::data_paths::resolve_pi_sessions_dir() {
-            roots.push((IntegrationProvider::Pi, root));
-        }
         self.sweep_in(&roots, now);
     }
 
@@ -893,13 +838,7 @@ impl LiveTracker {
                         .into_iter()
                         .map(|path| (path, *provider)),
                 ),
-                IntegrationProvider::Pi => paths.extend(
-                    crate::sessions::discover_pi_transcripts_in(root)
-                        .into_iter()
-                        .map(|path| (path, *provider))
-                        .filter(|(path, _)| modified_within_idle_window(path, now)),
-                ),
-                IntegrationProvider::MiniMax => {}
+                _ => {}
             }
         }
         self.apply_paths_at(paths, now);
@@ -1254,22 +1193,6 @@ pub(crate) fn normalize_observed_hostname(hostname: &str) -> Option<String> {
     (!short.is_empty()).then(|| short.to_ascii_lowercase())
 }
 
-fn pi_session_file(path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
-    let header = crate::pi_session::read_pi_session_header(path)?;
-    let session_id = observed_name(&header.id)?;
-    Some((
-        SessionKey {
-            provider: IntegrationProvider::Pi.as_str().to_owned(),
-            host: host.to_owned(),
-            session_id,
-        },
-        FileRole::Pi {
-            started_at: utc(&header.timestamp)?,
-            cwd: observed_root_cwd(Some(&header.cwd)),
-        },
-    ))
-}
-
 fn observed_name(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty() && value.len() <= MAX_STRING_LEN && !value.chars().any(char::is_control))
@@ -1346,21 +1269,6 @@ struct ScanRecord {
 struct ScanMessage {
     content: Option<serde_json::Value>,
     /// Present on every assistant record, absent on user records.
-    model: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PiLiveRecord {
-    #[serde(rename = "type")]
-    kind: String,
-    timestamp: Option<String>,
-    message: Option<PiLiveMessage>,
-}
-
-#[derive(Deserialize)]
-struct PiLiveMessage {
-    role: Option<String>,
-    provider: Option<String>,
     model: Option<String>,
 }
 
@@ -1603,29 +1511,6 @@ fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool, usize)> {
         }
     }
     Some((window, body_offset, truncated, scanned))
-}
-
-fn fold_pi_line(line: &str, session: &mut LiveSession) {
-    let Ok(record) = serde_json::from_str::<PiLiveRecord>(line) else {
-        return;
-    };
-    if record.kind == "session" {
-        return;
-    }
-    if let Some(timestamp) = record.timestamp.as_deref().and_then(utc) {
-        session.last_activity = timestamp;
-    }
-    let Some(message) = record
-        .message
-        .filter(|message| message.role.as_deref() == Some("assistant"))
-    else {
-        return;
-    };
-    session.model_provider = message.provider.as_deref().and_then(observed_name);
-    session.model = message
-        .model
-        .as_deref()
-        .and_then(|model| crate::model_usage::validate_model_id(model).ok());
 }
 
 /// The turn boundary a rollout line carries: whether it opens a turn, and when
@@ -2003,80 +1888,6 @@ mod tests {
         }
     }
 
-    struct PiFixture {
-        root: tempfile::TempDir,
-        path: PathBuf,
-        session_id: &'static str,
-    }
-
-    impl PiFixture {
-        fn new() -> Self {
-            let root = tempfile::tempdir().expect("create Pi fixture root");
-            let directory = root.path().join("--work-quill--");
-            fs::create_dir_all(&directory).expect("create Pi session directory");
-            Self {
-                root,
-                path: directory.join("2026-08-14T08-00-00-session-pi.jsonl"),
-                session_id: "session-pi",
-            }
-        }
-
-        fn header(&self, timestamp: &str) -> String {
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"{}\",\
-                 \"timestamp\":\"{timestamp}\",\"cwd\":\"/work/quill\"}}\n",
-                self.session_id
-            )
-        }
-
-        fn message(
-            &self,
-            id: &str,
-            parent_id: Option<&str>,
-            timestamp: &str,
-            role: &str,
-            provider: Option<&str>,
-            model: Option<&str>,
-        ) -> String {
-            let parent_id = parent_id.map_or("null".to_owned(), |parent| format!("\"{parent}\""));
-            let identity = match (provider, model) {
-                (Some(provider), Some(model)) => {
-                    format!(",\"provider\":\"{provider}\",\"model\":\"{model}\"")
-                }
-                _ => String::new(),
-            };
-            format!(
-                "{{\"type\":\"message\",\"id\":\"{id}\",\"parentId\":{parent_id},\
-                 \"timestamp\":\"{timestamp}\",\"message\":{{\"role\":\"{role}\",\
-                 \"content\":[]{} }} }}\n",
-                identity
-            )
-        }
-
-        fn write(&self, body: &str) {
-            fs::write(&self.path, body).expect("write Pi transcript");
-        }
-
-        fn apply(&self, tracker: &LiveTracker, now: DateTime<Utc>) {
-            tracker.apply_paths_at([(self.path.clone(), IntegrationProvider::Pi)], now);
-        }
-
-        fn sweep(&self, tracker: &LiveTracker, now: DateTime<Utc>) {
-            tracker.sweep_in(
-                &[(IntegrationProvider::Pi, self.root.path().to_path_buf())],
-                now,
-            );
-        }
-
-        fn key(&self) -> SessionKey {
-            SessionKey {
-                provider: IntegrationProvider::Pi.as_str().to_owned(),
-                host: local_observed_host().expect("local host").to_owned(),
-                session_id: self.session_id.to_owned(),
-            }
-        }
-    }
-
     /// Restamp a transcript so a sweep sees it as written at `at`.
     fn set_modified(path: &Path, at: DateTime<Utc>) {
         fs::File::options()
@@ -2298,170 +2109,16 @@ mod tests {
         assert!(tracker.session_ranking_keys().is_empty());
     }
 
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Liveness]]
-    #[test]
-    fn pi_tail_creates_a_live_session() {
-        let fixture = PiFixture::new();
-        fixture.write(&format!(
-            "{}{}",
-            fixture.header("2026-08-14T08:00:00Z"),
-            fixture.message("root", None, "2026-08-14T08:00:01Z", "user", None, None,)
-        ));
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:02Z"));
-
-        assert!(
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .sessions
-                .contains_key(&fixture.key())
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Header Cwd]]
-    #[test]
-    fn pi_tail_uses_the_session_header_cwd() {
-        let fixture = PiFixture::new();
-        fixture.write(&format!(
-            "{}{}",
-            fixture.header("2026-08-14T08:00:00Z"),
-            fixture.message("root", None, "2026-08-14T08:00:01Z", "user", None, None,)
-        ));
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:02Z"));
-
-        let state = tracker.state.lock().unwrap();
-        assert_eq!(
-            state.sessions[&fixture.key()].cwd.as_deref(),
-            Some("/work/quill")
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Last Entry Timestamp]]
-    #[test]
-    fn pi_tail_uses_the_last_entry_timestamp() {
-        let fixture = PiFixture::new();
-        fixture.write(&format!(
-            "{}{}{}",
-            fixture.header("2026-08-14T08:00:00Z"),
-            fixture.message("root", None, "2026-08-14T08:00:01Z", "user", None, None,),
-            fixture.message(
-                "leaf",
-                Some("root"),
-                "2026-08-14T08:00:09Z",
-                "assistant",
-                Some("anthropic"),
-                Some("claude-sonnet-4-5"),
-            )
-        ));
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:10Z"));
-
-        assert_eq!(
-            tracker.state.lock().unwrap().sessions[&fixture.key()].last_activity,
-            parse("2026-08-14T08:00:09Z")
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Last Message Identity]]
-    #[test]
-    fn pi_tail_uses_the_last_assistant_provider_and_model() {
-        let fixture = PiFixture::new();
-        fixture.write(&format!(
-            "{}{}{}",
-            fixture.header("2026-08-14T08:00:00Z"),
-            fixture.message(
-                "first",
-                None,
-                "2026-08-14T08:00:01Z",
-                "assistant",
-                Some("anthropic"),
-                Some("claude-sonnet-4-5"),
-            ),
-            fixture.message(
-                "last",
-                Some("first"),
-                "2026-08-14T08:00:02Z",
-                "assistant",
-                Some("openai"),
-                Some("gpt-5.6"),
-            )
-        ));
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:03Z"));
-
-        let state = tracker.state.lock().unwrap();
-        let session = &state.sessions[&fixture.key()];
-        assert_eq!(session.model_provider.as_deref(), Some("openai"));
-        assert_eq!(session.model.as_deref(), Some("gpt-5.6"));
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Deferred Initial Flush]]
-    #[test]
-    fn pi_file_appearing_after_an_initial_event_folds_normally() {
-        let fixture = PiFixture::new();
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:01Z"));
-        assert!(tracker.state.lock().unwrap().sessions.is_empty());
-
-        fixture.write(&format!(
-            "{}{}",
-            fixture.header("2026-08-14T08:00:00Z"),
-            fixture.message(
-                "root",
-                None,
-                "2026-08-14T08:00:02Z",
-                "assistant",
-                Some("anthropic"),
-                Some("claude-sonnet-4-5"),
-            )
-        ));
-        fixture.apply(&tracker, parse("2026-08-14T08:00:03Z"));
-        assert!(
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .sessions
-                .contains_key(&fixture.key())
-        );
-    }
-
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Proven Live Lineage]]
     #[test]
     fn pi_pushed_parent_exposes_exactly_two_linked_children_and_keeps_sibling_independent() {
-        let root = tempfile::tempdir().expect("create Pi root");
-        let project = root.path().join("--work-quill--");
-        fs::create_dir_all(&project).expect("create project directory");
         let now = parse("2026-08-14T08:00:10Z");
-        let write = |name: &str, id: &str, parent: Option<&Path>, second: u32| {
-            let parent = parent.map_or(String::new(), |path| {
-                format!(
-                    ",\"parentSession\":{}",
-                    serde_json::to_string(path).expect("encode parent path")
-                )
-            });
-            let path = project.join(name);
-            fs::write(
-                &path,
-                format!(
-                    "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"/work/quill\"{parent}}}\n{{\"type\":\"message\",\"id\":\"entry-{id}\",\"parentId\":null,\"timestamp\":\"2026-08-14T08:00:{second:02}Z\",\"message\":{{\"role\":\"assistant\",\"content\":[],\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\"}}}}\n"
-                ),
-            )
-            .expect("write Pi transcript");
-            set_modified(&path, now);
-            path
-        };
-        let parent = write("parent.jsonl", "parent", None, 1);
-        write("child-a.jsonl", "child-a", Some(&parent), 2);
-        write("child-b.jsonl", "child-b", Some(&parent), 3);
-        write("sibling.jsonl", "sibling", None, 4);
-
         let tracker = LiveTracker::new(None);
-        tracker.sweep_in(&[(IntegrationProvider::Pi, root.path().to_path_buf())], now);
-        let host = local_observed_host().expect("local host");
+        let host = "host";
+        for session_id in ["parent", "child-a", "child-b", "sibling"] {
+            tracker.start_pi_session(session_id, host, Some("/work/quill"), false, now, None);
+            tracker.set_pi_model(session_id, host, "anthropic", "claude-sonnet-4-5");
+        }
         tracker.set_pi_lineage("parent", host, PiLineage::Root);
         for child in ["child-a", "child-b"] {
             tracker.set_pi_lineage(
@@ -2502,140 +2159,6 @@ mod tests {
                 .unwrap()
                 .parent_session_id,
             None
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Equal Length Rewrite]]
-    #[test]
-    fn equal_length_pi_rewrite_cold_refolds() {
-        let fixture = PiFixture::new();
-        let body = |timestamp| {
-            format!(
-                "{}{}",
-                fixture.header("2026-08-14T08:00:00Z"),
-                fixture.message(
-                    "root",
-                    None,
-                    timestamp,
-                    "assistant",
-                    Some("anthropic"),
-                    Some("claude-sonnet-4-5"),
-                )
-            )
-        };
-        let old = body("2026-08-14T08:00:10Z");
-        let replacement = body("2026-08-14T08:00:01Z");
-        assert_eq!(old.len(), replacement.len());
-        fixture.write(&old);
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:11Z"));
-
-        fixture.write(&replacement);
-        set_modified(&fixture.path, parse("2026-08-14T08:00:12Z"));
-        fixture.apply(&tracker, parse("2026-08-14T08:00:13Z"));
-        assert_eq!(
-            tracker.state.lock().unwrap().sessions[&fixture.key()].last_activity,
-            parse("2026-08-14T08:00:01Z")
-        );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Idle Quiescence]]
-    #[test]
-    fn quiet_pi_session_leaves_the_fold_at_idle_after() {
-        let fixture = PiFixture::new();
-        fixture.write(&format!(
-            "{}{}",
-            fixture.header("2026-08-14T08:00:00Z"),
-            fixture.message("root", None, "2026-08-14T08:00:01Z", "user", None, None,)
-        ));
-        set_modified(&fixture.path, parse("2026-08-14T08:00:01Z"));
-        let tracker = LiveTracker::new(None);
-        fixture.sweep(&tracker, parse("2026-08-14T08:00:02Z"));
-        assert!(
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .sessions
-                .contains_key(&fixture.key())
-        );
-
-        fixture.sweep(&tracker, parse("2026-08-14T08:15:02Z"));
-        let state = tracker.state.lock().unwrap();
-        assert!(state.sessions.is_empty());
-        assert!(state.files.is_empty());
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral No Op]]
-    #[test]
-    fn missing_pi_transcript_produces_no_row() {
-        let fixture = PiFixture::new();
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:01Z"));
-        assert!(tracker.state.lock().unwrap().sessions.is_empty());
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Bounded Large Branch Tail]]
-    #[test]
-    fn large_branched_pi_session_reads_only_the_tail_budget() {
-        use std::io::{Seek, Write};
-
-        const LARGE_BYTES: u64 = 100 * 1024 * 1024;
-        let fixture = PiFixture::new();
-        let mut file = fs::File::create(&fixture.path).expect("create large Pi transcript");
-        file.write_all(fixture.header("2026-08-14T08:00:00Z").as_bytes())
-            .expect("write Pi header");
-        file.set_len(LARGE_BYTES)
-            .expect("extend sparse Pi transcript");
-        file.seek(SeekFrom::End(0))
-            .expect("seek Pi transcript tail");
-        file.write_all(
-            format!(
-                "\n{}{}",
-                fixture.message(
-                    "left",
-                    Some("root"),
-                    "2026-08-14T08:00:01Z",
-                    "assistant",
-                    Some("anthropic"),
-                    Some("claude-sonnet-4-5"),
-                ),
-                fixture.message(
-                    "right",
-                    Some("root"),
-                    "2026-08-14T08:00:02Z",
-                    "assistant",
-                    Some("openai"),
-                    Some("gpt-5.6"),
-                )
-            )
-            .as_bytes(),
-        )
-        .expect("write branched Pi tail");
-        drop(file);
-
-        let size = fs::metadata(&fixture.path)
-            .expect("stat Pi transcript")
-            .len();
-        let started = Instant::now();
-        let (_, _, _, scanned) = read_codex_tail(&fixture.path).expect("read bounded tail");
-        let elapsed = started.elapsed();
-        assert!(size >= LARGE_BYTES);
-        assert!(scanned as u64 <= CODEX_TAIL_SCAN_BYTES);
-
-        let tracker = LiveTracker::new(None);
-        fixture.apply(&tracker, parse("2026-08-14T08:00:03Z"));
-        assert!(
-            tracker
-                .state
-                .lock()
-                .unwrap()
-                .sessions
-                .contains_key(&fixture.key())
-        );
-        println!(
-            "pi-live-tail size_bytes={size} bound_bytes={CODEX_TAIL_SCAN_BYTES} read_bytes={} elapsed={elapsed:?}",
-            scanned
         );
     }
 

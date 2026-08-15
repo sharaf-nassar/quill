@@ -220,6 +220,13 @@ pub(crate) fn validate_retained_notify_source(
             "jsonl_path is outside the configured retained transcript root",
         ));
     }
+    if provider == IntegrationProvider::Pi
+        && crate::pi_session::read_pi_session_header(&canonical_path).is_none()
+    {
+        return Err(RetainedNotifySourceValidationError::Invalid(
+            "jsonl_path does not contain a supported Pi session header",
+        ));
+    }
 
     let layout_hint =
         retained_jsonl_source_layout_hint(provider, &canonical_root_path, &canonical_path).ok_or(
@@ -349,7 +356,6 @@ pub(crate) fn retained_jsonl_source_root_identities() -> Vec<(IntegrationProvide
     vec![
         (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
         (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
-        (IntegrationProvider::Pi, PI_SOURCE_ROOT_KEY),
     ]
 }
 
@@ -742,14 +748,6 @@ fn collect_codex_jsonl_candidates(
     collection
 }
 
-fn collect_pi_jsonl_candidates(
-    sessions_dir: &Path,
-    provider: IntegrationProvider,
-    diagnostic: &mut Option<String>,
-) -> TranscriptCandidateCollection {
-    collect_codex_jsonl_candidates(sessions_dir, provider, diagnostic)
-}
-
 /// Enumerate every Claude transcript under `projects_dir`, flagging sub-agent
 /// files.
 ///
@@ -778,19 +776,6 @@ pub(crate) fn discover_codex_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf>
     }
     let mut diagnostic = None;
     collect_codex_jsonl_candidates(sessions_dir, IntegrationProvider::Codex, &mut diagnostic)
-        .candidates
-        .into_iter()
-        .map(|candidate| candidate.path)
-        .collect()
-}
-
-/// Enumerate every Pi session transcript under `sessions_dir`.
-pub(crate) fn discover_pi_transcripts_in(sessions_dir: &Path) -> Vec<PathBuf> {
-    if !sessions_dir.exists() {
-        return Vec::new();
-    }
-    let mut diagnostic = None;
-    collect_pi_jsonl_candidates(sessions_dir, IntegrationProvider::Pi, &mut diagnostic)
         .candidates
         .into_iter()
         .map(|candidate| candidate.path)
@@ -4804,13 +4789,12 @@ mod tests {
 
     #[test]
     // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Transcript Root Coverage]]
-    fn retained_source_roots_cover_all_transcript_providers() {
+    fn retained_analytics_roots_exclude_notify_driven_pi() {
         assert_eq!(
             retained_jsonl_source_root_identities(),
             vec![
                 (IntegrationProvider::Claude, CLAUDE_SOURCE_ROOT_KEY),
                 (IntegrationProvider::Codex, CODEX_SOURCE_ROOT_KEY),
-                (IntegrationProvider::Pi, PI_SOURCE_ROOT_KEY),
             ]
         );
     }
@@ -5210,33 +5194,6 @@ mod tests {
                 .all(|message| message.session_id == "pi-session"
                     && message.cwd.as_deref() == Some("/work/quill"))
         );
-    }
-
-    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Recursive Candidate Collection]]
-    #[test]
-    fn pi_candidate_collection_accepts_nested_jsonl_files_only() {
-        let temp = TempDir::new().expect("tempdir");
-        let project = temp.path().join("--work-quill--");
-        fs::create_dir_all(&project).expect("create Pi project directory");
-        let transcript = project.join("session.jsonl");
-        fs::write(&transcript, "{}\n").expect("write transcript");
-        fs::write(project.join("ignored.json"), "{}\n").expect("write ignored file");
-
-        let root = enumerate_provider_source_root(
-            IntegrationProvider::Pi,
-            PI_SOURCE_ROOT_KEY,
-            temp.path().to_path_buf(),
-            collect_pi_jsonl_candidates,
-        );
-
-        assert_eq!(root.outcome, ProviderRootEnumerationOutcome::Complete);
-        assert_eq!(root.sources.len(), 1);
-        assert_eq!(root.sources[0].filesystem_path, transcript);
-        assert_eq!(root.sources[0].provider, IntegrationProvider::Pi);
-        assert!(matches!(
-            root.sources[0].layout_hint,
-            RetainedJsonlSourceLayoutHint::PiTranscript
-        ));
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Search]]

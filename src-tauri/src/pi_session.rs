@@ -1,7 +1,7 @@
 //! Narrow Pi transcript reads retained for notify-driven search indexing.
 //!
-//! The full-file parsers keep v2/v3 message entries. The bounded header probe
-//! temporarily also supplies identity to the live transcript fallback.
+//! The full-file parser keeps v2/v3 message entries, while notify validation
+//! uses the bounded header probe before admitting a path to search indexing.
 
 use std::fmt;
 use std::fs::File;

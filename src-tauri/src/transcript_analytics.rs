@@ -1180,7 +1180,6 @@ pub(crate) enum TranscriptAnalyticsError {
     SourceTooLarge,
     UnstableSource,
     Identity(IdentityError),
-    UnsupportedProvider,
     SourceIdentityDrift,
     EmptyResolvedRoot,
     InconsistentSnapshot,
@@ -1201,9 +1200,6 @@ impl fmt::Display for TranscriptAnalyticsError {
             }
             Self::Identity(error) => {
                 write!(formatter, "cannot resolve transcript identity: {error}")
-            }
-            Self::UnsupportedProvider => {
-                formatter.write_str("provider does not own retained transcript analytics")
             }
             Self::SourceIdentityDrift => formatter
                 .write_str("retained transcript identity changed between inventory and commit"),
@@ -1332,9 +1328,7 @@ fn resolve_native_identity(
             resolve_codex_native_identity(records)?,
             TranscriptRecordDiagnostics::default(),
         ),
-        IntegrationProvider::Pi | IntegrationProvider::MiniMax => {
-            return Err(TranscriptAnalyticsError::UnsupportedProvider);
-        }
+        _ => unreachable!("retained analytics inventory only contains Claude and Codex"),
     };
     // A retained-layout disagreement is one anomalous fact about an otherwise
     // usable source, so it is counted rather than discarding every row.

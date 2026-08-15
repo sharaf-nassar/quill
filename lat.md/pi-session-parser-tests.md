@@ -28,4 +28,4 @@ An absent session-file path or a missing file returns no session, covering Pi's 
 
 ## Bounded Header Probe
 
-The header probe reads at most 64 KiB and accepts only supported v2/v3 session headers for live identity fallback.
+The header probe reads at most 64 KiB and admits only supported v2/v3 session files during notify validation.

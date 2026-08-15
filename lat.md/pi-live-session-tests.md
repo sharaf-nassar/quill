@@ -4,7 +4,7 @@ lat:
 ---
 # Pi Live Session Test Specs
 
-These tests pin Pi's pushed live-session foundation while the bounded transcript fold remains available until the final cut-over.
+These tests pin Pi's extension-pushed live sessions after transcript tracking removal.
 
 ## Push Lifecycle
 
@@ -66,49 +66,9 @@ Demo mode returns a typed unavailable result without changing extension health, 
 
 A valid session-start envelope lowercases and shortens its hostname once, then uses that same key for durable lifecycle origin, live state, and extension health.
 
-## Liveness
-
-A valid Pi session file creates one provider-isolated live session from transcript evidence.
-
-## Recursive Candidate Collection
-
-The temporary live-fold fallback discovers nested Pi JSONL transcripts and ignores other files.
-
-## Header Cwd
-
-The live session takes cwd from the Pi session header rather than decoding its lossy directory name.
-
-## Last Entry Timestamp
-
-The newest complete tail entry supplies Pi activity time without consulting file mtime.
-
-## Last Message Identity
-
-The newest assistant message supplies its validated upstream provider and model without walking parent links.
-
-## Deferred Initial Flush
-
-An absent path remains a no-op until Pi's deferred first flush creates the transcript, which then folds normally.
-
-## Equal Length Rewrite
-
-An `(mtime_ns, len)` change cold-refolds Pi state even when a migration rewrite preserves file length.
-
-## Idle Quiescence
-
-A Pi transcript silent beyond the shared 15-minute cutoff releases its live session and file state.
-
 ## Cumulative Token Display
 
 A live Pi row renders the cumulative total maintained by pushed usage instead of replacing it with an em dash.
-
-## Ephemeral No Op
-
-The retained Pi transcript fold produces no row from a missing file; pushed lifecycle owns visibility for true ephemeral sessions.
-
-## Bounded Large Branch Tail
-
-A synthetic branched Pi session of 104,857,951 bytes scans 1,048,576 bytes, the shared tail bound, from an isolated temporary file.
 
 ## Proven Live Lineage
 

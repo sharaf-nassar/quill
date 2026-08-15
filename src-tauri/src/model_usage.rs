@@ -19,7 +19,6 @@ use crate::integrations::IntegrationProvider;
 use crate::models::{
     ModelAnalyticsUpdatedEvent, ModelBackfillDiagnostic, ModelBackfillState, ModelBackfillStatus,
 };
-use crate::pi_session::parse_pi_session_values;
 use crate::sessions::{
     DiscoveredRetainedJsonlSource, ProviderRootEnumerationOutcome, ProviderSourceRoot,
     RetainedJsonlSourceLayoutHint,
@@ -31,7 +30,7 @@ use crate::storage::{
 use crate::transcript_identity::{
     IdentityError, JsonlRecord, ModelSourceFastFingerprint, ModelSourceFingerprint,
     NativeChainIdentity, SourceRootGraph, model_source_fast_fingerprint, read_stable_transcript,
-    resolve_codex_native_identity, resolve_pi_native_identity,
+    resolve_codex_native_identity,
 };
 
 const MODEL_ID_MAX_SCALARS: usize = 256;
@@ -586,7 +585,6 @@ pub(crate) enum SourceRecordShape {
     ClaudeAssistant,
     CodexTurnContext,
     CodexTokenCount,
-    PiAssistant,
 }
 
 impl SourceRecordShape {
@@ -595,7 +593,6 @@ impl SourceRecordShape {
             Self::ClaudeAssistant => "claude_assistant",
             Self::CodexTurnContext => "codex_turn_context",
             Self::CodexTokenCount => "codex_token_count",
-            Self::PiAssistant => "pi_assistant",
         }
     }
 }
@@ -726,14 +723,6 @@ pub(crate) struct ClaudeAdapterContext<'a> {
 /// Trusted source context supplied to the Codex transcript adapter.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CodexAdapterContext<'a> {
-    pub source_key: &'a str,
-    pub layout_hint: &'a RetainedJsonlSourceLayoutHint,
-    pub hostname: Option<&'a str>,
-}
-
-/// Trusted source context supplied to the Pi transcript adapter.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PiAdapterContext<'a> {
     pub source_key: &'a str,
     pub layout_hint: &'a RetainedJsonlSourceLayoutHint,
     pub hostname: Option<&'a str>,
@@ -1220,274 +1209,6 @@ fn accept_claude_native_source(
     }
 
     true
-}
-
-fn stable_pi_source_record_key(session_id: &str, entry_id: &str) -> String {
-    format!(
-        "{SOURCE_RECORD_KEY_VERSION}:{}:{}:{session_id}:{}:{entry_id}",
-        SourceRecordShape::PiAssistant.as_str(),
-        session_id.len(),
-        entry_id.len(),
-    )
-}
-
-/// Parse Pi assistant usage through the shared tolerant session parser.
-pub(crate) fn parse_pi_model_usage_jsonl(
-    contents: &str,
-    context: PiAdapterContext<'_>,
-) -> ProviderAdapterParseResult {
-    let mut result = ProviderAdapterParseResult {
-        native_identity: ProviderNativeIdentityState::Absent,
-        observations: Vec::new(),
-        diagnostics: Vec::new(),
-        counts: ProviderAdapterParseCounts::default(),
-    };
-    let mut decoded = Vec::<(u64, Value)>::new();
-    for (line_index, line) in contents.lines().enumerate() {
-        result.counts.lines_seen = result.counts.lines_seen.saturating_add(1);
-        let source_ordinal = u64::try_from(line_index).unwrap_or(u64::MAX);
-        if line.trim().is_empty() {
-            result.counts.ignored_records = result.counts.ignored_records.saturating_add(1);
-            continue;
-        }
-        match serde_json::from_str::<Value>(line) {
-            Ok(Value::Object(record)) => decoded.push((source_ordinal, Value::Object(record))),
-            Ok(_) => {
-                result.counts.unsupported_shape_records =
-                    result.counts.unsupported_shape_records.saturating_add(1);
-                push_adapter_diagnostic(
-                    &mut result,
-                    source_ordinal,
-                    ModelUsageDiagnosticKind::RecordSkipped,
-                );
-            }
-            Err(_) => {
-                result.counts.malformed_json_records =
-                    result.counts.malformed_json_records.saturating_add(1);
-                push_adapter_diagnostic(
-                    &mut result,
-                    source_ordinal,
-                    ModelUsageDiagnosticKind::RecordSkipped,
-                );
-            }
-        }
-    }
-
-    let session = match parse_pi_session_values(decoded.iter().map(|(_, value)| value.clone())) {
-        Ok(Some(session)) => session,
-        Ok(None) | Err(_) => {
-            result.counts.unsupported_shape_records =
-                result.counts.unsupported_shape_records.saturating_add(1);
-            push_adapter_diagnostic(&mut result, 0, ModelUsageDiagnosticKind::RecordSkipped);
-            return result;
-        }
-    };
-    result.counts.session_metadata_records_seen = 1;
-
-    let native = match resolve_pi_native_identity(&session) {
-        Ok(native) => native,
-        Err(_) => {
-            result.counts.invalid_identity_records =
-                result.counts.invalid_identity_records.saturating_add(1);
-            push_adapter_diagnostic(&mut result, 0, ModelUsageDiagnosticKind::RecordSkipped);
-            return result;
-        }
-    };
-    if !matches!(
-        context.layout_hint,
-        RetainedJsonlSourceLayoutHint::PiTranscript
-    ) {
-        result.counts.layout_hint_conflict_records =
-            result.counts.layout_hint_conflict_records.saturating_add(1);
-    }
-
-    let parsed_entry_ids = session
-        .entries
-        .iter()
-        .map(|entry| entry.base.id.as_str())
-        .collect::<HashSet<_>>();
-    let ordinals = decoded
-        .iter()
-        .filter_map(|(ordinal, value)| {
-            value
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| (id, *ordinal))
-        })
-        .collect::<HashMap<_, _>>();
-    for (source_ordinal, value) in &decoded {
-        match value.get("type").and_then(Value::as_str) {
-            Some("session") => {}
-            Some("message")
-                if value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| parsed_entry_ids.contains(id)) => {}
-            Some("message") => {
-                result.counts.unsupported_shape_records =
-                    result.counts.unsupported_shape_records.saturating_add(1);
-                push_adapter_diagnostic(
-                    &mut result,
-                    *source_ordinal,
-                    ModelUsageDiagnosticKind::RecordSkipped,
-                );
-            }
-            Some(_) => {
-                result.counts.ignored_records = result.counts.ignored_records.saturating_add(1);
-            }
-            None => {
-                result.counts.unsupported_shape_records =
-                    result.counts.unsupported_shape_records.saturating_add(1);
-                push_adapter_diagnostic(
-                    &mut result,
-                    *source_ordinal,
-                    ModelUsageDiagnosticKind::RecordSkipped,
-                );
-            }
-        }
-    }
-
-    let mut seen_entry_ids = HashSet::<String>::new();
-    let mut first_activity_at_ms = chrono::DateTime::parse_from_rfc3339(&session.header.timestamp)
-        .ok()
-        .map(|timestamp| timestamp.timestamp_millis())
-        .filter(|timestamp| *timestamp >= 0);
-    let mut last_activity_at_ms = first_activity_at_ms;
-    for entry in &session.entries {
-        if entry.message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        result.counts.assistant_records_seen =
-            result.counts.assistant_records_seen.saturating_add(1);
-        let source_ordinal = ordinals.get(entry.base.id.as_str()).copied().unwrap_or(0);
-        if !seen_entry_ids.insert(entry.base.id.clone()) {
-            result.counts.invalid_identity_records =
-                result.counts.invalid_identity_records.saturating_add(1);
-            push_adapter_diagnostic(
-                &mut result,
-                source_ordinal,
-                ModelUsageDiagnosticKind::RecordSkipped,
-            );
-            continue;
-        }
-        let Some(observed_at_ms) = chrono::DateTime::parse_from_rfc3339(&entry.base.timestamp)
-            .ok()
-            .map(|timestamp| timestamp.timestamp_millis())
-            .filter(|timestamp| *timestamp >= 0)
-        else {
-            result.counts.invalid_timestamp_records =
-                result.counts.invalid_timestamp_records.saturating_add(1);
-            push_adapter_diagnostic(
-                &mut result,
-                source_ordinal,
-                ModelUsageDiagnosticKind::RecordSkipped,
-            );
-            continue;
-        };
-        first_activity_at_ms =
-            Some(first_activity_at_ms.map_or(observed_at_ms, |first| first.min(observed_at_ms)));
-        last_activity_at_ms =
-            Some(last_activity_at_ms.map_or(observed_at_ms, |last| last.max(observed_at_ms)));
-
-        let model_attribution = match (
-            entry.message.get("provider").and_then(Value::as_str),
-            entry.message.get("model").and_then(Value::as_str),
-        ) {
-            (Some(provider), Some(model)) => {
-                let model_id = validate_model_id(provider)
-                    .and_then(|provider| {
-                        validate_model_id(model).map(|model| format!("{provider}/{model}"))
-                    })
-                    .and_then(|model_id| validate_model_id(&model_id));
-                match model_id
-                    .and_then(|model_id| attribution::ModelAttribution::explicit(&model_id))
-                {
-                    Ok(model_attribution) => model_attribution,
-                    Err(_) => {
-                        record_invalid_model(&mut result, source_ordinal);
-                        attribution::ModelAttribution::invalid()
-                    }
-                }
-            }
-            _ => {
-                record_invalid_model(&mut result, source_ordinal);
-                attribution::ModelAttribution::invalid()
-            }
-        };
-        let usage = entry.message.get("usage").and_then(Value::as_object);
-        let input_tokens = usage.and_then(|usage| usage.get("input"));
-        let output_tokens = usage.and_then(|usage| usage.get("output"));
-        let cache_creation_tokens = usage.and_then(|usage| usage.get("cacheWrite"));
-        let cache_read_tokens = usage.and_then(|usage| usage.get("cacheRead"));
-        let invalid_token_dimensions = invalid_token_dimension_count([
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        ]);
-        if invalid_token_dimensions > 0 {
-            result.counts.invalid_token_dimension_values = result
-                .counts
-                .invalid_token_dimension_values
-                .saturating_add(invalid_token_dimensions);
-            push_adapter_diagnostic(
-                &mut result,
-                source_ordinal,
-                ModelUsageDiagnosticKind::InvalidTokenDimension,
-            );
-        }
-        let token_attribution = attribution::TokenAttribution::direct(validate_token_dimensions(
-            input_tokens,
-            output_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
-        ))
-        .unwrap_or_else(|_| attribution::TokenAttribution::unavailable());
-        result.observations.push(NormalizedObservation::new(
-            NormalizedObservationMetadata {
-                provider: IntegrationProvider::Pi,
-                source_key: context.source_key.to_owned(),
-                source_record_key: stable_pi_source_record_key(
-                    &native.source_session_id,
-                    &entry.base.id,
-                ),
-                source_ordinal,
-                kind: ObservationKind::Turn,
-                source_session_id: native.source_session_id.clone(),
-                analytics_session_id: native.source_session_id.clone(),
-                chain_id: native.chain_id.clone(),
-                parent_chain_id: None,
-                is_sidechain: false,
-                agent_id: None,
-                turn_id: Some(entry.base.id.clone()),
-                observed_at_ms,
-                cwd: native.cwd.clone(),
-                hostname: context.hostname.map(str::to_owned),
-            },
-            model_attribution,
-            token_attribution,
-        ));
-        result.counts.observations_emitted = result.counts.observations_emitted.saturating_add(1);
-    }
-
-    result.native_identity =
-        ProviderNativeIdentityState::Valid(Box::new(ProviderNativeSourceMetadata {
-            provider: IntegrationProvider::Pi,
-            source_key: context.source_key.to_owned(),
-            source_session_id: native.source_session_id.clone(),
-            analytics_session_id: native.source_session_id,
-            chain_id: native.chain_id,
-            parent_chain_id: None,
-            is_sidechain: false,
-            agent_id: None,
-            agent_nickname: None,
-            cwd: native.cwd,
-            hostname: context.hostname.map(str::to_owned),
-            first_activity_at_ms: first_activity_at_ms.unwrap_or(0),
-            last_activity_at_ms: last_activity_at_ms.unwrap_or(0),
-        }));
-    apply_carry_forward_attribution(&mut result);
-    result
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3327,15 +3048,7 @@ fn parse_model_source(
                 hostname: Some(hostname),
             },
         ),
-        IntegrationProvider::Pi => parse_pi_model_usage_jsonl(
-            contents,
-            PiAdapterContext {
-                source_key: &discovered.source_key,
-                layout_hint: &discovered.layout_hint,
-                hostname: Some(hostname),
-            },
-        ),
-        IntegrationProvider::MiniMax => {
+        _ => {
             log::warn!(
                 "Unsupported provider source reached model reconciliation: {}",
                 discovered.canonical_path.display()
@@ -4218,17 +3931,6 @@ mod tests {
         }
     }
 
-    fn pi_context<'a>(
-        source_key: &'a str,
-        layout_hint: &'a RetainedJsonlSourceLayoutHint,
-    ) -> PiAdapterContext<'a> {
-        PiAdapterContext {
-            source_key,
-            layout_hint,
-            hostname: Some("host-a"),
-        }
-    }
-
     fn claude_parent_hint() -> RetainedJsonlSourceLayoutHint {
         RetainedJsonlSourceLayoutHint::ClaudeParent {
             default_project: "proj".to_string(),
@@ -4297,92 +3999,6 @@ mod tests {
             .diagnostics
             .iter()
             .any(|entry| entry.diagnostic.as_str() == expected.as_str())
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#All Branch Usage]]
-    #[test]
-    fn pi_assistant_usage_keeps_upstream_identity_and_all_branch_totals() {
-        let hint = RetainedJsonlSourceLayoutHint::PiTranscript;
-        let contents = include_str!("../tests/fixtures/pi_sessions/model_usage_branches.jsonl");
-
-        let result = parse_pi_model_usage_jsonl(contents, pi_context("sk-pi", &hint));
-
-        assert_eq!(result.observations.len(), 3);
-        assert!(result.observations.iter().all(|observation| {
-            observation.metadata().provider == IntegrationProvider::Pi
-                && observation.token_evidence() == TokenEvidence::Direct
-        }));
-        assert_eq!(
-            result
-                .observations
-                .iter()
-                .map(|observation| observation.raw_model_id())
-                .collect::<Vec<_>>(),
-            [
-                Some("anthropic/claude-sonnet-4-5"),
-                Some("openai/gpt-5.6"),
-                Some("google/gemini-2.5-pro"),
-            ]
-        );
-        assert_eq!(
-            result.observations.iter().fold(0, |total, observation| {
-                total
-                    + observation.input_tokens().unwrap_or(0)
-                    + observation.output_tokens().unwrap_or(0)
-                    + observation.cache_creation_tokens().unwrap_or(0)
-                    + observation.cache_read_tokens().unwrap_or(0)
-            }),
-            236
-        );
-        assert_eq!(
-            result
-                .observations
-                .iter()
-                .map(|observation| observation.metadata().source_record_key.as_str())
-                .collect::<HashSet<_>>()
-                .len(),
-            3
-        );
-        assert!(result.observations.iter().all(|observation| {
-            observation
-                .metadata()
-                .source_record_key
-                .contains("session-usage-v3")
-        }));
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Version And Diagnostic Tolerance]]
-    #[test]
-    fn pi_adapter_uses_v2_parser_and_diagnoses_bad_records() {
-        let hint = RetainedJsonlSourceLayoutHint::PiTranscript;
-        let v2 = include_str!("../tests/fixtures/pi_sessions/model_usage_v2.jsonl");
-        let parsed_v2 = parse_pi_model_usage_jsonl(v2, pi_context("sk-pi-v2", &hint));
-        assert_eq!(parsed_v2.observations.len(), 1);
-        assert_eq!(
-            parsed_v2.observations[0].raw_model_id(),
-            Some("mistral/codestral")
-        );
-        assert_eq!(parsed_v2.observations[0].cache_creation_tokens(), Some(5));
-
-        let noisy = [
-            r#"{"type":"session","version":3,"id":"session-noise","timestamp":"2026-08-13T10:00:00Z","cwd":"/work/noise"}"#,
-            "not json",
-            r#"{"type":"future_entry","id":"future","parentId":null,"timestamp":"2026-08-13T10:00:01Z"}"#,
-            r#"{"type":"message","id":"bad","parentId":null,"timestamp":"2026-08-13T10:00:02Z","message":{"role":"assistant","provider":"openai","model":"gpt","usage":{"input":-1,"output":"bad"}}}"#,
-            r#"{"type":"message","id":"good","parentId":"bad","timestamp":"2026-08-13T10:00:03Z","message":{"role":"assistant","provider":"openai","model":"gpt","usage":{"input":4}}}"#,
-            r#"{"type":"message","id":"bad-provider","parentId":"good","timestamp":"2026-08-13T10:00:04Z","message":{"role":"assistant","provider":" ","model":"gpt","usage":{"input":2}}}"#,
-        ]
-        .join("\n");
-        let result = parse_pi_model_usage_jsonl(&noisy, pi_context("sk-pi-noise", &hint));
-        assert_eq!(result.observations.len(), 3);
-        assert_eq!(result.counts.malformed_json_records, 1);
-        assert_eq!(result.counts.ignored_records, 1);
-        assert_eq!(result.counts.invalid_token_dimension_values, 2);
-        assert_eq!(result.counts.invalid_model_values, 1);
-        assert!(has_diagnostic(
-            &result,
-            ModelUsageDiagnosticKind::InvalidTokenDimension
-        ));
     }
 
     // ---- Claude transcript adapter edge cases ---------------------------

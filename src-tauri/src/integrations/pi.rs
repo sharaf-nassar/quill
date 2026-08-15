@@ -1217,6 +1217,54 @@ mod tests {
         );
     }
 
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Upgrade In Place]]
+    #[test]
+    fn old_stamp_install_is_repaired_to_current_payload() {
+        let harness = Harness::new();
+        let features = IntegrationFeatures::default();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+
+        fs::write(
+            harness.paths.extension_path(),
+            "// quill-managed:pi\n// quill-managed-pi-payload: 1\nexport default function oldQuill() {}\n",
+        )
+        .unwrap();
+        fs::write(harness.paths.stamp_path(), "old-build-stamp").unwrap();
+        assert!(!deployment_is_current_with_paths(
+            &harness.bundle,
+            &harness.paths,
+            features,
+            &harness.storage,
+        ));
+
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+
+        assert!(deployment_is_current_with_paths(
+            &harness.bundle,
+            &harness.paths,
+            features,
+            &harness.storage,
+        ));
+        assert_eq!(
+            fs::read(harness.paths.extension_path()).unwrap(),
+            render_extension(&harness.bundle, features).unwrap(),
+        );
+    }
+
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Owned File Boundaries]]
     #[test]
     fn install_sweeps_only_marked_orphans_and_refuses_user_quill_ts() {

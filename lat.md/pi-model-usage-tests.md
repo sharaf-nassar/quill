@@ -4,23 +4,11 @@ lat:
 ---
 # Pi Model Usage Test Specs
 
-Pi usage tests pin pushed-message storage and its safe coexistence with retained transcript evidence.
+Pi usage tests pin pushed-message storage and the final transcript-adapter cut-over.
 
-## All Branch Usage
+## Removal Parity Gate
 
-Every Pi assistant message contributes direct token dimensions to aggregate totals, with its upstream provider and model retained as one provider-qualified model id.
-
-## Version And Diagnostic Tolerance
-
-Pi v2 and v3 sessions parse through the shared tolerant parser, while malformed records and invalid model or token fields produce bounded diagnostics instead of aborting later usage.
-
-## Native Session Identity
-
-Pi model-source identity comes from the session header id and cwd, independent of filenames and tree entry content.
-
-## Legacy All-Branch Totals
-
-Replacing one legacy Pi source twice stays idempotent, and every session/model read reports all stored branches without an active-branch scope label.
+The scripted Pi corpus proves exact linear totals, explains copied-ancestor fork divergence, and deduplicates replay while unioning disjoint pre-upgrade and pushed message identities.
 
 ## Pushed Usage Migration
 
@@ -36,7 +24,7 @@ Replaying one accepted usage envelope leaves one Models contribution and one cum
 
 ## Upgrade Coexistence
 
-A resumed session with pushed rows excludes its legacy adapter rows from raw and completed-rollup Models reads, preventing double count across an upgrade.
+A resumed session unions saved pre-upgrade rows with post-upgrade pushed rows in raw and completed-rollup Models reads, with the parity gate proving their message identities do not overlap.
 
 ## Push Source Prune Exemption
 

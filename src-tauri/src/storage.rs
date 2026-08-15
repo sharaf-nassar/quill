@@ -1703,20 +1703,7 @@ const MODEL_SOURCE_STATE_COLUMNS: &str = "
 /// `format!` never widens SQL injection surface — callers keep their own
 /// `?N` bindings.
 const ACTIVE_MODEL_SOURCE_PREDICATE: &str = "source.processing_status != 'suppressed'
-     AND source.suppressed_sha256 IS NULL
-     AND (
-         source.provider != 'pi'
-         OR source.source_key LIKE 'pi-push:%'
-         OR NOT EXISTS (
-             SELECT 1
-             FROM model_observation_sources AS pushed
-             WHERE pushed.provider = 'pi'
-               AND pushed.analytics_session_id = source.analytics_session_id
-               AND pushed.source_key LIKE 'pi-push:%'
-               AND pushed.processing_status != 'suppressed'
-               AND pushed.suppressed_sha256 IS NULL
-         )
-     )";
+     AND source.suppressed_sha256 IS NULL";
 const ACTIVE_RUNTIME_SOURCE_PREDICATE: &str =
     "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
 
@@ -23994,59 +23981,60 @@ mod tests {
             .expect("replace model source");
     }
 
-    fn seed_pi_model_source(storage: &Storage, dir: &TempDir, source_key: &str, jsonl: &str) {
-        let layout_hint = crate::sessions::RetainedJsonlSourceLayoutHint::PiTranscript;
-        let context = crate::model_usage::PiAdapterContext {
-            source_key,
-            layout_hint: &layout_hint,
-            hostname: Some("host-a"),
-        };
-        let parsed = crate::model_usage::parse_pi_model_usage_jsonl(jsonl, context);
-        let native = match &parsed.native_identity {
-            crate::model_usage::ProviderNativeIdentityState::Valid(native) => native,
-            state => panic!("expected valid Pi native identity, got {state:?}"),
-        };
-        let path = dir.path().join(format!("{source_key}.jsonl"));
-        std::fs::write(&path, jsonl).expect("write Pi transcript");
-        let fast = crate::transcript_identity::model_source_fast_fingerprint(
-            &std::fs::metadata(&path).expect("stat Pi transcript"),
+    fn seed_legacy_pi_model_source(storage: &Storage, source_key: &str) {
+        let now_ms = Utc::now().timestamp_millis();
+        let mut conn = storage.conn.lock().unwrap();
+        let tx = conn.transaction().expect("begin legacy Pi fixture");
+        tx.execute(
+            "INSERT INTO model_observation_sources (
+                 provider, source_key, source_root_key, source_path,
+                 source_session_id, analytics_session_id, chain_id,
+                 is_sidechain, cwd, hostname, first_activity_at_ms,
+                 last_activity_at_ms, seen_generation, processing_status,
+                 observation_count, last_attempt_at_ms, last_success_at_ms
+             ) VALUES (
+                 'pi', ?1, 'retired-pi-root', '/retired/pi.jsonl',
+                 'session-usage-v3', 'session-usage-v3', 'session-usage-v3',
+                 0, '/work/pi-usage', 'host-a', ?2, ?2, 1, 'ok', 3, ?2, ?2
+             )",
+            params![source_key, now_ms],
         )
-        .expect("fingerprint Pi transcript");
-        let fingerprint = ModelSourceFingerprint::from_content(fast, jsonl.as_bytes());
-        let attempted_at_ms = Utc::now().timestamp_millis();
-        let source = NormalizedSource {
-            provider: IntegrationProvider::Pi,
-            source_root_key: "root-pi".to_string(),
-            source_key: source_key.to_string(),
-            path,
-            layout_hint,
-            source_session_id: Some(native.source_session_id.clone()),
-            analytics_session_id: Some(native.analytics_session_id().to_string()),
-            chain_id: Some(native.chain_id.clone()),
-            parent_chain_id: native.parent_chain_id.clone(),
-            is_sidechain: false,
-            agent_id: None,
-            agent_nickname: None,
-            cwd: native.cwd.clone(),
-            hostname: native.hostname.clone(),
-            first_activity_at_ms: Some(native.first_activity_at_ms),
-            last_activity_at_ms: Some(native.last_activity_at_ms),
-            mtime_ns: None,
-            size_bytes: None,
-            content_sha256: None,
-            last_error: None,
-            suppressed_sha256: None,
-            suppressed_at_ms: None,
-            seen_generation: 1,
-            processing_status: SourceProcessingStatus::Ok,
-            observation_count: i64::try_from(parsed.observations.len())
-                .expect("Pi observation count"),
-            last_attempt_at_ms: Some(attempted_at_ms),
-            last_success_at_ms: Some(attempted_at_ms),
-        };
-        storage
-            .replace_model_source(&source, &parsed.observations, &fingerprint)
-            .expect("replace Pi model source");
+        .expect("seed legacy Pi source");
+        for (ordinal, record_key, model, tokens) in [
+            (0, "main", "anthropic/claude-sonnet-4-5", [11, 7, 5, 3]),
+            (1, "abandoned", "openai/gpt-5.6", [13, 17, 23, 19]),
+            (2, "active", "google/gemini-2.5-pro", [29, 31, 41, 37]),
+        ] {
+            tx.execute(
+                "INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, turn_id, raw_model_id,
+                     derived_model_id, cwd, hostname, is_sidechain,
+                     observed_at_ms, input_tokens, output_tokens,
+                     cache_creation_tokens, cache_read_tokens,
+                     model_evidence, token_evidence
+                 ) VALUES (
+                     'pi', ?1, ?2, ?3, 'turn', 'session-usage-v3',
+                     'session-usage-v3', 'session-usage-v3', ?2, ?4, ?4,
+                     '/work/pi-usage', 'host-a', 0, ?5, ?6, ?7, ?8, ?9,
+                     'explicit', 'direct'
+                 )",
+                params![
+                    source_key,
+                    record_key,
+                    ordinal,
+                    model,
+                    now_ms + ordinal,
+                    tokens[0],
+                    tokens[1],
+                    tokens[2],
+                    tokens[3],
+                ],
+            )
+            .expect("seed legacy Pi observation");
+        }
+        tx.commit().expect("commit legacy Pi fixture");
     }
 
     fn pushed_pi_usage_event(
@@ -24080,84 +24068,6 @@ mod tests {
                 },
             },
         }
-    }
-
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Legacy All-Branch Totals]]
-    #[test]
-    #[serial]
-    fn pi_replacement_is_idempotent_and_session_totals_are_all_branches() {
-        clear_env();
-        let dir = TempDir::new().expect("tempdir");
-        let storage = init_storage_in(&dir);
-        let jsonl = include_str!("../tests/fixtures/pi_sessions/model_usage_branches.jsonl");
-
-        seed_pi_model_source(&storage, &dir, "pi-source", jsonl);
-        seed_pi_model_source(&storage, &dir, "pi-source", jsonl);
-
-        let conn = storage.conn.lock().unwrap();
-        assert_eq!(
-            scalar_count(
-                &conn,
-                "SELECT COUNT(*) FROM model_usage_observations WHERE provider = 'pi'"
-            ),
-            3
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT SUM(COALESCE(input_tokens, 0)
-                            + COALESCE(output_tokens, 0)
-                            + COALESCE(cache_creation_tokens, 0)
-                            + COALESCE(cache_read_tokens, 0))
-                 FROM model_usage_observations WHERE provider = 'pi'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("sum Pi all-branch usage"),
-            236
-        );
-        drop(conn);
-
-        let overview = storage
-            .get_model_usage_overview(ModelRange::SevenDays, Some("pi"))
-            .expect("read Pi all-branch overview");
-        assert_eq!(overview.totals.total_tokens, 236);
-
-        let history = storage
-            .get_session_model_history("pi", "session-usage-v3", ModelRange::SevenDays)
-            .expect("read Pi session history");
-        assert_eq!(history.token_scope, ModelTokenScope::AllBranches);
-        assert_eq!(
-            serde_json::to_value(&history).expect("serialize Pi history")["tokenScope"],
-            "all-branches"
-        );
-        assert_eq!(history.attributed_tokens, 236);
-
-        let active_identity = ModelIdentity {
-            provider: "pi".to_string(),
-            model_id: "google/gemini-2.5-pro".to_string(),
-        };
-        let sessions = storage
-            .get_model_sessions(ModelRange::SevenDays, &active_identity, None, Some(10))
-            .expect("page Pi model sessions");
-        assert_eq!(sessions.sessions.len(), 1);
-        assert_eq!(
-            sessions.sessions[0].token_scope,
-            ModelTokenScope::AllBranches
-        );
-        assert_eq!(sessions.sessions[0].selected_model_tokens, 138);
-
-        let abandoned_identity = ModelIdentity {
-            provider: "pi".to_string(),
-            model_id: "openai/gpt-5.6".to_string(),
-        };
-        assert_eq!(
-            storage
-                .get_model_sessions(ModelRange::SevenDays, &abandoned_identity, None, Some(10))
-                .expect("page abandoned Pi model sessions")
-                .total,
-            1
-        );
-        clear_env();
     }
 
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pushed Usage Migration]]
@@ -24335,12 +24245,11 @@ mod tests {
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Upgrade Coexistence]]
     #[test]
     #[serial]
-    fn pushed_pi_session_excludes_legacy_adapter_rows_from_models_reads() {
+    fn resumed_pi_session_unions_legacy_and_pushed_rows_after_cutover() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let jsonl = include_str!("../tests/fixtures/pi_sessions/model_usage_branches.jsonl");
-        seed_pi_model_source(&storage, &dir, "legacy-pi", jsonl);
+        seed_legacy_pi_model_source(&storage, "legacy-pi");
         let observed_at_ms = Utc::now().timestamp_millis();
         let event = pushed_pi_usage_event(
             "resumed-event",
@@ -24365,18 +24274,14 @@ mod tests {
         let overview = storage
             .get_model_usage_overview(ModelRange::SevenDays, Some("pi"))
             .expect("read legacy/pushed union");
-        assert_eq!(overview.totals.total_tokens, 17);
-        assert_eq!(overview.models.len(), 1);
-        assert_eq!(
-            overview.models[0].identity.model_id,
-            "anthropic/pushed-model"
-        );
+        assert_eq!(overview.totals.total_tokens, 253);
+        assert_eq!(overview.models.len(), 4);
 
         let history = storage
             .get_session_model_history("pi", "session-usage-v3", ModelRange::SevenDays)
             .expect("read resumed session history");
         assert_eq!(history.token_scope, ModelTokenScope::AllBranches);
-        assert_eq!(history.attributed_tokens, 17);
+        assert_eq!(history.attributed_tokens, 253);
         clear_env();
     }
 

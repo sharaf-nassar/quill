@@ -20,7 +20,7 @@ Pi skill usage and hook rows remain visible in aggregate and provider-filtered b
 
 ## Transcript Root Coverage
 
-Retained analytics coordination covers Claude, Codex, and Pi provider-root identities.
+Retained analytics coordination covers Claude and Codex roots while notify-driven Pi stays outside transcript reconciliation.
 
 ## Hook Observation Contract
 

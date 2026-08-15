@@ -46,6 +46,10 @@ The next guarded mutation restores extension and instruction bytes left half-wri
 
 Verification rejects a stale stamp, changed extension payload, missing managed instruction block, unexpected marked extension, or invalid state file.
 
+## Upgrade In Place
+
+Startup repair detects an old deployment stamp and replaces its owned Pi extension with the current production payload without user action.
+
 ## Owned File Boundaries
 
 Repair removes only structurally marked Quill extensions and refuses to overwrite a user-owned `quill.ts` file.

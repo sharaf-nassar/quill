@@ -362,7 +362,7 @@ Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` 
 
 Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
 
-Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. Verification compares exact extension bytes, checks the payload marker, rejects extra Quill-marked extension files, requires the current AGENTS block, parses the four-field integration state, and validates the local shared config contract. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
+Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. An old stamp therefore triggers the idempotent install path and replaces the owned extension with current bundled bytes without user action. Verification checks exact extension bytes, payload ownership, the current AGENTS block, four-field integration state, and local shared config. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
 
 ### Extension Tools and Telemetry
 

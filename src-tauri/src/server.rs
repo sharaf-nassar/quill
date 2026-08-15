@@ -1414,6 +1414,9 @@ fn enqueue_validated_retained_source(
     state: &ServerState,
     source: sessions::DiscoveredRetainedJsonlSource,
 ) {
+    if source.provider == IntegrationProvider::Pi {
+        return;
+    }
     if let Err(error) = crate::enqueue_retained_live_source(&state.app_handle, source) {
         log::error!("Failed to enqueue validated retained transcript: {error}");
     }
