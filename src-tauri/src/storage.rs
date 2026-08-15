@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 41;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 42;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -7896,6 +7896,26 @@ impl Storage {
                 .map_err(|e| format!("Migration 41 commit: {e}"))?;
         }
 
+        // Migration 42 records whether a push-created live Pi session has no
+        // transcript file and therefore cannot participate in search.
+        if current_version < 42 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 42 transaction: {e}"))?;
+            if !table_has_column(&tx, "live_analytics_sessions", "ephemeral") {
+                tx.execute_batch(
+                    "ALTER TABLE live_analytics_sessions
+                     ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0
+                     CHECK(ephemeral IN (0, 1));",
+                )
+                .map_err(|e| format!("Migration 42 (add ephemeral flag): {e}"))?;
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (42)", [])
+                .map_err(|e| format!("Failed to record migration 42: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 42 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -13777,6 +13797,55 @@ impl Storage {
         Ok(result)
     }
 
+    /// Persist the durable origin for a pushed Pi lifecycle event.
+    pub(crate) fn upsert_pi_live_session(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        hostname: &str,
+        ephemeral: bool,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO live_analytics_sessions (
+                 provider, session_id, cwd, hostname, updated_at, ephemeral
+             ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider, session_id) DO UPDATE SET
+                 cwd = COALESCE(excluded.cwd, live_analytics_sessions.cwd),
+                 hostname = excluded.hostname,
+                 updated_at = excluded.updated_at,
+                 ephemeral = excluded.ephemeral",
+            params![
+                session_id,
+                cwd,
+                hostname,
+                Utc::now().to_rfc3339(),
+                ephemeral,
+            ],
+        )
+        .map_err(|e| format!("Upsert Pi live session: {e}"))?;
+        Ok(())
+    }
+
+    /// Store the newest Pi extension handshake as one settings transaction.
+    pub(crate) fn store_pi_extension_health(
+        &self,
+        protocol: u32,
+        extension_version: &str,
+        min_quill_version: &str,
+        last_error: Option<&str>,
+    ) -> Result<(), String> {
+        let protocol = protocol.to_string();
+        let last_seen = Utc::now().to_rfc3339();
+        self.set_settings_atomically(&[
+            ("pi_extension.last_seen", &last_seen),
+            ("pi_extension.protocol", &protocol),
+            ("pi_extension.extension_version", extension_version),
+            ("pi_extension.min_quill_version", min_quill_version),
+            ("pi_extension.last_error", last_error.unwrap_or("")),
+        ])
+    }
+
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -18891,6 +18960,70 @@ mod tests {
             std::env::remove_var("QUILL_CLAUDE_PROJECTS_DIR");
             std::env::remove_var("QUILL_CODEX_SESSIONS_DIR");
         }
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Persistence]]
+    #[test]
+    #[serial]
+    fn pi_lifecycle_upsert_persists_ephemeral_origin() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+
+        storage
+            .upsert_pi_live_session("pi-session", Some("/work/pi"), "host", true)
+            .expect("upsert Pi lifecycle");
+
+        let row = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT provider, cwd, hostname, ephemeral
+                 FROM live_analytics_sessions WHERE session_id = 'pi-session'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .expect("read Pi lifecycle row");
+        assert_eq!(row, ("pi".into(), "/work/pi".into(), "host".into(), true));
+        drop(storage);
+        clear_env();
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Extension Health Persistence]]
+    #[test]
+    #[serial]
+    fn pi_extension_health_stores_handshake_fields_and_last_error() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        storage
+            .store_pi_extension_health(1, "1.2.3", "0.9.0", Some("spool_corrupt"))
+            .expect("store Pi extension health");
+
+        for (key, expected) in [
+            ("pi_extension.protocol", "1"),
+            ("pi_extension.extension_version", "1.2.3"),
+            ("pi_extension.min_quill_version", "0.9.0"),
+            ("pi_extension.last_error", "spool_corrupt"),
+        ] {
+            assert_eq!(storage.get_setting(key).unwrap().as_deref(), Some(expected));
+        }
+        assert!(
+            storage
+                .get_setting("pi_extension.last_seen")
+                .unwrap()
+                .is_some()
+        );
+        drop(storage);
+        clear_env();
     }
 
     #[test]

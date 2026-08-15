@@ -4,7 +4,47 @@ lat:
 ---
 # Pi Live Session Test Specs
 
-These tests pin the bounded Pi transcript fold and its honest Sessions presentation.
+These tests pin Pi's pushed live-session foundation while the bounded transcript fold remains available until the final cut-over.
+
+## Push Lifecycle
+
+Pushed starts create normalized Pi live keys, replacement starts remove the prior identity, and shutdown removes the active identity deterministically.
+
+## Push Continuity
+
+Startup or reload of the same stable id preserves its original start while advancing activity and ignores a shutdown older than the continued session.
+
+## Push Mutations
+
+Activity, model, lineage, and cumulative-token pushes update an existing Pi session but never invent one without lifecycle evidence.
+
+## Push Crash Eviction
+
+A pushed Pi session with no shutdown ages out through the shared 15-minute idle sweep, and a shutdown arriving after eviction stays an idempotent no-op.
+
+## Ephemeral Persistence
+
+Migration 42 and the lifecycle upsert preserve the ephemeral flag with Pi's cwd and normalized hostname in `live_analytics_sessions`.
+
+## Extension Health Persistence
+
+One atomic settings write records the handshake protocol, extension version, minimum Quill version, last report time, and typed last error.
+
+## Tracking Request Validation
+
+The Pi tracking boundary rejects bad bearer authentication with `401` and protocol mismatch with a typed `400` response.
+
+## Tracking Rate Headroom
+
+The independent Pi tracking limiter accepts 4,000 single-event envelopes in one 60-second window, four times the specified 1,000-event stream.
+
+## Demo Gate
+
+Demo mode returns a typed unavailable result without changing extension health, durable lifecycle origin, or LiveTracker state.
+
+## Tracking Ingestion
+
+A valid session-start envelope lowercases and shortens its hostname once, then uses that same key for durable lifecycle origin, live state, and extension health.
 
 ## Liveness
 

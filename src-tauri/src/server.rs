@@ -20,8 +20,9 @@ use tauri::Emitter;
 use crate::integrations::IntegrationProvider;
 use crate::models::{
     ContextSavingsEventPayload, ContextSavingsEventsBatchPayload, LearnedRulePayload,
-    LearningRunPayload, ObservationPayload, ObservedHookObservation, SessionMessagePayload,
-    SessionMessagesPayload, SessionNotifyPayload, TokenReportPayload,
+    LearningRunPayload, ObservationPayload, ObservedHookObservation, PiLineage, PiTrackEnvelope,
+    PiTrackEventKind, SessionMessagePayload, SessionMessagesPayload, SessionNotifyPayload,
+    TokenReportPayload,
 };
 use crate::sessions;
 use crate::storage::Storage;
@@ -53,6 +54,10 @@ const MAX_CONTEXT_REF_LEN: usize = 1024;
 const MAX_CONTEXT_METADATA_LEN: usize = 16 * 1024;
 const MAX_SESSION_NOTIFY_REQUESTS: usize = 500;
 const MAX_SESSION_MSG_REQUESTS: usize = 100;
+const MAX_PI_TRACK_REQUESTS: usize = 4_000;
+const MAX_PI_TRACK_EVENTS_PER_REQUEST: usize = 200;
+const MAX_PI_LAST_ERROR_LEN: usize = 2_048;
+const PI_TRACK_PROTOCOL: u32 = 1;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_CONTENT_LEN: usize = 1_000_000;
 // Must match MAX_MESSAGES_PER_REQUEST in the deployed Claude session-sync bridge.
@@ -103,10 +108,13 @@ struct ServerState {
     obs_rate_limiter: Mutex<VecDeque<Instant>>,
     context_savings_rate_limiter: Mutex<VecDeque<Instant>>,
     session_rate_limiter: Mutex<VecDeque<Instant>>,
+    pi_track_rate_limiter: Mutex<VecDeque<Instant>>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     pending_validation_retries: Mutex<HashMap<String, PendingValidationRetry>>,
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
+    live_tracker: Arc<crate::live_tracker::LiveTracker>,
+    demo_mode: bool,
 }
 
 fn check_auth(headers: &HeaderMap, secret: &str) -> bool {
@@ -127,6 +135,7 @@ pub async fn start_server(
     secret: String,
     app_handle: tauri::AppHandle,
     session_index: Option<Arc<sessions::SessionIndex>>,
+    live_tracker: Arc<crate::live_tracker::LiveTracker>,
 ) {
     let port: u16 = std::env::var("QUILL_PORT")
         .ok()
@@ -140,10 +149,13 @@ pub async fn start_server(
         obs_rate_limiter: Mutex::new(VecDeque::new()),
         context_savings_rate_limiter: Mutex::new(VecDeque::new()),
         session_rate_limiter: Mutex::new(VecDeque::new()),
+        pi_track_rate_limiter: Mutex::new(VecDeque::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
         pending_validation_retries: Mutex::new(HashMap::new()),
         app_handle,
         session_index,
+        live_tracker,
+        demo_mode: std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1"),
     });
 
     // The main router below is intentionally reachable on 0.0.0.0. Context
@@ -209,6 +221,7 @@ pub async fn start_server(
         )
         .route("/api/v1/sessions/notify", post(post_session_notify))
         .route("/api/v1/sessions/messages", post(post_session_messages))
+        .route("/api/v1/pi/track", post(post_pi_track))
         .route("/api/v1/sessions/search", get(get_session_search))
         .route("/api/v1/sessions/context", get(get_session_context_api))
         .route("/api/v1/sessions/facets", get(get_session_facets))
@@ -326,6 +339,359 @@ fn check_rate_limit_with_max(rate_limiter: &Mutex<VecDeque<Instant>>, max: usize
     }
     window.push_back(now);
     true
+}
+
+#[derive(Debug)]
+struct PiTrackError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl PiTrackError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: message.into(),
+        }
+    }
+
+    fn response(self) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "error": self.code,
+                "message": self.message,
+            })),
+        )
+    }
+}
+
+fn validate_pi_track_auth(headers: &HeaderMap, secret: &str) -> StatusCode {
+    if check_auth(headers, secret) {
+        StatusCode::OK
+    } else {
+        StatusCode::UNAUTHORIZED
+    }
+}
+
+fn validate_pi_track_name(value: &str, label: &'static str) -> Result<(), PiTrackError> {
+    if value.trim().is_empty()
+        || value.trim() != value
+        || value.len() > MAX_STRING_LEN
+        || value.chars().any(char::is_control)
+    {
+        return Err(PiTrackError::bad_request(
+            "invalid_event",
+            format!("Invalid {label}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pi_lineage(lineage: &PiLineage) -> Result<(), PiTrackError> {
+    match lineage {
+        PiLineage::Root => Ok(()),
+        PiLineage::Linked { parent_session_id } => {
+            validate_pi_track_name(parent_session_id, "parent_session_id")
+        }
+        PiLineage::Unresolved { reason } => validate_pi_track_name(reason, "lineage reason"),
+    }
+}
+
+fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackError> {
+    validate_pi_track_name(&payload.extension_version, "extension_version")?;
+    validate_pi_track_name(&payload.min_quill_version, "min_quill_version")?;
+    if payload.last_error.as_ref().is_some_and(|error| {
+        error.len() > MAX_PI_LAST_ERROR_LEN || error.chars().any(char::is_control)
+    }) {
+        return Err(PiTrackError::bad_request(
+            "invalid_handshake",
+            "Invalid last_error",
+        ));
+    }
+    if payload.protocol != PI_TRACK_PROTOCOL {
+        return Err(PiTrackError::bad_request(
+            "protocol_mismatch",
+            format!(
+                "Unsupported Pi tracking protocol {}; expected {PI_TRACK_PROTOCOL}",
+                payload.protocol
+            ),
+        ));
+    }
+    if payload.events.is_empty() || payload.events.len() > MAX_PI_TRACK_EVENTS_PER_REQUEST {
+        return Err(PiTrackError::bad_request(
+            "invalid_envelope",
+            format!("events must contain 1..={MAX_PI_TRACK_EVENTS_PER_REQUEST} items"),
+        ));
+    }
+
+    let mut event_ids = HashSet::with_capacity(payload.events.len());
+    for event in &payload.events {
+        validate_pi_track_name(&event.event_uuid, "event_uuid")?;
+        if !event_ids.insert(event.event_uuid.as_str()) {
+            return Err(PiTrackError::bad_request(
+                "invalid_event",
+                "Duplicate event_uuid",
+            ));
+        }
+        validate_pi_track_name(&event.session_id, "session_id")?;
+        if crate::live_tracker::normalize_observed_hostname(&event.hostname).is_none() {
+            return Err(PiTrackError::bad_request(
+                "invalid_event",
+                "Invalid hostname",
+            ));
+        }
+        if event.timestamp.len() > MAX_STRING_LEN
+            || chrono::DateTime::parse_from_rfc3339(&event.timestamp).is_err()
+        {
+            return Err(PiTrackError::bad_request(
+                "invalid_event",
+                "Invalid timestamp",
+            ));
+        }
+        match &event.kind {
+            PiTrackEventKind::SessionStart {
+                cwd,
+                reason,
+                previous_session_id,
+                lineage,
+                ..
+            } => {
+                if cwd.as_ref().is_some_and(|cwd| {
+                    cwd.len() > MAX_CWD_LEN || cwd.trim() != cwd || !Path::new(cwd).is_absolute()
+                }) {
+                    return Err(PiTrackError::bad_request("invalid_event", "Invalid cwd"));
+                }
+                if let Some(previous) = previous_session_id {
+                    validate_pi_track_name(previous, "previous_session_id")?;
+                }
+                if matches!(
+                    reason,
+                    crate::models::PiSessionStartReason::Startup
+                        | crate::models::PiSessionStartReason::Reload
+                ) && previous_session_id.is_some()
+                {
+                    return Err(PiTrackError::bad_request(
+                        "invalid_event",
+                        "Continuity starts cannot replace another session",
+                    ));
+                }
+                validate_pi_lineage(lineage)?;
+            }
+            PiTrackEventKind::SessionEnd { reason } => {
+                log::trace!("Validated Pi session shutdown reason: {reason:?}");
+            }
+            PiTrackEventKind::Activity => {}
+            PiTrackEventKind::Model {
+                model_provider,
+                model,
+            } => {
+                validate_pi_track_name(model_provider, "model_provider")?;
+                crate::model_usage::validate_model_id(model)
+                    .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid model"))?;
+            }
+            PiTrackEventKind::Lineage { lineage } => validate_pi_lineage(lineage)?,
+            PiTrackEventKind::LiveTokens {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => {
+                let counts = [
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                ];
+                if counts
+                    .iter()
+                    .any(|count| !(0..=MAX_TOKEN_VALUE).contains(count))
+                    || counts
+                        .into_iter()
+                        .try_fold(0_i64, i64::checked_add)
+                        .is_none()
+                {
+                    return Err(PiTrackError::bad_request(
+                        "invalid_event",
+                        "Invalid token counts",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pi_lineage_parent(lineage: &PiLineage) -> Option<&str> {
+    match lineage {
+        PiLineage::Linked { parent_session_id } => Some(parent_session_id),
+        PiLineage::Root | PiLineage::Unresolved { .. } => None,
+    }
+}
+
+fn ingest_pi_track(
+    storage: &Storage,
+    live_tracker: &crate::live_tracker::LiveTracker,
+    payload: &PiTrackEnvelope,
+    demo_mode: bool,
+) -> Result<(), PiTrackError> {
+    if demo_mode {
+        return Err(PiTrackError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "demo_mode",
+            message: "Pi tracking ingestion is disabled in demo mode".to_owned(),
+        });
+    }
+    if let Err(error) = validate_pi_track_envelope(payload) {
+        if error.code == "protocol_mismatch" {
+            storage
+                .store_pi_extension_health(
+                    payload.protocol,
+                    &payload.extension_version,
+                    &payload.min_quill_version,
+                    Some("protocol_mismatch"),
+                )
+                .map_err(PiTrackError::internal)?;
+        }
+        return Err(error);
+    }
+    storage
+        .store_pi_extension_health(
+            payload.protocol,
+            &payload.extension_version,
+            &payload.min_quill_version,
+            payload.last_error.as_deref(),
+        )
+        .map_err(PiTrackError::internal)?;
+
+    for event in &payload.events {
+        let host = crate::live_tracker::normalize_observed_hostname(&event.hostname)
+            .expect("validated hostname");
+        let at = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .expect("validated timestamp")
+            .with_timezone(&chrono::Utc);
+        match &event.kind {
+            PiTrackEventKind::SessionStart {
+                cwd,
+                ephemeral,
+                previous_session_id,
+                lineage,
+                ..
+            } => {
+                storage
+                    .upsert_pi_live_session(&event.session_id, cwd.as_deref(), &host, *ephemeral)
+                    .map_err(PiTrackError::internal)?;
+                live_tracker.start_pi_session(
+                    &event.session_id,
+                    &host,
+                    cwd.as_deref(),
+                    at,
+                    previous_session_id.as_deref(),
+                );
+                live_tracker.set_pi_lineage(&event.session_id, &host, pi_lineage_parent(lineage));
+            }
+            PiTrackEventKind::SessionEnd { reason } => {
+                log::trace!("Closing Pi session after {reason:?}");
+                live_tracker.end_pi_session(&event.session_id, &host, at);
+            }
+            PiTrackEventKind::Activity => {
+                live_tracker.record_pi_activity(&event.session_id, &host, at);
+            }
+            PiTrackEventKind::Model {
+                model_provider,
+                model,
+            } => {
+                live_tracker.record_pi_activity(&event.session_id, &host, at);
+                live_tracker.set_pi_model(&event.session_id, &host, model_provider, model);
+            }
+            PiTrackEventKind::Lineage { lineage } => {
+                live_tracker.record_pi_activity(&event.session_id, &host, at);
+                live_tracker.set_pi_lineage(&event.session_id, &host, pi_lineage_parent(lineage));
+            }
+            PiTrackEventKind::LiveTokens {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            } => {
+                live_tracker.record_pi_activity(&event.session_id, &host, at);
+                live_tracker.set_pi_live_tokens(
+                    &event.session_id,
+                    &host,
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn post_pi_track(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(payload): Json<PiTrackEnvelope>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if validate_pi_track_auth(&headers, &state.secret) != StatusCode::OK {
+        return PiTrackError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "Unauthorized".to_owned(),
+        }
+        .response();
+    }
+    if crate::ingest_is_quiesced() {
+        return PiTrackError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "quiesced",
+            message: "Database maintenance in progress; retry shortly".to_owned(),
+        }
+        .response();
+    }
+    if !check_rate_limit_with_max(&state.pi_track_rate_limiter, MAX_PI_TRACK_REQUESTS) {
+        return PiTrackError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            message: "Rate limit exceeded".to_owned(),
+        }
+        .response();
+    }
+
+    let storage = state.storage;
+    let tracker = Arc::clone(&state.live_tracker);
+    let demo_mode = state.demo_mode;
+    match tokio::task::spawn_blocking(move || {
+        crate::with_ingest_write_permit(|| ingest_pi_track(storage, &tracker, &payload, demo_mode))
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            let _ = state
+                .app_handle
+                .emit(crate::SESSIONS_LIVE_UPDATED_EVENT, ());
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({"status": "accepted"})),
+            )
+        }
+        Ok(Err(error)) => error.response(),
+        Err(error) => {
+            log::error!("Pi tracking worker failed: {error}");
+            PiTrackError::internal("Pi tracking worker failed").response()
+        }
+    }
 }
 
 fn store_observation_in_background(storage: &'static Storage, payload: ObservationPayload) {
@@ -1893,5 +2259,94 @@ mod observed_subagent_tests {
             }],
         };
         assert!(validate_context_savings_batch(&payload).is_ok());
+    }
+
+    fn pi_envelope(protocol: u32) -> PiTrackEnvelope {
+        serde_json::from_value(serde_json::json!({
+            "protocol": protocol,
+            "extension_version": "1.2.3",
+            "min_quill_version": "0.9.0",
+            "last_error": "spool_corrupt",
+            "events": [{
+                "type": "session_start",
+                "event_uuid": "event-1",
+                "session_id": "session-1",
+                "hostname": "HOST.EXAMPLE.COM",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "cwd": "/work/pi",
+                "ephemeral": true,
+                "reason": "startup",
+                "lineage": { "kind": "root" }
+            }]
+        }))
+        .expect("deserialize Pi tracking envelope")
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Request Validation]]
+    #[test]
+    fn pi_track_rejects_bad_auth_and_protocol_with_typed_statuses() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            validate_pi_track_auth(&headers, "secret"),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let error = validate_pi_track_envelope(&pi_envelope(PI_TRACK_PROTOCOL + 1))
+            .expect_err("reject protocol mismatch");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, "protocol_mismatch");
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Rate Headroom]]
+    #[test]
+    fn pi_track_limiter_accepts_the_specified_event_stream() {
+        let limiter = Mutex::new(VecDeque::new());
+        for _ in 0..4_000 {
+            assert!(check_rate_limit_with_max(&limiter, MAX_PI_TRACK_REQUESTS,));
+        }
+        assert!(!check_rate_limit_with_max(&limiter, MAX_PI_TRACK_REQUESTS,));
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Demo Gate]]
+    #[test]
+    #[serial_test::serial]
+    fn pi_track_demo_mode_ingests_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+
+        let error = ingest_pi_track(&storage, &tracker, &pi_envelope(PI_TRACK_PROTOCOL), true)
+            .expect_err("demo gate");
+        assert_eq!(error.code, "demo_mode");
+        assert!(tracker.session_ranking_keys().is_empty());
+        assert!(
+            storage
+                .get_setting("pi_extension.last_seen")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Ingestion]]
+    #[test]
+    #[serial_test::serial]
+    fn pi_track_ingests_lowercase_hostname_lifecycle_and_health() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+
+        ingest_pi_track(&storage, &tracker, &pi_envelope(PI_TRACK_PROTOCOL), false).unwrap();
+
+        assert_eq!(
+            tracker.session_ranking_keys(),
+            vec![("pi".into(), "session-1".into(), "host".into())]
+        );
+        assert_eq!(
+            storage
+                .get_setting("pi_extension.last_error")
+                .unwrap()
+                .as_deref(),
+            Some("spool_corrupt")
+        );
     }
 }

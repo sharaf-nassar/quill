@@ -35,6 +35,88 @@ pub struct TokenReportPayload {
     pub parent_uuid: Option<String>,
 }
 
+/// Versioned Pi extension tracking envelope.
+#[derive(Deserialize, Clone, Debug)]
+pub struct PiTrackEnvelope {
+    pub protocol: u32,
+    pub extension_version: String,
+    pub min_quill_version: String,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub events: Vec<PiTrackEvent>,
+}
+
+/// Stable identity and origin shared by every Pi tracking event.
+#[derive(Deserialize, Clone, Debug)]
+pub struct PiTrackEvent {
+    pub event_uuid: String,
+    pub session_id: String,
+    pub hostname: String,
+    pub timestamp: String,
+    #[serde(flatten)]
+    pub kind: PiTrackEventKind,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PiTrackEventKind {
+    SessionStart {
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        ephemeral: bool,
+        reason: PiSessionStartReason,
+        #[serde(default)]
+        previous_session_id: Option<String>,
+        lineage: PiLineage,
+    },
+    SessionEnd {
+        reason: PiSessionEndReason,
+    },
+    Activity,
+    Model {
+        model_provider: String,
+        model: String,
+    },
+    Lineage {
+        lineage: PiLineage,
+    },
+    LiveTokens {
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiSessionStartReason {
+    Startup,
+    Reload,
+    New,
+    Resume,
+    Fork,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiSessionEndReason {
+    Quit,
+    Reload,
+    New,
+    Resume,
+    Fork,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PiLineage {
+    Root,
+    Linked { parent_session_id: String },
+    Unresolved { reason: String },
+}
+
 // Time-series point for token charts
 #[derive(Serialize, Clone, Debug)]
 pub struct TokenDataPoint {

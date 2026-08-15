@@ -41,12 +41,13 @@ Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 | Context savings | 500 req/min |
 | Session notify | 500 req/min |
 | Session messages | 100 req/min |
+| Pi tracking | 4,000 req/min |
 
 `/api/v1/hooks/observed` (feature 009) shares the **Observations** bucket because both endpoints accept hook-fire telemetry whose call rate scales with tool-call volume in active sessions, and a hook chain that fires `PreToolUse` + `PostToolUse` + Quill's own scripts can saturate a stricter limit on a heavy bash-driven turn. The handler accepts Claude, Codex, and Pi, then runs `check_auth` → `check_rate_limit_with_max(obs_rate_limiter, MAX_OBS_REQUESTS)` → validation ([[src-tauri/src/integrations/codex.rs#is_supported_hook_event|the Codex known-event set]] plus Claude StopFailure, ISO-8601 timestamp parse, length caps on `tool_name`/`hook_matcher`/`agent_id`) → background insert before returning `202 Accepted`, preserving the fast-ack contract observed by `src-tauri/codex-integration/scripts/hook-observe.cjs`. The endpoint holds no mutable live registry; accepted root terminal fires become advisory Sessions evidence while transcript activity remains authoritative for reopening.
 
 ### Endpoints
 
-The HTTP API exposes 15 endpoints for token ingestion, context savings, learning observations, session indexing, and hook telemetry across Claude Code and Codex.
+The HTTP API exposes 16 endpoints for token ingestion, context savings, learning observations, session indexing, hook telemetry, and Pi extension tracking.
 
 | Method | Route | Purpose |
 |--------|-------|---------|
@@ -61,12 +62,15 @@ The HTTP API exposes 15 endpoints for token ingestion, context savings, learning
 | POST | `/api/v1/learning/rules` | Store discovered behavioral rules |
 | POST | `/api/v1/sessions/notify` | Notify of new session JSONL file |
 | POST | `/api/v1/sessions/messages` | Ingest session messages for indexing |
+| POST | `/api/v1/pi/track` | Ingest versioned Pi lifecycle and live-state events |
 | GET | `/api/v1/sessions/search` | Full-text search sessions |
 | GET | `/api/v1/sessions/context` | Get surrounding messages |
 | GET | `/api/v1/sessions/facets` | Get search facets |
 | POST | `/api/v1/hooks/observed` | Record observed hook fires from Codex for audit history (Claude side reads from transcripts) |
 
 Each endpoint validates input (length limits, range checks, type validation) before processing. Provider-aware payloads default legacy callers to `claude`, while new Claude and Codex hooks send explicit provider tags for telemetry and session ingestion. Hook-facing observation and session-ingest POSTs acknowledge after validation and finish SQLite/Tantivy work on background blocking tasks so CLI hooks do not wait on local indexing. Local hook scripts treat receipt of response headers as the success boundary and use a short 1.5-second local timeout, which keeps the CLI path tolerant of slow response teardown without waiting on background indexing.
+
+`/api/v1/pi/track` uses its own 4,000-request sliding window, enough for four times the 1,000-event/minute single-event load. Its protocol-v1 envelope is `{protocol, extension_version, min_quill_version, last_error?, events[]}`. Events share `{event_uuid, session_id, hostname, timestamp, type}` and carry type-specific lifecycle, activity, model, lineage, or cumulative-token fields. The route returns typed JSON for `400`, `401`, `429`, and `503`; protocol mismatch persists handshake health for diagnosis, while demo mode and bad auth write nothing.
 
 ### Maintenance quiesce
 
@@ -1232,7 +1236,7 @@ Migration 30 establishes source and chain identity for transcript-derived analyt
 
 Owned/live identities are respectively: `session_events` `(provider, source_key, event_key)` / `(provider, session_id, event_key)`; `response_times` `(provider, source_key, chain_id, timestamp)` / `(provider, session_id, chain_id, timestamp)`; `tool_actions` `(provider, source_key, action_key)` / `(provider, session_id, action_key)`; `skill_usages` substitutes `source_key` or `session_id` before `(message_id, skill_name, skill_path, timestamp)`; and `hook_invocations` substitutes the same owner before `(chain_id, timestamp, hook_identity)`.
 
-`transcript_analytics_sources` stores canonical root/path ownership, fingerprints, last-good native and resolved identity, origin, inventory generation, processing diagnostics, and durable suppression. `live_analytics_sessions` stores project, cwd, and host origin for source-less analytics. Migration 30 sets `transcript_analytics_reingest_pending` for the later retained-source rebuild.
+`transcript_analytics_sources` stores canonical root/path ownership, fingerprints, last-good native and resolved identity, origin, inventory generation, processing diagnostics, and durable suppression. `live_analytics_sessions` stores project, cwd, and host origin for source-less analytics. Migration 42 adds its `ephemeral` flag for Pi lifecycle pushes; existing rows default false. Migration 30 sets `transcript_analytics_reingest_pending` for the later retained-source rebuild.
 
 Migration 30 renames the five prior analytics tables to `*_legacy_v30` and rebuilds them around source identity. The archives are **retained**, not dropped: rows with no hostname, and local rows whose transcript Claude has since pruned, are neither provably remote nor guaranteed rebuildable, and retention beats copying a multi-GB database. Nothing queries an archive and no index is kept on one — legacy named indexes are dropped so a retained archive cannot collide with the rebuilt tables' index names. An archive holding no rows at all is dropped immediately, so fresh installs stay clean.
 

@@ -60,6 +60,8 @@ struct LiveSession {
     /// Upstream provider and model from Pi's newest assistant message.
     model_provider: Option<String>,
     model: Option<String>,
+    /// Cumulative tokens reported by Pi's extension for the current session.
+    live_tokens: Option<i64>,
     /// Stable header id resolved from Pi's path-valued `parentSession` chain.
     parent_session_id: Option<String>,
     /// Spawn tool-use ids seen in a `tool_result` and workflow agent ids seen
@@ -585,6 +587,191 @@ impl LiveTracker {
         }
     }
 
+    /// Open or continue one pushed Pi session, optionally replacing its prior
+    /// identity for new/resume/fork transitions.
+    pub(crate) fn start_pi_session(
+        &self,
+        session_id: &str,
+        host: &str,
+        cwd: Option<&str>,
+        at: DateTime<Utc>,
+        previous_session_id: Option<&str>,
+    ) -> bool {
+        let Some(host) = normalize_observed_hostname(host) else {
+            return false;
+        };
+        let Some(session_id) = observed_name(session_id) else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        if !state.accepts(IntegrationProvider::Pi.as_str()) {
+            return false;
+        }
+        let mut changed = previous_session_id
+            .filter(|previous| *previous != session_id)
+            .is_some_and(|previous| {
+                state
+                    .sessions
+                    .remove(&SessionKey {
+                        provider: IntegrationProvider::Pi.as_str().to_owned(),
+                        host: host.clone(),
+                        session_id: previous.to_owned(),
+                    })
+                    .is_some()
+            });
+        let session = state
+            .sessions
+            .entry(SessionKey {
+                provider: IntegrationProvider::Pi.as_str().to_owned(),
+                host,
+                session_id,
+            })
+            .or_insert_with(|| {
+                changed = true;
+                LiveSession {
+                    last_activity: at,
+                    started_at: Some(at),
+                    cwd: observed_root_cwd(cwd),
+                    ..LiveSession::default()
+                }
+            });
+        changed |= advance(&mut session.last_activity, at);
+        if session.started_at.is_none() {
+            session.started_at = Some(at);
+            changed = true;
+        }
+        let cwd = observed_root_cwd(cwd);
+        if cwd.is_some() && session.cwd != cwd {
+            session.cwd = cwd;
+            changed = true;
+        }
+        drop(state);
+        if changed {
+            self.notify();
+        }
+        changed
+    }
+
+    /// Close a pushed Pi session only when the shutdown is not older than the
+    /// newest event already observed for that identity.
+    pub(crate) fn end_pi_session(&self, session_id: &str, host: &str, at: DateTime<Utc>) -> bool {
+        let Some(host) = normalize_observed_hostname(host) else {
+            return false;
+        };
+        let key = SessionKey {
+            provider: IntegrationProvider::Pi.as_str().to_owned(),
+            host,
+            session_id: session_id.to_owned(),
+        };
+        let mut state = self.state.lock().unwrap();
+        let removed = state
+            .sessions
+            .get(&key)
+            .is_some_and(|session| at >= session.last_activity)
+            && state.sessions.remove(&key).is_some();
+        drop(state);
+        if removed {
+            self.notify();
+        }
+        removed
+    }
+
+    pub(crate) fn record_pi_activity(
+        &self,
+        session_id: &str,
+        host: &str,
+        at: DateTime<Utc>,
+    ) -> bool {
+        self.mutate_pi_session(session_id, host, |session| {
+            advance(&mut session.last_activity, at)
+        })
+    }
+
+    pub(crate) fn set_pi_model(
+        &self,
+        session_id: &str,
+        host: &str,
+        model_provider: &str,
+        model: &str,
+    ) -> bool {
+        self.mutate_pi_session(session_id, host, |session| {
+            if session.model_provider.as_deref() == Some(model_provider)
+                && session.model.as_deref() == Some(model)
+            {
+                return false;
+            }
+            session.model_provider = Some(model_provider.to_owned());
+            session.model = Some(model.to_owned());
+            true
+        })
+    }
+
+    pub(crate) fn set_pi_lineage(
+        &self,
+        session_id: &str,
+        host: &str,
+        parent_session_id: Option<&str>,
+    ) -> bool {
+        self.mutate_pi_session(session_id, host, |session| {
+            let parent = parent_session_id.map(str::to_owned);
+            if session.parent_session_id == parent {
+                return false;
+            }
+            session.parent_session_id = parent;
+            true
+        })
+    }
+
+    pub(crate) fn set_pi_live_tokens(
+        &self,
+        session_id: &str,
+        host: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+    ) -> bool {
+        let Some(total) = input
+            .checked_add(output)
+            .and_then(|total| total.checked_add(cache_read))
+            .and_then(|total| total.checked_add(cache_write))
+        else {
+            return false;
+        };
+        self.mutate_pi_session(session_id, host, |session| {
+            if session.live_tokens == Some(total) {
+                return false;
+            }
+            session.live_tokens = Some(total);
+            true
+        })
+    }
+
+    fn mutate_pi_session(
+        &self,
+        session_id: &str,
+        host: &str,
+        mutate: impl FnOnce(&mut LiveSession) -> bool,
+    ) -> bool {
+        let Some(host) = normalize_observed_hostname(host) else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        let changed = state
+            .sessions
+            .get_mut(&SessionKey {
+                provider: IntegrationProvider::Pi.as_str().to_owned(),
+                host,
+                session_id: session_id.to_owned(),
+            })
+            .is_some_and(mutate);
+        drop(state);
+        if changed {
+            self.notify();
+        }
+        changed
+    }
+
     /// Fold the transcripts the watcher reported as written.
     pub(crate) fn apply_paths(
         &self,
@@ -773,6 +960,9 @@ impl LiveTracker {
             if utc(&row.last_active).is_none_or(|stored| session.last_activity > stored) {
                 row.last_active = session.last_activity.to_rfc3339();
             }
+            if let Some(total_tokens) = session.live_tokens {
+                row.total_tokens = total_tokens;
+            }
         }
 
         let from = utc(range_from);
@@ -799,7 +989,7 @@ impl LiveTracker {
                     session_id: key.session_id.clone(),
                     parent_session_id: session.parent_session_id.clone(),
                     hostname: key.host.clone(),
-                    total_tokens: 0,
+                    total_tokens: session.live_tokens.unwrap_or(0),
                     turn_count: 0,
                     first_seen: session
                         .started_at
@@ -1019,7 +1209,7 @@ fn local_observed_host() -> Option<&'static str> {
     .as_deref()
 }
 
-fn normalize_observed_hostname(hostname: &str) -> Option<String> {
+pub(crate) fn normalize_observed_hostname(hostname: &str) -> Option<String> {
     let hostname = hostname.trim();
     if hostname.is_empty() || hostname.len() > MAX_STRING_LEN {
         return None;
@@ -1913,6 +2103,108 @@ mod tests {
         DateTime::parse_from_rfc3339(timestamp)
             .expect("parse fixture timestamp")
             .with_timezone(&Utc)
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Lifecycle]]
+    #[test]
+    fn pi_push_start_end_and_replacement_mutate_live_state() {
+        let tracker = LiveTracker::new(None);
+        let started = parse("2026-08-14T08:00:00Z");
+
+        assert!(tracker.start_pi_session(
+            "first",
+            "HOST.EXAMPLE.COM",
+            Some("/work/quill"),
+            started,
+            None,
+        ));
+        assert_eq!(
+            tracker.session_ranking_keys(),
+            vec![("pi".into(), "first".into(), "host".into())]
+        );
+
+        assert!(tracker.start_pi_session(
+            "second",
+            "host.example.com",
+            Some("/work/quill"),
+            started + TimeDelta::seconds(1),
+            Some("first"),
+        ));
+        assert_eq!(
+            tracker.session_ranking_keys(),
+            vec![("pi".into(), "second".into(), "host".into())]
+        );
+        assert!(tracker.end_pi_session(
+            "second",
+            "HOST.EXAMPLE.COM",
+            started + TimeDelta::seconds(2),
+        ));
+        assert!(tracker.session_ranking_keys().is_empty());
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Continuity]]
+    #[test]
+    fn pi_push_reload_continues_same_session_and_ignores_stale_shutdown() {
+        let tracker = LiveTracker::new(None);
+        let started = parse("2026-08-14T08:00:00Z");
+        tracker.start_pi_session("same", "host", Some("/old"), started, None);
+        tracker.start_pi_session(
+            "same",
+            "host",
+            Some("/new"),
+            started + TimeDelta::minutes(1),
+            None,
+        );
+
+        assert!(!tracker.end_pi_session("same", "host", started + TimeDelta::seconds(30),));
+        let state = tracker.state.lock().unwrap();
+        let session = state.sessions.values().next().expect("continued session");
+        assert_eq!(session.started_at, Some(started));
+        assert_eq!(session.last_activity, started + TimeDelta::minutes(1));
+        assert_eq!(session.cwd.as_deref(), Some("/new"));
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Mutations]]
+    #[test]
+    fn pi_push_activity_model_lineage_and_tokens_update_existing_session_only() {
+        let tracker = LiveTracker::new(None);
+        let started = parse("2026-08-14T08:00:00Z");
+        tracker.start_pi_session("live", "host", Some("/work"), started, None);
+
+        assert!(tracker.record_pi_activity("live", "host", started + TimeDelta::seconds(1),));
+        assert!(tracker.set_pi_model("live", "host", "anthropic", "claude-sonnet-4-5"));
+        assert!(tracker.set_pi_lineage("live", "host", Some("parent")));
+        assert!(tracker.set_pi_live_tokens("live", "host", 10, 20, 30, 40));
+        assert!(!tracker.record_pi_activity("ended", "host", started));
+
+        let state = tracker.state.lock().unwrap();
+        let session = state.sessions.values().next().unwrap();
+        assert_eq!(session.last_activity, started + TimeDelta::seconds(1));
+        assert_eq!(session.model_provider.as_deref(), Some("anthropic"));
+        assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(session.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(session.live_tokens, Some(100));
+        drop(state);
+
+        let (_, rows) = read_path(&tracker, Vec::new(), started + TimeDelta::seconds(2));
+        assert_eq!(rows[0].total_tokens, 100);
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Crash Eviction]]
+    #[test]
+    fn pi_push_session_is_evicted_from_last_event_age_and_late_end_is_a_no_op() {
+        let tracker = LiveTracker::new(None);
+        let started = parse("2026-08-14T08:00:00Z");
+        tracker.start_pi_session("crashed", "host", Some("/work"), started, None);
+
+        tracker.sweep_in(&[], started + IDLE_AFTER + TimeDelta::seconds(1));
+        assert!(tracker.session_ranking_keys().is_empty());
+        assert!(!tracker.end_pi_session(
+            "crashed",
+            "host",
+            started + IDLE_AFTER + TimeDelta::seconds(2),
+        ));
+        assert!(tracker.session_ranking_keys().is_empty());
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Liveness]]
