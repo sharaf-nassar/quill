@@ -114,6 +114,10 @@ Workflow-spawned agents carry no spawning tool call, so the journal the fold pul
 
 An unresolved spawn whose own transcript went silent past the cutoff is abandoned rather than slow, while a sibling still writing stays open and keeps the session itself live.
 
+## Live Tracker Async Spawn Closure
+
+A backgrounded spawn stays open through the launch receipt it takes a moment after starting and closes only on the `<task-notification>` naming its spawning call, so a fleet of async agents is listed while it works instead of vanishing on arrival.
+
 ## Live Tracker Session Activity
 
 A session takes origin and project from its first record and keeps them, advances activity from later timestamped content, and ignores hook-result attachments so terminal bookkeeping cannot reopen it.

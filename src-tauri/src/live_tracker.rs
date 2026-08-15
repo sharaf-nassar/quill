@@ -414,6 +414,11 @@ impl TrackerState {
                 for tool_use_id in tool_result_ids(&record) {
                     changed |= session.resolved.insert(tool_use_id.to_owned());
                 }
+                // A backgrounded spawn's result says only that it started, so
+                // its completion notification is what closes it.
+                if let Some(tool_use_id) = task_notification_tool_use_id(&record) {
+                    changed |= session.resolved.insert(tool_use_id.to_owned());
+                }
             }),
         }
         self.files.insert(
@@ -1508,6 +1513,13 @@ fn journal_result_agent_id(line: &str) -> Option<String> {
     record.agent_id
 }
 
+/// The receipt a backgrounded `Agent` spawn returns. It lands within a second
+/// of the spawn and says only that the agent started, so it is the one
+/// `tool_result` that proves nothing about the agent finishing.
+const ASYNC_LAUNCH_RECEIPT: &str = "Async agent launched successfully";
+
+/// The spawns a record proves finished, skipping the immediate receipt an
+/// async spawn returns.
 fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
     record
         .message
@@ -1518,6 +1530,7 @@ fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
         .flatten()
         .filter(|block| {
             block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+                && !is_async_launch_receipt(block)
         })
         .filter_map(|block| {
             block
@@ -1525,6 +1538,40 @@ fn tool_result_ids(record: &ScanRecord) -> impl Iterator<Item = &str> {
                 .and_then(serde_json::Value::as_str)
                 .filter(|tool_use_id| !tool_use_id.is_empty())
         })
+}
+
+/// Whether a `tool_result` block is only an async spawn's launch receipt,
+/// whether the harness wrote its text bare or as the usual text blocks.
+fn is_async_launch_receipt(block: &serde_json::Value) -> bool {
+    let launched = |text: &str| text.starts_with(ASYNC_LAUNCH_RECEIPT);
+    let Some(content) = block.get("content") else {
+        return false;
+    };
+    content.as_str().is_some_and(launched)
+        || content.as_array().is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(launched)
+            })
+        })
+}
+
+/// The spawn a `<task-notification>` closes. An async agent's completion
+/// arrives as a user record naming the tool call that spawned it, which is the
+/// closure evidence its launch receipt is not.
+fn task_notification_tool_use_id(record: &ScanRecord) -> Option<&str> {
+    let content = record.message.as_ref()?.content.as_ref()?.as_str()?;
+    if !content.trim_start().starts_with("<task-notification>") {
+        return None;
+    }
+    let tool_use_id = content
+        .split_once("<tool-use-id>")?
+        .1
+        .split_once("</tool-use-id>")?
+        .0
+        .trim();
+    (!tool_use_id.is_empty()).then_some(tool_use_id)
 }
 
 #[cfg(test)]
@@ -1833,6 +1880,25 @@ mod tests {
         format!(
             "{{\"type\":\"user\",\"timestamp\":\"{timestamp}\",\"message\":{{\"role\":\"user\",\
              \"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{tool_use_id}\"}}]}}}}"
+        )
+    }
+
+    /// The receipt a backgrounded spawn returns within a second of starting.
+    fn async_launch_receipt(timestamp: &str, tool_use_id: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"timestamp\":\"{timestamp}\",\"message\":{{\"role\":\"user\",\
+             \"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"{tool_use_id}\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"Async agent launched successfully. \
+             (internal metadata)\"}}]}}]}}}}"
+        )
+    }
+
+    /// The completion the spawning session is handed once an async agent ends.
+    fn task_notification(timestamp: &str, agent_id: &str, tool_use_id: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"timestamp\":\"{timestamp}\",\"message\":{{\"role\":\"user\",\
+             \"content\":\"<task-notification>\\n<task-id>{agent_id}</task-id>\\n\
+             <tool-use-id>{tool_use_id}</tool-use-id>\\n</task-notification>\"}}}}"
         )
     }
 
@@ -2466,6 +2532,41 @@ mod tests {
         assert_eq!(
             fixture.last_activity(&tracker),
             Some(parse("2026-08-08T00:00:01Z"))
+        );
+    }
+
+    // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Async Spawn Closure]]
+    #[test]
+    fn an_async_spawn_stays_open_until_its_task_notification() {
+        let fixture = Fixture::new();
+        let subagents = fixture.subagents();
+        // Both spawns took their launch receipt a moment after starting, and
+        // only one has been notified as complete since.
+        fixture.write(&format!(
+            "{}\n{}\n{}\n{}\n",
+            record("2026-08-08T00:00:00Z"),
+            async_launch_receipt("2026-08-08T00:00:01Z", "toolu_done"),
+            async_launch_receipt("2026-08-08T00:00:02Z", "toolu_running"),
+            task_notification("2026-08-08T00:00:03Z", "hhh", "toolu_done"),
+        ));
+        fixture.spawn_agent(
+            &subagents,
+            "hhh",
+            "toolu_done",
+            &[record("2026-08-08T00:00:03Z")],
+        );
+        fixture.spawn_agent(
+            &subagents,
+            "iii",
+            "toolu_running",
+            &[record("2026-08-08T00:00:04Z")],
+        );
+
+        let tracker = LiveTracker::new(None);
+        fixture.sweep(&tracker, parse("2026-08-08T00:00:05Z"));
+        assert_eq!(
+            fixture.open_agents(&tracker, parse("2026-08-08T00:00:05Z")),
+            vec!["iii"]
         );
     }
 
