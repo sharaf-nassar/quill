@@ -1628,7 +1628,12 @@ fn ensure_startup_indexes(conn: &Connection) -> Result<(), String> {
                  ON session_events(
                      timestamp, provider, chain_id, is_sidechain,
                      kind, session_id
-                 );",
+                 );
+             CREATE INDEX IF NOT EXISTS idx_se_live_timestamp_chain
+                 ON session_events(
+                     timestamp, provider, chain_id, is_sidechain,
+                     kind, session_id
+                 ) WHERE source_key IS NULL;",
             "runtime window index",
         ),
         (
@@ -3432,7 +3437,7 @@ fn read_completed_runtime_rollup_rows(
             ""
         }
     );
-    let rollups = {
+    let mut rollups = {
         let mut statement = conn
             .prepare(&rollup_sql)
             .map_err(|error| format!("Prepare runtime rollup query: {error}"))?;
@@ -3477,7 +3482,7 @@ fn read_completed_runtime_rollup_rows(
             ""
         }
     );
-    let open_tails = {
+    let mut open_tails = {
         let mut statement = conn
             .prepare(&tail_sql)
             .map_err(|error| format!("Prepare runtime open-tail query: {error}"))?;
@@ -3494,6 +3499,81 @@ fn read_completed_runtime_rollup_rows(
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| format!("Read runtime open-tail row: {error}"))?
     };
+
+    let window_start = DateTime::<Utc>::from_timestamp_millis(window_start_ms)
+        .ok_or_else(|| "Runtime window start is outside the supported range".to_string())?
+        .to_rfc3339();
+    let live_sql = if parent_only {
+        "SELECT rowid, timestamp, kind, provider, session_id, chain_id
+         FROM session_events INDEXED BY idx_se_live_timestamp_chain
+         WHERE source_key IS NULL AND timestamp >= ?1 AND is_sidechain = 0
+         ORDER BY provider, chain_id, timestamp, rowid"
+    } else {
+        "SELECT rowid, timestamp, kind, provider, session_id, chain_id
+         FROM session_events INDEXED BY idx_se_live_timestamp_chain
+         WHERE source_key IS NULL AND timestamp >= ?1
+         ORDER BY provider, chain_id, timestamp, rowid"
+    };
+    let mut live_by_chain = BTreeMap::<(String, String, String), Vec<PersistedRuntimeEvent>>::new();
+    {
+        let mut statement = conn
+            .prepare(live_sql)
+            .map_err(|error| format!("Prepare live runtime query: {error}"))?;
+        let rows = statement
+            .query_map(params![window_start], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|error| format!("Query live runtime rows: {error}"))?;
+        for row in rows.flatten() {
+            let (rowid, timestamp, kind, provider, session_id, chain_id) = row;
+            let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
+                continue;
+            };
+            live_by_chain
+                .entry((provider, session_id, chain_id))
+                .or_default()
+                .push(PersistedRuntimeEvent {
+                    rowid,
+                    timestamp_ms: timestamp.timestamp_millis(),
+                    kind,
+                });
+        }
+    }
+    for ((provider, session_id, _), events) in live_by_chain {
+        let Some(last) = events.last() else {
+            continue;
+        };
+        let packed_last_event = format!(
+            "{}\u{1f}{}",
+            DateTime::<Utc>::from_timestamp_millis(last.timestamp_ms)
+                .expect("parsed live runtime timestamp remains representable")
+                .to_rfc3339(),
+            last.kind
+        );
+        let fold = fold_persisted_runtime_events(&events, "Live runtime read")?;
+        rollups.extend(fold.rollups.into_iter().map(|row| RuntimeRollupStatsRow {
+            hour_utc: row.hour_utc,
+            provider: provider.clone(),
+            session_id: session_id.clone(),
+            turn_count: row.turn_count,
+            runtime_secs: row.runtime_millis as f64 / 1_000.0,
+        }));
+        if let Some(turn_start_ms) = fold.open_turn_started_ms {
+            open_tails.push(RuntimeOpenTailStatsRow {
+                turn_start_ms,
+                provider,
+                session_id,
+                packed_last_event: Some(packed_last_event),
+            });
+        }
+    }
 
     Ok(Some(CompletedRuntimeRollupRows {
         rollups,
@@ -17401,10 +17481,11 @@ impl Storage {
         .map_err(|e| format!("Upsert live analytics origin: {e}"))?;
 
         if !rows.messages.is_empty() {
-            let response_max_secs = if provider == IntegrationProvider::Codex {
-                6.0 * 60.0 * 60.0
-            } else {
-                600.0
+            let response_max_secs = match provider {
+                IntegrationProvider::Codex => 6.0 * 60.0 * 60.0,
+                IntegrationProvider::Claude
+                | IntegrationProvider::Pi
+                | IntegrationProvider::MiniMax => 600.0,
             };
             let mut statement = tx
                 .prepare_cached(
@@ -17417,7 +17498,24 @@ impl Storage {
                 .map_err(|e| format!("Prepare live response times: {e}"))?;
             let mut messages_by_chain: HashMap<&str, Vec<LiveSessionMessageInput<'_>>> =
                 HashMap::new();
+            let pi_response_messages = rows
+                .session_events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        crate::sessions::SessionEventKind::UserText
+                            | crate::sessions::SessionEventKind::AsstText
+                    )
+                })
+                .map(|event| event.message_id)
+                .collect::<HashSet<_>>();
             for message in rows.messages {
+                if provider == IntegrationProvider::Pi
+                    && !pi_response_messages.contains(message.message_id)
+                {
+                    continue;
+                }
                 messages_by_chain
                     .entry(message.chain_id)
                     .or_default()
@@ -24739,6 +24837,114 @@ mod tests {
         clear_env();
     }
 
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Source-less Runtime Union Burst Budget]]
+    #[test]
+    #[ignore = "source-less runtime union timing acceptance"]
+    #[serial]
+    fn source_less_runtime_union_p95_stays_within_budget() {
+        clear_env();
+        const BURST_ROWS: usize = 6_000;
+        const SAMPLES: usize = 25;
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z").expect("base time");
+        let mut elapsed_ms = 0_i64;
+        {
+            let mut conn = storage.conn.lock().unwrap();
+            let tx = conn.transaction().expect("begin live runtime fixture");
+            {
+                let mut insert = tx
+                    .prepare(
+                        "INSERT INTO session_events (
+                             provider, source_key, event_key, session_id, chain_id,
+                             parent_chain_id, agent_id, is_sidechain, timestamp,
+                             kind, uuid, parent_uuid
+                         ) VALUES ('pi', NULL, ?1, 'pi-burst', 'pi-burst',
+                                   NULL, NULL, 0, ?2, ?3, ?1, NULL)",
+                    )
+                    .expect("prepare live runtime fixture");
+                for ordinal in 0..BURST_ROWS {
+                    if ordinal > 0 {
+                        elapsed_ms += if ordinal % 250 == 0 { 360_000 } else { 1_000 };
+                    }
+                    let kind = match ordinal % 4 {
+                        0 => "user_text",
+                        1 => "asst_text",
+                        2 => "asst_tool_use",
+                        _ => "user_tool_result",
+                    };
+                    insert
+                        .execute(params![
+                            format!("event-{ordinal}"),
+                            (base + chrono::Duration::milliseconds(elapsed_ms)).to_rfc3339(),
+                            kind,
+                        ])
+                        .expect("insert live runtime fixture");
+                }
+            }
+            tx.commit().expect("commit live runtime fixture");
+        }
+        let pinned_now =
+            (base + chrono::Duration::milliseconds(elapsed_ms + 1_000)).with_timezone(&Utc);
+        let set_status = |status: &str| {
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE rollup_meta SET runtime_backfill_status = ?1 WHERE id = 1",
+                    params![status],
+                )
+                .expect("set runtime read mode");
+        };
+        set_status("running");
+        with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("warm raw runtime read")
+        });
+        set_status("complete");
+        with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("warm union runtime read")
+        });
+
+        let mut baseline = Vec::with_capacity(SAMPLES);
+        let mut candidate = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let modes = if sample.is_multiple_of(2) {
+                [("running", &mut baseline), ("complete", &mut candidate)]
+            } else {
+                [("complete", &mut candidate), ("running", &mut baseline)]
+            };
+            for (status, samples) in modes {
+                set_status(status);
+                let started = Instant::now();
+                with_pinned_query_now(pinned_now, || {
+                    storage
+                        .get_llm_runtime_stats("30d", None)
+                        .expect("measure runtime read")
+                });
+                samples.push(started.elapsed());
+            }
+        }
+
+        let baseline_p95_ms = percentile_95_ms(&mut baseline);
+        let candidate_p95_ms = percentile_95_ms(&mut candidate);
+        let delta_percent = ((candidate_p95_ms - baseline_p95_ms) / baseline_p95_ms) * 100.0;
+        eprintln!("runtime_live_union.burst_rows={BURST_ROWS}");
+        eprintln!("runtime_live_union.samples={SAMPLES}");
+        eprintln!("runtime_live_union.baseline_p95_ms={baseline_p95_ms:.3}");
+        eprintln!("runtime_live_union.candidate_p95_ms={candidate_p95_ms:.3}");
+        eprintln!("runtime_live_union.delta_percent={delta_percent:.3}");
+        assert!(
+            delta_percent <= 10.0,
+            "source-less union p95 overhead {delta_percent:.3}% exceeds 10% budget"
+        );
+        clear_env();
+    }
+
     // @lat: [[backend#Backend#Database#Schema#Model Analytics Test Specs#Model Sessions Cursor Codec]]
     #[test]
     fn model_sessions_cursor_round_trips_and_rejects_tampering() {
@@ -30877,6 +31083,381 @@ mod tests {
         );
         eprintln!("runtime_tail.rows={tail_rows}");
         eprintln!("runtime_tail.plan={details:?}");
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Source-less Runtime Union]]
+    #[test]
+    #[serial]
+    fn completed_runtime_read_unions_provider_agnostic_live_rows() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+
+        for (provider, session_id, offset, duration) in [
+            (IntegrationProvider::Pi, "pi-live", 0, 60),
+            (IntegrationProvider::Claude, "remote-live", 120, 90),
+        ] {
+            let stamps = [at(offset), at(offset + duration)];
+            let messages = [
+                LiveSessionMessageInput {
+                    message_id: "user",
+                    role: "user",
+                    timestamp: &stamps[0],
+                    chain_id: session_id,
+                    parent_chain_id: None,
+                    is_sidechain: false,
+                    agent_id: None,
+                    parent_uuid: None,
+                },
+                LiveSessionMessageInput {
+                    message_id: "assistant",
+                    role: "assistant",
+                    timestamp: &stamps[1],
+                    chain_id: session_id,
+                    parent_chain_id: None,
+                    is_sidechain: false,
+                    agent_id: None,
+                    parent_uuid: None,
+                },
+            ];
+            let events = [
+                LiveSessionEventInput {
+                    message_id: "user",
+                    event_ordinal: 0,
+                    timestamp: &stamps[0],
+                    kind: crate::sessions::SessionEventKind::UserText,
+                },
+                LiveSessionEventInput {
+                    message_id: "assistant",
+                    event_ordinal: 0,
+                    timestamp: &stamps[1],
+                    kind: crate::sessions::SessionEventKind::AsstText,
+                },
+            ];
+            storage
+                .store_live_session_analytics(
+                    provider,
+                    session_id,
+                    LiveAnalyticsOrigin {
+                        project: None,
+                        cwd: None,
+                        hostname: Some("remote-host"),
+                    },
+                    LiveSessionAnalyticsRows {
+                        messages: &messages,
+                        session_events: &events,
+                        hook_invocations: &[],
+                    },
+                )
+                .expect("store live runtime");
+        }
+
+        let pinned_now = (base + chrono::Duration::minutes(5)).with_timezone(&Utc);
+        let before = with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("raw stats")
+        });
+        assert_eq!(before.turn_count, 2);
+        assert_eq!(before.session_count, 2);
+        assert_eq!(before.total_runtime_secs, 150.0);
+
+        storage
+            .run_runtime_rollup_backfill()
+            .expect("complete runtime backfill");
+        let after = with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("completed stats")
+        });
+        assert_eq!(after.turn_count, before.turn_count);
+        assert_eq!(after.session_count, before.session_count);
+        assert_eq!(after.total_runtime_secs, before.total_runtime_secs);
+        assert_eq!(after.sparkline, before.sparkline);
+
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Source-less Pi Session Evidence]]
+    #[test]
+    #[serial]
+    fn source_less_pi_session_runtime_evidence_is_unknown() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let timestamp = "2026-07-30T10:00:00Z";
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO session_events (
+                     provider, source_key, event_key, session_id, chain_id,
+                     parent_chain_id, agent_id, is_sidechain, timestamp,
+                     kind, uuid, parent_uuid
+                 ) VALUES ('pi', NULL, 'pi-live:0', 'pi-live', 'pi-live',
+                           NULL, NULL, 0, ?1, 'user_text', 'pi-live', NULL)",
+                params![timestamp],
+            )
+            .expect("insert source-less Pi event");
+            conn.execute(
+                "UPDATE rollup_meta SET runtime_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete runtime backfill");
+        }
+        let mut rows = vec![SessionBreakdown {
+            provider: "pi".to_string(),
+            session_id: "pi-live".to_string(),
+            parent_session_id: None,
+            hostname: "pi-host".to_string(),
+            total_tokens: 1,
+            turn_count: 0,
+            first_seen: timestamp.to_string(),
+            last_active: timestamp.to_string(),
+            ended_at: None,
+            project: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
+            live_linked_sessions: None,
+            observed_only: false,
+        }];
+        storage
+            .populate_session_runtime_evidence(&mut rows)
+            .expect("project source-less Pi evidence");
+        assert_eq!(rows[0].active_runtime_secs, None);
+        assert_eq!(rows[0].agent_runtime_secs, None);
+        assert_eq!(rows[0].agent_count, None);
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Pi Runtime Turn Boundaries]]
+    #[test]
+    #[serial]
+    fn pi_tool_events_preserve_long_turn_and_crash_response_boundaries() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+        let stamps = [at(0), at(60), at(500), at(540)];
+        let messages = [
+            LiveSessionMessageInput {
+                message_id: "turn-start",
+                role: "user",
+                timestamp: &stamps[0],
+                chain_id: "pi-long",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+            LiveSessionMessageInput {
+                message_id: "tool-start",
+                role: "assistant",
+                timestamp: &stamps[1],
+                chain_id: "pi-long",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+            LiveSessionMessageInput {
+                message_id: "tool-end",
+                role: "user",
+                timestamp: &stamps[2],
+                chain_id: "pi-long",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+            LiveSessionMessageInput {
+                message_id: "turn-end",
+                role: "assistant",
+                timestamp: &stamps[3],
+                chain_id: "pi-long",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+        ];
+        let events = [
+            LiveSessionEventInput {
+                message_id: "turn-start",
+                event_ordinal: 0,
+                timestamp: &stamps[0],
+                kind: crate::sessions::SessionEventKind::UserText,
+            },
+            LiveSessionEventInput {
+                message_id: "tool-start",
+                event_ordinal: 0,
+                timestamp: &stamps[1],
+                kind: crate::sessions::SessionEventKind::AsstToolUse,
+            },
+            LiveSessionEventInput {
+                message_id: "tool-end",
+                event_ordinal: 0,
+                timestamp: &stamps[2],
+                kind: crate::sessions::SessionEventKind::UserToolResult,
+            },
+            LiveSessionEventInput {
+                message_id: "turn-end",
+                event_ordinal: 0,
+                timestamp: &stamps[3],
+                kind: crate::sessions::SessionEventKind::AsstText,
+            },
+        ];
+        storage
+            .store_live_session_analytics(
+                IntegrationProvider::Pi,
+                "pi-long",
+                LiveAnalyticsOrigin {
+                    project: None,
+                    cwd: None,
+                    hostname: Some("pi-host"),
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &messages,
+                    session_events: &events,
+                    hook_invocations: &[],
+                },
+            )
+            .expect("store completed Pi turn");
+        storage
+            .store_live_session_analytics(
+                IntegrationProvider::Pi,
+                "pi-long",
+                LiveAnalyticsOrigin {
+                    project: None,
+                    cwd: None,
+                    hostname: Some("pi-host"),
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &messages,
+                    session_events: &events,
+                    hook_invocations: &[],
+                },
+            )
+            .expect("replay completed Pi turn");
+
+        let crash_stamps = [at(600), at(660)];
+        let crash_messages = [
+            LiveSessionMessageInput {
+                message_id: "crash-turn-start",
+                role: "user",
+                timestamp: &crash_stamps[0],
+                chain_id: "pi-crash",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+            LiveSessionMessageInput {
+                message_id: "crash-tool-start",
+                role: "assistant",
+                timestamp: &crash_stamps[1],
+                chain_id: "pi-crash",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+        ];
+        let crash_events = [
+            LiveSessionEventInput {
+                message_id: "crash-turn-start",
+                event_ordinal: 0,
+                timestamp: &crash_stamps[0],
+                kind: crate::sessions::SessionEventKind::UserText,
+            },
+            LiveSessionEventInput {
+                message_id: "crash-tool-start",
+                event_ordinal: 0,
+                timestamp: &crash_stamps[1],
+                kind: crate::sessions::SessionEventKind::AsstToolUse,
+            },
+        ];
+        storage
+            .store_live_session_analytics(
+                IntegrationProvider::Pi,
+                "pi-crash",
+                LiveAnalyticsOrigin {
+                    project: None,
+                    cwd: None,
+                    hostname: Some("pi-host"),
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &crash_messages,
+                    session_events: &crash_events,
+                    hook_invocations: &[],
+                },
+            )
+            .expect("store interrupted Pi turn");
+
+        let conn = storage.conn.lock().unwrap();
+        let completed: Vec<f64> = conn
+            .prepare(
+                "SELECT response_secs FROM response_times
+                 WHERE provider = 'pi' AND session_id = 'pi-long'
+                 ORDER BY timestamp",
+            )
+            .expect("prepare response read")
+            .query_map([], |row| row.get(0))
+            .expect("query response rows")
+            .collect::<Result<_, _>>()
+            .expect("collect response rows");
+        assert_eq!(completed, vec![540.0]);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM response_times
+                 WHERE provider = 'pi' AND session_id = 'pi-crash'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count crash responses"),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE provider = 'pi' AND session_id = 'pi-long'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count replayed Pi events"),
+            4
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events
+                 WHERE provider = 'pi' AND kind = 'asst_thinking'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count Pi thinking events"),
+            0
+        );
+        drop(conn);
+
+        let stats = with_pinned_query_now(
+            (base + chrono::Duration::seconds(700)).with_timezone(&Utc),
+            || {
+                storage
+                    .get_llm_runtime_stats("30d", None)
+                    .expect("Pi runtime")
+            },
+        );
+        assert!(stats.total_runtime_secs >= 540.0);
+        assert!(stats.turn_count >= 1);
         clear_env();
     }
 

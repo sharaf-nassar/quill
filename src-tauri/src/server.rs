@@ -52,6 +52,7 @@ const MAX_CONTEXT_REF_LEN: usize = 1024;
 const MAX_CONTEXT_METADATA_LEN: usize = 16 * 1024;
 const MAX_SESSION_NOTIFY_REQUESTS: usize = 500;
 const MAX_SESSION_MSG_REQUESTS: usize = 100;
+const MAX_PI_SESSION_MSG_REQUESTS: usize = 4_000;
 const MAX_PI_TRACK_REQUESTS: usize = 4_000;
 const MAX_PI_TRACK_EVENTS_PER_REQUEST: usize = 200;
 const MAX_PI_LAST_ERROR_LEN: usize = 2_048;
@@ -106,6 +107,7 @@ struct ServerState {
     obs_rate_limiter: Mutex<VecDeque<Instant>>,
     context_savings_rate_limiter: Mutex<VecDeque<Instant>>,
     session_rate_limiter: Mutex<VecDeque<Instant>>,
+    pi_session_rate_limiter: Mutex<VecDeque<Instant>>,
     pi_track_rate_limiter: Mutex<VecDeque<Instant>>,
     pending_session_notifies: Mutex<HashMap<String, PendingSessionNotify>>,
     pending_validation_retries: Mutex<HashMap<String, PendingValidationRetry>>,
@@ -144,6 +146,7 @@ pub async fn start_server(
         obs_rate_limiter: Mutex::new(VecDeque::new()),
         context_savings_rate_limiter: Mutex::new(VecDeque::new()),
         session_rate_limiter: Mutex::new(VecDeque::new()),
+        pi_session_rate_limiter: Mutex::new(VecDeque::new()),
         pi_track_rate_limiter: Mutex::new(VecDeque::new()),
         pending_session_notifies: Mutex::new(HashMap::new()),
         pending_validation_retries: Mutex::new(HashMap::new()),
@@ -331,6 +334,18 @@ fn check_rate_limit_with_max(rate_limiter: &Mutex<VecDeque<Instant>>, max: usize
     }
     window.push_back(now);
     true
+}
+
+fn session_messages_rate_limit<'a>(
+    provider: IntegrationProvider,
+    shared: &'a Mutex<VecDeque<Instant>>,
+    pi: &'a Mutex<VecDeque<Instant>>,
+) -> (&'a Mutex<VecDeque<Instant>>, usize) {
+    if provider == IntegrationProvider::Pi {
+        (pi, MAX_PI_SESSION_MSG_REQUESTS)
+    } else {
+        (shared, MAX_SESSION_MSG_REQUESTS)
+    }
 }
 
 #[derive(Debug)]
@@ -1217,7 +1232,10 @@ fn persist_remote_session_analytics(
         .collect::<Result<Vec<_>, String>>()?;
     let mut rt_events = Vec::new();
     for message in &payload.messages {
-        for (event_ordinal, kind) in remote_session_event_kinds(message)?.into_iter().enumerate() {
+        for (event_ordinal, kind) in remote_session_event_kinds(payload.provider, message)?
+            .into_iter()
+            .enumerate()
+        {
             rt_events.push(crate::storage::LiveSessionEventInput {
                 message_id: message.uuid.as_str(),
                 event_ordinal,
@@ -1276,8 +1294,27 @@ fn parse_remote_session_event_kind(value: &str) -> Option<sessions::SessionEvent
 }
 
 fn remote_session_event_kinds(
+    provider: IntegrationProvider,
     message: &SessionMessagePayload,
 ) -> Result<Vec<sessions::SessionEventKind>, String> {
+    let pi_kind = if provider == IntegrationProvider::Pi {
+        match message.msg_type.as_str() {
+            "input" | "turn_start" => Some(("user", sessions::SessionEventKind::UserText)),
+            "turn_end" => Some(("assistant", sessions::SessionEventKind::AsstText)),
+            "tool_execution_start" => Some(("assistant", sessions::SessionEventKind::AsstToolUse)),
+            "tool_execution_end" => Some(("user", sessions::SessionEventKind::UserToolResult)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some((role, kind)) = pi_kind
+        && message.event_kinds.is_empty()
+    {
+        return (message.role == role)
+            .then_some(vec![kind])
+            .ok_or_else(|| "Pi runtime event role does not match type".to_string());
+    }
     if message.event_kinds.is_empty() {
         return legacy_remote_session_event_kind(message)
             .map(|kind| vec![kind])
@@ -1310,6 +1347,16 @@ fn remote_session_event_kinds(
         }
         prior_position = Some(position);
         kinds.push(kind);
+    }
+    if provider == IntegrationProvider::Pi {
+        if kinds.contains(&sessions::SessionEventKind::AsstThinking) {
+            return Err("Pi does not expose thinking runtime events".to_string());
+        }
+        if let Some((role, kind)) = pi_kind
+            && (message.role != role || kinds.as_slice() != [kind])
+        {
+            return Err("Pi runtime event mapping does not match type".to_string());
+        }
     }
     Ok(kinds)
 }
@@ -1958,7 +2005,7 @@ fn validate_session_messages_payload(payload: &SessionMessagesPayload) -> Result
             return Err("Message content too long".to_string());
         }
         resolve_remote_message_identity(&payload.session_id, message).map_err(str::to_string)?;
-        remote_session_event_kinds(message)?;
+        remote_session_event_kinds(payload.provider, message)?;
         for (value, label) in [
             (message.chain_id.as_deref(), "chain_id"),
             (message.parent_chain_id.as_deref(), "parent_chain_id"),
@@ -1983,7 +2030,12 @@ async fn post_session_messages(
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
-    if !check_rate_limit_with_max(&state.session_rate_limiter, MAX_SESSION_MSG_REQUESTS) {
+    let (rate_limiter, max_requests) = session_messages_rate_limit(
+        payload.provider,
+        &state.session_rate_limiter,
+        &state.pi_session_rate_limiter,
+    );
+    if !check_rate_limit_with_max(rate_limiter, max_requests) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
@@ -1998,7 +2050,9 @@ async fn post_session_messages(
     let analytics_payload = payload.clone();
     let storage = state.storage;
     let analytics_result = tokio::task::spawn_blocking(move || {
-        persist_remote_session_analytics(storage, &analytics_payload)
+        crate::with_rollup_backfill_write_permit(|| {
+            persist_remote_session_analytics(storage, &analytics_payload)
+        })
     })
     .await;
     match analytics_result {
@@ -2366,6 +2420,67 @@ mod observed_subagent_tests {
             assert!(check_rate_limit_with_max(&limiter, MAX_PI_TRACK_REQUESTS,));
         }
         assert!(!check_rate_limit_with_max(&limiter, MAX_PI_TRACK_REQUESTS,));
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Session Message Rate Isolation]]
+    #[test]
+    fn pi_session_messages_have_independent_rate_headroom() {
+        let shared = Mutex::new(VecDeque::new());
+        let pi = Mutex::new(VecDeque::new());
+        for _ in 0..1_000 {
+            let (limiter, max) = session_messages_rate_limit(IntegrationProvider::Pi, &shared, &pi);
+            assert!(check_rate_limit_with_max(limiter, max));
+        }
+        assert!(check_rate_limit_with_max(&shared, MAX_SESSION_MSG_REQUESTS));
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Runtime Message Mapping]]
+    #[test]
+    fn pi_session_message_types_map_without_thinking_events() {
+        for (msg_type, role, expected) in [
+            ("input", "user", sessions::SessionEventKind::UserText),
+            ("turn_start", "user", sessions::SessionEventKind::UserText),
+            (
+                "turn_end",
+                "assistant",
+                sessions::SessionEventKind::AsstText,
+            ),
+            (
+                "tool_execution_start",
+                "assistant",
+                sessions::SessionEventKind::AsstToolUse,
+            ),
+            (
+                "tool_execution_end",
+                "user",
+                sessions::SessionEventKind::UserToolResult,
+            ),
+        ] {
+            let message: SessionMessagePayload = serde_json::from_value(serde_json::json!({
+                "uuid": format!("{msg_type}-1"),
+                "type": msg_type,
+                "timestamp": "2026-08-14T08:00:00Z",
+                "content": "",
+                "role": role
+            }))
+            .expect("deserialize Pi runtime message");
+            assert_eq!(
+                remote_session_event_kinds(IntegrationProvider::Pi, &message)
+                    .expect("map Pi runtime message"),
+                vec![expected]
+            );
+        }
+
+        let thinking: SessionMessagePayload = serde_json::from_value(serde_json::json!({
+            "uuid": "thinking-1",
+            "type": "assistant",
+            "timestamp": "2026-08-14T08:00:00Z",
+            "content": "",
+            "role": "assistant",
+            "event_kinds": ["asst_thinking"]
+        }))
+        .expect("deserialize unsupported Pi thinking message");
+        assert!(remote_session_event_kinds(IntegrationProvider::Pi, &thinking).is_err());
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Demo Gate]]

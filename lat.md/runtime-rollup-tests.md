@@ -18,6 +18,22 @@ Runtime finalization and folding must add no more than 10% p95 latency to repres
 
 The ignored release benchmark times 25 replacements of one 6,000-event batch against the identical production transaction with only runtime folding disabled; parsing, setup, and warm-up remain outside timing.
 
+## Source-less Runtime Union Burst Budget
+
+The completed-rollup read with a source-less live branch must stay within 10% p95 of the raw runtime read for the same 6,000-event burst.
+
+## Source-less Runtime Union
+
+Completed runtime reads union every provider's source-less live events so Pi and remote-session totals match the pre-backfill raw result.
+
+## Source-less Pi Session Evidence
+
+Source-less Pi rows do not claim per-session or agent runtime coverage; absent retained evidence remains unknown rather than a measured zero.
+
+## Pi Runtime Turn Boundaries
+
+Pi tool execution pairs preserve the six-hour tool-wait window without becoming response boundaries; completed long turns yield one response and interrupted turns yield none.
+
 ## Runtime Backfill Empty Completion
 
 An empty runtime source set must complete in one terminal shared-runner chunk and leave no misleading bookmark.

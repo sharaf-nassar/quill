@@ -38,6 +38,14 @@ The Pi tracking boundary rejects bad bearer authentication with `401` and protoc
 
 The independent Pi tracking limiter accepts 4,000 single-event envelopes in one 60-second window, four times the specified 1,000-event stream.
 
+## Pi Session Message Rate Isolation
+
+Pi runtime message traffic accepts the 1,000-event/minute load without consuming capacity from session notify or other providers' message traffic.
+
+## Pi Runtime Message Mapping
+
+Pi turn, input, and tool execution types map to canonical runtime events while the unavailable thinking event remains an explicit rejected gap.
+
 ## Demo Gate
 
 Demo mode returns a typed unavailable result without changing extension health, durable lifecycle origin, or LiveTracker state.
