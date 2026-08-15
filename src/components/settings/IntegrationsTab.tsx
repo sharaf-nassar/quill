@@ -424,6 +424,7 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
     statuses,
     loading,
     error,
+    providerActionErrors,
     inFlightProviders,
     indicatorPrimaryProvider,
     rescanInFlight,
@@ -567,10 +568,18 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
       ) : (
         statuses.map((status) => {
           const busy = inFlightProviders.has(status.provider);
-          const state = integrationToggleState(status, busy);
+          const actionError = providerActionErrors[status.provider];
+          const state =
+            actionError && !busy
+              ? { tone: "error" as const, label: "RETRY", disabled: false }
+              : integrationToggleState(status, busy);
           const attempts = status.lastDetectionAttempts ?? [];
           const description =
-            state.tone === "error"
+            actionError ? (
+              <span className="settings-empty--error" role="alert">
+                {actionError}
+              </span>
+            ) : state.tone === "error"
               ? status.lastError ?? "Integration setup failed; click to retry."
               : state.tone === "na" && attempts.length > 0
               ? `CLI not found. Checked: ${attempts.slice(0, 3).join(", ")}${attempts.length > 3 ? " …" : ""}`
@@ -601,6 +610,11 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
                   label={state.label}
                   pressed={status.enabled}
                   disabled={state.disabled}
+                  ariaLabel={
+                    actionError
+                      ? `Retry ${status.enabled ? "disabling" : "enabling"} ${providerLabel(status.provider)}`
+                      : undefined
+                  }
                   onClick={() =>
                     setPending({
                       provider: status.provider,

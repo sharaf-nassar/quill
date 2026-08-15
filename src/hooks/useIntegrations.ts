@@ -11,6 +11,19 @@ import type {
 
 const PROVIDER_ORDER: IntegrationProvider[] = ["claude", "codex", "pi", "mini_max"];
 
+export type ProviderActionErrors = Partial<Record<IntegrationProvider, string>>;
+
+export function updateProviderActionError(
+  current: ProviderActionErrors,
+  provider: IntegrationProvider,
+  message: string | null,
+): ProviderActionErrors {
+  const next = { ...current };
+  if (message === null) delete next[provider];
+  else next[provider] = message;
+  return next;
+}
+
 function sortStatuses(statuses: ProviderStatus[]): ProviderStatus[] {
   return [...statuses].sort(
     (a, b) => PROVIDER_ORDER.indexOf(a.provider) - PROVIDER_ORDER.indexOf(b.provider),
@@ -36,6 +49,7 @@ export interface UseIntegrationsResult {
   contextPreservation: ContextPreservationStatus;
   loading: boolean;
   error: string | null;
+  providerActionErrors: Readonly<ProviderActionErrors>;
   inFlightProviders: ReadonlySet<IntegrationProvider>;
   contextPreservationInFlight: boolean;
   rescanInFlight: boolean;
@@ -59,6 +73,8 @@ export function useIntegrations(): UseIntegrationsResult {
     });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [providerActionErrors, setProviderActionErrors] =
+    useState<ProviderActionErrors>({});
   const [inFlightProviders, setInFlightProviders] = useState<Set<IntegrationProvider>>(
     new Set(),
   );
@@ -153,11 +169,15 @@ export function useIntegrations(): UseIntegrationsResult {
       try {
         const updated = await invoke<ProviderStatus>(command, { provider, ...extraArgs });
         setStatuses((prev) => upsertStatus(prev, updated));
-        setError(null);
+        setProviderActionErrors((prev) =>
+          updateProviderActionError(prev, provider, null),
+        );
         return updated;
       } catch (e) {
         const message = String(e);
-        setError(message);
+        setProviderActionErrors((prev) =>
+          updateProviderActionError(prev, provider, message),
+        );
         throw new Error(message);
       } finally {
         setInFlightProviders((prev) => {
@@ -247,6 +267,7 @@ export function useIntegrations(): UseIntegrationsResult {
     contextPreservation,
     loading,
     error,
+    providerActionErrors,
     inFlightProviders,
     contextPreservationInFlight,
     rescanInFlight,

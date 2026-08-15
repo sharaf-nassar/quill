@@ -23,6 +23,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[window-chrome-tests]] — Cross-platform resize policy and macOS configuration test specs
 - [[pi-provider-plumbing-tests]] — Pi provider persistence, breakdown, hook, and root test specs
 - [[pi-integrations-ui-tests]] — Pi setup, consent, provider-count, and Limits omission test specs
+- [[integration-action-error-tests]] — Provider-local mutation error and retry test specs
 - [[pi-session-parser-tests]] — narrow Pi message and header parser test specs
 - [[pi-notify-index-tests]] — Pi notify and Session Search indexing test specs
 - [[pi-live-session-tests]] — Pi bounded live-fold and token-gap test specs
