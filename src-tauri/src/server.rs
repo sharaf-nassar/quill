@@ -583,13 +583,6 @@ fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackEr
     Ok(())
 }
 
-fn pi_lineage_parent(lineage: &PiLineage) -> Option<&str> {
-    match lineage {
-        PiLineage::Linked { parent_session_id } => Some(parent_session_id),
-        PiLineage::Root | PiLineage::Unresolved { .. } => None,
-    }
-}
-
 fn ingest_pi_track(
     storage: &Storage,
     live_tracker: &crate::live_tracker::LiveTracker,
@@ -649,7 +642,7 @@ fn ingest_pi_track(
                     at,
                     previous_session_id.as_deref(),
                 );
-                live_tracker.set_pi_lineage(&event.session_id, &host, pi_lineage_parent(lineage));
+                live_tracker.set_pi_lineage(&event.session_id, &host, lineage.clone());
             }
             PiTrackEventKind::SessionEnd { reason } => {
                 log::trace!("Closing Pi session after {reason:?}");
@@ -667,7 +660,7 @@ fn ingest_pi_track(
             }
             PiTrackEventKind::Lineage { lineage } => {
                 live_tracker.record_pi_activity(&event.session_id, &host, at);
-                live_tracker.set_pi_lineage(&event.session_id, &host, pi_lineage_parent(lineage));
+                live_tracker.set_pi_lineage(&event.session_id, &host, lineage.clone());
             }
             PiTrackEventKind::LiveTokens {
                 input_tokens,
@@ -1081,6 +1074,18 @@ fn process_session_notify_payload(
     let path = PathBuf::from(&payload.jsonl_path);
 
     let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
+    if payload.provider == IntegrationProvider::Pi {
+        let parent_session_id = pushed_pi_parent(
+            payload.lineage.as_ref(),
+            extracted
+                .messages
+                .first()
+                .and_then(|message| message.parent_session_id.clone()),
+        );
+        for message in &mut extracted.messages {
+            message.parent_session_id.clone_from(&parent_session_id);
+        }
+    }
     if let Some(git_branch) = payload
         .git_branch
         .as_deref()
@@ -1137,6 +1142,17 @@ fn process_session_notify_payload(
     let _ = app_handle.emit("sessions-index-updated", count);
 
     Ok(count)
+}
+
+fn pushed_pi_parent(
+    lineage: Option<&PiLineage>,
+    transcript_parent: Option<String>,
+) -> Option<String> {
+    match lineage {
+        Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
+        Some(PiLineage::Root | PiLineage::Unresolved { .. }) => None,
+        None => transcript_parent,
+    }
 }
 
 fn index_session_messages_in_background(
@@ -2410,6 +2426,35 @@ mod observed_subagent_tests {
             .expect_err("reject protocol mismatch");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.code, "protocol_mismatch");
+    }
+
+    // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Pushed Search Parent]]
+    #[test]
+    fn pi_notify_parent_uses_pushed_proof_instead_of_transcript_parent() {
+        let transcript_parent = || Some("transcript-parent".to_string());
+        assert_eq!(
+            pushed_pi_parent(
+                Some(&PiLineage::Linked {
+                    parent_session_id: "pushed-parent".into(),
+                }),
+                transcript_parent(),
+            )
+            .as_deref(),
+            Some("pushed-parent")
+        );
+        assert_eq!(
+            pushed_pi_parent(Some(&PiLineage::Root), transcript_parent()),
+            None
+        );
+        assert_eq!(
+            pushed_pi_parent(
+                Some(&PiLineage::Unresolved {
+                    reason: "parent_header_unavailable".into(),
+                }),
+                transcript_parent(),
+            ),
+            None
+        );
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Rate Headroom]]

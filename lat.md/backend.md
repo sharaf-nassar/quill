@@ -1927,7 +1927,7 @@ CPA adds a masked read command plus guarded connect/disconnect commands. The key
 
 `get_provider_statuses`, `confirm_enable_provider`, `confirm_disable_provider`, and `get_context_preservation_status` expose provider state and the context-preservation setting. `set_context_preservation_enabled` installs or removes local context-preservation assets for currently enabled Claude and Codex providers without deleting historical context data.
 
-`get_provider_statuses` returns the last saved provider statuses from storage rather than re-running detection. Fresh detection happens once at startup via the background `startup_refresh` task, which saves results and emits `integrations-updated`. This avoids redundant subprocess calls and eliminates the visible "Checking integrations..." loading state on the main window.
+`get_provider_statuses` returns the last saved provider statuses from storage rather than re-running detection. Pi's additive status detail derives extension health from `pi_extension.*`: never connected, alive through two minutes, idle through fifteen minutes, then stale, plus typed last error and handshake versions. Fresh detection happens once at startup via the background `startup_refresh` task, which saves results and emits `integrations-updated`. This avoids redundant subprocess calls and eliminates the visible "Checking integrations..." loading state on the main window.
 
 In `QUILL_DEMO_MODE=1`, startup refresh and manual rescan still detect providers
 and persist status in the isolated database, but skip interrupted-deployment

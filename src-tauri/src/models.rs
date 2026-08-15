@@ -127,7 +127,7 @@ pub enum PiSessionEndReason {
     Fork,
 }
 
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PiLineage {
     Root,
@@ -386,9 +386,11 @@ pub struct SessionStats {
 pub struct SessionBreakdown {
     pub provider: String,
     pub session_id: String,
-    /// Transcript-proven Pi parent header id. Null for other providers and
-    /// unlinked Pi sessions.
+    /// Extension-proven Pi parent header id. Null for other providers and
+    /// root or unresolved Pi sessions.
     pub parent_session_id: Option<String>,
+    /// Pushed Pi lineage proof. `None` means no extension proof exists.
+    pub pi_lineage: Option<PiLineage>,
     pub hostname: String,
     pub total_tokens: i64,
     pub turn_count: i64,
@@ -1005,6 +1007,9 @@ pub struct SessionNotifyPayload {
     pub cwd: Option<String>,
     pub project: Option<String>,
     pub git_branch: Option<String>,
+    /// Pi's in-process parent proof, resolved once by the extension.
+    #[serde(default)]
+    pub lineage: Option<PiLineage>,
 }
 
 /// A single message pushed via the HTTP API

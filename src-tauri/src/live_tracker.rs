@@ -23,7 +23,7 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::integrations::IntegrationProvider;
-use crate::models::{ObservedLinkedSession, ObservedSessionAgent, SessionBreakdown};
+use crate::models::{ObservedLinkedSession, ObservedSessionAgent, PiLineage, SessionBreakdown};
 use crate::server::{MAX_CWD_LEN, MAX_STRING_LEN};
 use crate::transcript_identity::{ModelSourceFastFingerprint, model_source_fast_fingerprint};
 
@@ -62,8 +62,8 @@ struct LiveSession {
     model: Option<String>,
     /// Cumulative tokens reported by Pi's extension for the current session.
     live_tokens: Option<i64>,
-    /// Stable header id resolved from Pi's path-valued `parentSession` chain.
-    parent_session_id: Option<String>,
+    /// Root, linked, or explicitly unresolved proof pushed by Pi's extension.
+    lineage: Option<PiLineage>,
     /// Spawn tool-use ids seen in a `tool_result` and workflow agent ids seen
     /// in a journal `result`, from anywhere in this session's tree.
     ///
@@ -204,7 +204,6 @@ enum FileRole {
     Pi {
         started_at: DateTime<Utc>,
         cwd: Option<String>,
-        parent_session_id: Option<String>,
     },
 }
 
@@ -348,19 +347,17 @@ impl TrackerState {
                     });
                 }
             }
-            FileRole::Pi {
-                started_at,
-                cwd,
-                parent_session_id,
-            } => {
+            FileRole::Pi { started_at, cwd } => {
                 if let Some(replaced) = replaced_session {
                     sessions.remove(&replaced);
                 }
+                let pushed = sessions.remove(&key);
                 let mut session = LiveSession {
                     last_activity: *started_at,
                     started_at: Some(*started_at),
                     cwd: cwd.clone(),
-                    parent_session_id: parent_session_id.clone(),
+                    lineage: pushed.as_ref().and_then(|session| session.lineage.clone()),
+                    live_tokens: pushed.and_then(|session| session.live_tokens),
                     ..LiveSession::default()
                 };
                 let Some((window, body_offset, _, _)) = read_codex_tail(path) else {
@@ -706,18 +703,12 @@ impl LiveTracker {
         })
     }
 
-    pub(crate) fn set_pi_lineage(
-        &self,
-        session_id: &str,
-        host: &str,
-        parent_session_id: Option<&str>,
-    ) -> bool {
+    pub(crate) fn set_pi_lineage(&self, session_id: &str, host: &str, lineage: PiLineage) -> bool {
         self.mutate_pi_session(session_id, host, |session| {
-            let parent = parent_session_id.map(str::to_owned);
-            if session.parent_session_id == parent {
+            if session.lineage.as_ref() == Some(&lineage) {
                 return false;
             }
-            session.parent_session_id = parent;
+            session.lineage = Some(lineage);
             true
         })
     }
@@ -947,7 +938,7 @@ impl LiveTracker {
         let mut seen = HashSet::new();
         let mut linked_by_parent = HashMap::<SessionKey, Vec<ObservedLinkedSession>>::new();
         for (child_key, child) in &state.sessions {
-            let Some(parent_session_id) = child.parent_session_id.as_ref() else {
+            let Some(PiLineage::Linked { parent_session_id }) = child.lineage.as_ref() else {
                 continue;
             };
             let parent_key = SessionKey {
@@ -979,7 +970,11 @@ impl LiveTracker {
                 continue;
             };
             row.observed_agents = Some(session.open_agents(now));
-            row.parent_session_id = session.parent_session_id.clone();
+            row.pi_lineage = session.lineage.clone();
+            row.parent_session_id = match &session.lineage {
+                Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
+                _ => None,
+            };
             row.live_linked_sessions = (key.provider == IntegrationProvider::Pi.as_str())
                 .then(|| linked_by_parent.get(&key).cloned().unwrap_or_default());
             if utc(&row.last_active).is_none_or(|stored| session.last_activity > stored) {
@@ -1012,7 +1007,13 @@ impl LiveTracker {
                 rows.push(SessionBreakdown {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
-                    parent_session_id: session.parent_session_id.clone(),
+                    parent_session_id: match &session.lineage {
+                        Some(PiLineage::Linked { parent_session_id }) => {
+                            Some(parent_session_id.clone())
+                        }
+                        _ => None,
+                    },
+                    pi_lineage: session.lineage.clone(),
                     hostname: key.host.clone(),
                     total_tokens: session.live_tokens.unwrap_or(0),
                     turn_count: 0,
@@ -1245,7 +1246,6 @@ pub(crate) fn normalize_observed_hostname(hostname: &str) -> Option<String> {
 
 fn pi_session_file(path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
     let header = crate::pi_session::read_pi_session_header(path)?;
-    let parent_session_id = crate::pi_session::resolve_pi_parent_session_id(path, &header);
     let session_id = observed_name(&header.id)?;
     Some((
         SessionKey {
@@ -1256,7 +1256,6 @@ fn pi_session_file(path: &Path, host: &str) -> Option<(SessionKey, FileRole)> {
         FileRole::Pi {
             started_at: utc(&header.timestamp)?,
             cwd: observed_root_cwd(Some(&header.cwd)),
-            parent_session_id,
         },
     ))
 }
@@ -2198,7 +2197,13 @@ mod tests {
 
         assert!(tracker.record_pi_activity("live", "host", started + TimeDelta::seconds(1),));
         assert!(tracker.set_pi_model("live", "host", "anthropic", "claude-sonnet-4-5"));
-        assert!(tracker.set_pi_lineage("live", "host", Some("parent")));
+        assert!(tracker.set_pi_lineage(
+            "live",
+            "host",
+            crate::models::PiLineage::Linked {
+                parent_session_id: "parent".into(),
+            },
+        ));
         assert!(tracker.set_pi_live_tokens("live", "host", 10, 20, 30, 40));
         assert!(!tracker.record_pi_activity("ended", "host", started));
 
@@ -2207,12 +2212,53 @@ mod tests {
         assert_eq!(session.last_activity, started + TimeDelta::seconds(1));
         assert_eq!(session.model_provider.as_deref(), Some("anthropic"));
         assert_eq!(session.model.as_deref(), Some("claude-sonnet-4-5"));
-        assert_eq!(session.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(
+            session.lineage,
+            Some(crate::models::PiLineage::Linked {
+                parent_session_id: "parent".into(),
+            })
+        );
         assert_eq!(session.live_tokens, Some(100));
         drop(state);
 
         let (_, rows) = read_path(&tracker, Vec::new(), started + TimeDelta::seconds(2));
         assert_eq!(rows[0].total_tokens, 100);
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pushed Lineage Proof]]
+    #[test]
+    fn pi_push_lineage_keeps_root_linked_and_unresolved_distinct() {
+        let tracker = LiveTracker::new(None);
+        let started = parse("2026-08-14T08:00:00Z");
+        for session_id in ["root", "linked", "unresolved"] {
+            tracker.start_pi_session(session_id, "host", Some("/work"), started, None);
+        }
+        tracker.set_pi_lineage("root", "host", crate::models::PiLineage::Root);
+        tracker.set_pi_lineage(
+            "linked",
+            "host",
+            crate::models::PiLineage::Linked {
+                parent_session_id: "root".into(),
+            },
+        );
+        tracker.set_pi_lineage(
+            "unresolved",
+            "host",
+            crate::models::PiLineage::Unresolved {
+                reason: "parent_header_unavailable".into(),
+            },
+        );
+
+        let (_, rows) = read_path(&tracker, Vec::new(), started);
+        let row = |id: &str| rows.iter().find(|row| row.session_id == id).unwrap();
+        assert_eq!(row("root").pi_lineage, Some(crate::models::PiLineage::Root));
+        assert_eq!(row("linked").parent_session_id.as_deref(), Some("root"));
+        assert_eq!(
+            row("unresolved").pi_lineage,
+            Some(crate::models::PiLineage::Unresolved {
+                reason: "parent_header_unavailable".into(),
+            })
+        );
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Crash Eviction]]
@@ -2365,7 +2411,7 @@ mod tests {
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Proven Live Lineage]]
     #[test]
-    fn pi_parent_exposes_exactly_two_linked_children_and_keeps_sibling_independent() {
+    fn pi_pushed_parent_exposes_exactly_two_linked_children_and_keeps_sibling_independent() {
         let root = tempfile::tempdir().expect("create Pi root");
         let project = root.path().join("--work-quill--");
         fs::create_dir_all(&project).expect("create project directory");
@@ -2395,6 +2441,18 @@ mod tests {
 
         let tracker = LiveTracker::new(None);
         tracker.sweep_in(&[(IntegrationProvider::Pi, root.path().to_path_buf())], now);
+        let host = local_observed_host().expect("local host");
+        tracker.set_pi_lineage("parent", host, PiLineage::Root);
+        for child in ["child-a", "child-b"] {
+            tracker.set_pi_lineage(
+                child,
+                host,
+                PiLineage::Linked {
+                    parent_session_id: "parent".into(),
+                },
+            );
+        }
+        tracker.set_pi_lineage("sibling", host, PiLineage::Root);
         let (_, rows) = read_path(&tracker, Vec::new(), now);
         assert_eq!(rows.len(), 4);
         let parent_row = rows.iter().find(|row| row.session_id == "parent").unwrap();
@@ -3486,6 +3544,7 @@ mod tests {
             provider: "claude".to_owned(),
             session_id: "stored-root".to_owned(),
             parent_session_id: None,
+            pi_lineage: None,
             hostname: "overlay-host".to_owned(),
             total_tokens: 7,
             turn_count: 1,
@@ -3537,6 +3596,7 @@ mod tests {
             provider: provider.to_owned(),
             session_id: "remote-root".to_owned(),
             parent_session_id: None,
+            pi_lineage: None,
             hostname: "remote-host.example.com".to_owned(),
             total_tokens: 42,
             turn_count: 3,

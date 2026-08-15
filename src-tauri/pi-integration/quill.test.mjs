@@ -339,7 +339,16 @@ test("session start resolves lineage once and notifies only persisted sessions",
       const start = calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0];
       assert.deepEqual(start.lineage, { kind: "linked", parent_session_id: "parent-id" });
       assert.equal(start.previous_session_id, "parent-id");
+      const notify = calls.find((call) => call.url.endsWith("/api/v1/sessions/notify"));
+      assert.deepEqual(notify.body.lineage, { kind: "linked", parent_session_id: "parent-id" });
       assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 1);
+
+      pi.handlers.get("session_start")[0]({ type: "session_start", reason: "resume", previousSessionFile: parent }, ctx);
+      await flushRequests();
+      assert.deepEqual(
+        calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).at(-1).body.lineage,
+        { kind: "linked", parent_session_id: "parent-id" },
+      );
 
       const ephemeralPi = fakePi();
       quill(ephemeralPi.api);
@@ -348,7 +357,7 @@ test("session start resolves lineage once and notifies only persisted sessions",
         context("ephemeral"),
       );
       await flushRequests();
-      assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 1);
+      assert.equal(calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify")).length, 2);
     } finally {
       globalThis.fetch = oldFetch;
     }

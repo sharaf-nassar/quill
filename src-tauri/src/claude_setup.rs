@@ -512,6 +512,7 @@ pub(crate) fn detect() -> Result<crate::integrations::ProviderStatus, String> {
         user_has_made_choice: false,
         last_error: None,
         last_verified_at: Some(chrono::Utc::now().to_rfc3339()),
+        pi_extension_health: None,
         last_detection_attempts: if detected_cli { Vec::new() } else { attempts },
     })
 }

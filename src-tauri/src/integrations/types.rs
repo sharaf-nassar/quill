@@ -53,6 +53,37 @@ pub enum ProviderSetupState {
     Error,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiExtensionHealthState {
+    NeverConnected,
+    Alive,
+    Idle,
+    Stale,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PiExtensionErrorKind {
+    Config,
+    Transport,
+    ProtocolMismatch,
+    Registration,
+    Spool,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PiExtensionHealth {
+    pub state: PiExtensionHealthState,
+    pub last_seen: Option<String>,
+    pub protocol: Option<String>,
+    pub extension_version: Option<String>,
+    pub min_quill_version: Option<String>,
+    pub last_error: Option<PiExtensionErrorKind>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
@@ -64,6 +95,8 @@ pub struct ProviderStatus {
     pub user_has_made_choice: bool,
     pub last_error: Option<String>,
     pub last_verified_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pi_extension_health: Option<PiExtensionHealth>,
     /// Paths inspected during the last CLI detection attempt. Populated only
     /// when detection failed so the UI can explain why a provider shows N/A
     /// despite being installed.

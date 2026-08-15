@@ -928,7 +928,7 @@ function runtimeMessage(config, state, info, message) {
   return sendTracked(config, state, "/api/v1/sessions/messages", payload);
 }
 
-function notifySession(config, state, info) {
+function notifySession(config, state, info, lineage) {
   if (!info.file) return Promise.resolve(true);
   const payload = {
     provider: "pi",
@@ -937,6 +937,7 @@ function notifySession(config, state, info) {
     host: config.hostname,
     cwd: info.cwd,
     project: info.cwd,
+    lineage,
   };
   return postPayload(config, "/api/v1/sessions/notify", payload).then(
     () => true,
@@ -990,7 +991,7 @@ function registerTracking(pi, config) {
         ...(previousSessionId ? { previous_session_id: previousSessionId } : {}),
         lineage,
       }, `${event.reason}:${timestamp}`);
-      void notifySession(config, state, info);
+      void notifySession(config, state, info, lineage);
       return handshake;
     });
   });

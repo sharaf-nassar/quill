@@ -89,6 +89,16 @@ export function useIntegrations(): UseIntegrationsResult {
   }, [refresh]);
 
   useEffect(() => {
+    const interval = setInterval(() => {
+      void invoke<ProviderStatus[]>("get_provider_statuses").then(
+        (nextStatuses) => setStatuses(sortStatuses(nextStatuses)),
+        () => {},
+      );
+    }, 60_000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
     const unlisten = listen<ProviderStatus[]>("integrations-updated", (event) => {
       setStatuses(sortStatuses(event.payload));
       setLoading(false);

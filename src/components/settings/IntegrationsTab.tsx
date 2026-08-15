@@ -378,6 +378,46 @@ function providerActionCopy(action: PendingProviderAction) {
   };
 }
 
+const PI_HEALTH_LABELS = {
+  never_connected: "Never connected",
+  alive: "Alive",
+  idle: "Idle",
+  stale: "Stale",
+} as const;
+
+const PI_ERROR_LABELS = {
+  config: "Configuration error",
+  transport: "Transport unavailable",
+  protocol_mismatch: "Protocol mismatch",
+  registration: "Registration error",
+  spool: "Spool error",
+  unknown: "Unknown extension error",
+} as const;
+
+function PiExtensionDetail({ status }: { status: ProviderStatus }) {
+  const health = status.piExtensionHealth;
+  if (status.provider !== "pi" || !status.enabled) return null;
+  if (!health) {
+    return (
+      <span className="pi-extension-health" data-state="unavailable">
+        Extension: Status unavailable
+      </span>
+    );
+  }
+  const detail = [
+    `Extension: ${PI_HEALTH_LABELS[health.state]}`,
+    health.lastError ? PI_ERROR_LABELS[health.lastError] : null,
+    health.protocol ? `protocol ${health.protocol}` : null,
+    health.extensionVersion ? `extension ${health.extensionVersion}` : null,
+    health.lastSeen ? `last report ${health.lastSeen}` : null,
+  ].filter(Boolean).join(" · ");
+  return (
+    <span className="pi-extension-health" data-state={health.state}>
+      {detail}
+    </span>
+  );
+}
+
 function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
   const { toast } = useToast();
   const {
@@ -544,8 +584,17 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
           return (
             <SettingRow
               key={status.provider}
-              label={providerLabel(status.provider)}
-              description={description}
+              label={
+                <span className="settings-provider-name" data-provider={status.provider}>
+                  {providerLabel(status.provider)}
+                </span>
+              }
+              description={
+                <>
+                  {description}
+                  <PiExtensionDetail status={status} />
+                </>
+              }
               control={
                 <Toggle
                   tone={state.tone}

@@ -44,7 +44,74 @@ const baseStatus = {
   userHasMadeChoice: false,
   lastError: null,
   lastVerifiedAt: null,
+  piExtensionHealth: null,
 };
+
+// @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health presentation]]
+test("Pi health renders current status and typed error detail without red", () => {
+  const features = {
+    features: { contextPreservation: false, activityTracking: true, contextTelemetry: true, brevity: false },
+    loading: false,
+    saving: false,
+  };
+  for (const [state, label] of [
+    ["never_connected", "Never connected"],
+    ["alive", "Alive"],
+    ["idle", "Idle"],
+    ["stale", "Stale"],
+  ]) {
+    const markup = renderToStaticMarkup(createElement(integrationsModule.default, {
+      integrations: {
+        statuses: [{
+          ...baseStatus,
+          enabled: true,
+          setupState: "installed",
+          piExtensionHealth: {
+            state,
+            lastSeen: "2026-08-14T08:00:00Z",
+            protocol: "2",
+            extensionVersion: "0.1.0",
+            minQuillVersion: "0.9.0",
+            lastError: state === "stale" ? "protocol_mismatch" : null,
+          },
+        }],
+        loading: false,
+        error: null,
+        inFlightProviders: new Set(),
+        indicatorPrimaryProvider: null,
+        rescanInFlight: false,
+      },
+      features,
+    }));
+    assert.match(markup, new RegExp(`Extension: ${label}`));
+    assert.doesNotMatch(markup, /meter-red|settings-toggle--error/);
+    if (state === "stale") {
+      assert.match(markup, /Protocol mismatch/);
+      assert.match(markup, /protocol 2/);
+    }
+  }
+});
+
+// @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Missing health fallback]]
+test("enabled Pi without health data renders a slate unavailable detail", () => {
+  const markup = renderToStaticMarkup(createElement(integrationsModule.default, {
+    integrations: {
+      statuses: [{ ...baseStatus, enabled: true, setupState: "installed" }],
+      loading: false,
+      error: null,
+      inFlightProviders: new Set(),
+      indicatorPrimaryProvider: null,
+      rescanInFlight: false,
+    },
+    features: {
+      features: { contextPreservation: false, activityTracking: true, contextTelemetry: true, brevity: false },
+      loading: false,
+      saving: false,
+    },
+  }));
+  assert.match(markup, /Extension: Status unavailable/);
+  assert.doesNotMatch(markup, /meter-red|settings-toggle--error/);
+});
 
 // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Pi card states]]
 test("Pi card exposes detected, enabled, and error states", () => {

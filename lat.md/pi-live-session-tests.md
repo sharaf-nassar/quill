@@ -96,4 +96,8 @@ A synthetic branched Pi session of 104,857,951 bytes scans 1,048,576 bytes, the 
 
 ## Proven Live Lineage
 
-One parent with two live declared children exposes exactly two linked sessions while an unlinked sibling stays independent and Pi native agent count stays unknown.
+One parent with two live children linked by pushed proof exposes exactly two linked sessions while a pushed root sibling stays independent and Pi native agent count stays unknown.
+
+## Pushed Lineage Proof
+
+Pushed root, linked, and unresolved states remain distinct in the live overlay, including the unresolved reason and the linked parent's stable id.

@@ -123,6 +123,7 @@ fn status_from_detection(
         user_has_made_choice: false,
         last_error,
         last_verified_at: Some(Utc::now().to_rfc3339()),
+        pi_extension_health: None,
         last_detection_attempts: if detected_cli { Vec::new() } else { attempts },
     }
 }

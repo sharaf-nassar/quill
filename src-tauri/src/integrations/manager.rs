@@ -3,10 +3,13 @@ use crate::brevity;
 use crate::integrations::cpa::{
     CpaConnectError, CpaConnectResult, CpaConnectionStatus, ValidatedCpaConnection,
 };
-use crate::integrations::types::{IntegrationProvider, ProviderSetupState, ProviderStatus};
+use crate::integrations::types::{
+    IntegrationProvider, PiExtensionErrorKind, PiExtensionHealth, PiExtensionHealthState,
+    ProviderSetupState, ProviderStatus,
+};
 use crate::models::{ContextPreservationStatus, IntegrationFeatures};
 use crate::storage::Storage;
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use tauri::{AppHandle, Emitter};
 
 const CONTEXT_PRESERVATION_ENABLED_KEY: &str = "context_preservation.enabled";
@@ -15,6 +18,66 @@ const CONTEXT_TELEMETRY_ENABLED_KEY: &str = "feature.context_telemetry.enabled";
 const BREVITY_ENABLED_KEY: &str = "feature.brevity.enabled";
 const LEGACY_PROVIDER_STATUSES_KEY: &str = "integration.providers.v1";
 const PI_PROVIDER_STATUS_KEY: &str = "integration.provider.pi.v1";
+const PI_EXTENSION_ALIVE_AFTER: TimeDelta = TimeDelta::minutes(2);
+const PI_EXTENSION_STALE_AFTER: TimeDelta = TimeDelta::minutes(15);
+
+fn pi_extension_error(value: &str) -> Option<PiExtensionErrorKind> {
+    match value {
+        "" => None,
+        "ConfigError" => Some(PiExtensionErrorKind::Config),
+        "TransportError" => Some(PiExtensionErrorKind::Transport),
+        "ProtocolMismatchError" | "protocol_mismatch" => {
+            Some(PiExtensionErrorKind::ProtocolMismatch)
+        }
+        "RegistrationError" => Some(PiExtensionErrorKind::Registration),
+        "SpoolError" | "spool_corrupt" => Some(PiExtensionErrorKind::Spool),
+        _ => Some(PiExtensionErrorKind::Unknown),
+    }
+}
+
+fn pi_extension_health_at(
+    storage: &Storage,
+    now: DateTime<Utc>,
+) -> Result<PiExtensionHealth, String> {
+    let last_seen = storage.get_setting("pi_extension.last_seen")?;
+    let state = last_seen
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|seen| now.signed_duration_since(seen.with_timezone(&Utc)))
+        .map_or(PiExtensionHealthState::NeverConnected, |age| {
+            if age <= PI_EXTENSION_ALIVE_AFTER {
+                PiExtensionHealthState::Alive
+            } else if age <= PI_EXTENSION_STALE_AFTER {
+                PiExtensionHealthState::Idle
+            } else {
+                PiExtensionHealthState::Stale
+            }
+        });
+    Ok(PiExtensionHealth {
+        state,
+        last_seen,
+        protocol: storage.get_setting("pi_extension.protocol")?,
+        extension_version: storage.get_setting("pi_extension.extension_version")?,
+        min_quill_version: storage.get_setting("pi_extension.min_quill_version")?,
+        last_error: storage
+            .get_setting("pi_extension.last_error")?
+            .as_deref()
+            .and_then(pi_extension_error),
+    })
+}
+
+fn attach_pi_extension_health(
+    storage: &Storage,
+    statuses: &mut [ProviderStatus],
+) -> Result<(), String> {
+    if let Some(pi) = statuses
+        .iter_mut()
+        .find(|status| status.provider == IntegrationProvider::Pi)
+    {
+        pi.pi_extension_health = Some(pi_extension_health_at(storage, Utc::now())?);
+    }
+    Ok(())
+}
 
 fn demo_mode_active() -> bool {
     std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1")
@@ -329,7 +392,9 @@ pub fn force_rescan(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
 }
 
 pub fn load_statuses(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    load_saved_statuses(storage)
+    let mut statuses = load_saved_statuses(storage)?;
+    attach_pi_extension_health(storage, &mut statuses)?;
+    Ok(statuses)
 }
 
 pub fn get_context_preservation_status(
@@ -436,7 +501,7 @@ fn sync_brevity_blocks(
 }
 
 fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, String> {
-    [
+    let mut statuses = [
         IntegrationProvider::Claude,
         IntegrationProvider::Codex,
         IntegrationProvider::Pi,
@@ -445,7 +510,9 @@ fn detect_all_with_storage(storage: &Storage) -> Result<Vec<ProviderStatus>, Str
     .into_iter()
     .map(detect_provider)
     .collect::<Result<Vec<_>, _>>()
-    .and_then(|detected| merge_saved_statuses(storage, detected))
+    .and_then(|detected| merge_saved_statuses(storage, detected))?;
+    attach_pi_extension_health(storage, &mut statuses)?;
+    Ok(statuses)
 }
 
 fn detect_provider(provider: IntegrationProvider) -> Result<ProviderStatus, String> {
@@ -722,6 +789,65 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health state machine]]
+    #[test]
+    fn pi_extension_health_distinguishes_never_connected_alive_idle_and_stale() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("quill.db"), false)
+            .expect("initialize temporary storage");
+        let now = Utc::now();
+
+        assert_eq!(
+            pi_extension_health_at(&storage, now).unwrap().state,
+            PiExtensionHealthState::NeverConnected
+        );
+        storage
+            .set_settings_atomically(&[
+                ("pi_extension.protocol", "1"),
+                ("pi_extension.extension_version", "0.1.0"),
+                ("pi_extension.min_quill_version", "0.9.0"),
+                ("pi_extension.last_error", ""),
+            ])
+            .unwrap();
+        for (age, expected) in [
+            (TimeDelta::seconds(30), PiExtensionHealthState::Alive),
+            (TimeDelta::minutes(5), PiExtensionHealthState::Idle),
+            (TimeDelta::minutes(20), PiExtensionHealthState::Stale),
+        ] {
+            storage
+                .set_setting("pi_extension.last_seen", &(now - age).to_rfc3339())
+                .unwrap();
+            assert_eq!(
+                pi_extension_health_at(&storage, now).unwrap().state,
+                expected
+            );
+        }
+    }
+
+    // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Typed extension error detail]]
+    #[test]
+    fn pi_extension_health_types_protocol_mismatch_and_retains_detail() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("quill.db"), false)
+            .expect("initialize temporary storage");
+        storage
+            .set_settings_atomically(&[
+                ("pi_extension.last_seen", &Utc::now().to_rfc3339()),
+                ("pi_extension.protocol", "2"),
+                ("pi_extension.extension_version", "0.1.0"),
+                ("pi_extension.min_quill_version", "0.9.0"),
+                ("pi_extension.last_error", "protocol_mismatch"),
+            ])
+            .unwrap();
+
+        let health = pi_extension_health_at(&storage, Utc::now()).unwrap();
+        assert_eq!(
+            health.last_error,
+            Some(PiExtensionErrorKind::ProtocolMismatch)
+        );
+        assert_eq!(health.protocol.as_deref(), Some("2"));
+    }
+
     #[test]
     // @lat: [[pi-provider-plumbing-tests#Pi Provider Plumbing Test Specs#Saved Status Tolerance]]
     fn saved_statuses_skip_unknown_providers_without_dropping_known_entries() {
@@ -770,6 +896,7 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
+            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
         let mixed_statuses = vec![
@@ -844,6 +971,7 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
+            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
 
@@ -867,6 +995,7 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
+            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
 
@@ -892,6 +1021,7 @@ mod tests {
             user_has_made_choice: false,
             last_error: Some("Pi extensions directory is not writable".to_string()),
             last_verified_at: None,
+            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         };
         let mut saved = detected.clone();

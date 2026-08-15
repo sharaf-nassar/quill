@@ -6334,6 +6334,7 @@ mod tests {
             provider: "claude".to_string(),
             session_id: session_id.to_string(),
             parent_session_id: None,
+            pi_lineage: None,
             hostname: "ipc-host".to_string(),
             total_tokens: 1,
             turn_count: 1,
@@ -6559,6 +6560,7 @@ mod tests {
             user_has_made_choice: true,
             last_error: None,
             last_verified_at: None,
+            pi_extension_health: None,
             last_detection_attempts: Vec::new(),
         });
 

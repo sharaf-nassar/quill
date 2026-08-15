@@ -305,6 +305,7 @@ interface RowModel {
   nameLabel?: string;
   chipLabel?: string;
   parentSessionId?: string;
+  lineageUnresolvedReason?: string;
   agentSummary?: {
     count: string;
     countLabel: string;
@@ -491,6 +492,15 @@ function SessionIdentity({ row }: { row: RowModel }) {
           ↳ {row.parentSessionId.slice(0, 8)}
         </span>
       )}
+      {row.lineageUnresolvedReason && (
+        <span
+          className="wg-row-session-parent wg-row-datum"
+          data-tooltip="Unlinked Pi session"
+          aria-label={`Unlinked Pi session: ${row.lineageUnresolvedReason.split("_").join(" ")}`}
+        >
+          unlinked
+        </span>
+      )}
       {linkedCount > 0 && (
         <span
           className="wg-row-linked-summary wg-row-datum"
@@ -598,6 +608,10 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     chip: { text: providerTag(row.provider), tone: row.provider },
     chipLabel: `Provider ${providerTag(row.provider)}`,
     parentSessionId: row.provider === "pi" ? row.parent_session_id ?? undefined : undefined,
+    lineageUnresolvedReason:
+      row.provider === "pi" && row.pi_lineage?.kind === "unresolved"
+        ? row.pi_lineage.reason
+        : undefined,
     agentSummary:
       hasAgentTotals || agents.length > 0
         ? {

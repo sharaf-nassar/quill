@@ -148,7 +148,7 @@ Codex config changes flow through parsed TOML: install snapshots the active cust
 
 Per-message usage persists through [[src-tauri/src/storage.rs#Storage#store_pi_model_usage]] before its token delta reaches LiveTracker. The Pi-only session/event UUID index makes live/spool overlap a no-op, so only a newly inserted event advances cumulative live tokens.
 
-Session-start events also upsert durable cwd, hostname, and migration-42 `ephemeral` state into `live_analytics_sessions`. Every accepted envelope atomically refreshes `pi_extension.{last_seen,protocol,extension_version,min_quill_version,last_error}` settings. Protocol mismatch records typed health before returning `400`, while bad auth records nothing.
+Session-start events also upsert durable cwd, hostname, and migration-42 `ephemeral` state into `live_analytics_sessions`. Every accepted envelope atomically refreshes `pi_extension.{last_seen,protocol,extension_version,min_quill_version,last_error}` settings. Provider-status IPC derives never-connected, alive, idle, or stale health and a typed error from those rows. Protocol mismatch records typed health before returning `400`, while bad auth records nothing.
 
 [[src-tauri/src/live_tracker.rs#LiveTracker#apply_paths]] folds the transcripts the filesystem watcher reports. Claude and Codex files carry the byte offset already consumed, so steady state parses only appended bytes; a trailing line without its newline is left for the next fold. Pi stores `(mtime_ns, len)` and cold-folds its bounded tail whenever that pair changes, catching equal-length and longer migration rewrites without treating the file as an append.
 
@@ -184,21 +184,21 @@ First sight of a rollout, and any rewrite of one, parses from a bounded tail thr
 
 ### Pi Fold Rules
 
-Pi live state remains tail-provable and bounded; pushed usage supplies cumulative spend independently of this fold.
+Pi transcript fallback remains tail-provable and bounded; pushed usage and lineage supply authoritative extension facts independently of this fold.
 
-[[src-tauri/src/live_tracker.rs#pi_session_file]] reads only the bounded header line for session id, start time, and cwd. [[src-tauri/src/live_tracker.rs#fold_pi_line]] then reads the shared 1 MiB tail and keeps last-entry activity plus the newest assistant message's validated upstream provider and model. It never builds an id map or follows `parentId`, so `/tree`, forks, compaction, and branch summaries cannot corrupt cumulative state because the fold claims no cumulative state.
+[[src-tauri/src/live_tracker.rs#pi_session_file]] reads only the bounded header line for session id, start time, and cwd. [[src-tauri/src/live_tracker.rs#fold_pi_line]] then reads the shared 1 MiB tail and keeps last-entry activity plus the newest assistant message's validated upstream provider and model. It never resolves parent paths or follows `parentId`, so `/tree`, forks, compaction, and branch summaries cannot corrupt pushed lineage or cumulative state.
 
 Every changed Pi fingerprint replaces that file's prior live contribution. This catches initial deferred flush and migrations that preserve or grow length. Missing files produce no row, and the shared idle cutoff removes quiet files. Pushed usage maintains real cumulative Pi tokens; the transcript fold remains only a temporary fallback and does not overwrite them.
 
 ### Pi Session Lineage
 
-Pi lineage exists only when transcript headers prove it; paths, timing, cwd, filenames, and models never infer a relationship.
+Pi lineage exists only when the extension pushes explicit root, linked, or unresolved proof; Quill never infers relationships from paths, timing, cwd, filenames, or models.
 
-[[src-tauri/src/pi_session.rs#resolve_pi_parent_session_id]] canonicalizes Pi 0.84.1's path-valued `parentSession`, requires every path in the chain to remain inside the same Pi session root, and reads each stable header id. Missing or malformed headers, paths outside the root, and cycles leave the child unlinked. Provider and host remain part of the live key, so equal ids from other providers or machines cannot join.
+The Pi extension reads the parent header once at session start and pushes its stable id. Missing or malformed parent headers push an unresolved reason rather than collapsing into root. Provider and host remain part of the live key, so equal ids from other providers or machines cannot join.
 
 [[src-tauri/src/live_tracker.rs#LiveTracker#overlay]] derives live child lists from the existing bounded session map on each read. It stores no second graph: provider disable, activity disable, and idle eviction remove the source sessions and therefore their links. Children remain independent rows with parent metadata; a parent receives only concurrently live children whose complete chain resolved.
 
-Session Search stores the resolved parent header id in each Pi document. The Sessions view can navigate from a child result to its provider-qualified parent without exposing the filesystem path from the transcript header.
+Session notify carries the same pushed proof, and Search stores its linked parent id in each Pi document. Root and unresolved proof clear any parser fallback. The Sessions view navigates from a child result to its provider-qualified parent without exposing the filesystem path.
 
 ## Model Observation Reconciliation
 

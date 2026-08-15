@@ -132,3 +132,33 @@ test("Pi live lineage uses singular copy for one child", () => {
 	assert.match(markup, /aria-label="1 live linked session"/);
 	assert.match(markup, />1 live linked session</);
 });
+
+// @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Unresolved Lineage Reason]]
+test("Pi unresolved lineage is visibly unlinked and distinct from root", () => {
+	const row = sessionRow({
+		provider: "pi",
+		session_id: "child-session",
+		parent_session_id: null,
+		pi_lineage: { kind: "unresolved", reason: "parent_header_unavailable" },
+		hostname: "host",
+		total_tokens: 10,
+		turn_count: 1,
+		first_seen: "2026-08-14T08:00:00Z",
+		last_active: "2099-01-01T00:00:00Z",
+		ended_at: null,
+		project: "/work/quill",
+		active_runtime_secs: null,
+		agent_count: null,
+		agent_runtime_secs: null,
+		current_turn_runtime_secs: null,
+		current_turn_runtime_active: false,
+		runtime_as_of_ms: null,
+		active_runtime_rate: 0,
+		observed_agents: [],
+		live_linked_sessions: [],
+		observed_only: false,
+	}, Date.now());
+	const markup = renderToStaticMarkup(createElement(SessionIdentity, { row }));
+	assert.match(markup, /Unlinked Pi session: parent header unavailable/);
+	assert.doesNotMatch(markup, /Parent Pi session/);
+});

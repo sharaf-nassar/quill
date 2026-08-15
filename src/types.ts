@@ -169,8 +169,9 @@ export interface HostBreakdown {
 export interface SessionBreakdown {
   provider: IntegrationProvider;
   session_id: string;
-  /** Transcript-proven Pi parent header id; null when unlinked. */
+  /** Extension-proven Pi parent header id; null for root or unresolved. */
   parent_session_id: string | null;
+  pi_lineage?: PiLineage | null;
   hostname: string;
   total_tokens: number;
   turn_count: number;
@@ -308,6 +309,7 @@ export interface ProviderStatus {
   userHasMadeChoice: boolean;
   lastError: string | null;
   lastVerifiedAt: string | null;
+  piExtensionHealth?: PiExtensionHealth | null;
   /**
    * Filesystem locations Quill checked when trying to find this provider's
    * CLI. Populated only when `detectedCli` is false so the integrations menu
@@ -315,6 +317,34 @@ export interface ProviderStatus {
    */
   lastDetectionAttempts?: string[];
 }
+
+export type PiExtensionHealthState =
+  | "never_connected"
+  | "alive"
+  | "idle"
+  | "stale";
+
+export type PiExtensionErrorKind =
+  | "config"
+  | "transport"
+  | "protocol_mismatch"
+  | "registration"
+  | "spool"
+  | "unknown";
+
+export interface PiExtensionHealth {
+  state: PiExtensionHealthState;
+  lastSeen: string | null;
+  protocol: string | null;
+  extensionVersion: string | null;
+  minQuillVersion: string | null;
+  lastError: PiExtensionErrorKind | null;
+}
+
+export type PiLineage =
+  | { kind: "root" }
+  | { kind: "linked"; parent_session_id: string }
+  | { kind: "unresolved"; reason: string };
 
 export interface CpaConnectionStatus {
   baseUrl: string | null;
