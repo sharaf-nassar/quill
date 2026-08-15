@@ -589,7 +589,9 @@ fn doomed_scan_sql(target: RetentionTarget) -> String {
     match target {
         RetentionTarget::ModelUsageObservations => format!(
             "CREATE TEMP TABLE {} AS
-             SELECT rowid AS rid FROM {} WHERE observed_at_ms < ?1",
+             SELECT rowid AS rid FROM {}
+             WHERE observed_at_ms < ?1
+               AND NOT (provider = 'pi' AND source_key LIKE 'pi-push:%')",
             target.doomed_table(),
             target.table()
         ),
@@ -670,7 +672,9 @@ fn nonconforming_count_sql(target: RetentionTarget) -> String {
 /// Every source-owned row in a target table, regardless of age.
 fn owned_count_sql(target: RetentionTarget) -> String {
     if target == RetentionTarget::ModelUsageObservations {
-        return "SELECT COUNT(*) FROM model_usage_observations".to_string();
+        return "SELECT COUNT(*) FROM model_usage_observations
+                WHERE NOT (provider = 'pi' AND source_key LIKE 'pi-push:%')"
+            .to_string();
     }
     format!(
         "SELECT COUNT(*) FROM {} WHERE source_key IS NOT NULL",
@@ -895,6 +899,7 @@ fn write_retention_archive(
                     "SELECT rowid AS archive_rowid, *
                        FROM {}
                       WHERE observed_at_ms < ?1
+                        AND NOT (provider = 'pi' AND source_key LIKE 'pi-push:%')
                       ORDER BY rowid",
                     target.table()
                 ),

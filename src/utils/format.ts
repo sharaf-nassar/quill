@@ -100,11 +100,11 @@ export function resolveSessionMetrics(
 	tokens: string,
 	turns: string,
 	observedOnly: boolean,
-	provider?: IntegrationProvider,
-	live = false,
+	_provider?: IntegrationProvider,
+	_live = false,
 ): { tokens: string; turns: string | null } {
 	return {
-		tokens: observedOnly || (provider === "pi" && live) ? "—" : tokens,
+		tokens: observedOnly ? "—" : tokens,
 		turns: observedOnly ? null : turns,
 	};
 }

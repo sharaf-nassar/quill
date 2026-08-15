@@ -41,7 +41,6 @@ const TOKEN_COUNT_MAX: i64 = 100_000_000;
 const SYNTHETIC_MODEL_ID: &str = "<synthetic>";
 const DIAGNOSTIC_MAX_SCALARS: usize = 240;
 const SOURCE_RECORD_KEY_VERSION: &str = "v1";
-const PI_ACTIVE_BRANCH_TURN_PREFIX: &str = "active-branch:";
 const RETAINED_SOURCE_COMMIT_BATCH_SIZE: usize = 32;
 
 /// Emitted after model analytics changes have been committed.
@@ -1232,16 +1231,6 @@ fn stable_pi_source_record_key(session_id: &str, entry_id: &str) -> String {
     )
 }
 
-#[cfg(test)]
-fn pi_observation_is_active_branch(observation: &NormalizedObservation) -> bool {
-    observation.metadata.provider == IntegrationProvider::Pi
-        && observation
-            .metadata
-            .turn_id
-            .as_deref()
-            .is_some_and(|turn_id| turn_id.starts_with(PI_ACTIVE_BRANCH_TURN_PREFIX))
-}
-
 /// Parse Pi assistant usage through the shared tolerant session parser.
 pub(crate) fn parse_pi_model_usage_jsonl(
     contents: &str,
@@ -1358,7 +1347,6 @@ pub(crate) fn parse_pi_model_usage_jsonl(
         }
     }
 
-    let active_path = session.active_path.iter().collect::<HashSet<_>>();
     let mut seen_entry_ids = HashSet::<String>::new();
     let mut first_activity_at_ms = chrono::DateTime::parse_from_rfc3339(&session.header.timestamp)
         .ok()
@@ -1458,12 +1446,6 @@ pub(crate) fn parse_pi_model_usage_jsonl(
             cache_read_tokens,
         ))
         .unwrap_or_else(|_| attribution::TokenAttribution::unavailable());
-        let active = active_path.contains(&entry.base.id);
-        let turn_id = if active {
-            format!("{PI_ACTIVE_BRANCH_TURN_PREFIX}{}", entry.base.id)
-        } else {
-            entry.base.id.clone()
-        };
         result.observations.push(NormalizedObservation::new(
             NormalizedObservationMetadata {
                 provider: IntegrationProvider::Pi,
@@ -1480,7 +1462,7 @@ pub(crate) fn parse_pi_model_usage_jsonl(
                 parent_chain_id: None,
                 is_sidechain: false,
                 agent_id: None,
-                turn_id: Some(turn_id),
+                turn_id: Some(entry.base.id.clone()),
                 observed_at_ms,
                 cwd: native.cwd.clone(),
                 hostname: context.hostname.map(str::to_owned),
@@ -4374,20 +4356,6 @@ mod tests {
                     + observation.cache_read_tokens().unwrap_or(0)
             }),
             236
-        );
-        assert_eq!(
-            result
-                .observations
-                .iter()
-                .filter(|observation| pi_observation_is_active_branch(observation))
-                .fold(0, |total, observation| {
-                    total
-                        + observation.input_tokens().unwrap_or(0)
-                        + observation.output_tokens().unwrap_or(0)
-                        + observation.cache_creation_tokens().unwrap_or(0)
-                        + observation.cache_read_tokens().unwrap_or(0)
-                }),
-            164
         );
         assert_eq!(
             result

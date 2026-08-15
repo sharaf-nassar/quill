@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 42;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 43;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -1697,8 +1697,21 @@ const MODEL_SOURCE_STATE_COLUMNS: &str = "
 /// compile-time constant with no runtime values, so interpolating it via
 /// `format!` never widens SQL injection surface — callers keep their own
 /// `?N` bindings.
-const ACTIVE_MODEL_SOURCE_PREDICATE: &str =
-    "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
+const ACTIVE_MODEL_SOURCE_PREDICATE: &str = "source.processing_status != 'suppressed'
+     AND source.suppressed_sha256 IS NULL
+     AND (
+         source.provider != 'pi'
+         OR source.source_key LIKE 'pi-push:%'
+         OR NOT EXISTS (
+             SELECT 1
+             FROM model_observation_sources AS pushed
+             WHERE pushed.provider = 'pi'
+               AND pushed.analytics_session_id = source.analytics_session_id
+               AND pushed.source_key LIKE 'pi-push:%'
+               AND pushed.processing_status != 'suppressed'
+               AND pushed.suppressed_sha256 IS NULL
+         )
+     )";
 const ACTIVE_RUNTIME_SOURCE_PREDICATE: &str =
     "source.processing_status != 'suppressed' AND source.suppressed_sha256 IS NULL";
 
@@ -7916,6 +7929,54 @@ impl Storage {
                 .map_err(|e| format!("Migration 42 commit: {e}"))?;
         }
 
+        // Migration 43 adds append-only Pi message usage identity and native
+        // cost storage without changing existing transcript observations.
+        if current_version < 43 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 43 transaction: {e}"))?;
+            for (column, definition) in [
+                ("event_uuid", "TEXT"),
+                (
+                    "input_cost",
+                    "REAL CHECK(input_cost IS NULL OR input_cost >= 0)",
+                ),
+                (
+                    "output_cost",
+                    "REAL CHECK(output_cost IS NULL OR output_cost >= 0)",
+                ),
+                (
+                    "cache_read_cost",
+                    "REAL CHECK(cache_read_cost IS NULL OR cache_read_cost >= 0)",
+                ),
+                (
+                    "cache_write_cost",
+                    "REAL CHECK(cache_write_cost IS NULL OR cache_write_cost >= 0)",
+                ),
+                (
+                    "total_cost",
+                    "REAL CHECK(total_cost IS NULL OR total_cost >= 0)",
+                ),
+            ] {
+                if !table_has_column(&tx, "model_usage_observations", column) {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE model_usage_observations ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(|e| format!("Migration 43 (add {column}): {e}"))?;
+                }
+            }
+            tx.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uidx_model_observations_pi_event_uuid
+                 ON model_usage_observations(analytics_session_id, event_uuid)
+                 WHERE provider = 'pi' AND event_uuid IS NOT NULL;",
+            )
+            .map_err(|e| format!("Migration 43 (Pi event dedupe index): {e}"))?;
+            tx.execute("INSERT INTO schema_version (version) VALUES (43)", [])
+                .map_err(|e| format!("Failed to record migration 43: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 43 commit: {e}"))?;
+        }
+
         ensure_startup_indexes(&conn)?;
 
         let storage = Self {
@@ -8926,6 +8987,11 @@ impl Storage {
         } else {
             ""
         };
+        let rollup_provider_filter = if provider.is_some() {
+            " AND rollup.provider = ?6"
+        } else {
+            ""
+        };
         let create_scoped_sql = if building_index {
             format!(
                 "CREATE TEMP TABLE scoped_overview AS
@@ -8994,7 +9060,7 @@ impl Storage {
                   AND source.source_key = rollup.source_key
                  WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                    AND rollup.hour_utc >= ?4
-                   AND rollup.hour_utc < ?5{provider_filter}
+                   AND rollup.hour_utc < ?5{rollup_provider_filter}
                  UNION ALL
                  SELECT observation.provider,
                         observation.analytics_session_id,
@@ -10153,8 +10219,6 @@ impl Storage {
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
                            AND observation.derived_model_id COLLATE BINARY = ?4
-                           AND (observation.provider != 'pi'
-                                OR observation.turn_id LIKE 'active-branch:%')
                          GROUP BY observation.provider COLLATE BINARY,
                                   observation.analytics_session_id COLLATE BINARY
                      ) AS matching_sessions"
@@ -10189,8 +10253,6 @@ impl Storage {
                            AND observation.observed_at_ms >= ?1
                            AND observation.observed_at_ms < ?2
                            AND observation.provider COLLATE BINARY = ?3
-                           AND (observation.provider != 'pi'
-                                OR observation.turn_id LIKE 'active-branch:%')
                      ),
                      selected_sessions AS (
                          SELECT provider,
@@ -10479,11 +10541,7 @@ impl Storage {
                     let display_name =
                         model_session_display_name(row.cwd.as_deref(), &row.session_id);
                     Ok(ModelSessionRow {
-                        token_scope: if row.provider == "pi" {
-                            ModelTokenScope::ActiveBranch
-                        } else {
-                            ModelTokenScope::AllBranches
-                        },
+                        token_scope: ModelTokenScope::AllBranches,
                         provider: row.provider,
                         session_id: row.session_id,
                         display_name,
@@ -10569,8 +10627,6 @@ impl Storage {
                      WHERE {ACTIVE_MODEL_SOURCE_PREDICATE}
                        AND observation.provider COLLATE BINARY = ?1
                        AND observation.analytics_session_id COLLATE BINARY = ?2
-                       AND (observation.provider != 'pi'
-                            OR observation.turn_id LIKE 'active-branch:%')
                        AND observation.observed_at_ms >= ?3
                        AND observation.observed_at_ms < ?4
                      ORDER BY observation.observed_at_ms ASC,
@@ -10786,11 +10842,7 @@ impl Storage {
                 primary_model,
                 distinct_models,
                 switch_count,
-                token_scope: if provider == "pi" {
-                    ModelTokenScope::ActiveBranch
-                } else {
-                    ModelTokenScope::AllBranches
-                },
+                token_scope: ModelTokenScope::AllBranches,
                 attributed_tokens,
                 unattributed_tokens,
                 chains,
@@ -13825,6 +13877,193 @@ impl Storage {
         )
         .map_err(|e| format!("Upsert Pi live session: {e}"))?;
         Ok(())
+    }
+
+    pub(crate) fn store_pi_model_usage(
+        &self,
+        event: &crate::models::PiTrackEvent,
+        hostname: &str,
+        observed_at_ms: i64,
+    ) -> Result<bool, String> {
+        let crate::models::PiTrackEventKind::Usage {
+            model_provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cost,
+        } = &event.kind
+        else {
+            return Err("Pushed Pi model usage requires a usage event".to_string());
+        };
+        let model_id = crate::model_usage::validate_model_id(&format!("{model_provider}/{model}"))
+            .map_err(|error| format!("Invalid pushed Pi model id: {error}"))?;
+        if event.event_uuid.is_empty() || event.session_id.is_empty() || hostname.is_empty() {
+            return Err("Pushed Pi usage identity must not be empty".to_string());
+        }
+        if observed_at_ms < 0
+            || [
+                *input_tokens,
+                *output_tokens,
+                *cache_write_tokens,
+                *cache_read_tokens,
+            ]
+            .into_iter()
+            .any(|value| !(0..=100_000_000).contains(&value))
+        {
+            return Err("Invalid pushed Pi usage token count".to_string());
+        }
+        if [
+            cost.input,
+            cost.output,
+            cost.cache_read,
+            cost.cache_write,
+            cost.total,
+        ]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err("Invalid pushed Pi usage cost".to_string());
+        }
+
+        let source_key = format!("pi-push:{}", event.session_id);
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin pushed Pi usage insert: {error}"))?;
+        tx.execute(
+            "INSERT INTO model_observation_sources (
+                 provider, source_key, source_root_key, source_path,
+                 source_session_id, analytics_session_id, chain_id,
+                 is_sidechain, cwd, hostname, first_activity_at_ms,
+                 last_activity_at_ms, seen_generation, processing_status,
+                 observation_count, last_attempt_at_ms, last_success_at_ms
+             ) VALUES (
+                 'pi', ?1, ?1, ?1, ?2, ?2, ?2, 0,
+                 (SELECT cwd FROM live_analytics_sessions
+                  WHERE provider = 'pi' AND session_id = ?2),
+                 ?3, ?4, ?4, 0, 'ok', 0, ?4, ?4
+             )
+             ON CONFLICT(provider, source_key) DO UPDATE SET
+                 cwd = COALESCE(model_observation_sources.cwd, excluded.cwd),
+                 hostname = excluded.hostname,
+                 first_activity_at_ms = MIN(
+                     model_observation_sources.first_activity_at_ms,
+                     excluded.first_activity_at_ms
+                 ),
+                 last_activity_at_ms = MAX(
+                     model_observation_sources.last_activity_at_ms,
+                     excluded.last_activity_at_ms
+                 ),
+                 processing_status = 'ok',
+                 last_attempt_at_ms = excluded.last_attempt_at_ms,
+                 last_success_at_ms = excluded.last_success_at_ms",
+            params![source_key, event.session_id, hostname, observed_at_ms],
+        )
+        .map_err(|error| format!("Upsert pushed Pi usage source: {error}"))?;
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, turn_id,
+                     raw_model_id, derived_model_id, hostname, is_sidechain,
+                     observed_at_ms, input_tokens, output_tokens,
+                     cache_creation_tokens, cache_read_tokens,
+                     model_evidence, token_evidence, event_uuid,
+                     input_cost, output_cost, cache_read_cost,
+                     cache_write_cost, total_cost
+                 ) VALUES (
+                     'pi', ?1, ?2, 0, 'turn', ?3, ?3, ?3, ?2,
+                     ?5, ?5, ?4, 0, ?6, ?7, ?8, ?9, ?10,
+                     'explicit', 'direct', ?2, ?11, ?12, ?13, ?14, ?15
+                 )",
+                params![
+                    source_key,
+                    event.event_uuid,
+                    event.session_id,
+                    hostname,
+                    model_id,
+                    observed_at_ms,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    cost.input,
+                    cost.output,
+                    cost.cache_read,
+                    cost.cache_write,
+                    cost.total,
+                ],
+            )
+            .map_err(|error| format!("Insert pushed Pi usage observation: {error}"))?
+            != 0;
+        if inserted {
+            tx.execute(
+                "UPDATE model_observation_sources
+                 SET observation_count = observation_count + 1
+                 WHERE provider = 'pi' AND source_key = ?1",
+                params![source_key],
+            )
+            .map_err(|error| format!("Count pushed Pi usage observation: {error}"))?;
+            tx.execute(
+                "INSERT INTO model_usage_hourly (
+                     hour_utc, provider, derived_model_id, source_key,
+                     analytics_session_id, obs_count, turn_count, token_count,
+                     sidechain_count, input_tokens, input_tokens_present,
+                     output_tokens, output_tokens_present, cache_creation_tokens,
+                     cache_creation_tokens_present, cache_read_tokens,
+                     cache_read_tokens_present, first_observed_at_ms,
+                     last_observed_at_ms, raw_pruned
+                 ) VALUES (
+                     (?1 / ?9) * ?9, 'pi', ?2, ?3, ?4, 1, 1, 0, 0,
+                     ?5, 1, ?6, 1, ?7, 1, ?8, 1, ?1, ?1, 0
+                 )
+                 ON CONFLICT(hour_utc, provider, derived_model_id, source_key)
+                 DO UPDATE SET
+                     obs_count = model_usage_hourly.obs_count + 1,
+                     turn_count = model_usage_hourly.turn_count + 1,
+                     input_tokens = model_usage_hourly.input_tokens + excluded.input_tokens,
+                     input_tokens_present = model_usage_hourly.input_tokens_present + 1,
+                     output_tokens = model_usage_hourly.output_tokens + excluded.output_tokens,
+                     output_tokens_present = model_usage_hourly.output_tokens_present + 1,
+                     cache_creation_tokens = model_usage_hourly.cache_creation_tokens
+                         + excluded.cache_creation_tokens,
+                     cache_creation_tokens_present =
+                         model_usage_hourly.cache_creation_tokens_present + 1,
+                     cache_read_tokens = model_usage_hourly.cache_read_tokens
+                         + excluded.cache_read_tokens,
+                     cache_read_tokens_present =
+                         model_usage_hourly.cache_read_tokens_present + 1,
+                     first_observed_at_ms = MIN(
+                         model_usage_hourly.first_observed_at_ms,
+                         excluded.first_observed_at_ms
+                     ),
+                     last_observed_at_ms = MAX(
+                         model_usage_hourly.last_observed_at_ms,
+                         excluded.last_observed_at_ms
+                     )
+                 WHERE model_usage_hourly.raw_pruned = 0",
+                params![
+                    observed_at_ms,
+                    model_id,
+                    source_key,
+                    event.session_id,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    MODEL_ROLLUP_HOUR_MS,
+                ],
+            )
+            .map_err(|error| format!("Fold pushed Pi usage rollup: {error}"))?;
+            bump_rollup_generation_in_transaction(&tx)?;
+            bump_model_data_revision(&tx)?;
+        }
+        tx.commit()
+            .map_err(|error| format!("Commit pushed Pi usage insert: {error}"))?;
+        Ok(inserted)
     }
 
     /// Store the newest Pi extension handshake as one settings transaction.
@@ -23580,10 +23819,43 @@ mod tests {
             .expect("replace Pi model source");
     }
 
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Idempotent All Versus Active Totals]]
+    fn pushed_pi_usage_event(
+        event_uuid: &str,
+        session_id: &str,
+        observed_at_ms: i64,
+        model_id: &str,
+        tokens: [i64; 4],
+    ) -> crate::models::PiTrackEvent {
+        let (model_provider, model) = model_id.split_once('/').expect("provider/model fixture");
+        crate::models::PiTrackEvent {
+            event_uuid: event_uuid.to_string(),
+            session_id: session_id.to_string(),
+            hostname: "host".to_string(),
+            timestamp: DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
+                .expect("valid pushed fixture timestamp")
+                .to_rfc3339(),
+            kind: crate::models::PiTrackEventKind::Usage {
+                model_provider: model_provider.to_string(),
+                model: model.to_string(),
+                input_tokens: tokens[0],
+                output_tokens: tokens[1],
+                cache_read_tokens: tokens[2],
+                cache_write_tokens: tokens[3],
+                cost: crate::models::PiUsageCost {
+                    input: 0.01,
+                    output: 0.02,
+                    cache_read: 0.03,
+                    cache_write: 0.04,
+                    total: 0.10,
+                },
+            },
+        }
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Legacy All-Branch Totals]]
     #[test]
     #[serial]
-    fn pi_replacement_is_idempotent_and_session_totals_are_active_branch() {
+    fn pi_replacement_is_idempotent_and_session_totals_are_all_branches() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
@@ -23623,12 +23895,12 @@ mod tests {
         let history = storage
             .get_session_model_history("pi", "session-usage-v3", ModelRange::SevenDays)
             .expect("read Pi session history");
-        assert_eq!(history.token_scope, ModelTokenScope::ActiveBranch);
+        assert_eq!(history.token_scope, ModelTokenScope::AllBranches);
         assert_eq!(
             serde_json::to_value(&history).expect("serialize Pi history")["tokenScope"],
-            "active-branch"
+            "all-branches"
         );
-        assert_eq!(history.attributed_tokens, 164);
+        assert_eq!(history.attributed_tokens, 236);
 
         let active_identity = ModelIdentity {
             provider: "pi".to_string(),
@@ -23640,7 +23912,7 @@ mod tests {
         assert_eq!(sessions.sessions.len(), 1);
         assert_eq!(
             sessions.sessions[0].token_scope,
-            ModelTokenScope::ActiveBranch
+            ModelTokenScope::AllBranches
         );
         assert_eq!(sessions.sessions[0].selected_model_tokens, 138);
 
@@ -23653,7 +23925,263 @@ mod tests {
                 .get_model_sessions(ModelRange::SevenDays, &abandoned_identity, None, Some(10))
                 .expect("page abandoned Pi model sessions")
                 .total,
-            0
+            1
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pushed Usage Migration]]
+    #[test]
+    #[serial]
+    fn migration_43_adds_pushed_usage_identity_and_cost_storage() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO model_usage_observations (
+                     provider, source_key, source_record_key, source_ordinal,
+                     observation_kind, source_session_id,
+                     analytics_session_id, chain_id, is_sidechain,
+                     observed_at_ms, model_evidence, token_evidence
+                 ) VALUES (
+                     'claude', 'legacy-source', 'legacy-record', 0, 'turn',
+                     'legacy-session', 'legacy-session', 'legacy-session', 0,
+                     1, 'missing', 'unavailable'
+                 );
+                 DROP INDEX uidx_model_observations_pi_event_uuid;
+                 ALTER TABLE model_usage_observations DROP COLUMN event_uuid;
+                 ALTER TABLE model_usage_observations DROP COLUMN input_cost;
+                 ALTER TABLE model_usage_observations DROP COLUMN output_cost;
+                 ALTER TABLE model_usage_observations DROP COLUMN cache_read_cost;
+                 ALTER TABLE model_usage_observations DROP COLUMN cache_write_cost;
+                 ALTER TABLE model_usage_observations DROP COLUMN total_cost;
+                 DELETE FROM schema_version WHERE version = 43;",
+            )
+            .expect("rewind database to schema 42");
+        }
+        drop(storage);
+
+        let migrated = init_storage_in(&dir);
+        let conn = migrated.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get::<_, i32>(0),
+            )
+            .expect("read schema version"),
+            43
+        );
+        for column in [
+            "event_uuid",
+            "input_cost",
+            "output_cost",
+            "cache_read_cost",
+            "cache_write_cost",
+            "total_cost",
+        ] {
+            assert!(
+                table_has_column(&conn, "model_usage_observations", column),
+                "missing pushed usage column {column}"
+            );
+        }
+        assert!(index_present(
+            &conn,
+            "uidx_model_observations_pi_event_uuid"
+        ));
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM model_usage_observations
+                 WHERE source_key = 'legacy-source'"
+            ),
+            1
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Replay And Cost Storage]]
+    #[test]
+    #[serial]
+    fn pushed_pi_usage_deduplicates_and_stores_all_cost_dimensions() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let observed_at_ms = Utc::now().timestamp_millis();
+        let event = pushed_pi_usage_event(
+            "event-1",
+            "session-1",
+            observed_at_ms,
+            "anthropic/claude-sonnet-4-5",
+            [10, 20, 30, 40],
+        );
+
+        assert!(
+            storage
+                .store_pi_model_usage(&event, "host", observed_at_ms)
+                .expect("insert pushed usage")
+        );
+        assert!(
+            !storage
+                .store_pi_model_usage(&event, "host", observed_at_ms)
+                .expect("ignore replayed pushed usage")
+        );
+
+        let conn = storage.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT event_uuid, source_key, raw_model_id,
+                        input_tokens, output_tokens,
+                        cache_creation_tokens, cache_read_tokens,
+                        input_cost, output_cost, cache_read_cost,
+                        cache_write_cost, total_cost
+                 FROM model_usage_observations",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, f64>(7)?,
+                        row.get::<_, f64>(8)?,
+                        row.get::<_, f64>(9)?,
+                        row.get::<_, f64>(10)?,
+                        row.get::<_, f64>(11)?,
+                    ))
+                },
+            )
+            .expect("read pushed usage row");
+        assert_eq!(
+            row,
+            (
+                "event-1".into(),
+                "pi-push:session-1".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+                10,
+                20,
+                40,
+                30,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.10,
+            )
+        );
+        assert_eq!(
+            scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
+            1
+        );
+        drop(conn);
+
+        let other_session = pushed_pi_usage_event(
+            "event-1",
+            "session-2",
+            observed_at_ms,
+            "anthropic/claude-sonnet-4-5",
+            [1, 2, 3, 4],
+        );
+        assert!(
+            storage
+                .store_pi_model_usage(&other_session, "host", observed_at_ms)
+                .expect("same event id belongs to a different session")
+        );
+        assert_eq!(
+            scalar_count(
+                &storage.conn.lock().unwrap(),
+                "SELECT COUNT(*) FROM model_usage_observations"
+            ),
+            2
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Upgrade Coexistence]]
+    #[test]
+    #[serial]
+    fn pushed_pi_session_excludes_legacy_adapter_rows_from_models_reads() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let jsonl = include_str!("../tests/fixtures/pi_sessions/model_usage_branches.jsonl");
+        seed_pi_model_source(&storage, &dir, "legacy-pi", jsonl);
+        let observed_at_ms = Utc::now().timestamp_millis();
+        let event = pushed_pi_usage_event(
+            "resumed-event",
+            "session-usage-v3",
+            observed_at_ms,
+            "anthropic/pushed-model",
+            [2, 3, 5, 7],
+        );
+        storage
+            .store_pi_model_usage(&event, "host-a", observed_at_ms)
+            .expect("insert resumed pushed usage");
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete model rollup fixture");
+
+        let overview = storage
+            .get_model_usage_overview(ModelRange::SevenDays, Some("pi"))
+            .expect("read legacy/pushed union");
+        assert_eq!(overview.totals.total_tokens, 17);
+        assert_eq!(overview.models.len(), 1);
+        assert_eq!(
+            overview.models[0].identity.model_id,
+            "anthropic/pushed-model"
+        );
+
+        let history = storage
+            .get_session_model_history("pi", "session-usage-v3", ModelRange::SevenDays)
+            .expect("read resumed session history");
+        assert_eq!(history.token_scope, ModelTokenScope::AllBranches);
+        assert_eq!(history.attributed_tokens, 17);
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Push Source Prune Exemption]]
+    #[test]
+    #[serial]
+    fn retention_never_selects_pi_push_observations_for_raw_prune() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let event = pushed_pi_usage_event(
+            "old-event",
+            "session-old",
+            1,
+            "anthropic/model",
+            [1, 2, 3, 4],
+        );
+        storage
+            .store_pi_model_usage(&event, "host", 1)
+            .expect("insert old pushed usage");
+        let conn = crate::retention_engine::open_maintenance_connection(storage.database_path())
+            .expect("open retention connection");
+        let scan = crate::retention_engine::scan_doomed_rows(
+            &conn,
+            "2026-08-14T00:00:00.000Z",
+            &crate::retention_engine::RetentionDeleteControls::default(),
+        )
+        .expect("scan retention rows");
+        assert_eq!(scan.doomed.model_usage_observations, 0);
+        assert_eq!(
+            scalar_count(
+                &storage.conn.lock().unwrap(),
+                "SELECT COUNT(*) FROM model_usage_observations"
+            ),
+            1
         );
         clear_env();
     }

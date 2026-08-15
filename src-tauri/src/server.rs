@@ -400,6 +400,33 @@ fn validate_pi_lineage(lineage: &PiLineage) -> Result<(), PiTrackError> {
     }
 }
 
+fn pi_model_id(model_provider: &str, model: &str) -> Result<String, PiTrackError> {
+    validate_pi_track_name(model_provider, "model_provider")?;
+    let provider = crate::model_usage::validate_model_id(model_provider)
+        .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid model provider"))?;
+    let model = crate::model_usage::validate_model_id(model)
+        .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid model"))?;
+    crate::model_usage::validate_model_id(&format!("{provider}/{model}"))
+        .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid provider/model"))
+}
+
+fn validate_pi_token_counts(counts: [i64; 4]) -> Result<(), PiTrackError> {
+    if counts
+        .iter()
+        .any(|count| !(0..=MAX_TOKEN_VALUE).contains(count))
+        || counts
+            .into_iter()
+            .try_fold(0_i64, i64::checked_add)
+            .is_none()
+    {
+        return Err(PiTrackError::bad_request(
+            "invalid_event",
+            "Invalid token counts",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackError> {
     validate_pi_track_name(&payload.extension_version, "extension_version")?;
     validate_pi_track_name(&payload.min_quill_version, "min_quill_version")?;
@@ -488,9 +515,7 @@ fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackEr
                 model_provider,
                 model,
             } => {
-                validate_pi_track_name(model_provider, "model_provider")?;
-                crate::model_usage::validate_model_id(model)
-                    .map_err(|_| PiTrackError::bad_request("invalid_event", "Invalid model"))?;
+                pi_model_id(model_provider, model)?;
             }
             PiTrackEventKind::Lineage { lineage } => validate_pi_lineage(lineage)?,
             PiTrackEventKind::LiveTokens {
@@ -499,23 +524,42 @@ fn validate_pi_track_envelope(payload: &PiTrackEnvelope) -> Result<(), PiTrackEr
                 cache_read_tokens,
                 cache_write_tokens,
             } => {
-                let counts = [
+                validate_pi_token_counts([
                     *input_tokens,
                     *output_tokens,
                     *cache_read_tokens,
                     *cache_write_tokens,
-                ];
-                if counts
-                    .iter()
-                    .any(|count| !(0..=MAX_TOKEN_VALUE).contains(count))
-                    || counts
-                        .into_iter()
-                        .try_fold(0_i64, i64::checked_add)
-                        .is_none()
+                ])?;
+            }
+            PiTrackEventKind::Usage {
+                model_provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                cost,
+            } => {
+                pi_model_id(model_provider, model)?;
+                validate_pi_token_counts([
+                    *input_tokens,
+                    *output_tokens,
+                    *cache_read_tokens,
+                    *cache_write_tokens,
+                ])?;
+                if [
+                    cost.input,
+                    cost.output,
+                    cost.cache_read,
+                    cost.cache_write,
+                    cost.total,
+                ]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
                 {
                     return Err(PiTrackError::bad_request(
                         "invalid_event",
-                        "Invalid token counts",
+                        "Invalid usage cost",
                     ));
                 }
             }
@@ -625,6 +669,31 @@ fn ingest_pi_track(
                     *cache_read_tokens,
                     *cache_write_tokens,
                 );
+            }
+            PiTrackEventKind::Usage {
+                model_provider,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                cost: _,
+            } => {
+                let inserted = storage
+                    .store_pi_model_usage(event, &host, at.timestamp_millis())
+                    .map_err(PiTrackError::internal)?;
+                live_tracker.record_pi_activity(&event.session_id, &host, at);
+                live_tracker.set_pi_model(&event.session_id, &host, model_provider, model);
+                if inserted {
+                    live_tracker.add_pi_live_tokens(
+                        &event.session_id,
+                        &host,
+                        *input_tokens,
+                        *output_tokens,
+                        *cache_read_tokens,
+                        *cache_write_tokens,
+                    );
+                }
             }
         }
     }
@@ -2340,5 +2409,69 @@ mod observed_subagent_tests {
                 .as_deref(),
             Some("spool_corrupt")
         );
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Tracking Replay And Live Totals]]
+    #[test]
+    #[serial_test::serial]
+    fn pi_track_usage_replay_is_deduplicated_and_keeps_live_tokens_cumulative() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::init_at(dir.path().join("usage.db"), false).unwrap();
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        let payload: PiTrackEnvelope = serde_json::from_value(serde_json::json!({
+            "protocol": PI_TRACK_PROTOCOL,
+            "extension_version": "1.2.3",
+            "min_quill_version": "0.9.0",
+            "events": [
+                {
+                    "type": "session_start",
+                    "event_uuid": "start-1",
+                    "session_id": "usage-session",
+                    "hostname": "HOST.EXAMPLE.COM",
+                    "timestamp": "2026-08-14T08:00:00Z",
+                    "cwd": "/work/pi",
+                    "reason": "startup",
+                    "lineage": { "kind": "root" }
+                },
+                {
+                    "type": "usage",
+                    "event_uuid": "usage-1",
+                    "session_id": "usage-session",
+                    "hostname": "HOST.EXAMPLE.COM",
+                    "timestamp": "2026-08-14T08:00:01Z",
+                    "model_provider": "anthropic",
+                    "model": "claude-sonnet-4-5",
+                    "input_tokens": 10,
+                    "output_tokens": 20,
+                    "cache_read_tokens": 30,
+                    "cache_write_tokens": 40,
+                    "cost": {
+                        "input": 0.01,
+                        "output": 0.02,
+                        "cache_read": 0.03,
+                        "cache_write": 0.04,
+                        "total": 0.10
+                    }
+                }
+            ]
+        }))
+        .expect("deserialize Pi usage envelope");
+
+        ingest_pi_track(&storage, &tracker, &payload, false).unwrap();
+        ingest_pi_track(&storage, &tracker, &payload, false).unwrap();
+
+        let rows = tracker.overlay(
+            Vec::new(),
+            "2026-08-14T00:00:00Z",
+            Some("host"),
+            Some(IntegrationProvider::Pi),
+            Some(10),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].total_tokens, 100);
+        let overview = storage
+            .get_model_usage_overview(crate::models::ModelRange::SevenDays, Some("pi"))
+            .expect("read pushed Pi usage");
+        assert_eq!(overview.totals.total_tokens, 100);
     }
 }

@@ -74,9 +74,9 @@ An `(mtime_ns, len)` change cold-refolds Pi state even when a migration rewrite 
 
 A Pi transcript silent beyond the shared 15-minute cutoff releases its live session and file state.
 
-## Explicit Token Gap
+## Cumulative Token Display
 
-A live Pi row renders cumulative tokens as `—` while keeping retained turn evidence available.
+A live Pi row renders the cumulative total maintained by pushed usage instead of replacing it with an em dash.
 
 ## Ephemeral No Op
 

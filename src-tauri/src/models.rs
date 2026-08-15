@@ -87,6 +87,24 @@ pub enum PiTrackEventKind {
         cache_read_tokens: i64,
         cache_write_tokens: i64,
     },
+    Usage {
+        model_provider: String,
+        model: String,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read_tokens: i64,
+        cache_write_tokens: i64,
+        cost: PiUsageCost,
+    },
+}
+
+#[derive(Deserialize, Clone, Copy, Debug)]
+pub struct PiUsageCost {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub total: f64,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1543,7 +1561,6 @@ pub struct ModelAnalyticsScope {
 #[serde(rename_all = "kebab-case")]
 pub enum ModelTokenScope {
     AllBranches,
-    ActiveBranch,
 }
 
 #[derive(Serialize, Clone, Debug)]

@@ -747,6 +747,31 @@ impl LiveTracker {
         })
     }
 
+    pub(crate) fn add_pi_live_tokens(
+        &self,
+        session_id: &str,
+        host: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cache_write: i64,
+    ) -> bool {
+        let Some(delta) = input
+            .checked_add(output)
+            .and_then(|total| total.checked_add(cache_read))
+            .and_then(|total| total.checked_add(cache_write))
+        else {
+            return false;
+        };
+        self.mutate_pi_session(session_id, host, |session| {
+            let Some(total) = session.live_tokens.unwrap_or(0).checked_add(delta) else {
+                return false;
+            };
+            session.live_tokens = Some(total);
+            true
+        })
+    }
+
     fn mutate_pi_session(
         &self,
         session_id: &str,

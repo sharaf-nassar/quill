@@ -168,10 +168,10 @@ test("observed-only session metrics stay unavailable instead of reading as zero"
 	});
 });
 
-// @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Explicit Token Gap]]
-test("live Pi session tokens stay unavailable", () => {
+// @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Cumulative Token Display]]
+test("live Pi session tokens show pushed cumulative usage", () => {
 	assert.deepEqual(resolveSessionMetrics("12.3k", "7 turns", false, "pi", true), {
-		tokens: "—",
+		tokens: "12.3k",
 		turns: "7 turns",
 	});
 });
