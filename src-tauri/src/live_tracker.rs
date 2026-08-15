@@ -1605,11 +1605,6 @@ fn read_codex_tail(path: &Path) -> Option<(Vec<u8>, u64, bool, usize)> {
     Some((window, body_offset, truncated, scanned))
 }
 
-#[cfg(test)]
-pub(crate) fn bounded_tail_stats_for_test(path: &Path) -> Option<(u64, u64)> {
-    read_codex_tail(path).map(|(_, _, _, read)| (CODEX_TAIL_SCAN_BYTES, read as u64))
-}
-
 fn fold_pi_line(line: &str, session: &mut LiveSession) {
     let Ok(record) = serde_json::from_str::<PiLiveRecord>(line) else {
         return;

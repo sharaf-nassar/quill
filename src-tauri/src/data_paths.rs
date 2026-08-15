@@ -460,7 +460,7 @@ mod tests {
         clear_env();
     }
 
-    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Demo Root Isolation]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Demo Root Isolation]]
     #[test]
     #[serial]
     fn pi_demo_without_override_never_uses_persisted_root() {

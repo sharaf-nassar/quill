@@ -192,7 +192,7 @@ Pi transcript fallback remains tail-provable and bounded; pushed usage and linea
 
 Every changed Pi fingerprint replaces that file's prior live contribution. This catches initial deferred flush and migrations that preserve or grow length. Missing files produce no row, and the shared idle cutoff removes quiet files. Pushed usage maintains real cumulative Pi tokens; the transcript fold remains only a temporary fallback and does not overwrite them.
 
-The extension calls Session Search notify only when Pi supplies a transcript path. Ephemeral starts have no path, so they can reach lifecycle, usage, and runtime analytics but never enter the indexing queue or search corpus.
+The extension calls Session Search notify only when Pi supplies a transcript path. It repeats the start notify after each persisted turn. Ephemeral starts have no path, so they reach lifecycle, usage, and runtime analytics but never enter search.
 
 ### Pi Session Lineage
 
@@ -202,7 +202,7 @@ The Pi extension reads the parent header once at session start and pushes its st
 
 [[src-tauri/src/live_tracker.rs#LiveTracker#overlay]] derives live child lists from the existing bounded session map on each read. It stores no second graph: provider disable, activity disable, and idle eviction remove the source sessions and therefore their links. Children remain independent rows with parent metadata; a parent receives only concurrently live children whose complete chain resolved.
 
-Session notify carries the same pushed proof, and Search stores its linked parent id in each Pi document. Root and unresolved proof clear any parser fallback. The Sessions view navigates from a child result to its provider-qualified parent without exposing the filesystem path.
+Session notify carries the same pushed proof captured at start, including post-turn refreshes, and Search stores its linked parent id in each Pi document. Root and unresolved proof clear parser fallback. Sessions navigate to the provider-qualified parent without exposing paths.
 
 ## Model Observation Reconciliation
 
@@ -234,9 +234,11 @@ The [[src-tauri/src/storage.rs#Storage#get_model_usage_overview|overview]] and [
 
 After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted running history to pending and reserves one nonblocking migration/resume worker. Explicit [[src-tauri/src/lib.rs#retry_model_history_backfill]] uses the same reservation before changing durable state, so concurrent retries are idempotent and an unowned persisted `running` row is safely recovered; live work can finish under the shared permit before the pending retained pass starts.
 
-[[src-tauri/src/sessions.rs#SessionIndex#startup_scan]] uses the same concrete provider walkers as retained inventory but consumes their permissive search view. Search keeps original filesystem paths with nanosecond-mtime-and-size fingerprints and remains parent-session aware, while analytics derives canonical containment and root-completeness proofs separately. Search extraction and scan failures cannot suppress startup or periodic analytics reconciliation.
+[[src-tauri/src/sessions.rs#SessionIndex#startup_scan]] scans retained Claude and Codex roots through their concrete walkers. Pi search indexing instead reads only the path accepted by `sessions/notify`, with canonical containment under the configured Pi root.
 
-[[src-tauri/src/transcript_watcher.rs#start]] recursively watches distinct Claude, Codex, and Pi transcript roots. It admits debounced JSONL changes through strict validation and runs the shared Session Search sync. Missing, changed, or failed watches retry every 120 seconds; ambiguous canonical roots are rejected.
+[[src-tauri/src/transcript_watcher.rs#start]] recursively watches distinct Claude and Codex transcript roots. It admits debounced JSONL changes through strict validation. Missing or failed watches retry every 120 seconds, and ambiguous canonical roots are rejected.
+
+Nonempty watcher batches, recovery events, and newly attached Claude or Codex roots rerun the incremental Session Search scan. Because startup scan enumerates only retained Claude and Codex roots, this recovery path cannot scan Pi.
 
 [[src/hooks/useModelAnalytics.ts#useModelAnalytics]] requests only one command-and-arguments-scoped overview through the process-lifetime invoke cache. Data-changing model events invalidate that key and join the shared five-second-or-longer mounted fan-out; the 60-second fallback poll follows the same path. Each accepted overview advances the frontend refresh generation and updates both [[src/components/widget/views/ModelsView.tsx#ModelsView]] bands as one unit. The widget has no selected-model paging or lazy chain-history request to fan out.
 
@@ -244,12 +246,12 @@ After storage initializes, [[src-tauri/src/lib.rs#run]] resets interrupted runni
 
 Session transcripts are indexed for full-text search with enriched metadata, while provider-aware side tables keep tool and latency data distinct.
 
-1. Claude Code writes session JSONL files to `~/.claude/projects/`, Codex writes rollout transcripts to `~/.codex/sessions/`, and Pi writes tree sessions to its persisted lifecycle session directory
-2. When Session Search opens, [[src-tauri/src/sessions.rs]] scans all three provider roots incrementally by mtime; enabling Pi runs the same full sync for existing sessions
-3. Provider hook scripts can also post `POST /api/v1/sessions/notify` with JSONL path plus provider metadata, while incremental remote sync can push `POST /api/v1/sessions/messages`
+1. Claude Code writes session JSONL files to `~/.claude/projects/`, Codex writes rollout transcripts to `~/.codex/sessions/`, and Pi writes tree sessions to its configured session directory
+2. When Session Search opens, [[src-tauri/src/sessions.rs#SessionIndex#startup_scan]] scans Claude and Codex incrementally by mtime; Pi is never scanned
+3. Provider hooks post `POST /api/v1/sessions/notify` with a JSONL path and provider metadata; Pi also pushes its stable session identity and lineage proof, while remote sync can push `POST /api/v1/sessions/messages`
 4. `notify` requests acknowledge first, then feed independent search and analytics schedulers; remote `messages` requests acknowledge only after source-less analytics commits, while Tantivy indexing remains asynchronous and best effort
 5. Local Claude full-transcript sync runs on `Stop`, `StopFailure`, and `SessionEnd` instead of every `PostToolUse`, so full-file reindexing happens only at terminal boundaries
-6. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details; Pi uses the session header id and indexes each text-bearing message entry once by entry id
+6. Provider-specific parsers enrich messages: Claude tool blocks and Codex function/custom tool calls become tools_used, files_modified, code_changes, commands_run, and tool details; Pi's narrow parser indexes each text-bearing message once by entry id under the pushed identity
 7. Indexed into Tantivy with fields: provider, message_id, session_id, content, role, project, host, timestamp, git_branch, plus enriched metadata
 8. Retained runtime, response, tool, skill, and hook rows persist in provider-aware SQLite snapshots owned by canonical transcript source; remote message and hook pushes use separate source-less identities
 9. Frontend search queries use TF-IDF weighted scoring with snippet generation

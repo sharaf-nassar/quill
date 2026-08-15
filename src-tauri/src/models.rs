@@ -425,8 +425,8 @@ pub struct SessionBreakdown {
     /// Current transcript snapshot's open native agents. Null is unknown;
     /// an empty vector is covered with none open.
     pub observed_agents: Option<Vec<ObservedSessionAgent>>,
-    /// Concurrent Pi children whose `parentSession` chains resolve to this
-    /// session. This is lineage activity, not a native agent count.
+    /// Concurrent Pi children whose pushed lineage links to this session.
+    /// This is lineage activity, not a native agent count.
     pub live_linked_sessions: Option<Vec<ObservedLinkedSession>>,
     /// True when current-process hook evidence supplied the row before the
     /// first retained token snapshot made its metrics available.

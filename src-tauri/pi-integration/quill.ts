@@ -968,7 +968,7 @@ function registerHandler(pi, config, event, handler) {
 }
 
 function registerTracking(pi, config) {
-  const state = { lastError: null };
+  const state = { lastError: null, notify: null };
   const activity = (event, ctx, name) => {
     defer(config, () => {
       const info = sessionInfo(ctx);
@@ -981,6 +981,7 @@ function registerTracking(pi, config) {
     defer(config, () => {
       const info = sessionInfo(ctx);
       const { lineage, previousSessionId } = resolveStart(event, info);
+      state.notify = { info, lineage };
       const timestamp = isoTimestamp(info.header?.timestamp);
       postTelemetry(config, event, ctx, EVENT_MAP.session_start);
       const handshake = trackEvent(config, state, info, "session_start", {
@@ -1110,6 +1111,9 @@ function registerTracking(pi, config) {
       const timestamp = isoTimestamp(event.message?.timestamp);
       postTelemetry(config, event, ctx, EVENT_MAP.turn_end);
       void trackEvent(config, state, info, "activity", { timestamp }, `turn:${event.turnIndex}`);
+      if (state.notify) {
+        void notifySession(config, state, state.notify.info, state.notify.lineage);
+      }
       return runtimeMessage(config, state, info, {
         uuid: stableId("pi_msg", info.id, "turn", event.turnIndex, timestamp),
         type: "assistant",

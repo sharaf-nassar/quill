@@ -70,6 +70,10 @@ A valid session-start envelope lowercases and shortens its hostname once, then u
 
 A valid Pi session file creates one provider-isolated live session from transcript evidence.
 
+## Recursive Candidate Collection
+
+The temporary live-fold fallback discovers nested Pi JSONL transcripts and ignores other files.
+
 ## Header Cwd
 
 The live session takes cwd from the Pi session header rather than decoding its lossy directory name.

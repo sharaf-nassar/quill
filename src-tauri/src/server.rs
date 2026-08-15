@@ -1072,18 +1072,22 @@ fn process_session_notify_payload(
     session_index: Arc<sessions::SessionIndex>,
     payload: SessionNotifyPayload,
 ) -> Result<usize, String> {
+    let count = index_session_notify_payload(&session_index, payload)?;
+    let _ = app_handle.emit("sessions-index-updated", count);
+    Ok(count)
+}
+
+fn index_session_notify_payload(
+    session_index: &sessions::SessionIndex,
+    payload: SessionNotifyPayload,
+) -> Result<usize, String> {
     let path = PathBuf::from(&payload.jsonl_path);
 
     let mut extracted = sessions::extract_messages_from_jsonl(payload.provider, &path);
     if payload.provider == IntegrationProvider::Pi {
-        let parent_session_id = pushed_pi_parent(
-            payload.lineage.as_ref(),
-            extracted
-                .messages
-                .first()
-                .and_then(|message| message.parent_session_id.clone()),
-        );
+        let parent_session_id = pushed_pi_parent(payload.lineage.as_ref());
         for message in &mut extracted.messages {
+            message.session_id.clone_from(&payload.session_id);
             message.parent_session_id.clone_from(&parent_session_id);
         }
     }
@@ -1127,11 +1131,12 @@ fn process_session_notify_payload(
         .clone()
         .filter(|host| !host.is_empty())
         .unwrap_or_else(|| "local".to_string());
-    let session_id = if extracted.session_id.is_empty() {
-        payload.session_id.clone()
-    } else {
-        extracted.session_id.clone()
-    };
+    let session_id =
+        if payload.provider == IntegrationProvider::Pi || extracted.session_id.is_empty() {
+            payload.session_id.clone()
+        } else {
+            extracted.session_id.clone()
+        };
 
     let count = session_index.replace_session_docs_batch(
         payload.provider,
@@ -1140,20 +1145,19 @@ fn process_session_notify_payload(
         &host,
         &extracted.messages,
     )?;
-    let _ = app_handle.emit("sessions-index-updated", count);
-
     Ok(count)
 }
 
-fn pushed_pi_parent(
-    lineage: Option<&PiLineage>,
-    transcript_parent: Option<String>,
-) -> Option<String> {
+fn pushed_pi_parent(lineage: Option<&PiLineage>) -> Option<String> {
     match lineage {
         Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
         Some(PiLineage::Root | PiLineage::Unresolved { .. }) => None,
-        None => transcript_parent,
+        None => None,
     }
+}
+
+fn allows_unvalidated_search_notify(provider: IntegrationProvider) -> bool {
+    provider != IntegrationProvider::Pi
 }
 
 fn index_session_messages_in_background(
@@ -1906,12 +1910,12 @@ async fn post_session_notify(
     {
         Ok(Ok(source)) => source,
         Ok(Err(sessions::RetainedNotifySourceValidationError::Invalid(message))) => {
-            // Model-analytics enumeration must not change existing Session
-            // Search indexing. A path that fails the stricter model-source
-            // policy (wrong layout, symlinked outside the canonical root, a
-            // non-`.jsonl` name, and so on) is still indexed for search
-            // whenever the pre-analytics contract would have accepted it: a
-            // naive existence check. Only model admission is skipped for it.
+            // Legacy providers preserve their pre-analytics search-only
+            // fallback. Pi requires canonical containment under its configured
+            // root before either queue may admit the transcript.
+            if !allows_unvalidated_search_notify(provider) {
+                return (StatusCode::BAD_REQUEST, message.to_string());
+            }
             if !std::path::Path::new(&payload.jsonl_path).exists() {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1932,7 +1936,7 @@ async fn post_session_notify(
         }
         Ok(Err(sessions::RetainedNotifySourceValidationError::Unavailable(message))) => {
             queue_validation_retry(state.clone(), payload.clone());
-            if state.session_index.is_some() {
+            if allows_unvalidated_search_notify(provider) && state.session_index.is_some() {
                 queue_session_notify(state.clone(), payload);
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1944,7 +1948,7 @@ async fn post_session_notify(
         Err(error) => {
             log::error!("Session notify source validation task failed: {error}");
             queue_validation_retry(state.clone(), payload.clone());
-            if state.session_index.is_some() {
+            if allows_unvalidated_search_notify(provider) && state.session_index.is_some() {
                 queue_session_notify(state.clone(), payload);
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2432,30 +2436,108 @@ mod observed_subagent_tests {
     // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Pushed Search Parent]]
     #[test]
     fn pi_notify_parent_uses_pushed_proof_instead_of_transcript_parent() {
-        let transcript_parent = || Some("transcript-parent".to_string());
         assert_eq!(
-            pushed_pi_parent(
-                Some(&PiLineage::Linked {
-                    parent_session_id: "pushed-parent".into(),
-                }),
-                transcript_parent(),
-            )
+            pushed_pi_parent(Some(&PiLineage::Linked {
+                parent_session_id: "pushed-parent".into(),
+            }))
             .as_deref(),
             Some("pushed-parent")
         );
+        assert_eq!(pushed_pi_parent(Some(&PiLineage::Root)), None);
         assert_eq!(
-            pushed_pi_parent(Some(&PiLineage::Root), transcript_parent()),
+            pushed_pi_parent(Some(&PiLineage::Unresolved {
+                reason: "parent_header_unavailable".into(),
+            })),
             None
         );
-        assert_eq!(
-            pushed_pi_parent(
-                Some(&PiLineage::Unresolved {
-                    reason: "parent_header_unavailable".into(),
-                }),
-                transcript_parent(),
+        assert_eq!(pushed_pi_parent(None), None);
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Notify Identity And Parent]]
+    #[test]
+    fn pi_notify_indexes_named_transcript_under_pushed_identity_and_parent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("named.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"session","version":3,"id":"header-id","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"entry-id","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"user","content":"notify-index-needle"}}"#,
+                "\n",
             ),
-            None
+        )
+        .expect("write Pi transcript");
+        let index =
+            sessions::SessionIndex::open_or_create(&temp.path().join("index")).expect("open index");
+        let payload = SessionNotifyPayload {
+            provider: IntegrationProvider::Pi,
+            session_id: "pushed-id".into(),
+            jsonl_path: transcript.to_string_lossy().into_owned(),
+            host: Some("host".into()),
+            cwd: Some("/work/quill".into()),
+            project: Some("quill".into()),
+            git_branch: None,
+            lineage: Some(PiLineage::Linked {
+                parent_session_id: "pushed-parent".into(),
+            }),
+        };
+
+        assert_eq!(index_session_notify_payload(&index, payload).unwrap(), 1);
+        index.reader.reload().expect("reload index");
+        let result = index
+            .search(
+                "notify-index-needle",
+                &sessions::SearchFilters {
+                    provider: Some(IntegrationProvider::Pi),
+                    ..sessions::SearchFilters::default()
+                },
+                "relevance",
+                0,
+                10,
+            )
+            .expect("search Pi notify result");
+        assert_eq!(result.total_hits, 1);
+        assert_eq!(result.hits[0].session_id, "pushed-id");
+        assert_eq!(
+            result.hits[0].parent_session_id.as_deref(),
+            Some("pushed-parent")
         );
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Configured Root Containment]]
+    #[test]
+    #[serial_test::serial]
+    fn pi_notify_never_falls_back_to_unvalidated_search_admission() {
+        struct DemoEnv;
+        impl Drop for DemoEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    std::env::remove_var("QUILL_DEMO_MODE");
+                    std::env::remove_var("QUILL_PI_SESSIONS_DIR");
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("pi-sessions");
+        std::fs::create_dir_all(&root).expect("create Pi root");
+        let external = temp.path().join("outside.jsonl");
+        std::fs::write(&external, "{}\n").expect("write outside transcript");
+        unsafe {
+            std::env::set_var("QUILL_DEMO_MODE", "1");
+            std::env::set_var("QUILL_PI_SESSIONS_DIR", &root);
+        }
+        let _env = DemoEnv;
+
+        assert!(matches!(
+            sessions::validate_retained_notify_source(IntegrationProvider::Pi, &external),
+            Err(sessions::RetainedNotifySourceValidationError::Invalid(_))
+        ));
+        assert!(!allows_unvalidated_search_notify(IntegrationProvider::Pi));
+        assert!(allows_unvalidated_search_notify(
+            IntegrationProvider::Claude
+        ));
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Rate Headroom]]

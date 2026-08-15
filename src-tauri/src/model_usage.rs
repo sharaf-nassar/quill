@@ -19,7 +19,7 @@ use crate::integrations::IntegrationProvider;
 use crate::models::{
     ModelAnalyticsUpdatedEvent, ModelBackfillDiagnostic, ModelBackfillState, ModelBackfillStatus,
 };
-use crate::pi_session::{PiSessionEntry, parse_pi_session_values};
+use crate::pi_session::parse_pi_session_values;
 use crate::sessions::{
     DiscoveredRetainedJsonlSource, ProviderRootEnumerationOutcome, ProviderSourceRoot,
     RetainedJsonlSourceLayoutHint,
@@ -1304,7 +1304,7 @@ pub(crate) fn parse_pi_model_usage_jsonl(
     let parsed_entry_ids = session
         .entries
         .iter()
-        .map(|entry| entry.base().id.as_str())
+        .map(|entry| entry.base.id.as_str())
         .collect::<HashSet<_>>();
     let ordinals = decoded
         .iter()
@@ -1354,9 +1354,6 @@ pub(crate) fn parse_pi_model_usage_jsonl(
         .filter(|timestamp| *timestamp >= 0);
     let mut last_activity_at_ms = first_activity_at_ms;
     for entry in &session.entries {
-        let PiSessionEntry::Message(entry) = entry else {
-            continue;
-        };
         if entry.message.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
@@ -2714,26 +2711,6 @@ pub(crate) fn commit_next_model_source_batch(
     }
 
     Ok(batch)
-}
-
-#[cfg(test)]
-pub(crate) fn reconcile_source_for_test(
-    storage: &Storage,
-    source: DiscoveredRetainedJsonlSource,
-) -> Result<(), String> {
-    let mut permit =
-        try_acquire_model_usage_runner().ok_or_else(|| "Model usage runner is busy".to_string())?;
-    let mut plan = prepare_scoped_model_source_reconciliation(storage, &[source], 1, &mut permit)?;
-    while let Some(staged) = plan.pending_sources.front() {
-        commit_staged_model_source(
-            storage,
-            staged,
-            plan.generation,
-            ModelSourceCommitMode::Live,
-        )?;
-        plan.pending_sources.pop_front();
-    }
-    Ok(())
 }
 
 #[derive(Default)]

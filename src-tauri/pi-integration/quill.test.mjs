@@ -364,6 +364,45 @@ test("session start resolves lineage once and notifies only persisted sessions",
   });
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Turn-end search freshness]]
+test("turn end repeats the start notify with unchanged lineage", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const parent = join(process.env.HOME, "parent.jsonl");
+    const child = join(process.env.HOME, "child.jsonl");
+    writeFileSync(parent, `${JSON.stringify({ type: "session", id: "parent-id" })}\n`);
+    writeFileSync(child, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
+    const pi = fakePi();
+    quill(pi.api);
+    const calls = [];
+    const oldFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), body: JSON.parse(options.body) });
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      const ctx = context("child-id", { sessionFile: child, parentSession: parent });
+      pi.handlers.get("session_start")[0](
+        { type: "session_start", reason: "fork", previousSessionFile: parent },
+        ctx,
+      );
+      await flushRequests();
+      writeFileSync(parent, "malformed");
+      pi.handlers.get("turn_end")[0]({ type: "turn_end", turnIndex: 0 }, ctx);
+      await flushRequests();
+
+      const notifies = calls.filter((call) => call.url.endsWith("/api/v1/sessions/notify"));
+      assert.equal(notifies.length, 2);
+      assert.deepEqual(notifies[1].body, notifies[0].body);
+      assert.deepEqual(notifies[1].body.lineage, {
+        kind: "linked",
+        parent_session_id: "parent-id",
+      });
+    } finally {
+      globalThis.fetch = oldFetch;
+    }
+  });
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Stable teardown identity]]
 test("session event identity survives extension teardown", async () => {
   await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {

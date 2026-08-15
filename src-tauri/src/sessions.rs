@@ -341,12 +341,6 @@ pub(crate) fn enumerate_retained_jsonl_source_roots() -> Vec<ProviderSourceRoot>
     ]
 }
 
-fn enumerate_session_search_roots() -> Vec<ProviderSourceRoot> {
-    let mut roots = enumerate_retained_jsonl_source_roots();
-    roots.push(enumerate_pi_session_search_root());
-    roots
-}
-
 /// Stable identities for every configured retained transcript root.
 ///
 /// Callers that serialize whole-root work use these identities before walking
@@ -376,19 +370,6 @@ pub(crate) fn enumerate_codex_retained_jsonl_source_root() -> ProviderSourceRoot
         CODEX_SOURCE_ROOT_KEY,
         crate::data_paths::resolve_codex_sessions_dir(),
         collect_codex_jsonl_candidates,
-    )
-}
-
-fn enumerate_pi_session_search_root() -> ProviderSourceRoot {
-    let root = crate::data_paths::resolve_pi_sessions_dir().unwrap_or_else(|error| {
-        log::warn!("Failed to resolve Pi transcript root: {error}");
-        std::env::temp_dir().join("quill-unavailable-pi-sessions")
-    });
-    enumerate_provider_source_root(
-        IntegrationProvider::Pi,
-        PI_SOURCE_ROOT_KEY,
-        root,
-        collect_pi_jsonl_candidates,
     )
 }
 
@@ -1514,7 +1495,7 @@ impl SessionIndex {
         let mut state = self.state.lock().unwrap();
         let hostname = Self::local_hostname();
         let mut writer = self.writer.lock().unwrap();
-        let roots = enumerate_session_search_roots();
+        let roots = enumerate_retained_jsonl_source_roots();
         let discovered_paths = roots
             .iter()
             .flat_map(|root| &root.sources)
@@ -3620,7 +3601,6 @@ fn extract_pi_messages(
             return unsupported_extracted_session(path);
         }
     };
-    let parent_session_id = crate::pi_session::resolve_pi_parent_session_id(path, &session.header);
     let session_id = session.header.id;
     let cwd = session.header.cwd;
     let project_name = Path::new(&cwd)
@@ -3632,9 +3612,6 @@ fn extract_pi_messages(
         .entries
         .into_iter()
         .filter_map(|entry| {
-            let crate::pi_session::PiSessionEntry::Message(entry) = entry else {
-                return None;
-            };
             if !seen.insert(entry.base.id.clone()) {
                 return None;
             }
@@ -3646,7 +3623,7 @@ fn extract_pi_messages(
             Some(ExtractedMessage {
                 uuid: entry.base.id,
                 session_id: session_id.clone(),
-                parent_session_id: parent_session_id.clone(),
+                parent_session_id: None,
                 role,
                 content,
                 timestamp: entry.base.timestamp,
@@ -4742,30 +4719,9 @@ pub(crate) fn find_session_path(
             let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
             find_codex_session_path_in(&sessions_dir, session_id)
         }
-        IntegrationProvider::Pi => {
-            let sessions_dir = crate::data_paths::resolve_pi_sessions_dir()?;
-            find_pi_session_path_in(&sessions_dir, session_id)
-        }
+        IntegrationProvider::Pi => Ok(None),
         IntegrationProvider::MiniMax => Ok(None),
     }
-}
-
-fn find_pi_session_path_in(
-    sessions_dir: &Path,
-    session_id: &str,
-) -> Result<Option<PathBuf>, String> {
-    unique_session_path(
-        IntegrationProvider::Pi,
-        session_id,
-        collect_pi_jsonl_candidates(sessions_dir, IntegrationProvider::Pi, &mut None)
-            .candidates
-            .into_iter()
-            .filter(|source| {
-                extract_messages_from_jsonl(IntegrationProvider::Pi, &source.path).session_id
-                    == session_id
-            })
-            .map(|source| source.path),
-    )
 }
 
 fn find_codex_session_path_in(
@@ -5195,8 +5151,9 @@ mod tests {
         );
     }
 
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#No Root Scan]]
     #[test]
-    fn pi_session_lookup_uses_header_id_instead_of_filename() {
+    fn pi_session_lookup_does_not_walk_the_transcript_root() {
         let temp = TempDir::new().expect("tempdir");
         let nested = temp.path().join("--work-quill--");
         fs::create_dir_all(&nested).expect("create Pi project directory");
@@ -5213,12 +5170,12 @@ mod tests {
         .expect("write Pi transcript");
 
         assert_eq!(
-            find_pi_session_path_in(temp.path(), "pi-header-id").expect("find Pi session"),
-            Some(transcript)
+            find_session_path(IntegrationProvider::Pi, "pi-header-id"),
+            Ok(None)
         );
     }
 
-    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Message Identity And Extraction]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Message Extraction]]
     #[test]
     fn pi_extraction_uses_header_identity_and_deduplicates_entry_ids() {
         let transcript = concat!(
@@ -5255,7 +5212,7 @@ mod tests {
         );
     }
 
-    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Recursive Candidate Collection]]
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Recursive Candidate Collection]]
     #[test]
     fn pi_candidate_collection_accepts_nested_jsonl_files_only() {
         let temp = TempDir::new().expect("tempdir");
@@ -5282,7 +5239,7 @@ mod tests {
         ));
     }
 
-    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Provider Safe Search]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Search]]
     #[test]
     fn pi_search_hits_and_facets_keep_provider_identity() {
         let temp = TempDir::new().expect("tempdir");
@@ -5334,58 +5291,7 @@ mod tests {
         );
     }
 
-    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Parent Session Search Metadata]]
-    #[test]
-    fn pi_search_hit_resolves_parent_path_to_header_identity() {
-        let root = TempDir::new().expect("tempdir");
-        let project = root.path().join("--work-quill--");
-        fs::create_dir_all(&project).expect("create project dir");
-        let parent = project.join("parent.jsonl");
-        let child = project.join("child.jsonl");
-        fs::write(
-            &parent,
-            "{\"type\":\"session\",\"version\":3,\"id\":\"stable-parent\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"/work/quill\"}\n",
-        )
-        .expect("write parent");
-        fs::write(
-            &child,
-            format!(
-                "{{\"type\":\"session\",\"version\":3,\"id\":\"stable-child\",\"timestamp\":\"2026-08-14T08:00:01Z\",\"cwd\":\"/work/quill\",\"parentSession\":{}}}\n{{\"type\":\"message\",\"id\":\"child-message\",\"parentId\":null,\"timestamp\":\"2026-08-14T08:00:02Z\",\"message\":{{\"role\":\"user\",\"content\":\"lineage-needle\"}}}}\n",
-                serde_json::to_string(&parent).expect("encode parent path")
-            ),
-        )
-        .expect("write child");
-        let messages = extract_messages_from_jsonl(IntegrationProvider::Pi, &child).messages;
-        let index_dir = TempDir::new().expect("index tempdir");
-        let index = SessionIndex::open_or_create(index_dir.path()).expect("open index");
-        index
-            .replace_session_docs_batch(
-                IntegrationProvider::Pi,
-                "stable-child",
-                "quill",
-                "host",
-                &messages,
-            )
-            .expect("index child");
-        index.reader.reload().expect("reload index");
-
-        let result = index
-            .search(
-                "lineage-needle",
-                &SearchFilters::default(),
-                "relevance",
-                0,
-                10,
-            )
-            .expect("search child");
-        assert_eq!(
-            result.hits[0].parent_session_id.as_deref(),
-            Some("stable-parent")
-        );
-        assert_eq!(result.hits[0].provider, IntegrationProvider::Pi);
-    }
-
-    // @lat: [[pi-watcher-index-tests#Pi Watcher And Index Test Specs#Provider Safe Cleanup]]
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Cleanup]]
     #[test]
     fn pi_cleanup_does_not_delete_same_id_from_other_providers() {
         let temp = TempDir::new().expect("tempdir");

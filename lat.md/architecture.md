@@ -71,7 +71,7 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | HTTP server | [[src-tauri/src/server.rs]] | Axum API on port 19876 for hook data ingestion |
 | Storage | [[src-tauri/src/storage.rs]] | SQLite schema, migrations, queries, aggregation |
 | Sessions | [[src-tauri/src/sessions.rs]] | Tantivy full-text indexing of session transcripts |
-| Pi session format | [[src-tauri/src/pi_session.rs]] | Tolerant v2/v3 JSONL tree parsing and active-path resolution |
+| Pi session format | [[src-tauri/src/pi_session.rs]] | Narrow v2/v3 message parsing and bounded header probes for search and temporary live fallback |
 | Learning | [[src-tauri/src/learning.rs]] | Two-stream LLM analysis for behavioral pattern discovery |
 | Memory optimizer | [[src-tauri/src/memory_optimizer.rs]] | LLM-driven memory file optimization |
 | Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
@@ -131,7 +131,7 @@ All tasks that touch the database or network MUST be spawned async — never blo
 - **Learning periodic timer**: Runs behavioral analysis every N minutes if configured
 - **Integration refresh + tray summary**: One merged task runs `startup_refresh` (detect providers, save, emit `integrations-updated`) then populates tray summary items. Merged to avoid redundant `detect_all` subprocess calls.
 - **Live usage refresh**: Background loop that updates the main widget and tray summary rows. The enable flag (`live_usage.enabled`) and refresh interval (`live_usage.interval_seconds`, 60–600, default 180) are read from the settings table on every iteration so the [[features#Settings Window]] can adjust both at runtime.
-- **Transcript rescan loop**: Always-on incremental rescan of the Claude, Codex, and configured Pi transcript roots via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Every 120 seconds it enqueues each changed canonical source once; one coordinator tracks independent model and transcript completion, retry, and events. A separate [[src-tauri/src/lib.rs#spawn_startup_model_source_reconciliation]] pass re-admits retained model inventory after every launch. Unchanged sources are cheap stat-only no-ops.
+- **Transcript rescan loop**: Always-on incremental rescan of the Claude and Codex transcript roots via [[src-tauri/src/lib.rs#spawn_transcript_rescan_loop]]. Every 120 seconds it enqueues each changed canonical source once; one coordinator tracks independent model and transcript completion, retry, and events. A separate [[src-tauri/src/lib.rs#spawn_startup_model_source_reconciliation]] pass re-admits retained model inventory after every launch. Unchanged sources are cheap stat-only no-ops.
 - **Rule filesystem watcher**: Optional. The `rule_watcher.enabled` setting (default true) is checked at startup; disabling skips the `notify` watcher entirely. Live re-toggling takes effect after the next app launch since the watcher holds an OS handle.
 - **Tray "Check for Update"**: Manual trigger via system tray menu. Uses `tauri-plugin-dialog` to show a native OS confirmation dialog when an update is found (Install / Not Now), or an info dialog when already up to date. The frontend still performs its own 4-hour availability check via `@tauri-apps/plugin-updater`, but the titlebar install action now delegates to [[src-tauri/src/lib.rs#install_app_update]] so Rust owns the install-and-restart boundary.
 

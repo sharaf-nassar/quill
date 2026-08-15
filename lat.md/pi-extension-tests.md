@@ -26,6 +26,10 @@ Handlers push versioned lifecycle, per-message usage, model, activity, and sourc
 
 Session start sends the handshake, resolves one stable parent header id, and notifies indexing only when a transcript path exists.
 
+## Turn-end search freshness
+
+After Pi persists a turn, the extension repeats notify with the transcript identity and lineage captured at session start.
+
 ## Stable teardown identity
 
 Reloading the extension for the same session header reproduces the same lifecycle event id so retries remain idempotent across teardown.
