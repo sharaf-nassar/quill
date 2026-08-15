@@ -639,6 +639,7 @@ fn ingest_pi_track(
                     &event.session_id,
                     &host,
                     cwd.as_deref(),
+                    *ephemeral,
                     at,
                     previous_session_id.as_deref(),
                 );

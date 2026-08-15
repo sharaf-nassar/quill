@@ -26,6 +26,18 @@ A pushed Pi session with no shutdown ages out through the shared 15-minute idle 
 
 Migration 42 and the lifecycle upsert preserve the ephemeral flag with Pi's cwd and normalized hostname in `live_analytics_sessions`.
 
+## Ephemeral Live Overlay
+
+A pushed ephemeral start marks its live Sessions row immediately, before any usage or transcript evidence exists.
+
+## Ephemeral Breakdown Persistence
+
+An ephemeral lifecycle origin remains a Sessions row after shutdown and combines pushed usage and source-less turn activity without creating ordinary lifecycle-only rows.
+
+## Ephemeral Badge
+
+The Sessions identity renders a neutral, accessible EPHEMERAL badge only for rows whose additive breakdown flag is true.
+
 ## Extension Health Persistence
 
 One atomic settings write records the handshake protocol, extension version, minimum Quill version, last report time, and typed last error.
@@ -88,7 +100,7 @@ A live Pi row renders the cumulative total maintained by pushed usage instead of
 
 ## Ephemeral No Op
 
-A Pi conversation with no session file produces no live row.
+The retained Pi transcript fold produces no row from a missing file; pushed lifecycle owns visibility for true ephemeral sessions.
 
 ## Bounded Large Branch Tail
 

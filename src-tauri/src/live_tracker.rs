@@ -57,6 +57,8 @@ struct LiveSession {
     started_at: Option<DateTime<Utc>>,
     /// The project the session runs in, from the same first record.
     cwd: Option<String>,
+    /// Whether Pi intentionally omitted a transcript for this session.
+    ephemeral: bool,
     /// Upstream provider and model from Pi's newest assistant message.
     model_provider: Option<String>,
     model: Option<String>,
@@ -591,6 +593,7 @@ impl LiveTracker {
         session_id: &str,
         host: &str,
         cwd: Option<&str>,
+        ephemeral: bool,
         at: DateTime<Utc>,
         previous_session_id: Option<&str>,
     ) -> bool {
@@ -629,6 +632,7 @@ impl LiveTracker {
                     last_activity: at,
                     started_at: Some(at),
                     cwd: observed_root_cwd(cwd),
+                    ephemeral,
                     ..LiveSession::default()
                 }
             });
@@ -640,6 +644,10 @@ impl LiveTracker {
         let cwd = observed_root_cwd(cwd);
         if cwd.is_some() && session.cwd != cwd {
             session.cwd = cwd;
+            changed = true;
+        }
+        if session.ephemeral != ephemeral {
+            session.ephemeral = ephemeral;
             changed = true;
         }
         drop(state);
@@ -969,6 +977,7 @@ impl LiveTracker {
             let Some(session) = state.sessions.get(&key) else {
                 continue;
             };
+            row.ephemeral = session.ephemeral;
             row.observed_agents = Some(session.open_agents(now));
             row.pi_lineage = session.lineage.clone();
             row.parent_session_id = match &session.lineage {
@@ -1014,6 +1023,7 @@ impl LiveTracker {
                         _ => None,
                     },
                     pi_lineage: session.lineage.clone(),
+                    ephemeral: session.ephemeral,
                     hostname: key.host.clone(),
                     total_tokens: session.live_tokens.unwrap_or(0),
                     turn_count: 0,
@@ -2139,6 +2149,7 @@ mod tests {
             "first",
             "HOST.EXAMPLE.COM",
             Some("/work/quill"),
+            false,
             started,
             None,
         ));
@@ -2151,6 +2162,7 @@ mod tests {
             "second",
             "host.example.com",
             Some("/work/quill"),
+            false,
             started + TimeDelta::seconds(1),
             Some("first"),
         ));
@@ -2171,11 +2183,12 @@ mod tests {
     fn pi_push_reload_continues_same_session_and_ignores_stale_shutdown() {
         let tracker = LiveTracker::new(None);
         let started = parse("2026-08-14T08:00:00Z");
-        tracker.start_pi_session("same", "host", Some("/old"), started, None);
+        tracker.start_pi_session("same", "host", Some("/old"), false, started, None);
         tracker.start_pi_session(
             "same",
             "host",
             Some("/new"),
+            false,
             started + TimeDelta::minutes(1),
             None,
         );
@@ -2193,7 +2206,7 @@ mod tests {
     fn pi_push_activity_model_lineage_and_tokens_update_existing_session_only() {
         let tracker = LiveTracker::new(None);
         let started = parse("2026-08-14T08:00:00Z");
-        tracker.start_pi_session("live", "host", Some("/work"), started, None);
+        tracker.start_pi_session("live", "host", Some("/work"), false, started, None);
 
         assert!(tracker.record_pi_activity("live", "host", started + TimeDelta::seconds(1),));
         assert!(tracker.set_pi_model("live", "host", "anthropic", "claude-sonnet-4-5"));
@@ -2231,7 +2244,7 @@ mod tests {
         let tracker = LiveTracker::new(None);
         let started = parse("2026-08-14T08:00:00Z");
         for session_id in ["root", "linked", "unresolved"] {
-            tracker.start_pi_session(session_id, "host", Some("/work"), started, None);
+            tracker.start_pi_session(session_id, "host", Some("/work"), false, started, None);
         }
         tracker.set_pi_lineage("root", "host", crate::models::PiLineage::Root);
         tracker.set_pi_lineage(
@@ -2261,12 +2274,24 @@ mod tests {
         );
     }
 
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Live Overlay]]
+    #[test]
+    fn pi_ephemeral_start_marks_the_observed_session_row() {
+        let tracker = LiveTracker::new(None);
+        let started = parse("2026-08-14T08:00:00Z");
+        tracker.start_pi_session("ephemeral", "host", Some("/work"), true, started, None);
+
+        let (_, rows) = read_path(&tracker, Vec::new(), started + TimeDelta::seconds(1));
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ephemeral);
+    }
+
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Push Crash Eviction]]
     #[test]
     fn pi_push_session_is_evicted_from_last_event_age_and_late_end_is_a_no_op() {
         let tracker = LiveTracker::new(None);
         let started = parse("2026-08-14T08:00:00Z");
-        tracker.start_pi_session("crashed", "host", Some("/work"), started, None);
+        tracker.start_pi_session("crashed", "host", Some("/work"), false, started, None);
 
         tracker.sweep_in(&[], started + IDLE_AFTER + TimeDelta::seconds(1));
         assert!(tracker.session_ranking_keys().is_empty());
@@ -3545,6 +3570,7 @@ mod tests {
             session_id: "stored-root".to_owned(),
             parent_session_id: None,
             pi_lineage: None,
+            ephemeral: false,
             hostname: "overlay-host".to_owned(),
             total_tokens: 7,
             turn_count: 1,
@@ -3597,6 +3623,7 @@ mod tests {
             session_id: "remote-root".to_owned(),
             parent_session_id: None,
             pi_lineage: None,
+            ephemeral: false,
             hostname: "remote-host.example.com".to_owned(),
             total_tokens: 42,
             turn_count: 3,

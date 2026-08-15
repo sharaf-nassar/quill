@@ -13257,8 +13257,9 @@ impl Storage {
         // rollup aggregates parent + sub-agent rows within each tuple, not
         // across hostnames.
         //
-        // * tokens / first_seen / last_active come from `token_snapshots`
-        //   (the only source of per-row token amounts).
+        // * tokens / first_seen / last_active come from `token_snapshots`;
+        //   ephemeral lifecycle origins without usage contribute an honest
+        //   zero-token row until their first pushed usage snapshot arrives.
         // * turn_count is the lifetime count of completed root prompt/response
         //   pairs. Sub-agent turns and the selected token range do not change
         //   this session-lifetime fact.
@@ -13266,9 +13267,10 @@ impl Storage {
         //   snapshots, except token bookkeeping after a terminal hook is
         //   clamped to that hook. A newer response or transcript scan still
         //   reopens the session after this retained identity is merged.
-        // Rank only the cheap, range-scoped token groups plus each group's
-        // indexed response-time maximum. The top-N frontier plus any retained
-        // identities visible to the transcript scanner proceed to enrichment.
+        // Rank only the cheap, range-scoped token groups and ephemeral origins
+        // plus each group's indexed response-time maximum. The top-N frontier
+        // plus any retained identities visible to the transcript scanner
+        // proceed to enrichment.
         // Grouping is provider/session-led for every supported filter shape.
         // Pin that access path so planner statistics cannot substitute the
         // unrelated provider/timestamp skip-scan audited on the frozen corpus.
@@ -13321,10 +13323,40 @@ impl Storage {
             sql.push_str(&format!(" AND hostname = ?{hostname_param}"));
         }
 
-        sql.push_str(&format!(
+        sql.push_str(
             " GROUP BY provider, session_id, hostname
+             ), ephemeral AS MATERIALIZED (
+                 SELECT live.provider, live.session_id, live.hostname,
+                        0 AS total_tokens,
+                        live.updated_at AS first_seen,
+                        live.updated_at AS last_active_tok
+                 FROM live_analytics_sessions AS live
+                 WHERE live.ephemeral = 1
+                   AND live.hostname IS NOT NULL
+                   AND julianday(live.updated_at) >= julianday(?1)",
+        );
+
+        if provider_filter.is_some() {
+            sql.push_str(" AND live.provider = ?2");
+        }
+
+        if hostname.is_some() {
+            sql.push_str(&format!(" AND live.hostname = ?{hostname_param}"));
+        }
+
+        sql.push_str(&format!(
+            " ), session_evidence AS MATERIALIZED (
+                 SELECT * FROM tok
+                 UNION ALL
+                 SELECT ephemeral.* FROM ephemeral
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM tok
+                     WHERE tok.provider = ephemeral.provider
+                       AND tok.session_id = ephemeral.session_id
+                       AND tok.hostname = ephemeral.hostname
+                 )
              ), rankable AS MATERIALIZED (
-                 SELECT tok.*,
+                 SELECT session_evidence.*,
                         (SELECT MAX(rt.timestamp) FROM response_times rt
                           LEFT JOIN transcript_analytics_sources AS source
                             ON source.provider = rt.provider
@@ -13333,21 +13365,21 @@ impl Storage {
                             ON rt.source_key IS NULL
                            AND live.provider = rt.provider
                            AND live.session_id = rt.session_id
-                          WHERE rt.provider = tok.provider
-                            AND rt.session_id = tok.session_id
-                            AND COALESCE(source.hostname, live.hostname) = tok.hostname
+                          WHERE rt.provider = session_evidence.provider
+                            AND rt.session_id = session_evidence.session_id
+                            AND COALESCE(source.hostname, live.hostname) = session_evidence.hostname
                             AND rt.timestamp >= ?1) AS last_active_rt,
                         (SELECT h.timestamp FROM hook_invocations h
-                          WHERE h.provider = tok.provider
-                            AND h.session_id = tok.session_id
-                            AND h.hostname = tok.hostname
+                          WHERE h.provider = session_evidence.provider
+                            AND h.session_id = session_evidence.session_id
+                            AND h.hostname = session_evidence.hostname
                             AND h.is_sidechain = 0
                             AND h.hook_event IN ('Stop', 'StopFailure', 'SessionEnd')
                             AND julianday(h.timestamp) IS NOT NULL
                             AND julianday(h.timestamp) >= julianday(?1)
                           ORDER BY julianday(h.timestamp) DESC, h.timestamp DESC
                           LIMIT 1) AS ended_at
-                 FROM tok
+                 FROM session_evidence
              ), stored_activity AS NOT MATERIALIZED (
                  SELECT rankable.*,
                         CASE
@@ -13403,12 +13435,26 @@ impl Storage {
                                   OR ({ACTIVE_RUNTIME_SOURCE_PREDICATE}))), 0) AS turn_count,
                  candidates.first_seen,
                  candidates.last_active,
-                 (SELECT t.cwd FROM token_snapshots t
-                    WHERE t.provider = candidates.provider
-                      AND t.session_id = candidates.session_id
-                      AND t.timestamp >= ?1
-                      AND t.cwd IS NOT NULL
-                    ORDER BY t.timestamp DESC LIMIT 1) AS project
+                 COALESCE(
+                     (SELECT t.cwd FROM token_snapshots t
+                        WHERE t.provider = candidates.provider
+                          AND t.session_id = candidates.session_id
+                          AND t.timestamp >= ?1
+                          AND t.cwd IS NOT NULL
+                        ORDER BY t.timestamp DESC LIMIT 1),
+                     (SELECT live.cwd FROM live_analytics_sessions live
+                        WHERE live.provider = candidates.provider
+                          AND live.session_id = candidates.session_id
+                          AND live.hostname = candidates.hostname
+                          AND live.ephemeral = 1)
+                 ) AS project,
+                 COALESCE(
+                     (SELECT live.ephemeral FROM live_analytics_sessions live
+                        WHERE live.provider = candidates.provider
+                          AND live.session_id = candidates.session_id
+                          AND live.hostname = candidates.hostname),
+                     0
+                 ) AS ephemeral
              FROM candidates
              ORDER BY candidates.last_active DESC, candidates.provider ASC,
                       candidates.hostname ASC, candidates.session_id ASC"
@@ -13459,6 +13505,7 @@ impl Storage {
                     session_id: row.get(1)?,
                     parent_session_id: None,
                     pi_lineage: None,
+                    ephemeral: row.get(8)?,
                     hostname: row.get(2)?,
                     total_tokens: row.get(3)?,
                     turn_count: row.get(4)?,
@@ -14081,6 +14128,29 @@ impl Storage {
             .map_err(|error| format!("Insert pushed Pi usage observation: {error}"))?
             != 0;
         if inserted {
+            tx.execute(
+                "INSERT INTO token_snapshots (
+                     provider, session_id, hostname, timestamp, input_tokens,
+                     output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, cwd, is_sidechain, agent_id,
+                     parent_uuid
+                 )
+                 SELECT 'pi', session_id, hostname, ?2, ?3, ?4, ?5, ?6,
+                        cwd, 0, NULL, NULL
+                 FROM live_analytics_sessions
+                 WHERE provider = 'pi' AND session_id = ?1
+                   AND hostname = ?7 AND ephemeral = 1",
+                params![
+                    event.session_id,
+                    event.timestamp,
+                    input_tokens,
+                    output_tokens,
+                    cache_write_tokens,
+                    cache_read_tokens,
+                    hostname,
+                ],
+            )
+            .map_err(|error| format!("Store ephemeral Pi token snapshot: {error}"))?;
             tx.execute(
                 "UPDATE model_observation_sources
                  SET observation_count = observation_count + 1
@@ -19332,6 +19402,67 @@ mod tests {
             .expect("read Pi lifecycle row");
         assert_eq!(row, ("pi".into(), "/work/pi".into(), "host".into(), true));
         drop(storage);
+        clear_env();
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Breakdown Persistence]]
+    #[test]
+    #[serial]
+    fn ephemeral_pi_breakdown_persists_pushed_usage_and_activity() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let observed_at_ms = Utc::now().timestamp_millis();
+        let timestamp = DateTime::<Utc>::from_timestamp_millis(observed_at_ms)
+            .expect("valid timestamp")
+            .to_rfc3339();
+
+        storage
+            .upsert_pi_live_session("ephemeral", Some("/work/pi"), "host", true)
+            .expect("upsert ephemeral lifecycle");
+        storage
+            .store_pi_model_usage(
+                &pushed_pi_usage_event(
+                    "ephemeral-usage",
+                    "ephemeral",
+                    observed_at_ms,
+                    "anthropic/claude-sonnet-4-5",
+                    [10, 20, 30, 40],
+                ),
+                "host",
+                observed_at_ms,
+            )
+            .expect("store ephemeral usage");
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO response_times (
+                     provider, session_id, chain_id, timestamp, response_secs,
+                     is_sidechain
+                 ) VALUES ('pi', 'ephemeral', 'ephemeral', ?1, 1.0, 0)",
+                params![timestamp],
+            )
+            .expect("store ephemeral turn activity");
+            conn.execute(
+                "INSERT INTO live_analytics_sessions (
+                     provider, session_id, cwd, hostname, updated_at, ephemeral
+                 ) VALUES ('pi', 'ordinary', '/work/pi', 'host', ?1, 0)",
+                params![timestamp],
+            )
+            .expect("store ordinary lifecycle control");
+        }
+
+        let rows = storage
+            .get_session_breakdown("1h", None, Some(IntegrationProvider::Pi), Some(10))
+            .expect("read Pi breakdown");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.session_id, "ephemeral");
+        assert_eq!(row.project.as_deref(), Some("/work/pi"));
+        assert_eq!(row.total_tokens, 100);
+        assert_eq!(row.turn_count, 1);
+        assert!(row.ephemeral);
+
         clear_env();
     }
 
@@ -29177,6 +29308,7 @@ mod tests {
             session_id: "session-open-agent".to_string(),
             parent_session_id: None,
             pi_lineage: None,
+            ephemeral: false,
             hostname: "fixture-host".to_string(),
             total_tokens: 0,
             turn_count: 0,
@@ -31214,6 +31346,7 @@ mod tests {
             session_id: "pi-live".to_string(),
             parent_session_id: None,
             pi_lineage: None,
+            ephemeral: false,
             hostname: "pi-host".to_string(),
             total_tokens: 1,
             turn_count: 0,
@@ -32191,6 +32324,7 @@ mod tests {
             session_id: "session-runtime".to_string(),
             parent_session_id: None,
             pi_lineage: None,
+            ephemeral: false,
             hostname: "fixture-host".to_string(),
             total_tokens: 1,
             turn_count: 1,

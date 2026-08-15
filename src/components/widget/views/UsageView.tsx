@@ -304,6 +304,7 @@ interface RowModel {
   };
   nameLabel?: string;
   chipLabel?: string;
+  ephemeral?: boolean;
   parentSessionId?: string;
   lineageUnresolvedReason?: string;
   agentSummary?: {
@@ -483,6 +484,11 @@ function SessionIdentity({ row }: { row: RowModel }) {
           {row.chip.text}
         </span>
       )}
+      {row.ephemeral && (
+        <span className="wg-row-session-ephemeral" aria-label="Ephemeral session">
+          EPHEMERAL
+        </span>
+      )}
       {row.parentSessionId && (
         <span
           className="wg-row-session-parent wg-row-datum"
@@ -607,6 +613,7 @@ function sessionRow(row: SessionBreakdown, nowMs: number): RowModel {
     },
     chip: { text: providerTag(row.provider), tone: row.provider },
     chipLabel: `Provider ${providerTag(row.provider)}`,
+    ephemeral: row.ephemeral,
     parentSessionId: row.provider === "pi" ? row.parent_session_id ?? undefined : undefined,
     lineageUnresolvedReason:
       row.provider === "pi" && row.pi_lineage?.kind === "unresolved"

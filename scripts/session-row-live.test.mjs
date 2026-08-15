@@ -117,3 +117,16 @@ test("session identity places the full provider name directly after the session 
 	assert.match(markup("mini_max"), /aria-label="Provider MINIMAX">MINIMAX<\/span>/);
 	assert.doesNotMatch(claude, /wg-row-chip/);
 });
+
+// @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Ephemeral Badge]]
+test("session identity badges only ephemeral rows", () => {
+	const markup = (ephemeral) => renderToStaticMarkup(createElement(SessionIdentity, {
+		row: sessionRow({ ...baseRow, provider: "pi", ephemeral }, NOW),
+	}));
+
+	assert.match(
+		markup(true),
+		/<span class="wg-row-session-ephemeral" aria-label="Ephemeral session">EPHEMERAL<\/span>/,
+	);
+	assert.doesNotMatch(markup(false), /EPHEMERAL/);
+});

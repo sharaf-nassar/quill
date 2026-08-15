@@ -6335,6 +6335,7 @@ mod tests {
             session_id: session_id.to_string(),
             parent_session_id: None,
             pi_lineage: None,
+            ephemeral: false,
             hostname: "ipc-host".to_string(),
             total_tokens: 1,
             turn_count: 1,

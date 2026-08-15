@@ -391,6 +391,8 @@ pub struct SessionBreakdown {
     pub parent_session_id: Option<String>,
     /// Pushed Pi lineage proof. `None` means no extension proof exists.
     pub pi_lineage: Option<PiLineage>,
+    /// True when Pi intentionally created no transcript file.
+    pub ephemeral: bool,
     pub hostname: String,
     pub total_tokens: i64,
     pub turn_count: i64,

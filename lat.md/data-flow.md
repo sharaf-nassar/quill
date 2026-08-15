@@ -25,6 +25,8 @@ Analytics session drill-down uses the same provider plus session id pair when re
 
 Hook-reported tokens still flow into `token_snapshots` keyed by the parent `session_id` — Claude sub-agents share the parent's session id on disk, so each row also carries `is_sidechain`/`agent_id`/`parent_uuid` from migration 20. The [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates parent and sub-agent rows at query time so a sub-agent's tokens count toward the parent session's totals, and `get_llm_runtime_stats(scope = "parent_only")` is available when the widget runtime readout needs to exclude the sub-agent traffic instead.
 
+An accepted Pi usage event also writes one `token_snapshots` row when its lifecycle origin is ephemeral. Event-UUID dedupe gates that write, so replay cannot double tokens. Sessions unions zero-token ephemeral origins until usage arrives and returns their additive badge flag; ordinary origins still need token evidence.
+
 Sessions ranking clamps token snapshots newer than the latest matching root terminal hook to that hook. Fresh transcript identities join retained candidates before the final limit, preserving stored metrics when newer transcript activity reopens them. Stop-cycle token bookkeeping cannot reopen a row; strictly newer transcript or response activity can.
 
 ## Database Maintenance Pipeline
@@ -189,6 +191,8 @@ Pi transcript fallback remains tail-provable and bounded; pushed usage and linea
 [[src-tauri/src/live_tracker.rs#pi_session_file]] reads only the bounded header line for session id, start time, and cwd. [[src-tauri/src/live_tracker.rs#fold_pi_line]] then reads the shared 1 MiB tail and keeps last-entry activity plus the newest assistant message's validated upstream provider and model. It never resolves parent paths or follows `parentId`, so `/tree`, forks, compaction, and branch summaries cannot corrupt pushed lineage or cumulative state.
 
 Every changed Pi fingerprint replaces that file's prior live contribution. This catches initial deferred flush and migrations that preserve or grow length. Missing files produce no row, and the shared idle cutoff removes quiet files. Pushed usage maintains real cumulative Pi tokens; the transcript fold remains only a temporary fallback and does not overwrite them.
+
+The extension calls Session Search notify only when Pi supplies a transcript path. Ephemeral starts have no path, so they can reach lifecycle, usage, and runtime analytics but never enter the indexing queue or search corpus.
 
 ### Pi Session Lineage
 

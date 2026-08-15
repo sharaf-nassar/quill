@@ -2424,6 +2424,18 @@ body {
   color: var(--signal-cyan);
 }
 
+.wg-row-session-ephemeral {
+  flex: 0 0 auto;
+  padding: 1px 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xs);
+  color: var(--label);
+  font-size: 8px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.04em;
+}
+
 .wg-row[data-idle="true"] .wg-row-name,
 .wg-row[data-idle="true"] .wg-row-value {
   color: var(--label);

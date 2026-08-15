@@ -959,6 +959,8 @@ Tables for recording per-session token consumption and hourly host-level aggrega
 
 Migration 20 added `is_sidechain`, `agent_id`, and `parent_uuid` to `token_snapshots` for provider-agnostic sub-agent attribution; the [[backend#Tauri IPC Commands#Usage and Token Commands (14)]] `get_session_breakdown` rollup aggregates across all sidechain rows by `session_id` so a sub-agent's tokens count toward its parent session row. Hook-reported snapshots written before migration 20 stay tagged `is_sidechain=0` (a future CLI repair utility is documented as a TODO in [[src-tauri/src/storage.rs]]).
 
+Pushed Pi usage reuses `token_snapshots` only for lifecycle origins marked ephemeral. The model-observation event UUID admits the snapshot once, preserving tokens after live teardown without changing non-ephemeral rows.
+
 #### Model Analytics Evidence
 
 Migration 28 stores replayable transcript evidence and source ownership for provider-qualified model analytics without a model catalog.
@@ -1241,7 +1243,7 @@ Migration 30 establishes source and chain identity for transcript-derived analyt
 
 Owned/live identities are respectively: `session_events` `(provider, source_key, event_key)` / `(provider, session_id, event_key)`; `response_times` `(provider, source_key, chain_id, timestamp)` / `(provider, session_id, chain_id, timestamp)`; `tool_actions` `(provider, source_key, action_key)` / `(provider, session_id, action_key)`; `skill_usages` substitutes `source_key` or `session_id` before `(message_id, skill_name, skill_path, timestamp)`; and `hook_invocations` substitutes the same owner before `(chain_id, timestamp, hook_identity)`.
 
-`transcript_analytics_sources` stores canonical root/path ownership, fingerprints, last-good native and resolved identity, origin, inventory generation, processing diagnostics, and durable suppression. `live_analytics_sessions` stores project, cwd, and host origin for source-less analytics. Migration 42 adds its `ephemeral` flag for Pi lifecycle pushes; existing rows default false. Migration 43 adds pushed Pi usage identity and store-only cost fields to model observations. Migration 30 sets `transcript_analytics_reingest_pending` for the later retained-source rebuild.
+`transcript_analytics_sources` stores canonical root/path ownership, fingerprints, last-good native and resolved identity, origin, inventory generation, processing diagnostics, and durable suppression. `live_analytics_sessions` stores project, cwd, and host origin for source-less analytics. Migration 42 adds its `ephemeral` flag for Pi lifecycle pushes; existing rows default false. Sessions reads retain flagged origins without a transcript, join their cwd and badge flag, and leave ordinary origin-only rows absent. Migration 43 adds pushed Pi usage identity and store-only cost fields to model observations. Migration 30 sets `transcript_analytics_reingest_pending` for the later retained-source rebuild.
 
 Migration 30 renames the five prior analytics tables to `*_legacy_v30` and rebuilds them around source identity. The archives are **retained**, not dropped: rows with no hostname, and local rows whose transcript Claude has since pruned, are neither provably remote nor guaranteed rebuildable, and retention beats copying a multi-GB database. Nothing queries an archive and no index is kept on one — legacy named indexes are dropped so a retained archive cannot collide with the rebuilt tables' index names. An archive holding no rows at all is dropped immediately, so fresh installs stay clean.
 
