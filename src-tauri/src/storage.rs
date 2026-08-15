@@ -24971,7 +24971,7 @@ mod tests {
     }
 
     fn seed_legacy_pi_model_source(storage: &Storage, source_key: &str) {
-        let now_ms = Utc::now().timestamp_millis();
+        let now_ms = Utc::now().timestamp_millis() - 1_000;
         let mut conn = storage.conn.lock().unwrap();
         let tx = conn.transaction().expect("begin legacy Pi fixture");
         tx.execute(

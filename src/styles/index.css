@@ -185,10 +185,11 @@ body {
 }
 
 .confirm-dialog {
-  /* Native <dialog>: reset UA styles (color/max-width), keep margin auto
+  /* Native <dialog>: reset UA styles (color/max-width), restore margin auto
      centering. Width matches the old 16px backdrop padding constraint. */
   width: min(420px, calc(100vw - 32px));
   max-width: none;
+  margin: auto;
   color: inherit;
   background: var(--panel-raised);
   border: 1px solid rgba(255, 255, 255, 0.08);

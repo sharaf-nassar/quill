@@ -142,6 +142,8 @@ Disabling activity tracking removes both managed observer paths and clears the w
 
 Codex config changes flow through parsed TOML: install snapshots the active custom or default Codex home, records prior feature and MCP environment values, replaces only Quill commands, then reconciles positional trust keys against pre/post `hooks/list` metadata. Verification reparses the file, rejects retired Quill shell-hook commands omitted from `hooks/list`, and checks exact enabled/trusted handlers; startup repair then migrates stale registrations, which is also what prunes lifecycle registrations written by an older Quill. Uninstall targets the recorded home and restores the captured user values.
 
+Every lifecycle `hooks/list` call uses a process-only local-provider override, so enable, repair, feature reapplication, verification, and uninstall never initialize the configured model provider or rewrite its TOML tables.
+
 ## Live Session Tracker
 
 [[src-tauri/src/live_tracker.rs#LiveTracker]] owns Claude/Codex transcript folds and Pi-pushed live state, so a Sessions read costs a map lock instead of a directory walk. It is the sole owner of liveness and open-agent membership.

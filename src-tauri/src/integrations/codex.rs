@@ -553,13 +553,7 @@ fn list_codex_hooks(paths: &CodexInstallPaths) -> Result<Vec<CodexHookMetadata>,
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     let response: CodexHooksListResponse = run_app_server_request(
-        AppServerRequest {
-            feature: "hooks",
-            client_name: "quill_codex_hooks",
-            client_title: "Quill Codex Hooks",
-            codex_home: Some(&paths.home),
-            timeout: CODEX_APP_SERVER_TIMEOUT,
-        },
+        codex_hooks_request(paths),
         "hooks/list",
         serde_json::json!({ "cwds": [cwd] }),
     )?;
@@ -568,6 +562,17 @@ fn list_codex_hooks(paths: &CodexInstallPaths) -> Result<Vec<CodexHookMetadata>,
         .into_iter()
         .flat_map(|entry| entry.hooks)
         .collect())
+}
+
+fn codex_hooks_request(paths: &CodexInstallPaths) -> AppServerRequest<'_> {
+    AppServerRequest {
+        feature: "hooks",
+        client_name: "quill_codex_hooks",
+        client_title: "Quill Codex Hooks",
+        codex_home: Some(&paths.home),
+        model_provider_override: Some("ollama"),
+        timeout: CODEX_APP_SERVER_TIMEOUT,
+    }
 }
 
 fn normalize_hook_event(event: &str) -> String {
@@ -947,6 +952,8 @@ pub(crate) struct AppServerRequest<'a> {
     pub client_title: &'a str,
     /// `CODEX_HOME` override; `None` leaves the child on the inherited value.
     pub codex_home: Option<&'a Path>,
+    /// Process-only provider override for requests unrelated to model access.
+    pub model_provider_override: Option<&'a str>,
     pub timeout: Duration,
 }
 
@@ -957,8 +964,17 @@ pub(crate) fn run_app_server_request<T: serde::de::DeserializeOwned>(
 ) -> Result<T, String> {
     let codex_path = crate::config::resolve_command_path("codex")
         .ok_or_else(|| "Codex CLI was not found in PATH".to_string())?;
-    let codex_env_path = crate::config::path_for_resolved_command(&codex_path);
-    let mut command = Command::new(&codex_path);
+    run_app_server_request_at(&codex_path, request, method, params)
+}
+
+fn run_app_server_request_at<T: serde::de::DeserializeOwned>(
+    codex_path: &Path,
+    request: AppServerRequest<'_>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<T, String> {
+    let codex_env_path = crate::config::path_for_resolved_command(codex_path);
+    let mut command = Command::new(codex_path);
     command
         .args([
             "app-server",
@@ -971,6 +987,11 @@ pub(crate) fn run_app_server_request<T: serde::de::DeserializeOwned>(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(provider) = request.model_provider_override {
+        command
+            .arg("--config")
+            .arg(format!("model_provider={provider:?}"));
+    }
     if let Some(home) = request.codex_home {
         command.env("CODEX_HOME", home);
     }
@@ -2648,6 +2669,63 @@ mod tests {
             "must not block for the full sleep"
         );
         assert!(child.reaped, "the hung child must be reaped");
+    }
+
+    // @lat: [[codex-lifecycle-tests#Codex Lifecycle Test Specs#Hook Discovery Auth Isolation]]
+    #[cfg(unix)]
+    #[test]
+    fn hook_listing_bypasses_cliproxyapi_auth_without_mutating_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = codex_paths(temp.path().join("codex-home"));
+        fs::create_dir_all(&paths.home).unwrap();
+        let config = r#"model_provider = "cliproxyapi"
+
+[model_providers.cliproxyapi]
+name = "CLIProxyAPI"
+base_url = "http://127.0.0.1:8317/v1"
+experimental_bearer_token = "preserve-cliproxy-token"
+requires_openai_auth = true
+wire_api = "responses"
+
+[model_providers.foreign]
+name = "Foreign Provider"
+base_url = "https://foreign.invalid/v1"
+env_key = "FOREIGN_API_KEY"
+"#;
+        fs::write(&paths.config, config).unwrap();
+
+        let fake_codex = temp.path().join("codex");
+        fs::write(
+            &fake_codex,
+            r#"#!/bin/sh
+set -eu
+IFS= read -r _
+IFS= read -r _
+IFS= read -r _
+grep -Fq 'model_provider = "cliproxyapi"' "$CODEX_HOME/config.toml"
+grep -Fq 'requires_openai_auth = true' "$CODEX_HOME/config.toml"
+case " $* " in
+  *' --config model_provider="ollama" '*) ;;
+  *) echo 'provider authentication reached' >&2; exit 91 ;;
+esac
+printf '%s\n' '{"id":2,"result":{"data":[]}}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let response: CodexHooksListResponse = run_app_server_request_at(
+            &fake_codex,
+            codex_hooks_request(&paths),
+            "hooks/list",
+            serde_json::json!({ "cwds": [temp.path()] }),
+        )
+        .expect("hook discovery must not initialize model-provider authentication");
+
+        assert!(response.data.is_empty());
+        assert_eq!(fs::read_to_string(&paths.config).unwrap(), config);
     }
 
     // `codex` is usually an npm wrapper that re-execs the platform binary, so

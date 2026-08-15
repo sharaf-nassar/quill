@@ -48,7 +48,7 @@ Manual dispatch must select an existing `v*` tag. The `create-release` job rejec
 
 `.github/workflows/ci.yml` is the cross-platform Rust backend gate that also blocks release on failure.
 
-It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and pins Rust 1.95.0 plus the Cargo cache. The Linux job installs Tauri development packages and enforces `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`; the `macos-latest` job keeps `cargo check --all-targets` for AppKit-only code and runs the focused `runtime_backfill_` tests against bundled SQLite in the macOS filesystem/runtime environment before merge.
+It triggers on `pull_request`, `push` to `main`, and `workflow_call`, runs in `src-tauri` with `permissions: contents: read`, and pins Rust 1.95.0 plus the Cargo cache. The Linux job installs Tauri development packages, provisions uv, and runs `cargo test` through the locked MCP Python project so Rust/Python parity tests receive the packaged dependencies; it also enforces `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`. The `macos-latest` job keeps `cargo check --all-targets` for AppKit-only code and runs the focused `runtime_backfill_` tests against bundled SQLite in the macOS filesystem/runtime environment before merge.
 
 Because the base Tauri config enables `app.macOSPrivateApi`, the `tauri` dependency must keep the matching `macos-private-api` Cargo feature on every target; Tauri rejects config/feature drift before release.
 
@@ -340,7 +340,9 @@ Quill resolves the Codex CLI before running provider checks or `codex app-server
 
 ### App-Server Request Contract
 
-[[src-tauri/src/integrations/codex.rs#run_app_server_request]] is the single one-shot `codex app-server` path. Hook registration and Codex usage polling differ only in feature flag, client identity, `CODEX_HOME`, and deadline.
+[[src-tauri/src/integrations/codex.rs#run_app_server_request]] is the single one-shot `codex app-server` path. Hook registration and usage polling differ in feature, identity, `CODEX_HOME`, provider isolation, and deadline.
+
+Hook discovery selects the built-in `ollama` provider through a process-only config override. This prevents `hooks/list` from refreshing unrelated model-provider auth without changing the user's `model_provider`, `model_providers`, bearer token, base URL, or auth settings. Usage polling applies no provider override because `account/rateLimits/read` needs the configured OpenAI account.
 
 Each call spawns the CLI, sends `initialize`, `initialized`, and one request at id 2, then reads stdout until that id answers or the caller's deadline expires. Hook work uses ten seconds because it runs at startup holding the process-wide mutation guard; usage polling uses thirty because the child round-trips to the ChatGPT backend.
 

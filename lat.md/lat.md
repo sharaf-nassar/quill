@@ -19,11 +19,13 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[view-reader-tests]] — Slow-reader contention and concurrent-ingest test specs
 - [[rollup-concurrency-tests]] — Backfill, quiesce, live-ingest, and WAL-bound test specs
 - [[crash-reporting-tests]] — Rust crash payload privacy and release identity test specs
+- [[codex-lifecycle-tests]] — Codex hook-discovery authentication isolation test specs
 - [[appimage-integration-tests]] — Version-aware AppImage refresh test specs
 - [[window-chrome-tests]] — Cross-platform resize policy and macOS configuration test specs
 - [[pi-provider-plumbing-tests]] — Pi provider persistence, breakdown, hook, and root test specs
 - [[pi-integrations-ui-tests]] — Pi setup, consent, provider-count, and Limits omission test specs
 - [[integration-action-error-tests]] — Provider-local mutation error and retry test specs
+- [[confirm-dialog-tests]] — Manage-window confirmation dialog centering test specs
 - [[pi-session-parser-tests]] — narrow Pi message and header parser test specs
 - [[pi-notify-index-tests]] — Pi notify and Session Search indexing test specs
 - [[pi-live-session-tests]] — Pi bounded live-fold and token-gap test specs

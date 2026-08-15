@@ -714,6 +714,7 @@ fn fetch_codex_usage_direct() -> Result<(Vec<UsageBucket>, Option<ProviderCredit
             client_name: "quill_usage",
             client_title: "Quill Usage",
             codex_home: None,
+            model_provider_override: None,
             timeout: CODEX_USAGE_TIMEOUT,
         },
         "account/rateLimits/read",
