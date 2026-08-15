@@ -220,19 +220,20 @@ pub fn confirm_disable(
     {
         status.enabled = false;
     }
+    let remove_shared_config = should_remove_shared_config(&existing_statuses);
     if let Err(err) = sync_brevity_blocks(&existing_statuses, features) {
         log::warn!("Failed to sync brevity blocks during disable of {provider:?}: {err}");
     }
 
     match provider {
         IntegrationProvider::Claude => {
-            crate::claude_setup::uninstall(remove_shared_restart_assets)?;
+            crate::claude_setup::uninstall(remove_shared_restart_assets, remove_shared_config)?;
         }
         IntegrationProvider::Codex => {
-            codex::uninstall(remove_shared_restart_assets)?;
+            codex::uninstall(remove_shared_restart_assets, remove_shared_config)?;
         }
         IntegrationProvider::Pi => {
-            pi::uninstall()?;
+            pi::uninstall(remove_shared_config)?;
         }
         IntegrationProvider::MiniMax => {
             minimax::delete_api_key(&storage)?;
@@ -259,6 +260,16 @@ pub fn confirm_disable(
     emit_statuses(app, &statuses);
 
     Ok(status)
+}
+
+fn should_remove_shared_config(statuses: &[ProviderStatus]) -> bool {
+    !statuses.iter().any(|status| {
+        status.enabled
+            && matches!(
+                status.provider,
+                IntegrationProvider::Claude | IntegrationProvider::Codex | IntegrationProvider::Pi
+            )
+    })
 }
 
 pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
@@ -842,6 +853,31 @@ mod tests {
         status.setup_state = ProviderSetupState::Error;
         status.last_error = Some("Quill requires pi >= 0.84.0".to_string());
         assert!(!should_repair_provider(&status));
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Shared Config Consumer Set]]
+    #[test]
+    fn shared_config_lifetime_ignores_service_only_providers() {
+        let status = |provider, enabled| ProviderStatus {
+            provider,
+            detected_cli: true,
+            detected_home: true,
+            enabled,
+            setup_state: ProviderSetupState::Installed,
+            user_has_made_choice: true,
+            last_error: None,
+            last_verified_at: None,
+            last_detection_attempts: Vec::new(),
+        };
+
+        assert!(!should_remove_shared_config(&[
+            status(IntegrationProvider::Claude, true),
+            status(IntegrationProvider::Pi, false),
+        ]));
+        assert!(should_remove_shared_config(&[
+            status(IntegrationProvider::Pi, false),
+            status(IntegrationProvider::MiniMax, true),
+        ]));
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Typed Detection Errors]]

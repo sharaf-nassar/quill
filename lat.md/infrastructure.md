@@ -241,6 +241,14 @@ MCP import verification for Claude and Codex removes inherited `PYTHONHOME`
 and `PYTHONPATH`. This isolates `uv run ... python` from packaged-launcher
 variables while preserving each provider's normal runtime environment.
 
+## Shared Provider Config Contract
+
+Claude, Codex, and Pi share one local server contract so every provider can be enabled independently without a silent missing-config install.
+
+[[src-tauri/src/integrations/config_contract.rs#write_local_contract]] writes `~/.config/quill/config.json` with `url`, `context_url`, `hostname`, and `secret`, using the same `QUILL_PORT` and `QUILL_CONTEXT_PORT` resolution as [[src-tauri/src/server.rs#start_server]]. Local repair refreshes all owned fields, preserves unknown fields, and leaves deliberate remote URLs untouched. The file is mode `0600` on Unix.
+
+Every Claude, Codex, and Pi enable path calls the shared writer. Pi includes the file in its snapshot transaction and semantic verification, so a Pi-only enable is complete and startup repair heals local port, hostname, or secret drift. [[src-tauri/src/integrations/manager.rs#should_remove_shared_config]] keeps the file until the last enabled Claude, Codex, or Pi provider is disabled; service-only providers do not extend its lifetime.
+
 ## Claude Integration Deployment
 
 Claude integration lives directly in [[src-tauri/src/claude_setup.rs]] —
@@ -352,9 +360,9 @@ The selected `$PI_CODING_AGENT_DIR` and `$PI_CODING_AGENT_SESSION_DIR`, or their
 
 Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes only marked Quill files, the managed block, state, and stamp. It does not delete indexed Pi sessions or analytics.
 
-Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
+Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
 
-Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. Verification compares exact extension bytes, checks the payload marker, rejects extra Quill-marked extension files, requires the current AGENTS block, and parses the four-field integration state. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
+Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. Verification compares exact extension bytes, checks the payload marker, rejects extra Quill-marked extension files, requires the current AGENTS block, parses the four-field integration state, and validates the local shared config contract. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
 
 ### Extension Tools and Telemetry
 

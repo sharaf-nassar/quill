@@ -39,6 +39,8 @@ struct PiInstallPaths {
     provider_root: PathBuf,
     config_dir: PathBuf,
     session_dir: PathBuf,
+    quill_config: PathBuf,
+    auth_secret: PathBuf,
 }
 
 impl PiInstallPaths {
@@ -205,6 +207,13 @@ fn install_from_bundle(
     let snapshots = capture_snapshots(paths)?;
     let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
     let setup = (|| {
+        crate::integrations::config_contract::write_local_contract_at(
+            &paths.quill_config,
+            &paths.auth_secret,
+            &crate::sessions::SessionIndex::local_hostname(),
+            crate::integrations::config_contract::main_port(),
+            crate::integrations::config_contract::context_port(),
+        )?;
         fs::create_dir_all(paths.extensions_dir()).map_err(|error| {
             format!(
                 "Failed to create Pi extensions directory {}: {error}",
@@ -245,11 +254,19 @@ fn install_from_bundle(
     }
 }
 
-pub fn uninstall() -> Result<(), String> {
-    uninstall_with_paths(&resolve_uninstall_paths()?, &Storage::init()?)
+pub fn uninstall(remove_shared_config: bool) -> Result<(), String> {
+    uninstall_with_paths(
+        &resolve_uninstall_paths()?,
+        &Storage::init()?,
+        remove_shared_config,
+    )
 }
 
-fn uninstall_with_paths(paths: &PiInstallPaths, storage: &Storage) -> Result<(), String> {
+fn uninstall_with_paths(
+    paths: &PiInstallPaths,
+    storage: &Storage,
+    remove_shared_config: bool,
+) -> Result<(), String> {
     let snapshots = capture_snapshots(paths)?;
     let prior_context_setting = storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?;
     let result = (|| {
@@ -268,7 +285,11 @@ fn uninstall_with_paths(paths: &PiInstallPaths, storage: &Storage) -> Result<(),
         }
         // Pi is the only installed consumer of this listener today.
         storage.delete_setting(CONTEXT_HTTP_ENABLED_KEY)?;
-        verify_uninstalled(paths, storage)
+        verify_uninstalled(paths, storage)?;
+        if remove_shared_config {
+            crate::integrations::config_contract::remove_at(&paths.quill_config)?;
+        }
+        Ok(())
     })();
     match result {
         Ok(()) => snapshots.commit(),
@@ -330,6 +351,13 @@ fn verify_without_stamp(
     if storage.get_setting(CONTEXT_HTTP_ENABLED_KEY)?.as_deref() != Some("true") {
         return Err("Pi context HTTP listener setting is disabled".to_string());
     }
+    crate::integrations::config_contract::verify_local_contract_at(
+        &paths.quill_config,
+        &paths.auth_secret,
+        &crate::sessions::SessionIndex::local_hostname(),
+        crate::integrations::config_contract::main_port(),
+        crate::integrations::config_contract::context_port(),
+    )?;
     Ok(())
 }
 
@@ -383,6 +411,7 @@ fn capture_snapshots(paths: &PiInstallPaths) -> Result<FileSnapshots, String> {
         paths.agents_path(),
         paths.state_path(),
         paths.stamp_path(),
+        paths.quill_config.clone(),
     ];
     for path in quill_extension_files(&paths.extensions_dir())? {
         if !files.contains(&path) {
@@ -537,6 +566,8 @@ fn paths_from_configured_dirs() -> Result<PiInstallPaths, String> {
         provider_root: provider_root(),
         session_dir: configured_session_dir(&config_dir)?,
         config_dir,
+        quill_config: crate::integrations::config_contract::config_path(),
+        auth_secret: crate::integrations::config_contract::auth_secret_path(),
     })
 }
 
@@ -549,6 +580,8 @@ fn resolve_install_paths() -> Result<PiInstallPaths, String> {
             provider_root: root,
             config_dir: state.config_dir,
             session_dir: state.session_dir,
+            quill_config: crate::integrations::config_contract::config_path(),
+            auth_secret: crate::integrations::config_contract::auth_secret_path(),
         });
     }
     paths_from_configured_dirs()
@@ -845,10 +878,14 @@ mod tests {
             fs::write(bundle.join(EXTENSION_FILE), PAYLOAD).unwrap();
             fs::write(bundle.join(AGENTS_TEMPLATE_FILE), AGENTS).unwrap();
             let config_dir = temp.path().join("pi-agent");
+            let auth_secret = temp.path().join("auth_secret");
+            fs::write(&auth_secret, "pi-only-secret").unwrap();
             let paths = PiInstallPaths {
                 provider_root: temp.path().join("quill-pi"),
                 session_dir: config_dir.join("sessions"),
                 config_dir,
+                quill_config: temp.path().join("quill-config.json"),
+                auth_secret,
             };
             let storage = Storage::init_at(temp.path().join("quill.db"), false).unwrap();
             Self {
@@ -858,6 +895,95 @@ mod tests {
                 storage,
             }
         }
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Shared Config Contract]]
+    #[test]
+    fn pi_only_install_provisions_config_and_repair_heals_drift() {
+        let harness = Harness::new();
+        let features = IntegrationFeatures::default();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+
+        let read_config = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(&harness.paths.quill_config).unwrap()).unwrap()
+        };
+        let installed = read_config();
+        assert_eq!(installed["url"], "http://localhost:19876");
+        assert_eq!(installed["context_url"], "http://localhost:19877");
+        assert_eq!(installed["secret"], "pi-only-secret");
+        assert!(
+            installed["hostname"]
+                .as_str()
+                .is_some_and(|host| !host.is_empty())
+        );
+
+        fs::write(
+            &harness.paths.quill_config,
+            serde_json::to_vec(&serde_json::json!({
+                "url": "http://localhost:10000",
+                "context_url": "http://localhost:10001",
+                "hostname": "stale-host",
+                "secret": "stale-secret",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!deployment_is_current_with_paths(
+            &harness.bundle,
+            &harness.paths,
+            features,
+            &harness.storage,
+        ));
+
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+        let repaired = read_config();
+        assert_eq!(repaired["url"], "http://localhost:19876");
+        assert_eq!(repaired["context_url"], "http://localhost:19877");
+        assert_eq!(repaired["secret"], "pi-only-secret");
+        assert_ne!(repaired["hostname"], "stale-host");
+    }
+
+    // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Shared Config Lifetime]]
+    #[test]
+    fn pi_uninstall_removes_shared_config_only_for_last_provider() {
+        let harness = Harness::new();
+        let features = IntegrationFeatures::default();
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+
+        uninstall_with_paths(&harness.paths, &harness.storage, false).unwrap();
+        assert!(harness.paths.quill_config.exists());
+
+        install_from_bundle(
+            &harness.bundle,
+            &harness.paths,
+            "0.84.1",
+            features,
+            &harness.storage,
+        )
+        .unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage, true).unwrap();
+        assert!(!harness.paths.quill_config.exists());
     }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Version Gate]]
@@ -914,7 +1040,7 @@ mod tests {
         verify_with_paths(&harness.bundle, &harness.paths, features, &harness.storage).unwrap();
         assert_eq!(fs::read(&other).unwrap(), b"export default () => 42;\n");
 
-        uninstall_with_paths(&harness.paths, &harness.storage).unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage, true).unwrap();
         assert_eq!(fs::read(&agents).unwrap(), b"user bytes without newline");
         assert_eq!(fs::read(&other).unwrap(), b"export default () => 42;\n");
         assert!(!harness.paths.extension_path().exists());
@@ -1058,7 +1184,7 @@ mod tests {
         assert!(!orphan.exists());
         assert!(other.exists());
 
-        uninstall_with_paths(&harness.paths, &harness.storage).unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage, true).unwrap();
         fs::write(harness.paths.extension_path(), "// user owns this\n").unwrap();
         let error = install_from_bundle(
             &harness.bundle,
@@ -1147,7 +1273,7 @@ mod tests {
             .storage
             .get_setting(CONTEXT_HTTP_ENABLED_KEY)
             .unwrap();
-        uninstall_with_paths(&harness.paths, &harness.storage).unwrap();
+        uninstall_with_paths(&harness.paths, &harness.storage, true).unwrap();
         let after_uninstall = harness
             .storage
             .get_setting(CONTEXT_HTTP_ENABLED_KEY)

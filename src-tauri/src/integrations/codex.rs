@@ -293,7 +293,7 @@ pub fn install(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<
     let published = deploy_files(app, features, snapshots)?;
 
     let setup_result = (|| {
-        create_local_config()?;
+        crate::integrations::config_contract::write_local_contract()?;
         update_config_toml(features, &paths)?;
         update_agents_md(&paths.agents)?;
         verify_with_paths(features, &paths)?;
@@ -356,7 +356,10 @@ fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: Integrat
     }
 }
 
-pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
+pub fn uninstall(
+    remove_shared_restart_assets: bool,
+    remove_shared_config: bool,
+) -> Result<(), String> {
     let paths = resolve_codex_uninstall_paths()?;
     let manifest = build_owned_manifest();
     remove_managed_config_entries(&paths)?;
@@ -366,6 +369,9 @@ pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
     crate::restart::uninstall_codex_restart_assets(remove_shared_restart_assets)?;
     remove_path(&integration_state_path())
         .map_err(|err| format!("Failed to remove Codex integration state: {err}"))?;
+    if remove_shared_config {
+        crate::integrations::config_contract::remove()?;
+    }
     Ok(())
 }
 
@@ -1281,12 +1287,6 @@ fn resolve_codex_uninstall_paths() -> Result<CodexInstallPaths, String> {
     ))
 }
 
-fn app_data_dir() -> PathBuf {
-    let default = crate::data_paths::default_app_data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"));
-    crate::data_paths::resolve_data_dir_with_default(default)
-}
-
 fn build_owned_manifest() -> OwnedAssetManifest {
     let mut files: Vec<String> = all_managed_script_files()
         .map(|name| scripts_dir().join(name).to_string_lossy().to_string())
@@ -1414,59 +1414,6 @@ fn remove_context_mcp_tool(mcp_root: &Path) -> Result<(), String> {
             )
         })?;
     }
-    Ok(())
-}
-
-fn create_local_config() -> Result<(), String> {
-    let secret_path = app_data_dir().join("auth_secret");
-    if !secret_path.exists() {
-        log::debug!("No auth_secret found for Codex integration setup");
-        return Ok(());
-    }
-
-    let secret = fs::read_to_string(&secret_path)
-        .map_err(|err| format!("Failed to read auth_secret: {err}"))?;
-    let secret = secret.trim().to_string();
-    if secret.is_empty() {
-        log::debug!("auth_secret is empty; skipping Codex config bootstrap");
-        return Ok(());
-    }
-
-    let config_dir = quill_config_dir();
-    let config_path = config_dir.join("config.json");
-    fs::create_dir_all(&config_dir)
-        .map_err(|err| format!("Failed to create {}: {err}", config_dir.display()))?;
-
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .map_err(|err| format!("Failed to read config.json: {err}"))?;
-        let mut config: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|err| format!("Failed to parse config.json: {err}"))?;
-
-        let is_local = config
-            .get("url")
-            .and_then(|value| value.as_str())
-            .is_some_and(|url| url.contains("localhost") || url.contains("127.0.0.1"));
-
-        if is_local {
-            config["secret"] = serde_json::Value::String(secret);
-            let output = serde_json::to_string_pretty(&config)
-                .map_err(|err| format!("Failed to serialize config.json: {err}"))?;
-            fs::write(&config_path, output)
-                .map_err(|err| format!("Failed to write config.json: {err}"))?;
-        }
-
-        return Ok(());
-    }
-
-    let config = serde_json::json!({
-        "url": "http://localhost:19876",
-        "hostname": crate::sessions::SessionIndex::local_hostname(),
-        "secret": secret,
-    });
-    let output = serde_json::to_string_pretty(&config)
-        .map_err(|err| format!("Failed to serialize config.json: {err}"))?;
-    fs::write(&config_path, output).map_err(|err| format!("Failed to write config.json: {err}"))?;
     Ok(())
 }
 

@@ -27,8 +27,6 @@ use crate::models::{
 use crate::sessions;
 use crate::storage::Storage;
 
-const DEFAULT_PORT: u16 = 19876;
-const DEFAULT_CONTEXT_PORT: u16 = 19877;
 const CONTEXT_HTTP_ENABLED_KEY: &str = "context_http.enabled";
 const MAX_REQUESTS: usize = 100;
 const RATE_WINDOW_SECS: u64 = 60;
@@ -137,10 +135,7 @@ pub async fn start_server(
     session_index: Option<Arc<sessions::SessionIndex>>,
     live_tracker: Arc<crate::live_tracker::LiveTracker>,
 ) {
-    let port: u16 = std::env::var("QUILL_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    let port = crate::integrations::config_contract::main_port();
 
     let state = Arc::new(ServerState {
         storage,
@@ -166,10 +161,7 @@ pub async fn start_server(
         .ok()
         .flatten()
         .is_some_and(|value| value == "true");
-    let context_port = std::env::var("QUILL_CONTEXT_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_CONTEXT_PORT);
+    let context_port = crate::integrations::config_contract::context_port();
     let context_db = dirs::home_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join(".config/quill/context/context.db");

@@ -1,4 +1,5 @@
 pub mod codex;
+pub(crate) mod config_contract;
 pub mod cpa;
 pub(crate) mod deploy;
 pub mod manager;

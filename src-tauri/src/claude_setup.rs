@@ -280,20 +280,6 @@ fn resolve_runtime_paths() -> Result<ClaudeRuntimePaths, String> {
     Ok(ClaudeRuntimePaths { node, git })
 }
 
-/// Returns the platform-aware app data dir
-/// Linux: ~/.local/share/com.quilltoolkit.app/
-/// macOS: ~/Library/Application Support/com.quilltoolkit.app/
-///
-/// Routes through `crate::data_paths::resolve_data_dir_with_default` so the
-/// `QUILL_DEMO_MODE` opt-in env-var override applies uniformly. Production
-/// behavior (with no demo override) is byte-identical to the previous direct
-/// `dirs::data_local_dir()` lookup.
-fn app_data_dir() -> PathBuf {
-    let default = crate::data_paths::default_app_data_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp").join("com.quilltoolkit.app"));
-    crate::data_paths::resolve_data_dir_with_default(default)
-}
-
 /// Returns ~/.config/quill/scripts/
 fn scripts_dir() -> PathBuf {
     config_dir().join("scripts")
@@ -441,7 +427,7 @@ pub fn install(app: &tauri::AppHandle, features: IntegrationFeatures) -> Result<
 
     let setup_result = (|| {
         ensure_main_integration_state(&paths)?;
-        create_local_config()?;
+        crate::integrations::config_contract::write_local_contract()?;
         register_mcp_server(features, &paths)?;
         register_hooks(features, &paths, &runtime)?;
         update_claude_md(&paths)?;
@@ -530,7 +516,10 @@ pub(crate) fn detect() -> Result<crate::integrations::ProviderStatus, String> {
     })
 }
 
-pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
+pub fn uninstall(
+    remove_shared_restart_assets: bool,
+    remove_shared_config: bool,
+) -> Result<(), String> {
     let paths = resolve_claude_uninstall_paths()?;
     crate::restart::uninstall_claude_restart_assets(&paths, remove_shared_restart_assets)?;
     let state = load_integration_state()?;
@@ -548,6 +537,9 @@ pub fn uninstall(remove_shared_restart_assets: bool) -> Result<(), String> {
         cleanup_legacy_hook_files(&paths)?;
         verify_uninstalled(&paths)?;
         mark_main_uninstalled(&paths)?;
+        if remove_shared_config {
+            crate::integrations::config_contract::remove()?;
+        }
         Ok(())
     })();
 
@@ -991,66 +983,6 @@ fn remove_context_mcp_tool(mcp_root: &Path) -> Result<(), String> {
             )
         })?;
     }
-    Ok(())
-}
-
-// ── Local config ──
-
-/// Create ~/.config/quill/config.json for localhost if a local widget is detected.
-fn create_local_config() -> Result<(), String> {
-    let secret_path = app_data_dir().join("auth_secret");
-    if !secret_path.exists() {
-        log::debug!("No auth_secret found — skipping local config creation");
-        return Ok(());
-    }
-
-    let secret =
-        fs::read_to_string(&secret_path).map_err(|e| format!("Failed to read auth_secret: {e}"))?;
-    let secret = secret.trim().to_string();
-    if secret.is_empty() {
-        log::debug!("auth_secret is empty — skipping local config creation");
-        return Ok(());
-    }
-
-    let config_path = config_dir().join("config.json");
-    fs::create_dir_all(config_dir()).map_err(|e| format!("Failed to create config dir: {e}"))?;
-
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .map_err(|e| format!("Failed to read config.json: {e}"))?;
-        let mut config: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse config.json: {e}"))?;
-
-        // Check if existing URL is local
-        let is_local = config
-            .get("url")
-            .and_then(|u| u.as_str())
-            .is_some_and(|u| u.contains("localhost") || u.contains("127.0.0.1"));
-
-        if is_local {
-            // Refresh secret only, preserve other fields
-            config["secret"] = serde_json::Value::String(secret);
-            let output = serde_json::to_string_pretty(&config)
-                .map_err(|e| format!("Failed to serialize config.json: {e}"))?;
-            fs::write(&config_path, output)
-                .map_err(|e| format!("Failed to write config.json: {e}"))?;
-            log::info!("Refreshed secret in existing local config.json");
-        } else {
-            log::info!("config.json points to remote URL — not overwriting");
-        }
-    } else {
-        let hostname = crate::sessions::SessionIndex::local_hostname();
-        let config = serde_json::json!({
-            "url": "http://localhost:19876",
-            "hostname": hostname,
-            "secret": secret,
-        });
-        let output = serde_json::to_string_pretty(&config)
-            .map_err(|e| format!("Failed to serialize config.json: {e}"))?;
-        fs::write(&config_path, output).map_err(|e| format!("Failed to write config.json: {e}"))?;
-        log::info!("Created local config.json for hostname '{hostname}'");
-    }
-
     Ok(())
 }
 

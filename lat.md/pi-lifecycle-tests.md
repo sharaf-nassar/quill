@@ -6,6 +6,30 @@ lat:
 
 These tests pin Pi detection, transactional file ownership, repair verification, and manager wiring.
 
+## Full Shared Config Contract
+
+The shared provider writer creates `config.json` with the main URL, context URL, hostname, and trimmed authentication secret required by every local integration.
+
+## Local Config Drift
+
+Rewriting a local contract heals port, hostname, and secret drift while retaining fields owned by newer or external consumers.
+
+## Remote Config Preservation
+
+A deliberately remote main URL remains byte-for-byte unchanged when a local provider is enabled or repaired.
+
+## Shared Config Contract
+
+A Pi-only install provisions all four shared config fields, and semantic verification makes stale local ports, hostname, or secret trigger repair.
+
+## Shared Config Lifetime
+
+Pi uninstall keeps the shared config while another local provider needs it and removes it when Pi is the last local provider.
+
+## Shared Config Consumer Set
+
+The last-provider decision counts Claude, Codex, and Pi but ignores service-only providers that never consume `config.json`.
+
 ## Version Gate
 
 Pi 0.84.0 and newer pass detection, while older, unknown, and malformed versions produce an explicit error status.

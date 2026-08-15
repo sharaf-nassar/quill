@@ -352,7 +352,7 @@ function providerActionCopy(action: PendingProviderAction) {
       return {
         title: `Enable ${label}?`,
         description:
-          "Quill will install the executable extension file quill.ts at ~/.pi/agent/extensions/quill.ts by default, or $PI_CODING_AGENT_DIR/extensions/quill.ts when that directory is configured. Quill repairs and self-updates the stamped file. A running Pi process loads the updated file after /reload.",
+          "Quill will install quill.ts in Pi's extensions directory and write the local server URL, context URL, hostname, and authentication secret to ~/.config/quill/config.json. Quill repairs both files automatically. A running Pi process loads updates after /reload.",
         confirmLabel: `Enable ${label}`,
         destructive: false,
         needsApiKey: false,
