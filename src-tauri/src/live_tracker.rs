@@ -1186,7 +1186,10 @@ fn local_observed_host() -> Option<&'static str> {
 
 pub(crate) fn normalize_observed_hostname(hostname: &str) -> Option<String> {
     let hostname = hostname.trim();
-    if hostname.is_empty() || hostname.len() > MAX_STRING_LEN {
+    if hostname.is_empty()
+        || hostname.len() > MAX_STRING_LEN
+        || hostname.chars().any(char::is_control)
+    {
         return None;
     }
     let short = hostname.split('.').next().unwrap_or_default();

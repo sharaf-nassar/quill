@@ -1036,7 +1036,7 @@ fn drain_pi_spool_once_with(
                         break;
                     }
                     message_records += 1;
-                    let payload: SessionMessagesPayload =
+                    let mut payload: SessionMessagesPayload =
                         match serde_json::from_value(record.payload) {
                             Ok(payload) => payload,
                             Err(_) => {
@@ -1046,7 +1046,7 @@ fn drain_pi_spool_once_with(
                             }
                         };
                     if payload.provider != IntegrationProvider::Pi
-                        || validate_session_messages_payload(&payload).is_err()
+                        || validate_session_messages_payload(&mut payload).is_err()
                     {
                         outcome.corrupt_records += 1;
                         gap = Some(PI_SPOOL_CORRUPT_GAP);
@@ -2394,7 +2394,11 @@ async fn post_session_notify(
     (StatusCode::ACCEPTED, "queued".to_string())
 }
 
-fn validate_session_messages_payload(payload: &SessionMessagesPayload) -> Result<(), String> {
+fn validate_session_messages_payload(payload: &mut SessionMessagesPayload) -> Result<(), String> {
+    if payload.provider == IntegrationProvider::Pi {
+        payload.host = crate::live_tracker::normalize_observed_hostname(&payload.host)
+            .ok_or_else(|| "Invalid host".to_string())?;
+    }
     if payload.session_id.trim().is_empty() || payload.session_id.len() > MAX_STRING_LEN {
         return Err("Invalid session_id".to_string());
     }
@@ -2462,7 +2466,7 @@ fn validate_session_messages_payload(payload: &SessionMessagesPayload) -> Result
 async fn post_session_messages(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
-    Json(payload): Json<SessionMessagesPayload>,
+    Json(mut payload): Json<SessionMessagesPayload>,
 ) -> impl IntoResponse {
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
@@ -2480,7 +2484,7 @@ async fn post_session_messages(
     }
     // Validate the complete batch before constructing search documents or
     // scheduling any background mutation.
-    if let Err(error) = validate_session_messages_payload(&payload) {
+    if let Err(error) = validate_session_messages_payload(&mut payload) {
         return (StatusCode::BAD_REQUEST, error);
     }
 
@@ -2847,6 +2851,11 @@ mod observed_subagent_tests {
             .expect_err("reject protocol mismatch");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.code, "protocol_mismatch");
+
+        let mut payload = pi_envelope(PI_TRACK_PROTOCOL);
+        payload.events[0].hostname = "host\nforged".into();
+        let error = validate_pi_track_envelope(&payload).expect_err("reject control hostname");
+        assert_eq!(error.code, "invalid_event");
     }
 
     // @lat: [[pi-lineage-ui-tests#Pi Lineage UI Tests#Pushed Search Parent]]
@@ -3025,6 +3034,31 @@ mod observed_subagent_tests {
         }))
         .expect("deserialize unsupported Pi thinking message");
         assert!(remote_session_event_kinds(IntegrationProvider::Pi, &thinking).is_err());
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Runtime Hostname]]
+    #[test]
+    fn pi_session_messages_normalize_hostname_before_storage() {
+        let mut payload: SessionMessagesPayload = serde_json::from_value(serde_json::json!({
+            "provider": "pi",
+            "host": "HOST.EXAMPLE.COM",
+            "session_id": "session-1",
+            "project": "/work/pi",
+            "cwd": "/work/pi",
+            "messages": [{
+                "uuid": "input-1",
+                "type": "input",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "content": "",
+                "role": "user",
+                "event_kinds": ["user_text"]
+            }]
+        }))
+        .expect("deserialize Pi runtime payload");
+
+        validate_session_messages_payload(&mut payload).expect("validate Pi runtime payload");
+
+        assert_eq!(payload.host, "host");
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Demo Gate]]

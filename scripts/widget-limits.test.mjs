@@ -6,7 +6,8 @@ import { createServer } from "vite";
 
 const server = await createServer({
   appType: "custom",
-  server: { middlewareMode: true },
+  server: { middlewareMode: true, hmr: false },
+  optimizeDeps: { noDiscovery: true },
   plugins: [
     {
       name: "expose-cpa-row",

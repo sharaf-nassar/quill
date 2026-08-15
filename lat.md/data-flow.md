@@ -146,7 +146,7 @@ Codex config changes flow through parsed TOML: install snapshots the active cust
 
 [[src-tauri/src/live_tracker.rs#LiveTracker]] owns Claude/Codex transcript folds and Pi-pushed live state, so a Sessions read costs a map lock instead of a directory walk. It is the sole owner of liveness and open-agent membership.
 
-`POST /api/v1/pi/track` accepts bearer-authenticated protocol-v1 envelopes containing stable event ids and lifecycle, activity, model, lineage, cumulative-token, or per-message usage events. Validation finishes before mutation. Hostnames normalize once to the lowercase short storage key. Only session start may create state; later events update an existing identity, shutdown removes it, and stale shutdown cannot close a newer startup/reload continuation. Replacement starts remove their prior id first. Demo mode mutates nothing.
+`POST /api/v1/pi/track` accepts bearer-authenticated protocol-v1 envelopes containing stable event ids and lifecycle, activity, model, lineage, cumulative-token, or per-message usage events. Validation finishes before mutation. Hostnames reject control characters and normalize once to the lowercase short storage key; Pi runtime messages use the same key before analytics storage. Only session start may create state; later events update an existing identity, shutdown removes it, and stale shutdown cannot close a newer startup/reload continuation. Replacement starts remove their prior id first. Demo mode mutates nothing.
 
 Per-message usage persists through [[src-tauri/src/storage.rs#Storage#store_pi_model_usage]] before its token delta reaches LiveTracker. The Pi-only session/event UUID index makes live/spool overlap a no-op, so only a newly inserted event advances cumulative live tokens.
 

@@ -73,7 +73,7 @@ Each endpoint validates input (length limits, range checks, type validation) bef
 
 `/api/v1/pi/track` uses its own 4,000-request sliding window, enough for four times the 1,000-event/minute single-event load. Its protocol-v1 envelope is `{protocol, extension_version, min_quill_version, last_error?, events[]}`. Events share `{event_uuid, session_id, hostname, timestamp, type}` and carry type-specific lifecycle, activity, model, lineage, or cumulative-token fields. The route returns typed JSON for `400`, `401`, `429`, and `503`; protocol mismatch persists handshake health for diagnosis, while demo mode and bad auth write nothing.
 
-Pi `/sessions/messages` requests use a separate 4,000-request window, so runtime traffic cannot consume the shared notify/message capacity. Stable message ids and exact timestamps produce contiguous server-side event ordinals; turn and tool types map to canonical runtime kinds, with thinking rejected because Pi exposes none.
+Pi `/sessions/messages` requests use a separate 4,000-request window, so runtime traffic cannot consume the shared notify/message capacity. The boundary normalizes Pi hostnames to the lifecycle key before storage. Stable message ids and exact timestamps produce contiguous server-side event ordinals; turn and tool types map to canonical runtime kinds, with thinking rejected because Pi exposes none.
 
 ### Maintenance quiesce
 

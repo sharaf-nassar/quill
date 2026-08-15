@@ -7,11 +7,20 @@ token and model usage, and gives Pi agents Quill's history and working-context
 tools through Pi's extension API. Pi remains absent from LIMITS because Quill
 has no supported Pi rate-limit source.
 
+Pi sessions that were already active before this upgrade stay dark in Live until
+Pi restarts and loads the new extension. Ephemeral Pi sessions now appear as
+persistent Sessions rows with an EPHEMERAL badge. Quill stores Pi's per-message
+cost data, but does not display it yet.
+
 Enabling Pi installs the executable managed file `quill.ts` at
 `~/.pi/agent/extensions/quill.ts`, or
 `$PI_CODING_AGENT_DIR/extensions/quill.ts` when configured. Quill repairs and
 self-updates that file. Disabling Pi removes it while preserving every other Pi
 file.
+
+Settings → Integrations reports the extension's connection, protocol, and
+offline-spool health. Failed tracking waits in a bounded private spool and
+replays after Quill becomes available.
 
 Downgrade note: older Quill builds that do not understand provider `pi` drop
 its saved enablement entry. If you downgrade and later return to a current

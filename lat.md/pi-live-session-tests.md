@@ -44,7 +44,7 @@ One atomic settings write records the handshake protocol, extension version, min
 
 ## Tracking Request Validation
 
-The Pi tracking boundary rejects bad bearer authentication with `401` and protocol mismatch with a typed `400` response.
+The Pi tracking boundary rejects bad bearer authentication with `401`, protocol mismatch with a typed `400`, and control characters in hostname identity before mutation.
 
 ## Tracking Rate Headroom
 
@@ -57,6 +57,10 @@ Pi runtime message traffic accepts the 1,000-event/minute load without consuming
 ## Pi Runtime Message Mapping
 
 Pi turn, input, and tool execution types map to canonical runtime events while the unavailable thinking event remains an explicit rejected gap.
+
+## Pi Runtime Hostname
+
+Pi runtime messages normalize their hostname to the same lowercase short key used by lifecycle tracking before analytics storage.
 
 ## Demo Gate
 
