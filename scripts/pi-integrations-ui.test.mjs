@@ -104,16 +104,16 @@ test("Pi card exposes detected, enabled, and error states", () => {
 });
 
 // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Executable extension consent]]
-test("Pi consent names the executable path and stamped-file repair", () => {
+test("Pi consent discloses installed files, credentials, repair, and reload", () => {
   const copy = integrationsModule.providerActionCopy({
     provider: "pi",
     nextEnabled: true,
   }).description;
 
-  assert.match(copy, /executable extension file quill\.ts/);
-  assert.match(copy, /~\/\.pi\/agent\/extensions\/quill\.ts/);
-  assert.match(copy, /\$PI_CODING_AGENT_DIR\/extensions\/quill\.ts/);
-  assert.match(copy, /Quill repairs and self-updates the stamped file\./);
+  assert.equal(
+    copy,
+    "Quill will install quill.ts in Pi's extensions directory and write the local server URL, context URL, hostname, and authentication secret to ~/.config/quill/config.json. Quill repairs both files automatically. A running Pi process loads updates after /reload.",
+  );
 });
 
 // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Provider breakdown counts]]
