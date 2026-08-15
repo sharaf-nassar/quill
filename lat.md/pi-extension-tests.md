@@ -18,6 +18,10 @@ Invalid config causes no disk writes or registrations and emits one discoverable
 
 The extension registers every supported Pi lifecycle, agent, turn, message, tool-execution, model-select, and input handler.
 
+## Reporter coexistence
+
+Compatible managed and npm copies elect one reporter, so every handler and stable lifecycle, model, and usage event registers or emits once.
+
 ## Tracking envelopes
 
 Handlers push versioned lifecycle, per-message usage, model, activity, and source-less runtime envelopes without message bodies.
@@ -48,7 +52,7 @@ Pi receives the eight `quill_`-prefixed tools with dependency-free plain JSON Sc
 
 ## Feature gates
 
-Rendered `context_preservation`, `activity_tracking`, and `context_telemetry` values independently gate tools, routing, and lifecycle telemetry.
+Rendered `context_preservation`, `activity_tracking`, and `context_telemetry` values independently gate tools, routing, and telemetry while retaining only the I/O-free singleton teardown handler.
 
 ## Exception containment
 

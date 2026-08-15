@@ -360,9 +360,31 @@ The selected `$PI_CODING_AGENT_DIR` and `$PI_CODING_AGENT_SESSION_DIR`, or their
 
 Installation copies the bundled `quill.ts` to `<Pi config>/extensions/quill.ts` and maintains one Quill block in `<Pi config>/AGENTS.md`. The extension payload marker and managed block markers define ownership. A user-owned `quill.ts` blocks installation; unrelated extension files and user instruction bytes remain untouched. Disabling removes marked Quill files, the managed block, state, stamp, Pi spool directory, and bounded extension log. It does not delete indexed Pi sessions or analytics.
 
+Pi's npm package is user-owned. Quill never edits Pi package settings or npm storage, while `pi install`, `pi update`, `pi config`, and `pi remove` own that lifecycle. Managed uninstall cannot remove the package, and package removal cannot remove Quill's managed file or local data.
+
 Pi uses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] as a configuration-only transaction over individual files, including the shared provider contract. It never stages or renames the extensions directory, so sibling extensions cannot enter Quill's backup. The global mutation guard invokes Pi recovery before every provider mutation.
 
 Startup repair takes the same fast path as Codex: a deployment is current only when its bundled-source stamp matches and semantic verification passes. An old stamp therefore triggers the idempotent install path and replaces the owned extension with current bundled bytes without user action. Verification checks exact extension bytes, payload ownership, the current AGENTS block, four-field integration state, and local shared config. Tauri bundles `pi-integration/**/*`, and [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Packaged Assets]] pins that package input.
+
+### npm package and coexistence
+
+`@sharaf-nassar/quill-pi` publishes the same dependency-free `quill.ts` source that Quill bundles, with independent SemVer and support for Pi `>=0.84.0 <1` on Node.js `>=22.19.0`.
+
+Pi's native order is project extensions, user extensions, then packages. A process-wide claim keyed by Quill's config root lets the first compatible copy register; later managed or npm copies stay inert. The shutdown handler releases the claim before Pi rebuilds extensions on `/reload` or session replacement.
+
+| Copies present | Reporter precedence | Lifecycle owner |
+| --- | --- | --- |
+| Managed and npm | Managed | Quill repairs only the marked file; Pi updates only the package. |
+| User `quill.ts` and npm | User file, then npm | Quill refuses to overwrite an unmarked global file. |
+| Project, managed, and npm | Project, managed, then npm | Project trust and Pi settings remain user-owned. |
+
+Only compatible Quill reporters participate in the claim. An unrelated user extension named `quill.ts` keeps its behavior; the npm copy remains the only Quill reporter. Copies older than package `0.1.0` must not coexist because they predate election.
+
+Exact npm versions provide rollback and downgrade pins; Pi excludes pins from bulk updates. Desktop rollback changes only the managed bundle. Every install-channel change takes effect after `/reload`, and neither channel deletes the other's files, settings, spool format, config, secrets, or indexed data.
+
+`.github/workflows/publish-pi-extension.yml` accepts only `pi-vX.Y.Z` tags matching both package and reporter versions. It tests the real npm tarball and extension before `npm publish --provenance --access public` from a GitHub-hosted OIDC runner.
+
+The npm trusted-publisher record must name `sharaf-nassar/quill` and that exact workflow filename. npm's Sigstore provenance and registry attestation are the package signature; CI stores no long-lived npm token. Package metadata fixes the public registry, repository directory, MIT license, export, Pi manifest, and supported host versions. [[pi-package-tests]] pins the shipped files.
 
 ### Extension Tools and Telemetry
 

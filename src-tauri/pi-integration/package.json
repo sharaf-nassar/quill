@@ -1,0 +1,48 @@
+{
+  "name": "@sharaf-nassar/quill-pi",
+  "version": "0.1.0",
+  "description": "Quill's local-only tracking and context extension for Pi",
+  "type": "module",
+  "exports": {
+    ".": "./quill.ts"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "quill.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./quill.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.84.0 <1"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "registry": "https://registry.npmjs.org"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "quill"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sharaf-nassar/quill.git",
+    "directory": "src-tauri/pi-integration"
+  },
+  "homepage": "https://github.com/sharaf-nassar/quill#readme",
+  "bugs": "https://github.com/sharaf-nassar/quill/issues",
+  "license": "MIT"
+}

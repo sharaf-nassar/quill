@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import {
   mkdirSync,
@@ -177,6 +177,86 @@ test("registers every production tracking handler", async () => {
   });
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Reporter coexistence]]
+test("coexisting copies register and emit each stable event once", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret", hostname: "pi-host" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      quill(pi.api);
+
+      for (const event of [
+        "session_start",
+        "session_shutdown",
+        "agent_start",
+        "agent_settled",
+        "turn_start",
+        "turn_end",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "model_select",
+        "input",
+      ]) {
+        assert.equal(pi.handlers.get(event)?.length, 1, event);
+      }
+
+      const calls = [];
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        calls.push({ url: String(url), body: JSON.parse(options.body) });
+        return { ok: true, status: 202, json: async () => ({}), body: { cancel: async () => {} } };
+      };
+      const ctx = context("coexistence-session");
+      try {
+        pi.handlers.get("session_start")[0](
+          { type: "session_start", reason: "startup" },
+          ctx,
+        );
+        await flushRequests();
+        pi.handlers.get("message_end")[0](
+          {
+            type: "message_end",
+            message: {
+              role: "assistant",
+              provider: "openai",
+              model: "gpt-5",
+              responseId: "coexistence-response",
+              timestamp: 1_765_699_202_000,
+              content: [{ type: "text", text: "not sent" }],
+              usage: {
+                input: 2,
+                output: 3,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 5,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+            },
+          },
+          ctx,
+        );
+        await flushRequests();
+        await pi.handlers.get("session_shutdown")[0](
+          { type: "session_shutdown", reason: "quit" },
+          ctx,
+        );
+
+        const events = calls
+          .filter((call) => call.url.endsWith("/api/v1/pi/track"))
+          .flatMap((call) => call.body.events);
+        for (const type of ["session_start", "model", "usage", "session_end"]) {
+          assert.equal(events.filter((event) => event.type === type).length, 1, type);
+        }
+        assert.equal(new Set(events.map((event) => event.event_uuid)).size, events.length);
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Tracking envelopes]]
 test("tracking handlers emit versioned lifecycle, usage, and runtime envelopes", async () => {
   await withHome(
@@ -350,9 +430,7 @@ test("session start resolves lineage once and notifies only persisted sessions",
         { kind: "linked", parent_session_id: "parent-id" },
       );
 
-      const ephemeralPi = fakePi();
-      quill(ephemeralPi.api);
-      ephemeralPi.handlers.get("session_start")[0](
+      pi.handlers.get("session_start")[0](
         { type: "session_start", reason: "startup" },
         context("ephemeral"),
       );
@@ -410,7 +488,8 @@ test("session event identity survives extension teardown", async () => {
     const oldFetch = globalThis.fetch;
     globalThis.fetch = async (url, options) => {
       if (String(url).endsWith("/api/v1/pi/track")) {
-        ids.push(JSON.parse(options.body).events[0].event_uuid);
+        const event = JSON.parse(options.body).events[0];
+        if (event.type === "session_start") ids.push(event.event_uuid);
       }
       return { ok: true, status: 202, body: { cancel: async () => {} } };
     };
@@ -423,6 +502,10 @@ test("session event identity survives extension teardown", async () => {
           context("stable-session"),
         );
         await new Promise((resolve) => setTimeout(resolve, 5));
+        await pi.handlers.get("session_shutdown")[0](
+          { type: "session_shutdown", reason: "reload" },
+          context("stable-session"),
+        );
       }
       assert.equal(ids.length, 2);
       assert.equal(ids[0], ids[1]);
@@ -523,38 +606,48 @@ test("rendered feature flags independently gate tools and telemetry", async () =
     { url: "http://localhost:19876", secret: "secret" },
     async () => {
       const source = readFileSync(join(import.meta.dirname, "quill.ts"), "utf8");
-      for (const [flags, expectedTools, requiredHandlers] of [
-        [
-          { context_preservation: false, activity_tracking: true, context_telemetry: true },
-          0,
-          ["session_start", "session_shutdown", "message_end", "tool_execution_start"],
-        ],
-        [
-          { context_preservation: true, activity_tracking: false, context_telemetry: false },
-          8,
-          ["tool_call"],
-        ],
-      ]) {
-        const path = join(
-          process.env.HOME,
-          `rendered-${flags.context_preservation}-${flags.activity_tracking}.mjs`,
-        );
-        writeFileSync(
-          path,
-          source.replace(
-            "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };",
-            `const FEATURES = { context_preservation: ${flags.context_preservation}, activity_tracking: ${flags.activity_tracking}, context_telemetry: ${flags.context_telemetry} };`,
-          ),
-        );
-        const rendered = (await import(pathToFileURL(path).href)).default;
-        const pi = fakePi();
-        rendered(pi.api);
-        assert.equal(pi.tools.size, expectedTools);
-        assert.deepEqual(
-          [...pi.handlers.keys()].filter((name) => requiredHandlers.includes(name)).sort(),
-          requiredHandlers.toSorted(),
-        );
-        assert.equal(pi.handlers.has("session_start"), flags.activity_tracking);
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({ ok: true, status: 202, body: { cancel: async () => {} } });
+      try {
+        for (const [flags, expectedTools, requiredHandlers] of [
+          [
+            { context_preservation: false, activity_tracking: true, context_telemetry: true },
+            0,
+            ["session_start", "session_shutdown", "message_end", "tool_execution_start"],
+          ],
+          [
+            { context_preservation: true, activity_tracking: false, context_telemetry: false },
+            8,
+            ["tool_call", "session_shutdown"],
+          ],
+        ]) {
+          const path = join(
+            process.env.HOME,
+            `rendered-${flags.context_preservation}-${flags.activity_tracking}.mjs`,
+          );
+          writeFileSync(
+            path,
+            source.replace(
+              "const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };",
+              `const FEATURES = { context_preservation: ${flags.context_preservation}, activity_tracking: ${flags.activity_tracking}, context_telemetry: ${flags.context_telemetry} };`,
+            ),
+          );
+          const rendered = (await import(pathToFileURL(path).href)).default;
+          const pi = fakePi();
+          rendered(pi.api);
+          assert.equal(pi.tools.size, expectedTools);
+          assert.deepEqual(
+            [...pi.handlers.keys()].filter((name) => requiredHandlers.includes(name)).sort(),
+            requiredHandlers.toSorted(),
+          );
+          assert.equal(pi.handlers.has("session_start"), flags.activity_tracking);
+          await pi.handlers.get("session_shutdown")[0](
+            { type: "session_shutdown", reason: "reload" },
+            context(),
+          );
+        }
+      } finally {
+        globalThis.fetch = oldFetch;
       }
     },
   );
@@ -960,7 +1053,7 @@ test("context preservation off registers no router or routing telemetry", async 
       try {
         rendered(pi.api);
         assert.equal(pi.tools.size, 0);
-        assert.equal(pi.handlers.size, 0);
+        assert.deepEqual([...pi.handlers.keys()], ["session_shutdown"]);
         assert.equal(requests, 0);
       } finally {
         globalThis.fetch = oldFetch;
@@ -1138,7 +1231,9 @@ test("sustains 1000 events per minute without turn delay or unbounded RSS", asyn
 
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Real Pi session]]
 test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", async () => {
-  const piBin = "/home/mamba/.nvm/versions/node/v25.8.2/bin/pi";
+  const piBin = process.env.QUILL_PI_BIN || "pi";
+  const piVersion = execFileSync(piBin, ["--version"], { encoding: "utf8" }).trim();
+  assert.equal(piVersion, "0.84.2");
   const root = mkdtempSync(join(tmpdir(), "quill-real-pi-"));
   const configDir = join(root, "pi-agent");
   const sessionDir = join(root, "sessions");
@@ -1307,7 +1402,7 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
     assert.match(stdout, /Quill probe complete/);
     assert.match(stdout, /"sources":7/);
     assert.ok(readdirSync(sessionDir, { recursive: true }).some((entry) => entry.endsWith(".jsonl")));
-    console.log(`REAL_PI_RESULT version=0.84.2 context_calls=1 session_ms=${sessionMs}`);
+    console.log(`REAL_PI_RESULT version=${piVersion} context_calls=1 session_ms=${sessionMs}`);
   } finally {
     server.close();
     await once(server, "close");

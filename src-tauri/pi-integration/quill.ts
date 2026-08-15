@@ -25,13 +25,14 @@ const LOCAL_TIMEOUT_MS = 1500;
 const CONTEXT_PORT = "19877";
 const FEATURES = { context_preservation: true, activity_tracking: true, context_telemetry: true };
 const PROTOCOL_VERSION = 1;
-const EXTENSION_VERSION = "0.1.0";
+export const EXTENSION_VERSION = "0.1.0";
 const MIN_QUILL_VERSION = "0.9.0";
 const SPOOL_FILE_MAX_BYTES = 1024 * 1024;
 const SPOOL_DIR_MAX_BYTES = 16 * SPOOL_FILE_MAX_BYTES;
 const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LOG_MAX_BYTES = 256 * 1024;
 const TAINTED_MAX_PATHS = 256;
+const REPORTER_CLAIMS = Symbol.for("quill.pi.reporter.claims");
 let lastNoticeRoot;
 const READER_COMMAND_PATTERN =
   /\b(cat|bat|head|tail|less|more|view|od|xxd|strings|hexdump|sed|awk|grep|rg|ack|jq|yq|xq|xmllint)\b/i;
@@ -275,6 +276,18 @@ function headers(config) {
     "Content-Type": "application/json",
     Authorization: `Bearer ${config.secret}`,
   };
+}
+
+function claimReporter(config) {
+  const claims = globalThis[REPORTER_CLAIMS] || new Set();
+  globalThis[REPORTER_CLAIMS] = claims;
+  if (claims.has(config.quillRoot)) return false;
+  claims.add(config.quillRoot);
+  return true;
+}
+
+function releaseReporter(config) {
+  globalThis[REPORTER_CLAIMS]?.delete(config.quillRoot);
 }
 
 async function fetchJson(config, url, options) {
@@ -1003,6 +1016,8 @@ function registerTracking(pi, config) {
       await trackEvent(config, state, info, "session_end", { reason: event.reason }, `${event.reason}:${event.targetSessionFile || ""}`);
     } catch (error) {
       writeLog(config, new TransportError("Pi shutdown tracking failed", { cause: error }));
+    } finally {
+      releaseReporter(config);
     }
   });
   registerHandler(pi, config, "agent_start", (event, ctx) => activity(event, ctx, "agent_start"));
@@ -1138,6 +1153,7 @@ export default function quill(pi) {
     }
     return;
   }
+  if (!claimReporter(config)) return;
 
   if (FEATURES.context_preservation) {
     for (const tool of TOOLS) {
@@ -1190,5 +1206,7 @@ export default function quill(pi) {
         }
       });
     }
+  } else {
+    registerHandler(pi, config, "session_shutdown", () => releaseReporter(config));
   }
 }

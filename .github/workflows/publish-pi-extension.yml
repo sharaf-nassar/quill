@@ -1,0 +1,55 @@
+name: Publish Pi extension
+
+on:
+  push:
+    tags:
+      - 'pi-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install pinned publish toolchain
+        run: |
+          npm install --global npm@11.11.1
+          npm install --global @earendil-works/pi-coding-agent@0.84.2
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/pi-integration/package.json').version")
+          EXTENSION_VERSION=$(node -e "import('./src-tauri/pi-integration/quill.ts').then(module => process.stdout.write(module.EXTENSION_VERSION))")
+          if [ "$GITHUB_REF_NAME" != "pi-v${VERSION}" ] || [ "$EXTENSION_VERSION" != "$VERSION" ]; then
+            echo "::error::Tag, package, and extension versions must match"
+            exit 1
+          fi
+
+      - name: Test package and extension
+        run: |
+          node --test scripts/pi-package.test.mjs
+          node --test src-tauri/pi-integration/quill.test.mjs
+
+      - name: Inspect package
+        working-directory: src-tauri/pi-integration
+        run: npm pack --dry-run --json
+
+      - name: Publish package
+        working-directory: src-tauri/pi-integration
+        run: npm publish --provenance --access public
