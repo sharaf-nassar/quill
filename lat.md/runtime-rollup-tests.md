@@ -24,7 +24,15 @@ The completed-rollup read with a source-less live branch must stay within 10% p9
 
 ## Source-less Runtime Union
 
-Completed runtime reads union every provider's source-less live events so Pi and remote-session totals match the pre-backfill raw result.
+Completed runtime reads combine remote source-less events with active Pi live-source tails. Sessions folds that active Pi tail into live per-session runtime; sealing moves the same totals into hourly authority without duplication.
+
+## Pi Live Source Plateau
+
+A still-open Pi source accepts four 1,000-event bursts across confirmed 365/180/90/30-day runs. Each run prunes the finalized prefix, keeps one open tail and active owner, and preserves exact runtime and model query totals.
+
+## Pi Sequential Ingest Bound
+
+One thousand production-shaped singleton Pi events must use linear SQLite work, leave at most one raw residual row for active reads, preserve exact open-turn runtime, and keep late replay exact.
 
 ## Source-less Pi Session Evidence
 

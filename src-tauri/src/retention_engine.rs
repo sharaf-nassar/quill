@@ -589,9 +589,8 @@ fn doomed_scan_sql(target: RetentionTarget) -> String {
     match target {
         RetentionTarget::ModelUsageObservations => format!(
             "CREATE TEMP TABLE {} AS
-             SELECT rowid AS rid FROM {}
-             WHERE observed_at_ms < ?1
-               AND NOT (provider = 'pi' AND source_key LIKE 'pi-push:%')",
+             SELECT observation.rowid AS rid FROM {} AS observation
+             WHERE observation.observed_at_ms < ?1",
             target.doomed_table(),
             target.table()
         ),
@@ -665,16 +664,14 @@ fn nonconforming_count_sql(target: RetentionTarget) -> String {
           WHERE source_key IS NOT NULL
             AND NOT (length(timestamp) = 24 AND timestamp LIKE '%Z')
             AND timestamp < ?1",
-        target.table()
+        target.table(),
     )
 }
 
 /// Every source-owned row in a target table, regardless of age.
 fn owned_count_sql(target: RetentionTarget) -> String {
     if target == RetentionTarget::ModelUsageObservations {
-        return "SELECT COUNT(*) FROM model_usage_observations
-                WHERE NOT (provider = 'pi' AND source_key LIKE 'pi-push:%')"
-            .to_string();
+        return "SELECT COUNT(*) FROM model_usage_observations".to_string();
     }
     format!(
         "SELECT COUNT(*) FROM {} WHERE source_key IS NOT NULL",
@@ -899,7 +896,13 @@ fn write_retention_archive(
                     "SELECT rowid AS archive_rowid, *
                        FROM {}
                       WHERE observed_at_ms < ?1
-                        AND NOT (provider = 'pi' AND source_key LIKE 'pi-push:%')
+                      ORDER BY rowid",
+                    target.table()
+                ),
+                RetentionTarget::SessionEvents => format!(
+                    "SELECT rowid AS archive_rowid, *
+                       FROM {}
+                      WHERE source_key IS NOT NULL AND timestamp < ?1
                       ORDER BY rowid",
                     target.table()
                 ),
@@ -1426,6 +1429,7 @@ fn drain_target(
     conn: &mut Connection,
     db_path: &Path,
     target: RetentionTarget,
+    cutoff: &str,
     cutoff_ms: i64,
     total_doomed: i64,
     budget: RetentionDeleteBudget,
@@ -1565,6 +1569,29 @@ fn drain_target(
                     reason: "rollup metadata singleton is missing".to_string(),
                 });
             }
+        }
+        if target == RetentionTarget::SessionEvents {
+            tx.execute(
+                &format!(
+                    "DELETE FROM response_times AS response
+                     WHERE response.provider = 'pi'
+                       AND response.source_key LIKE 'live:pi:%'
+                       AND length(response.timestamp) = 24
+                       AND response.timestamp LIKE '%Z'
+                       AND response.timestamp < ?2
+                       AND EXISTS (
+                           SELECT 1 FROM session_events AS event
+                           WHERE event.provider = response.provider
+                             AND event.source_key = response.source_key
+                             AND event.rowid <= ?1
+                             AND event.rowid IN (
+                                 SELECT rid FROM {}
+                             )
+                       )",
+                    target.doomed_table()
+                ),
+                params![boundary, cutoff],
+            )?;
         }
         if let Some(target_aggregate_sql) = &target_aggregate_sql {
             tx.execute(target_aggregate_sql, params![boundary])?;
@@ -1730,6 +1757,7 @@ pub fn run_retention_delete_phase(
                 &mut conn,
                 &db_path,
                 target,
+                &request.cutoff,
                 cutoff_ms,
                 scan.total_doomed(),
                 budget,

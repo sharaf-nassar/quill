@@ -24,7 +24,7 @@ Compatible managed and npm copies elect one reporter, so every handler and stabl
 
 ## Tracking envelopes
 
-Handlers push versioned lifecycle, per-message usage, model, activity, and source-less runtime envelopes without message bodies.
+Handlers push versioned lifecycle, per-message usage, model, activity, and runtime envelopes without message bodies; Quill derives the stable live source from provider and session identity.
 
 ## Handshake and lineage
 

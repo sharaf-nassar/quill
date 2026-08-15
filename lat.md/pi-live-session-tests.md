@@ -24,7 +24,7 @@ A pushed Pi session with no shutdown ages out through the shared 15-minute idle 
 
 ## Ephemeral Persistence
 
-Migration 42 and the lifecycle upsert preserve the ephemeral flag with Pi's cwd and normalized hostname in `live_analytics_sessions`.
+Migration 42 and the lifecycle upsert preserve the ephemeral flag with Pi's cwd and normalized hostname. Migration 44 orders replayed close/start events so stale starts stay closed and newer resumes reopen.
 
 ## Ephemeral Live Overlay
 
@@ -32,7 +32,7 @@ A pushed ephemeral start marks its live Sessions row immediately, before any usa
 
 ## Ephemeral Breakdown Persistence
 
-An ephemeral lifecycle origin remains a Sessions row after shutdown and combines pushed usage and source-less turn activity without creating ordinary lifecycle-only rows.
+An ephemeral lifecycle origin remains a Sessions row after shutdown and combines pushed usage with session-owned turn activity without creating ordinary lifecycle-only rows.
 
 ## Ephemeral Badge
 
@@ -48,11 +48,11 @@ The Pi tracking boundary rejects bad bearer authentication with `401`, protocol 
 
 ## Tracking Rate Headroom
 
-The independent Pi tracking limiter accepts 4,000 single-event envelopes in one 60-second window, four times the specified 1,000-event stream.
+The independent Pi tracking limiter charges contained events and accepts 4,000 events in one 60-second window, four times the specified stream even when envelopes batch 200 events.
 
 ## Pi Session Message Rate Isolation
 
-Pi runtime message traffic accepts the 1,000-event/minute load without consuming capacity from session notify or other providers' message traffic.
+Pi runtime traffic charges contained messages, accepts 4,000 messages per minute, and consumes no session-notify or other-provider capacity.
 
 ## Pi Runtime Message Mapping
 

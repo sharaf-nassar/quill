@@ -976,3 +976,28 @@ retire.
 - `min_quill_version` added to the handshake envelope (A, should);
   `transcript_analytics.rs` `UnsupportedProvider` arm disposition
   recorded (A, borderline).
+
+## Live-source retention extension
+
+The cut-over row-volume follow-up replaces Pi's permanent exceptions with one stable `live:pi:<session-id>` owner shared by runtime and model evidence.
+
+- Migration 44 moves existing Pi NULL-runtime rows and `pi-push:` model
+  observations and rollups to the session owner in one transaction. It keeps
+  session, chain, host, timestamp, UUID, ordinal, tokens, and costs unchanged,
+  marks pre-upgrade rows sealed, and refolds runtime authority.
+- `live_analytics_sessions.lifecycle_at_ms` orders replayed starts and ends;
+  `closed_at_ms` records lifecycle without exempting the whole active source.
+  Each accepted in-order runtime event advances compact open-turn state and
+  adds newly closed hourly turns; late ordering refolds retained rows once.
+  Retention prunes covered processed rows while state preserves the open turn,
+  and shutdown seals state directly. Active and closed replay filters runtime,
+  response, and usage rows through the same watermark before raw evidence can
+  return.
+- Runtime backfill keeps its transcript-only contiguous-rowid contract and
+  preserves live state during reset. Completed Runtime and Sessions reads use
+  one compact Pi state row per source instead of refolding raw residuals.
+  Sealed Pi totals come from the existing hourly rollup.
+- Pi rate windows charge contained tracking events and runtime messages, not
+  envelopes. The evidence test keeps one source open through four 1,000-event
+  bursts and confirmed 365/180/90/30-day pruning. Finalized raw prefixes
+  plateau at one open tail while runtime and model queries remain exact.

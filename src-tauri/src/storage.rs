@@ -100,7 +100,7 @@ use crate::models::{
 /// a newer build would silently skip every unknown migration, start clean, and
 /// then fail every analytics insert on a column it cannot satisfy. `init`
 /// refuses to open anything above this instead.
-pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 43;
+pub(crate) const MAX_SUPPORTED_SCHEMA_VERSION: i32 = 45;
 
 /// Approximate rows examined per index by the manual maintenance ANALYZE.
 pub(crate) const DATABASE_ANALYSIS_LIMIT: i64 = 1_000;
@@ -112,6 +112,11 @@ const MODEL_SOURCE_PATH_UNIX_PREFIX: &str = "\0quill-source-path-unix-v1:";
 const MODEL_SOURCE_PATH_WINDOWS_PREFIX: &str = "\0quill-source-path-windows-v1:";
 const MODEL_SOURCE_PATH_UNICODE_PREFIX: &str = "\0quill-source-path-unicode-v1:";
 const INDICATOR_PRIMARY_PROVIDER_KEY: &str = "indicator.primary_provider.v1";
+const PI_LIVE_SOURCE_ROOT_KEY: &str = "live:pi";
+
+pub(crate) fn pi_live_source_key(session_id: &str) -> String {
+    format!("{PI_LIVE_SOURCE_ROOT_KEY}:{session_id}")
+}
 
 // @lat: [[backend#Backend#Database#tool_detail payload carve-out]]
 /// `tool_actions.category` value whose rows carry no readable payload. Every
@@ -581,7 +586,7 @@ pub(crate) struct LiveSessionEventInput<'a> {
     pub(crate) kind: crate::sessions::SessionEventKind,
 }
 
-/// Complete source-less analytics batch committed beside its origin mapping.
+/// Complete live analytics batch committed beside its origin mapping.
 #[derive(Clone, Copy)]
 pub(crate) struct LiveSessionAnalyticsRows<'a> {
     pub(crate) messages: &'a [LiveSessionMessageInput<'a>],
@@ -1750,6 +1755,7 @@ struct PersistedRuntimeEvent {
     rowid: i64,
     timestamp_ms: i64,
     kind: String,
+    retention_eligible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1766,6 +1772,9 @@ struct PreparedRuntimeFold {
     rollups: Vec<PreparedRuntimeHourlyRollup>,
     finalized_through_rowid: i64,
     open_turn_started_ms: Option<i64>,
+    open_turn_last_ms: Option<i64>,
+    open_turn_last_kind: Option<String>,
+    open_turn_all_conforming: Option<bool>,
 }
 
 fn fold_persisted_runtime_events(
@@ -1775,9 +1784,13 @@ fn fold_persisted_runtime_events(
     let mut rollups = BTreeMap::<i64, PreparedRuntimeHourlyRollup>::new();
     let mut finalized_through_rowid = 0_i64;
     let mut open_turn_started_ms = None;
+    let mut open_turn_last_ms = None;
+    let mut open_turn_last_kind = None;
+    let mut open_turn_all_conforming = None;
     if let Some(first) = events.first() {
         let mut turn_start_ms = first.timestamp_ms;
         let mut open_turn_min_rowid = first.rowid;
+        let mut turn_all_conforming = first.retention_eligible;
         let mut previous = first;
 
         for event in events.iter().skip(1) {
@@ -1791,6 +1804,7 @@ fn fold_persisted_runtime_events(
 
             if continues_turn {
                 open_turn_min_rowid = open_turn_min_rowid.min(event.rowid);
+                turn_all_conforming &= event.retention_eligible;
             } else {
                 let turn_end_ms = if is_tool_wait {
                     previous
@@ -1828,18 +1842,78 @@ fn fold_persisted_runtime_events(
                 }
                 turn_start_ms = event.timestamp_ms;
                 open_turn_min_rowid = event.rowid;
+                turn_all_conforming = event.retention_eligible;
             }
             previous = event;
         }
         finalized_through_rowid = open_turn_min_rowid.saturating_sub(1).max(0);
         open_turn_started_ms = Some(turn_start_ms);
+        open_turn_last_ms = Some(previous.timestamp_ms);
+        open_turn_last_kind = Some(previous.kind.clone());
+        open_turn_all_conforming = Some(turn_all_conforming);
     }
 
     Ok(PreparedRuntimeFold {
         rollups: rollups.into_values().collect(),
         finalized_through_rowid,
         open_turn_started_ms,
+        open_turn_last_ms,
+        open_turn_last_kind,
+        open_turn_all_conforming,
     })
+}
+
+fn close_persisted_runtime_fold(
+    mut fold: PreparedRuntimeFold,
+    events: &[PersistedRuntimeEvent],
+    closed_at_ms: i64,
+) -> PreparedRuntimeFold {
+    let Some(turn_start_ms) = fold.open_turn_started_ms else {
+        return fold;
+    };
+    let Some(last) = events.last() else {
+        return fold;
+    };
+    let turn_end_ms = if last.kind == "asst_tool_use" {
+        last.timestamp_ms.saturating_add(RUNTIME_TOOL_WAIT_MAX_MS)
+    } else {
+        last.timestamp_ms
+    };
+    if turn_end_ms > closed_at_ms {
+        return fold;
+    }
+    if turn_end_ms > turn_start_ms {
+        let hour_utc = turn_start_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+        if let Some(rollup) = fold
+            .rollups
+            .iter_mut()
+            .find(|rollup| rollup.hour_utc == hour_utc)
+        {
+            rollup.turn_count += 1;
+            rollup.runtime_millis += turn_end_ms - turn_start_ms;
+            rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
+            rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
+        } else {
+            fold.rollups.push(PreparedRuntimeHourlyRollup {
+                hour_utc,
+                turn_count: 1,
+                runtime_millis: turn_end_ms - turn_start_ms,
+                first_turn_start_ms: turn_start_ms,
+                last_turn_end_ms: turn_end_ms,
+            });
+            fold.rollups.sort_unstable_by_key(|rollup| rollup.hour_utc);
+        }
+    }
+    fold.finalized_through_rowid = events
+        .iter()
+        .map(|event| event.rowid)
+        .max()
+        .unwrap_or(fold.finalized_through_rowid);
+    fold.open_turn_started_ms = None;
+    fold.open_turn_last_ms = None;
+    fold.open_turn_last_kind = None;
+    fold.open_turn_all_conforming = None;
+    fold
 }
 
 #[derive(Clone, Debug)]
@@ -2321,6 +2395,7 @@ pub(crate) fn refold_runtime_source_identity(
                     "Runtime event chain {event_chain_id} does not match source chain {chain_id}"
                 ));
             }
+            let retention_eligible = crate::retention::is_conforming_timestamp(&timestamp);
             let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
                 continue;
             };
@@ -2334,6 +2409,7 @@ pub(crate) fn refold_runtime_source_identity(
                 rowid,
                 timestamp_ms,
                 kind,
+                retention_eligible,
             });
         }
         events
@@ -2391,17 +2467,47 @@ pub(crate) fn refold_runtime_source_identity(
         }
     }
 
+    let compact_live_tail = tx
+        .query_row(
+            "SELECT source_kind = 'live'
+             FROM transcript_analytics_sources
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider, source_key],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Read runtime source kind: {error}"))?
+        .unwrap_or(false);
     let inserted_state_rows = if let Some(open_turn_started_ms) = fold.open_turn_started_ms {
+        let finalized_through_rowid = if compact_live_tail {
+            events
+                .iter()
+                .map(|event| event.rowid)
+                .max()
+                .unwrap_or(fold.finalized_through_rowid)
+        } else {
+            fold.finalized_through_rowid
+        };
         tx.execute(
             "INSERT INTO runtime_turn_state (
                  provider, source_key, finalized_through_rowid,
-                 open_turn_started_ms
-             ) VALUES (?1, ?2, ?3, ?4)",
+                 open_turn_started_ms, open_turn_last_ms,
+                 open_turn_last_kind, open_turn_all_conforming
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 provider,
                 source_key,
-                fold.finalized_through_rowid,
+                finalized_through_rowid,
                 open_turn_started_ms,
+                compact_live_tail
+                    .then_some(fold.open_turn_last_ms)
+                    .flatten(),
+                compact_live_tail
+                    .then_some(fold.open_turn_last_kind.as_deref())
+                    .flatten(),
+                compact_live_tail
+                    .then_some(fold.open_turn_all_conforming)
+                    .flatten(),
             ],
         )
         .map_err(|error| format!("Insert runtime turn state: {error}"))?
@@ -2430,19 +2536,230 @@ pub(crate) fn refold_runtime_source_identity(
     Ok(())
 }
 
+fn add_runtime_rollup_deltas(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_key: &str,
+    session_id: &str,
+    rollups: &[PreparedRuntimeHourlyRollup],
+) -> Result<(), String> {
+    let mut statement = tx
+        .prepare_cached(
+            "INSERT INTO runtime_hourly (
+                 hour_utc, provider, source_key, session_id, turn_count,
+                 runtime_secs, first_turn_start_ms, last_turn_end_ms,
+                 raw_pruned
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
+             ON CONFLICT(hour_utc, provider, source_key) DO UPDATE SET
+                 session_id = excluded.session_id,
+                 turn_count = runtime_hourly.turn_count + excluded.turn_count,
+                 runtime_secs = runtime_hourly.runtime_secs + excluded.runtime_secs,
+                 first_turn_start_ms = MIN(
+                     runtime_hourly.first_turn_start_ms,
+                     excluded.first_turn_start_ms
+                 ),
+                 last_turn_end_ms = MAX(
+                     runtime_hourly.last_turn_end_ms,
+                     excluded.last_turn_end_ms
+                 )",
+        )
+        .map_err(|error| format!("Prepare incremental runtime rollup: {error}"))?;
+    for rollup in rollups {
+        statement
+            .execute(params![
+                rollup.hour_utc,
+                provider,
+                source_key,
+                session_id,
+                rollup.turn_count,
+                rollup.runtime_millis as f64 / 1_000.0,
+                rollup.first_turn_start_ms,
+                rollup.last_turn_end_ms,
+            ])
+            .map_err(|error| format!("Add incremental runtime rollup: {error}"))?;
+    }
+    Ok(())
+}
+
+fn advance_live_runtime_source_identity(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_key: &str,
+    session_id: &str,
+    events: &[PersistedRuntimeEvent],
+) -> Result<(), String> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let state = tx
+        .query_row(
+            "SELECT finalized_through_rowid, open_turn_started_ms,
+                    open_turn_last_ms, open_turn_last_kind,
+                    open_turn_all_conforming
+             FROM runtime_turn_state
+             WHERE provider = ?1 AND source_key = ?2",
+            params![provider, source_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<bool>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Read incremental runtime state: {error}"))?;
+    let mut events = events.to_vec();
+    events.sort_unstable_by_key(|event| (event.timestamp_ms, event.rowid));
+
+    let (prior_rowid, mut turn_start_ms, mut previous, mut turn_all_conforming) = match state {
+        Some((rowid, Some(start_ms), Some(last_ms), Some(last_kind), Some(all_conforming))) => {
+            if events
+                .first()
+                .is_some_and(|event| event.timestamp_ms < last_ms)
+            {
+                return refold_runtime_source_identity(
+                    tx, provider, source_key, session_id, session_id,
+                );
+            }
+            (
+                rowid,
+                start_ms,
+                Some(PersistedRuntimeEvent {
+                    rowid,
+                    timestamp_ms: last_ms,
+                    kind: last_kind,
+                    retention_eligible: all_conforming,
+                }),
+                all_conforming,
+            )
+        }
+        Some((rowid, None, None, None, None)) => (
+            rowid,
+            events[0].timestamp_ms,
+            None,
+            events[0].retention_eligible,
+        ),
+        None => (
+            0,
+            events[0].timestamp_ms,
+            None,
+            events[0].retention_eligible,
+        ),
+        Some(_) => {
+            return Err(format!(
+                "Live runtime state for {provider}/{source_key} is incomplete"
+            ));
+        }
+    };
+    let mut rollups = BTreeMap::<i64, PreparedRuntimeHourlyRollup>::new();
+    for event in &events {
+        if let Some(prior) = previous.as_ref() {
+            let gap_ms = event.timestamp_ms.saturating_sub(prior.timestamp_ms);
+            let is_tool_wait = prior.kind == "asst_tool_use" && event.kind == "user_tool_result";
+            let continues_turn = if is_tool_wait {
+                gap_ms <= RUNTIME_TOOL_WAIT_MAX_MS
+            } else {
+                gap_ms <= RUNTIME_IDLE_THRESHOLD_MS
+            };
+            if !continues_turn {
+                let turn_end_ms = if is_tool_wait {
+                    prior
+                        .timestamp_ms
+                        .saturating_add(gap_ms.min(RUNTIME_TOOL_WAIT_MAX_MS))
+                } else {
+                    prior.timestamp_ms
+                };
+                if turn_end_ms > turn_start_ms {
+                    let hour_utc =
+                        turn_start_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+                    let rollup =
+                        rollups
+                            .entry(hour_utc)
+                            .or_insert_with(|| PreparedRuntimeHourlyRollup {
+                                hour_utc,
+                                turn_count: 0,
+                                runtime_millis: 0,
+                                first_turn_start_ms: turn_start_ms,
+                                last_turn_end_ms: turn_end_ms,
+                            });
+                    rollup.turn_count = rollup.turn_count.checked_add(1).ok_or_else(|| {
+                        "Incremental runtime turn count exceeds SQLite INTEGER range".to_string()
+                    })?;
+                    rollup.runtime_millis = rollup
+                        .runtime_millis
+                        .checked_add(turn_end_ms - turn_start_ms)
+                        .ok_or_else(|| {
+                            "Incremental runtime duration exceeds SQLite INTEGER range".to_string()
+                        })?;
+                    rollup.first_turn_start_ms = rollup.first_turn_start_ms.min(turn_start_ms);
+                    rollup.last_turn_end_ms = rollup.last_turn_end_ms.max(turn_end_ms);
+                }
+                turn_start_ms = event.timestamp_ms;
+                turn_all_conforming = event.retention_eligible;
+            } else {
+                turn_all_conforming &= event.retention_eligible;
+            }
+        } else {
+            turn_all_conforming = event.retention_eligible;
+        }
+        previous = Some(event.clone());
+    }
+    let previous = previous.expect("non-empty incremental runtime input");
+    let rollups = rollups.into_values().collect::<Vec<_>>();
+    add_runtime_rollup_deltas(tx, provider, source_key, session_id, &rollups)?;
+    tx.execute(
+        "INSERT INTO runtime_turn_state (
+             provider, source_key, finalized_through_rowid,
+             open_turn_started_ms, open_turn_last_ms, open_turn_last_kind,
+             open_turn_all_conforming
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(provider, source_key) DO UPDATE SET
+             finalized_through_rowid = excluded.finalized_through_rowid,
+             open_turn_started_ms = excluded.open_turn_started_ms,
+             open_turn_last_ms = excluded.open_turn_last_ms,
+             open_turn_last_kind = excluded.open_turn_last_kind,
+             open_turn_all_conforming = excluded.open_turn_all_conforming",
+        params![
+            provider,
+            source_key,
+            prior_rowid.max(events.iter().map(|event| event.rowid).max().unwrap_or(0)),
+            turn_start_ms,
+            previous.timestamp_ms,
+            previous.kind,
+            turn_all_conforming,
+        ],
+    )
+    .map_err(|error| format!("Advance incremental runtime state: {error}"))?;
+    bump_rollup_generation_in_transaction(tx)
+}
+
 // @lat: [[backend#Backend#Database#Schema#Hourly Analytics Rollups]]
 pub(crate) fn verify_runtime_rollup_source_coverage(
     tx: &rusqlite::Transaction<'_>,
     provider: &str,
     source_key: &str,
 ) -> Result<i64, String> {
-    let (session_id, chain_id) = tx
+    let (session_id, chain_id, live_closed_at_ms) = tx
         .query_row(
-            "SELECT analytics_session_id, chain_id
-             FROM transcript_analytics_sources
-             WHERE provider = ?1 AND source_key = ?2",
+            "SELECT source.analytics_session_id, source.chain_id,
+                    CASE WHEN source.source_kind = 'live'
+                         THEN live.closed_at_ms ELSE NULL END
+             FROM transcript_analytics_sources AS source
+             LEFT JOIN live_analytics_sessions AS live
+               ON live.provider = source.provider
+              AND live.session_id = source.analytics_session_id
+             WHERE source.provider = ?1 AND source.source_key = ?2",
             params![provider, source_key],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
         )
         .map_err(|error| format!("Read runtime retention source identity: {error}"))?;
     let mut events = {
@@ -2474,6 +2791,7 @@ pub(crate) fn verify_runtime_rollup_source_coverage(
                     "Runtime retention source {provider}/{source_key} has mixed session or chain identity"
                 ));
             }
+            let retention_eligible = crate::retention::is_conforming_timestamp(&timestamp);
             let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
                 continue;
             };
@@ -2487,12 +2805,16 @@ pub(crate) fn verify_runtime_rollup_source_coverage(
                 rowid,
                 timestamp_ms,
                 kind,
+                retention_eligible,
             });
         }
         events
     };
     events.sort_unstable_by_key(|event| (event.timestamp_ms, event.rowid));
-    let fold = fold_persisted_runtime_events(&events, "Runtime retention coverage")?;
+    let mut fold = fold_persisted_runtime_events(&events, "Runtime retention coverage")?;
+    if let Some(closed_at_ms) = live_closed_at_ms {
+        fold = close_persisted_runtime_fold(fold, &events, closed_at_ms.saturating_add(1));
+    }
 
     let mut authoritative_hours = HashSet::new();
     let mut actual = BTreeMap::new();
@@ -2592,10 +2914,21 @@ pub(crate) fn seal_runtime_open_turn_for_retention(
     source_key: &str,
     cutoff_ms: i64,
 ) -> Result<usize, String> {
+    seal_runtime_open_turn(tx, provider, source_key, cutoff_ms, true)
+}
+
+fn seal_runtime_open_turn(
+    tx: &rusqlite::Transaction<'_>,
+    provider: &str,
+    source_key: &str,
+    cutoff_ms: i64,
+    require_conforming_timestamp: bool,
+) -> Result<usize, String> {
     let state = tx
         .query_row(
             "SELECT state.finalized_through_rowid, state.open_turn_started_ms,
-                    source.analytics_session_id
+                    source.analytics_session_id, state.open_turn_last_ms,
+                    state.open_turn_last_kind, state.open_turn_all_conforming
              FROM runtime_turn_state AS state
              JOIN transcript_analytics_sources AS source
                ON source.provider = state.provider
@@ -2607,14 +2940,74 @@ pub(crate) fn seal_runtime_open_turn_for_retention(
                     row.get::<_, i64>(0)?,
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<bool>>(5)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| format!("Read runtime retention open state: {error}"))?;
-    let Some((finalized_through_rowid, Some(open_turn_started_ms), session_id)) = state else {
+    let Some((
+        finalized_through_rowid,
+        Some(open_turn_started_ms),
+        session_id,
+        summarized_last_ms,
+        summarized_last_kind,
+        summarized_all_conforming,
+    )) = state
+    else {
         return Ok(0);
     };
+    if let (Some(last_event_ms), Some(last_kind), Some(all_conforming)) = (
+        summarized_last_ms,
+        summarized_last_kind.as_deref(),
+        summarized_all_conforming,
+    ) {
+        if require_conforming_timestamp && !all_conforming {
+            return Ok(0);
+        }
+        let turn_end_ms = if last_kind == "asst_tool_use" {
+            last_event_ms.saturating_add(RUNTIME_TOOL_WAIT_MAX_MS)
+        } else {
+            last_event_ms
+        };
+        if turn_end_ms > cutoff_ms {
+            return Ok(0);
+        }
+        let mut changed = 0_usize;
+        if turn_end_ms > open_turn_started_ms {
+            let hour_utc =
+                open_turn_started_ms.div_euclid(MODEL_ROLLUP_HOUR_MS) * MODEL_ROLLUP_HOUR_MS;
+            add_runtime_rollup_deltas(
+                tx,
+                provider,
+                source_key,
+                &session_id,
+                &[PreparedRuntimeHourlyRollup {
+                    hour_utc,
+                    turn_count: 1,
+                    runtime_millis: turn_end_ms - open_turn_started_ms,
+                    first_turn_start_ms: open_turn_started_ms,
+                    last_turn_end_ms: turn_end_ms,
+                }],
+            )?;
+            changed = changed.saturating_add(1);
+        }
+        changed = changed.saturating_add(
+            tx.execute(
+                "UPDATE runtime_turn_state
+                 SET open_turn_started_ms = NULL,
+                     open_turn_last_ms = NULL,
+                     open_turn_last_kind = NULL,
+                     open_turn_all_conforming = NULL
+                 WHERE provider = ?1 AND source_key = ?2",
+                params![provider, source_key],
+            )
+            .map_err(|error| format!("Seal compact runtime state: {error}"))?,
+        );
+        return Ok(changed);
+    }
     let mut open_events = {
         let mut statement = tx
             .prepare(
@@ -2647,7 +3040,7 @@ pub(crate) fn seal_runtime_open_turn_for_retention(
     }
     let mut last_event_ms = 0_i64;
     for (_, timestamp, _) in &open_events {
-        if !crate::retention::is_conforming_timestamp(timestamp) {
+        if require_conforming_timestamp && !crate::retention::is_conforming_timestamp(timestamp) {
             return Ok(0);
         }
         let timestamp_ms = DateTime::parse_from_rfc3339(timestamp)
@@ -2713,7 +3106,10 @@ pub(crate) fn seal_runtime_open_turn_for_retention(
         tx.execute(
             "UPDATE runtime_turn_state
              SET finalized_through_rowid = MAX(finalized_through_rowid, ?3),
-                 open_turn_started_ms = NULL
+                 open_turn_started_ms = NULL,
+                 open_turn_last_ms = NULL,
+                 open_turn_last_kind = NULL,
+                 open_turn_all_conforming = NULL
              WHERE provider = ?1 AND source_key = ?2",
             params![provider, source_key, max_open_rowid],
         )
@@ -3011,8 +3407,14 @@ impl RuntimeRollupBackfillTarget {
             .query_row(
                 "WITH next_source AS (
                      SELECT provider, source_key
-                     FROM session_events
+                     FROM session_events AS candidate
                      WHERE source_key IS NOT NULL AND rowid > ?1
+                       AND EXISTS (
+                           SELECT 1 FROM transcript_analytics_sources AS source
+                           WHERE source.provider = candidate.provider
+                             AND source.source_key = candidate.source_key
+                             AND source.source_kind = 'transcript'
+                       )
                      ORDER BY rowid
                      LIMIT 1
                  )
@@ -3102,6 +3504,7 @@ impl RuntimeRollupBackfillTarget {
                     "Runtime source {provider}/{source_key} changed identity during preparation"
                 )));
             }
+            let retention_eligible = crate::retention::is_conforming_timestamp(&timestamp);
             let Ok(timestamp) = DateTime::parse_from_rfc3339(&timestamp) else {
                 continue;
             };
@@ -3115,6 +3518,7 @@ impl RuntimeRollupBackfillTarget {
                 rowid,
                 timestamp_ms,
                 kind,
+                retention_eligible,
             });
         }
 
@@ -3152,7 +3556,12 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
         )?;
         let done_through = if status == "complete" {
             conn.query_row(
-                "SELECT MAX(rowid) FROM session_events WHERE source_key IS NOT NULL",
+                "SELECT MAX(event.rowid)
+                 FROM session_events AS event
+                 JOIN transcript_analytics_sources AS source
+                   ON source.provider = event.provider
+                  AND source.source_key = event.source_key
+                 WHERE source.source_kind = 'transcript'",
                 [],
                 |row| row.get::<_, Option<i64>>(0),
             )?
@@ -3161,8 +3570,11 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
         };
         let rows_done = match done_through {
             Some(rowid) => conn.query_row(
-                "SELECT COUNT(*) FROM session_events
-                 WHERE source_key IS NOT NULL AND rowid <= ?1",
+                "SELECT COUNT(*) FROM session_events AS event
+                 JOIN transcript_analytics_sources AS source
+                   ON source.provider = event.provider
+                  AND source.source_key = event.source_key
+                 WHERE source.source_kind = 'transcript' AND event.rowid <= ?1",
                 params![rowid],
                 |row| row.get::<_, u64>(0),
             )?,
@@ -3176,7 +3588,11 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
 
     fn count_total_rows(&self, conn: &Connection) -> rusqlite::Result<u64> {
         conn.query_row(
-            "SELECT COUNT(*) FROM session_events WHERE source_key IS NOT NULL",
+            "SELECT COUNT(*) FROM session_events AS event
+             JOIN transcript_analytics_sources AS source
+               ON source.provider = event.provider
+              AND source.source_key = event.source_key
+             WHERE source.source_kind = 'transcript'",
             [],
             |row| row.get(0),
         )
@@ -3199,9 +3615,26 @@ impl RollupBackfillTarget for RuntimeRollupBackfillTarget {
         budget: RollupBackfillChunkBudget,
     ) -> rusqlite::Result<RollupBackfillChunk> {
         let reset_changed = if state.done_through.is_none() {
-            let deleted_rollups =
-                tx.execute("DELETE FROM runtime_hourly WHERE raw_pruned = 0", [])?;
-            let deleted_states = tx.execute("DELETE FROM runtime_turn_state", [])?;
+            let deleted_rollups = tx.execute(
+                "DELETE FROM runtime_hourly AS rollup
+                 WHERE raw_pruned = 0 AND EXISTS (
+                     SELECT 1 FROM transcript_analytics_sources AS source
+                     WHERE source.provider = rollup.provider
+                       AND source.source_key = rollup.source_key
+                       AND source.source_kind = 'transcript'
+                 )",
+                [],
+            )?;
+            let deleted_states = tx.execute(
+                "DELETE FROM runtime_turn_state AS state
+                 WHERE EXISTS (
+                     SELECT 1 FROM transcript_analytics_sources AS source
+                     WHERE source.provider = state.provider
+                       AND source.source_key = state.source_key
+                       AND source.source_kind = 'transcript'
+                 )",
+                [],
+            )?;
             deleted_rollups > 0 || deleted_states > 0
         } else {
             false
@@ -3384,6 +3817,8 @@ struct RuntimeOpenTailStatsRow {
     turn_start_ms: i64,
     provider: String,
     session_id: String,
+    last_event_ms: Option<i64>,
+    last_event_kind: Option<String>,
     packed_last_event: Option<String>,
 }
 
@@ -3445,7 +3880,8 @@ fn read_completed_runtime_rollup_rows(
 
     let tail_sql = format!(
         "SELECT state.open_turn_started_ms, source.provider,
-                source.analytics_session_id,
+                source.analytics_session_id, state.open_turn_last_ms,
+                state.open_turn_last_kind,
                 (
                     SELECT event.timestamp || char(31) || event.kind
                     FROM session_events AS event
@@ -3461,6 +3897,9 @@ fn read_completed_runtime_rollup_rows(
          JOIN transcript_analytics_sources AS source
            ON source.provider = state.provider
           AND source.source_key = state.source_key
+         LEFT JOIN live_analytics_sessions AS live
+           ON live.provider = source.provider
+          AND live.session_id = source.analytics_session_id
          WHERE state.open_turn_started_ms >= ?1
            AND {ACTIVE_RUNTIME_SOURCE_PREDICATE}{}",
         if parent_only {
@@ -3479,7 +3918,9 @@ fn read_completed_runtime_rollup_rows(
                     turn_start_ms: row.get(0)?,
                     provider: row.get(1)?,
                     session_id: row.get(2)?,
-                    packed_last_event: row.get(3)?,
+                    last_event_ms: row.get(3)?,
+                    last_event_kind: row.get(4)?,
+                    packed_last_event: row.get(5)?,
                 })
             })
             .map_err(|error| format!("Query runtime open tail: {error}"))?;
@@ -3491,15 +3932,19 @@ fn read_completed_runtime_rollup_rows(
         .ok_or_else(|| "Runtime window start is outside the supported range".to_string())?
         .to_rfc3339();
     let live_sql = if parent_only {
-        "SELECT rowid, timestamp, kind, provider, session_id, chain_id
-         FROM session_events INDEXED BY idx_se_live_timestamp_chain
-         WHERE source_key IS NULL AND timestamp >= ?1 AND is_sidechain = 0
-         ORDER BY provider, chain_id, timestamp, rowid"
+        "SELECT event.rowid, event.timestamp, event.kind, event.provider,
+                event.session_id, event.chain_id
+         FROM session_events AS event INDEXED BY idx_se_timestamp_chain
+         WHERE event.timestamp >= ?1 AND event.is_sidechain = 0
+           AND event.source_key IS NULL
+         ORDER BY event.provider, event.chain_id, event.timestamp, event.rowid"
     } else {
-        "SELECT rowid, timestamp, kind, provider, session_id, chain_id
-         FROM session_events INDEXED BY idx_se_live_timestamp_chain
-         WHERE source_key IS NULL AND timestamp >= ?1
-         ORDER BY provider, chain_id, timestamp, rowid"
+        "SELECT event.rowid, event.timestamp, event.kind, event.provider,
+                event.session_id, event.chain_id
+         FROM session_events AS event INDEXED BY idx_se_timestamp_chain
+         WHERE event.timestamp >= ?1
+           AND event.source_key IS NULL
+         ORDER BY event.provider, event.chain_id, event.timestamp, event.rowid"
     };
     let mut live_by_chain = BTreeMap::<(String, String, String), Vec<PersistedRuntimeEvent>>::new();
     {
@@ -3530,6 +3975,7 @@ fn read_completed_runtime_rollup_rows(
                     rowid,
                     timestamp_ms: timestamp.timestamp_millis(),
                     kind,
+                    retention_eligible: true,
                 });
         }
     }
@@ -3557,6 +4003,8 @@ fn read_completed_runtime_rollup_rows(
                 turn_start_ms,
                 provider,
                 session_id,
+                last_event_ms: None,
+                last_event_kind: None,
                 packed_last_event: Some(packed_last_event),
             });
         }
@@ -3593,15 +4041,20 @@ fn shape_completed_runtime_rollup_stats(
     }
 
     for row in rows.open_tails {
-        let Some(packed_last_event) = row.packed_last_event else {
-            continue;
+        let (last_event_ms, kind) = match (row.last_event_ms, row.last_event_kind) {
+            (Some(last_event_ms), Some(kind)) => (last_event_ms, kind),
+            _ => {
+                let Some(packed_last_event) = row.packed_last_event else {
+                    continue;
+                };
+                let Some((timestamp, kind)) = packed_last_event.split_once('\u{1f}') else {
+                    return Err("Runtime open-tail row has an invalid packed event".to_string());
+                };
+                let timestamp = DateTime::parse_from_rfc3339(timestamp)
+                    .map_err(|error| format!("Parse runtime open-tail timestamp: {error}"))?;
+                (timestamp.timestamp_millis(), kind.to_string())
+            }
         };
-        let Some((timestamp, kind)) = packed_last_event.split_once('\u{1f}') else {
-            return Err("Runtime open-tail row has an invalid packed event".to_string());
-        };
-        let timestamp = DateTime::parse_from_rfc3339(timestamp)
-            .map_err(|error| format!("Parse runtime open-tail timestamp: {error}"))?;
-        let last_event_ms = timestamp.timestamp_millis();
         let end_ms = if kind == "asst_tool_use" {
             now.timestamp_millis()
                 .min(last_event_ms.saturating_add(RUNTIME_TOOL_WAIT_MAX_MS))
@@ -7835,10 +8288,19 @@ impl Storage {
                      source_key                  TEXT NOT NULL,
                      finalized_through_rowid     INTEGER NOT NULL DEFAULT 0,
                      open_turn_started_ms        INTEGER,
+                     open_turn_last_ms           INTEGER,
+                     open_turn_last_kind         TEXT,
+                     open_turn_all_conforming   INTEGER,
                      PRIMARY KEY(provider, source_key),
                      CHECK(finalized_through_rowid >= 0),
                      CHECK(open_turn_started_ms IS NULL
-                           OR open_turn_started_ms >= 0)
+                           OR open_turn_started_ms >= 0),
+                     CHECK(open_turn_last_ms IS NULL
+                           OR open_turn_last_ms >= open_turn_started_ms),
+                     CHECK((open_turn_last_ms IS NULL) =
+                           (open_turn_last_kind IS NULL)),
+                     CHECK(open_turn_all_conforming IS NULL OR
+                           open_turn_all_conforming IN (0, 1))
                  );
 
                  CREATE TABLE IF NOT EXISTS rollup_meta (
@@ -8042,6 +8504,252 @@ impl Storage {
                 .map_err(|e| format!("Failed to record migration 43: {e}"))?;
             tx.commit()
                 .map_err(|e| format!("Migration 43 commit: {e}"))?;
+        }
+
+        // Migration 44 gives extension-pushed Pi evidence one provider/session
+        // source. Lifecycle state, rather than a transcript path, decides when
+        // retention may prune it.
+        if current_version < 44 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 44 transaction: {e}"))?;
+            if !table_has_column(&tx, "live_analytics_sessions", "lifecycle_at_ms") {
+                tx.execute_batch(
+                    "ALTER TABLE live_analytics_sessions
+                     ADD COLUMN lifecycle_at_ms INTEGER NOT NULL DEFAULT 0
+                     CHECK(lifecycle_at_ms >= 0);
+                     ALTER TABLE live_analytics_sessions
+                     ADD COLUMN closed_at_ms INTEGER
+                     CHECK(closed_at_ms IS NULL OR closed_at_ms >= 0);
+                     ALTER TABLE transcript_analytics_sources
+                     ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'transcript'
+                     CHECK(source_kind IN ('transcript', 'live'));",
+                )
+                .map_err(|e| format!("Migration 44 (live source columns): {e}"))?;
+            }
+            if !table_has_column(&tx, "runtime_turn_state", "open_turn_last_ms") {
+                tx.execute_batch(
+                    "ALTER TABLE runtime_turn_state
+                     ADD COLUMN open_turn_last_ms INTEGER;
+                     ALTER TABLE runtime_turn_state
+                     ADD COLUMN open_turn_last_kind TEXT;
+                     ALTER TABLE runtime_turn_state
+                     ADD COLUMN open_turn_all_conforming INTEGER;",
+                )
+                .map_err(|e| format!("Migration 44 (live runtime state): {e}"))?;
+            }
+            let migrated_at_ms = Utc::now().timestamp_millis();
+            let migrated_at = Utc::now().to_rfc3339();
+            tx.execute(
+                "INSERT OR IGNORE INTO live_analytics_sessions (
+                     provider, session_id, cwd, hostname, updated_at,
+                     ephemeral, lifecycle_at_ms, closed_at_ms
+                 )
+                 SELECT 'pi', evidence.session_id, source.cwd,
+                        COALESCE(source.hostname, 'unknown'), ?1, 0, ?2, ?2
+                 FROM (
+                     SELECT session_id FROM session_events
+                     WHERE provider = 'pi' AND source_key IS NULL
+                     UNION
+                     SELECT session_id FROM response_times
+                     WHERE provider = 'pi' AND source_key IS NULL
+                     UNION
+                     SELECT analytics_session_id FROM model_usage_observations
+                     WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'
+                 ) AS evidence
+                 LEFT JOIN model_observation_sources AS source
+                   ON source.provider = 'pi'
+                  AND source.source_key = 'pi-push:' || evidence.session_id",
+                params![migrated_at, migrated_at_ms],
+            )
+            .map_err(|e| format!("Migration 44 (register Pi sessions): {e}"))?;
+            tx.execute(
+                "UPDATE live_analytics_sessions
+                 SET lifecycle_at_ms = MAX(lifecycle_at_ms, ?1),
+                     closed_at_ms = COALESCE(closed_at_ms, ?1)
+                 WHERE provider = 'pi'",
+                params![migrated_at_ms],
+            )
+            .map_err(|e| format!("Migration 44 (seal pre-upgrade Pi sessions): {e}"))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     is_sidechain, cwd, hostname, seen_generation,
+                     processing_status, last_attempt_at_ms,
+                     last_success_at_ms, source_kind
+                 )
+                 SELECT 'pi', 'live:pi:' || evidence.session_id, 'live:pi',
+                        'live:pi:' || evidence.session_id, evidence.session_id,
+                        evidence.session_id, evidence.session_id, 0,
+                        live.cwd, live.hostname, 0, 'ok', ?1, ?1, 'live'
+                 FROM (
+                     SELECT session_id FROM session_events
+                     WHERE provider = 'pi' AND source_key IS NULL
+                     UNION
+                     SELECT session_id FROM response_times
+                     WHERE provider = 'pi' AND source_key IS NULL
+                 ) AS evidence
+                 LEFT JOIN live_analytics_sessions AS live
+                   ON live.provider = 'pi'
+                  AND live.session_id = evidence.session_id",
+                params![migrated_at_ms],
+            )
+            .map_err(|e| format!("Migration 44 (register Pi runtime sources): {e}"))?;
+            tx.execute(
+                "UPDATE session_events
+                 SET source_key = 'live:pi:' || session_id
+                 WHERE provider = 'pi' AND source_key IS NULL",
+                [],
+            )
+            .map_err(|e| format!("Migration 44 (own Pi runtime events): {e}"))?;
+            tx.execute(
+                "UPDATE response_times
+                 SET source_key = 'live:pi:' || session_id
+                 WHERE provider = 'pi' AND source_key IS NULL",
+                [],
+            )
+            .map_err(|e| format!("Migration 44 (own Pi response rows): {e}"))?;
+            tx.execute(
+                "INSERT OR IGNORE INTO model_observation_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     parent_chain_id, agent_id, agent_nickname, is_sidechain,
+                     cwd, hostname, first_activity_at_ms, last_activity_at_ms,
+                     mtime_ns, size_bytes, content_sha256, last_error,
+                     suppressed_sha256, suppressed_at_ms, seen_generation,
+                     processing_status, observation_count, last_attempt_at_ms,
+                     last_success_at_ms
+                 )
+                 SELECT provider, 'live:pi:' || analytics_session_id,
+                        'live:pi', 'live:pi:' || analytics_session_id,
+                        source_session_id, analytics_session_id, chain_id,
+                        parent_chain_id, agent_id, agent_nickname, is_sidechain,
+                        cwd, hostname, first_activity_at_ms, last_activity_at_ms,
+                        mtime_ns, size_bytes, content_sha256, last_error,
+                        suppressed_sha256, suppressed_at_ms, seen_generation,
+                        processing_status, observation_count,
+                        last_attempt_at_ms, last_success_at_ms
+                 FROM model_observation_sources
+                 WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'",
+                [],
+            )
+            .map_err(|e| format!("Migration 44 (register Pi model sources): {e}"))?;
+            tx.execute(
+                "UPDATE model_usage_observations
+                 SET source_key = 'live:pi:' || analytics_session_id
+                 WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'",
+                [],
+            )
+            .map_err(|e| format!("Migration 44 (own Pi model observations): {e}"))?;
+            tx.execute(
+                "UPDATE model_usage_hourly
+                 SET source_key = 'live:pi:' || analytics_session_id
+                 WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'",
+                [],
+            )
+            .map_err(|e| format!("Migration 44 (move Pi model rollups): {e}"))?;
+            tx.execute(
+                "DELETE FROM model_observation_sources
+                 WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'",
+                [],
+            )
+            .map_err(|e| format!("Migration 44 (remove Pi push sources): {e}"))?;
+            let migrated_runtime_sessions = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT analytics_session_id, source_key
+                         FROM transcript_analytics_sources
+                         WHERE provider = 'pi' AND source_kind = 'live'",
+                    )
+                    .map_err(|e| format!("Migration 44 (prepare Pi runtime fold): {e}"))?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|e| format!("Migration 44 (query Pi runtime fold): {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Migration 44 (read Pi runtime fold): {e}"))?
+            };
+            for (session_id, source_key) in migrated_runtime_sessions {
+                refold_runtime_source_identity(&tx, "pi", &source_key, &session_id, &session_id)?;
+                if seal_runtime_open_turn(
+                    &tx,
+                    "pi",
+                    &source_key,
+                    migrated_at_ms.saturating_add(1),
+                    false,
+                )? > 0
+                {
+                    bump_rollup_generation_in_transaction(&tx)?;
+                }
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (44)", [])
+                .map_err(|e| format!("Failed to record migration 44: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 44 commit: {e}"))?;
+        }
+
+        // Migration 45 compacts lifecycle-owned open turns into bounded state.
+        // Normal Pi ingest can then advance one row without refolding history.
+        if current_version < 45 {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("Migration 45 transaction: {e}"))?;
+            if !table_has_column(&tx, "runtime_turn_state", "open_turn_last_ms") {
+                tx.execute_batch(
+                    "ALTER TABLE runtime_turn_state
+                     ADD COLUMN open_turn_last_ms INTEGER;
+                     ALTER TABLE runtime_turn_state
+                     ADD COLUMN open_turn_last_kind TEXT;
+                     ALTER TABLE runtime_turn_state
+                     ADD COLUMN open_turn_all_conforming INTEGER;",
+                )
+                .map_err(|e| format!("Migration 45 (live runtime state): {e}"))?;
+            }
+            let live_sources = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT source.analytics_session_id, source.source_key,
+                                live.closed_at_ms
+                         FROM transcript_analytics_sources AS source
+                         LEFT JOIN live_analytics_sessions AS live
+                           ON live.provider = source.provider
+                          AND live.session_id = source.analytics_session_id
+                         WHERE source.provider = 'pi'
+                           AND source.source_kind = 'live'",
+                    )
+                    .map_err(|e| format!("Migration 45 (prepare live sources): {e}"))?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    })
+                    .map_err(|e| format!("Migration 45 (query live sources): {e}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("Migration 45 (read live sources): {e}"))?
+            };
+            for (session_id, source_key, closed_at_ms) in live_sources {
+                refold_runtime_source_identity(&tx, "pi", &source_key, &session_id, &session_id)?;
+                if let Some(closed_at_ms) = closed_at_ms
+                    && seal_runtime_open_turn(
+                        &tx,
+                        "pi",
+                        &source_key,
+                        closed_at_ms.saturating_add(1),
+                        false,
+                    )? > 0
+                {
+                    bump_rollup_generation_in_transaction(&tx)?;
+                }
+            }
+            tx.execute("INSERT INTO schema_version (version) VALUES (45)", [])
+                .map_err(|e| format!("Failed to record migration 45: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("Migration 45 commit: {e}"))?;
         }
 
         ensure_startup_indexes(&conn)?;
@@ -13651,6 +14359,8 @@ impl Storage {
                     sources.hostname, sources.is_sidechain, sources.source_ok,
                     COALESCE(SUM(rollup.runtime_secs), 0),
                     state.open_turn_started_ms,
+                    state.open_turn_last_ms,
+                    state.open_turn_last_kind,
                     CASE WHEN state.open_turn_started_ms IS NULL THEN NULL ELSE (
                         SELECT event.timestamp || char(31) || event.kind
                         FROM session_events AS event
@@ -13673,6 +14383,7 @@ impl Storage {
              GROUP BY sources.provider, sources.session_id, sources.chain_id,
                       sources.hostname, sources.is_sidechain, sources.source_ok,
                       sources.source_key, state.open_turn_started_ms,
+                      state.open_turn_last_ms, state.open_turn_last_kind,
                       state.finalized_through_rowid"
         );
         {
@@ -13690,7 +14401,9 @@ impl Storage {
                         row.get::<_, bool>(5)?,
                         row.get::<_, f64>(6)?,
                         row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                     ))
                 })
                 .map_err(|error| format!("Query session lifetime runtime: {error}"))?;
@@ -13704,11 +14417,21 @@ impl Storage {
                     source_ok,
                     finalized_secs,
                     open_turn_started_ms,
+                    open_turn_last_ms,
+                    open_turn_last_kind,
                     packed_last_event,
                 ) = runtime_row
                     .map_err(|error| format!("Read session lifetime runtime: {error}"))?;
-                let open_tail = match (open_turn_started_ms, packed_last_event) {
-                    (Some(start_ms), Some(packed)) => {
+                let open_tail = match (
+                    open_turn_started_ms,
+                    open_turn_last_ms,
+                    open_turn_last_kind,
+                    packed_last_event,
+                ) {
+                    (Some(start_ms), Some(last_ms), Some(kind), _) => {
+                        Some((start_ms, last_ms, kind))
+                    }
+                    (Some(start_ms), _, _, Some(packed)) => {
                         let Some((timestamp, kind)) = packed.split_once('\u{1f}') else {
                             return Err("Session runtime open-tail row is invalid".to_string());
                         };
@@ -13971,27 +14694,104 @@ impl Storage {
         cwd: Option<&str>,
         hostname: &str,
         ephemeral: bool,
+        lifecycle_at_ms: i64,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO live_analytics_sessions (
-                 provider, session_id, cwd, hostname, updated_at, ephemeral
-             ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5)
+                 provider, session_id, cwd, hostname, updated_at, ephemeral,
+                 lifecycle_at_ms, closed_at_ms
+             ) VALUES ('pi', ?1, ?2, ?3, ?4, ?5, ?6, NULL)
              ON CONFLICT(provider, session_id) DO UPDATE SET
                  cwd = COALESCE(excluded.cwd, live_analytics_sessions.cwd),
                  hostname = excluded.hostname,
                  updated_at = excluded.updated_at,
-                 ephemeral = excluded.ephemeral",
+                 ephemeral = excluded.ephemeral,
+                 lifecycle_at_ms = excluded.lifecycle_at_ms,
+                 closed_at_ms = NULL
+             WHERE live_analytics_sessions.lifecycle_at_ms <= excluded.lifecycle_at_ms",
             params![
                 session_id,
                 cwd,
                 hostname,
                 Utc::now().to_rfc3339(),
                 ephemeral,
+                lifecycle_at_ms,
             ],
         )
         .map_err(|e| format!("Upsert Pi live session: {e}"))?;
         Ok(())
+    }
+
+    pub(crate) fn close_pi_live_session(
+        &self,
+        session_id: &str,
+        closed_at_ms: i64,
+    ) -> Result<(), String> {
+        let source_key = pi_live_source_key(session_id);
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Begin Pi live source close: {error}"))?;
+        let closed = tx
+            .execute(
+                "INSERT INTO live_analytics_sessions (
+                     provider, session_id, updated_at, ephemeral,
+                     lifecycle_at_ms, closed_at_ms
+                 ) VALUES ('pi', ?1, ?3, 0, ?2, ?2)
+                 ON CONFLICT(provider, session_id) DO UPDATE SET
+                     lifecycle_at_ms = excluded.lifecycle_at_ms,
+                     closed_at_ms = excluded.closed_at_ms,
+                     updated_at = excluded.updated_at
+                 WHERE live_analytics_sessions.lifecycle_at_ms <=
+                       excluded.lifecycle_at_ms",
+                params![session_id, closed_at_ms, Utc::now().to_rfc3339()],
+            )
+            .map_err(|error| format!("Close Pi live session: {error}"))?;
+        if closed > 0
+            && tx
+                .query_row(
+                    "SELECT 1 FROM transcript_analytics_sources
+                     WHERE provider = 'pi' AND source_key = ?1",
+                    params![source_key],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| format!("Find Pi runtime source: {error}"))?
+                .is_some()
+        {
+            if let Some(watermark) = tx
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    params![RETENTION_WATERMARK_KEY],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("Read Pi close retention watermark: {error}"))?
+                .and_then(|raw| parse_watermark_setting(&raw))
+            {
+                tx.execute(
+                    "DELETE FROM session_events
+                     WHERE provider = 'pi' AND source_key = ?1
+                       AND length(timestamp) = 24 AND timestamp LIKE '%Z'
+                       AND timestamp < ?2",
+                    params![source_key, watermark],
+                )
+                .map_err(|error| format!("Suppress covered Pi runtime rows: {error}"))?;
+            }
+            if seal_runtime_open_turn(
+                &tx,
+                "pi",
+                &source_key,
+                closed_at_ms.saturating_add(1),
+                false,
+            )? > 0
+            {
+                bump_rollup_generation_in_transaction(&tx)?;
+            }
+        }
+        tx.commit()
+            .map_err(|error| format!("Commit Pi live source close: {error}"))
     }
 
     pub(crate) fn store_pi_model_usage(
@@ -14042,11 +14842,19 @@ impl Storage {
             return Err("Invalid pushed Pi usage cost".to_string());
         }
 
-        let source_key = format!("pi-push:{}", event.session_id);
+        let source_key = pi_live_source_key(&event.session_id);
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
             .map_err(|error| format!("Begin pushed Pi usage insert: {error}"))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO live_analytics_sessions (
+                 provider, session_id, hostname, updated_at, ephemeral,
+                 lifecycle_at_ms, closed_at_ms
+             ) VALUES ('pi', ?1, ?2, ?3, 0, 0, NULL)",
+            params![event.session_id, hostname, Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| format!("Register pushed Pi usage session: {error}"))?;
         tx.execute(
             "INSERT INTO model_observation_sources (
                  provider, source_key, source_root_key, source_path,
@@ -14055,7 +14863,7 @@ impl Storage {
                  last_activity_at_ms, seen_generation, processing_status,
                  observation_count, last_attempt_at_ms, last_success_at_ms
              ) VALUES (
-                 'pi', ?1, ?1, ?1, ?2, ?2, ?2, 0,
+                 'pi', ?1, 'live:pi', ?1, ?2, ?2, ?2, 0,
                  (SELECT cwd FROM live_analytics_sessions
                   WHERE provider = 'pi' AND session_id = ?2),
                  ?3, ?4, ?4, 0, 'ok', 0, ?4, ?4
@@ -14077,6 +14885,22 @@ impl Storage {
             params![source_key, event.session_id, hostname, observed_at_ms],
         )
         .map_err(|error| format!("Upsert pushed Pi usage source: {error}"))?;
+        let watermark_ms = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RETENTION_WATERMARK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Read pushed Pi retention watermark: {error}"))?
+            .and_then(|raw| parse_watermark_setting(&raw))
+            .and_then(|raw| DateTime::parse_from_rfc3339(&raw).ok())
+            .map(|watermark| watermark.timestamp_millis());
+        if watermark_ms.is_some_and(|watermark| observed_at_ms < watermark) {
+            tx.commit()
+                .map_err(|error| format!("Commit suppressed Pi usage replay: {error}"))?;
+            return Ok(false);
+        }
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO model_usage_observations (
@@ -17419,9 +18243,9 @@ impl Storage {
         })
     }
 
-    /// Atomically persist one source-less analytics batch and the exact origin
-    /// fields supplied by its producer. Null origin values never erase a known
-    /// value from an earlier endpoint.
+    /// Atomically persist one live analytics batch and its exact origin.
+    /// Pi rows receive a lifecycle-owned session source; other providers keep
+    /// the source-less identity. Null origin fields never erase known values.
     // @lat: [[data-flow#Session Indexing Pipeline#Live Analytics Origin]]
     pub(crate) fn store_live_session_analytics(
         &self,
@@ -17507,6 +18331,9 @@ impl Storage {
             return Err("Live hook invocation identity is incomplete".to_string());
         }
 
+        let source_key =
+            (provider == IntegrationProvider::Pi).then(|| pi_live_source_key(session_id));
+
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
@@ -17516,8 +18343,9 @@ impl Storage {
         let updated_at = Utc::now().to_rfc3339();
         tx.execute(
             "INSERT INTO live_analytics_sessions (
-                 provider, session_id, project, cwd, hostname, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 provider, session_id, project, cwd, hostname, updated_at,
+                 lifecycle_at_ms, closed_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, NULL)
              ON CONFLICT(provider, session_id) DO UPDATE SET
                  project = COALESCE(
                      excluded.project, live_analytics_sessions.project
@@ -17538,6 +18366,65 @@ impl Storage {
         )
         .map_err(|e| format!("Upsert live analytics origin: {e}"))?;
 
+        if let Some(source_key) = source_key.as_deref() {
+            tx.execute(
+                "INSERT INTO transcript_analytics_sources (
+                     provider, source_key, source_root_key, source_path,
+                     source_session_id, analytics_session_id, chain_id,
+                     is_sidechain, project, cwd, hostname, seen_generation,
+                     processing_status, last_attempt_at_ms,
+                     last_success_at_ms, source_kind
+                 ) VALUES (
+                     'pi', ?1, 'live:pi', ?1, ?2, ?2, ?2, 0,
+                     ?3, ?4, ?5, 0, 'ok', ?6, ?6, 'live'
+                 )
+                 ON CONFLICT(provider, source_key) DO UPDATE SET
+                     project = COALESCE(
+                         excluded.project, transcript_analytics_sources.project
+                     ),
+                     cwd = COALESCE(excluded.cwd, transcript_analytics_sources.cwd),
+                     hostname = COALESCE(
+                         excluded.hostname, transcript_analytics_sources.hostname
+                     ),
+                     processing_status = 'ok',
+                     last_attempt_at_ms = excluded.last_attempt_at_ms,
+                     last_success_at_ms = excluded.last_success_at_ms",
+                params![
+                    source_key,
+                    session_id,
+                    origin_project,
+                    origin_cwd,
+                    origin.hostname,
+                    Utc::now().timestamp_millis(),
+                ],
+            )
+            .map_err(|e| format!("Upsert Pi live runtime source: {e}"))?;
+        }
+        let pi_closed_at_ms = if source_key.is_some() {
+            tx.query_row(
+                "SELECT closed_at_ms
+                 FROM live_analytics_sessions
+                 WHERE provider = 'pi' AND session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| format!("Read Pi live runtime lifecycle: {e}"))?
+        } else {
+            None
+        };
+        let runtime_watermark = if source_key.is_some() {
+            tx.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RETENTION_WATERMARK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Read Pi runtime retention watermark: {e}"))?
+            .and_then(|raw| parse_watermark_setting(&raw))
+        } else {
+            None
+        };
+
         if !rows.messages.is_empty() {
             let response_max_secs = match provider {
                 IntegrationProvider::Codex => 6.0 * 60.0 * 60.0,
@@ -17551,7 +18438,7 @@ impl Storage {
                          provider, source_key, session_id, chain_id,
                          parent_chain_id, timestamp, response_secs, idle_secs,
                          is_sidechain, agent_id, parent_uuid
-                     ) VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     ) VALUES (?1, ?11, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
                 .map_err(|e| format!("Prepare live response times: {e}"))?;
             let mut messages_by_chain: HashMap<&str, Vec<LiveSessionMessageInput<'_>>> =
@@ -17585,9 +18472,9 @@ impl Storage {
                     .query_row(
                         "SELECT timestamp FROM response_times
                          WHERE provider = ?1 AND session_id = ?2 AND chain_id = ?3
-                           AND source_key IS NULL AND response_secs IS NOT NULL
+                           AND source_key IS ?4 AND response_secs IS NOT NULL
                          ORDER BY timestamp DESC LIMIT 1",
-                        params![provider.as_str(), session_id, chain_id],
+                        params![provider.as_str(), session_id, chain_id, source_key],
                         |row| row.get::<_, String>(0),
                     )
                     .optional()
@@ -17637,6 +18524,14 @@ impl Storage {
                 }
 
                 for (user, assistant, prior_assistant_ts) in turns {
+                    if source_key.is_some()
+                        && retention_insert_verdict(
+                            runtime_watermark.as_deref(),
+                            assistant.timestamp,
+                        ) == RetentionInsertVerdict::Suppress
+                    {
+                        continue;
+                    }
                     let response_secs = parse_ts_diff(assistant.timestamp, user.timestamp)
                         .filter(|seconds| *seconds > 0.0 && *seconds <= response_max_secs);
                     let idle_secs = prior_assistant_ts
@@ -17658,12 +18553,14 @@ impl Storage {
                             assistant.is_sidechain,
                             assistant.agent_id,
                             assistant.parent_uuid,
+                            source_key,
                         ])
                         .map_err(|e| format!("Insert live response time: {e}"))?;
                 }
             }
         }
 
+        let mut inserted_runtime_events = Vec::new();
         if !rows.session_events.is_empty() {
             let mut statement = tx
                 .prepare_cached(
@@ -17672,16 +18569,22 @@ impl Storage {
                          parent_chain_id, agent_id, is_sidechain, timestamp,
                          kind, uuid, parent_uuid
                      ) VALUES (
-                         ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                         ?1, ?12, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
                      )",
                 )
                 .map_err(|e| format!("Prepare live session events: {e}"))?;
             for event in rows.session_events {
+                if source_key.is_some()
+                    && retention_insert_verdict(runtime_watermark.as_deref(), event.timestamp)
+                        == RetentionInsertVerdict::Suppress
+                {
+                    continue;
+                }
                 let message = message_by_id
                     .get(event.message_id)
                     .expect("validated live event message identity");
                 let event_key = format!("{}:{}", event.message_id, event.event_ordinal);
-                statement
+                let inserted = statement
                     .execute(params![
                         provider.as_str(),
                         event_key,
@@ -17694,8 +18597,21 @@ impl Storage {
                         event.kind.as_str(),
                         event.message_id,
                         message.parent_uuid,
+                        source_key,
                     ])
                     .map_err(|e| format!("Insert live session event: {e}"))?;
+                if inserted > 0 && source_key.is_some() {
+                    inserted_runtime_events.push(PersistedRuntimeEvent {
+                        rowid: tx.last_insert_rowid(),
+                        timestamp_ms: DateTime::parse_from_rfc3339(event.timestamp)
+                            .expect("validated live event timestamp")
+                            .timestamp_millis(),
+                        kind: event.kind.as_str().to_string(),
+                        retention_eligible: crate::retention::is_conforming_timestamp(
+                            event.timestamp,
+                        ),
+                    });
+                }
             }
         }
 
@@ -17734,6 +18650,27 @@ impl Storage {
                         invocation.message_id,
                     ])
                     .map_err(|e| format!("Insert live hook invocation: {e}"))?;
+            }
+        }
+
+        if let Some(source_key) = source_key.as_deref() {
+            advance_live_runtime_source_identity(
+                &tx,
+                "pi",
+                source_key,
+                session_id,
+                &inserted_runtime_events,
+            )?;
+            if let Some(closed_at_ms) = pi_closed_at_ms
+                && seal_runtime_open_turn(
+                    &tx,
+                    "pi",
+                    source_key,
+                    closed_at_ms.saturating_add(1),
+                    false,
+                )? > 0
+            {
+                bump_rollup_generation_in_transaction(&tx)?;
             }
         }
 
@@ -19329,6 +20266,10 @@ fn downsample(points: Vec<DataPoint>, max: usize) -> Vec<DataPoint> {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use tempfile::TempDir;
 
     /// Drive Storage::init against a temp directory by routing `db_path`
@@ -19366,7 +20307,7 @@ mod tests {
         let storage = init_storage_in(&dir);
 
         storage
-            .upsert_pi_live_session("pi-session", Some("/work/pi"), "host", true)
+            .upsert_pi_live_session("pi-session", Some("/work/pi"), "host", true, 1)
             .expect("upsert Pi lifecycle");
 
         let row = storage
@@ -19388,6 +20329,54 @@ mod tests {
             )
             .expect("read Pi lifecycle row");
         assert_eq!(row, ("pi".into(), "/work/pi".into(), "host".into(), true));
+        storage
+            .close_pi_live_session("pi-session", 3)
+            .expect("close Pi lifecycle");
+        storage
+            .upsert_pi_live_session("pi-session", Some("/stale"), "stale", false, 2)
+            .expect("ignore stale Pi start");
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT cwd, hostname, ephemeral, lifecycle_at_ms,
+                            closed_at_ms
+                     FROM live_analytics_sessions
+                     WHERE provider = 'pi' AND session_id = 'pi-session'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .expect("read closed Pi lifecycle"),
+            ("/work/pi".into(), "host".into(), true, 3, Some(3))
+        );
+        storage
+            .upsert_pi_live_session("pi-session", Some("/resumed"), "new-host", false, 4)
+            .expect("reopen newer Pi lifecycle");
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT lifecycle_at_ms, closed_at_ms
+                     FROM live_analytics_sessions
+                     WHERE provider = 'pi' AND session_id = 'pi-session'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .expect("read resumed Pi lifecycle"),
+            (4, None)
+        );
         drop(storage);
         clear_env();
     }
@@ -19405,7 +20394,7 @@ mod tests {
             .to_rfc3339();
 
         storage
-            .upsert_pi_live_session("ephemeral", Some("/work/pi"), "host", true)
+            .upsert_pi_live_session("ephemeral", Some("/work/pi"), "host", true, 1)
             .expect("upsert ephemeral lifecycle");
         storage
             .store_pi_model_usage(
@@ -24070,6 +25059,61 @@ mod tests {
         }
     }
 
+    fn store_pi_runtime_batch(
+        storage: &Storage,
+        session_id: &str,
+        prefix: &str,
+        timestamps: &[String],
+    ) {
+        let ids = (0..timestamps.len())
+            .map(|index| format!("{prefix}-{index}"))
+            .collect::<Vec<_>>();
+        let messages = ids
+            .iter()
+            .zip(timestamps)
+            .enumerate()
+            .map(|(index, (message_id, timestamp))| LiveSessionMessageInput {
+                message_id,
+                role: if index % 2 == 0 { "user" } else { "assistant" },
+                timestamp,
+                chain_id: session_id,
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            })
+            .collect::<Vec<_>>();
+        let events = messages
+            .iter()
+            .map(|message| LiveSessionEventInput {
+                message_id: message.message_id,
+                event_ordinal: 0,
+                timestamp: message.timestamp,
+                kind: if message.role == "user" {
+                    crate::sessions::SessionEventKind::UserText
+                } else {
+                    crate::sessions::SessionEventKind::AsstText
+                },
+            })
+            .collect::<Vec<_>>();
+        storage
+            .store_live_session_analytics(
+                IntegrationProvider::Pi,
+                session_id,
+                LiveAnalyticsOrigin {
+                    project: None,
+                    cwd: Some(Path::new("/work/pi-retention")),
+                    hostname: Some("host"),
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &messages,
+                    session_events: &events,
+                    hook_invocations: &[],
+                },
+            )
+            .expect("store Pi runtime batch");
+    }
+
     // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Pushed Usage Migration]]
     #[test]
     #[serial]
@@ -24097,7 +25141,25 @@ mod tests {
                  ALTER TABLE model_usage_observations DROP COLUMN cache_read_cost;
                  ALTER TABLE model_usage_observations DROP COLUMN cache_write_cost;
                  ALTER TABLE model_usage_observations DROP COLUMN total_cost;
-                 DELETE FROM schema_version WHERE version = 43;",
+                 ALTER TABLE transcript_analytics_sources DROP COLUMN source_kind;
+                 ALTER TABLE live_analytics_sessions DROP COLUMN closed_at_ms;
+                 ALTER TABLE live_analytics_sessions DROP COLUMN lifecycle_at_ms;
+                 ALTER TABLE runtime_turn_state RENAME TO runtime_turn_state_v45;
+                 CREATE TABLE runtime_turn_state (
+                     provider TEXT NOT NULL,
+                     source_key TEXT NOT NULL,
+                     finalized_through_rowid INTEGER NOT NULL DEFAULT 0,
+                     open_turn_started_ms INTEGER,
+                     PRIMARY KEY(provider, source_key),
+                     CHECK(finalized_through_rowid >= 0),
+                     CHECK(open_turn_started_ms IS NULL OR open_turn_started_ms >= 0)
+                 );
+                 INSERT INTO runtime_turn_state
+                 SELECT provider, source_key, finalized_through_rowid,
+                        open_turn_started_ms
+                 FROM runtime_turn_state_v45;
+                 DROP TABLE runtime_turn_state_v45;
+                 DELETE FROM schema_version WHERE version IN (43, 44, 45);",
             )
             .expect("rewind database to schema 42");
         }
@@ -24112,7 +25174,7 @@ mod tests {
                 |row| row.get::<_, i32>(0),
             )
             .expect("read schema version"),
-            43
+            45
         );
         for column in [
             "event_uuid",
@@ -24138,6 +25200,257 @@ mod tests {
                  WHERE source_key = 'legacy-source'"
             ),
             1
+        );
+        clear_env();
+    }
+
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Live Source Migration]]
+    #[test]
+    #[serial]
+    fn migration_44_owns_legacy_pi_evidence_without_changing_identity() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let stamps = ["2026-08-01T10:00:00.000Z", "2026-08-01T10:01:00.000Z"];
+        let messages = [
+            LiveSessionMessageInput {
+                message_id: "runtime-user",
+                role: "user",
+                timestamp: stamps[0],
+                chain_id: "legacy-live",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            },
+            LiveSessionMessageInput {
+                message_id: "runtime-assistant",
+                role: "assistant",
+                timestamp: stamps[1],
+                chain_id: "legacy-live",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: Some("runtime-user"),
+            },
+        ];
+        let events = [
+            LiveSessionEventInput {
+                message_id: "runtime-user",
+                event_ordinal: 0,
+                timestamp: stamps[0],
+                kind: crate::sessions::SessionEventKind::UserText,
+            },
+            LiveSessionEventInput {
+                message_id: "runtime-assistant",
+                event_ordinal: 0,
+                timestamp: stamps[1],
+                kind: crate::sessions::SessionEventKind::AsstText,
+            },
+        ];
+        storage
+            .store_live_session_analytics(
+                IntegrationProvider::Pi,
+                "legacy-live",
+                LiveAnalyticsOrigin {
+                    project: Some("legacy-project"),
+                    cwd: Some(Path::new("/work/legacy")),
+                    hostname: Some("legacy-host"),
+                },
+                LiveSessionAnalyticsRows {
+                    messages: &messages,
+                    session_events: &events,
+                    hook_invocations: &[],
+                },
+            )
+            .expect("seed legacy runtime");
+        let usage = pushed_pi_usage_event(
+            "legacy-usage-event",
+            "legacy-live",
+            DateTime::parse_from_rfc3339(stamps[1])
+                .expect("usage time")
+                .timestamp_millis(),
+            "anthropic/legacy-model",
+            [11, 13, 17, 19],
+        );
+        storage
+            .store_pi_model_usage(
+                &usage,
+                "legacy-host",
+                DateTime::parse_from_rfc3339(stamps[1])
+                    .expect("usage time")
+                    .timestamp_millis(),
+            )
+            .expect("seed legacy usage");
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "UPDATE session_events SET source_key = NULL
+                 WHERE provider = 'pi' AND session_id = 'legacy-live';
+                 UPDATE response_times SET source_key = NULL
+                 WHERE provider = 'pi' AND session_id = 'legacy-live';
+                 DELETE FROM runtime_hourly WHERE provider = 'pi';
+                 DELETE FROM runtime_turn_state WHERE provider = 'pi';
+                 DELETE FROM transcript_analytics_sources WHERE provider = 'pi';
+                 UPDATE model_usage_observations
+                 SET source_key = 'pi-push:legacy-live'
+                 WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
+                 UPDATE model_usage_hourly
+                 SET source_key = 'pi-push:legacy-live'
+                 WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
+                 UPDATE model_observation_sources
+                 SET source_key = 'pi-push:legacy-live',
+                     source_root_key = 'pi-push:legacy-live',
+                     source_path = 'pi-push:legacy-live'
+                 WHERE provider = 'pi' AND analytics_session_id = 'legacy-live';
+                 DELETE FROM schema_version WHERE version IN (44, 45);
+                 ALTER TABLE transcript_analytics_sources DROP COLUMN source_kind;
+                 ALTER TABLE live_analytics_sessions DROP COLUMN closed_at_ms;
+                 ALTER TABLE live_analytics_sessions DROP COLUMN lifecycle_at_ms;
+                 ALTER TABLE runtime_turn_state RENAME TO runtime_turn_state_v45;
+                 CREATE TABLE runtime_turn_state (
+                     provider TEXT NOT NULL,
+                     source_key TEXT NOT NULL,
+                     finalized_through_rowid INTEGER NOT NULL DEFAULT 0,
+                     open_turn_started_ms INTEGER,
+                     PRIMARY KEY(provider, source_key),
+                     CHECK(finalized_through_rowid >= 0),
+                     CHECK(open_turn_started_ms IS NULL OR open_turn_started_ms >= 0)
+                 );
+                 INSERT INTO runtime_turn_state
+                 SELECT provider, source_key, finalized_through_rowid,
+                        open_turn_started_ms
+                 FROM runtime_turn_state_v45;
+                 DROP TABLE runtime_turn_state_v45;",
+            )
+            .expect("rewind database to schema 43");
+        }
+        drop(storage);
+
+        let migrated = init_storage_in(&dir);
+        {
+            let conn = migrated.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .expect("read migrated version"),
+                45
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT source_key, event_key, chain_id, timestamp, uuid,
+                            parent_uuid
+                     FROM session_events WHERE provider = 'pi' AND uuid =
+                          'runtime-assistant'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    },
+                )
+                .expect("read migrated runtime identity"),
+                (
+                    "live:pi:legacy-live".to_string(),
+                    "runtime-assistant:0".to_string(),
+                    "legacy-live".to_string(),
+                    stamps[1].to_string(),
+                    "runtime-assistant".to_string(),
+                    Some("runtime-user".to_string()),
+                )
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT source_key, source_record_key, source_ordinal,
+                            event_uuid, analytics_session_id, chain_id,
+                            hostname, observed_at_ms, input_tokens,
+                            output_tokens, cache_creation_tokens,
+                            cache_read_tokens
+                     FROM model_usage_observations
+                     WHERE provider = 'pi'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, i64>(10)?,
+                            row.get::<_, i64>(11)?,
+                        ))
+                    },
+                )
+                .expect("read migrated usage identity"),
+                (
+                    "live:pi:legacy-live".to_string(),
+                    "legacy-usage-event".to_string(),
+                    0,
+                    "legacy-usage-event".to_string(),
+                    "legacy-live".to_string(),
+                    "legacy-live".to_string(),
+                    "legacy-host".to_string(),
+                    DateTime::parse_from_rfc3339(stamps[1])
+                        .expect("usage time")
+                        .timestamp_millis(),
+                    11,
+                    13,
+                    19,
+                    17,
+                )
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT total_cost FROM model_usage_observations
+                     WHERE provider = 'pi'",
+                    [],
+                    |row| row.get::<_, f64>(0),
+                )
+                .expect("read migrated usage cost"),
+                0.10
+            );
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM model_observation_sources
+                     WHERE provider = 'pi' AND source_key LIKE 'pi-push:%'"
+                ),
+                0
+            );
+            assert!(
+                conn.query_row(
+                    "SELECT open_turn_started_ms IS NULL
+                     FROM runtime_turn_state
+                     WHERE provider = 'pi'
+                       AND source_key = 'live:pi:legacy-live'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("read migrated closed runtime state"),
+                "migration 45 must not reopen migration 44's sealed runtime"
+            );
+        }
+        drop(migrated);
+        let reopened = init_storage_in(&dir);
+        assert_eq!(
+            scalar_count(
+                &reopened.conn.lock().unwrap(),
+                "SELECT COUNT(*) FROM session_events WHERE provider = 'pi'"
+            ),
+            2
         );
         clear_env();
     }
@@ -24201,7 +25514,7 @@ mod tests {
             row,
             (
                 "event-1".into(),
-                "pi-push:session-1".into(),
+                "live:pi:session-1".into(),
                 "anthropic/claude-sonnet-4-5".into(),
                 10,
                 20,
@@ -24285,39 +25598,484 @@ mod tests {
         clear_env();
     }
 
-    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Push Source Prune Exemption]]
+    // @lat: [[pi-model-usage-tests#Pi Model Usage Test Specs#Live Source Retention]]
     #[test]
     #[serial]
-    fn retention_never_selects_pi_push_observations_for_raw_prune() {
+    fn pi_retention_watermark_blocks_active_and_closed_replay() {
+        clear_env();
+        let cutoff = "2026-08-14T00:00:00.000Z";
+        let old_times = vec![
+            "2026-08-01T00:00:00.000Z".to_string(),
+            "2026-08-01T00:01:00.000Z".to_string(),
+        ];
+        let current_times = vec![
+            "2026-08-14T00:01:00.000Z".to_string(),
+            "2026-08-14T00:02:00.000Z".to_string(),
+        ];
+
+        for closed in [false, true] {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = init_storage_in(&dir);
+            storage
+                .run_runtime_rollup_backfill()
+                .expect("complete empty runtime backfill");
+            let lifecycle = if closed { "closed" } else { "active" };
+            let session_id = format!("pi-replay-{lifecycle}");
+            store_pi_runtime_batch(&storage, &session_id, "old", &old_times);
+            let old_usage_ms = DateTime::parse_from_rfc3339(&old_times[1])
+                .expect("old usage timestamp")
+                .timestamp_millis();
+            let old_usage = pushed_pi_usage_event(
+                &format!("old-usage-{lifecycle}"),
+                &session_id,
+                old_usage_ms,
+                "anthropic/model",
+                [1, 2, 3, 4],
+            );
+            assert!(
+                storage
+                    .store_pi_model_usage(&old_usage, "host", old_usage_ms)
+                    .expect("store old Pi usage")
+            );
+            if closed {
+                storage
+                    .close_pi_live_session(&session_id, old_usage_ms + 1)
+                    .expect("close Pi replay source");
+            }
+
+            let request = crate::retention_engine::RetentionDeleteRequest {
+                cutoff: cutoff.to_string(),
+                window_days: 30,
+                bytes_before: std::fs::metadata(storage.database_path())
+                    .expect("stat database")
+                    .len(),
+                ran_at: DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
+                    .expect("retention run time")
+                    .with_timezone(&Utc),
+            };
+            crate::retention_engine::run_retention_delete_phase(
+                &storage,
+                &request,
+                &crate::retention_engine::RetentionDeleteControls::default(),
+            )
+            .expect("prune Pi replay fixture");
+            {
+                let conn = storage.conn.lock().unwrap();
+                for (table, session_column) in [
+                    ("session_events", "session_id"),
+                    ("response_times", "session_id"),
+                    ("model_usage_observations", "analytics_session_id"),
+                ] {
+                    assert_eq!(
+                        conn.query_row(
+                            &format!(
+                                "SELECT COUNT(*) FROM {table} WHERE provider = 'pi' AND \
+                                 {session_column} = ?1"
+                            ),
+                            params![session_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .expect("count pruned Pi evidence"),
+                        0,
+                        "{lifecycle} {table} must be pruned"
+                    );
+                }
+            }
+
+            store_pi_runtime_batch(&storage, &session_id, "old", &old_times);
+            assert!(
+                !storage
+                    .store_pi_model_usage(&old_usage, "host", old_usage_ms)
+                    .expect("suppress old Pi usage replay")
+            );
+            {
+                let conn = storage.conn.lock().unwrap();
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM session_events
+                         WHERE provider = 'pi' AND session_id = ?1",
+                        params![session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count suppressed runtime replay"),
+                    0
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM response_times
+                         WHERE provider = 'pi' AND session_id = ?1",
+                        params![session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .expect("count suppressed response replay"),
+                    0
+                );
+            }
+
+            store_pi_runtime_batch(&storage, &session_id, "current", &current_times);
+            let current_usage_ms = DateTime::parse_from_rfc3339(&current_times[1])
+                .expect("current usage timestamp")
+                .timestamp_millis();
+            let current_usage = pushed_pi_usage_event(
+                &format!("current-usage-{lifecycle}"),
+                &session_id,
+                current_usage_ms,
+                "anthropic/model",
+                [5, 7, 11, 13],
+            );
+            assert!(
+                storage
+                    .store_pi_model_usage(&current_usage, "host", current_usage_ms,)
+                    .expect("store current Pi usage")
+            );
+            store_pi_runtime_batch(&storage, &session_id, "current", &current_times);
+            assert!(
+                !storage
+                    .store_pi_model_usage(&current_usage, "host", current_usage_ms,)
+                    .expect("deduplicate current Pi usage")
+            );
+            let conn = storage.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE provider = 'pi' AND session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count current runtime"),
+                2
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM response_times
+                     WHERE provider = 'pi' AND session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count current response"),
+                1
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COALESCE(SUM(input_tokens + output_tokens
+                                         + cache_creation_tokens
+                                         + cache_read_tokens), 0)
+                     FROM model_usage_observations
+                     WHERE provider = 'pi' AND analytics_session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("read current Pi usage total"),
+                36
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT closed_at_ms IS NOT NULL FROM live_analytics_sessions
+                     WHERE provider = 'pi' AND session_id = ?1",
+                    params![session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("read replay lifecycle"),
+                closed
+            );
+            drop(conn);
+            drop(storage);
+            clear_env();
+        }
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Pi Sequential Ingest Bound]]
+    #[test]
+    #[serial]
+    fn pi_single_event_ingest_and_active_read_stay_bounded() {
         clear_env();
         let dir = TempDir::new().expect("tempdir");
         let storage = init_storage_in(&dir);
-        let event = pushed_pi_usage_event(
-            "old-event",
-            "session-old",
-            1,
-            "anthropic/model",
-            [1, 2, 3, 4],
-        );
         storage
-            .store_pi_model_usage(&event, "host", 1)
-            .expect("insert old pushed usage");
-        let conn = crate::retention_engine::open_maintenance_connection(storage.database_path())
-            .expect("open retention connection");
-        let scan = crate::retention_engine::scan_doomed_rows(
-            &conn,
-            "2026-08-14T00:00:00.000Z",
-            &crate::retention_engine::RetentionDeleteControls::default(),
-        )
-        .expect("scan retention rows");
-        assert_eq!(scan.doomed.model_usage_observations, 0);
-        assert_eq!(
-            scalar_count(
-                &storage.conn.lock().unwrap(),
-                "SELECT COUNT(*) FROM model_usage_observations"
-            ),
-            1
+            .run_runtime_rollup_backfill()
+            .expect("complete empty runtime backfill");
+        let base = DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
+            .expect("ingest base")
+            .with_timezone(&Utc);
+        let vm_steps = Arc::new(AtomicUsize::new(0));
+        {
+            let counter = Arc::clone(&vm_steps);
+            storage.conn.lock().unwrap().progress_handler(
+                1_000,
+                Some(move || {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+        }
+
+        for index in 0..1_000 {
+            let timestamp = (base + chrono::Duration::milliseconds(index))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store_pi_runtime_batch(
+                &storage,
+                "pi-sequential",
+                &format!("singleton-{index}"),
+                &[timestamp],
+            );
+        }
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .progress_handler(0, None::<fn() -> bool>);
+
+        let ingest_vm_ksteps = vm_steps.load(Ordering::Relaxed);
+        assert!(
+            ingest_vm_ksteps < 2_000,
+            "singleton ingest must stay linear; counted {ingest_vm_ksteps}k VM steps"
         );
+        let residual_rows = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM session_events AS event
+                 JOIN runtime_turn_state AS state
+                   ON state.provider = event.provider
+                  AND state.source_key = event.source_key
+                 WHERE event.provider = 'pi'
+                   AND event.source_key = 'live:pi:pi-sequential'
+                   AND event.rowid > state.finalized_through_rowid",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count active Pi residual rows");
+        assert!(
+            residual_rows <= 1,
+            "active Sessions reads must not refold {residual_rows} retained events"
+        );
+        let stats = with_pinned_query_now(base + chrono::Duration::minutes(1), || {
+            storage
+                .get_llm_runtime_stats("30d", Some("pi"))
+                .expect("read sustained Pi runtime")
+        });
+        assert_eq!(stats.turn_count, 1);
+        assert_eq!(stats.total_runtime_secs, 0.999);
+
+        for (id, offset_ms) in [("first", 0), ("last", 600_000), ("late", 60_000)] {
+            let timestamp = (base + chrono::Duration::milliseconds(offset_ms))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store_pi_runtime_batch(&storage, "pi-out-of-order", id, &[timestamp]);
+        }
+        let before_replay = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(runtime_secs), 0), open_turn_started_ms
+                 FROM runtime_turn_state AS state
+                 LEFT JOIN runtime_hourly AS rollup
+                   ON rollup.provider = state.provider
+                  AND rollup.source_key = state.source_key
+                 WHERE state.provider = 'pi'
+                   AND state.source_key = 'live:pi:pi-out-of-order'",
+                [],
+                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("read out-of-order runtime");
+        assert_eq!(before_replay, (60.0, base.timestamp_millis() + 600_000));
+        let replay_timestamp = (base + chrono::Duration::seconds(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store_pi_runtime_batch(&storage, "pi-out-of-order", "late", &[replay_timestamp]);
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE provider = 'pi'
+                       AND source_key = 'live:pi:pi-out-of-order'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count out-of-order replay"),
+            3
+        );
+        clear_env();
+    }
+
+    // @lat: [[runtime-rollup-tests#Runtime Rollup Test Specs#Pi Live Source Plateau]]
+    #[test]
+    #[serial]
+    fn confirmed_retention_plateaus_active_pi_at_its_open_tail() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        storage
+            .run_runtime_rollup_backfill()
+            .expect("complete empty runtime backfill");
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE rollup_meta SET model_backfill_status = 'complete' WHERE id = 1",
+                [],
+            )
+            .expect("complete model rollup fixture");
+        let session_id = "pi-volume";
+        let anchor = DateTime::parse_from_rfc3339("2026-08-15T00:00:00Z")
+            .expect("retention anchor")
+            .with_timezone(&Utc);
+
+        for (cycle, (window_days, event_start, tail_start)) in [
+            (365, "2025-01-01T00:00:00Z", "2025-09-01T00:00:00Z"),
+            (180, "2025-10-01T00:00:00Z", "2026-03-01T00:00:00Z"),
+            (90, "2026-03-02T00:00:00Z", "2026-06-01T00:00:00Z"),
+            (30, "2026-06-02T00:00:00Z", "2026-08-01T00:00:00Z"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let start = DateTime::parse_from_rfc3339(event_start)
+                .expect("event start")
+                .with_timezone(&Utc);
+            let tail = DateTime::parse_from_rfc3339(tail_start)
+                .expect("tail start")
+                .with_timezone(&Utc);
+            storage
+                .upsert_pi_live_session(
+                    session_id,
+                    Some("/work/pi-volume"),
+                    "host",
+                    false,
+                    start.timestamp_millis(),
+                )
+                .expect("open Pi volume source");
+            let timestamps = (0..1_000)
+                .map(|index| {
+                    (start + chrono::Duration::milliseconds(index * 60))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                })
+                .collect::<Vec<_>>();
+            store_pi_runtime_batch(
+                &storage,
+                session_id,
+                &format!("volume-{cycle}"),
+                &timestamps,
+            );
+            let tail_timestamps = [tail, tail + chrono::Duration::minutes(1)]
+                .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            store_pi_runtime_batch(
+                &storage,
+                session_id,
+                &format!("tail-{cycle}"),
+                &tail_timestamps,
+            );
+            let old_usage = pushed_pi_usage_event(
+                &format!("old-usage-{cycle}"),
+                session_id,
+                start.timestamp_millis(),
+                "anthropic/model",
+                [1, 2, 3, 4],
+            );
+            storage
+                .store_pi_model_usage(&old_usage, "host", start.timestamp_millis())
+                .expect("store old Pi volume usage");
+            let current_usage = pushed_pi_usage_event(
+                &format!("current-usage-{cycle}"),
+                session_id,
+                tail.timestamp_millis(),
+                "anthropic/model",
+                [5, 7, 11, 13],
+            );
+            storage
+                .store_pi_model_usage(&current_usage, "host", tail.timestamp_millis())
+                .expect("store current Pi volume usage");
+            let query_now = tail + chrono::Duration::minutes(2);
+            let runtime_before = with_pinned_query_now(query_now, || {
+                storage
+                    .get_llm_runtime_stats("90d", None)
+                    .expect("read Pi runtime before retention")
+            });
+            let models_before = storage
+                .get_model_usage_overview_uncached(ModelRange::NinetyDays, Some("pi"), query_now)
+                .expect("read Pi model totals before retention");
+
+            let cutoff = crate::retention::derive_retention_cutoff(anchor, window_days)
+                .expect("derive retention cutoff");
+            let request = crate::retention_engine::RetentionDeleteRequest {
+                cutoff,
+                window_days,
+                bytes_before: std::fs::metadata(storage.database_path())
+                    .expect("stat database")
+                    .len(),
+                ran_at: anchor,
+            };
+            let report = crate::retention_engine::run_retention_delete_phase(
+                &storage,
+                &request,
+                &crate::retention_engine::RetentionDeleteControls::default(),
+            )
+            .expect("run confirmed retention");
+            assert_eq!(
+                report.deleted.session_events,
+                if cycle == 0 { 1_000 } else { 1_002 }
+            );
+            assert_eq!(
+                report.deleted.model_usage_observations,
+                if cycle == 0 { 1 } else { 2 }
+            );
+            {
+                let conn = storage.conn.lock().unwrap();
+                assert_eq!(
+                    scalar_count(&conn, "SELECT COUNT(*) FROM session_events"),
+                    2
+                );
+                assert_eq!(
+                    scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
+                    1
+                );
+                assert!(
+                    conn.query_row(
+                        "SELECT closed_at_ms IS NULL FROM live_analytics_sessions
+                         WHERE provider = 'pi' AND session_id = 'pi-volume'",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .expect("read active Pi lifecycle")
+                );
+            }
+            let runtime_after = with_pinned_query_now(query_now, || {
+                storage
+                    .get_llm_runtime_stats("90d", None)
+                    .expect("read retained Pi runtime")
+            });
+            assert_eq!(runtime_after.turn_count, runtime_before.turn_count);
+            assert_eq!(runtime_after.session_count, runtime_before.session_count);
+            assert_eq!(
+                runtime_after.total_runtime_secs,
+                runtime_before.total_runtime_secs
+            );
+            assert_eq!(runtime_after.sparkline, runtime_before.sparkline);
+            let models_after = storage
+                .get_model_usage_overview_uncached(ModelRange::NinetyDays, Some("pi"), query_now)
+                .expect("read Pi model totals after retention");
+            assert_eq!(
+                (
+                    models_after.totals.sessions,
+                    models_after.totals.turns,
+                    models_after.totals.attributed_tokens,
+                    models_after.totals.total_tokens,
+                    models_after.totals.distinct_models,
+                ),
+                (
+                    models_before.totals.sessions,
+                    models_before.totals.turns,
+                    models_before.totals.attributed_tokens,
+                    models_before.totals.total_tokens,
+                    models_before.totals.distinct_models,
+                )
+            );
+        }
         clear_env();
     }
 
@@ -28676,6 +30434,9 @@ mod tests {
                         "source_key",
                         "finalized_through_rowid",
                         "open_turn_started_ms",
+                        "open_turn_last_ms",
+                        "open_turn_last_kind",
+                        "open_turn_all_conforming",
                     ][..],
                 ),
                 (
@@ -31203,6 +32964,27 @@ mod tests {
         assert_eq!(before.turn_count, 2);
         assert_eq!(before.session_count, 2);
         assert_eq!(before.total_runtime_secs, 150.0);
+        {
+            let conn = storage.conn.lock().unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT source_key FROM session_events
+                     WHERE provider = 'pi' LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("read Pi live source"),
+                "live:pi:pi-live"
+            );
+            assert_eq!(
+                scalar_count(
+                    &conn,
+                    "SELECT COUNT(*) FROM session_events
+                     WHERE provider = 'claude' AND source_key IS NULL"
+                ),
+                2
+            );
+        }
 
         storage
             .run_runtime_rollup_backfill()
@@ -31216,6 +32998,63 @@ mod tests {
         assert_eq!(after.session_count, before.session_count);
         assert_eq!(after.total_runtime_secs, before.total_runtime_secs);
         assert_eq!(after.sparkline, before.sparkline);
+
+        let mut evidence = vec![SessionBreakdown {
+            provider: "pi".to_string(),
+            session_id: "pi-live".to_string(),
+            parent_session_id: None,
+            pi_lineage: None,
+            ephemeral: false,
+            hostname: "remote-host".to_string(),
+            total_tokens: 1,
+            turn_count: 1,
+            first_seen: at(0),
+            last_active: at(60),
+            ended_at: None,
+            project: None,
+            active_runtime_secs: None,
+            agent_count: None,
+            agent_runtime_secs: None,
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: None,
+            active_runtime_rate: 0.0,
+            observed_agents: None,
+            live_linked_sessions: None,
+            observed_only: false,
+        }];
+        with_pinned_query_now(pinned_now, || {
+            storage
+                .populate_session_runtime_evidence(&mut evidence)
+                .expect("read active Pi runtime evidence");
+        });
+        assert_eq!(evidence[0].active_runtime_secs, Some(300.0));
+        assert_eq!(evidence[0].current_turn_runtime_secs, Some(300.0));
+        assert!(evidence[0].current_turn_runtime_active);
+        assert_eq!(evidence[0].active_runtime_rate, 1.0);
+
+        storage
+            .close_pi_live_session(
+                "pi-live",
+                (base + chrono::Duration::seconds(61)).timestamp_millis(),
+            )
+            .expect("seal Pi runtime source");
+        let sealed = with_pinned_query_now(pinned_now, || {
+            storage
+                .get_llm_runtime_stats("30d", None)
+                .expect("sealed stats")
+        });
+        assert_eq!(sealed.turn_count, before.turn_count);
+        assert_eq!(sealed.session_count, before.session_count);
+        assert_eq!(sealed.total_runtime_secs, before.total_runtime_secs);
+        assert_eq!(
+            scalar_count(
+                &storage.conn.lock().unwrap(),
+                "SELECT COUNT(*) FROM runtime_hourly
+                 WHERE provider = 'pi' AND source_key = 'live:pi:pi-live'"
+            ),
+            1
+        );
 
         clear_env();
     }

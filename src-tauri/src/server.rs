@@ -333,16 +333,24 @@ async fn report_tokens(
 // --- Learning endpoints ---
 
 fn check_rate_limit_with_max(rate_limiter: &Mutex<VecDeque<Instant>>, max: usize) -> bool {
+    check_rate_limit_with_cost(rate_limiter, max, 1)
+}
+
+fn check_rate_limit_with_cost(
+    rate_limiter: &Mutex<VecDeque<Instant>>,
+    max: usize,
+    cost: usize,
+) -> bool {
     let mut window = rate_limiter.lock().unwrap();
     let now = Instant::now();
     let cutoff = now - std::time::Duration::from_secs(RATE_WINDOW_SECS);
     while window.front().is_some_and(|t| *t < cutoff) {
         window.pop_front();
     }
-    if window.len() >= max {
+    if window.len().saturating_add(cost) > max {
         return false;
     }
-    window.push_back(now);
+    window.extend(std::iter::repeat_n(now, cost));
     true
 }
 
@@ -643,7 +651,13 @@ fn ingest_pi_track(
                 ..
             } => {
                 storage
-                    .upsert_pi_live_session(&event.session_id, cwd.as_deref(), &host, *ephemeral)
+                    .upsert_pi_live_session(
+                        &event.session_id,
+                        cwd.as_deref(),
+                        &host,
+                        *ephemeral,
+                        at.timestamp_millis(),
+                    )
                     .map_err(PiTrackError::internal)?;
                 live_tracker.start_pi_session(
                     &event.session_id,
@@ -657,6 +671,9 @@ fn ingest_pi_track(
             }
             PiTrackEventKind::SessionEnd { reason } => {
                 log::trace!("Closing Pi session after {reason:?}");
+                storage
+                    .close_pi_live_session(&event.session_id, at.timestamp_millis())
+                    .map_err(PiTrackError::internal)?;
                 live_tracker.end_pi_session(&event.session_id, &host, at);
             }
             PiTrackEventKind::Activity => {
@@ -1000,9 +1017,7 @@ fn drain_pi_spool_once_with(
             };
             match record.endpoint.as_str() {
                 "/api/v1/pi/track" => {
-                    if track_records >= limits.max_track_records_per_pass
-                        || !check_rate_limit_with_max(track_limiter, MAX_PI_TRACK_REQUESTS)
-                    {
+                    if track_records >= limits.max_track_records_per_pass {
                         outcome.throttled = true;
                         complete = false;
                         break;
@@ -1016,6 +1031,15 @@ fn drain_pi_spool_once_with(
                             continue;
                         }
                     };
+                    if !check_rate_limit_with_cost(
+                        track_limiter,
+                        MAX_PI_TRACK_REQUESTS,
+                        payload.events.len().max(1),
+                    ) {
+                        outcome.throttled = true;
+                        complete = false;
+                        break;
+                    }
                     match crate::with_ingest_write_permit(|| {
                         ingest_pi_track(storage, live_tracker, &payload, false)
                     }) {
@@ -1028,9 +1052,7 @@ fn drain_pi_spool_once_with(
                     }
                 }
                 "/api/v1/sessions/messages" => {
-                    if message_records >= limits.max_message_records_per_pass
-                        || !check_rate_limit_with_max(message_limiter, MAX_PI_SESSION_MSG_REQUESTS)
-                    {
+                    if message_records >= limits.max_message_records_per_pass {
                         outcome.throttled = true;
                         complete = false;
                         break;
@@ -1051,6 +1073,15 @@ fn drain_pi_spool_once_with(
                         outcome.corrupt_records += 1;
                         gap = Some(PI_SPOOL_CORRUPT_GAP);
                         continue;
+                    }
+                    if !check_rate_limit_with_cost(
+                        message_limiter,
+                        MAX_PI_SESSION_MSG_REQUESTS,
+                        payload.messages.len().max(1),
+                    ) {
+                        outcome.throttled = true;
+                        complete = false;
+                        break;
                     }
                     crate::with_rollup_backfill_write_permit(|| {
                         persist_remote_session_analytics(storage, &payload)
@@ -1143,7 +1174,11 @@ async fn post_pi_track(
         }
         .response();
     }
-    if !check_rate_limit_with_max(&state.pi_track_rate_limiter, MAX_PI_TRACK_REQUESTS) {
+    if !check_rate_limit_with_cost(
+        &state.pi_track_rate_limiter,
+        MAX_PI_TRACK_REQUESTS,
+        payload.events.len().max(1),
+    ) {
         return PiTrackError {
             status: StatusCode::TOO_MANY_REQUESTS,
             code: "rate_limited",
@@ -2471,21 +2506,26 @@ async fn post_session_messages(
     if !check_auth(&headers, &state.secret) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".to_string());
     }
+    // Validate the complete batch before constructing search documents or
+    // scheduling any background mutation.
+    if let Err(error) = validate_session_messages_payload(&mut payload) {
+        return (StatusCode::BAD_REQUEST, error);
+    }
     let (rate_limiter, max_requests) = session_messages_rate_limit(
         payload.provider,
         &state.session_rate_limiter,
         &state.pi_session_rate_limiter,
     );
-    if !check_rate_limit_with_max(rate_limiter, max_requests) {
+    let rate_cost = if payload.provider == IntegrationProvider::Pi {
+        payload.messages.len().max(1)
+    } else {
+        1
+    };
+    if !check_rate_limit_with_cost(rate_limiter, max_requests, rate_cost) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             "Rate limit exceeded".to_string(),
         );
-    }
-    // Validate the complete batch before constructing search documents or
-    // scheduling any background mutation.
-    if let Err(error) = validate_session_messages_payload(&mut payload) {
-        return (StatusCode::BAD_REQUEST, error);
     }
 
     let analytics_payload = payload.clone();
@@ -2969,10 +3009,18 @@ mod observed_subagent_tests {
     #[test]
     fn pi_track_limiter_accepts_the_specified_event_stream() {
         let limiter = Mutex::new(VecDeque::new());
-        for _ in 0..4_000 {
-            assert!(check_rate_limit_with_max(&limiter, MAX_PI_TRACK_REQUESTS,));
+        for _ in 0..20 {
+            assert!(check_rate_limit_with_cost(
+                &limiter,
+                MAX_PI_TRACK_REQUESTS,
+                200,
+            ));
         }
-        assert!(!check_rate_limit_with_max(&limiter, MAX_PI_TRACK_REQUESTS,));
+        assert!(!check_rate_limit_with_cost(
+            &limiter,
+            MAX_PI_TRACK_REQUESTS,
+            1,
+        ));
     }
 
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Session Message Rate Isolation]]
@@ -2980,10 +3028,15 @@ mod observed_subagent_tests {
     fn pi_session_messages_have_independent_rate_headroom() {
         let shared = Mutex::new(VecDeque::new());
         let pi = Mutex::new(VecDeque::new());
-        for _ in 0..1_000 {
+        for _ in 0..40 {
             let (limiter, max) = session_messages_rate_limit(IntegrationProvider::Pi, &shared, &pi);
-            assert!(check_rate_limit_with_max(limiter, max));
+            assert!(check_rate_limit_with_cost(limiter, max, 100));
         }
+        assert!(!check_rate_limit_with_cost(
+            &pi,
+            MAX_PI_SESSION_MSG_REQUESTS,
+            1,
+        ));
         assert!(check_rate_limit_with_max(&shared, MAX_SESSION_MSG_REQUESTS));
     }
 
