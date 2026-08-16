@@ -86,7 +86,7 @@ It:
 
 ## R5. Screenshot scope (which views to capture)
 
-**Decision**: The capture script produces eight PNGs from the dummy-data instance, all at 2× for HiDPI rendering per FR-021.
+**Decision**: The capture script produces seven PNGs from the dummy-data instance, all at 2× for HiDPI rendering per FR-021.
 
 | Filename                       | View                                            | Section anchor   |
 |--------------------------------|-------------------------------------------------|------------------|
@@ -96,14 +96,13 @@ It:
 | `analytics-context.png`        | Widget → Context view                           | `#context`       |
 | `sessions.png`                 | Manage → Sessions                               | `#search`        |
 | `learning.png`                 | Manage → Learning                               | `#learning`      |
-| `instances.png`                | Manage → Instances                              | Product docs     |
 | `settings.png`                 | Manage → Settings                               | Product docs     |
 
 Memory and brevity remain manual sub-panel captures because they are not Manage sections.
 
 **Rationale**:
 - `hero.png` intentionally serves both the product hero and analytics section.
-- Models, Instances, and Settings captures support product documentation outside the marketing anchors.
+- Models and Settings captures support product documentation outside the marketing anchors.
 - @2x captures honor FR-021 / SC-007.
 
 **Alternatives considered**:

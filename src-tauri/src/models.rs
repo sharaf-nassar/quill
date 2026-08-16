@@ -132,6 +132,7 @@ pub enum PiSessionEndReason {
 pub enum PiLineage {
     Root,
     Linked { parent_session_id: String },
+    Agent { parent_session_id: String },
     Unresolved { reason: String },
 }
 
@@ -405,11 +406,11 @@ pub struct SessionBreakdown {
     /// Lifetime active runtime summed across every native chain. Null means
     /// retained runtime coverage cannot support a claim.
     pub active_runtime_secs: Option<f64>,
-    /// Distinct retained sidechain chains in this session family. Null means
-    /// retained runtime coverage cannot support a lifetime count.
+    /// Distinct retained sidechains plus current explicit Pi subagent processes.
+    /// Null means neither retained nor pushed live coverage supports a count.
     pub agent_count: Option<i64>,
-    /// Lifetime active runtime summed across sidechain chains only. Null means
-    /// retained runtime coverage cannot support a claim.
+    /// Sidechain active runtime plus current explicit Pi subagent runtime. Null
+    /// means neither retained nor pushed live coverage supports a claim.
     pub agent_runtime_secs: Option<f64>,
     /// Active runtime of the root session's current open turn. Null means no
     /// covered root open-tail evidence exists.
@@ -422,11 +423,11 @@ pub struct SessionBreakdown {
     /// Seconds added per wall-clock second by covered, currently accruing
     /// native chains. Concurrent chains intentionally sum.
     pub active_runtime_rate: f64,
-    /// Current transcript snapshot's open native agents. Null is unknown;
-    /// an empty vector is covered with none open.
+    /// Current open native agents or explicitly marked Pi subagent processes.
+    /// Null is unknown; an empty vector is covered with none open.
     pub observed_agents: Option<Vec<ObservedSessionAgent>>,
-    /// Concurrent Pi children whose pushed lineage links to this session.
-    /// This is lineage activity, not a native agent count.
+    /// Concurrent generic Pi children whose pushed lineage links to this
+    /// session. Explicit Pi subagent processes use `observed_agents` instead.
     pub live_linked_sessions: Option<Vec<ObservedLinkedSession>>,
     /// True when current-process hook evidence supplied the row before the
     /// first retained token snapshot made its metrics available.

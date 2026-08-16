@@ -304,6 +304,14 @@ function safeSessionId(value) {
   return String(value || "unknown").replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 120);
 }
 
+function trackedName(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.trim() === value
+    && Buffer.byteLength(value) <= 256
+    && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+}
+
 function writeLog(config, error) {
   try {
     const line = `${new Date().toISOString()} ${errorMessage(error)}\n`;
@@ -869,18 +877,34 @@ function readSessionId(path) {
 
 function resolveStart(event, info) {
   const parentPath = info.header?.parentSession || (event.reason === "fork" ? event.previousSessionFile : undefined);
+  const subagent = process.env.PI_SUBAGENT_CHILD === "1";
   const resolved = new Map();
   const resolveId = (path) => {
     if (!resolved.has(path)) resolved.set(path, readSessionId(path));
     return resolved.get(path);
   };
   let lineage = { kind: "root" };
+  let parentSessionId;
   if (parentPath) {
     try {
-      lineage = { kind: "linked", parent_session_id: resolveId(parentPath) };
-    } catch (error) {
-      lineage = { kind: "unresolved", reason: "parent_header_unavailable" };
-    }
+      const headerParent = resolveId(parentPath);
+      if (trackedName(headerParent) && headerParent !== info.id) parentSessionId = headerParent;
+    } catch {}
+  }
+  const envParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+  if (!parentSessionId && subagent && trackedName(envParent) && envParent !== info.id) {
+    parentSessionId = envParent;
+  }
+  if (parentSessionId) {
+    lineage = {
+      kind: subagent ? "agent" : "linked",
+      parent_session_id: parentSessionId,
+    };
+  } else if (parentPath || subagent) {
+    lineage = {
+      kind: "unresolved",
+      reason: subagent ? "subagent_parent_unavailable" : "parent_header_unavailable",
+    };
   }
   let previousSessionId;
   if (["new", "resume", "fork"].includes(event.reason) && event.previousSessionFile) {

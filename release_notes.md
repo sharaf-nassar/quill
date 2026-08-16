@@ -38,7 +38,7 @@ The split Live/Analytics dashboard has been replaced by a single 360px
 always-on-top monitoring widget: a compact LIMITS band with one row per
 provider, and a switchable view below it — Usage, Models, and Context — all in
 one window. Management surfaces (Sessions,
-Learning, Instances, Settings) are unchanged and still open from the titlebar.
+Learning, Settings) are unchanged and still open from the titlebar.
 
 Because the old layout is gone, its preferences are gone with it. The saved
 main-window size is discarded once (the widget owns its own geometry; your

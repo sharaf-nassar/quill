@@ -27,7 +27,6 @@ import type {
   ProviderStatus,
   ProviderTokenSeries,
   ProviderTokenSeriesResponse,
-  RestartStatus,
   RetentionAuditRecord,
   RetentionMaintenanceProgress,
   RetentionMaintenanceResult,
@@ -449,13 +448,6 @@ const learningRuns: LearningRun[] = [
   { id: 42, trigger_mode: "periodic", observations_analyzed: 184, rules_created: 2, rules_updated: 5, duration_ms: 41_200, status: "completed", error: null, logs: null, created_at: sqliteUtc(2 * H), phases: [{ name: "collect", status: "completed", duration_ms: 1_200, findings_count: 184 }, { name: "infer", status: "completed", duration_ms: 38_000, findings_count: 7 }], provider_scope: ["claude", "codex"], inference: { total_cost_usd: 0.142, total_duration_ms: 38_000, primary_model: "claude-opus-4-8", call_count: 4, failed_call_count: 0, calls: [] } },
   { id: 41, trigger_mode: "on-demand", observations_analyzed: 96, rules_created: 1, rules_updated: 2, duration_ms: 22_800, status: "completed", error: null, logs: null, created_at: sqliteUtc(28 * H), phases: null, provider_scope: ["claude"] },
 ];
-
-const restartStatus: RestartStatus = {
-  phase: "Idle",
-  instances: [],
-  waiting_on: 0,
-  elapsed_seconds: 0,
-};
 
 const searchResults: SearchResults = { hits: [], total_hits: 0, query_time_ms: 2 };
 const searchFacets: SearchFacets = { providers: [], projects: [], hosts: [] };
@@ -2173,8 +2165,6 @@ const fixtures: Record<string, FixtureHandler> = {
   get_search_facets: () => searchFacets,
   get_session_context: () => ({ provider: "claude", messages: [], session_id: "a1b2c3d4", project: "quill" }),
   sync_search_index: () => 0,
-  // restart
-  get_restart_status: () => restartStatus,
   // release notes / updates
   get_release_notes: () => [],
   // misc no-ops

@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn configuration_only_commit_keeps_mutation_and_clears_backup() {
         let dir = TempDir::new().unwrap();
-        let target = dir.path().join("restart-transaction");
+        let target = dir.path().join("deployment-transaction");
         let config = dir.path().join("settings.json");
         write_file(&config, b"old");
 

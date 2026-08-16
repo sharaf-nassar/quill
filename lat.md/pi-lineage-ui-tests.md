@@ -12,7 +12,7 @@ Pi child search results render accessible parent-session navigation using stable
 
 ## Pushed Search Parent
 
-Pi notify indexing prefers the extension's pushed parent id and clears transcript-derived parents for pushed root or unresolved proof.
+Pi notify indexing uses the extension's pushed parent id for generic links and explicit agents, while root or unresolved proof clears transcript-derived parents.
 
 ## Immediate Search Input
 
@@ -20,7 +20,7 @@ Search input updates parent query state on each change so controlled text remain
 
 ## Live Linked Session Copy
 
-Two live Pi children render as live linked sessions without subagent, native-agent, or total-agent wording.
+Two generic live Pi children render as linked sessions without agent wording; explicitly marked Pi subagents use the agent rail instead.
 
 ## Singular Linked Session Copy
 

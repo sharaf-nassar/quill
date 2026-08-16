@@ -14457,6 +14457,10 @@ impl Storage {
             .map_err(|error| format!("Commit session runtime read snapshot: {error}"))?;
 
         for row in rows {
+            let pushed_active_runtime = row.active_runtime_secs;
+            let pushed_agent_count = row.agent_count;
+            let pushed_agent_runtime = row.agent_runtime_secs;
+            let pushed_active_rate = row.active_runtime_rate;
             let last_active = DateTime::parse_from_rfc3339(&row.last_active)
                 .ok()
                 .map(|timestamp| timestamp.timestamp_millis());
@@ -14550,13 +14554,24 @@ impl Storage {
                     }
                 }
             }
-            row.active_runtime_secs = covered.then_some(session_runtime);
-            row.agent_count = covered.then_some(agent_count);
-            row.agent_runtime_secs = covered.then_some(agent_runtime);
+            row.active_runtime_secs =
+                match (covered.then_some(session_runtime), pushed_active_runtime) {
+                    (Some(native), Some(pushed)) => Some(native + pushed),
+                    (native, pushed) => native.or(pushed),
+                };
+            row.agent_count = match (covered.then_some(agent_count), pushed_agent_count) {
+                (Some(native), Some(pushed)) => Some(native.saturating_add(pushed)),
+                (native, pushed) => native.or(pushed),
+            };
+            row.agent_runtime_secs = match (covered.then_some(agent_runtime), pushed_agent_runtime)
+            {
+                (Some(native), Some(pushed)) => Some(native + pushed),
+                (native, pushed) => native.or(pushed),
+            };
             row.current_turn_runtime_secs = current_root_turn.map(|(_, seconds, _)| seconds);
             row.current_turn_runtime_active =
                 current_root_turn.is_some_and(|(_, _, runtime_active)| runtime_active);
-            row.active_runtime_rate = session_rate;
+            row.active_runtime_rate = session_rate + pushed_active_rate;
             if let Some(agents) = &mut row.observed_agents {
                 for agent in agents {
                     let runtime = by_chain.get(&(
@@ -14574,7 +14589,7 @@ impl Storage {
                         let (seconds, rate) = materialize(runtime, through_ms, session_live);
                         agent.runtime_secs = Some(seconds);
                         agent.runtime_active = rate > 0.0;
-                    } else {
+                    } else if agent.runtime_secs.is_none() {
                         agent.runtime_secs = None;
                         agent.runtime_active = false;
                     }
@@ -14582,6 +14597,8 @@ impl Storage {
             }
             row.runtime_as_of_ms = (covered
                 || current_root_turn.is_some()
+                || pushed_active_runtime.is_some()
+                || pushed_agent_runtime.is_some()
                 || row
                     .observed_agents
                     .as_ref()
@@ -22078,6 +22095,98 @@ mod tests {
             rows[0].ended_at,
             Some((now - TimeDelta::minutes(5)).to_rfc3339())
         );
+
+        clear_env();
+    }
+
+    /// Break: evicting an idle Pi parent while its explicit agent remains
+    /// active removes the parent from ranking before the limited storage read.
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Agent Retained Parent Overlay]]
+    #[test]
+    #[serial]
+    fn active_pi_agent_keeps_idle_parent_in_limited_session_read() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = Utc::now();
+
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO token_snapshots (
+                     provider, session_id, hostname, timestamp, input_tokens,
+                     output_tokens, cache_creation_input_tokens,
+                     cache_read_input_tokens, cwd, is_sidechain
+                 ) VALUES
+                     ('pi', 'parent', 'host.example.com',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-20 minutes'),
+                      30, 12, 0, 0, '/parent', 0),
+                     ('pi', 'leader', 'host.example.com',
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 minute'),
+                      1, 0, 0, 0, '/leader', 0);",
+            )
+            .expect("seed limited Pi session rows");
+        }
+        let baseline = storage
+            .get_session_breakdown("1h", None, Some(IntegrationProvider::Pi), Some(1))
+            .expect("read limited SQL frontier");
+        assert_eq!(baseline[0].session_id, "leader");
+
+        let tracker = crate::live_tracker::LiveTracker::new(None);
+        tracker.start_pi_session(
+            "parent",
+            "host",
+            Some("/parent"),
+            false,
+            now - TimeDelta::minutes(16),
+            None,
+        );
+        tracker.start_pi_session("agent", "host", Some("/parent"), false, now, None);
+        tracker.set_pi_lineage("parent", "host", crate::models::PiLineage::Root);
+        tracker.set_pi_lineage(
+            "agent",
+            "host",
+            crate::models::PiLineage::Agent {
+                parent_session_id: "parent".into(),
+            },
+        );
+        unsafe {
+            std::env::set_var("QUILL_CLAUDE_PROJECTS_DIR", dir.path().join("claude"));
+            std::env::set_var("QUILL_CODEX_SESSIONS_DIR", dir.path().join("codex"));
+        }
+        tracker.sweep(now);
+
+        let rows = storage
+            .get_session_breakdown_with_observed(
+                "1h",
+                None,
+                Some(IntegrationProvider::Pi),
+                Some(1),
+                &tracker.session_ranking_keys(),
+            )
+            .expect("read observed Pi candidates");
+        let rows = tracker.overlay(
+            rows,
+            &range_from_timestamp("1h"),
+            None,
+            Some(IntegrationProvider::Pi),
+            Some(1),
+        );
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent"]
+        );
+        assert_eq!(
+            rows[0].observed_agents.as_ref().map(|agents| agents
+                .iter()
+                .map(|agent| agent.agent_id.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["agent"])
+        );
+        assert_eq!(rows[0].agent_count, Some(1));
 
         clear_env();
     }
@@ -31036,6 +31145,65 @@ mod tests {
         assert_eq!(agents[2].runtime_secs, None);
         assert!(!agents[2].runtime_active);
 
+        clear_env();
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Pi Agent Runtime Projection]]
+    #[test]
+    #[serial]
+    fn native_runtime_projection_preserves_pushed_pi_agent_runtime() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let now = DateTime::parse_from_rfc3339("2030-01-01T00:00:10Z")
+            .expect("runtime now")
+            .with_timezone(&Utc);
+        let mut rows = [SessionBreakdown {
+            provider: "pi".to_string(),
+            session_id: "parent".to_string(),
+            parent_session_id: None,
+            pi_lineage: Some(crate::models::PiLineage::Root),
+            ephemeral: false,
+            hostname: "fixture-host".to_string(),
+            total_tokens: 0,
+            turn_count: 0,
+            first_seen: (now - chrono::Duration::seconds(10)).to_rfc3339(),
+            last_active: now.to_rfc3339(),
+            ended_at: None,
+            project: Some("/work/quill".to_string()),
+            active_runtime_secs: Some(8.0),
+            agent_count: Some(1),
+            agent_runtime_secs: Some(8.0),
+            current_turn_runtime_secs: None,
+            current_turn_runtime_active: false,
+            runtime_as_of_ms: Some(now.timestamp_millis()),
+            active_runtime_rate: 1.0,
+            observed_agents: Some(vec![crate::models::ObservedSessionAgent {
+                agent_id: "child".to_string(),
+                model_id: Some("gpt-5.6-sol".to_string()),
+                agent_type: None,
+                runtime_secs: Some(8.0),
+                runtime_active: true,
+            }]),
+            live_linked_sessions: Some(Vec::new()),
+            observed_only: true,
+        }];
+
+        with_pinned_query_now(now, || {
+            storage
+                .populate_session_runtime_evidence(&mut rows)
+                .expect("preserve pushed Pi agent runtime")
+        });
+
+        let row = &rows[0];
+        assert_eq!(row.active_runtime_secs, Some(8.0));
+        assert_eq!(row.agent_count, Some(1));
+        assert_eq!(row.agent_runtime_secs, Some(8.0));
+        assert_eq!(row.runtime_as_of_ms, Some(now.timestamp_millis()));
+        assert_eq!(row.active_runtime_rate, 1.0);
+        let agent = &row.observed_agents.as_ref().unwrap()[0];
+        assert_eq!(agent.runtime_secs, Some(8.0));
+        assert!(agent.runtime_active);
         clear_env();
     }
 

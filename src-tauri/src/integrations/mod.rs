@@ -21,10 +21,10 @@ pub use manager::{
 
 pub use types::{IntegrationProvider, ProviderStatus};
 
-// Provider installers and restart-hook setup share deployment state plus
-// config, hook, instruction, and status files. Keep each mutation lifecycle in
-// one process-wide critical section so concurrent blocking jobs cannot recover
-// or overwrite another job's in-progress changes.
+// Provider installers share deployment state plus config, hook, instruction,
+// and status files. Keep each mutation lifecycle in one process-wide critical
+// section so concurrent blocking jobs cannot recover or overwrite another
+// job's in-progress changes.
 static INTEGRATION_MUTATION_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn integration_mutation_guard() -> Result<MutexGuard<'static, ()>, String> {

@@ -1905,14 +1905,6 @@ Most read and trigger commands accept an optional provider filter for Claude, Co
 
 `sync_search_index` runs a fingerprint-based incremental sweep — not a wipe-and-rebuild — so a true rebuild requires deleting the on-disk index dir while the app is closed (or bumping `SCHEMA_VERSION` in [[src-tauri/src/sessions.rs]]).
 
-### Restart Commands (5)
-
-`request_restart`, `cancel_restart`, `get_restart_status`, `install_restart_hooks`, `check_restart_hooks_installed`.
-
-Restart commands expose a shared provider-aware row model across Claude and Codex. Hook install/check commands accept an optional provider parameter so restart setup can be applied per provider.
-
-Claude setup resolves its persisted `ClaudePaths`, runs under the integration mutation guard, and commits settings, restart ownership, hook assets, and shell RC blocks as one restart-specific transaction. `check_restart_hooks_installed` parses exact handler command/args/timeout tuples and verifies current script/block contents; malformed state or configuration reports not installed instead of accepting a filename substring.
-
 ### UI Commands (4)
 
 `hide_window`, `quit_app`, `install_app_update`, `get_release_notes`.
@@ -1951,7 +1943,6 @@ The backend pushes real-time updates to the frontend via Tauri's emit system.
 | `learning-log` | learning.rs | `{run_id, message}` | Real-time analysis progress |
 | `learning-updated` | lib.rs | `()` | Rules changed |
 | `provider-status-updated` | integrations | `Vec<ProviderStatus>` | Startup provider detection refresh |
-| `restart-status-changed` | restart.rs | `RestartStatus` | Restart phase change |
 | `integrations-updated` | integrations/manager.rs | `ProviderStatus[]` | Startup refresh or provider enable/disable completed |
 | `context-preservation-updated` | integrations/manager.rs | `ContextPreservationStatus` | Global context-preservation toggle changed |
 | `integration-features-updated` | integrations/manager.rs | `IntegrationFeatures` | Activity tracking or context telemetry toggle changed |
@@ -2038,7 +2029,7 @@ The backend uses Tokio for async operations with specific patterns:
 
 Conditional compilation targets for Unix signal handling, macOS Keychain, and cross-platform paths.
 
-- `#[cfg(unix)]` — Process signal handling (SIGUSR1 for restart), nix crate for signal/process, `setsid` + env-var handshake for update-driven relaunch (see [[architecture#Architecture#Single Instance]])
+- `#[cfg(unix)]` — Process-group cleanup plus the `setsid` handoff for update-driven relaunch (see [[architecture#Architecture#Single Instance]])
 - `#[cfg(target_os = "macos")]` — Keychain integration for credential reading
 - Cross-platform path resolution via `dirs` crate
 
@@ -2060,7 +2051,6 @@ Key filesystem locations used by the backend for storage, config, and caching.
 | `~/Library/Application Support/com.quilltoolkit.app/` | macOS | DB, search index, auth secret |
 | `~/.config/quill/` | All | Deployed hooks, MCP server, scripts |
 | `~/.claude/` | All | Claude Code config, credentials |
-| `~/.cache/quill/` | All | Instance state files, restart flags |
 
 ### Demo-mode path override
 

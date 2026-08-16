@@ -56,4 +56,3 @@ QUILL_DEMO_MODE=1 \
 ## Out-of-scope (future, separate clarification)
 
 - A `QUILL_HOOKS_DIR` override for the deployed-hook directory under `~/.config/quill/`. Initial release covers data and rules only because those are the dirs the seeder writes; hook installation is not part of the screenshot pipeline.
-- A `QUILL_CACHE_DIR` override for `~/.cache/quill/`. The instance-state files are restart-related and not relevant to screenshots.

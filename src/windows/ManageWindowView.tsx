@@ -21,7 +21,6 @@ import "../styles/manage.css";
 // Lazy-load sections so only the active chunk is fetched.
 const SessionsSection = lazy(() => import("./SessionsWindowView"));
 const LearningSection = lazy(() => import("./LearningWindow"));
-const InstancesSection = lazy(() => import("../components/restart/RestartPanel"));
 const SettingsSection = lazy(() => import("./SettingsWindowView"));
 
 // ── Section icons (14px line glyphs, shared visual language with the widget
@@ -49,13 +48,6 @@ const SessionsIcon = () => (
 const LearningIcon = () => (
   <svg {...SVG}>
     <path d="M7 1.5L8.4 5.6 12.5 7 8.4 8.4 7 12.5 5.6 8.4 1.5 7 5.6 5.6Z" />
-  </svg>
-);
-const InstancesIcon = () => (
-  <svg {...SVG}>
-    <rect x="1.6" y="2.6" width="10.8" height="8.8" rx="1.2" />
-    <path d="M4 5.6l2 1.5-2 1.5" />
-    <line x1="7.4" y1="9.1" x2="9.6" y2="9.1" />
   </svg>
 );
 const SettingsIcon = () => (
@@ -88,7 +80,6 @@ const CloseIcon = () => (
 export type ManageSection =
   | "sessions"
   | "learning"
-  | "instances"
   | "settings";
 
 interface SectionDef {
@@ -98,8 +89,7 @@ interface SectionDef {
   Icon: () => React.ReactElement;
 }
 
-// Memory + Runs stay under Learning (per the confirmed brief), so the rail is
-// four flat items.
+// Memory + Runs stay under Learning.
 const SECTIONS: SectionDef[] = [
   {
     id: "sessions",
@@ -112,12 +102,6 @@ const SECTIONS: SectionDef[] = [
     label: "Learning",
     desc: "Learned rules, memory optimization, and analysis run history.",
     Icon: LearningIcon,
-  },
-  {
-    id: "instances",
-    label: "Instances",
-    desc: "Restart and manage running Claude Code and Codex instances.",
-    Icon: InstancesIcon,
   },
   {
     id: "settings",
@@ -373,8 +357,6 @@ function ManageWindowView() {
               <SessionsSection />
             ) : active === "learning" ? (
               <LearningSection />
-            ) : active === "instances" ? (
-              <InstancesSection />
             ) : (
               <SettingsSection />
             )}

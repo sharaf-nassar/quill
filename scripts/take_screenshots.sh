@@ -50,7 +50,6 @@
 #   analytics-context.png   widget on the Context view  (site anchor #context)
 #   sessions.png            Manage → Sessions
 #   learning.png            Manage → Learning
-#   instances.png           Manage → Instances
 #   settings.png            Manage → Settings
 #
 # `memory.png` and `brevity.png` stay manual: both live inside a Manage section
@@ -355,17 +354,17 @@ fi
 # ── Widget views ──────────────────────────────────────────────────────────────
 
 echo ""
-echo "[1/7] hero.png + live.png (Usage view)"
+echo "[1/6] hero.png + live.png (Usage view)"
 capture_view "$VIEW_ROW_USAGE" "Usage" "$OUTDIR/hero.png"
 cp "$OUTDIR/hero.png" "$OUTDIR/live.png"
 log "Saved: $OUTDIR/live.png (copy of hero.png)"
 
 echo ""
-echo "[2/7] models.png (Models view)"
+echo "[2/6] models.png (Models view)"
 capture_view "$VIEW_ROW_MODELS" "Models" "$OUTDIR/models.png"
 
 echo ""
-echo "[3/7] analytics-context.png (Context view)"
+echo "[3/6] analytics-context.png (Context view)"
 capture_view "$VIEW_ROW_CONTEXT" "Context" "$OUTDIR/analytics-context.png"
 
 # ── Manage workspace ──────────────────────────────────────────────────────────
@@ -380,19 +379,15 @@ log "Manage window: $MANAGE_WID"
 sleep 0.6
 
 echo ""
-echo "[4/7] sessions.png (Manage → Sessions)"
+echo "[4/6] sessions.png (Manage → Sessions)"
 capture_section "Sessions" "$OUTDIR/sessions.png"
 
 echo ""
-echo "[5/7] learning.png (Manage → Learning)"
+echo "[5/6] learning.png (Manage → Learning)"
 capture_section "Learning" "$OUTDIR/learning.png"
 
 echo ""
-echo "[6/7] instances.png (Manage → Instances)"
-capture_section "Instances" "$OUTDIR/instances.png"
-
-echo ""
-echo "[7/7] settings.png (Manage → Settings)"
+echo "[6/6] settings.png (Manage → Settings)"
 capture_section "Settings" "$OUTDIR/settings.png"
 
 xdotool windowclose "$MANAGE_WID" 2>/dev/null || true

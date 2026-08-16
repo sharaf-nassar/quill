@@ -67,7 +67,6 @@ marketing-site/                              # NEW — site source root (FR-002)
 │   │   ├── analytics-context.png
 │   │   ├── sessions.png
 │   │   ├── learning.png
-│   │   ├── instances.png
 │   │   ├── settings.png
 │   │   ├── memory.png
 │   │   └── brevity.png

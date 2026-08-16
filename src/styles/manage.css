@@ -206,7 +206,6 @@
 /* Let each section fill the pane instead of its standalone 100vh wrapper. */
 .manage-content > .sessions-window,
 .manage-content > .learning-window,
-.manage-content > .restart-window,
 .manage-content > .settings-window {
   flex: 1;
   height: auto;

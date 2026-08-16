@@ -272,9 +272,6 @@ pub fn confirm_disable(
     let storage = Storage::init()?;
     let features = load_integration_features(&storage)?;
     let mut existing_statuses = detect_all_with_storage(&storage)?;
-    let remove_shared_restart_assets = !existing_statuses
-        .iter()
-        .any(|status| status.provider != provider && status.enabled);
 
     // Strip this provider's brevity block before the provider uninstall
     // touches the file, but mark it disabled in the working status list first
@@ -293,10 +290,10 @@ pub fn confirm_disable(
 
     match provider {
         IntegrationProvider::Claude => {
-            crate::claude_setup::uninstall(remove_shared_restart_assets, remove_shared_config)?;
+            crate::claude_setup::uninstall(remove_shared_config)?;
         }
         IntegrationProvider::Codex => {
-            codex::uninstall(remove_shared_restart_assets, remove_shared_config)?;
+            codex::uninstall(remove_shared_config)?;
         }
         IntegrationProvider::Pi => {
             pi::uninstall(remove_shared_config)?;

@@ -1,6 +1,6 @@
 # Features
 
-Quill provides live usage monitoring, analytics, behavioral learning, session search, working-context preservation, memory optimization, and restart orchestration.
+Quill provides live usage monitoring, analytics, behavioral learning, session search, working-context preservation, and memory optimization.
 
 ## Live Usage View
 
@@ -371,42 +371,6 @@ Supports custom project management, bulk operations, provider badges on files an
 Optional caveman-compress pre-pass run from the Memories panel before the regular optimizer.
 
 [[src-tauri/src/memory_optimizer.rs#run_prose_compression]] drives the orchestrator in [[src-tauri/src/compress_prose.rs]], which rewrites every eligible memory file via Sonnet 4.6, validates the rewrite preserves headings, code blocks, URLs, file paths, and bullets, retries up to twice on validation or LLM error, and either commits the rewrite (leaving a `<file>.original.md` backup next to the compressed file) or restores the original. Skip rules in `compress_prose/detect.rs` exclude instruction files, files over 500 KB, files on the secrets denylist (paths under `.ssh`/`.aws`/`.gnupg`/`.kube`/`.docker`, basenames such as `.netrc`/`authorized_keys`/`known_hosts`, basenames containing `secret`/`credential`/`apikey`/`privatekey`, and `.env*` prefixes), files with non-prose extensions (code, config, markup, lock files), and files that already have an `.original.md` backup so a second pass is a no-op. The `trigger_memory_optimization` Tauri command takes an optional `compress_prose: bool` flag plumbed from the Memories panel checkbox, and progress streams over the existing `memory-optimizer-log` event.
-
-## Restart Orchestrator
-
-Graceful restart of running Claude and Codex sessions via [[src-tauri/src/restart.rs]].
-
-### Instance Discovery
-
-Uses provider-specific discovery with a shared row model.
-
-Claude instances come from Quill state files in `~/.cache/quill/claude-state/` plus process scanning. The restart CJS hook writes `processing` on `UserPromptSubmit`/`PreToolUse`, `idle` on `Stop`/`StopFailure`, and `exited` on `SessionEnd`. Codex instances come from process scanning and `<Codex home>/sessions/` metadata per cwd. Quill emits a Codex restart row only when the cwd has exactly one process and one distinct metadata candidate; ambiguous process or session mappings are omitted.
-
-### Restart Flow
-
-Four-phase orchestration with real-time status events at each phase transition.
-
-(1) Discover instances, (2) wait for idle where supported, (3) send SIGTERM and wait for exit, (4) resume with provider-specific commands. Claude uses `claude --resume`; Codex uses `codex resume`. Each phase emits `restart-status-changed` events.
-
-Codex does not expose a reliable idle signal, so its rows stay `Unknown` before restart and Quill proceeds directly to termination/resume instead of pretending it observed an idle transition.
-
-### Instance Status
-
-Tracked as: Idle, Processing, Unknown, Restarting, Exited, or RestartFailed. The UI shows status indicators per instance with cancel support.
-
-Force restart skips the idle-wait phase.
-
-### Hook Installation
-
-Restart hook actions are provider-aware.
-
-Claude restart setup is on-demand and uses the same pinned [[src-tauri/src/claude_setup.rs#ClaudePaths]] as provider setup. It registers one non-executable `claude-restart-hook.cjs` Node exec-form handler on `UserPromptSubmit`, `PreToolUse`, `Stop`, `StopFailure`, and `SessionEnd`, each with a 2-second timeout. Codex restart setup installs only shared shell integration; provider telemetry/session hooks remain separate.
-
-Restart install, repair, and uninstall snapshot Claude settings, shared and restart ownership state, hook assets, the shell script, and every touched `.bashrc`, `.bash_profile`, or `.zshrc` before mutation. Rollback restores all snapshots, and [[src-tauri/src/restart.rs#startup_cleanup]] recovers an interrupted transaction on app startup. Component flags keep pinned Claude path state until both main and restart ownership are gone, so an uninstall failure remains retryable.
-
-Shell setup owns a bounded `# quill-managed:restart:start` / `# quill-managed:restart:end` block containing one exact source line. Repair removes prior bounded blocks and migrates only the exact legacy `# quill-shell-integration` plus source-line pair; unrelated lines that merely mention Quill survive. Verification requires current script contents, exactly one block in every recorded RC file, and exact hook commands/args/timeouts rather than substring markers.
-
-The shared shell integration is removed only when the last restart-capable provider is disabled. The restart window groups instances by provider and shows setup banners when exact provider verification fails.
 
 ## Settings Window
 

@@ -16,7 +16,7 @@ A one-line tour. Each item links to its full description in [Features in depth](
 - **[Widget views](#widget-views)** — Usage, Models, and Context swap in one region under a shared 1H/6H/24H/7D range strip; widget graphics use an internal SVG kit, so Quill ships no charting dependency
 - **[Agent visibility](#agent-visibility)** — sessions show the subagents Quill actually observed running, grouped by model (`2×Opus · 3×Sonnet`)
 - **[Multi-account pools](#multi-account-pools)** — connect a local CLI Proxy API instance and LIMITS reports mean pool pressure instead of a single account
-- **[Manage workspace](#manage-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, Instances, and Settings
+- **[Manage workspace](#manage-workspace)** — one rail-navigated window (⌘M / Ctrl+M) holding Sessions, Learning, and Settings
 - **[Session search](#session-search)** — Tantivy-backed full-text search across every Claude Code, Codex, and Pi session, with filters and snippet highlighting
 - **[Token tracking](#token-tracking)** — per-turn input/output/cache counts collected by each provider integration
 - **[Code stats](#code-stats)** — lines added and removed per session by language, plus tokens per LOC and LOC per hour
@@ -25,7 +25,6 @@ A one-line tour. Each item links to its full description in [Features in depth](
 - **[Brevity profile](#brevity-profile)** — a managed instruction block that compresses assistant prose while leaving code, paths, and commands untouched
 - **[Working context preservation](#working-context-preservation)** — routes large transient output into a local searchable store instead of the LLM transcript
 - **[MCP server](#mcp-server)** — hands Claude Code and Codex `search_history`, plus the context tools when preservation is on
-- **[Restart orchestrator](#restart-orchestrator)** — gracefully restart running Claude Code and Codex sessions from inside Quill
 - **[Desktop integration](#desktop-integration)** — tray menu, in-app updater, always-on-top, a frameless resizable window, and per-window zoom
 - **[Crash reporting](#crash-reporting)** — default-on and opt-out, sending stack frames with every dynamic field stripped locally first
 
@@ -46,7 +45,7 @@ dropdown swaps.
   </tr>
 </table>
 
-Learning, session search, instances, and settings live in the Manage workspace
+Learning, session search, and settings live in the Manage workspace
 (⌘M / Ctrl+M); their shots are captured by `scripts/take_screenshots.sh`.
 
 ## Architecture
@@ -341,7 +340,7 @@ instance, Quill can read the whole pool instead of one account. Configured from
 One rail-navigated window for everything that is not live monitoring, opened
 from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
 
-- Four sections — **Sessions** (search), **Learning** (rules, memory, runs), **Instances** (restart), and **Settings**
+- Three sections — **Sessions** (search), **Learning** (rules, memory, runs), and **Settings**
 - ⌘K / Ctrl+K opens a command palette over the sections plus Back-to-Live and Close-Tools actions
 - **Settings** tabs: General, Integrations, Context, Learning, and Performance
 
@@ -407,14 +406,6 @@ from the widget titlebar's settings key or the ⌘M / Ctrl+M accelerator.
   - **`search_history`** — full-text search across all sessions by content, edits, commands, or tool use (filter by project, git branch, role, date)
 - Context tools (only when context preservation is enabled): see [Working context preservation](#working-context-preservation)
 - Automatically configured when the app starts — no manual setup needed
-
-### Restart orchestrator
-
-- Discovers running Claude and Codex sessions — Claude from Quill's hook-written state files plus process scanning, Codex from process scanning and session metadata per working directory
-- Restarts in four phases with live status events: discover, wait for idle where the provider exposes one, SIGTERM and wait for exit, then resume (`claude --resume`, `codex resume`). Force restart skips the idle wait
-- Codex has no reliable idle signal, so its rows stay `Unknown` rather than claiming an idle transition Quill never observed; ambiguous Codex process or session mappings are omitted instead of guessed
-- Per-instance status — Idle, Processing, Unknown, Restarting, Exited, RestartFailed — with cancel support
-- Lives in the **Instances** section of the Manage workspace
 
 ### Desktop integration
 

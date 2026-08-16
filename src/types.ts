@@ -184,9 +184,9 @@ export interface SessionBreakdown {
   project: string | null;
   /** Lifetime active runtime across every native chain; null is unknown. */
   active_runtime_secs: number | null;
-  /** Distinct retained sidechain chains across the session lifetime. */
+  /** Retained sidechains plus current explicitly marked Pi subagent processes. */
   agent_count: number | null;
-  /** Lifetime active runtime across sidechain chains only. */
+  /** Sidechain runtime plus current explicitly marked Pi subagent runtime. */
   agent_runtime_secs: number | null;
   /** Root session's current open-turn runtime; null is unknown. */
   current_turn_runtime_secs: number | null;
@@ -196,9 +196,9 @@ export interface SessionBreakdown {
   runtime_as_of_ms: number | null;
   /** Aggregate active seconds accrued per wall-clock second after runtime_as_of_ms. */
   active_runtime_rate: number;
-  /** Current open native agents; null means transcript coverage is unknown. */
+  /** Current open native or explicitly marked Pi agents; null means unknown. */
   observed_agents: ObservedSessionAgent[] | null;
-  /** Concurrent Pi children proven by `parentSession`; never a native agent count. */
+  /** Concurrent generic Pi links; explicit Pi subagents use observed_agents. */
   live_linked_sessions: ObservedLinkedSession[] | null;
   /** True until retained token metrics arrive for a current-boot observed root. */
   observed_only: boolean;
@@ -346,6 +346,7 @@ export interface PiExtensionHealth {
 export type PiLineage =
   | { kind: "root" }
   | { kind: "linked"; parent_session_id: string }
+  | { kind: "agent"; parent_session_id: string }
   | { kind: "unresolved"; reason: string };
 
 export interface CpaConnectionStatus {
@@ -1062,46 +1063,6 @@ export interface LlmRuntimeStats {
 	session_count: number;
 	avg_per_turn_secs: number;
 	sparkline: number[];
-}
-
-// Restart feature types
-
-export interface RestartInstance {
-	provider: IntegrationProvider;
-	pid: number;
-	session_id: string | null;
-	cwd: string;
-	tty: string;
-	terminal_type: TerminalType;
-	status: InstanceStatus;
-	last_seen: string;
-}
-
-export type TerminalType =
-	| { type: "Tmux"; target: string }
-	| { type: "Plain" };
-
-export type InstanceStatus =
-	| "Idle"
-	| "Processing"
-	| "Unknown"
-	| "Restarting"
-	| "Exited"
-	| { RestartFailed: { error: string } };
-
-export type RestartPhase =
-	| "Idle"
-	| "WaitingForIdle"
-	| "Restarting"
-	| "Complete"
-	| "Cancelled"
-	| "TimedOut";
-
-export interface RestartStatus {
-	phase: RestartPhase;
-	instances: RestartInstance[];
-	waiting_on: number;
-	elapsed_seconds: number;
 }
 
 // Retention pruning types (feature 014). These mirror the Rust shapes in

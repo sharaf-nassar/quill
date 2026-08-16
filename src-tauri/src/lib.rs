@@ -23,7 +23,6 @@ mod pi_session;
 mod prompt_utils;
 mod redaction;
 mod releases;
-mod restart;
 /// Retention policy primitive: the three `settings` keys, their typed
 /// read/write helpers, cutoff derivation, and the monotonic watermark rule.
 pub mod retention;
@@ -5895,13 +5894,6 @@ pub fn run() {
                 rule_watcher::start(app.handle().clone(), storage);
             }
 
-            // Initialize restart state and run startup cleanup
-            {
-                let restart_state = std::sync::Arc::new(restart::RestartState::new());
-                app.manage(restart_state);
-                restart::startup_cleanup();
-            }
-
             // startup_refresh is merged into the tray summary spawn below
             // to avoid redundant detect_all calls.
 
@@ -6284,11 +6276,6 @@ pub fn run() {
             sessions::get_session_context,
             sessions::get_search_facets,
             sessions::sync_search_index,
-            restart::request_restart,
-            restart::cancel_restart,
-            restart::get_restart_status,
-            restart::install_restart_hooks,
-            restart::check_restart_hooks_installed,
             hide_window,
             quit_app,
             install_app_update,

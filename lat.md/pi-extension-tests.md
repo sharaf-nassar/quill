@@ -30,6 +30,18 @@ Handlers push versioned lifecycle, per-message usage, model, activity, and runti
 
 Session start sends the handshake, resolves one stable parent header id, and notifies indexing only when a transcript path exists.
 
+## Environment Agent Lineage
+
+A Pi process marked as a subagent uses its validated parent-session environment id when its fresh session header has no parent path, and pushes explicit agent lineage to tracking and search notify.
+
+## Invalid Environment Agent Lineage
+
+A marked Pi subagent with an unusable parent-session environment id pushes unresolved proof instead of masquerading as a root session.
+
+## Invalid Header Agent Lineage
+
+A marked Pi subagent rejects malformed or self-referential parent ids read from a session header and pushes unresolved proof instead.
+
 ## Turn-end search freshness
 
 After Pi persists a turn, the extension repeats notify with the transcript identity and lineage captured at session start.

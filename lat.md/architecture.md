@@ -15,9 +15,9 @@ The application pairs a Rust backend with a React frontend communicating over Ta
 
 The app runs as three Tauri windows routed by a URL query parameter in [[src/main.tsx]]: the main widget, the consolidated Manage workspace, and a release-notes viewer. All three are transparent, paint custom visual chrome, and resize freely.
 
-The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], [[features#Restart Orchestrator]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
+The main window hosts the widget shell described in [[frontend#Main Window Layout]]. The [[features#Session Search]], [[features#Learning System]], and [[features#Settings Window]] surfaces are no longer separate windows — they run as sections inside the Manage workspace, which gates each one inline when no provider is enabled.
 
-The Sessions, Learning, Restart, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the widget titlebar's settings key or the app-scoped ⌘M / Ctrl+M accelerator. Each tool now renders as a section without standalone window chrome, with inline no-provider states, and Learning includes its run history. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
+The Sessions, Learning, and Settings management surfaces are consolidated into a single rail-navigated `?view=manage` workspace ([[src/windows/ManageWindowView.tsx]]), opened from the widget titlebar's settings key or the app-scoped ⌘M / Ctrl+M accelerator. Each tool now renders as a section without standalone window chrome, with inline no-provider states, and Learning includes its run history. The standalone tool windows, their `?view=` routes, and capabilities entries were retired, leaving only `main`, `manage`, and `release-notes`. The previous inline `ProviderMenu` popover was removed earlier in favor of the dedicated settings surface.
 
 ### Window Configuration
 
@@ -59,7 +59,7 @@ Neither Manage nor release-notes had any affordance at all before this, because 
 
 ## Module Map
 
-The Rust backend in [[src-tauri/src/lib.rs]] registers 68 Tauri commands and starts background tasks on launch.
+The Rust backend in [[src-tauri/src/lib.rs]] registers 89 Tauri commands and starts background tasks on launch.
 
 ### Backend Modules
 
@@ -74,7 +74,6 @@ Rust modules under `src-tauri/src/` organized by domain responsibility.
 | Pi session format | [[src-tauri/src/pi_session.rs]] | Narrow v2/v3 message parsing and bounded header probes for search and temporary live fallback |
 | Learning | [[src-tauri/src/learning.rs]] | Two-stream LLM analysis for behavioral pattern discovery |
 | Memory optimizer | [[src-tauri/src/memory_optimizer.rs]] | LLM-driven memory file optimization |
-| Restart | [[src-tauri/src/restart.rs]] | Claude Code instance discovery and restart orchestration |
 | Integrations | [[src-tauri/src/integrations/mod.rs]] | Provider detection plus persisted enable and disable lifecycle for Claude, Codex, and Pi |
 | Indicator | [[src-tauri/src/indicator.rs]] | Primary-provider resolution, compact title text, and warnings for the tray summary |
 | Tray keep-alive | [[src-tauri/src/tray_keepalive.rs]] | macOS-only workaround that rebuilds the tray on sleep/wake and screen-parameter changes |
@@ -119,7 +118,7 @@ An Axum server on port 19876 (configurable via `QUILL_PORT`) receives data from 
 
 Backend pushes real-time updates to the frontend via `emit()`.
 
-Current events include `tokens-updated`, `learning-updated`, `learning-log`, `restart-status-changed`, `integrations-updated`, `indicator-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
+Current events include `tokens-updated`, `learning-updated`, `learning-log`, `integrations-updated`, `indicator-updated`, `memory-optimizer-updated`, and `memory-files-updated`.
 
 ## Background Tasks
 
@@ -169,17 +168,15 @@ Claude, Codex, and Pi installers treat managed assets and provider configuration
 
 [[src-tauri/src/integrations/deploy.rs]] builds each scripts, MCP, and templates tree in a temporary directory beside its target so every publication step is a same-filesystem rename by construction (all targets of a batch share one parent, so no cross-device handling exists). Before any live mutation it recovers an unfinished transaction, then captures owned configuration, hook, command, and instruction files by copying them into the backup directory with a JSON manifest written scratch-then-rename, so a crash can never leave a half-written manifest. Backup directories and files are created `0700`/`0600` because snapshots can hold secrets, and only an optional Unix mode per file is persisted for restoration. Publication renames each live target into the backup's `targets/` area (or writes a `<name>.was-absent` sentinel for a target that did not exist), then renames the staged tree into place; symlinked or dangling-symlink targets are treated as plain replace/absent rather than snapshotted through their referents.
 
-Commit is one atomic rename of the backup directory to a trash name — the single commit point — followed by a best-effort delete. An earlier failure, or a backup directory found by the next guarded mutation, restores every captured file and renamed target from the backup; cross-process crash recovery from an uncommitted transaction is retained and regression-tested through the restart path. A backup that cannot be restored (for example a corrupt manifest) fails closed with an error naming the directory for manual repair. The former per-file snapshot structs, symlink-referent snapshotting, quarantine directories and their stale pruning, transaction marker file, content-match skip, and Windows read-only handling are gone. Their on-disk leftovers are not merely ignored: the same post-recovery sweep that clears crashed staging directories prunes the retired names (`.mcp.quill-backup`, `.scripts.quill-backup`, `.templates.quill-backup`, `.quill-provider-snapshots`, `.quill-deploy-transaction`) from the deployment parent, so an upgraded install reclaims the hundreds of megabytes a copied MCP venv left behind. The prune matches exact names — never a prefix or suffix — so `.quill-deploy-backup`, `.quill-deploy-stamp`, and `integration-state.json` are untouchable, and it is best-effort: a removal failure never fails an install. It runs after recovery for all three providers through [[src-tauri/src/integrations/deploy.rs#recover_staged_batch]]. Pi uses only file snapshots and never publishes a staged extensions directory.
+Commit is one atomic rename of the backup directory to a trash name — the single commit point — followed by a best-effort delete. An earlier failure, or a backup directory found by the next guarded mutation, restores every captured file and renamed target from the backup; cross-process crash recovery from an uncommitted transaction is retained and regression-tested through the recovery path. A backup that cannot be restored (for example a corrupt manifest) fails closed with an error naming the directory for manual repair. The former per-file snapshot structs, symlink-referent snapshotting, quarantine directories and their stale pruning, transaction marker file, content-match skip, and Windows read-only handling are gone. Their on-disk leftovers are not merely ignored: the same post-recovery sweep that clears crashed staging directories prunes the retired names (`.mcp.quill-backup`, `.scripts.quill-backup`, `.templates.quill-backup`, `.quill-provider-snapshots`, `.quill-deploy-transaction`) from the deployment parent, so an upgraded install reclaims the hundreds of megabytes a copied MCP venv left behind. The prune matches exact names — never a prefix or suffix — so `.quill-deploy-backup`, `.quill-deploy-stamp`, and `integration-state.json` are untouchable, and it is best-effort: a removal failure never fails an install. It runs after recovery for all three providers through [[src-tauri/src/integrations/deploy.rs#recover_staged_batch]]. Pi uses only file snapshots and never publishes a staged extensions directory.
 
 Claude preflights `settings.json` and `.claude.json` structure before opening its deployment transaction, and uninstall publishes empty managed trees before removing provider configuration. Malformed provider JSON therefore fails without replacement, while any later error restores the exact prior files and trees.
-
-Restart integration reuses [[src-tauri/src/integrations/deploy.rs#FileSnapshots]] through a configuration-only commit path. Its settings, ownership state, hook assets, shell script, and touched RC files roll back together; startup cleanup recovers an interrupted restart transaction before other restart maintenance.
 
 ### Mutation Serialization
 
 One process-local guard serializes workflows that can rewrite shared provider integration state.
 
-[[src-tauri/src/integrations/mod.rs#integration_mutation_guard]] spans provider enable and disable, startup repair and rescan, feature synchronization, restart-hook setup, and Memory Optimizer writes to provider instruction files. After acquiring the lock it attempts and aggregates interrupted-install recovery for Claude, Codex, and Pi before allowing the requested mutation. A backup that cannot be restored fails closed — the guarded mutation is refused with an error naming the backup directory until it is repaired by hand. Holding it across staleness checks, filesystem changes, and status persistence prevents one workflow from recovering or overwriting another workflow's in-progress changes, including when a first enable was interrupted before provider status could be saved.
+[[src-tauri/src/integrations/mod.rs#integration_mutation_guard]] spans provider enable and disable, startup repair and rescan, feature synchronization, and Memory Optimizer writes to provider instruction files. After acquiring the lock it attempts and aggregates interrupted-install recovery for Claude, Codex, and Pi before allowing the requested mutation. A backup that cannot be restored fails closed — the guarded mutation is refused with an error naming the directory until it is repaired by hand. Holding it across staleness checks, filesystem changes, and status persistence prevents one workflow from recovering or overwriting another workflow's in-progress changes, including when a first enable was interrupted before provider status could be saved.
 
 ### Startup Repair
 

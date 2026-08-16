@@ -442,6 +442,124 @@ test("session start resolves lineage once and notifies only persisted sessions",
   });
 });
 
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Environment Agent Lineage]]
+test("env-marked Pi child reports agent lineage without a parent header", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const child = join(process.env.HOME, "child.jsonl");
+    writeFileSync(child, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
+    const pi = fakePi();
+    quill(pi.api);
+    const calls = [];
+    const oldFetch = globalThis.fetch;
+    const oldChild = process.env.PI_SUBAGENT_CHILD;
+    const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+    process.env.PI_SUBAGENT_CHILD = "1";
+    process.env.PI_SUBAGENT_PARENT_SESSION = "parent-id";
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), body: JSON.parse(options.body) });
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      pi.handlers.get("session_start")[0](
+        { type: "session_start", reason: "startup" },
+        context("child-id", { sessionFile: child }),
+      );
+      await flushRequests();
+
+      const lineage = { kind: "agent", parent_session_id: "parent-id" };
+      assert.deepEqual(
+        calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0].lineage,
+        lineage,
+      );
+      assert.deepEqual(
+        calls.find((call) => call.url.endsWith("/api/v1/sessions/notify")).body.lineage,
+        lineage,
+      );
+    } finally {
+      globalThis.fetch = oldFetch;
+      if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = oldChild;
+      if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+      else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+    }
+  });
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Invalid Environment Agent Lineage]]
+test("env-marked Pi child with an invalid parent reports unresolved lineage", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const pi = fakePi();
+    quill(pi.api);
+    const calls = [];
+    const oldFetch = globalThis.fetch;
+    const oldChild = process.env.PI_SUBAGENT_CHILD;
+    const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+    process.env.PI_SUBAGENT_CHILD = "1";
+    process.env.PI_SUBAGENT_PARENT_SESSION = " parent-id ";
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), body: JSON.parse(options.body) });
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      pi.handlers.get("session_start")[0](
+        { type: "session_start", reason: "startup" },
+        context("child-id"),
+      );
+      await flushRequests();
+
+      assert.deepEqual(
+        calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0].lineage,
+        { kind: "unresolved", reason: "subagent_parent_unavailable" },
+      );
+    } finally {
+      globalThis.fetch = oldFetch;
+      if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = oldChild;
+      if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+      else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+    }
+  });
+});
+
+// Break: trusting a header-derived parent id lets a marked child parent itself.
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Invalid Header Agent Lineage]]
+test("env-marked Pi child rejects its own header-derived parent id", async () => {
+  await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {
+    const parent = join(process.env.HOME, "parent.jsonl");
+    writeFileSync(parent, `${JSON.stringify({ type: "session", id: "child-id" })}\n`);
+    const pi = fakePi();
+    quill(pi.api);
+    const calls = [];
+    const oldFetch = globalThis.fetch;
+    const oldChild = process.env.PI_SUBAGENT_CHILD;
+    const oldParent = process.env.PI_SUBAGENT_PARENT_SESSION;
+    process.env.PI_SUBAGENT_CHILD = "1";
+    delete process.env.PI_SUBAGENT_PARENT_SESSION;
+    globalThis.fetch = async (url, options) => {
+      calls.push({ url: String(url), body: JSON.parse(options.body) });
+      return { ok: true, status: 202, body: { cancel: async () => {} } };
+    };
+    try {
+      pi.handlers.get("session_start")[0](
+        { type: "session_start", reason: "startup" },
+        context("child-id", { parentSession: parent }),
+      );
+      await flushRequests();
+
+      assert.deepEqual(
+        calls.find((call) => call.url.endsWith("/api/v1/pi/track")).body.events[0].lineage,
+        { kind: "unresolved", reason: "subagent_parent_unavailable" },
+      );
+    } finally {
+      globalThis.fetch = oldFetch;
+      if (oldChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = oldChild;
+      if (oldParent === undefined) delete process.env.PI_SUBAGENT_PARENT_SESSION;
+      else process.env.PI_SUBAGENT_PARENT_SESSION = oldParent;
+    }
+  });
+});
+
 // @lat: [[pi-extension-tests#Pi Extension Test Specs#Turn-end search freshness]]
 test("turn end repeats the start notify with unchanged lineage", async () => {
   await withHome({ url: "http://127.0.0.1:19876", secret: "secret" }, async () => {

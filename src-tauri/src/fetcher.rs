@@ -729,7 +729,7 @@ fn fetch_codex_usage_direct() -> Result<(Vec<UsageBucket>, Option<ProviderCredit
 }
 
 fn fetch_codex_usage_from_sessions() -> Result<Vec<UsageBucket>, String> {
-    let sessions_dir = crate::restart::codex_sessions_dir();
+    let sessions_dir = crate::data_paths::resolve_codex_sessions_dir();
     if !sessions_dir.exists() {
         return Err("Codex session history not found. Start a Codex session first.".to_string());
     }

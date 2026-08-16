@@ -77,8 +77,8 @@ watcher) stays the same.
   table would be its own feature).
 - Pi does not appear in the Limits section at all — no row, no N/A copy
   (`LimitsSection.tsx` stays claude|codex).
-- Deferred for pi v1: restart-orchestration hooks, Memory Optimizer coverage
-  of pi instruction files, brevity-profile injection (excluded like MiniMax
+- Deferred for pi v1: Memory Optimizer coverage of pi instruction files,
+  brevity-profile injection (excluded like MiniMax
   so the global toggle cannot error on pi), ephemeral sessions (no session
   file → skipped), v1-format legacy session files (surfaced as an explicit
   "unsupported version" gap, never silently missing), and pi participation
@@ -400,8 +400,8 @@ Quill codebase and pi's actual source
    parity v1 (stories 1–8) including a new context HTTP API. — flagged
    by: scope, feasibility, stakeholders, requirements.
 3. **Confirm the deferred-feature list as explicit non-goals for pi v1:**
-   restart-orchestration hooks, Memory Optimizer coverage of pi files,
-   brevity-profile injection for pi (the global brevity toggle iterates
+   Memory Optimizer coverage of pi files, brevity-profile injection for pi
+   (the global brevity toggle iterates
    enabled providers and must explicitly exclude pi the way it excludes
    MiniMax, or it errors), context-preservation routing, CPA/limits band
    (`LimitsSection.tsx` hard-types claude|codex), subagent/agent rails
@@ -490,7 +490,7 @@ Transcript pipeline (needed in every MVP variant):
   `sessions.rs:334` (`[(IntegrationProvider, &str); 2]`),
   `transcript_watcher.rs:72-91` (`transcript_roots()`), and
   `live_tracker.rs:585-606` (two-root sweep). Every existing provider
-  iteration (brevity sync, memory optimizer, restart/resume, quota
+  iteration (brevity sync, memory optimizer, quota
   indicator, learning rule scope) gets an explicit pi arm — excluded
   like MiniMax unless the gate says otherwise — so the new variant
   cannot silently change a global toggle's behavior, and each excluded
@@ -672,7 +672,7 @@ than cutting scope. (Reflected in Goals, story 5.)
 A: 3B — context-preservation routing and subagent/session tracking are IN
 scope (stories 9 and 10; observe-only non-goal rewritten to permit
 reasoned `tool_call` blocks for routing only). The rest of the deferred
-list stands: restart hooks, Memory Optimizer coverage, brevity injection,
+list stands: Memory Optimizer coverage, brevity injection,
 CPA/limits, ephemeral sessions, v1-format files (explicit unsupported
 surface), remote sync. (Reflected in Goals, Non-Goals.)
 
@@ -759,7 +759,7 @@ whole files off the UI thread on change (constitution 3).
 - `src-tauri/src/context_store.rs` (new) — Rust operations on the shared
   context DB (index, fetch-and-index via `fetcher.rs`, bounded execute,
   search, get-source, stats, purge).
-- `src-tauri/src/restart.rs`, `indicator.rs`, `memory_optimizer.rs`,
+- `indicator.rs`, `memory_optimizer.rs`,
   `learning.rs`, `brevity.rs` (+ `manager.rs` brevity sync) — explicit pi
   exclusion arms so the new variant cannot change global-toggle behavior;
   excluded surfaces get explicit copy except Limits, which omits pi
@@ -918,7 +918,7 @@ Pi 0.84.1 loaded bundled `quill.ts` with isolated config and session roots, call
 - **Tree-fold scope creep**: v1 is tail-only by decision; any tree walk
   requires a written memory/CPU budget first.
 - **Enum sweep breadth** (~170 sites): compiler-forced, but review each
-  arm's semantics — the brevity/memory-optimizer/restart exclusions are
+  arm's semantics — the brevity and memory-optimizer exclusions are
   behavior decisions, not just match arms.
 - **Dark green vs. severity green**: the design task must pick a pi hue
   measurably distinct from the reserved severity green in both themes.
@@ -934,7 +934,7 @@ Every item syncs its own `lat.md` sections as part of its acceptance
    (all THREE lists: `storage.rs:12788`, `12878`, `12951`) + `pi_count`,
    the non-compiler-forced array literals as explicit decisions
    (`rule_watcher.rs:31`, `cpa/aggregate.rs:29`, `memory_optimizer.rs:118`,
-   `learning.rs:61`, `restart.rs:1660`, `manager.rs:408`,
+   `learning.rs:61`, `manager.rs:408`,
    `storage.rs:1119`, `storage.rs:15074`), rollup-coverage three-provider
    check, frontend type union + `providers.ts` label + `PROVIDER_ORDER`
    (pi must never render mislabeled), fixed-arity generalizations,

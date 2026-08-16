@@ -63,7 +63,7 @@ struct LiveSession {
     model: Option<String>,
     /// Cumulative tokens reported by Pi's extension for the current session.
     live_tokens: Option<i64>,
-    /// Root, linked, or explicitly unresolved proof pushed by Pi's extension.
+    /// Root, generic link, explicit subagent, or unresolved proof from Pi.
     lineage: Option<PiLineage>,
     /// Spawn tool-use ids seen in a `tool_result` and workflow agent ids seen
     /// in a journal `result`, from anywhere in this session's tree.
@@ -515,9 +515,23 @@ impl TrackerState {
         let Self {
             sessions, files, ..
         } = self;
+        let active_agent_parents = sessions
+            .iter()
+            .filter(|(_, child)| now.signed_duration_since(child.last_activity) <= IDLE_AFTER)
+            .filter_map(|(child_key, child)| match &child.lineage {
+                Some(PiLineage::Agent { parent_session_id }) => Some(SessionKey {
+                    provider: child_key.provider.clone(),
+                    host: child_key.host.clone(),
+                    session_id: parent_session_id.clone(),
+                }),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
         let before = sessions.len();
-        sessions
-            .retain(|_, session| now.signed_duration_since(session.last_activity) <= IDLE_AFTER);
+        sessions.retain(|key, session| {
+            now.signed_duration_since(session.last_activity) <= IDLE_AFTER
+                || active_agent_parents.contains(key)
+        });
         if sessions.len() == before {
             return false;
         }
@@ -854,8 +868,9 @@ impl LiveTracker {
             .lock()
             .unwrap()
             .sessions
-            .keys()
-            .map(|key| {
+            .iter()
+            .filter(|(_, session)| !matches!(session.lineage, Some(PiLineage::Agent { .. })))
+            .map(|(key, _)| {
                 (
                     key.provider.clone(),
                     key.session_id.clone(),
@@ -884,28 +899,67 @@ impl LiveTracker {
         let state = self.state.lock().unwrap();
         let mut seen = HashSet::new();
         let mut linked_by_parent = HashMap::<SessionKey, Vec<ObservedLinkedSession>>::new();
+        let mut agents_by_parent = HashMap::<SessionKey, Vec<ObservedSessionAgent>>::new();
+        let mut agent_activity_by_parent = HashMap::<SessionKey, DateTime<Utc>>::new();
+        let mut agent_child_keys = HashSet::new();
         for (child_key, child) in &state.sessions {
-            let Some(PiLineage::Linked { parent_session_id }) = child.lineage.as_ref() else {
-                continue;
+            let (parent_session_id, agent) = match child.lineage.as_ref() {
+                Some(PiLineage::Linked { parent_session_id }) => (parent_session_id, false),
+                Some(PiLineage::Agent { parent_session_id }) => (parent_session_id, true),
+                _ => continue,
             };
             let parent_key = SessionKey {
                 provider: IntegrationProvider::Pi.as_str().to_owned(),
                 host: child_key.host.clone(),
                 session_id: parent_session_id.clone(),
             };
+            if agent {
+                agent_child_keys.insert(child_key.clone());
+            }
             if state.sessions.contains_key(&parent_key) {
-                linked_by_parent
-                    .entry(parent_key)
-                    .or_default()
-                    .push(ObservedLinkedSession {
-                        session_id: child_key.session_id.clone(),
-                        model_id: child.model.clone(),
-                    });
+                if agent {
+                    agent_activity_by_parent
+                        .entry(parent_key.clone())
+                        .and_modify(|activity| {
+                            if child.last_activity > *activity {
+                                *activity = child.last_activity;
+                            }
+                        })
+                        .or_insert(child.last_activity);
+                    agents_by_parent
+                        .entry(parent_key)
+                        .or_default()
+                        .push(ObservedSessionAgent {
+                            agent_id: child_key.session_id.clone(),
+                            model_id: child.model.clone(),
+                            agent_type: None,
+                            runtime_secs: child.started_at.map(|started_at| {
+                                now.signed_duration_since(started_at)
+                                    .num_milliseconds()
+                                    .max(0) as f64
+                                    / 1_000.0
+                            }),
+                            runtime_active: true,
+                        });
+                } else {
+                    linked_by_parent
+                        .entry(parent_key)
+                        .or_default()
+                        .push(ObservedLinkedSession {
+                            session_id: child_key.session_id.clone(),
+                            model_id: child.model.clone(),
+                        });
+                }
             }
         }
         for linked in linked_by_parent.values_mut() {
             linked.sort_by(|left, right| left.session_id.cmp(&right.session_id));
         }
+        for agents in agents_by_parent.values_mut() {
+            agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        }
+
+        rows.retain(|row| row_key(row).is_none_or(|key| !agent_child_keys.contains(&key)));
 
         for row in &mut rows {
             row.observed_only = false;
@@ -917,7 +971,19 @@ impl LiveTracker {
                 continue;
             };
             row.ephemeral = session.ephemeral;
-            row.observed_agents = Some(session.open_agents(now));
+            let mut observed_agents = session.open_agents(now);
+            if let Some(agents) = agents_by_parent.get(&key) {
+                observed_agents.extend(agents.iter().cloned());
+                observed_agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+                row.agent_count = i64::try_from(agents.len()).ok();
+                let agent_runtime_secs = agents.iter().filter_map(|agent| agent.runtime_secs).sum();
+                row.agent_runtime_secs = Some(agent_runtime_secs);
+                row.active_runtime_secs =
+                    Some(row.active_runtime_secs.unwrap_or(0.0) + agent_runtime_secs);
+                row.active_runtime_rate += agents.len() as f64;
+                row.runtime_as_of_ms = Some(now.timestamp_millis());
+            }
+            row.observed_agents = Some(observed_agents);
             row.pi_lineage = session.lineage.clone();
             row.parent_session_id = match &session.lineage {
                 Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
@@ -925,8 +991,13 @@ impl LiveTracker {
             };
             row.live_linked_sessions = (key.provider == IntegrationProvider::Pi.as_str())
                 .then(|| linked_by_parent.get(&key).cloned().unwrap_or_default());
-            if utc(&row.last_active).is_none_or(|stored| session.last_activity > stored) {
-                row.last_active = session.last_activity.to_rfc3339();
+            let last_activity = agent_activity_by_parent
+                .get(&key)
+                .copied()
+                .unwrap_or(session.last_activity)
+                .max(session.last_activity);
+            if utc(&row.last_active).is_none_or(|stored| last_activity > stored) {
+                row.last_active = last_activity.to_rfc3339();
             }
             if let Some(total_tokens) = session.live_tokens {
                 row.total_tokens = total_tokens;
@@ -944,6 +1015,7 @@ impl LiveTracker {
                     continue;
                 };
                 if seen.contains(key)
+                    || agent_child_keys.contains(key)
                     || provider_filter.is_some_and(|filter| key.provider != filter)
                     || hostname_filter
                         .as_ref()
@@ -952,6 +1024,16 @@ impl LiveTracker {
                 {
                     continue;
                 }
+                let mut observed_agents = session.open_agents(now);
+                let pi_agents = agents_by_parent.get(key).cloned().unwrap_or_default();
+                observed_agents.extend(pi_agents.iter().cloned());
+                observed_agents.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+                let agent_runtime_secs = (!pi_agents.is_empty()).then(|| {
+                    pi_agents
+                        .iter()
+                        .filter_map(|agent| agent.runtime_secs)
+                        .sum()
+                });
                 rows.push(SessionBreakdown {
                     provider: key.provider.clone(),
                     session_id: key.session_id.clone(),
@@ -970,17 +1052,24 @@ impl LiveTracker {
                         .started_at
                         .unwrap_or(session.last_activity)
                         .to_rfc3339(),
-                    last_active: session.last_activity.to_rfc3339(),
+                    last_active: agent_activity_by_parent
+                        .get(key)
+                        .copied()
+                        .unwrap_or(session.last_activity)
+                        .max(session.last_activity)
+                        .to_rfc3339(),
                     ended_at: None,
                     project: Some(cwd.clone()),
-                    active_runtime_secs: None,
-                    agent_count: None,
-                    agent_runtime_secs: None,
+                    active_runtime_secs: agent_runtime_secs,
+                    agent_count: i64::try_from(pi_agents.len())
+                        .ok()
+                        .filter(|count| *count > 0),
+                    agent_runtime_secs,
                     current_turn_runtime_secs: None,
                     current_turn_runtime_active: false,
-                    runtime_as_of_ms: None,
-                    active_runtime_rate: 0.0,
-                    observed_agents: Some(session.open_agents(now)),
+                    runtime_as_of_ms: agent_runtime_secs.map(|_| now.timestamp_millis()),
+                    active_runtime_rate: pi_agents.len() as f64,
+                    observed_agents: Some(observed_agents),
                     live_linked_sessions: (key.provider == IntegrationProvider::Pi.as_str())
                         .then(|| linked_by_parent.get(key).cloned().unwrap_or_default()),
                     observed_only: true,
@@ -2163,6 +2252,95 @@ mod tests {
                 .parent_session_id,
             None
         );
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Explicit Pi Agent Lineage]]
+    #[test]
+    fn pi_agent_lineage_folds_child_into_parent_agent_rail() {
+        let now = Utc::now();
+        let parent_started = now - TimeDelta::minutes(10);
+        let agent_started = now - TimeDelta::seconds(8);
+        let tracker = LiveTracker::new(None);
+        let host = "host";
+        tracker.start_pi_session(
+            "parent",
+            host,
+            Some("/work/quill"),
+            false,
+            parent_started,
+            None,
+        );
+        tracker.start_pi_session(
+            "linked",
+            host,
+            Some("/work/quill"),
+            false,
+            parent_started,
+            None,
+        );
+        tracker.start_pi_session(
+            "agent",
+            host,
+            Some("/work/quill"),
+            false,
+            agent_started,
+            None,
+        );
+        tracker.set_pi_lineage("parent", host, PiLineage::Root);
+        tracker.set_pi_lineage(
+            "linked",
+            host,
+            PiLineage::Linked {
+                parent_session_id: "parent".into(),
+            },
+        );
+        tracker.set_pi_lineage(
+            "agent",
+            host,
+            PiLineage::Agent {
+                parent_session_id: "parent".into(),
+            },
+        );
+        tracker.set_pi_model("agent", host, "openai", "gpt-5.6-sol");
+
+        let (keys, rows) = read_path(&tracker, Vec::new(), now);
+
+        assert!(keys.iter().all(|(_, session_id, _)| session_id != "agent"));
+        assert!(rows.iter().all(|row| row.session_id != "agent"));
+        let linked = rows.iter().find(|row| row.session_id == "linked").unwrap();
+        assert_eq!(linked.parent_session_id.as_deref(), Some("parent"));
+        let parent = rows.iter().find(|row| row.session_id == "parent").unwrap();
+        assert_eq!(agent_ids(parent), vec!["agent"]);
+        assert_eq!(parent.agent_count, Some(1));
+        assert!(
+            parent
+                .agent_runtime_secs
+                .is_some_and(|runtime| (8.0..9.0).contains(&runtime))
+        );
+        assert!(
+            parent
+                .active_runtime_secs
+                .is_some_and(|runtime| (8.0..9.0).contains(&runtime))
+        );
+        assert_eq!(parent.active_runtime_rate, 1.0);
+        assert!(
+            parent
+                .runtime_as_of_ms
+                .is_some_and(|timestamp| timestamp >= now.timestamp_millis())
+        );
+        assert!(utc(&parent.last_active).is_some_and(|last_active| last_active >= agent_started));
+        assert_eq!(
+            parent.live_linked_sessions.as_ref().unwrap()[0].session_id,
+            "linked"
+        );
+        let agent = &parent.observed_agents.as_ref().unwrap()[0];
+        assert_eq!(agent.model_id.as_deref(), Some("gpt-5.6-sol"));
+        assert!(
+            agent
+                .runtime_secs
+                .is_some_and(|runtime| (8.0..9.0).contains(&runtime))
+        );
+        assert!(agent.runtime_active);
     }
 
     // @lat: [[live-subagent-count-tests#Live Subagent Count Tests#Live Tracker Tail Mechanics]]

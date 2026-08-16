@@ -46,6 +46,10 @@ One atomic settings write records the handshake protocol, extension version, min
 
 The Pi tracking boundary rejects bad bearer authentication with `401`, protocol mismatch with a typed `400`, and control characters in hostname identity before mutation.
 
+## Agent Lineage Protocol
+
+The Pi tracking protocol accepts explicit agent lineage with a validated parent session id so the extension marker survives the HTTP boundary.
+
 ## Tracking Rate Headroom
 
 The independent Pi tracking limiter charges contained events and accepts 4,000 events in one 60-second window, four times the specified stream even when envelopes batch 200 events.
@@ -77,6 +81,18 @@ A live Pi row renders the cumulative total maintained by pushed usage instead of
 ## Proven Live Lineage
 
 One parent with two live children linked by pushed proof exposes exactly two linked sessions while a pushed root sibling stays independent and Pi native agent count stays unknown.
+
+## Explicit Pi Agent Lineage
+
+An explicitly marked Pi subagent becomes a live agent on its parent with model, count, runtime, and activity while its child session row is omitted; generic Pi links remain separate.
+
+## Pi Agent Retained Parent Overlay
+
+An active explicit Pi agent keeps its otherwise-idle parent live and rankable, so limited storage reads return the parent with the child attached and no independent child.
+
+## Pi Agent Runtime Projection
+
+Native runtime enrichment preserves pushed Pi agent totals and per-agent baselines so storage coverage cannot erase the live fold before IPC serialization.
 
 ## Pushed Lineage Proof
 

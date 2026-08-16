@@ -426,7 +426,7 @@ fn validate_pi_track_name(value: &str, label: &'static str) -> Result<(), PiTrac
 fn validate_pi_lineage(lineage: &PiLineage) -> Result<(), PiTrackError> {
     match lineage {
         PiLineage::Root => Ok(()),
-        PiLineage::Linked { parent_session_id } => {
+        PiLineage::Linked { parent_session_id } | PiLineage::Agent { parent_session_id } => {
             validate_pi_track_name(parent_session_id, "parent_session_id")
         }
         PiLineage::Unresolved { reason } => validate_pi_track_name(reason, "lineage reason"),
@@ -1601,7 +1601,8 @@ fn index_session_notify_payload(
 
 fn pushed_pi_parent(lineage: Option<&PiLineage>) -> Option<String> {
     match lineage {
-        Some(PiLineage::Linked { parent_session_id }) => Some(parent_session_id.clone()),
+        Some(PiLineage::Linked { parent_session_id })
+        | Some(PiLineage::Agent { parent_session_id }) => Some(parent_session_id.clone()),
         Some(PiLineage::Root | PiLineage::Unresolved { .. }) => None,
         None => None,
     }
@@ -2878,6 +2879,35 @@ mod observed_subagent_tests {
         .expect("deserialize Pi tracking envelope")
     }
 
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Agent Lineage Protocol]]
+    #[test]
+    fn pi_tracking_protocol_accepts_agent_lineage() {
+        let payload = serde_json::from_value::<PiTrackEnvelope>(serde_json::json!({
+            "protocol": PI_TRACK_PROTOCOL,
+            "extension_version": "1.2.3",
+            "min_quill_version": "0.9.0",
+            "events": [{
+                "type": "session_start",
+                "event_uuid": "event-agent",
+                "session_id": "child",
+                "hostname": "host",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "cwd": "/work/pi",
+                "ephemeral": false,
+                "reason": "startup",
+                "lineage": {
+                    "kind": "agent",
+                    "parent_session_id": "parent"
+                }
+            }]
+        }));
+
+        assert!(
+            payload.is_ok(),
+            "agent lineage must cross the tracking protocol"
+        );
+    }
+
     // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Tracking Request Validation]]
     #[test]
     fn pi_track_rejects_bad_auth_and_protocol_with_typed_statuses() {
@@ -2903,6 +2933,13 @@ mod observed_subagent_tests {
     fn pi_notify_parent_uses_pushed_proof_instead_of_transcript_parent() {
         assert_eq!(
             pushed_pi_parent(Some(&PiLineage::Linked {
+                parent_session_id: "pushed-parent".into(),
+            }))
+            .as_deref(),
+            Some("pushed-parent")
+        );
+        assert_eq!(
+            pushed_pi_parent(Some(&PiLineage::Agent {
                 parent_session_id: "pushed-parent".into(),
             }))
             .as_deref(),

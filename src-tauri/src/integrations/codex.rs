@@ -357,17 +357,13 @@ fn write_deployment_stamp_best_effort(app: &tauri::AppHandle, features: Integrat
     }
 }
 
-pub fn uninstall(
-    remove_shared_restart_assets: bool,
-    remove_shared_config: bool,
-) -> Result<(), String> {
+pub fn uninstall(remove_shared_config: bool) -> Result<(), String> {
     let paths = resolve_codex_uninstall_paths()?;
     let manifest = build_owned_manifest();
     remove_managed_config_entries(&paths)?;
     remove_agents_block(&paths.agents)?;
     remove_owned_files(&manifest.files)?;
     remove_owned_directories(&manifest.directories)?;
-    crate::restart::uninstall_codex_restart_assets(remove_shared_restart_assets)?;
     remove_path(&integration_state_path())
         .map_err(|err| format!("Failed to remove Codex integration state: {err}"))?;
     if remove_shared_config {

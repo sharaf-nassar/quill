@@ -509,8 +509,8 @@ widget's 360px design width: a 14px gutter, an 8/10/12/16px vertical ladder,
 the window — a widget dragged to 1200px keeps the same gutter and type ladder
 and simply gives its bands more room.
 
-**The stated exception.** The Manage workspace (Sessions, Learning, Instances,
-Settings), the settings surfaces, and the release-notes window still render in
+**The stated exception.** The Manage workspace (Sessions, Learning, Settings),
+the settings surfaces, and the release-notes window still render in
 their pre-existing roomier density on the Graphite Stack — cards, borders, and
 the older 11px/9px type ladder. That is a migration state, not a second
 doctrine: each of those windows keeps its current density until its own

@@ -25,7 +25,7 @@ const INTEGRATION_STATE_VERSION: u8 = 1;
 const INTEGRATION_STATE_FILE: &str = "integration-state.json";
 
 #[derive(Clone, Debug)]
-pub(crate) struct ClaudePaths {
+struct ClaudePaths {
     pub(crate) config_dir: PathBuf,
     pub(crate) settings: PathBuf,
     pub(crate) mcp_config: PathBuf,
@@ -40,8 +40,6 @@ struct ClaudeIntegrationState {
     version: u8,
     config_dir: PathBuf,
     mcp_config: PathBuf,
-    main_installed: bool,
-    restart_installed: bool,
     mcp_state_captured: bool,
     mcp_server_was_present: bool,
     prior_mcp_server: Option<serde_json::Value>,
@@ -162,8 +160,6 @@ fn empty_integration_state(paths: &ClaudePaths) -> ClaudeIntegrationState {
         version: INTEGRATION_STATE_VERSION,
         config_dir: paths.config_dir.clone(),
         mcp_config: paths.mcp_config.clone(),
-        main_installed: false,
-        restart_installed: false,
         mcp_state_captured: false,
         mcp_server_was_present: false,
         prior_mcp_server: None,
@@ -183,21 +179,7 @@ fn ensure_state_paths(state: &ClaudeIntegrationState, paths: &ClaudePaths) -> Re
     ))
 }
 
-pub(crate) fn set_claude_restart_installed(
-    paths: &ClaudePaths,
-    installed: bool,
-) -> Result<(), String> {
-    let mut state = load_integration_state()?.unwrap_or_else(|| empty_integration_state(paths));
-    ensure_state_paths(&state, paths)?;
-    state.restart_installed = installed;
-    if !state.main_installed && !state.restart_installed {
-        return remove_path(&paths.state)
-            .map_err(|err| format!("Failed to remove Claude integration state: {err}"));
-    }
-    write_integration_state(&state)
-}
-
-pub(crate) fn resolve_claude_install_paths() -> Result<ClaudePaths, String> {
+fn resolve_claude_install_paths() -> Result<ClaudePaths, String> {
     if let Some(state) = load_integration_state()? {
         return Ok(paths_from_state(&state));
     }
@@ -217,7 +199,7 @@ pub(crate) fn resolve_claude_install_paths() -> Result<ClaudePaths, String> {
     Ok(configured)
 }
 
-pub(crate) fn resolve_claude_uninstall_paths() -> Result<ClaudePaths, String> {
+fn resolve_claude_uninstall_paths() -> Result<ClaudePaths, String> {
     Ok(load_integration_state()?
         .as_ref()
         .map(paths_from_state)
@@ -234,7 +216,7 @@ pub(crate) fn detect_claude_home() -> bool {
     }
 }
 
-pub(crate) fn resolve_node_executable() -> Result<PathBuf, String> {
+fn resolve_node_executable() -> Result<PathBuf, String> {
     let node = crate::config::resolve_command_path("node")
         .ok_or_else(|| "Node.js 18 or newer is required for Claude hooks".to_string())?;
     let output = Command::new(&node)
@@ -468,8 +450,7 @@ fn deployment_stamp(
 /// verification still passes, letting repair skip the full transactional
 /// reinstall (which would swap the MCP tree and force a `uv` resync).
 pub(crate) fn deployment_is_current(app: &tauri::AppHandle, features: IntegrationFeatures) -> bool {
-    if !load_integration_state().is_ok_and(|state| state.is_some_and(|state| state.main_installed))
-    {
+    if !load_integration_state().is_ok_and(|state| state.is_some()) {
         return false;
     }
     let Ok(stamp) = deployment_stamp(app, features) else {
@@ -517,12 +498,8 @@ pub(crate) fn detect() -> Result<crate::integrations::ProviderStatus, String> {
     })
 }
 
-pub fn uninstall(
-    remove_shared_restart_assets: bool,
-    remove_shared_config: bool,
-) -> Result<(), String> {
+pub fn uninstall(remove_shared_config: bool) -> Result<(), String> {
     let paths = resolve_claude_uninstall_paths()?;
-    crate::restart::uninstall_claude_restart_assets(&paths, remove_shared_restart_assets)?;
     let state = load_integration_state()?;
     preflight_configuration(&paths)?;
 
@@ -537,7 +514,7 @@ pub fn uninstall(
         remove_claude_md_sections(&paths)?;
         cleanup_legacy_hook_files(&paths)?;
         verify_uninstalled(&paths)?;
-        mark_main_uninstalled(&paths)?;
+        remove_integration_state(&paths)?;
         if remove_shared_config {
             crate::integrations::config_contract::remove()?;
         }
@@ -682,14 +659,11 @@ fn read_json_object(path: &Path, label: &str) -> Result<serde_json::Value, Strin
     Ok(value)
 }
 
-pub(crate) fn read_settings_object(path: &Path) -> Result<serde_json::Value, String> {
+fn read_settings_object(path: &Path) -> Result<serde_json::Value, String> {
     read_json_object(path, "settings.json")
 }
 
-pub(crate) fn write_settings_object(
-    path: &Path,
-    settings: &serde_json::Value,
-) -> Result<(), String> {
+fn write_settings_object(path: &Path, settings: &serde_json::Value) -> Result<(), String> {
     if !settings.is_object() {
         return Err("settings.json root is not an object".to_string());
     }
@@ -703,7 +677,7 @@ pub(crate) fn write_settings_object(
         .map_err(|err| format!("Failed to write settings.json at {}: {err}", path.display()))
 }
 
-pub(crate) fn remove_matching_hook_handlers<F>(
+fn remove_matching_hook_handlers<F>(
     settings: &mut serde_json::Value,
     mut owned: F,
 ) -> Result<bool, String>
@@ -1236,13 +1210,12 @@ fn prepare_main_install_state(
     state: &mut ClaudeIntegrationState,
     existing: Option<serde_json::Value>,
 ) {
-    if !state.main_installed || !state.mcp_state_captured {
+    if !state.mcp_state_captured {
         let prior = existing.filter(|entry| !mcp_entry_is_managed(entry));
         state.mcp_server_was_present = prior.is_some();
         state.prior_mcp_server = prior;
         state.mcp_state_captured = true;
     }
-    state.main_installed = true;
 }
 
 fn ensure_main_integration_state(paths: &ClaudePaths) -> Result<(), String> {
@@ -1313,18 +1286,13 @@ fn restore_quill_mcp(
     write_json_object(&paths.mcp_config, &root, ".claude.json")
 }
 
-fn mark_main_uninstalled(paths: &ClaudePaths) -> Result<(), String> {
-    let Some(mut state) = load_integration_state()? else {
+fn remove_integration_state(paths: &ClaudePaths) -> Result<(), String> {
+    let Some(state) = load_integration_state()? else {
         return Ok(());
     };
     ensure_state_paths(&state, paths)?;
-    state.main_installed = false;
-    if !state.restart_installed {
-        remove_path(&paths.state)
-            .map_err(|err| format!("Failed to remove Claude integration state: {err}"))
-    } else {
-        write_integration_state(&state)
-    }
+    remove_path(&paths.state)
+        .map_err(|err| format!("Failed to remove Claude integration state: {err}"))
 }
 
 // ── Hook registration ──
@@ -1787,7 +1755,7 @@ fn verify_with_paths(
 
     let state = load_integration_state()?.ok_or("Claude integration state is missing")?;
     ensure_state_paths(&state, paths)?;
-    if !state.main_installed || !state.mcp_state_captured {
+    if !state.mcp_state_captured {
         return Err("Claude integration ownership state is incomplete".to_string());
     }
 
@@ -2188,8 +2156,6 @@ mod tests {
             version: INTEGRATION_STATE_VERSION,
             config_dir: paths.config_dir.clone(),
             mcp_config: paths.mcp_config.clone(),
-            main_installed: true,
-            restart_installed: false,
             mcp_state_captured: true,
             mcp_server_was_present: true,
             prior_mcp_server: Some(prior.clone()),
@@ -2219,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn reinstall_recaptures_mcp_replacement_while_restart_keeps_state() {
+    fn fresh_install_recaptures_mcp_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("claude");
         let mcp_config = config.join(".claude.json");
@@ -2230,8 +2196,6 @@ mod tests {
             version: INTEGRATION_STATE_VERSION,
             config_dir: paths.config_dir.clone(),
             mcp_config: paths.mcp_config.clone(),
-            main_installed: true,
-            restart_installed: true,
             mcp_state_captured: true,
             mcp_server_was_present: true,
             prior_mcp_server: Some(prior.clone()),
@@ -2246,8 +2210,7 @@ mod tests {
         )
         .unwrap();
         restore_quill_mcp(&paths, Some(&state)).unwrap();
-        state.main_installed = false;
-        assert!(state.restart_installed);
+        state = empty_integration_state(&paths);
 
         write_json_object(
             &mcp_config,

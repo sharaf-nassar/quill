@@ -198,13 +198,13 @@ The extension calls Session Search notify only when Pi supplies a transcript pat
 
 ### Pi Session Lineage
 
-Pi lineage exists only when the extension pushes explicit root, linked, or unresolved proof; Quill never infers relationships from paths, timing, cwd, filenames, or models.
+Pi lineage exists only when the extension pushes explicit root, linked, agent, or unresolved proof; Quill never infers relationships from paths, timing, cwd, filenames, or models.
 
-The Pi extension reads the parent header once at session start and pushes its stable id. Missing or malformed parent headers push an unresolved reason rather than collapsing into root. Provider and host remain part of the live key, so equal ids from other providers or machines cannot join.
+The Pi extension reads a generic child's parent header once at session start. A process explicitly marked `PI_SUBAGENT_CHILD=1` instead uses its validated `PI_SUBAGENT_PARENT_SESSION` id when its fresh header has no parent path. Missing, malformed, self-referential, or oversized parent proof stays unresolved. Provider and host remain part of the live key, so equal ids from other providers or machines cannot join.
 
-[[src-tauri/src/live_tracker.rs#LiveTracker#overlay]] derives live child lists from the existing bounded session map on each read. It stores no second graph: provider disable, activity disable, and idle eviction remove the source sessions and therefore their links. Children remain independent rows with parent metadata; a parent receives only concurrently live children whose complete chain resolved.
+[[src-tauri/src/live_tracker.rs#LiveTracker#overlay]] derives relationships from the bounded session map on each read. Generic linked children remain independent rows and feed the parent's linked-session rail. Explicit agent children are omitted as rows, advance parent activity, and feed its agent count, active runtime, and open-agent rail. Provider disable, activity disable, and idle eviction remove the source sessions and their relationships.
 
-Session notify carries the same pushed proof captured at start, including post-turn refreshes, and Search stores its linked parent id in each Pi document. Root and unresolved proof clear parser fallback. Sessions navigate to the provider-qualified parent without exposing paths.
+Session notify carries the same pushed proof captured at start, including post-turn refreshes, and Search stores generic and agent parent ids in each Pi document. Root and unresolved proof clear parser fallback. Sessions navigate to the provider-qualified parent without exposing paths.
 
 ## Model Observation Reconciliation
 
