@@ -991,6 +991,7 @@ pub struct SessionSchema {
     pub content: Field,
     pub role: Field,
     pub project: Field,
+    pub project_path: Field,
     pub host: Field,
     pub provider_facet: Field,
     pub timestamp: Field,
@@ -1047,7 +1048,7 @@ pub struct SessionIndex {
 }
 
 impl SessionIndex {
-    const SCHEMA_VERSION: u32 = 6;
+    const SCHEMA_VERSION: u32 = 7;
 
     /// Open an existing index or create a new one at the given directory.
     pub fn open_or_create(index_dir: &Path) -> Result<Self, String> {
@@ -1104,7 +1105,7 @@ impl SessionIndex {
         })
     }
 
-    /// Build the tantivy schema with all 10 fields.
+    /// Build the Tantivy schema.
     fn build_schema() -> (Schema, SessionSchema) {
         let mut builder = Schema::builder();
 
@@ -1126,8 +1127,9 @@ impl SessionIndex {
         let display_text = builder.add_text_field("display_text", TEXT | STORED);
 
         // Facet fields (hierarchical)
-        let project = builder.add_facet_field("project", FacetOptions::default());
-        let host = builder.add_facet_field("host", FacetOptions::default());
+        let project = builder.add_facet_field("project", FacetOptions::default().set_stored());
+        let project_path = builder.add_text_field("project_path", STRING);
+        let host = builder.add_facet_field("host", FacetOptions::default().set_stored());
         let provider_facet = builder.add_facet_field("provider_facet", FacetOptions::default());
 
         // Date field (indexed, stored, fast)
@@ -1147,6 +1149,7 @@ impl SessionIndex {
             content,
             role,
             project,
+            project_path,
             host,
             provider_facet,
             timestamp,
@@ -1288,6 +1291,9 @@ impl SessionIndex {
             self.fields.project,
             Facet::from(&format!("/{project_facet}")),
         );
+        if let Some(cwd) = msg.cwd.as_deref().filter(|cwd| !cwd.is_empty()) {
+            doc.add_text(self.fields.project_path, cwd);
+        }
         doc.add_facet(self.fields.host, Facet::from(&format!("/{host_facet}")));
         doc.add_facet(
             self.fields.provider_facet,
@@ -1872,11 +1878,25 @@ impl SessionIndex {
         // Project facet filter
         if let Some(ref proj) = filters.project {
             let facet = Facet::from(&format!("/{proj}"));
-            let term = Term::from_facet(f.project, &facet);
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+            let facet_query = Box::new(TermQuery::new(
+                Term::from_facet(f.project, &facet),
+                IndexRecordOption::Basic,
             ));
+            if Path::new(proj).is_absolute() {
+                let path_query = Box::new(TermQuery::new(
+                    Term::from_field_text(f.project_path, proj),
+                    IndexRecordOption::Basic,
+                ));
+                clauses.push((
+                    Occur::Must,
+                    Box::new(BooleanQuery::new(vec![
+                        (Occur::Should, path_query),
+                        (Occur::Should, facet_query),
+                    ])),
+                ));
+            } else {
+                clauses.push((Occur::Must, facet_query));
+            }
         }
 
         // Host facet filter
@@ -5198,7 +5218,7 @@ mod tests {
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Search]]
     #[test]
-    fn pi_search_hits_and_facets_keep_provider_identity() {
+    fn pi_search_hits_and_facets_keep_provider_identity_and_metadata() {
         let temp = TempDir::new().expect("tempdir");
         let index = SessionIndex::open_or_create(temp.path()).expect("open index");
         let messages = extract_messages_from_jsonl_contents(
@@ -5238,6 +5258,8 @@ mod tests {
         assert_eq!(result.total_hits, 1);
         assert_eq!(result.hits[0].provider, IntegrationProvider::Pi);
         assert_eq!(result.hits[0].message_id, "pi-entry");
+        assert_eq!(result.hits[0].project, "quill");
+        assert_eq!(result.hits[0].host, "host");
         assert!(
             index
                 .get_facets()
@@ -5246,6 +5268,71 @@ mod tests {
                 .iter()
                 .any(|facet| { facet.name == "pi" && facet.count == 1 })
         );
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Working Directory Filter]]
+    #[test]
+    fn absolute_project_filter_distinguishes_same_named_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+
+        for (session_id, message_id, cwd) in [
+            ("session-a", "message-a", "/work/team-a/quill"),
+            ("session-b", "message-b", "/work/team-b/quill"),
+        ] {
+            let transcript = format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\"timestamp\":\"2026-08-14T08:00:00Z\",\"cwd\":\"{cwd}\"}}\n{{\"type\":\"message\",\"id\":\"{message_id}\",\"parentId\":null,\"timestamp\":\"2026-08-14T08:00:01Z\",\"message\":{{\"role\":\"user\",\"content\":\"shared-search-term\"}}}}\n"
+            );
+            let messages = extract_messages_from_jsonl_contents(
+                IntegrationProvider::Pi,
+                Path::new("session.jsonl"),
+                &transcript,
+            )
+            .messages;
+            index
+                .replace_session_docs_batch(
+                    IntegrationProvider::Pi,
+                    session_id,
+                    "quill",
+                    "host",
+                    &messages,
+                )
+                .expect("index Pi message");
+        }
+        index.reader.reload().expect("reload index");
+
+        let result = index
+            .search(
+                "shared-search-term",
+                &SearchFilters {
+                    project: Some("/work/team-a/quill".to_string()),
+                    ..SearchFilters::default()
+                },
+                "relevance",
+                0,
+                10,
+            )
+            .expect("search one cwd");
+
+        assert_eq!(result.total_hits, 1);
+        assert_eq!(result.hits[0].message_id, "message-a");
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Search Schema Rebuild]]
+    #[test]
+    fn search_schema_change_rebuilds_existing_index() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(temp.path().join("schema_version.txt"), "6").expect("write old version");
+        let obsolete = temp.path().join("obsolete-index-file");
+        fs::write(&obsolete, "old schema").expect("write old index marker");
+
+        let _index = SessionIndex::open_or_create(temp.path()).expect("open index");
+
+        assert_eq!(
+            fs::read_to_string(temp.path().join("schema_version.txt")).expect("read version"),
+            "7"
+        );
+        assert!(!obsolete.exists(), "old schema contents must be removed");
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Cleanup]]

@@ -1972,7 +1972,7 @@ Indicator state payloads use the explicit status vocabulary `ready`, `degraded`,
 
 The Tantivy index stores provider, identity, content, and enrichment fields for shared session search.
 
-Fields include provider, message_id, session_id, content, role, project, host, timestamp, git_branch, tools_used, files_modified, code_changes, commands_run, tool_details, and a stored display text field. Provider/project/host are faceted for filters. Stored at `~/.local/share/com.quilltoolkit.app/session-index/`.
+Fields include provider, message_id, session_id, content, role, project, project_path, host, timestamp, git_branch, tools_used, files_modified, code_changes, commands_run, tool_details, and display text. Provider/project/host support facets, project and host are stored for hit metadata, and project_path keeps exact cwd identity. Stored at `~/.local/share/com.quilltoolkit.app/session-index/`; schema version 7 rebuilds older indexes.
 
 ### Indexing Strategy
 
@@ -1990,7 +1990,7 @@ Skill usage is derived by [[src-tauri/src/sessions.rs#extract_skill_accesses_fro
 
 The shared Claude candidate walker descends through the complete `<projectSlug>/<session-uuid>/subagents/**` subtree in addition to flat parent transcripts. Its permissive search view preserves original paths, project labels, and `is_subagent`; its strict retained view canonicalizes containment and source identity. Both admit only nested `agent-*.jsonl` transcripts, excluding Workflow journals. Claude extraction indexes top-level messages by `sessionId` and sidechain messages by `agentId`, retaining `parentUuid` for message linkage. Context lookup canonicalizes candidates under the Claude root and requires one matching extracted chain identity. Codex preserves the first child `session_meta.id` and resolves `parent_thread_id`, falling back to `forked_from_id`; context lookup checks its provider-qualified transcript registry before the legacy filename suffix and rejects ambiguous matches.
 
-The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
+The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. Project filters keep display-name facet matching for the UI and accept an exact absolute cwd for MCP callers; exact cwd identity separates same-named directories. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
 
 [[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model and transcript reconciliation before session-keyed search coalescing; a resolvable path that fails the stricter retained-source policy still coalesces for search only, preserving the indexing contract. Direct message payloads append Tantivy documents and atomically store source-less runtime rows plus recorded live origin through [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]].
 

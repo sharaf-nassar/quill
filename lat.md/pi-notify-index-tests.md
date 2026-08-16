@@ -32,7 +32,15 @@ The narrow parser extracts each text-bearing Pi message once by entry id with he
 
 ## Provider Safe Search
 
-Pi search hits and provider facets retain Pi identity instead of falling back to another provider.
+Pi search hits retain provider, project, and host metadata, while provider facets keep Pi identity instead of falling back to another provider.
+
+## Working Directory Filter
+
+An absolute project filter matches exact indexed cwd identity, so projects with the same final directory name do not leak into each other's results.
+
+## Search Schema Rebuild
+
+Opening an index from schema version 6 removes its old contents and records version 7 so stored metadata and cwd filtering are available after reindexing.
 
 ## Provider Safe Cleanup
 

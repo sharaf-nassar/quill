@@ -264,7 +264,7 @@ Incomplete discovery preserves indexed data. Hook endpoints can also ingest upda
 
 ### Search Interface
 
-Search bar with filters for project, host, role, date range, and git branch.
+Search bar with filters for project, host, role, date range, and git branch. Project filters accept the displayed project label or an exact absolute cwd; the latter keeps same-named directories distinct for MCP history search.
 
 Results show ranked hits with snippets, tools used, files modified, and code changes. A detail panel shows surrounding context (plus/minus 5 messages). Faceted search provides pre-aggregated project and host counts. Pagination with 20 results per page and load-more.
 
