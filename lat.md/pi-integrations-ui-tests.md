@@ -10,6 +10,8 @@ These tests pin Pi setup controls and analytics presentation without adding Pi t
 
 The Integrations provider row distinguishes a detected Pi CLI, an enabled integration, and a setup error so operators can act on each state.
 
+A detected-but-disabled provider reports itself as off or unconfigured instead of claiming Quill assets are missing; that language appears only when setup state confirms assets are actually absent.
+
 ## Extension health state machine
 
 Pi extension reports transition from never connected to alive, idle, and stale using bounded last-report ages.

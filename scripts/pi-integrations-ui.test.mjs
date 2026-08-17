@@ -146,12 +146,27 @@ test("Pi card exposes detected, enabled, and error states", () => {
     loading: false,
     saving: false,
   };
-  for (const [status, expectedClass] of [
-    [baseStatus, "settings-toggle--off"],
-    [{ ...baseStatus, enabled: true, setupState: "installed" }, "settings-toggle--on"],
+  for (const [status, expectedClass, expectedCopy] of [
+    [baseStatus, "settings-toggle--off", /Quill integration disabled or not configured\./],
+    [
+      { ...baseStatus, setupState: "installed" },
+      "settings-toggle--off",
+      /Quill integration disabled or not configured\./,
+    ],
+    [
+      { ...baseStatus, setupState: "missing", detectedHome: false },
+      "settings-toggle--setup",
+      /Auto-deployment pending; click to run\./,
+    ],
+    [
+      { ...baseStatus, enabled: true, setupState: "installed" },
+      "settings-toggle--on",
+      /Quill assets installed and active\./,
+    ],
     [
       { ...baseStatus, setupState: "error", lastError: "Extension is stale" },
       "settings-toggle--error",
+      /Extension is stale/,
     ],
   ]) {
     const markup = renderToStaticMarkup(
@@ -170,6 +185,8 @@ test("Pi card exposes detected, enabled, and error states", () => {
     );
     assert.match(markup, />Pi</);
     assert.match(markup, new RegExp(expectedClass));
+    assert.match(markup, expectedCopy);
+    assert.doesNotMatch(markup, /Quill assets not installed/);
   }
 });
 

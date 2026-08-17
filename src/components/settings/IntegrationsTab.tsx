@@ -589,7 +589,7 @@ function IntegrationsTab({ integrations, features }: IntegrationsTabProps) {
                   ? "Auto-deployment pending; click to run."
                   : state.tone === "na"
                     ? "Provider CLI not detected on this machine."
-                    : "Provider detected; Quill assets not installed.";
+                    : "Provider CLI detected; Quill integration disabled or not configured.";
           return (
             <SettingRow
               key={status.provider}
