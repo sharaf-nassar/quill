@@ -2076,7 +2076,7 @@ Transcript source discovery is deliberately untouched: `~/.claude/`, `~/.codex/`
 
 A dev run must also be able to sit beside a running production install without fighting it for a port, a config file, or a provider.
 
-[[src-tauri/src/data_paths.rs#identity_namespace]] is the single discriminator — the same recorded identity the data paths use, never a second environment detector — and returns `None` for `PRODUCTION_IDENTIFIER`, so every production default below is byte-identical.
+[[src-tauri/src/data_paths.rs#namespace_for]] is the single discriminator — the same recorded identity the data paths use, never a second environment detector — and returns `None` for `PRODUCTION_IDENTIFIER`, so every production default below is byte-identical.
 
 Listeners: [[src-tauri/src/integrations/config_contract.rs#default_ports_for]] keeps production on 19876/19877 and gives any other identity 19878/19879. Sharing them would make whichever process starts second fail its bind, and a provider pointed at the shared port would reach whichever won the race. `QUILL_PORT` and `QUILL_CONTEXT_PORT` still override both, because a maintainer who names a port means it.
 

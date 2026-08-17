@@ -57,12 +57,8 @@ pub fn app_identifier() -> &'static str {
 /// otherwise collide with a running production instance — the loopback
 /// listener ports, `~/.config/quill/`, and the provider-facing auth contract
 /// underneath it — keys off this and stays byte-identical in production.
-pub fn identity_namespace() -> Option<&'static str> {
-    namespace_for(app_identifier())
-}
-
-/// [`identity_namespace`] for an explicit identity. Tests use this because
-/// the process identity is a write-once global.
+///
+/// Tests use this directly because the process identity is a write-once global.
 pub fn namespace_for(identifier: &str) -> Option<&str> {
     if identifier == PRODUCTION_IDENTIFIER {
         return None;
