@@ -1169,10 +1169,7 @@ fn detect_codex_home() -> bool {
 }
 
 fn quill_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config")
-        .join("quill")
+    crate::data_paths::quill_config_dir()
 }
 
 fn provider_root() -> PathBuf {

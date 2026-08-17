@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build && npm run verify:sentry-output",
     "test": "node --test \"scripts/*.test.mjs\"",
+    "test:dev-isolation": "node scripts/dev-runtime-isolation.mjs",
     "preview": "vite preview",
     "tauri": "node scripts/tauri.mjs",
     "typecheck": "tsc --noEmit",

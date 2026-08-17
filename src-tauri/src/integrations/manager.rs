@@ -86,6 +86,23 @@ fn demo_mode_active() -> bool {
     std::env::var("QUILL_DEMO_MODE").ok().as_deref() == Some("1")
 }
 
+/// Provider roots (`~/.claude`, `~/.codex`, `~/.pi`) are the agents'
+/// directories, not Quill's, so a dev run shares them with the installed app.
+/// Startup repair and continuity retirement rewrite assets there to point at
+/// the running Quill's paths, which under a dev identity would redirect the
+/// installed app's providers at dev's ports, contract, and context store.
+/// `QUILL_DEV_INTEGRATIONS=1` opts a dev run into exercising those flows.
+fn provider_writes_allowed() -> bool {
+    provider_writes_allowed_for(
+        crate::data_paths::app_identifier(),
+        std::env::var("QUILL_DEV_INTEGRATIONS").ok().as_deref() == Some("1"),
+    )
+}
+
+fn provider_writes_allowed_for(identifier: &str, dev_integrations: bool) -> bool {
+    crate::data_paths::namespace_for(identifier).is_none() || dev_integrations
+}
+
 // Legacy per-provider brevity keys that pre-date the consolidated global flag.
 // On first read after upgrade, any value of `true` here promotes the global
 // brevity feature to ON so existing users do not silently lose their setting.
@@ -336,7 +353,7 @@ fn should_remove_shared_config(statuses: &[ProviderStatus]) -> bool {
 }
 
 pub fn startup_refresh(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
-    if demo_mode_active() {
+    if demo_mode_active() || !provider_writes_allowed() {
         return startup_refresh_unlocked(app, false);
     }
 
@@ -381,7 +398,7 @@ fn retire_continuity(storage: &Storage) -> Result<(), String> {
 /// their shell config or installed a CLI and wants Quill to pick it up
 /// without restarting.
 pub fn force_rescan(app: &AppHandle) -> Result<Vec<ProviderStatus>, String> {
-    if demo_mode_active() {
+    if demo_mode_active() || !provider_writes_allowed() {
         crate::config::refresh_shell_path();
         return startup_refresh_unlocked(app, false);
     }
@@ -787,6 +804,17 @@ fn emit_context_preservation_status(app: &AppHandle, status: &ContextPreservatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn development_startup_provider_writes_require_an_explicit_opt_in() {
+        let production = crate::data_paths::PRODUCTION_IDENTIFIER;
+        let development = format!("{production}.dev");
+
+        assert!(provider_writes_allowed_for(production, false));
+        assert!(!provider_writes_allowed_for(&development, false));
+        assert!(provider_writes_allowed_for(&development, true));
+    }
     use tempfile::TempDir;
 
     // @lat: [[pi-integrations-ui-tests#Pi Integrations UI Tests#Extension health state machine]]

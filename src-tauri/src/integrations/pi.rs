@@ -579,9 +579,7 @@ fn load_state(path: &Path) -> Result<Option<PiIntegrationState>, String> {
 }
 
 fn quill_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config/quill")
+    crate::data_paths::quill_config_dir()
 }
 
 fn provider_root() -> PathBuf {

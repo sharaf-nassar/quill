@@ -50,6 +50,58 @@ pub fn app_identifier() -> &'static str {
     APP_IDENTIFIER.get().map_or(PRODUCTION_IDENTIFIER, |id| id)
 }
 
+/// The namespace a non-production identity gives its Quill-owned runtime
+/// state, or `None` for the installed app.
+///
+/// This is the single environment discriminator: everything that would
+/// otherwise collide with a running production instance — the loopback
+/// listener ports, `~/.config/quill/`, and the provider-facing auth contract
+/// underneath it — keys off this and stays byte-identical in production.
+pub fn identity_namespace() -> Option<&'static str> {
+    namespace_for(app_identifier())
+}
+
+/// [`identity_namespace`] for an explicit identity. Tests use this because
+/// the process identity is a write-once global.
+pub fn namespace_for(identifier: &str) -> Option<&str> {
+    if identifier == PRODUCTION_IDENTIFIER {
+        return None;
+    }
+    Some(
+        identifier
+            .strip_prefix(PRODUCTION_IDENTIFIER)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+            .filter(|suffix| !suffix.is_empty())
+            .unwrap_or(identifier),
+    )
+}
+
+/// The `quill` directory name Quill's own config, context, and cache roots
+/// use: `quill` in production, `quill-dev` under a dev identity.
+pub fn quill_dir_name() -> String {
+    quill_dir_name_for(app_identifier())
+}
+
+/// [`quill_dir_name`] for an explicit identity.
+pub fn quill_dir_name_for(identifier: &str) -> String {
+    match namespace_for(identifier) {
+        None => "quill".to_string(),
+        Some(namespace) => format!("quill-{namespace}"),
+    }
+}
+
+/// `~/.config/quill/`, namespaced for a non-production identity.
+///
+/// Every Quill-owned file under this root — the shared provider contract,
+/// the context store, deployment staging, the Pi spool — relocates with the
+/// identity, so a dev run neither reads nor rewrites the installed app's.
+pub fn quill_config_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".config")
+        .join(quill_dir_name())
+}
+
 /// Platform-aware app-data directory for an explicit identity.
 fn app_data_dir_for(identifier: &str) -> Option<PathBuf> {
     dirs::data_local_dir()
@@ -415,6 +467,22 @@ mod tests {
         for leaf in ["usage.db", "auth_secret", "session-index"] {
             assert_ne!(prod.join(leaf), dev.join(leaf), "{leaf} must not be shared");
         }
+    }
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn quill_owned_roots_are_namespaced_only_off_production() {
+        assert_eq!(namespace_for(PRODUCTION_IDENTIFIER), None);
+        assert_eq!(quill_dir_name_for(PRODUCTION_IDENTIFIER), "quill");
+
+        let dev = format!("{PRODUCTION_IDENTIFIER}.dev");
+        assert_eq!(namespace_for(&dev), Some("dev"));
+        assert_eq!(quill_dir_name_for(&dev), "quill-dev");
+
+        // An identity that is not a production suffix still gets its own
+        // namespace rather than silently sharing production's.
+        assert_eq!(namespace_for("org.example.fork"), Some("org.example.fork"));
+        assert_ne!(quill_dir_name_for("org.example.fork"), "quill");
     }
 
     // @lat: [[infrastructure#Infrastructure#Build Configuration#Tauri Configuration#Development Identity]]

@@ -74,7 +74,10 @@ pub(crate) fn purge_continuity_artifacts_at(
 
 pub(crate) fn default_config_dir() -> Result<PathBuf, String> {
     dirs::home_dir()
-        .map(|home| home.join(".config/quill"))
+        .map(|home| {
+            home.join(".config")
+                .join(crate::data_paths::quill_dir_name())
+        })
         .ok_or_else(|| "Cannot retire session context without a home directory".to_string())
 }
 

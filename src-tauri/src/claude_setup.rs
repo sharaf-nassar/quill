@@ -13,12 +13,9 @@ use tauri::Manager;
 
 // ── Path helpers ──
 
-/// Returns ~/.config/quill/.
+/// Returns ~/.config/quill/, namespaced for a non-production identity.
 fn config_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config")
-        .join("quill")
+    crate::data_paths::quill_config_dir()
 }
 
 const INTEGRATION_STATE_VERSION: u8 = 1;

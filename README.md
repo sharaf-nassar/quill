@@ -272,6 +272,15 @@ This loads `src-tauri/tauri.dev.conf.json`, so a dev run identifies as
 and single-instance lock separate from an installed Quill. Invoking the Tauri
 CLI directly (`cargo tauri dev`) skips that and writes to production state.
 
+That identity also moves the runtime endpoints, so a dev run can sit beside a
+running install: it listens on 19878/19879 instead of 19876/19877, keeps its
+config and context store under `~/.config/quill-dev/`, keeps app caches under
+its identity-specific data root, and skips startup provider repair that would
+otherwise re-point `~/.claude/`,
+`~/.codex/`, and `~/.pi/` at the dev build. `QUILL_PORT` and
+`QUILL_CONTEXT_PORT` still override the ports; `QUILL_DEV_INTEGRATIONS=1` opts
+a dev run back into provider installs.
+
 ## Controls
 
 - **Drag the titlebar** to move the widget; **drag any edge or corner** to resize it (floor 320×200, no ceiling) — both position and size are remembered

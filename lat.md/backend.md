@@ -2068,9 +2068,23 @@ A dev build's writes must never land in the installed app's data directory.
 
 [[src-tauri/src/lib.rs#run]] records `context.config().identifier` through [[src-tauri/src/data_paths.rs#set_app_identifier]] immediately after `generate_context!()` and before any plugin, storage, auth, or session-index resolution — a later call would leave earlier resolutions pointing at the production install. A process that never records one (unit tests, `quill --init-database`) resolves `PRODUCTION_IDENTIFIER`, so production paths are unchanged. The dev identifier itself comes from config, not `debug_assertions`, so `tauri dev --release` stays isolated; see [[infrastructure#Infrastructure#Build Configuration#Tauri Configuration#Development Identity]].
 
-Transcript source discovery is deliberately untouched: `~/.claude/`, `~/.codex/`, and the Pi session root are the agents' directories, not Quill's, so a dev run still reads the same transcripts. `~/.config/quill/` and the HTTP port are likewise shared — runtime endpoint coexistence is a separate concern.
+Transcript source discovery is deliberately untouched: `~/.claude/`, `~/.codex/`, and the Pi session root are the agents' directories, not Quill's, so a dev run still reads the same transcripts.
 
 `only_data_paths_knows_the_production_identifier` scans `src-tauri/src` and fails if any module outside `data_paths.rs` hardcodes the production identifier, because a second copy would silently keep writing to the installed app's directory while everything else relocated.
+
+### Development runtime isolation
+
+A dev run must also be able to sit beside a running production install without fighting it for a port, a config file, or a provider.
+
+[[src-tauri/src/data_paths.rs#identity_namespace]] is the single discriminator — the same recorded identity the data paths use, never a second environment detector — and returns `None` for `PRODUCTION_IDENTIFIER`, so every production default below is byte-identical.
+
+Listeners: [[src-tauri/src/integrations/config_contract.rs#default_ports_for]] keeps production on 19876/19877 and gives any other identity 19878/19879. Sharing them would make whichever process starts second fail its bind, and a provider pointed at the shared port would reach whichever won the race. `QUILL_PORT` and `QUILL_CONTEXT_PORT` still override both, because a maintainer who names a port means it.
+
+Paths: [[src-tauri/src/data_paths.rs#quill_dir_name]] namespaces the `quill` leaf (`quill` → `quill-dev`) and [[src-tauri/src/data_paths.rs#quill_config_dir]] is the one root `claude_setup`, `codex`, `pi`, `retirement`, the shared config contract, the context store, and the Pi spool all derive from. `learning.rs` uses the same leaf name under `dirs::config_dir()`, which differs from `~/.config` on macOS and must keep doing so. One relocation therefore moves the whole config/context writable set. Tauri's app cache already hangs under the identity-specific app-data root, so the installed app's `~/.config/quill/config.json`, `context/context.db`, `~/.cache/quill/`, and app cache stay untouched.
+
+Provider roots stay production's. `~/.claude/`, `~/.codex/`, and `~/.pi/` belong to the agents, and startup repair rewrites assets there to point at the running Quill — under a dev identity that would redirect the installed app's providers at dev's ports and contract. [[src-tauri/src/integrations/manager.rs#provider_writes_allowed]] therefore drops `startup_refresh` and `force_rescan` to the same read-only path demo mode uses, skipping repair, deployment, and continuity retirement. `QUILL_DEV_INTEGRATIONS=1` opts a dev run back in when the integration flows themselves are what is under test.
+
+`scripts/dev-runtime-isolation.mjs` (`npm run test:dev-isolation`) is the live regression: it builds both identities, runs them together under one throwaway `HOME`, one Xvfb display, and one session bus, assigns four kernel-selected ports through the public overrides so it can coexist with a real Quill, and asserts both stay alive on distinct listeners with their own auth secrets, context stores, and app cache roots while every production-owned hash and mtime — contract, context store, `~/.cache/quill/`, and provider assets — is unchanged. Focused Rust tests separately pin the production/dev default pairs and override precedence. It is not in `npm test` because it builds two binaries.
 
 ### Demo-mode path override
 

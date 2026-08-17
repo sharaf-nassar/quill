@@ -177,9 +177,7 @@ pub async fn start_server(
         .flatten()
         .is_some_and(|value| value == "true");
     let context_port = crate::integrations::config_contract::context_port();
-    let context_db = dirs::home_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join(".config/quill/context/context.db");
+    let context_db = crate::data_paths::quill_config_dir().join("context/context.db");
     let allowed_roots = [dirs::home_dir(), Some(std::env::temp_dir())]
         .into_iter()
         .flatten()

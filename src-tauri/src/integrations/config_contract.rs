@@ -5,13 +5,30 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const DEFAULT_MAIN_PORT: u16 = 19876;
 pub(crate) const DEFAULT_CONTEXT_PORT: u16 = 19877;
+// A non-production identity defaults to its own loopback pair: sharing
+// production's would make whichever process starts second fail its bind, and
+// a provider pointed at the shared port would reach whichever won.
+pub(crate) const DEV_MAIN_PORT: u16 = 19878;
+pub(crate) const DEV_CONTEXT_PORT: u16 = 19879;
+
+/// The `(main, context)` listener defaults for an identity. Production keeps
+/// 19876/19877; anything else answers on its own pair.
+pub(crate) fn default_ports_for(identifier: &str) -> (u16, u16) {
+    if crate::data_paths::namespace_for(identifier).is_some() {
+        (DEV_MAIN_PORT, DEV_CONTEXT_PORT)
+    } else {
+        (DEFAULT_MAIN_PORT, DEFAULT_CONTEXT_PORT)
+    }
+}
 
 pub(crate) fn main_port() -> u16 {
-    configured_port("QUILL_PORT", DEFAULT_MAIN_PORT)
+    let (main, _) = default_ports_for(crate::data_paths::app_identifier());
+    configured_port("QUILL_PORT", main)
 }
 
 pub(crate) fn context_port() -> u16 {
-    configured_port("QUILL_CONTEXT_PORT", DEFAULT_CONTEXT_PORT)
+    let (_, context) = default_ports_for(crate::data_paths::app_identifier());
+    configured_port("QUILL_CONTEXT_PORT", context)
 }
 
 fn configured_port(name: &str, default: u16) -> u16 {
@@ -22,9 +39,7 @@ fn configured_port(name: &str, default: u16) -> u16 {
 }
 
 pub(crate) fn config_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".config/quill/config.json")
+    crate::data_paths::quill_config_dir().join("config.json")
 }
 
 pub(crate) fn auth_secret_path() -> PathBuf {
@@ -166,7 +181,82 @@ fn is_loopback_url(raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_paths::PRODUCTION_IDENTIFIER;
+    use serial_test::serial;
     use std::fs;
+
+    fn set_env(name: &str, value: &str) {
+        // SAFETY: serialized by #[serial]; no other thread reads these here.
+        unsafe { std::env::set_var(name, value) }
+    }
+
+    fn clear_port_env() {
+        unsafe {
+            std::env::remove_var("QUILL_PORT");
+            std::env::remove_var("QUILL_CONTEXT_PORT");
+        }
+    }
+
+    /// Composed rather than written out so `data_paths.rs` stays the only
+    /// module that spells the production identifier.
+    fn dev_identity() -> String {
+        format!("{PRODUCTION_IDENTIFIER}.dev")
+    }
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn production_keeps_the_published_listener_pair() {
+        assert_eq!(default_ports_for(PRODUCTION_IDENTIFIER), (19876, 19877));
+    }
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn a_development_identity_defaults_to_its_own_listener_pair() {
+        let (main, context) = default_ports_for(&dev_identity());
+        let (prod_main, prod_context) = default_ports_for(PRODUCTION_IDENTIFIER);
+
+        assert_eq!((main, context), (19878, 19879));
+        assert_ne!(main, prod_main);
+        assert_ne!(context, prod_context);
+        assert_ne!(
+            main, prod_context,
+            "dev must not squat production's context"
+        );
+        assert_ne!(context, prod_main);
+    }
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    #[serial]
+    fn explicit_port_overrides_beat_both_identity_defaults() {
+        clear_port_env();
+        assert_eq!(main_port(), 19876);
+        assert_eq!(context_port(), 19877);
+
+        set_env("QUILL_PORT", "31876");
+        set_env("QUILL_CONTEXT_PORT", "31877");
+        assert_eq!(main_port(), 31876);
+        assert_eq!(context_port(), 31877);
+
+        set_env("QUILL_PORT", "not-a-port");
+        assert_eq!(main_port(), 19876, "a malformed override falls back");
+        clear_port_env();
+    }
+
+    // @lat: [[backend#Backend#Data Paths#Development runtime isolation]]
+    #[test]
+    fn the_shared_contract_relocates_with_the_identity() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(
+            config_path(),
+            home.join(".config/quill/config.json"),
+            "production contract path is unchanged"
+        );
+        assert_eq!(
+            crate::data_paths::quill_dir_name_for(&dev_identity()),
+            "quill-dev"
+        );
+    }
 
     // @lat: [[pi-lifecycle-tests#Pi Lifecycle Test Specs#Full Shared Config Contract]]
     #[test]

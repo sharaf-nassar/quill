@@ -180,12 +180,13 @@ fn demo_mode_active() -> bool {
 
 /// Production root for non-Claude learned rules: `~/.config/quill/learned-rules/`.
 /// Used only when demo mode is off; demo mode routes everything through
-/// `crate::data_paths::resolve_rules_dir()` instead.
+/// `crate::data_paths::resolve_rules_dir()` instead. A non-production identity
+/// namespaces the `quill` leaf so a dev run keeps its own learned rules.
 fn quill_rules_root() -> PathBuf {
     dirs::config_dir()
         .or_else(dirs::home_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("quill")
+        .join(crate::data_paths::quill_dir_name())
         .join("learned-rules")
 }
 
