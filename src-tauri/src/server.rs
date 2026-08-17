@@ -1548,15 +1548,15 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
             }
         }
 
-        let Some(idx) = state.session_index.clone() else {
-            let mut pending = state.pending_session_notifies.lock().unwrap();
-            pending.remove(&key);
-            return;
-        };
+        // A missing index no longer abandons the drain: Pi's tool and skill
+        // rows come only from this parse, and Session Search failing to open
+        // must not also cost Pi its analytics.
+        let idx = state.session_index.clone();
 
         let app_handle = state.app_handle.clone();
+        let storage = state.storage;
         match tokio::task::spawn_blocking(move || {
-            process_session_notify_payload(app_handle, idx, payload)
+            process_session_notify_payload(app_handle, storage, idx, payload)
         })
         .await
         {
@@ -1585,16 +1585,18 @@ async fn drain_session_notify_queue(state: Arc<ServerState>, key: String) {
 
 fn process_session_notify_payload(
     app_handle: tauri::AppHandle,
-    session_index: Arc<sessions::SessionIndex>,
+    storage: &'static Storage,
+    session_index: Option<Arc<sessions::SessionIndex>>,
     payload: SessionNotifyPayload,
 ) -> Result<usize, String> {
-    let count = index_session_notify_payload(&session_index, payload)?;
+    let count = index_session_notify_payload(storage, session_index.as_deref(), payload)?;
     let _ = app_handle.emit("sessions-index-updated", count);
     Ok(count)
 }
 
 fn index_session_notify_payload(
-    session_index: &sessions::SessionIndex,
+    storage: &Storage,
+    session_index: Option<&sessions::SessionIndex>,
     payload: SessionNotifyPayload,
 ) -> Result<usize, String> {
     let path = PathBuf::from(&payload.jsonl_path);
@@ -1654,6 +1656,27 @@ fn index_session_notify_payload(
             extracted.session_id.clone()
         };
 
+    // Pi's tool and skill rows have no other producer: it never reaches
+    // retained transcript analytics, and the pushed live path deliberately
+    // carries no tool payloads, so this parse is the only place that evidence
+    // exists. Search indexing stays authoritative for the response — a
+    // persistence failure is logged rather than raised, because it must not
+    // cost the session its search documents.
+    if payload.provider == IntegrationProvider::Pi {
+        let (tool_actions, skill_usages) =
+            sessions::pi_transcript_tool_rows(&session_id, &host, &extracted.messages);
+        if let Err(error) = storage.replace_pi_transcript_tool_rows(
+            &crate::storage::pi_live_source_key(&session_id),
+            &tool_actions,
+            &skill_usages,
+        ) {
+            log::error!("Failed to persist Pi transcript tool rows: {error}");
+        }
+    }
+
+    let Some(session_index) = session_index else {
+        return Ok(0);
+    };
     let count = session_index.replace_session_docs_batch(
         payload.provider,
         &session_id,
@@ -2484,7 +2507,11 @@ async fn post_session_notify(
         enqueue_validated_retained_source(&state, source);
     }
 
-    if state.session_index.is_none() {
+    // Pi is the one provider whose `tool_actions` and `skill_usages` exist
+    // nowhere but this parse, so an unopenable index must not turn its notify
+    // away. Claude and Codex own those rows through retained analytics and
+    // have nothing left to do here without an index.
+    if state.session_index.is_none() && provider != IntegrationProvider::Pi {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Session index not available".to_string(),
@@ -2730,7 +2757,14 @@ async fn get_session_search(
         tokio::task::block_in_place(|| idx.search(&query, &filters, &sort_by, page, page_size));
 
     match result {
-        Ok(results) => (StatusCode::OK, Json(serde_json::json!(results))),
+        Ok(results) => {
+            let body = if params.get("view").is_some_and(|view| view == "compact") {
+                results.compact_for_ai(sessions::COMPACT_SEARCH_MAX_BYTES)
+            } else {
+                serde_json::json!(results)
+            };
+            (StatusCode::OK, Json(body))
+        }
         Err(e) => {
             log::error!("Session search error: {e}");
             (
@@ -3050,7 +3084,11 @@ mod observed_subagent_tests {
             }),
         };
 
-        assert_eq!(index_session_notify_payload(&index, payload).unwrap(), 1);
+        let storage = Storage::init_at(temp.path().join("usage.db"), false).unwrap();
+        assert_eq!(
+            index_session_notify_payload(&storage, Some(&index), payload).unwrap(),
+            1
+        );
         index.reader.reload().expect("reload index");
         let result = index
             .search(
@@ -3070,6 +3108,64 @@ mod observed_subagent_tests {
             result.hits[0].parent_session_id.as_deref(),
             Some("pushed-parent")
         );
+    }
+
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Notify Tool And Skill Rows]]
+    #[test]
+    #[serial_test::serial]
+    fn pi_notify_persists_tool_actions_with_line_counts_and_skill_reads() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let transcript = temp.path().join("tools.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"session","version":3,"id":"header-id","timestamp":"2026-08-14T08:00:00Z","cwd":"/work/quill"}"#,
+                "\n",
+                r#"{"type":"message","id":"asst-1","parentId":null,"timestamp":"2026-08-14T08:00:01Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-edit","name":"edit","arguments":{"path":"/work/quill/a.rs","edits":[{"oldText":"one\ntwo","newText":"uno\ndos\ntres"}]}}]}}"#,
+                "\n",
+                r#"{"type":"message","id":"asst-2","parentId":"asst-1","timestamp":"2026-08-14T08:00:02Z","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-read","name":"read","arguments":{"path":"/home/u/.agents/skills/unslop/SKILL.md"}}]}}"#,
+                "\n",
+            ),
+        )
+        .expect("write Pi transcript");
+        let index =
+            sessions::SessionIndex::open_or_create(&temp.path().join("index")).expect("open index");
+        let storage = Storage::init_at(temp.path().join("usage.db"), false).unwrap();
+        let payload = SessionNotifyPayload {
+            provider: IntegrationProvider::Pi,
+            session_id: "pushed-id".into(),
+            jsonl_path: transcript.to_string_lossy().into_owned(),
+            host: Some("host".into()),
+            cwd: Some("/work/quill".into()),
+            project: Some("quill".into()),
+            git_branch: None,
+            lineage: None,
+        };
+
+        index_session_notify_payload(&storage, Some(&index), payload.clone())
+            .expect("first notify");
+        // Pi re-notifies the same transcript on every turn end, so the whole
+        // parse must land as a replacement rather than accumulate duplicates.
+        // The second pass also runs with no index at all: Session Search
+        // failing to open must not cost Pi its analytics rows.
+        index_session_notify_payload(&storage, None, payload).expect("repeat notify");
+
+        // Assert through the readers that were empty for Pi, not the rows:
+        // `get_code_stats` is what backs the lines-changed readouts, and the
+        // repeat notify above must not double the counts.
+        let stats = crate::storage::with_pinned_query_now(
+            "2026-08-14T09:00:00Z".parse().expect("pinned now"),
+            || storage.get_code_stats("24h").expect("Pi code stats"),
+        );
+        assert_eq!((stats.lines_added, stats.lines_removed), (3, 2));
+        assert_eq!(stats.net_change, 1);
+
+        let skills = storage
+            .get_skill_breakdown("all", Some(IntegrationProvider::Pi), true, None)
+            .expect("Pi skill breakdown");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].skill_name, "unslop");
+        assert_eq!(skills[0].pi_count, 1);
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Configured Root Containment]]

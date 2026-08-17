@@ -21,6 +21,7 @@ const CLAUDE_SOURCE_ROOT_KEY: &str = "claude:projects";
 const CODEX_SOURCE_ROOT_KEY: &str = "codex:sessions";
 const PI_SOURCE_ROOT_KEY: &str = "pi:sessions";
 const ROOT_DIAGNOSTIC_MAX_CHARS: usize = 240;
+pub const COMPACT_SEARCH_MAX_BYTES: usize = 32 * 1024;
 
 /// One provider-owned filesystem root that may contain retained transcripts.
 ///
@@ -1032,6 +1033,9 @@ pub struct IndexState {
     /// Provider-native session id last extracted from each indexed file.
     #[serde(default)]
     file_session_ids: HashMap<String, String>,
+    /// One-time in-place removal of legacy Pi tool-result/custom-role documents.
+    #[serde(default)]
+    pi_conversation_cleanup_complete: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,14 +1099,61 @@ impl SessionIndex {
 
         let _ = std::fs::write(&version_path, Self::SCHEMA_VERSION.to_string());
 
-        Ok(Self {
+        let session_index = Self {
             index,
             fields,
             writer: Arc::new(Mutex::new(writer)),
             reader,
             index_dir: index_dir.to_path_buf(),
             state: Mutex::new(state),
-        })
+        };
+        session_index.cleanup_legacy_pi_non_conversation_documents()?;
+        Ok(session_index)
+    }
+
+    fn cleanup_legacy_pi_non_conversation_documents(&self) -> Result<(), String> {
+        if self.state.lock().unwrap().pi_conversation_cleanup_complete {
+            return Ok(());
+        }
+
+        let legacy_pi_roles = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.provider, IntegrationProvider::Pi.as_str()),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.role, "user"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+            (
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.role, "assistant"),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+
+        {
+            let mut writer = self.writer.lock().unwrap();
+            writer
+                .delete_query(Box::new(legacy_pi_roles))
+                .map_err(|error| format!("Delete legacy Pi search documents: {error}"))?;
+            writer
+                .commit()
+                .map_err(|error| format!("Commit legacy Pi search cleanup: {error}"))?;
+        }
+        self.reader
+            .reload()
+            .map_err(|error| format!("Reload legacy Pi search cleanup: {error}"))?;
+        self.state.lock().unwrap().pi_conversation_cleanup_complete = true;
+        self.save_state()
     }
 
     /// Build the Tantivy schema.
@@ -1874,6 +1925,36 @@ impl SessionIndex {
         // Combine with filter clauses via BooleanQuery
         let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> =
             vec![(Occur::Must, text_query)];
+        let non_pi = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(tantivy::query::AllQuery)),
+            (
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(f.provider, IntegrationProvider::Pi.as_str()),
+                    IndexRecordOption::Basic,
+                )),
+            ),
+        ]);
+        clauses.push((
+            Occur::Must,
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Should, Box::new(non_pi)),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.role, "user"),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.role, "assistant"),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ])),
+        ));
 
         // Project facet filter
         if let Some(ref proj) = filters.project {
@@ -2245,6 +2326,54 @@ pub struct SearchResults {
     pub hits: Vec<SearchHit>,
     pub total_hits: u64,
     pub query_time_ms: u64,
+}
+
+impl SearchResults {
+    pub fn compact_for_ai(&self, max_bytes: usize) -> serde_json::Value {
+        let mut hits = Vec::new();
+        let mut truncated_response = false;
+
+        // ponytail: page size is capped at 100; use incremental accounting if it grows.
+        for hit in &self.hits {
+            hits.push(serde_json::json!({
+                "provider": hit.provider,
+                "message_id": truncate(&hit.message_id, 512),
+                "session_id": truncate(&hit.session_id, 512),
+                "parent_session_id": hit
+                    .parent_session_id
+                    .as_deref()
+                    .map(|value| truncate(value, 512)),
+                "snippet": truncate(&hit.snippet, 2_048),
+                "role": truncate(&hit.role, 32),
+                "project": truncate(&hit.project, 512),
+                "host": truncate(&hit.host, 512),
+                "timestamp": truncate(&hit.timestamp, 64),
+                "git_branch": truncate(&hit.git_branch, 512),
+                "score": hit.score,
+            }));
+            let candidate = serde_json::json!({
+                "hits": &hits,
+                "total_hits": self.total_hits,
+                "query_time_ms": self.query_time_ms,
+                "truncated": false,
+            });
+            if serde_json::to_vec(&candidate).is_ok_and(|encoded| encoded.len() > max_bytes) {
+                hits.pop();
+                truncated_response = true;
+                break;
+            }
+        }
+
+        if hits.len() < self.hits.len() {
+            truncated_response = true;
+        }
+        serde_json::json!({
+            "hits": hits,
+            "total_hits": self.total_hits,
+            "query_time_ms": self.query_time_ms,
+            "truncated": truncated_response,
+        })
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -2852,8 +2981,11 @@ fn codex_custom_change_lines(tool_name: &str, input: &str) -> Option<(i64, i64)>
 pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<SkillAccess> {
     let mut paths = Vec::new();
 
+    // Pi names the same two tools in lowercase (`read`, `bash`) and has no
+    // `Skill` tool at all — a Pi skill is loaded by reading its SKILL.md, so
+    // the read arm is the only one that can ever attribute one.
     match action.tool_name.as_str() {
-        "Read" => {
+        "Read" | "read" => {
             if let Some(file_path) = action.file_path.as_deref() {
                 collect_skill_paths_from_text(file_path, &mut paths);
             }
@@ -2863,7 +2995,7 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
                 collect_skill_paths_from_text(&file_path, &mut paths);
             }
         }
-        "exec_command" => {
+        "exec_command" | "bash" => {
             if let Some(command) =
                 extract_tool_input_string(action.full_input.as_deref(), &["cmd", "command"])
                 && command_reads_skill_file(&command)
@@ -2899,6 +3031,80 @@ pub fn extract_skill_accesses_from_tool_action(action: &ToolAction) -> Vec<Skill
             }
         })
         .collect()
+}
+
+/// Build Pi's owned `tool_actions` and `skill_usages` rows from one notify
+/// parse.
+///
+/// Claude and Codex reach the identical row shape through
+/// `transcript_analytics::parse_transcript_analytics_source`, which Pi never
+/// enters. The action key, the skill fan-out and the ownership fields are
+/// kept deliberately identical to that builder so both paths dedupe against
+/// the same unique indexes. Pi has no sub-agent transcripts, so chain identity
+/// is flat: every row is the session's own.
+// @lat: [[data-flow#Session Indexing Pipeline#Enrichment]]
+pub(crate) fn pi_transcript_tool_rows(
+    session_id: &str,
+    hostname: &str,
+    messages: &[ExtractedMessage],
+) -> (
+    Vec<crate::transcript_analytics::OwnedToolAction>,
+    Vec<crate::transcript_analytics::OwnedSkillUsage>,
+) {
+    let source_key = crate::storage::pi_live_source_key(session_id);
+    let mut tool_actions = Vec::new();
+    let mut skill_usages = Vec::new();
+    for message in messages {
+        for action in &message.tool_actions {
+            let action_key = if action.tool_use_id.is_empty() {
+                if message.uuid.is_empty() {
+                    format!("record:{}:{}", action.source_ordinal, action.block_ordinal)
+                } else {
+                    format!("{}:{}", message.uuid, action.block_ordinal)
+                }
+            } else {
+                action.tool_use_id.clone()
+            };
+            for access in extract_skill_accesses_from_tool_action(action) {
+                skill_usages.push(crate::transcript_analytics::OwnedSkillUsage {
+                    provider: IntegrationProvider::Pi,
+                    source_key: source_key.clone(),
+                    session_id: session_id.to_owned(),
+                    chain_id: session_id.to_owned(),
+                    parent_chain_id: None,
+                    message_id: message.uuid.clone(),
+                    skill_name: access.skill_name,
+                    skill_path: access.skill_path,
+                    timestamp: action.timestamp.clone(),
+                    tool_name: action.tool_name.clone(),
+                    cwd: message.cwd.clone(),
+                    hostname: hostname.to_owned(),
+                });
+            }
+            tool_actions.push(crate::transcript_analytics::OwnedToolAction {
+                provider: IntegrationProvider::Pi,
+                source_key: source_key.clone(),
+                action_key,
+                message_id: message.uuid.clone(),
+                session_id: session_id.to_owned(),
+                chain_id: session_id.to_owned(),
+                parent_chain_id: None,
+                tool_name: action.tool_name.clone(),
+                category: action.category.clone(),
+                file_path: action.file_path.clone(),
+                summary: action.summary.clone(),
+                full_input: action.full_input.clone(),
+                full_output: action.full_output.clone(),
+                lines_added: action.lines_added,
+                lines_removed: action.lines_removed,
+                timestamp: action.timestamp.clone(),
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: message.parent_uuid.clone(),
+            });
+        }
+    }
+    (tool_actions, skill_usages)
 }
 
 /// Canonicalize a hook script command into a stable identity string used
@@ -3613,39 +3819,164 @@ fn extract_pi_messages(
         .and_then(|name| name.to_str())
         .map(str::to_owned);
     let mut seen = HashSet::new();
-    let messages = session
-        .entries
-        .into_iter()
-        .filter_map(|entry| {
-            if !seen.insert(entry.base.id.clone()) {
-                return None;
+    let mut messages: Vec<ExtractedMessage> = Vec::new();
+    let mut tool_use_map: HashMap<String, ToolUseEntry> = HashMap::new();
+
+    for (source_ordinal, entry) in session.entries.into_iter().enumerate() {
+        if !seen.insert(entry.base.id.clone()) {
+            continue;
+        }
+        let Some(role) = entry.message.get("role").and_then(|value| value.as_str()) else {
+            continue;
+        };
+
+        if role == "toolResult" {
+            let Some(tool_use_id) = entry
+                .message
+                .get("toolCallId")
+                .and_then(|value| value.as_str())
+            else {
+                continue;
+            };
+            let output = entry
+                .message
+                .get("content")
+                .map(pi_message_text)
+                .map(|value| truncate(&value, 10_240));
+            if let Some(tool_entry) = tool_use_map.get(tool_use_id)
+                && let Some(message) = messages.get_mut(tool_entry.message_idx)
+            {
+                if let Some(action) = message
+                    .tool_actions
+                    .iter_mut()
+                    .find(|action| action.tool_use_id == tool_use_id)
+                {
+                    action.full_output = output.clone();
+                }
+                if tool_entry.category == "command"
+                    && let Some(output) = &output
+                    && let Some(command) = message
+                        .commands_run
+                        .iter_mut()
+                        .find(|command| command.starts_with(&tool_entry.summary))
+                {
+                    *command = format!("{}\n{}", tool_entry.summary, truncate(output, 300));
+                }
             }
-            let role = entry.message.get("role")?.as_str()?.to_owned();
-            let content = pi_message_text(entry.message.get("content")?);
-            if content.trim().is_empty() {
-                return None;
+            continue;
+        }
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+
+        let content = entry
+            .message
+            .get("content")
+            .map(pi_message_text)
+            .unwrap_or_default();
+        let mut tools_used = Vec::new();
+        let mut files_modified = Vec::new();
+        let mut code_changes = Vec::new();
+        let mut commands_run = Vec::new();
+        let mut tool_details = Vec::new();
+        let mut tool_actions = Vec::new();
+
+        if role == "assistant"
+            && let Some(blocks) = entry
+                .message
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+        {
+            for (block_ordinal, block) in blocks.iter().enumerate() {
+                if block.get("type").and_then(|value| value.as_str()) != Some("toolCall") {
+                    continue;
+                }
+                let Some(tool_name) = block
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                else {
+                    continue;
+                };
+                let tool_use_id = block
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let input = block.get("arguments");
+                let (category, summary, file_path) = build_pi_tool_summary(tool_name, input);
+                let full_input = input.map(|value| truncate(&value.to_string(), 10_240));
+                let (lines_added, lines_removed) = pi_code_change_lines(tool_name, input)
+                    .map(|(added, removed)| (Some(added), Some(removed)))
+                    .unwrap_or((None, None));
+
+                tools_used.push(tool_name.to_string());
+                match category.as_str() {
+                    "code_change" => {
+                        code_changes.push(summary.clone());
+                        if let Some(path) = &file_path
+                            && !path.is_empty()
+                        {
+                            files_modified.push(path.clone());
+                        }
+                    }
+                    "command" => commands_run.push(summary.clone()),
+                    _ => tool_details.push(summary.clone()),
+                }
+                tool_actions.push(ToolAction {
+                    tool_use_id: tool_use_id.clone(),
+                    source_ordinal: source_ordinal as u64,
+                    block_ordinal,
+                    tool_name: tool_name.to_string(),
+                    category: category.clone(),
+                    file_path: file_path.clone(),
+                    summary: summary.clone(),
+                    full_input: full_input.clone(),
+                    full_output: None,
+                    lines_added,
+                    lines_removed,
+                    timestamp: entry.base.timestamp.clone(),
+                });
+                if !tool_use_id.is_empty() {
+                    tool_use_map.insert(
+                        tool_use_id,
+                        ToolUseEntry {
+                            tool_name: tool_name.to_string(),
+                            category,
+                            file_path,
+                            summary,
+                            full_input,
+                            timestamp: entry.base.timestamp.clone(),
+                            message_idx: messages.len(),
+                        },
+                    );
+                }
             }
-            Some(ExtractedMessage {
-                uuid: entry.base.id,
-                session_id: session_id.clone(),
-                parent_session_id: None,
-                role,
-                content,
-                timestamp: entry.base.timestamp,
-                git_branch: String::new(),
-                tools_used: Vec::new(),
-                files_modified: Vec::new(),
-                code_changes: Vec::new(),
-                commands_run: Vec::new(),
-                tool_details: Vec::new(),
-                tool_actions: Vec::new(),
-                is_sidechain: false,
-                agent_id: None,
-                parent_uuid: entry.base.parent_id,
-                cwd: Some(cwd.clone()),
-            })
-        })
-        .collect();
+        }
+
+        if content.trim().is_empty() && tool_actions.is_empty() {
+            continue;
+        }
+        messages.push(ExtractedMessage {
+            uuid: entry.base.id,
+            session_id: session_id.clone(),
+            parent_session_id: None,
+            role: role.to_string(),
+            content,
+            timestamp: entry.base.timestamp,
+            git_branch: String::new(),
+            tools_used,
+            files_modified,
+            code_changes,
+            commands_run,
+            tool_details,
+            tool_actions,
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: entry.base.parent_id,
+            cwd: Some(cwd.clone()),
+        });
+    }
 
     ExtractedSession {
         session_id,
@@ -3654,6 +3985,103 @@ fn extract_pi_messages(
         extraction_succeeded: true,
         events: Vec::new(),
         hook_invocations: Vec::new(),
+    }
+}
+
+fn build_pi_tool_summary(
+    tool_name: &str,
+    input: Option<&serde_json::Value>,
+) -> (String, String, Option<String>) {
+    let object = input.and_then(serde_json::Value::as_object);
+    let get_str = |key: &str| {
+        object
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let path = || {
+        ["path", "file_path"]
+            .into_iter()
+            .map(get_str)
+            .find(|value| !value.is_empty())
+            .unwrap_or_default()
+    };
+
+    match tool_name.to_ascii_lowercase().as_str() {
+        "bash" => (
+            "command".to_string(),
+            format!("$ {}", get_str("command")),
+            None,
+        ),
+        "write" => {
+            let path = path();
+            (
+                "code_change".to_string(),
+                format!("Write {path}: {}", truncate(&get_str("content"), 120)),
+                Some(path),
+            )
+        }
+        "edit" => {
+            let path = path();
+            let edit_count = object
+                .and_then(|value| value.get("edits"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(1);
+            (
+                "code_change".to_string(),
+                format!("Edit {path}: {edit_count} edits"),
+                Some(path),
+            )
+        }
+        "read" => {
+            let path = path();
+            (
+                "tool_detail".to_string(),
+                format!("Read {path}"),
+                Some(path),
+            )
+        }
+        "grep" => {
+            let target = path();
+            (
+                "tool_detail".to_string(),
+                format!("Grep \"{}\" in {target}", get_str("pattern")),
+                None,
+            )
+        }
+        "find" => (
+            "tool_detail".to_string(),
+            format!("Find \"{}\" in {}", get_str("pattern"), path()),
+            None,
+        ),
+        "ls" => ("tool_detail".to_string(), format!("List {}", path()), None),
+        _ => ("tool_detail".to_string(), tool_name.to_string(), None),
+    }
+}
+
+fn pi_code_change_lines(tool_name: &str, input: Option<&serde_json::Value>) -> Option<(i64, i64)> {
+    let object = input?.as_object()?;
+    match tool_name.to_ascii_lowercase().as_str() {
+        "write" => object
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(|content| (content.lines().count() as i64, 0)),
+        "edit" => {
+            let edits = object.get("edits")?.as_array()?;
+            let (mut added, mut removed) = (0, 0);
+            for edit in edits {
+                if let Some(value) = edit.get("newText").and_then(serde_json::Value::as_str) {
+                    added += value.lines().count() as i64;
+                }
+                if let Some(value) = edit.get("oldText").and_then(serde_json::Value::as_str) {
+                    removed += value.lines().count() as i64;
+                }
+            }
+            Some((added, removed))
+        }
+        _ => None,
     }
 }
 
@@ -5216,6 +5644,87 @@ mod tests {
         );
     }
 
+    // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Tool Result Correlation]]
+    #[test]
+    fn pi_tool_results_attach_to_assistant_actions_without_becoming_messages() {
+        let output = "x".repeat(12_000);
+        let transcript = [
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-tools",
+                "timestamp": "2026-08-14T08:00:00Z",
+                "cwd": "/work/quill"
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "message",
+                "id": "assistant-1",
+                "parentId": null,
+                "timestamp": "2026-08-14T08:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "running"},
+                        {
+                            "type": "toolCall",
+                            "id": "call-1",
+                            "name": "bash",
+                            "arguments": {"command": "printf hello"}
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "message",
+                "id": "result-1",
+                "parentId": "assistant-1",
+                "timestamp": "2026-08-14T08:00:02Z",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": "call-1",
+                    "toolName": "bash",
+                    "content": [{"type": "text", "text": output}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "message",
+                "id": "custom-1",
+                "parentId": "result-1",
+                "timestamp": "2026-08-14T08:00:03Z",
+                "message": {"role": "custom", "content": "do not index"}
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let extracted = extract_messages_from_jsonl_contents(
+            IntegrationProvider::Pi,
+            Path::new("session.jsonl"),
+            &transcript,
+        );
+
+        assert_eq!(extracted.messages.len(), 1);
+        let message = &extracted.messages[0];
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.content, "running");
+        assert_eq!(message.tools_used, vec!["bash"]);
+        assert_eq!(message.commands_run.len(), 1);
+        assert!(message.commands_run[0].starts_with("$ printf hello\n"));
+        assert!(message.commands_run[0].len() < 400);
+        assert_eq!(message.tool_actions.len(), 1);
+        let action = &message.tool_actions[0];
+        assert_eq!(action.category, "command");
+        assert!(
+            action
+                .full_output
+                .as_deref()
+                .is_some_and(|value| value.len() <= 10_256 && value.ends_with("... [truncated]"))
+        );
+    }
+
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Provider Safe Search]]
     #[test]
     fn pi_search_hits_and_facets_keep_provider_identity_and_metadata() {
@@ -5268,6 +5777,203 @@ mod tests {
                 .iter()
                 .any(|facet| { facet.name == "pi" && facet.count == 1 })
         );
+    }
+
+    // @lat: [[session-search-tests#Session Search Test Specs#Conversation Role Guard]]
+    #[test]
+    fn search_excludes_non_conversation_roles() {
+        let temp = TempDir::new().expect("tempdir");
+        let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+        let make_message = |uuid: &str, role: &str, content: &str| ExtractedMessage {
+            uuid: uuid.to_string(),
+            session_id: "roles".to_string(),
+            parent_session_id: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: "2026-08-14T08:00:01Z".to_string(),
+            git_branch: String::new(),
+            tools_used: Vec::new(),
+            files_modified: Vec::new(),
+            code_changes: Vec::new(),
+            commands_run: Vec::new(),
+            tool_details: Vec::new(),
+            tool_actions: Vec::new(),
+            is_sidechain: false,
+            agent_id: None,
+            parent_uuid: None,
+            cwd: None,
+        };
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Pi,
+                "roles",
+                "project",
+                "host",
+                &[
+                    make_message("user", "user", "conversation-needle"),
+                    make_message("result", "toolResult", "legacy-tool-result-needle"),
+                ],
+            )
+            .expect("index Pi messages");
+        index
+            .replace_session_docs_batch(
+                IntegrationProvider::Codex,
+                "roles",
+                "project",
+                "host",
+                &[make_message("collab", "reviewer", "codex-collab-needle")],
+            )
+            .expect("index Codex collaboration message");
+        index.reader.reload().expect("reload index");
+
+        assert_eq!(
+            index
+                .search(
+                    "legacy-tool-result-needle",
+                    &SearchFilters::default(),
+                    "relevance",
+                    0,
+                    10,
+                )
+                .expect("search legacy role")
+                .total_hits,
+            0
+        );
+        assert_eq!(
+            index
+                .search(
+                    "conversation-needle",
+                    &SearchFilters::default(),
+                    "relevance",
+                    0,
+                    10,
+                )
+                .expect("search conversation role")
+                .total_hits,
+            1
+        );
+        assert_eq!(
+            index
+                .search(
+                    "codex-collab-needle",
+                    &SearchFilters::default(),
+                    "relevance",
+                    0,
+                    10,
+                )
+                .expect("search Codex collaboration role")
+                .total_hits,
+            1
+        );
+    }
+
+    // @lat: [[session-search-tests#Session Search Test Specs#Legacy Pi Role Cleanup]]
+    #[test]
+    fn opening_index_removes_only_legacy_pi_non_conversation_documents() {
+        let temp = TempDir::new().expect("tempdir");
+        {
+            let index = SessionIndex::open_or_create(temp.path()).expect("open index");
+            let make_message = |uuid: &str, role: &str| ExtractedMessage {
+                uuid: uuid.to_string(),
+                session_id: uuid.to_string(),
+                parent_session_id: None,
+                role: role.to_string(),
+                content: uuid.to_string(),
+                timestamp: "2026-08-14T08:00:01Z".to_string(),
+                git_branch: String::new(),
+                tools_used: Vec::new(),
+                files_modified: Vec::new(),
+                code_changes: Vec::new(),
+                commands_run: Vec::new(),
+                tool_details: Vec::new(),
+                tool_actions: Vec::new(),
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+                cwd: None,
+            };
+            index
+                .replace_session_docs_batch(
+                    IntegrationProvider::Pi,
+                    "pi-user",
+                    "project",
+                    "host",
+                    &[make_message("pi-user", "user")],
+                )
+                .expect("index Pi user");
+            index
+                .replace_session_docs_batch(
+                    IntegrationProvider::Pi,
+                    "pi-result",
+                    "project",
+                    "host",
+                    &[make_message("pi-result", "toolResult")],
+                )
+                .expect("index Pi tool result");
+            index
+                .replace_session_docs_batch(
+                    IntegrationProvider::Claude,
+                    "claude-custom",
+                    "project",
+                    "host",
+                    &[make_message("claude-custom", "custom")],
+                )
+                .expect("index Claude custom role");
+        }
+        fs::write(
+            temp.path().join("index_state.json"),
+            r#"{"file_mtimes":{},"file_session_ids":{},"pi_conversation_cleanup_complete":false}"#,
+        )
+        .expect("reset cleanup state");
+
+        let index = SessionIndex::open_or_create(temp.path()).expect("reopen index");
+        let facets = index.get_facets().expect("facets");
+        let count = |provider: &str| {
+            facets
+                .providers
+                .iter()
+                .find(|facet| facet.name == provider)
+                .map(|facet| facet.count)
+        };
+        assert_eq!(count("pi"), Some(1));
+        assert_eq!(count("claude"), Some(1));
+    }
+
+    // @lat: [[session-search-tests#Session Search Test Specs#Compact AI Results]]
+    #[test]
+    fn compact_search_results_omit_content_and_obey_byte_budget() {
+        let hit = SearchHit {
+            provider: IntegrationProvider::Pi,
+            message_id: "message".to_string(),
+            session_id: "session".to_string(),
+            parent_session_id: None,
+            content: "raw-tool-output".repeat(10_000),
+            snippet: "matching snippet ".repeat(1_000),
+            role: "assistant".to_string(),
+            project: "quill".to_string(),
+            host: "host".to_string(),
+            timestamp: "2026-08-14T08:00:01Z".to_string(),
+            git_branch: "main".to_string(),
+            tools_used: "bash".to_string(),
+            files_modified: String::new(),
+            code_changes: String::new(),
+            commands_run: String::new(),
+            tool_details: String::new(),
+            score: 1.0,
+        };
+        let compact = SearchResults {
+            hits: vec![hit; 50],
+            total_hits: 50,
+            query_time_ms: 2,
+        }
+        .compact_for_ai(32 * 1024);
+        let encoded = serde_json::to_vec(&compact).expect("serialize compact search results");
+        let hits = compact["hits"].as_array().expect("compact hits");
+
+        assert!(encoded.len() <= 32 * 1024);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.get("content").is_none()));
+        assert_eq!(compact["truncated"], true);
     }
 
     // @lat: [[pi-notify-index-tests#Pi Notify Index Test Specs#Working Directory Filter]]

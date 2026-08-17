@@ -35,7 +35,7 @@ All endpoints require a Bearer token validated with constant-time comparison (`s
 Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 
 | Category | Limit |
-|----------|-------|
+| ---------- | ------- |
 | General | 100 req/min |
 | Observations | 500 req/min |
 | Context savings | 500 req/min |
@@ -51,7 +51,7 @@ Sliding window rate limiter with 60-second buckets. Limits per endpoint type:
 The HTTP API exposes 16 endpoints for token ingestion, context savings, learning observations, session indexing, hook telemetry, and Pi extension tracking.
 
 | Method | Route | Purpose |
-|--------|-------|---------|
+| -------- | ------- | --------- |
 | GET | `/api/v1/health` | Health check |
 | POST | `/api/v1/tokens` | Record token usage from hook scripts |
 | POST | `/api/v1/context-savings/events` | Store context savings events from hooks and MCP tools |
@@ -124,6 +124,7 @@ The frozen measurement in `specs/013-analytics-query-perf/vacuum-spike.md` recor
 The frozen proof in `specs/014-retention-pruning/eqp-index-drop-proof.md` established that SQLite uses the partial source-owned unique index after a redundant plain provider/source index is removed.
 
 Current regression tests extend that proof across all five transcript analytics tables and the bundled SQLite version. Each source-owned delete must report its `uidx_*_owned` seek and no table scan.
+
 ### Redundant provider/source index drop
 
 [[src-tauri/src/storage.rs#ensure_startup_indexes]] drops `idx_session_events_provider_source(provider, source_key)` on every open, because the partial `uidx_se_owned` already serves every statement that index existed for.
@@ -172,6 +173,7 @@ query change cannot silently trade the drop for a full table scan.
 The frozen measurement in `specs/014-retention-pruning/index-drop-measurement.md` records the storage benefit and maintenance cost of removing a redundant provider/source index.
 
 On the measured 7.55 GB database, the drop took 416 ms, dirtied 471 KiB of WAL, and reclaimed 727 MB after VACUUM. Production keeps the proven index removal; the one-off corpus utility is no longer shipped.
+
 ### Retention timing spike
 
 The frozen measurement in `specs/014-retention-pruning/retention-timing-spike.md` supplies the numeric budgets used by the retention delete engine and preflight.
@@ -208,6 +210,7 @@ Full numbers live in `specs/014-retention-pruning/retention-timing-spike.md`.
 Feature 020's frozen evidence records production-scale query timings, planner audits, and corrected rollup volume without keeping corpus tooling in the application crate.
 
 The immutable protocols and results remain in `specs/020-widget-query-perf/timing-measurement.md`. They established the current read-only connection settings, bounded planner analysis, raw/hybrid overview parity, and a conservative 1.856 GB annual model-rollup envelope.
+
 ### Database compaction
 
 [[src-tauri/src/lib.rs#compact_database]] exposes user-triggered SQLite compaction with observable progress and a structured, safe skip result.
@@ -238,6 +241,7 @@ statistics cannot change query semantics. Skipped preflight/VACUUM paths and
 retention-triggered compaction do not run ANALYZE.
 
 Frozen planner and timing evidence remains in `specs/020-widget-query-perf/`. Production keeps the verified bounded ANALYZE path without shipping its one-off trace and corpus audit machinery.
+
 #### Database Compaction Test Specs
 
 These specs pin the user-triggered maintenance result contract without needing
@@ -1160,7 +1164,7 @@ a search hit therefore survives the deletion of the rows behind its code stats,
 which is precisely the degradation
 [[frontend#Frontend#Components#Retention Degradation]] exists to state.
 
-- **tool_actions** — Tool invocation details behind `get_code_stats`, `get_batch_session_code_stats` and sub-agent discovery (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input. The code-stats queries select those persisted counters directly and conditionally project `full_input` only when either counter is NULL; these legacy rows keep the tolerant parser while migrated rows never materialize the payload. Retained transcript rows are committed only through source-owned snapshot replacement, and rows written that way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
+- **tool_actions** — Tool invocation details behind `get_code_stats`, `get_batch_session_code_stats` and sub-agent discovery (provider, message_id, session_id, tool_name, category, file_path, summary, full_input/output, plus `is_sidechain`, `agent_id`, and `parent_uuid` from migration 20, and nullable `lines_added`/`lines_removed` from migration 33). Indexed on provider/session, message_id, file_path, category, and the new provider+session+sidechain / provider+session+agent pairs. `full_input` is truncated to 10KB, so the `lines_added`/`lines_removed` counts for `code_change` rows are computed at ingest from the untruncated input. The code-stats queries select those persisted counters directly and conditionally project `full_input` only when either counter is NULL; these legacy rows keep the tolerant parser while migrated rows never materialize the payload. Retained transcript rows are committed through source-owned snapshot replacement, and Pi's through the narrower notify writer that stands in for it; rows written either way with `category = 'tool_detail'` carry NULL in both payload columns — see [[backend#Backend#Database#tool_detail payload carve-out]].
 - **response_times** — Assistant response latency per provider/session turn (provider, session_id, timestamp, response_secs, idle_secs, plus the same migration-20 `is_sidechain`/`agent_id`/`parent_uuid` triple). Unique on (provider, session_id, timestamp).
 
 #### Retention aggregates
@@ -1189,9 +1193,9 @@ Recognized `SKILL.md` loads derived during the same Session Indexing extraction 
 
 - **skill_usages** — One row per recognized skill load (provider, session_id, message_id, skill_name, skill_path, timestamp, tool_name, cwd, hostname). Unique on (provider, session_id, message_id, skill_name, skill_path, timestamp). Indexed on provider+timestamp, provider+session, skill+timestamp, and the migration-22 skill+cwd pair that powers per-project drilldowns. Migration 23 re-arms `skill_usage_reingest_pending` so historical sessions are replayed against the updated extractor without any schema change.
 
-[[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]] recognizes three ingest shapes: Codex `exec_command` calls that read a `SKILL.md` path with `cat`/`head`/`tail`/etc., Claude `Read` calls against a `SKILL.md` path, and Claude `Skill` tool calls. The `Skill` arm normalizes the `skill` input via [[src-tauri/src/sessions.rs#skill_access_from_skill_tool_input]] by stripping any `plugin:` prefix so Claude rows merge with Codex's bare folder names (e.g. Claude `superpowers:using-superpowers` collapses onto Codex `using-superpowers`), and synthesizes a `skill://<raw>` path that preserves the original identifier for forensic drilldowns without colliding with filesystem paths.
+[[src-tauri/src/sessions.rs#extract_skill_accesses_from_tool_action]] recognizes five ingest shapes: Codex `exec_command` calls that read a `SKILL.md` path with `cat`/`head`/`tail`/etc., Claude `Read` calls against a `SKILL.md` path, Claude `Skill` tool calls, and Pi's lowercase `read` and `bash` spellings of the first two. Pi has no `Skill` tool, so reading the file is the only way one of its skill loads is ever observable. The `Skill` arm normalizes the `skill` input via [[src-tauri/src/sessions.rs#skill_access_from_skill_tool_input]] by stripping any `plugin:` prefix so Claude rows merge with Codex's bare folder names (e.g. Claude `superpowers:using-superpowers` collapses onto Codex `using-superpowers`), and synthesizes a `skill://<raw>` path that preserves the original identifier for forensic drilldowns without colliding with filesystem paths.
 
-`cwd` and `hostname` are populated in source-owned snapshots: Claude pulls `cwd` from each record's top-level field, Codex threads session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and reconciliation captures the local hostname once per source. The HTTP message-ingest path leaves skill usage empty because its flattened payload has no tool-action detail.
+`cwd` and `hostname` are populated in source-owned snapshots: Claude pulls `cwd` from each record's top-level field, Codex threads session-level `cwd` through every tool message in [[src-tauri/src/sessions.rs#ExtractedMessage]], and reconciliation captures the local hostname once per source. Pi takes both from its notify payload instead, since it has no retained source to capture them from. The HTTP message-ingest path still leaves skill usage empty because its flattened payload has no tool-action detail — which is exactly why Pi's rows come from the notify parse rather than from the pushed messages.
 
 #### Hook Invocations
 
@@ -1264,6 +1268,10 @@ Reconciliation compares canonical source key/path and last-good status before re
 `replace_transcript_analytics_snapshot` replaces all five owned analytics tables and the source registry in one transaction; valid empty snapshots remove only that source, while suppression and any insert failure leave prior rows intact. Owned inserts use `INSERT OR IGNORE` through statements prepared once outside their loops, matching the source-less live paths — an owned identity is the table's own dedupe key, so a legitimate repeat must not roll back the whole five-table snapshot. Registry upserts advance `seen_generation`; stale prepared generations are rejected before owned rows change. Parse or identity conflicts retain last-good registry state. The `session_events` and `tool_actions` insert loops are additionally filtered by [[backend#Backend#Database#Insert-time watermark filtering]], which is what stops this delete-and-reinsert from resurrecting pruned history, and the `tool_actions` loop applies the [[backend#Backend#Database#tool_detail payload carve-out]] to the rows that do land.
 
 [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]] atomically writes runtime or hook rows with durable project, full-cwd, and host origin. Pi runtime rows use `live:pi:<session-id>`; other live rows remain source-less. Origin upserts preserve known fields with `COALESCE`; event rows require unique message UUID identity and use the incoming session as root and chain. Active and closed Pi runtime and response replay obey the retention watermark; accepted closed rows refold without accumulating hourly totals.
+
+Its response pairing reaches back into storage for Pi alone. Pi pushes one message per request, so a turn's prompt and reply arrive in different batches and a call-local pending slot pairs nothing; the reply instead recovers the newest `user_text` event in its chain that no completed turn has consumed, claimed once per batch so one prompt stays one turn.
+
+[[src-tauri/src/storage.rs#Storage#replace_pi_transcript_tool_rows]] is the second owned writer, narrowed to the two tables `replace_transcript_analytics_snapshot` would have written for Pi if Pi reached retained analytics at all. It replaces `tool_actions` and `skill_usages` under the same `live:pi:<session-id>` key, so both writers share the owned partial unique indexes rather than the source-less ones, and applies the same watermark filter and `tool_detail` carve-out. It deliberately does not touch the other three tables: `session_events` and `response_times` share that key but belong to the pushed path, whose ephemeral sessions and in-flight turns no transcript restates.
 
 Session, project, and host deletion removes all five analytics tables in one transaction. A retained project/host match expands through provider-qualified analytics roots before leaving every sibling source as a suppressed tombstone. Source-less project/host rows use only exact recorded live origin; direct session deletion also catches unmapped legacy live rows. Committed deletions emit `transcript-analytics-updated` only when transcript rows changed.
 
@@ -1937,7 +1945,7 @@ Detection runs via `--version` checks for CLI providers through the shared [[src
 The backend pushes real-time updates to the frontend via Tauri's emit system.
 
 | Event | Source | Payload | Trigger |
-|-------|--------|---------|---------|
+| ------- | -------- | --------- | --------- |
 | `tokens-updated` | server.rs | `()` | Token snapshot stored |
 | `context-savings-updated` | server.rs | `()` | Context savings events stored |
 | `learning-log` | learning.rs | `{run_id, message}` | Real-time analysis progress |
@@ -1957,13 +1965,13 @@ Indicator state payloads use the explicit status vocabulary `ready`, `degraded`,
 
 ## Session Indexing
 
-[[src-tauri/src/sessions.rs]] provides full-text search over Claude Code and Codex transcripts using Tantivy, with provider-safe identity for indexing, search hits, context lookup, and reindex cleanup.
+[[src-tauri/src/sessions.rs]] provides full-text search over Claude Code, Codex, and Pi transcripts using Tantivy, with provider-safe identity for indexing, search hits, context lookup, and reindex cleanup.
 
 ### Index Schema
 
 The Tantivy index stores provider, identity, content, and enrichment fields for shared session search.
 
-Fields include provider, message_id, session_id, content, role, project, project_path, host, timestamp, git_branch, tools_used, files_modified, code_changes, commands_run, tool_details, and display text. Provider/project/host support facets, project and host are stored for hit metadata, and project_path keeps exact cwd identity. Stored at `~/.local/share/com.quilltoolkit.app/session-index/`; schema version 7 rebuilds older indexes.
+Fields include provider, message_id, session_id, content, role, project, project_path, host, timestamp, git_branch, tools_used, files_modified, code_changes, commands_run, tool_details, and display text. Provider/project/host support facets, project and host are stored for hit metadata, and project_path keeps exact cwd identity. Pi search admits only user and assistant documents; Claude and Codex retain intentional provider-native roles. Pi tool calls attach to assistant enrichment, while matching tool results are capped at 10 KiB in `ToolAction.full_output` and never become documents. Opening an existing index performs a one-time provider-scoped deletion of legacy Pi non-conversation roles without rebuilding notify-only Pi history. Stored at `~/.local/share/com.quilltoolkit.app/session-index/`; schema version 7 rebuilds older indexes.
 
 ### Indexing Strategy
 
@@ -1981,7 +1989,7 @@ Skill usage is derived by [[src-tauri/src/sessions.rs#extract_skill_accesses_fro
 
 The shared Claude candidate walker descends through the complete `<projectSlug>/<session-uuid>/subagents/**` subtree in addition to flat parent transcripts. Its permissive search view preserves original paths, project labels, and `is_subagent`; its strict retained view canonicalizes containment and source identity. Both admit only nested `agent-*.jsonl` transcripts, excluding Workflow journals. Claude extraction indexes top-level messages by `sessionId` and sidechain messages by `agentId`, retaining `parentUuid` for message linkage. Context lookup canonicalizes candidates under the Claude root and requires one matching extracted chain identity. Codex preserves the first child `session_meta.id` and resolves `parent_thread_id`, falling back to `forked_from_id`; context lookup checks its provider-qualified transcript registry before the legacy filename suffix and rejects ambiguous matches.
 
-The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. Project filters keep display-name facet matching for the UI and accept an exact absolute cwd for MCP callers; exact cwd identity separates same-named directories. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges.
+The HTTP API also accepts provider-tagged notify and direct message ingestion. Local Claude full-transcript sync is Stop-scoped, while direct message ingestion still appends atomically for incremental remote updates. Project filters keep display-name facet matching for the UI and accept an exact absolute cwd for MCP callers; exact cwd identity separates same-named directories. BM25 scoring plus snippet generation power the shared search UI with provider filters and badges. The default search response retains full stored content for the desktop UI; `view=compact` omits it, returns snippet-and-identity hits, and stops before the serialized response exceeds 32 KiB for model-facing clients.
 
 [[src-tauri/src/sessions.rs#validate_retained_notify_source]] validates one `notify` path against only its configured provider root, canonical containment, and supported layout without walking transcript history. Quill admits a canonical source to model and transcript reconciliation before session-keyed search coalescing; a resolvable path that fails the stricter retained-source policy still coalesces for search only, preserving the indexing contract. Direct message payloads append Tantivy documents and atomically store source-less runtime rows plus recorded live origin through [[src-tauri/src/storage.rs#Storage#store_live_session_analytics]].
 
@@ -2046,7 +2054,7 @@ Live-usage IPC carries one structured exception to the plain-string contract: `U
 Key filesystem locations used by the backend for storage, config, and caching.
 
 | Path | Platform | Purpose |
-|------|----------|---------|
+| ------ | ---------- | --------- |
 | `~/.local/share/com.quilltoolkit.app/` | Linux | DB, search index, auth secret |
 | `~/Library/Application Support/com.quilltoolkit.app/` | macOS | DB, search index, auth secret |
 | `~/.config/quill/` | All | Deployed hooks, MCP server, scripts |

@@ -14981,7 +14981,7 @@ impl Storage {
                         cwd, 0, NULL, NULL
                  FROM live_analytics_sessions
                  WHERE provider = 'pi' AND session_id = ?1
-                   AND hostname = ?7 AND ephemeral = 1",
+                   AND hostname = ?7",
                 params![
                     event.session_id,
                     event.timestamp,
@@ -14992,7 +14992,7 @@ impl Storage {
                     hostname,
                 ],
             )
-            .map_err(|error| format!("Store ephemeral Pi token snapshot: {error}"))?;
+            .map_err(|error| format!("Store Pi token snapshot: {error}"))?;
             tx.execute(
                 "UPDATE model_observation_sources
                  SET observation_count = observation_count + 1
@@ -15057,6 +15057,156 @@ impl Storage {
         tx.commit()
             .map_err(|error| format!("Commit pushed Pi usage insert: {error}"))?;
         Ok(inserted)
+    }
+
+    /// Replace Pi's transcript-derived tool rows for one notified session.
+    ///
+    /// Pi never enters retained transcript analytics, so the snapshot writer
+    /// that owns `tool_actions` and `skill_usages` for Claude and Codex never
+    /// runs for it, and the code-stats queries behind lines-changed saw no Pi
+    /// rows at all. The notify parse already builds both row sets through the
+    /// same extractor those providers use, and re-reads the whole transcript
+    /// each time, so replacing exactly this source's two tables is the
+    /// idempotent equivalent of one snapshot commit.
+    ///
+    /// `session_events` and `response_times` are deliberately untouched. They
+    /// share this `source_key` but are owned by the pushed live path, which
+    /// sees ephemeral sessions and in-flight turns no transcript restates.
+    pub(crate) fn replace_pi_transcript_tool_rows(
+        &self,
+        source_key: &str,
+        tool_actions: &[crate::transcript_analytics::OwnedToolAction],
+        skill_usages: &[crate::transcript_analytics::OwnedSkillUsage],
+    ) -> Result<(), String> {
+        if source_key.is_empty() {
+            return Err("Pi transcript tool rows require a source key".to_string());
+        }
+        if tool_actions
+            .iter()
+            .any(|row| row.provider != IntegrationProvider::Pi || row.source_key != source_key)
+            || skill_usages
+                .iter()
+                .any(|row| row.provider != IntegrationProvider::Pi || row.source_key != source_key)
+        {
+            return Err("Pi transcript tool row ownership mismatch".to_string());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Begin Pi transcript tool replacement: {e}"))?;
+        // Read inside the transaction for the same reason the snapshot writer
+        // does: the delete below drops every owned row, so an unfiltered
+        // reinsert would resurrect pre-cutoff history a retention run already
+        // deleted.
+        let watermark = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![RETENTION_WATERMARK_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("Read Pi transcript retention watermark: {e}"))?
+            .as_deref()
+            .and_then(parse_watermark_setting);
+        for table in ["tool_actions", "skill_usages"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE provider = ?1 AND source_key = ?2"),
+                params![IntegrationProvider::Pi.as_str(), source_key],
+            )
+            .map_err(|e| format!("Delete Pi {table} source rows: {e}"))?;
+        }
+        {
+            let mut tool_action_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO tool_actions (
+                         provider, source_key, action_key, message_id,
+                         session_id, chain_id, parent_chain_id, tool_name,
+                         category, file_path, summary, full_input, full_output,
+                         timestamp, is_sidechain, agent_id, parent_uuid,
+                         lines_added, lines_removed
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                     )",
+                )
+                .map_err(|e| format!("Prepare Pi tool actions: {e}"))?;
+            for row in tool_actions {
+                if retention_insert_verdict(watermark.as_deref(), &row.timestamp)
+                    == RetentionInsertVerdict::Suppress
+                {
+                    continue;
+                }
+                // Same forward-only payload carve-out the snapshot writer
+                // applies: a `tool_detail` row keeps its identity and its place
+                // in the category-agnostic counts, but not the two columns no
+                // reader ever selects back.
+                let (full_input, full_output) = if row.category == TOOL_DETAIL_CATEGORY {
+                    (None, None)
+                } else {
+                    (row.full_input.as_deref(), row.full_output.as_deref())
+                };
+                tool_action_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.action_key,
+                        row.message_id,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.tool_name,
+                        row.category,
+                        row.file_path,
+                        row.summary,
+                        full_input,
+                        full_output,
+                        row.timestamp,
+                        i64::from(row.is_sidechain),
+                        row.agent_id,
+                        row.parent_uuid,
+                        row.lines_added,
+                        row.lines_removed,
+                    ])
+                    .map_err(|e| format!("Insert Pi tool action: {e}"))?;
+            }
+
+            let mut skill_usage_stmt = tx
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO skill_usages (
+                         provider, source_key, session_id, chain_id,
+                         parent_chain_id, message_id, skill_name, skill_path,
+                         timestamp, tool_name, cwd, hostname
+                     ) VALUES (
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                     )",
+                )
+                .map_err(|e| format!("Prepare Pi skill usages: {e}"))?;
+            for row in skill_usages {
+                if retention_insert_verdict(watermark.as_deref(), &row.timestamp)
+                    == RetentionInsertVerdict::Suppress
+                {
+                    continue;
+                }
+                skill_usage_stmt
+                    .execute(params![
+                        row.provider.as_str(),
+                        row.source_key,
+                        row.session_id,
+                        row.chain_id,
+                        row.parent_chain_id,
+                        row.message_id,
+                        row.skill_name,
+                        row.skill_path,
+                        row.timestamp,
+                        row.tool_name,
+                        row.cwd,
+                        row.hostname,
+                    ])
+                    .map_err(|e| format!("Insert Pi skill usage: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("Commit Pi transcript tool replacement: {e}"))
     }
 
     /// Store the newest Pi extension handshake as one settings transaction.
@@ -18528,14 +18678,41 @@ impl Storage {
                     )
                     .optional()
                     .map_err(|e| format!("Read prior live response time: {e}"))?;
+                // Pi pushes exactly one message per request, so a turn's user
+                // prompt and the assistant reply that answers it never share a
+                // batch and a call-local pending slot can never pair them. The
+                // unpaired prompt is recovered from its own persisted runtime
+                // event: the newest `user_text` in this chain that no completed
+                // turn has consumed yet. Taking it once per batch means the
+                // many `asst_text` events inside one turn still produce exactly
+                // one row, matching the transcript providers' turn accounting.
+                let mut carried_user_ts = if provider == IntegrationProvider::Pi {
+                    tx.query_row(
+                        "SELECT MAX(timestamp) FROM session_events
+                         WHERE provider = ?1 AND session_id = ?2 AND chain_id = ?3
+                           AND source_key IS ?4 AND kind = 'user_text'
+                           AND timestamp > COALESCE(
+                               (SELECT MAX(timestamp) FROM response_times
+                                WHERE provider = ?1 AND session_id = ?2
+                                  AND chain_id = ?3 AND source_key IS ?4
+                                  AND response_secs IS NOT NULL), '')",
+                        params![provider.as_str(), session_id, chain_id, source_key],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(|e| format!("Read pending live user turn: {e}"))?
+                    .flatten()
+                } else {
+                    None
+                };
                 let mut pending_user: Option<LiveSessionMessageInput<'_>> = None;
                 let mut pending_assistant: Option<LiveSessionMessageInput<'_>> = None;
                 let mut previous_assistant = last_assistant_ts;
-                let mut turns: Vec<(
-                    LiveSessionMessageInput<'_>,
-                    LiveSessionMessageInput<'_>,
-                    Option<String>,
-                )> = Vec::new();
+                // The user side of a turn contributes only its timestamp, so it
+                // is carried as one, letting an in-batch message and a recovered
+                // prior-batch prompt share the same completion path.
+                let mut turns: Vec<(String, LiveSessionMessageInput<'_>, Option<String>)> =
+                    Vec::new();
 
                 for message in sorted {
                     match message.role {
@@ -18544,9 +18721,16 @@ impl Storage {
                                 && let (Some(user), Some(assistant)) =
                                     (pending_user.take(), pending_assistant.take())
                             {
-                                turns.push((user, assistant, previous_assistant.clone()));
+                                turns.push((
+                                    user.timestamp.to_string(),
+                                    assistant,
+                                    previous_assistant.clone(),
+                                ));
                                 previous_assistant = Some(assistant.timestamp.to_string());
                             }
+                            // A prompt in this batch supersedes any older one
+                            // recovered from storage.
+                            carried_user_ts = None;
                             pending_user = Some(message);
                         }
                         "assistant" => {
@@ -18557,7 +18741,11 @@ impl Storage {
                                     previous_assistant = Some(message.timestamp.to_string());
                                 }
                             } else {
-                                if let Some(user) = pending_user.take() {
+                                if let Some(user) = pending_user
+                                    .take()
+                                    .map(|user| user.timestamp.to_string())
+                                    .or_else(|| carried_user_ts.take())
+                                {
                                     turns.push((user, message, previous_assistant.clone()));
                                 }
                                 previous_assistant = Some(message.timestamp.to_string());
@@ -18569,10 +18757,10 @@ impl Storage {
                 if provider == IntegrationProvider::Codex
                     && let (Some(user), Some(assistant)) = (pending_user, pending_assistant)
                 {
-                    turns.push((user, assistant, previous_assistant));
+                    turns.push((user.timestamp.to_string(), assistant, previous_assistant));
                 }
 
-                for (user, assistant, prior_assistant_ts) in turns {
+                for (user_timestamp, assistant, prior_assistant_ts) in turns {
                     if source_key.is_some()
                         && retention_insert_verdict(
                             runtime_watermark.as_deref(),
@@ -18581,11 +18769,11 @@ impl Storage {
                     {
                         continue;
                     }
-                    let response_secs = parse_ts_diff(assistant.timestamp, user.timestamp)
+                    let response_secs = parse_ts_diff(assistant.timestamp, &user_timestamp)
                         .filter(|seconds| *seconds > 0.0 && *seconds <= response_max_secs);
                     let idle_secs = prior_assistant_ts
                         .as_deref()
-                        .and_then(|prior| parse_ts_diff(user.timestamp, prior))
+                        .and_then(|prior| parse_ts_diff(&user_timestamp, prior))
                         .filter(|seconds| *seconds > 0.0 && *seconds <= 600.0);
                     if response_secs.is_none() && idle_secs.is_none() {
                         continue;
@@ -25691,6 +25879,15 @@ mod tests {
         );
         assert_eq!(
             scalar_count(&conn, "SELECT COUNT(*) FROM model_usage_observations"),
+            1
+        );
+        // An ordinary (non-ephemeral) origin still feeds the token series, and
+        // the observation dedupe keeps the replay from doubling it.
+        assert_eq!(
+            scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM token_snapshots WHERE provider = 'pi'"
+            ),
             1
         );
         drop(conn);
@@ -33559,6 +33756,101 @@ mod tests {
         );
         assert!(stats.total_runtime_secs >= 540.0);
         assert!(stats.turn_count >= 1);
+        clear_env();
+    }
+
+    // @lat: [[pi-live-session-tests#Pi Live Session Test Specs#Split Turn Response Pairing]]
+    #[test]
+    #[serial]
+    fn pi_turn_pairs_across_single_message_pushes() {
+        clear_env();
+        let dir = TempDir::new().expect("tempdir");
+        let storage = init_storage_in(&dir);
+        let base = DateTime::parse_from_rfc3339("2026-07-30T10:00:00Z").expect("base time");
+        let at = |seconds: i64| (base + chrono::Duration::seconds(seconds)).to_rfc3339();
+
+        // One message per call is the shape the extension actually pushes, so
+        // a turn's prompt and its reply never share a batch.
+        let push = |message_id: &str,
+                    role: &str,
+                    timestamp: &str,
+                    kind: crate::sessions::SessionEventKind| {
+            let messages = [LiveSessionMessageInput {
+                message_id,
+                role,
+                timestamp,
+                chain_id: "pi-split",
+                parent_chain_id: None,
+                is_sidechain: false,
+                agent_id: None,
+                parent_uuid: None,
+            }];
+            let events = [LiveSessionEventInput {
+                message_id,
+                event_ordinal: 0,
+                timestamp,
+                kind,
+            }];
+            storage
+                .store_live_session_analytics(
+                    IntegrationProvider::Pi,
+                    "pi-split",
+                    LiveAnalyticsOrigin {
+                        project: None,
+                        cwd: None,
+                        hostname: Some("pi-host"),
+                    },
+                    LiveSessionAnalyticsRows {
+                        messages: &messages,
+                        session_events: &events,
+                        hook_invocations: &[],
+                    },
+                )
+                .expect("push one Pi message");
+        };
+
+        use crate::sessions::SessionEventKind;
+        push("u1", "user", &at(0), SessionEventKind::UserText);
+        push("t1", "assistant", &at(10), SessionEventKind::AsstToolUse);
+        push("a1", "assistant", &at(30), SessionEventKind::AsstText);
+        // Every later reply inside the same turn must stay unpaired, or one
+        // prompt would inflate into many turns.
+        push("a2", "assistant", &at(40), SessionEventKind::AsstText);
+        push("u2", "user", &at(100), SessionEventKind::UserText);
+        push("a3", "assistant", &at(120), SessionEventKind::AsstText);
+
+        let conn = storage.conn.lock().unwrap();
+        let paired: Vec<f64> = conn
+            .prepare(
+                "SELECT response_secs FROM response_times
+                 WHERE provider = 'pi' AND session_id = 'pi-split'
+                   AND response_secs IS NOT NULL
+                 ORDER BY timestamp",
+            )
+            .expect("prepare split response read")
+            .query_map([], |row| row.get(0))
+            .expect("query split response rows")
+            .collect::<Result<_, _>>()
+            .expect("collect split response rows");
+        assert_eq!(paired, vec![30.0, 20.0]);
+        drop(conn);
+
+        // Re-pushing every message must not invent extra turns.
+        push("a3", "assistant", &at(120), SessionEventKind::AsstText);
+        assert_eq!(
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM response_times
+                     WHERE provider = 'pi' AND session_id = 'pi-split'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("count split responses"),
+            2
+        );
         clear_env();
     }
 

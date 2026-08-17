@@ -4,11 +4,17 @@ lat:
 ---
 # Pi Notify Index Test Specs
 
-These tests pin extension-notified Pi search indexing and provider isolation.
+These tests pin extension-notified Pi search indexing, the analytics rows that same parse persists, and provider isolation.
 
 ## Notify Identity And Parent
 
 A Pi notify reads only its named transcript and indexes messages under the pushed session id and lineage parent id.
+
+## Notify Tool And Skill Rows
+
+A Pi notify persists the parsed transcript's `tool_actions` and `skill_usages`, which no other path produces for Pi.
+
+Write and edit inputs carry their line counts through to code stats, a `tool_detail` row keeps its identity while its payload columns drop at the bind, and a SKILL.md read attributes to its skill. Re-notifying the same transcript replaces the rows instead of doubling them, and the rows still land when the search index is absent.
 
 ## Configured Root Containment
 
@@ -28,7 +34,11 @@ Provider-qualified session lookup returns no Pi transcript instead of walking ev
 
 ## Message Extraction
 
-The narrow parser extracts each text-bearing Pi message once by entry id with header cwd and project metadata.
+The narrow parser extracts each user and assistant message once by entry id with header cwd and project metadata.
+
+## Tool Result Correlation
+
+Pi assistant tool calls populate tool, file, command, and code-change metadata. Matching results attach at 10 KiB, command previews stay at 300 bytes, and result entries never become search documents.
 
 ## Provider Safe Search
 

@@ -78,6 +78,10 @@ Typed registration, transport, protocol, config, and spool failures remain conta
 
 History and working-context tools preserve loopback hostname semantics, authenticate requests, map parameters, and return typed results.
 
+## Bounded History Results
+
+Pi requests compact history responses, removes duplicate detail payloads, and applies the shared byte ceiling even when an older backend returns oversized hits.
+
 ## Bounded synchronous work
 
 Tool and telemetry handlers start their bounded HTTP work and return from synchronous work within 10 milliseconds.

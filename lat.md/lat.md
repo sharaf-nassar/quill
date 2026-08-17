@@ -29,6 +29,7 @@ This directory defines the high-level concepts, business logic, and architecture
 - [[manage-section-tests]] — Manage workspace section availability test specs
 - [[pi-session-parser-tests]] — narrow Pi message and header parser test specs
 - [[pi-notify-index-tests]] — Pi notify and Session Search indexing test specs
+- [[session-search-tests]] — Conversation-role and bounded search response test specs
 - [[pi-live-session-tests]] — Pi bounded live-fold and token-gap test specs
 - [[pi-model-usage-tests]] — Pi model-usage identity, tree totals, tolerance, and replay test specs
 - [[pi-lineage-ui-tests]] — Pi parent navigation and live linked-session copy test specs

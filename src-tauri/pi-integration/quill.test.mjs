@@ -1189,19 +1189,72 @@ test("tools call the local session and context APIs with typed results", async (
             context(),
           );
         assert.equal(history.isError, undefined);
-        assert.equal(indexed.details.ok, true);
+        assert.deepEqual(indexed.details, { ok: true });
         assert.match(
           calls[0].url,
           /^http:\/\/\[::1\]:19876\/api\/v1\/sessions\/search\?/,
         );
         assert.match(calls[0].url, /q=needle/);
         assert.match(calls[0].url, /page_size=3/);
+        assert.match(calls[0].url, /view=compact/);
         assert.equal(calls[1].url, "http://[::1]:19877/api/v1/context/index");
         assert.equal(calls[1].options.headers.Authorization, "Bearer secret");
         assert.deepEqual(JSON.parse(calls[1].options.body), {
           content: "large output",
           cwd: "/tmp/project",
         });
+      } finally {
+        globalThis.fetch = oldFetch;
+      }
+    },
+  );
+});
+
+// @lat: [[pi-extension-tests#Pi Extension Test Specs#Bounded History Results]]
+test("history results stay compact without duplicate details", async () => {
+  await withHome(
+    { url: "http://127.0.0.1:19876", secret: "secret" },
+    async () => {
+      const pi = fakePi();
+      quill(pi.api);
+      const oldFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+          hits: Array.from({ length: 50 }, (_, index) => ({
+            provider: "pi",
+            message_id: `message-${index}`,
+            session_id: "session",
+            content: "raw-tool-output".repeat(10_000),
+            snippet: "matching snippet ".repeat(1_000),
+            role: "assistant",
+            project: "quill",
+            host: "host",
+            timestamp: "2026-08-14T08:00:01Z",
+            git_branch: "main",
+            score: 1,
+          })),
+          total_hits: 50,
+          query_time_ms: 2,
+        }),
+      });
+      try {
+        const result = await pi.tools
+          .get("quill_search_history")
+          .execute(
+            "history",
+            { query: "needle" },
+            undefined,
+            undefined,
+            context(),
+          );
+        const payload = JSON.parse(result.content[0].text);
+
+        assert.ok(Buffer.byteLength(result.content[0].text) <= 32 * 1024);
+        assert.ok(payload.hits.length > 0);
+        assert.ok(payload.hits.every((hit) => !("content" in hit)));
+        assert.equal(payload.truncated, true);
+        assert.deepEqual(result.details, { ok: true });
       } finally {
         globalThis.fetch = oldFetch;
       }
@@ -2022,7 +2075,17 @@ test("Pi 0.84.2 loads tracking and calls a Quill tool in an isolated session", a
         .some((message) => message.role === "assistant"),
     );
     assert.match(stdout, /Quill probe complete/);
-    assert.match(stdout, /"sources":7/);
+    const toolResult = stdout
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line))
+      .find(
+        (record) =>
+          record.type === "message_end" &&
+          record.message?.role === "toolResult",
+      );
+    assert.equal(JSON.parse(toolResult.message.content[0].text).sources, 7);
+    assert.deepEqual(toolResult.message.details, { ok: true });
     assert.ok(
       readdirSync(sessionDir, { recursive: true }).some((entry) =>
         entry.endsWith(".jsonl"),

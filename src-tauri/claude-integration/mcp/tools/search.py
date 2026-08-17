@@ -21,9 +21,7 @@ async def search_history(
     project: Annotated[
         str | None, Field(description="Filter by project working directory (cwd)")
     ] = None,
-    host: Annotated[
-        str | None, Field(description="Filter by hostname")
-    ] = None,
+    host: Annotated[str | None, Field(description="Filter by hostname")] = None,
     role: Annotated[
         str | None, Field(description="Filter by message role (user or assistant)")
     ] = None,
@@ -33,19 +31,19 @@ async def search_history(
     date_from: Annotated[
         str | None, Field(description="Start date (YYYY-MM-DD)")
     ] = None,
-    date_to: Annotated[
-        str | None, Field(description="End date (YYYY-MM-DD)")
-    ] = None,
-    limit: Annotated[
-        int, Field(description="Max results to return", ge=1, le=50)
-    ] = 10,
+    date_to: Annotated[str | None, Field(description="End date (YYYY-MM-DD)")] = None,
+    limit: Annotated[int, Field(description="Max results to return", ge=1, le=50)] = 10,
 ) -> dict:
     """Full-text search across conversation history, code changes (Edit/Write),
-    commands run (Bash), and tool details (Read/Grep/Glob/Agent). Returns
-    matching messages with all indexed fields. Search for file names, commands,
-    error messages, or any conversation content."""
+    commands run (Bash), and tool details (Read/Grep/Glob/Agent). Returns bounded
+    snippets and identifiers. Search for file names, commands, error messages,
+    or any conversation content."""
     client = await get_http_client()
-    params: dict = {"q": query, "page_size": str(limit)}
+    params: dict[str, str] = {
+        "q": query,
+        "page_size": str(limit),
+        "view": "compact",
+    }
     if project is not None:
         params["project"] = project
     if host is not None:

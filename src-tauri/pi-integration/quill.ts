@@ -39,6 +39,8 @@ const SPOOL_DIR_MAX_BYTES = 16 * SPOOL_FILE_MAX_BYTES;
 const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const LOG_MAX_BYTES = 256 * 1024;
 const TAINTED_MAX_PATHS = 256;
+// Keep equal to sessions::COMPACT_SEARCH_MAX_BYTES.
+const HISTORY_RESULT_MAX_BYTES = 32 * 1024;
 const REPORTER_CLAIMS = Symbol.for("quill.pi.reporter.claims");
 let lastNoticeRoot;
 const READER_COMMAND_PATTERN =
@@ -252,6 +254,7 @@ function errorMessage(error) {
 }
 
 function localBase(value) {
+  // pi-lens-ignore: unchecked-throwing-call
   const url = new URL(value);
   if (
     url.protocol !== "http:" ||
@@ -510,10 +513,74 @@ function sendTracked(config, state, endpoint, payload) {
   );
 }
 
+function boundedText(value, maxBytes) {
+  const text = typeof value === "string" ? value : String(value ?? "");
+  const bytes = Buffer.from(text);
+  if (bytes.length <= maxBytes) return text;
+  return `${bytes
+    .subarray(0, maxBytes)
+    .toString("utf8")
+    .replace(/\uFFFD$/, "")}... [truncated]`;
+}
+
+function compactHistory(data) {
+  const source = data && typeof data === "object" ? data : {};
+  const sourceHits = Array.isArray(source.hits) ? source.hits : [];
+  const hits = [];
+  let truncated = source.truncated === true;
+
+  for (const sourceHit of sourceHits) {
+    const hit = sourceHit && typeof sourceHit === "object" ? sourceHit : {};
+    hits.push({
+      provider: boundedText(hit.provider, 32),
+      message_id: boundedText(hit.message_id, 512),
+      session_id: boundedText(hit.session_id, 512),
+      parent_session_id:
+        hit.parent_session_id == null
+          ? null
+          : boundedText(hit.parent_session_id, 512),
+      snippet: boundedText(hit.snippet, 2048),
+      role: boundedText(hit.role, 32),
+      project: boundedText(hit.project, 512),
+      host: boundedText(hit.host, 512),
+      timestamp: boundedText(hit.timestamp, 64),
+      git_branch: boundedText(hit.git_branch, 512),
+      score: typeof hit.score === "number" ? hit.score : 0,
+    });
+    const candidate = JSON.stringify({
+      hits,
+      total_hits:
+        typeof source.total_hits === "number"
+          ? source.total_hits
+          : sourceHits.length,
+      query_time_ms:
+        typeof source.query_time_ms === "number" ? source.query_time_ms : 0,
+      truncated: false,
+    });
+    if (Buffer.byteLength(candidate) > HISTORY_RESULT_MAX_BYTES) {
+      hits.pop();
+      truncated = true;
+      break;
+    }
+  }
+
+  if (hits.length < sourceHits.length) truncated = true;
+  return {
+    hits,
+    total_hits:
+      typeof source.total_hits === "number"
+        ? source.total_hits
+        : sourceHits.length,
+    query_time_ms:
+      typeof source.query_time_ms === "number" ? source.query_time_ms : 0,
+    truncated,
+  };
+}
+
 function success(data) {
   return {
     content: [{ type: "text", text: JSON.stringify(data) }],
-    details: { ok: true, data },
+    details: { ok: true },
   };
 }
 
@@ -530,6 +597,7 @@ function unavailable() {
 
 function historyUrl(config, params) {
   const url = new URL("/api/v1/sessions/search", config.main);
+  url.searchParams.set("view", "compact");
   const names = {
     query: "q",
     limit: "page_size",
@@ -1473,9 +1541,11 @@ export default function quill(pi) {
             try {
               if (tool.kind === "history") {
                 return success(
-                  await fetchJson(config, historyUrl(config, params), {
-                    method: "GET",
-                  }),
+                  compactHistory(
+                    await fetchJson(config, historyUrl(config, params), {
+                      method: "GET",
+                    }),
+                  ),
                 );
               }
               const payload = { ...params };

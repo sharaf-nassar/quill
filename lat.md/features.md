@@ -260,13 +260,13 @@ Full-text search across Claude Code, Codex, and Pi session transcripts, powered 
 
 Opening Session Search syncs transcripts using nanosecond mtime plus file size, including removal of search documents for transcripts proven absent by complete source discovery. Metadata failures remain uncached for retry.
 
-Incomplete discovery preserves indexed data. Hook endpoints can also ingest updates; indexed messages include code_changes, commands_run, tool_details, and files_modified metadata. Parent and child chains keep distinct provider-native identities, so result context resolves the exact retained transcript without crossing providers or choosing an ambiguous source.
+Incomplete discovery preserves indexed data. Hook endpoints can also ingest updates; Pi indexes only user and assistant messages, while Claude and Codex retain intentional provider-native search roles. Tool calls add code_changes, commands_run, tool_details, and files_modified metadata; Pi tool results attach as bounded output instead of standalone messages. Parent and child chains keep distinct provider-native identities, so result context resolves the exact retained transcript without crossing providers or choosing an ambiguous source.
 
 ### Search Interface
 
 Search bar with filters for project, host, role, date range, and git branch. Project filters accept the displayed project label or an exact absolute cwd; the latter keeps same-named directories distinct for MCP history search.
 
-Results show ranked hits with snippets, tools used, files modified, and code changes. A detail panel shows surrounding context (plus/minus 5 messages). Faceted search provides pre-aggregated project and host counts. Pagination with 20 results per page and load-more.
+Results show ranked hits with snippets, tools used, files modified, and code changes. A detail panel shows surrounding context (plus/minus 5 messages). Faceted search provides pre-aggregated project and host counts. Pagination with 20 results per page and load-more. Model-facing callers request a compact view that omits full message content and caps the serialized response at 32 KiB; the desktop keeps the full response contract.
 
 ### Batch Code Stats
 
@@ -288,7 +288,7 @@ The Quill MCP server exposes context tools beside the single `search_history` se
 
 Tools in [[src-tauri/claude-integration/mcp/tools/context.py]] can index text or files, fetch and cache web pages, run bounded commands, search indexed chunks, retrieve focused sources, inspect stats, and purge stored context. File-based tools resolve paths under the selected working directory before reading or preserving content.
 
-The session-history surface in [[src-tauri/claude-integration/mcp/tools/search.py]] is intentionally narrow: only `search_history` remains, after a 30-day usage audit showed the discovery, analytics, and drill-down tools (`list_projects`, `list_sessions`, `get_session_overview`, `get_session_context`, `get_file_history`, `get_branch_activity`, `find_related_sessions`, `get_token_usage`, `get_learned_rules`, `get_tool_details`, `get_index_status`) were called ≤20 times across all sessions tracked. Trimming the surface keeps the tool listing legible and reduces low-value tool-selection noise.
+The session-history surface in [[src-tauri/claude-integration/mcp/tools/search.py]] is intentionally narrow: only `search_history` remains, after a 30-day usage audit showed the discovery, analytics, and drill-down tools (`list_projects`, `list_sessions`, `get_session_overview`, `get_session_context`, `get_file_history`, `get_branch_activity`, `find_related_sessions`, `get_token_usage`, `get_learned_rules`, `get_tool_details`, `get_index_status`) were called ≤20 times across all sessions tracked. Trimming the surface keeps the tool listing legible and reduces low-value tool-selection noise. `search_history` requests the shared compact search view, returning bounded snippets and provider/session/message identifiers instead of full stored bodies.
 
 Large execution and batch outputs are stored as `source:N` and `chunk:N` refs. Responses return previews and snippets by default, while [[src-tauri/claude-integration/mcp/tools/context.py#quill_get_context_source]] retrieves bounded chunks when the model needs exact details.
 
@@ -389,7 +389,7 @@ Settings is always reachable (the Manage workspace never gates it) so users can 
 Top-tabs navigation hosts five panels: General, Integrations, Context, Learning, and Performance.
 
 | Tab | Panel | Settings |
-|-----|-------|----------|
+| ----- | ------- | ---------- |
 | General | [[src/components/settings/GeneralTab.tsx]] | Always-on-top toggle, an Advanced section with the current-config summary and "Reset to defaults" button covering runtime and learning settings, a "Help improve Quill" toggle that drives the [[features#Crash Reporting]] opt-out, and an About section described in [[features#Settings Window#Version and Release Notes]] |
 | Integrations | [[src/components/settings/IntegrationsTab.tsx]] | Status provider selector, Rescan PATH, Activity tracking master toggle, per-provider enable/disable confirmations (with Pi executable-extension consent and MiniMax API key prompt), in-place MiniMax API-key edit form, and the CPA connection lifecycle |
 | Context | [[src/components/settings/ContextTab.tsx]] | Working Context Preservation global toggle, Context savings telemetry sub-toggle (gated on context preservation), and the [[features#Brevity Profile]] global toggle (gated on having any provider enabled), each with descriptive copy explaining what gets installed |

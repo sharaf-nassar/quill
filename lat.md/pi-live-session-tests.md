@@ -64,6 +64,12 @@ Pi runtime traffic charges contained messages, accepts 4,000 messages per minute
 
 Pi turn, input, and tool execution types map to canonical runtime events while the unavailable thinking event remains an explicit rejected gap.
 
+## Split Turn Response Pairing
+
+A reply pairs with a prompt pushed in an earlier request, because the extension sends one message per request.
+
+Later replies inside the same turn stay unpaired, so one prompt counts as one turn, and re-pushing a message invents no extra turns.
+
 ## Pi Runtime Hostname
 
 Pi runtime messages normalize their hostname to the same lowercase short key used by lifecycle tracking before analytics storage.
