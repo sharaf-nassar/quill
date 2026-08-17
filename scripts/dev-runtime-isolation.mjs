@@ -265,18 +265,15 @@ function readSecret(home, identifier) {
 /// preserve the bytes is still caught.
 function snapshot(root) {
 	const entries = {};
-	const walk = (dir) => {
-		for (const entry of readdirSync(dir, { withFileTypes: true })) {
-			const path = join(dir, entry.name);
-			if (entry.isDirectory()) {
-				walk(path);
-			} else if (entry.isFile()) {
-				const stat = statSync(path);
+	if (existsSync(root)) {
+		for (const relativePath of readdirSync(root, { recursive: true })) {
+			const path = join(root, relativePath);
+			const stat = statSync(path);
+			if (stat.isFile()) {
 				entries[path] = `${createHash("sha256").update(readFileSync(path)).digest("hex")}@${stat.mtimeMs}`;
 			}
 		}
-	};
-	if (existsSync(root)) walk(root);
+	}
 	return entries;
 }
 
